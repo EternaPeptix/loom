@@ -22,7 +22,8 @@
 - The daemon's own port is refused to commands in every profile, even with `loopback_all` or when listed in
   `loopback_ports`, so a `loom open` login code on another process's command line cannot be redeemed. New
   non-configuration fields `SandboxCfg::daemon_port` and `SandboxCfg::network_deny_all` carry what the profile
-  needs.
+  needs. With `loopback_all` the loopback allow is written for TCP and UDP (not `ip`), because a deny of one port
+  after an allow of `(remote ip "localhost:*")` is unreliable on macOS 27; loopback ICMP is no longer allowed then.
 - `agent_adopt` writes, makes and removes relative to directories it opened without following a link and judged
   by their real path (as `write` does), so a background command that swaps a workspace directory for a link
   during adoption can no longer redirect an unsandboxed write (into `~/.ssh` or `.git/hooks`, say).

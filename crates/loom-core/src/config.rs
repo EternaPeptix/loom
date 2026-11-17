@@ -198,6 +198,14 @@ pub struct SandboxCfg {
     /// Used only to exclude untrusted imports/inputs during isolated replay; not a config key.
     #[serde(skip)]
     pub replay_untrusted_paths: Vec<String>,
+    /// The daemon's own TCP port, which no command may connect to whatever else allows it. Set by the daemon
+    /// before the runtime starts; not a config key.
+    #[serde(skip)]
+    pub daemon_port: Option<u16>,
+    /// Whether `[network] mode` is `deny_all`, so that commands also cannot reach the system services that fetch
+    /// URLs for a process (certificate evaluation). Set by the runtime; not a config key.
+    #[serde(skip)]
+    pub network_deny_all: bool,
 }
 
 impl Default for SandboxCfg {
@@ -214,6 +222,8 @@ impl Default for SandboxCfg {
             env_pass: Vec::new(),
             secret_env: Vec::new(),
             replay_untrusted_paths: Vec::new(),
+            daemon_port: None,
+            network_deny_all: false,
         }
     }
 }

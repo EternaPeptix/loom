@@ -118,7 +118,7 @@ pub async fn run_until(paths: Paths, stop: CancellationToken, ready: impl FnOnce
 
     prepare_home(&paths)?;
     let _home_lock = take_home_lock(&paths)?;
-    let config = load_config(&paths)?;
+    let mut config = load_config(&paths)?;
     loom_tools::sandbox::preflight(&config.sandbox)?;
 
     if let Some(file) = read_daemon_file(&paths) {
@@ -149,6 +149,8 @@ pub async fn run_until(paths: Paths, stop: CancellationToken, ready: impl FnOnce
     let bind = local.to_string();
     let port = local.port();
 
+    // No sandboxed command may connect to this daemon, whatever else the sandbox allows.
+    config.sandbox.daemon_port = Some(port);
     let runtime = Runtime::start(config, paths.clone()).await?;
 
     let started_ms = loom_core::now_ms();

@@ -3598,7 +3598,9 @@ pub struct Runtime {
 
 impl Runtime {
     /// Bring the runtime up over `paths` and restore what was running. See *Start*.
-    pub async fn start(config: Config, paths: Paths) -> Result<Runtime, String> {
+    pub async fn start(mut config: Config, paths: Paths) -> Result<Runtime, String> {
+        // Every sandbox made from the configuration (sessions, agents' copies, judges) carries this.
+        config.sandbox.network_deny_all = config.network.mode == NetworkMode::DenyAll;
         config.check().map_err(|e| e.to_string())?;
         paths
             .ensure_private_layout()
@@ -7297,6 +7299,23 @@ mod tests {
         // The forwarder is one task; the repeat notice of the restored item is another.
         assert!(rt2.inner.st().tasks.len() >= 2, "the repeat notice was not armed");
         rt2.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn start_records_whether_the_network_is_deny_all_for_every_sandbox_it_makes() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = MockServer::start(Script::new(|_, _| finish("ok"))).await.unwrap();
+        for (mode, deny_all) in [(NetworkMode::DenyAll, true), (NetworkMode::Open, false)] {
+            let mut config = config_for(&server, None);
+            config.network.mode = mode;
+            // The flag is the runtime's to set: whatever the caller passed is replaced.
+            config.sandbox.network_deny_all = !deny_all;
+            config.sandbox.daemon_port = Some(4242);
+            let rt = Runtime::start(config, Paths::at(dir.path().join(format!("home-{deny_all}")))).await.unwrap();
+            assert_eq!(rt.config().sandbox.network_deny_all, deny_all);
+            assert_eq!(rt.config().sandbox.daemon_port, Some(4242));
+            rt.shutdown().await;
+        }
     }
 
     #[tokio::test]
