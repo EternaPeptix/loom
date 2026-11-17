@@ -23,9 +23,12 @@
 //! - `run [options] <message…>`: start a session and follow it. The message is the arguments
 //!   joined by spaces; `-` or no message reads standard input to its end. Options → `NewSession`
 //!   (`--workspace` defaults to the current directory; `--attended` sets `unattended: false`;
-//!   `--max-steps`/`--max-minutes` → budget; `--prior <mission>`, repeatable, → `prior` in the order
-//!   given: earlier missions for this one to recall, `loom_agent::prior`; `chat` takes it too, and refuses it
-//!   with `--session`: a mission recalls when it starts). A
+//!   `--max-steps`/`--max-minutes` → budget; each `--agent-model ROLE=PROFILE` → `role_models`, `all`
+//!   as `*`; `--create-workspace` → `create_workspace`: the daemon makes the folder when it does not exist, and
+//!   `created workspace {path}` goes to stderr before `session {id}` when it did; a `~` or `~/x` workspace is sent
+//!   as written, for the daemon to expand; `--prior <mission>`, repeatable, → `prior` in the order
+//!   given: earlier missions for this one to recall, `loom_agent::prior`; the same options serve `chat`, which
+//!   refuses `--prior` with `--session`: a mission recalls when it starts). A
 //!   `--prior` word that starts with `m-` is a mission id, sent as it is; any other word is resolved as a
 //!   session (`client.resolve`: an id, a prefix, or `last`) and its `mission` is sent. Prints `session {id}` to stderr first. With
 //!   `--detach`, stops there. Otherwise *follows* (below).
@@ -64,10 +67,18 @@
 //!   `render::granted_hosts_line` from the mission's ledger (left out when the ledger cannot be read).
 //! - `out <handle> [--lines <a>:<b>]`: the stored output's lines (all of it, paged 5 000 lines at a
 //!   time, without `--lines`), passed through `render::clean`.
-//! - `config path` prints the config file's path; `config check` loads and checks it and reads every
-//!   `api_key_file` (`check_model_keys`): `ok`, or the error and exit 1; with `ok`, each line of
+//! - `config path` prints the config file's path; `config check` loads and checks it, reads every
+//!   `api_key_file` (`check_model_keys`) and runs the daemon's other start-up checks (sandbox preflight, box
+//!   paths): `ok: {path}`, or the error (naming the file) and exit 1; with `ok`, each line of
 //!   `key_env_warnings` judged against this shell's environment on stderr as `warning: {line}`; `config init` writes [`DEFAULT_CONFIG`] if no file exists (refuses to
 //!   overwrite: `{path} already exists.`).
+//! - `models list`: `render::models_table` of `GET /api/models`. `models reload`: `POST
+//!   /api/models/reload`, `render::models_reload` of the report. `models set <session> <profile>`:
+//!   resolves the session, `POST /api/sessions/{id}/model`, `render::model_switch_line`. `models show
+//!   <session>`: `render::mission_models_table` of `GET /api/sessions/{id}/models`. `models role
+//!   <session> <role> <profile> [--now]` / `--clear`: `POST /api/sessions/{id}/role-model` (`all` sent
+//!   as `*`), `render::role_model_receipt`. None needs a restart; the daemon refuses with its sentence
+//!   (an unknown profile names the configured ones).
 //! - `service install|uninstall|status` (macOS; elsewhere `This command is for macOS (launchd).`):
 //!   `install` first loads the config and refuses (nothing written) a profile that sets `api_key_env`: a
 //!   launchd agent does not have the shell's variables, so its requests would carry no key, and putting
@@ -98,7 +109,7 @@
 //! Tests required (`clap` parsing and the pure parts; the calls themselves are covered by the
 //! client's tests): every command parses with its options and rejects a missing argument; `run`
 //! and `send` message joining and `-`; `--lines` parsing (`10:20`, `10:`, `:20`, bad forms);
-//! `follow_exit_code` for every turn end; `DEFAULT_CONFIG` parses with `Config::parse` and passes
+//! `--create-workspace` parsing and its `NewSession`; `follow_exit_code` for every turn end; `DEFAULT_CONFIG` parses with `Config::parse` and passes
 //! `check()`; `open_url`; `open` hands the address to the browser and writes it only with `--print`;
 //! the service-install key check refuses a profile with `api_key_env` (naming it and the variable) and a
 //! missing key file, and passes a config whose profiles use `api_key_file` or no key.
@@ -106,9 +117,9 @@
 use crate::client::{self, Client};
 use crate::render::{self, RecordOpts, Style};
 use clap::{Args, Parser, Subcommand};
-use loom_agent::runtime::{BusEvent, Delta, NewSession, RuleReceipt, ScopeReceipt};
+use loom_agent::runtime::{BusEvent, Delta, NewSession, RuleReceipt, ScopeReceipt, ANY_ROLE};
 use loom_agent::session::Phase;
-use loom_core::config::{Config, Paths};
+use loom_core::config::{Config, ConfigError, Paths};
 use loom_core::event::{Budget, Event, Record, Seq, SessionOutcome, TurnEndReason};
 use loom_core::{MissionId, SessionId};
 use std::future::Future;
@@ -195,6 +206,8 @@ pub enum Command {
     Reweave(SessionArg),
     /// Hide a finished session (or bring it back with --undo)
     Archive(ArchiveArgs),
+    /// Rename a mission (set its lead session's title)
+    Rename(RenameArgs),
     /// Set a standing rule for a mission (or withdraw one with --withdraw)
     Rule(RuleArgs),
     /// Record an approval for a mission
@@ -232,6 +245,11 @@ pub enum Command {
         #[command(subcommand)]
         action: ConfigAction,
     },
+    /// The model profiles: list them, reload them from the config, switch a session's model
+    Models {
+        #[command(subcommand)]
+        action: ModelsAction,
+    },
     /// Run the daemon as a login service (macOS)
     Service {
         #[command(subcommand)]
@@ -258,6 +276,9 @@ pub struct StartOpts {
     /// Model profile from the configuration
     #[arg(short, long)]
     pub model: Option<String>,
+    /// Model profile for the mission's agents of a role, as ROLE=PROFILE; repeatable; `all=PROFILE` for every role
+    #[arg(long = "agent-model", value_name = "ROLE=PROFILE", value_parser = parse_agent_model)]
+    pub agent_models: Vec<(String, String)>,
     #[arg(short, long)]
     pub title: Option<String>,
     /// Do not resume by itself after a restart
@@ -271,6 +292,9 @@ pub struct StartOpts {
     /// (its mission). Repeat for more
     #[arg(long, value_name = "MISSION")]
     pub prior: Vec<String>,
+    /// Make the workspace folder (and the folders above it) when it does not exist
+    #[arg(long)]
+    pub create_workspace: bool,
 }
 
 #[derive(Args, Debug)]
@@ -347,9 +371,20 @@ pub struct SessionArg {
 
 #[derive(Args, Debug)]
 pub struct ArchiveArgs {
+    /// A session id, the beginning of one, or `last`
     pub session: String,
+    /// Bring an archived session back instead of hiding it
     #[arg(long)]
     pub undo: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct RenameArgs {
+    /// A session id, the beginning of one, or `last` (the mission's lead)
+    pub session: String,
+    /// The new title (quote it if it has spaces); the words are joined with a space
+    #[arg(required = true)]
+    pub title: Vec<String>,
 }
 
 #[derive(Args, Debug)]
@@ -437,15 +472,66 @@ pub struct OutArgs {
 
 #[derive(Subcommand, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigAction {
+    /// Print the path of the configuration file
     Path,
+    /// Validate the configuration — parse, sandbox preflight and box paths — and name the file checked
     Check,
+    /// Write a starting configuration file (refuses to overwrite an existing one)
     Init,
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum ModelsAction {
+    /// List the model profiles in use, with each server's state (the default one is marked)
+    List,
+    /// Read [models] and default_model from the config again and use them now, without a restart
+    Reload,
+    /// Switch a session to another model profile, from its next step, without a restart
+    Set(ModelsSetArgs),
+    /// A mission's models: its lead's, the one chosen for each role of its agents, the agents running now
+    Show(ModelsShowArgs),
+    /// Choose the model a mission starts its agents of a role on (`all` for every role), or clear it
+    Role(ModelsRoleArgs),
+}
+
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct ModelsShowArgs {
+    /// A session id, the beginning of one, or `last` (any session of the mission)
+    pub session: String,
+}
+
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct ModelsRoleArgs {
+    /// A session id, the beginning of one, or `last` (any session of the mission)
+    pub session: String,
+    /// The agents' role (`loom models show` lists them), or `all` for every role the lead starts
+    pub role: String,
+    /// The model profile (`loom models list`); left out with --clear
+    #[arg(required_unless_present = "clear", conflicts_with = "clear")]
+    pub profile: Option<String>,
+    /// Remove the choice: the pack chooses again for agents started later
+    #[arg(long)]
+    pub clear: bool,
+    /// Also move the mission's running agents of that role now (not forked ones)
+    #[arg(long, conflicts_with = "clear")]
+    pub now: bool,
+}
+
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct ModelsSetArgs {
+    /// A session id, the beginning of one, or `last`
+    pub session: String,
+    /// The model profile to switch it to (`loom models list` shows them)
+    pub profile: String,
 }
 
 #[derive(Subcommand, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceAction {
+    /// Install and start the login service so the daemon runs at login (macOS launchd)
     Install,
+    /// Stop and remove the login service
     Uninstall,
+    /// Show whether the login service is installed and loaded
     Status,
 }
 /// Run one command; the result is the process's exit code.
@@ -672,8 +758,10 @@ where
 /// The request `loom run` and `loom chat` make; `cwd` is the default workspace; `prior` the missions to recall.
 fn new_session(opts: &StartOpts, message: Option<String>, cwd: &Path, prior: Vec<MissionId>) -> NewSession {
     let workspace = opts.workspace.clone().unwrap_or_else(|| cwd.to_path_buf());
+    // `~` and `~/x` reach the daemon as they are: it expands them to its user's home.
+    let tilde = workspace.to_str().is_some_and(|w| w == "~" || w.starts_with("~/"));
     NewSession {
-        workspace: std::path::absolute(&workspace).unwrap_or(workspace),
+        workspace: if tilde { workspace } else { std::path::absolute(&workspace).unwrap_or(workspace) },
         pack: opts.pack.clone(),
         role: opts.role.clone(),
         model: opts.model.clone(),
@@ -682,7 +770,30 @@ fn new_session(opts: &StartOpts, message: Option<String>, cwd: &Path, prior: Vec
         budget: Budget { max_steps: non_zero(opts.max_steps), max_minutes: non_zero(opts.max_minutes) },
         message,
         prior,
+        role_models: opts.agent_models.iter().cloned().collect(),
+        create_workspace: opts.create_workspace,
     }
+}
+
+/// The role a model choice names on the command line: `all` (or a quoted `*`) is every role the lead
+/// starts. `*` alone is globbed by shells, and zsh refuses `*=x` when nothing matches.
+fn cli_role(role: &str) -> String {
+    match role.trim() {
+        "all" | ANY_ROLE => ANY_ROLE.to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// `--agent-model ROLE=PROFILE`.
+fn parse_agent_model(text: &str) -> Result<(String, String), String> {
+    let Some((role, profile)) = text.split_once('=') else {
+        return Err(format!("`{text}` is not ROLE=PROFILE (for example worker=fast, or all=fast for every role)"));
+    };
+    let (role, profile) = (role.trim(), profile.trim());
+    if role.is_empty() || profile.is_empty() {
+        return Err(format!("`{text}` needs both a role and a profile, as ROLE=PROFILE"));
+    }
+    Ok((cli_role(role), profile.to_string()))
 }
 
 fn record_opts(show: &ShowOpts) -> RecordOpts {
@@ -1058,6 +1169,7 @@ async fn dispatch(command: Command) -> Result<i32, String> {
         Command::Up => cmd_up(&paths).await,
         Command::Down => cmd_down(&paths).await,
         Command::Config { action } => cmd_config(&paths, action),
+        Command::Models { action } => cmd_models(&paths, action).await,
         Command::Service { action } => cmd_service(&paths, action),
         Command::Status => {
             let view = client_of(&paths)?.status().await?;
@@ -1111,6 +1223,13 @@ async fn dispatch(command: Command) -> Result<i32, String> {
             let id = c.resolve(&a.session).await?;
             c.archive(&id, !a.undo).await?;
             outln(&format!("{} {id}", if a.undo { "restored" } else { "archived" })).map(|()| 0)
+        }
+        Command::Rename(a) => {
+            let c = client_of(&paths)?;
+            let id = c.resolve(&a.session).await?;
+            let title = a.title.join(" ");
+            c.rename(&id, &title).await?;
+            outln(&format!("renamed {id} to {title:?}")).map(|()| 0)
         }
         Command::Rule(a) => {
             let c = client_of(&paths)?;
@@ -1280,8 +1399,12 @@ async fn down(paths: &Paths, within: Duration) -> Result<i32, String> {
         // named, alive, in `daemon.json` and holds the home until it exits: that is waited for below. A
         // daemon that is starting has not written `daemon.json` yet, or answers once it has.
         let shutting_down = !crate::serve::home_lock_free(paths) && crate::serve::live_daemon_pid(paths).is_some();
-        if !shutting_down || c.alive().await {
-            return Err(e);
+        if c.alive().await {
+            return Err(e); // it answered but the shutdown itself errored: keep the real reason
+        }
+        if !shutting_down {
+            // For `down`, the generic "start it with `loom up`" is the wrong next step.
+            return Err("The loom daemon is not running, so there is nothing to stop.".to_string());
         }
     } else {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -1364,8 +1487,11 @@ async fn cmd_run(paths: &Paths, a: RunArgs) -> Result<i32, String> {
         std::env::current_dir().map_err(|e| format!("Cannot find the current directory ({e}). Pass --workspace."))?;
     let client = &c;
     let prior = prior_missions(&a.start.prior, |word| async move { client.mission_of(&word).await }).await?;
-    let info = c.create(&new_session(&a.start, Some(message), &cwd, prior)).await?;
-    let id = info.meta.id;
+    let made = c.create_receipt(&new_session(&a.start, Some(message), &cwd, prior)).await?;
+    let id = made.info.meta.id;
+    if made.created {
+        errln(&format!("created workspace {}", made.info.meta.workspace));
+    }
     errln(&format!("session {id}"));
     if a.detach {
         outln(id.as_str())?;
@@ -1392,12 +1518,20 @@ that recalls them, or drop --prior to continue this one."
             if new.role.is_none() {
                 new.role = Some("chat".to_string());
             }
-            let id = c.create(&new).await?.meta.id;
+            let made = c.create_receipt(&new).await?;
+            let id = made.info.meta.id;
+            if made.created {
+                errln(&format!("created workspace {}", made.info.meta.workspace));
+            }
             errln(&format!("session {id}"));
             id
         }
     };
     let tty = std::io::stdin().is_terminal();
+    if tty {
+        // A first-time operator has no way to know how to leave or that the prompt means "your turn".
+        errln("type a message and press Enter · /quit or Ctrl-D to leave");
+    }
     let style = style();
     let opts = record_opts(&a.show);
     let render_record = |r: &Record| render::record(r, &style, &opts);
@@ -1423,15 +1557,48 @@ that recalls them, or drop --prior to continue this one."
     }
 }
 
+async fn cmd_models(paths: &Paths, action: ModelsAction) -> Result<i32, String> {
+    let c = client_of(paths)?;
+    match action {
+        ModelsAction::List => block(&render::models_table(&c.models().await?, &style())).map(|()| 0),
+        ModelsAction::Reload => block(&render::models_reload(&c.reload_models().await?)).map(|()| 0),
+        ModelsAction::Set(a) => {
+            let id = c.resolve(&a.session).await?;
+            let receipt = c.set_model(&id, &a.profile).await?;
+            outln(&render::model_switch_line(&receipt)).map(|()| 0)
+        }
+        ModelsAction::Show(a) => {
+            let id = c.resolve(&a.session).await?;
+            block(&render::mission_models_table(&c.mission_models(&id).await?, &style())).map(|()| 0)
+        }
+        ModelsAction::Role(a) => {
+            let id = c.resolve(&a.session).await?;
+            let role = cli_role(&a.role);
+            let receipt = c.set_role_model(&id, &role, a.profile.as_deref(), a.now).await?;
+            block(&render::role_model_receipt(&receipt, &role, a.profile.as_deref(), &style())).map(|()| 0)
+        }
+    }
+}
+
 fn cmd_config(paths: &Paths, action: ConfigAction) -> Result<i32, String> {
     let file = paths.config_file();
     match action {
         ConfigAction::Path => outln(&file.display().to_string()).map(|()| 0),
         ConfigAction::Check => {
-            let config = Config::load(&file).map_err(|e| e.to_string())?;
-            config.check_model_keys(&paths.model_keys_dir())?;
-            outln("ok")?;
-            for line in config.key_env_warnings(&paths.model_keys_dir(), env_var_is_set) {
+            // Name the file on error, as the daemon does, so the operator knows which one to edit.
+            let describe = |e: ConfigError| match e {
+                ConfigError::Parse { .. } => e.to_string(), // already begins with the path
+                other => format!("{}: {other}", file.display()),
+            };
+            let cfg = Config::load(&file).map_err(describe)?;
+            // Run the same deterministic checks the daemon runs at startup, so `check` no longer prints
+            // `ok` for a config that `up` then refuses (a key file it cannot use, a missing sandbox, a box
+            // path inside the home).
+            cfg.check_model_keys(&paths.model_keys_dir())?;
+            loom_tools::sandbox::preflight(&cfg.sandbox).map_err(|e| e.to_string())?;
+            cfg.check_box_paths(&paths.home).map_err(|e| e.to_string())?;
+            outln(&format!("ok: {}", file.display()))?;
+            for line in cfg.key_env_warnings(&paths.model_keys_dir(), env_var_is_set) {
                 errln(&format!("warning: {line}"));
             }
             Ok(0)
@@ -1599,6 +1766,7 @@ mod tests {
             "m-1",
             "--prior",
             "last",
+            "--create-workspace",
             "-d",
             "--reasoning",
             "--full",
@@ -1610,6 +1778,7 @@ mod tests {
             panic!("not run");
         };
         assert_eq!(a.start.workspace, Some(PathBuf::from("/work")));
+        assert!(a.start.create_workspace);
         assert_eq!(a.start.pack.as_deref(), Some("p"));
         assert_eq!(a.start.role.as_deref(), Some("r"));
         assert_eq!(a.start.model.as_deref(), Some("big"));
@@ -1677,6 +1846,9 @@ mod tests {
         assert!(a.undo);
         let Command::Archive(a) = ok(&["archive", "s-1"]) else { panic!("not archive") };
         assert!(!a.undo);
+        let Command::Rename(a) = ok(&["rename", "last", "Grafana", "CVE", "hunt"]) else { panic!("not rename") };
+        assert_eq!((a.session.as_str(), a.title.join(" ").as_str()), ("last", "Grafana CVE hunt"));
+        rejected(&["rename", "s-1"]); // a title is required
         let Command::Rule(a) = ok(&["rule", "s-1", "no", "prod"]) else { panic!("not rule") };
         assert_eq!((a.session.as_str(), a.text, a.withdraw), ("s-1", words(&["no", "prod"]), None));
         let Command::Rule(a) = ok(&["rule", "last", "--withdraw", "k2", "--reason", "done now"]) else {
@@ -1735,6 +1907,39 @@ mod tests {
         rejected(&["config"]);
         rejected(&["config", "edit"]);
         rejected(&["service"]);
+        assert!(matches!(ok(&["models", "list"]), Command::Models { action: ModelsAction::List }));
+        assert!(matches!(ok(&["models", "reload"]), Command::Models { action: ModelsAction::Reload }));
+        let Command::Models { action: ModelsAction::Set(a) } = ok(&["models", "set", "last", "big"]) else {
+            panic!("not models set")
+        };
+        assert_eq!((a.session.as_str(), a.profile.as_str()), ("last", "big"));
+        rejected(&["models"]);
+        rejected(&["models", "set", "last"]); // a profile is required
+        let Command::Models { action: ModelsAction::Show(a) } = ok(&["models", "show", "last"]) else {
+            panic!("not models show")
+        };
+        assert_eq!(a.session, "last");
+        let Command::Models { action: ModelsAction::Role(a) } =
+            ok(&["models", "role", "last", "worker", "fast", "--now"])
+        else {
+            panic!("not models role")
+        };
+        assert_eq!((a.role.as_str(), a.profile.as_deref(), a.clear, a.now), ("worker", Some("fast"), false, true));
+        let Command::Models { action: ModelsAction::Role(a) } = ok(&["models", "role", "last", "all", "--clear"])
+        else {
+            panic!("not models role --clear")
+        };
+        assert_eq!((cli_role(&a.role).as_str(), a.profile, a.clear), ("*", None, true));
+        rejected(&["models", "role", "last", "worker"]); // a profile, or --clear
+        rejected(&["models", "role", "last", "worker", "fast", "--clear"]);
+        rejected(&["models", "role", "last", "worker", "--clear", "--now"]);
+        // `all` spells every role on the command line: `*` alone is globbed by shells.
+        let Command::Run(a) = ok(&["run", "--agent-model", "worker=fast", "--agent-model", "all=big", "go"]) else {
+            panic!("not run")
+        };
+        assert_eq!(a.start.agent_models, vec![("worker".into(), "fast".into()), ("*".into(), "big".into())]);
+        rejected(&["run", "--agent-model", "worker", "go"]);
+        rejected(&["run", "--agent-model", "=fast", "go"]);
     }
 
     #[test]
@@ -1962,7 +2167,15 @@ mod tests {
             cmd_config(&paths, ConfigAction::Init).unwrap_err(),
             format!("{} already exists.", paths.config_file().display())
         );
-        assert_eq!(cmd_config(&paths, ConfigAction::Check), Ok(0));
+        // `check` runs the start-up checks, so the default sandbox (seatbelt) passes only where `up` would
+        // accept it; on any other host it is refused with the sentence `up` gives.
+        let check = cmd_config(&paths, ConfigAction::Check);
+        if cfg!(target_os = "macos") {
+            assert_eq!(check, Ok(0));
+        } else {
+            let err = check.unwrap_err();
+            assert!(err.contains("seatbelt") && err.contains("not macOS"), "{err}");
+        }
         std::fs::write(paths.config_file(), "default_model = [").unwrap();
         assert!(cmd_config(&paths, ConfigAction::Check).unwrap_err().contains("config.toml"));
     }
@@ -2050,10 +2263,22 @@ mod tests {
             max_steps: 7,
             max_minutes: 3,
             prior: Vec::new(),
+            create_workspace: true,
+            agent_models: vec![("worker".into(), "fast".into()), (ANY_ROLE.into(), "big".into())],
         };
         let n = new_session(&opts, None, cwd, vec![MissionId::from("m-1"), MissionId::from("m-2")]);
         assert_eq!(n.prior, [MissionId::from("m-1"), MissionId::from("m-2")]);
+        assert_eq!(
+            n.role_models,
+            std::collections::BTreeMap::from([
+                ("worker".to_string(), "fast".to_string()),
+                ("*".to_string(), "big".to_string())
+            ])
+        );
         assert_eq!(n.workspace, PathBuf::from("/w"));
+        assert!(n.create_workspace && !new_session(&StartOpts::default(), None, cwd, Vec::new()).create_workspace);
+        let tilde = StartOpts { workspace: Some("~/proj".into()), ..StartOpts::default() };
+        assert_eq!(new_session(&tilde, None, cwd, Vec::new()).workspace, PathBuf::from("~/proj"));
         assert_eq!(
             (n.pack.as_deref(), n.role.as_deref(), n.model.as_deref(), n.title.as_deref()),
             (Some("p"), Some("r"), Some("m"), Some("t"))

@@ -46,7 +46,9 @@ struct RootView: View {
         case .failed(let msg):
             VStack(spacing: 12) {
                 Image(systemName: "wifi.exclamationmark").font(.largeTitle)
-                Text("The daemon is unreachable").font(.headline)
+                // A generic headline: this fires for an auth/login-code failure too, where the daemon
+                // is reachable and the fix is just Reconnect. The specific reason and action is the body.
+                Text("Can't show the loom page").font(.headline)
                 Text(msg).foregroundStyle(.secondary).textSelection(.enabled).multilineTextAlignment(.center)
                 HStack {
                     Button("Retry") { state.reload() }
@@ -84,15 +86,20 @@ struct ConnectionBar: View {
     var body: some View {
         HStack(spacing: 10) {
             Circle().fill(dotColor).frame(width: 8, height: 8)
+                .accessibilityLabel("Connection status: \(dotLabel)")
             Text(state.active?.name ?? "loom").font(.headline)
             if state.link != .none {
                 Menu {
                     ForEach(state.connections) { c in
-                        Button(c.name.isEmpty ? c.sshHost : c.name) { state.connect(c) }
+                        let isActive = c.id == state.active?.id
+                        Button { if !isActive { state.connect(c) } } label: {
+                            Label(c.name.isEmpty ? c.sshHost : c.name, systemImage: isActive ? "checkmark" : "")
+                        }
                     }
                 } label: { Image(systemName: "arrow.left.arrow.right") }
                     .menuStyle(.borderlessButton).fixedSize()
                     .help("Switch connection")
+                    .accessibilityLabel("Switch connection")
             }
             Spacer()
             if state.feedStatus.lastUpdated != nil {
@@ -119,16 +126,35 @@ struct ConnectionBar: View {
             if case .connected = state.link {
                 Button { state.reload() } label: { Image(systemName: "arrow.clockwise") }
                     .help("Reload the page")
-                Button { state.copyAddress() } label: { Image(systemName: "link") }
+                    .accessibilityLabel("Reload the page")
+                Button {
+                    state.copyAddress()
+                    justCopied = true
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { justCopied = false }
+                } label: { Image(systemName: justCopied ? "checkmark" : "link") }
                     .help("Copy the daemon's address (no login code, no token)")
+                    .accessibilityLabel(justCopied ? "Address copied" : "Copy the daemon's address")
             }
             if state.link != .none {
                 Button { state.disconnect() } label: { Image(systemName: "xmark.circle") }
                     .help("Disconnect")
+                    .accessibilityLabel("Disconnect")
             }
         }
         .buttonStyle(.borderless)
         .padding(.horizontal, 12).padding(.vertical, 6)
+    }
+
+    @State private var justCopied = false
+
+    /// A worded version of the status dot, for VoiceOver.
+    private var dotLabel: String {
+        switch state.link {
+        case .connected: return state.daemonUnreachable ? "daemon unreachable" : (state.feedStatus.stale ? "stale" : "connected")
+        case .connecting: return "connecting"
+        case .failed: return "disconnected"
+        case .none: return "not connected"
+        }
     }
 
     private var dotColor: Color {

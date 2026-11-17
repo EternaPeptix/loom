@@ -59,6 +59,16 @@ final class DaemonClient: @unchecked Sendable {
         var item: ItemLite
     }
 
+    /// One thing that needs the operator, handed to the app to notify. Keyed by `itemId` so a repeat
+    /// replaces its banner and a resolve can withdraw it.
+    struct InboxNotice: Sendable, Equatable {
+        var itemId: String
+        var session: String
+        var title: String
+        var text: String
+        var isScope: Bool
+    }
+
     struct RecordLite: Decodable { var kind: String? }
 
     struct BusEvent: Decodable {
@@ -460,12 +470,13 @@ final class DaemonClient: @unchecked Sendable {
     func start(baseURL: String,
                token: String?,
                onCounts: @escaping @Sendable (Counts) -> Void,
-               onBlockingInbox: @escaping @Sendable (_ sessionId: String, _ title: String, _ text: String) -> Void,
+               onNotify: @escaping @Sendable (InboxNotice) -> Void,
+               onResolve: @escaping @Sendable (_ itemId: String) -> Void = { _ in },
                onMode: @escaping @Sendable (String) -> Void = { _ in },
                onFeedStatus: @escaping @Sendable (FeedStatus) -> Void = { _ in }) {
         stop()
         let runner = Runner(baseURL: baseURL, token: token,
-                            onCounts: onCounts, onBlocking: onBlockingInbox, onMode: onMode,
+                            onCounts: onCounts, onNotify: onNotify, onResolve: onResolve, onMode: onMode,
                             onFeedStatus: onFeedStatus)
         let t = Task.detached { await runner.run() }
         lock.lock(); task = t; lock.unlock()
@@ -482,7 +493,8 @@ final class DaemonClient: @unchecked Sendable {
         let baseURL: String
         let token: String?
         let onCounts: @Sendable (Counts) -> Void
-        let onBlocking: @Sendable (String, String, String) -> Void
+        let onNotify: @Sendable (InboxNotice) -> Void
+        let onResolve: @Sendable (String) -> Void
         let onMode: @Sendable (String) -> Void
         let onFeedStatus: @Sendable (FeedStatus) -> Void
         let session: URLSession
@@ -490,17 +502,19 @@ final class DaemonClient: @unchecked Sendable {
         private let lock = NSLock()
         private var model = Model()
         private var seen = Set<String>()
+        private var notified = Set<String>()   // items we raised a notification for, to withdraw on resolve
         private var seeded = false
         private var lastCounts: Counts?
         private var feed = FeedStatus()
 
         init(baseURL: String, token: String?,
              onCounts: @escaping @Sendable (Counts) -> Void,
-             onBlocking: @escaping @Sendable (String, String, String) -> Void,
+             onNotify: @escaping @Sendable (InboxNotice) -> Void,
+             onResolve: @escaping @Sendable (String) -> Void,
              onMode: @escaping @Sendable (String) -> Void,
              onFeedStatus: @escaping @Sendable (FeedStatus) -> Void) {
             self.baseURL = baseURL; self.token = token
-            self.onCounts = onCounts; self.onBlocking = onBlocking; self.onMode = onMode
+            self.onCounts = onCounts; self.onNotify = onNotify; self.onResolve = onResolve; self.onMode = onMode
             self.onFeedStatus = onFeedStatus
             let cfg = URLSessionConfiguration.ephemeral
             cfg.timeoutIntervalForRequest = 45      // the stream sends a keep-alive every 15 s
@@ -645,15 +659,29 @@ final class DaemonClient: @unchecked Sendable {
                     guard let list = DaemonClient.decodeList(InboxLite.self, from: data) else {
                         throw URLError(.cannotParseResponse)
                     }
-                    let fresh: [InboxLite] = lock.withLock {
+                    let (fresh, resolved): ([InboxNotice], [String]) = lock.withLock {
                         model.replaceInbox(list)
                         feed.succeeded("inbox", at: Date())
-                        let f = seeded ? list.filter { $0.item.isBlocking && !seen.contains($0.item.item_id) } : []
-                        for e in list { seen.insert(e.item.item_id) }   // the first snapshot seeds silently
+                        let present = Set(list.map { $0.item.item_id })
+                        // Items we notified that are no longer open have been answered/dismissed: withdraw them.
+                        let gone = notified.subtracting(present)
+                        notified.subtract(gone)
+                        // New items that need a human: blocking questions and scope requests (an agent
+                        // waiting for host approval). The first snapshot seeds silently so a reconnect does
+                        // not re-announce what was already open.
+                        var fresh: [InboxNotice] = []
+                        if seeded {
+                            for e in list where (e.item.isBlocking || e.item.isScopeRequest) && !seen.contains(e.item.item_id) {
+                                fresh.append(notice(for: e))
+                                notified.insert(e.item.item_id)
+                            }
+                        }
+                        for e in list { seen.insert(e.item.item_id) }
                         seeded = true
-                        return f
+                        return (fresh, Array(gone))
                     }
-                    for e in fresh { onBlocking(e.session, e.title ?? e.session, e.item.text ?? "") }
+                    for n in fresh { onNotify(n) }
+                    for id in resolved { onResolve(id) }
                 } catch {
                     complete = false
                     lock.withLock { feed.failed("inbox", reason: "Inbox refresh failed: \(error.localizedDescription)") }
@@ -662,6 +690,19 @@ final class DaemonClient: @unchecked Sendable {
             if sessions && inbox && complete { lock.withLock { feed.recoveredSnapshot(at: Date()) } }
             publish()
             publishFeed()
+        }
+
+        /// Build the notice for an inbox item; a scope request names the hosts it waits on.
+        private func notice(for e: InboxLite) -> InboxNotice {
+            let base = e.item.text ?? ""
+            let text: String
+            if e.item.isScopeRequest {
+                let hosts = (e.item.options ?? []).joined(separator: ", ")
+                text = hosts.isEmpty ? base : "Wants network access to \(hosts). \(base)"
+            } else {
+                text = base
+            }
+            return InboxNotice(itemId: e.item.item_id, session: e.session, title: e.title ?? e.session, text: text, isScope: e.item.isScopeRequest)
         }
 
         func publishFeed() { onFeedStatus(lock.withLock { feed }) }

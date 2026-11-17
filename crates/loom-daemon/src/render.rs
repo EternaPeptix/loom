@@ -46,6 +46,8 @@
 //! - `inbox_resolved`: `✉ answered: {answer}` (`✉ dismissed` for an empty answer).
 //! - `ledger`: `▪ ledger #{n}: {summary}` (dim).
 //! - `cache_break`: `! cache break at message {first_diff_message}: {detail}` (yellow).
+//! - `model_switched`: `⇄ model {profile} ({model}, window {window}) → {…same for to} · {reason}` (cyan;
+//!   a window of 0 reads `unknown`; no `· …` when the reason is empty).
 //! - `interrupted`: `! interrupted: {reason}` (yellow).
 //! - `turn_end`: `— turn ended: {reason in words} —` (dim): `yielded`, `finished`, `asked the
 //!   operator`, `blocked`, `waiting for jobs or agents`, `stopped`, `parked for the operator`,
@@ -68,16 +70,17 @@
 //! ## Listings (columns separated by two spaces, widths from the content, a header line, rows cut
 //! to `style.width`)
 //! - `sessions_table(list, now_ms, style)`: one row per session, children indented under their
-//!   parent (`  └ `): `ID  ROLE  STATE  STEP  CONTEXT  AGE  TITLE`. `STATE`: `running`, `ended
+//!   parent (`  └ `): `ID  ROLE  MODEL  STATE  STEP  CONTEXT  AGE  TITLE`. `MODEL`: the session's profile name (`meta.profile`). `STATE`: `running`, `ended
 //!   ({outcome})`, else the last turn end in the words above, else `new`; ` *` appended when
 //!   `open_inbox > 0`. `CONTEXT`: `tokens(prompt_tokens)`. Empty list: `No sessions.`
-//! - `inbox_list(list, now_ms, style)`: per item `{item_id}  {kind}  {age}  {session} {title}` and
+//! - `inbox_list(list, now_ms, style)`: per item `{item_id}  {kind}  {age}  {session}  {title}` and
 //!   the text indented, then the options numbered; `Nothing is waiting for you.` when empty. A scope
 //!   request is listed as `scope request`, with `hosts: a, b` and `approve: loom scope {session} a b`
-//!   (a host with a character the shell would read is single-quoted). A blocking `Blocker` or `Parked`
-//!   item gets the ways to answer it: `answer: loom answer {item_id} "…"` and `close as blocked: loom
-//!   release {session} "why"`; a blocker also says to name the next step, not ask a yes or no question.
-//!   `granted_hosts_line(hosts)` is the line `loom net` ends with.
+//!   (a host with a character the shell would read is single-quoted). Every other item names how to
+//!   act on it, as the streaming view does: a finished report gets `dismiss: loom answer {item_id}`;
+//!   anything else gets `answer: loom answer {item_id} "…"`, and a blocking `Blocker` or `Parked`
+//!   item also gets `close as blocked: loom release {session} "why"`; a blocker says to name the next
+//!   step, not ask a yes or no question. `granted_hosts_line(hosts)` is the line `loom net` ends with.
 //! - `window_table(view, style)`: a summary line (`epoch {e} · about {tokens} tokens in view ·
 //!   folds at {target} down to {floor} · window {context_window or "unknown"} · last request
 //!   {prompt} in, {pct}% cached`), then per item `#{seq}  {kind}  {state}  {chars}  {pin}
@@ -86,6 +89,14 @@
 //!   GiB free of {total} GiB ({pct}%) on the volume of the loom home`, or `unknown`) and, when it is low
 //!   (`DiskSpace::is_low`), a warning that sessions will fail when the disk fills (bold yellow); one
 //!   line per model (`✓`/`✗`, base URL, model, window, detail when unreachable); the counts.
+//! - `models_table(view, style)`: one line per live profile, `✓`/`✗ {profile}[ (default)] · {model} ·
+//!   {base_url} · window {window} · {max_concurrent} at once[ · {detail}]`; then a line when no
+//!   `default_model` is set; `No model profiles are configured.` when there is none.
+//! - `models_reload(report)`: `No profile changed.` or one `added|changed|removed: a, b` line per
+//!   non-empty list; `{n} session(s) moved to the new settings of a changed profile`; `default model:
+//!   {name or none}`; then one `! {note}` per note.
+//! - `model_switch_line(receipt)`: `{session} now uses {profile} ({model}, window {window}), from its
+//!   next step` (or `when it next runs` when no task took it).
 //! - `net_table(entries, style)`: `TIME  VERDICT  METHOD  HOST:PORT  RULE` (time as `HH:MM:SS` UTC).
 //! - `score_table(view, style)`: what a mission's work took. `SESSION  ROLE`, then the headings of
 //!   `loom_core::scorecard::COLUMNS` in capitals; one row per session with its `Scorecard::cells()`
@@ -101,8 +112,11 @@
 //! the empty cases and the child indentation; rows never exceed `width` characters; the score table
 //! for one session and for several, with a card that is not recorded, wider than the width.
 
-use crate::wire::StatusView;
-use loom_agent::runtime::{InboxEntry, NetEntry, ScoreView, SessionInfo, WindowView};
+use crate::wire::{ModelsView, StatusView};
+use loom_agent::runtime::{
+    InboxEntry, MissionModels, ModelSwitchReceipt, ModelsReload, NetEntry, RoleModelReceipt, RoleModels, ScoreView,
+    SessionInfo, WindowView, ANY_ROLE,
+};
 use loom_agent::session::Phase;
 use loom_core::event::{
     Author, ChildOutcome, Event, FinishReason, InboxItem, InboxKind, Record, SessionOutcome, SpawnMode, ToolStatus,
@@ -553,6 +567,17 @@ pub fn record(rec: &Record, style: &Style, opts: &RecordOpts) -> String {
             let text = format!("! cache break at message {first_diff_message}: {detail}");
             out.push(paint(style, YELLOW, &text));
         }
+        Event::ModelSwitched(m) => {
+            let side = |r: &loom_core::event::ModelRef| {
+                let window = if r.context_window > 0 { tokens(r.context_window) } else { "unknown".to_string() };
+                format!("{} ({}, window {window})", clean(&r.profile), clean(&r.model))
+            };
+            let mut text = format!("⇄ model {} → {}", side(&m.from), side(&m.to));
+            if !m.reason.is_empty() {
+                text.push_str(&format!(" · {}", clean(&m.reason)));
+            }
+            out.push(paint(style, CYAN, &text));
+        }
         Event::Interrupted { reason } => {
             out.push(paint(style, YELLOW, &format!("! interrupted: {reason}")));
         }
@@ -691,6 +716,7 @@ pub fn sessions_table(list: &[SessionInfo], now_ms: u64, style: &Style) -> Strin
             vec![
                 id,
                 flat(&s.meta.role),
+                flat(&s.meta.profile),
                 flat(&session_state(s)),
                 s.status.step.to_string(),
                 tokens(s.status.prompt_tokens),
@@ -699,7 +725,7 @@ pub fn sessions_table(list: &[SessionInfo], now_ms: u64, style: &Style) -> Strin
             ]
         })
         .collect();
-    table(style, &["ID", "ROLE", "STATE", "STEP", "CONTEXT", "AGE", "TITLE"], &rows)
+    table(style, &["ID", "ROLE", "MODEL", "STATE", "STEP", "CONTEXT", "AGE", "TITLE"], &rows)
 }
 
 pub fn inbox_list(list: &[InboxEntry], now_ms: u64, style: &Style) -> String {
@@ -709,7 +735,7 @@ pub fn inbox_list(list: &[InboxEntry], now_ms: u64, style: &Style) -> String {
     let mut out = Vec::new();
     for entry in list {
         let head = format!(
-            "{}  {}  {}  {} {}",
+            "{}  {}  {}  {}  {}",
             flat(&entry.item.item_id),
             inbox_kind_word(entry.item.kind),
             age(now_ms.saturating_sub(entry.opened_ms)),
@@ -736,12 +762,19 @@ pub fn inbox_list(list: &[InboxEntry], now_ms: u64, style: &Style) -> String {
         for (i, option) in item.options.iter().enumerate() {
             out.push(format!("  {}. {}", i + 1, flat(option)));
         }
-        if item.blocking && matches!(item.kind, InboxKind::Blocker | InboxKind::Parked) {
+        // Every item but a finished report can be acted on with `loom answer`; the streaming view
+        // (`record`) already shows this for every kind, so the list does too. A finished report is
+        // only cleared, and a blocked/parked session can also be closed outright.
+        if item.kind == InboxKind::Finished {
+            out.push(dim(format!("  dismiss: loom answer {}", flat(&item.item_id))));
+        } else {
             let next =
                 if item.kind == InboxKind::Blocker { " (name the next step, not a yes or no question)" } else { "" };
             out.push(dim(format!("  answer: loom answer {} \"…\"{next}", flat(&item.item_id))));
-            let session = shell_word(&flat(entry.session.as_str()));
-            out.push(dim(format!("  close as blocked: loom release {session} \"why\"")));
+            if item.blocking && matches!(item.kind, InboxKind::Blocker | InboxKind::Parked) {
+                let session = shell_word(&flat(entry.session.as_str()));
+                out.push(dim(format!("  close as blocked: loom release {session} \"why\"")));
+            }
         }
     }
     finish(out)
@@ -809,6 +842,14 @@ pub fn status(view: &StatusView, style: &Style) -> String {
         view.version, view.pid, view.bind, view.proxy_port, view.home
     );
     out.push(cut(&flat(&daemon), width));
+    // The security posture, at the place an operator checks the daemon. A missing field means an older
+    // daemon that does not report it, so skip the line rather than show blanks.
+    if !view.sandbox.is_empty() {
+        let line = format!("sandbox: {} · network: {}", flat(&view.sandbox), flat(&view.network));
+        // `none` (commands unconfined) and `open` (tools reach any host) are the postures worth a warning.
+        let unsafe_posture = view.sandbox == "none" || view.network == "open";
+        out.push(if unsafe_posture { paint(style, BOLD_YELLOW, &cut(&line, width)) } else { cut(&line, width) });
+    }
     match &view.disk {
         Some(disk) => {
             let (free, total) = (disk.free_bytes, disk.total_bytes);
@@ -840,6 +881,161 @@ pub fn status(view: &StatusView, style: &Style) -> String {
     );
     out.push(cut(&counts, width));
     finish(out)
+}
+
+/// `loom models list`: one line per live profile — ✓/✗ for its server, the default one marked.
+pub fn models_table(view: &ModelsView, style: &Style) -> String {
+    if view.models.is_empty() {
+        return "No model profiles are configured.\n".to_string();
+    }
+    let width = width_of(style);
+    let mut out = Vec::new();
+    for m in &view.models {
+        let mark = if m.reachable { paint(style, GREEN, "✓") } else { paint(style, RED, "✗") };
+        let default = if m.profile == view.default_model { " (default)" } else { "" };
+        let window = m.context_window.map_or_else(|| "unknown".to_string(), tokens);
+        let mut text = format!(
+            "{}{default} · {} · {} · window {window} · {} at once",
+            flat(&m.profile),
+            flat(&m.model),
+            flat(&m.base_url),
+            m.max_concurrent
+        );
+        if !m.reachable && !m.detail.is_empty() {
+            text.push_str(&format!(" · {}", flat(&m.detail)));
+        }
+        out.push(format!("{mark} {}", cut(&text, width.saturating_sub(2))));
+    }
+    if view.default_model.is_empty() {
+        out.push(cut("no default_model: a new session names its model with --model", width));
+    }
+    finish(out)
+}
+
+/// `loom models reload`: what changed, then what needs the operator (`! …`).
+pub fn models_reload(r: &ModelsReload) -> String {
+    let list = |names: &[String]| names.iter().map(|n| flat(n)).collect::<Vec<_>>().join(", ");
+    let mut out = Vec::new();
+    if r.added.is_empty() && r.changed.is_empty() && r.removed.is_empty() {
+        out.push("No profile changed.".to_string());
+    }
+    for (word, names) in [("added", &r.added), ("changed", &r.changed), ("removed", &r.removed)] {
+        if !names.is_empty() {
+            out.push(format!("{word}: {}", list(names)));
+        }
+    }
+    if !r.rebound.is_empty() {
+        let n = r.rebound.len();
+        out.push(format!(
+            "{n} {} moved to the new settings of a changed profile",
+            if n == 1 { "session" } else { "sessions" }
+        ));
+    }
+    out.push(format!("default model: {}", if r.default_model.is_empty() { "none" } else { r.default_model.as_str() }));
+    for note in &r.notes {
+        out.push(format!("! {}", flat(note)));
+    }
+    finish(out)
+}
+
+/// `loom models set`: whom it switched, to what, and from when.
+pub fn model_switch_line(r: &ModelSwitchReceipt) -> String {
+    let when = if r.live { "from its next step" } else { "when it next runs" };
+    let window = if r.model.context_window > 0 { tokens(r.model.context_window) } else { "unknown".to_string() };
+    format!(
+        "{} now uses {} ({}, window {window}), {when}",
+        flat(r.session.as_str()),
+        flat(&r.model.profile),
+        flat(&r.model.model)
+    )
+}
+
+/// What the pack chooses for a role's agents when the operator chose nothing.
+fn pack_choice_words(r: &RoleModels) -> String {
+    let mut words = if !r.alloy_models.is_empty() {
+        format!("rotates {}", r.alloy_models.iter().map(|m| flat(m)).collect::<Vec<_>>().join(", "))
+    } else if let Some(m) = &r.pack_model {
+        flat(m)
+    } else {
+        "the lead's".to_string()
+    };
+    if let Some(e) = &r.escalation_model {
+        words.push_str(&format!(", {} after a failed agent", flat(e)));
+    }
+    words
+}
+
+/// `loom models show`: the lead's model, the choice for every role, one line per role of its agents
+/// (the choice in force, whether it is the finish gate's, its agents running now), the profiles.
+pub fn mission_models_table(m: &MissionModels, style: &Style) -> String {
+    let width = width_of(style);
+    let window = |w: u64| if w > 0 { tokens(w) } else { "unknown".to_string() };
+    let mut out = vec![cut(
+        &format!(
+            "mission {} · lead {} on {} ({}, window {})",
+            flat(m.mission.as_str()),
+            flat(m.lead.as_str()),
+            flat(&m.lead_model.profile),
+            flat(&m.lead_model.model),
+            window(m.lead_model.context_window)
+        ),
+        width,
+    )];
+    out.push(match &m.any_role {
+        Some(p) => cut(&format!("agents of every role: {}", flat(p)), width),
+        None => cut("agents of every role: as each role's pack setting says", width),
+    });
+    if m.roles.is_empty() {
+        out.push("this lead starts no agents".to_string());
+    }
+    let pad = m.roles.iter().map(|r| flat(&r.role).chars().count()).max().unwrap_or(0);
+    for r in &m.roles {
+        let choice = match (&r.chosen, &m.any_role) {
+            (Some(p), _) => format!("{} (chosen)", flat(p)),
+            (None, Some(p)) if !r.verifier => format!("{} (every role)", flat(p)),
+            _ => format!("pack: {}", pack_choice_words(r)),
+        };
+        let gate = if r.verifier { " · finish gate" } else { "" };
+        let running = if r.agents.is_empty() {
+            "none".to_string()
+        } else {
+            r.agents
+                .iter()
+                .map(|a| {
+                    format!(
+                        "{} on {}{}",
+                        flat(a.session.as_str()),
+                        flat(&a.profile),
+                        if a.forked { " (forked)" } else { "" }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        out.push(cut(&format!("{:pad$}  {choice}{gate} · running: {running}", flat(&r.role)), width));
+    }
+    let profiles: Vec<String> = m
+        .profiles
+        .iter()
+        .map(|p| if *p == m.default_model { format!("{} (default)", flat(p)) } else { flat(p) })
+        .collect();
+    out.push(cut(&format!("profiles: {}", profiles.join(", ")), width));
+    finish(out)
+}
+
+/// `loom models role`: what changed, who moved now, then [`mission_models_table`].
+pub fn role_model_receipt(r: &RoleModelReceipt, role: &str, profile: Option<&str>, style: &Style) -> String {
+    let who = if role == ANY_ROLE { "every role".to_string() } else { format!("`{}`", flat(role)) };
+    let mut out = vec![match profile {
+        Some(p) => format!("agents of {who} start on {} from now on", flat(p)),
+        None => format!("the choice for {who} is cleared: the pack chooses again"),
+    }];
+    if !r.switched.is_empty() {
+        out.push(format!("moved now: {}", r.switched.iter().map(|s| flat(s.as_str())).collect::<Vec<_>>().join(", ")));
+    }
+    let mut text = finish(out);
+    text.push_str(&mission_models_table(&r.models, style));
+    text
 }
 
 pub fn net_table(entries: &[NetEntry], style: &Style) -> String {
@@ -1118,6 +1314,12 @@ mod tests {
             Event::Interrupted { reason: s.into() },
             Event::TurnEnd { reason: TurnEndReason::Finished },
             Event::SessionEnd { outcome: SessionOutcome::Failed, detail: s.into() },
+            Event::ModelSwitched(loom_core::event::ModelSwitched {
+                from: loom_core::event::ModelRef { profile: s.into(), model: s.into(), context_window: 1000 },
+                to: loom_core::event::ModelRef { profile: s.into(), model: s.into(), context_window: 0 },
+                reasoning_replay: loom_core::event::ReasoningReplay::None,
+                reason: s.into(),
+            }),
             Event::Unknown,
         ];
         events.extend(continuation_and_outbox_events(s));
@@ -1567,7 +1769,7 @@ mod tests {
         e.item = item(false, vec!["docs.example.test", "*.cdn.test"]);
         assert_eq!(
             inbox_list(&[e], 5_000, &MONO),
-            "i-7  scope request  5s  s-a main job\n  Needs docs.example.test to read the API reference.\n  hosts: docs.example.test, *.cdn.test\n  approve: loom scope s-a docs.example.test '*.cdn.test'\n"
+            "i-7  scope request  5s  s-a  main job\n  Needs docs.example.test to read the API reference.\n  hosts: docs.example.test, *.cdn.test\n  approve: loom scope s-a docs.example.test '*.cdn.test'\n"
         );
     }
 
@@ -1675,6 +1877,7 @@ mod tests {
             archived: false,
             gate: None,
             prior: Vec::new(),
+            role_models: Default::default(),
         }
     }
 
@@ -1739,6 +1942,28 @@ mod tests {
     }
 
     #[test]
+    fn sessions_table_shows_the_profile_after_role() {
+        let mut root = info("s-root", None, "main", status_of(Phase::Idle, None, None, 0));
+        root.meta.profile = "dsv41".into();
+        let mut kid = info("s-kid", Some("s-root"), "sub", status_of(Phase::Idle, None, None, 0));
+        kid.meta.profile = "qwen\nx".into();
+        let text = sessions_table(&[root, kid], 0, &MONO);
+        let lines: Vec<&str> = text.lines().collect();
+        let header: Vec<&str> = lines[0].split_whitespace().collect();
+        assert_eq!(&header[..4], ["ID", "ROLE", "MODEL", "STATE"], "{}", lines[0]);
+        let col = lines[0].find("MODEL").unwrap_or(usize::MAX);
+        assert!(
+            lines[1][lines[1].char_indices().nth(col).map_or(0, |(i, _)| i)..].starts_with("dsv41"),
+            "{}",
+            lines[1]
+        );
+        assert!(lines[2].contains("qwen x"), "{}", lines[2]);
+        assert!(lines[2].starts_with("  └ s-kid"), "{}", lines[2]);
+        let kid_col = lines[2].chars().take(col).count();
+        assert_eq!(kid_col, col);
+    }
+
+    #[test]
     fn sessions_table_survives_a_parent_cycle() {
         let list = vec![
             info("s-a", Some("s-b"), "a", status_of(Phase::Idle, None, None, 0)),
@@ -1790,9 +2015,11 @@ mod tests {
     fn inbox_list_shapes() {
         assert_eq!(inbox_list(&[], 0, &MONO), "Nothing is waiting for you.\n");
         let text = inbox_list(&[entry(0), entry(60_000)], 3_600_000, &MONO);
+        // A blocking approval that is not a scope request still needs the operator, so it names how
+        // to answer — as the streaming view (`record`) does for every kind but a finished report.
         assert_eq!(
             text,
-            "i-1  approval  1h  s-a main job\n  May I?\n  Please.\ni-1  approval  59m  s-a main job\n  May I?\n  Please.\n"
+            "i-1  approval  1h  s-a  main job\n  May I?\n  Please.\n  answer: loom answer i-1 \"…\"\ni-1  approval  59m  s-a  main job\n  May I?\n  Please.\n  answer: loom answer i-1 \"…\"\n"
         );
         let narrow = inbox_list(&[entry(0)], 5_000, &Style { color: false, width: 12 });
         assert_eq!(narrow.lines().next().map(|l| l.chars().count()), Some(12));
@@ -1809,15 +2036,23 @@ mod tests {
         };
         assert_eq!(
             with(InboxKind::Blocker, true, &[]),
-            "i-1  blocker  5s  s-a main job\n  May I?\n  Please.\n  answer: loom answer i-1 \"…\" (name the next step, not a yes or no question)\n  close as blocked: loom release s-a \"why\"\n"
+            "i-1  blocker  5s  s-a  main job\n  May I?\n  Please.\n  answer: loom answer i-1 \"…\" (name the next step, not a yes or no question)\n  close as blocked: loom release s-a \"why\"\n"
         );
         let parked = with(InboxKind::Parked, true, &["Keep working", "Accept as blocked and close"]);
         assert_eq!(
             parked,
-            "i-1  parked  5s  s-a main job\n  May I?\n  Please.\n  1. Keep working\n  2. Accept as blocked and close\n  answer: loom answer i-1 \"…\"\n  close as blocked: loom release s-a \"why\"\n"
+            "i-1  parked  5s  s-a  main job\n  May I?\n  Please.\n  1. Keep working\n  2. Accept as blocked and close\n  answer: loom answer i-1 \"…\"\n  close as blocked: loom release s-a \"why\"\n"
         );
         // A notice that does not block is not a park.
         assert!(!with(InboxKind::Blocker, false, &[]).contains("loom release"));
+        // A question — the most common operator action — names how to answer it, with no release line.
+        let question = with(InboxKind::Question, true, &[]);
+        assert!(question.contains("answer: loom answer i-1 \"…\""), "{question}");
+        assert!(!question.contains("loom release"), "{question}");
+        // A finished report is cleared, not answered: it offers `dismiss`, never `answer …`.
+        let finished = with(InboxKind::Finished, false, &[]);
+        assert!(finished.contains("dismiss: loom answer i-1"), "{finished}");
+        assert!(!finished.contains("answer: loom answer"), "{finished}");
     }
 
     fn window_item(seq: u64, state: ItemState, pinned: bool) -> WindowItem {
@@ -1881,6 +2116,108 @@ mod tests {
     }
 
     #[test]
+    fn models_list_reload_report_and_switch_line_shapes() {
+        let mut other = health(false);
+        other.profile = "other".into();
+        let view = ModelsView { default_model: "local".into(), models: vec![health(true), other] };
+        assert_eq!(
+            models_table(&view, &MONO),
+            "✓ local (default) · big · http://10.0.0.1:8000/v1 · window 1.00M · 4 at once\n\
+             ✗ other · big · http://10.0.0.1:8000/v1 · window unknown · 4 at once · connection refused\n"
+        );
+        let none = ModelsView { default_model: String::new(), models: vec![health(true)] };
+        assert!(models_table(&none, &MONO).ends_with("no default_model: a new session names its model with --model\n"));
+        assert_eq!(
+            models_table(&ModelsView { default_model: String::new(), models: vec![] }, &MONO),
+            "No model profiles are configured.\n"
+        );
+
+        assert_eq!(models_reload(&ModelsReload::default()), "No profile changed.\ndefault model: none\n");
+        let report = ModelsReload {
+            added: vec!["fast".into()],
+            changed: vec!["big".into()],
+            removed: vec!["old".into()],
+            default_model: "big".into(),
+            rebound: vec![SessionId::from("s-1"), SessionId::from("s-2")],
+            notes: vec!["\"old\" is no longer configured".into()],
+        };
+        assert_eq!(
+            models_reload(&report),
+            "added: fast\nchanged: big\nremoved: old\n2 sessions moved to the new settings of a changed profile\ndefault model: big\n! \"old\" is no longer configured\n"
+        );
+
+        let receipt = |live: bool| ModelSwitchReceipt {
+            session: SessionId::from("s-1"),
+            model: loom_core::event::ModelRef { profile: "fast".into(), model: "m".into(), context_window: 200_000 },
+            live,
+        };
+        assert_eq!(model_switch_line(&receipt(true)), "s-1 now uses fast (m, window 200.0k), from its next step");
+        assert_eq!(model_switch_line(&receipt(false)), "s-1 now uses fast (m, window 200.0k), when it next runs");
+    }
+
+    #[test]
+    fn mission_models_and_role_receipt_shapes() {
+        use loom_agent::runtime::{AgentModel, MissionModels, RoleModelReceipt, RoleModels};
+        let role = |name: &str, verifier: bool| RoleModels {
+            role: name.into(),
+            verifier,
+            chosen: None,
+            pack_model: None,
+            alloy_models: vec![],
+            escalation_model: None,
+            agents: vec![],
+        };
+        let mut worker = role("worker", false);
+        worker.chosen = Some("fast".into());
+        worker.agents = vec![
+            AgentModel { session: SessionId::from("s-a"), profile: "fast".into(), forked: false },
+            AgentModel { session: SessionId::from("s-b"), profile: "big".into(), forked: true },
+        ];
+        let mut solver = role("solver", false);
+        solver.alloy_models = vec!["big".into(), "fast".into()];
+        solver.escalation_model = Some("huge".into());
+        let mut verifier = role("verifier", true);
+        verifier.pack_model = Some("big".into());
+        let mut m = MissionModels {
+            mission: loom_core::MissionId::from("m-1"),
+            lead: SessionId::from("s-l"),
+            lead_model: loom_core::event::ModelRef {
+                profile: "big".into(),
+                model: "b".into(),
+                context_window: 1_000_000,
+            },
+            any_role: None,
+            roles: vec![worker, solver, verifier],
+            profiles: vec!["big".into(), "fast".into()],
+            default_model: "big".into(),
+        };
+        assert_eq!(
+            mission_models_table(&m, &MONO),
+            "mission m-1 · lead s-l on big (b, window 1.00M)\n\
+             agents of every role: as each role's pack setting says\n\
+             worker    fast (chosen) · running: s-a on fast, s-b on big (forked)\n\
+             solver    pack: rotates big, fast, huge after a failed agent · running: none\n\
+             verifier  pack: big · finish gate · running: none\n\
+             profiles: big (default), fast\n"
+        );
+        // A choice for every role covers the roles without their own, not the finish gate's verifier.
+        m.any_role = Some("fast".into());
+        let text = mission_models_table(&m, &MONO);
+        assert!(
+            text.contains("agents of every role: fast\n") && text.contains("solver    fast (every role) ·"),
+            "{text}"
+        );
+        assert!(text.contains("verifier  pack: big · finish gate"), "{text}");
+
+        let r = RoleModelReceipt { switched: vec![SessionId::from("s-a")], models: m.clone() };
+        assert!(role_model_receipt(&r, "worker", Some("fast"), &MONO)
+            .starts_with("agents of `worker` start on fast from now on\nmoved now: s-a\nmission m-1"));
+        let cleared = RoleModelReceipt { switched: vec![], models: m };
+        assert!(role_model_receipt(&cleared, "*", None, &MONO)
+            .starts_with("the choice for every role is cleared: the pack chooses again\nmission m-1"));
+    }
+
+    #[test]
     fn status_shapes() {
         let mut view = StatusView {
             version: "0.1.0".into(),
@@ -1889,6 +2226,8 @@ mod tests {
             bind: "127.0.0.1:7878".into(),
             proxy_port: 7879,
             home: "/home/u/.loom".into(),
+            sandbox: "seatbelt".into(),
+            network: "deny_all".into(),
             disk: Some(crate::wire::DiskSpace { free_bytes: 400 << 30, total_bytes: (1000 << 30) + (1 << 29) }),
             models: vec![health(true), health(false)],
             sessions_total: 5,
@@ -1899,6 +2238,7 @@ mod tests {
         assert_eq!(
             status(&view, &MONO),
             "loom 0.1.0 · pid 42 · 127.0.0.1:7878 · proxy port 7879 · home /home/u/.loom\n\
+             sandbox: seatbelt · network: deny_all\n\
              400.0 GiB free of 1000.5 GiB (39%) on the volume of the loom home\n\
              ✓ http://10.0.0.1:8000/v1 · big · window 1.00M\n\
              ✗ http://10.0.0.1:8000/v1 · big · window unknown · connection refused\n\
@@ -1907,6 +2247,15 @@ mod tests {
         let colored = status(&view, &COLOR);
         assert!(colored.contains("\x1b[32m✓\x1b[0m http://"));
         assert!(colored.contains("\x1b[31m✗\x1b[0m http://"));
+        // An unsafe posture (unconfined, or open network) is warned in bold yellow.
+        view.sandbox = "none".into();
+        assert!(
+            status(&view, &COLOR).contains(&format!("{BOLD_YELLOW}sandbox: none · network: deny_all{RESET}")),
+            "{}",
+            status(&view, &COLOR)
+        );
+        assert!(status(&view, &MONO).contains("\nsandbox: none · network: deny_all\n"));
+        view.sandbox = "seatbelt".into();
         view.models.clear();
         assert!(status(&view, &MONO).contains("no models configured\n"));
         let narrow = status(&view, &Style { color: false, width: 20 });
@@ -1926,6 +2275,10 @@ mod tests {
             bind: "127.0.0.1:7878".into(),
             proxy_port: 7879,
             home: "/home/u/.loom".into(),
+            // This test indexes lines by position and is about disk, not posture: leave the sandbox line
+            // off (the renderer skips it when the field is empty).
+            sandbox: String::new(),
+            network: String::new(),
             disk,
             models: vec![health(true)],
             sessions_total: 0,

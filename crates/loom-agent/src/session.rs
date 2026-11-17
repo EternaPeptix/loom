@@ -73,13 +73,20 @@
 //!   model was told of since the last own `turn_end` (a `job_settled` with its note right after it)
 //!   with no `turn_start` since; the runtime starts a turn for a session that was waiting. Calls
 //!   `deps.ctx.jobs.resume_from(n)` with the highest job number in the log's `job_registered`
-//!   records, those just appended included (`j7` → 7). Last, unless the session has ended, the
+//!   records, those just appended included (`j7` → 7). Then, unless the session has ended, the model:
+//!   when `deps.model` or `deps.reasoning_replay` differs from the model the log names (`session_start`'s,
+//!   a fork's from its parent's, then the latest `model_switched`'s), `model_switched{from, to:
+//!   deps.model, reasoning_replay, reason: SWITCH_IDLE}` is appended (it was switched while no task
+//!   ran it, its profile was reloaded meanwhile, or a restart cut a switch short). Last, unless the
+//!   session has ended, the
 //!   prefix guard is primed (`PrefixGuard::prime`) with the weave of the records up to the last `model_request` and that
 //!   record's epoch, so that the first request after a restart is checked like any other. When the
 //!   stable hash of those messages differs from the one stored on the record (the rendering of the
 //!   existing log changed, e.g. with an upgrade), `cache_break{req_id: that request's,
 //!   first_diff_message: 0, detail: texts::rendering_changed(..)}` is appended, unless a
-//!   `cache_break` already follows that record (an earlier open reported it).
+//!   `cache_break` already follows that record (an earlier open reported it). When a `model_switched`
+//!   follows that record, the guard is then primed again with the weave of the whole log: the switch
+//!   may re-render the history on purpose (its replay policy), which is no cache break.
 //!
 //! All three use `Durability::Always`, build the registry, and compute the state below from the
 //! log, so that a session opened from its log behaves as the one that wrote it would:
@@ -168,6 +175,12 @@
 //!   authored `Agent(from)`. Start a turn (`Trigger::Resume`) only if the last turn ended `Waiting`.
 //! - `Input::Resume`: start a turn (`Trigger::Resume`).
 //! - `Input::Reweave`: run the re-weave procedure with reason `operator` (forced). No turn.
+//! - `Input::SwitchModel(sw)`: from the next request on, `deps.client`, `limiter`, `context_window`,
+//!   `model` and `reasoning_replay` are `sw`'s. When the model or the replay policy differs from the
+//!   one the log names, or `sw.settings_changed` (a reload changed the profile: the server or the
+//!   request's extra fields may differ), append `model_switched{from, to, reasoning_replay, reason}` and publish; a
+//!   new replay policy re-renders the history, so the prefix guard is primed with the weave as it is
+//!   now. No turn. While a turn runs it is applied between steps, like a rule.
 //! - `Input::Stop`: a child appends `interrupted{REASON_PARENT}`, kills its jobs, stops its children
 //!   and settles `Stopped` with `texts::stopped_report(step)`, so its parent is not left waiting.
 //!   Anything else: `jobs.kill_all`, `orch.stop_children(session)`. When the last turn ended `Waiting`
@@ -539,9 +552,9 @@ use loom_core::config::{AgentsCfg, Paths};
 use loom_core::estimate::TokenEstimator;
 use loom_core::event::{
     Author, Budget, ChildCompleted, ChildOutcome, ChildSettled, Event, FinishReason, Forked, InboxItem, InboxKind,
-    ModelRequest, ModelResponse, NoteKind, Purpose, Record, Reweave, Seq, SessionOutcome, SessionStart, StoredAction,
-    Termination, Timing, ToolCall, ToolCallRequest, ToolClass, ToolSpec, ToolStatus, Trigger, TurnEndReason, Usage,
-    META_DEFERRED_OBSERVATION, META_EXIT_CODE, META_JOB, META_SIGNAL,
+    ModelRef, ModelRequest, ModelResponse, ModelSwitched, NoteKind, Purpose, ReasoningReplay, Record, Reweave, Seq,
+    SessionOutcome, SessionStart, StoredAction, Termination, Timing, ToolCall, ToolCallRequest, ToolClass, ToolSpec,
+    ToolStatus, Trigger, TurnEndReason, Usage, META_DEFERRED_OBSERVATION, META_EXIT_CODE, META_JOB, META_SIGNAL,
 };
 use loom_core::ids::{new_item_id, new_request_id, CallId, SessionId};
 use loom_core::ledger::{LedgerOp, LedgerState};
@@ -599,7 +612,39 @@ pub enum Input {
     /// A `Constraint`, `Approval`, `Withdraw` or `Scope` kept on disk at `file` until it is recorded (see
     /// [`queue_input`]).
     Queued { file: PathBuf, input: Box<Input> },
+    /// Use another model from the next request on (the operator switched it, or its profile was
+    /// reloaded). Applied between steps like a rule; it starts no turn. Not kept on disk: the runtime
+    /// writes the new model to `meta.json` first, and `open` records a switch a restart cut short.
+    SwitchModel(Box<ModelSwitch>),
 }
+
+/// What [`Input::SwitchModel`] carries: the new model's client, slots, window and replay policy.
+#[derive(Clone)]
+pub struct ModelSwitch {
+    pub client: Arc<ModelClient>,
+    pub limiter: Arc<Limiter>,
+    pub context_window: Option<u64>,
+    pub model: ModelRef,
+    pub reasoning_replay: ReasoningReplay,
+    /// For the record: `operator` or `profile reloaded`.
+    pub reason: String,
+    /// The profile's settings changed (a reload): recorded even when the model, window and replay policy
+    /// did not, since what a request carries may have (the server, `extra_body`, `max_output_tokens`).
+    pub settings_changed: bool,
+}
+
+impl std::fmt::Debug for ModelSwitch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelSwitch").field("model", &self.model).field("reason", &self.reason).finish()
+    }
+}
+
+/// The `reason` of a `model_switched` the operator asked for.
+pub const SWITCH_OPERATOR: &str = "operator";
+/// The `reason` of a `model_switched` made because the session's profile was reloaded with new settings.
+pub const SWITCH_RELOADED: &str = "profile reloaded";
+/// The `reason` of a `model_switched` recorded when the session is opened on another model than its log names.
+pub const SWITCH_IDLE: &str = "changed while the session was idle";
 
 /// One input of a session's `queued/` directory.
 #[derive(Serialize, Deserialize)]
@@ -779,6 +824,12 @@ pub struct Deps {
     pub priority: Priority,
     /// Context window of the served model, when known.
     pub context_window: Option<u64>,
+    /// The model the session is meant to use (from its `meta.json`). When the log says another one —
+    /// the operator switched it while it was idle, or its profile was reloaded — `open` records the
+    /// change as a `model_switched` before anything else is sent.
+    pub model: ModelRef,
+    /// The reasoning replay of `model`'s profile.
+    pub reasoning_replay: ReasoningReplay,
     pub shared: Arc<Shared>,
     /// Template for tool calls: `call_id` and `cancel` are replaced for each call.
     pub ctx: ToolCtx,
@@ -847,6 +898,9 @@ struct State {
     requested: Option<Measured>,
     /// The latest step request whose reply carried the prompt size the server counted.
     measured: Option<Measured>,
+    /// The model the log says requests go to, and its replay policy: `session_start`'s (a fork's comes
+    /// from its parent's), then each `model_switched`'s.
+    model: Option<(ModelRef, ReasoningReplay)>,
 }
 
 /// Durable intervals rather than subtracting response timings (which can overlap or never arrive).
@@ -937,6 +991,7 @@ impl State {
                 if s.schema >= 2 {
                     self.clock = Some(ActiveClock::default());
                 }
+                self.model = Some((s.model.clone(), s.reasoning_replay));
             }
             Event::Forked(f) => {
                 *self = State {
@@ -948,9 +1003,12 @@ impl State {
                     clock: self.clock.take().map(|_| ActiveClock::default()),
                     requested: self.requested.take(),
                     measured: self.measured.take(),
+                    // A fork sends to its parent's model (a fork never changes profile).
+                    model: self.model.take(),
                     ..State::default()
                 };
             }
+            Event::ModelSwitched(m) => self.model = Some((m.to.clone(), m.reasoning_replay)),
             Event::ModelRequest(m) if m.purpose == Purpose::Step => {
                 self.step = self.step.saturating_add(1);
                 self.fork_point = rec.seq.checked_sub(1);
@@ -1705,6 +1763,12 @@ Name them when you start a new mission instead."
             // `resume_from` only takes a lock; it never waits.
             let _ = session.deps.ctx.jobs.resume_from(n).now_or_never();
         }
+        // The model the runtime opened the session with may not be the one its log names: it was
+        // switched while the session was idle, its profile was reloaded meanwhile, or a restart cut a
+        // switch short. Recorded before anything is sent, so the log stays the truth.
+        if session.st.ended.is_none() {
+            session.record_model(SWITCH_IDLE, false).map_err(|e| e.0)?;
+        }
         session.seed_guard().map_err(|e| e.0)?;
         Ok(session)
     }
@@ -1728,6 +1792,52 @@ Name them when you start a new mission instead."
         if stable_hash(&messages) != sent.stable_hash && !reported {
             let detail = texts::rendering_changed(sent.n_messages, messages.len());
             self.append(Author::Harness, Event::CacheBreak { req_id: sent.req_id, first_diff_message: 0, detail })?;
+        }
+        // A model switch since that request may re-render the history on purpose (its replay policy):
+        // the next request is compared with the history as it renders now, not as it was sent.
+        if self.records.iter().skip(at).any(|r| matches!(r.event, Event::ModelSwitched(_))) {
+            let w = self.woven();
+            self.guard.prime(w.weave.epoch, &w.weave.messages);
+        }
+        Ok(())
+    }
+
+    /// Point the session at the model of `sw` from the next request on (see [`Input::SwitchModel`]).
+    fn switch_model(&mut self, sw: ModelSwitch) -> R<()> {
+        let ModelSwitch { client, limiter, context_window, model, reasoning_replay, reason, settings_changed } = sw;
+        self.deps.client = client;
+        self.deps.limiter = limiter;
+        self.deps.context_window = context_window;
+        self.deps.model = model;
+        self.deps.reasoning_replay = reasoning_replay;
+        self.record_model(&reason, settings_changed)
+    }
+
+    /// Record a `model_switched` when the log's model (or its replay policy) is not `deps.model`, or when
+    /// `always` (the profile's other settings changed), so the weave and every reader of the log follow
+    /// the change. Otherwise nothing is recorded when they agree. A new replay policy re-renders the
+    /// history on purpose, so the prefix guard is primed with it: that is not a cache break of the
+    /// session's making.
+    fn record_model(&mut self, reason: &str, always: bool) -> R<()> {
+        let to = (self.deps.model.clone(), self.deps.reasoning_replay);
+        let Some(from) = self.st.model.clone() else { return Ok(()) };
+        if from == to && !always {
+            return Ok(());
+        }
+        let replay_changed = from.1 != to.1;
+        self.append(
+            Author::Harness,
+            Event::ModelSwitched(ModelSwitched {
+                from: from.0,
+                to: to.0,
+                reasoning_replay: to.1,
+                reason: reason.to_string(),
+            }),
+        )?;
+        self.publish();
+        if replay_changed {
+            let w = self.woven();
+            self.guard.prime(w.weave.epoch, &w.weave.messages);
         }
         Ok(())
     }
@@ -2263,6 +2373,7 @@ Name them when you start a new mission instead."
                     out.trigger = Some(Trigger::Resume);
                 }
             }
+            Input::SwitchModel(sw) => self.switch_model(*sw)?,
             Input::Resume | Input::Reweave | Input::Stop | Input::Queued { .. } => {}
         }
         Ok(out)
@@ -3849,6 +3960,9 @@ mod tests {
                 limiter: Arc::new(Limiter::new(4)),
                 priority: Priority::Lead,
                 context_window: self.window,
+                // As `start` records it, so opening a log it wrote records no switch.
+                model: ModelRef { profile: "mock".into(), model: "mock".into(), context_window: 1_000_000 },
+                reasoning_replay: ReasoningReplay::All,
                 shared: self.shared.clone(),
                 ctx: self.ctx.clone(),
                 job_events,
@@ -7885,6 +7999,71 @@ mod tests {
         let session = Session::open(fx.deps()).unwrap();
         assert_eq!(session.exec_count(), 1);
         assert_eq!(session.st.clock.as_ref().unwrap().running_from, None);
+    }
+
+    #[tokio::test]
+    async fn a_switch_that_changes_reasoning_replay_re_renders_the_history_without_a_cache_break() {
+        let script = seq(vec![
+            Reply::text("first").with_reasoning("thought one").into(),
+            Reply::text("second").into(),
+            Reply::text("third").into(),
+        ]);
+        let mut fx = Fx::new("chat", false, false, script).await;
+        let (tx, task) = spawn_run(fx.create());
+        let turn_ends = |rs: &[Record]| rs.iter().filter(|r| matches!(r.event, Event::TurnEnd { .. })).count();
+        // Two turns, so the reply with reasoning is inside a prefix already sent (the guard compares the
+        // next request with the last one sent).
+        tx.send(user("go")).unwrap();
+        wait_until(&fx.sink, "first reply", |rs| turn_ends(rs) == 1).await;
+        tx.send(user("again")).unwrap();
+        wait_until(&fx.sink, "second reply", |rs| turn_ends(rs) == 2).await;
+        // The same server behind a profile that replays no reasoning.
+        let switch = ModelSwitch {
+            client: Arc::new(ModelClient::new("other", fx.profile.clone(), &fx.paths.model_keys_dir()).unwrap()),
+            limiter: Arc::new(Limiter::new(4)),
+            context_window: fx.window,
+            model: ModelRef { profile: "other".into(), model: "mock".into(), context_window: 1_000_000 },
+            reasoning_replay: ReasoningReplay::None,
+            reason: SWITCH_OPERATOR.into(),
+            settings_changed: false,
+        };
+        tx.send(Input::SwitchModel(Box::new(switch.clone()))).unwrap();
+        // The same settings again record nothing.
+        tx.send(Input::SwitchModel(Box::new(switch))).unwrap();
+        tx.send(user("third")).unwrap();
+        wait_until(&fx.sink, "third reply", |rs| turn_ends(rs) == 3).await;
+        finish_task(tx, task).await;
+        let rs = fx.sink.records();
+        let switched: Vec<&Record> = rs.iter().filter(|r| matches!(r.event, Event::ModelSwitched(_))).collect();
+        assert_eq!(switched.len(), 1, "{:?}", kinds(&rs));
+        // The history re-renders on purpose: not a cache break of the session's making.
+        assert!(!rs.iter().any(|r| matches!(r.event, Event::CacheBreak { .. })), "{:?}", kinds(&rs));
+        let bodies = fx.server.requests();
+        assert!(bodies[1].to_string().contains("thought one"), "replayed before the switch");
+        assert!(bodies[2].to_string().contains("first"));
+        assert!(!bodies[2].to_string().contains("thought one"), "the new model is not sent the old reasoning");
+
+        // Opened again on its start-up model (as a restart that lost the switch would), the session
+        // records the switch back before anything is sent, and reports no cache break for it.
+        let reopened = Session::open(fx.deps()).unwrap();
+        let back: Vec<ModelSwitched> = reopened
+            .records()
+            .iter()
+            .filter_map(|r| match &r.event {
+                Event::ModelSwitched(m) => Some(m.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(back.len(), 2);
+        assert_eq!((back[1].to.profile.as_str(), back[1].reason.as_str()), ("mock", SWITCH_IDLE));
+        assert!(!reopened.records().iter().any(|r| matches!(r.event, Event::CacheBreak { .. })));
+        // Its next request carries the reasoning again, and that is no cache break either.
+        let (tx, task) = spawn_run(reopened);
+        tx.send(user("fourth")).unwrap();
+        wait_until(&fx.sink, "fourth reply", |rs| turn_ends(rs) == 4).await;
+        finish_task(tx, task).await;
+        assert!(!fx.sink.records().iter().any(|r| matches!(r.event, Event::CacheBreak { .. })));
+        assert!(fx.server.requests()[3].to_string().contains("thought one"));
     }
 
     #[tokio::test]

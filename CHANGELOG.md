@@ -200,6 +200,82 @@
   the whole security state; `entry` and `normalized` are unchanged. The `state` key is gone from its
   result; read the state with `security_query`.
 
+### Workspace folders: create a missing workspace, pick a folder, browse the workspace
+
+- `POST /api/sessions` accepts `create_workspace` (default false). When the workspace does not exist and the flag is
+  set, the daemon makes it (`create_dir_all`) and the 201 answer carries `created: true`; without the flag the refusal
+  says the folder does not exist and how to create it. Refused before anything is made: a relative path, a path inside
+  the loom home or its copies folder, a path under a file, `.`/`..` in the part that does not exist, `/` or the home
+  itself. `~` and `~/x` expand to the daemon user's home. `loom run --create-workspace` (and `loom chat`) does the same
+  and prints `created workspace <path>`.
+- `GET /api/fs/dirs?path=` lists the folders in a folder (folders only, never file names; links marked; the loom home
+  refused). `GET /api/sessions/{id}/files?path=` and `.../files/lines?path=&start=&count=` read a session's workspace
+  (read-only, confined to it, `.loom` never shown, links that leave are not followed, files over 32 MiB refused, binary
+  files named as such); they record nothing in the session. Additive; no stored shape changed.
+- Web UI: a **Browse…** folder picker and a "Create and start" confirmation on the New mission form; a **Files** tab in
+  the inspector (and a Files button in the session header), a file viewer mode, and **Open file** on tool rows. The
+  fixture (`tools/ui-preview.mjs`) mirrors the routes. `docs/UI.md`, `docs/DESIGN.md` section 12 and `docs/RUN.md`
+  are updated.
+- Hardening: "inside the loom home or copies folder" is judged by file identity, so `/System/Volumes/Data/...` and links
+  no longer get around it (also re-judged once a new workspace exists, which is removed again if it landed there); a new
+  workspace gets its `.loom` (0700), so Bubblewrap can start in it, and a request that fails after the folder was made
+  removes what it made; an existing workspace inside the loom home is refused. Both listings read a folder through one
+  open descriptor, and the Files routes refuse anything that resolves into the loom home (a workspace may hold it); a
+  line page keeps no per-line index. UI: the first read of the workspace root is no longer started twice, the folder
+  lists no longer leak scroll height, the focused row is scrolled into view, coarse-pointer targets are 44 px, and
+  Backspace/Alt+Up go up from an empty folder. Additive; no stored shape changed.
+
+### Web UI pass 2: supervising many missions
+
+- Switcher (Ctrl/Cmd+K, `Switch…`), Alt+Up/Down and Alt+Shift+Up/Down (next mission that needs you), and a `?`
+  shortcut sheet; no key stops a session.
+- An **Agents** tab (`#/s/<id>/agents`): agents grouped Needs you, Running, Waiting, Idle, Ended in stable
+  creation order, with per-agent figures from `GET /api/missions/{id}/score` (on open, Refresh, at most every 120 s).
+- **Find in the record** (`/`): literal search of the whole loaded record including folded groups, with an honest
+  count; cut outputs are searched in the viewer.
+- Browser notifications for blocking items, results and mission endings: only when the page is hidden, batched within
+  5 s, never for a stop this tab asked for, closed when the item resolves.
+- A quiet indicator ("no new record for 41m"), a "New since your last visit" divider, "Jump to latest · N new" and
+  a progress line (plan, current step, budget as a limit) above the composer.
+- Tool statuses have their own shapes (`exit N`, denied, invalid, timeout, interrupted) with counts in group
+  headers, and a "partial" mark when the model saw only part of an output.
+- "Ways out" on parked and blocker cards (fold the context, switch model, last recorded error); the inbox is
+  grouped by mission with Ctrl/Cmd+Enter to send, focus to the next card, and "Refuse…" on scope requests.
+- Fixes: snapshot merge keeps live session state, Overview work only runs on its tab, the ledger is re-read after
+  a reconnect or `lagged`, an approved scope request is no longer shown as "Dismissed", Fold now and the model
+  selects confirm first, code blocks render in linear time, and the inbox self-heals every 60 s.
+- UI only; `docs/UI.md` is updated.
+
+### Web UI: chat-first layout and visible model identity
+
+- The session opens on **Chat**, the whole record as a conversation (`#/s/<id>` and `/chat`; `/record` is
+  rewritten to `/chat`), then Overview and Evidence. Operator messages are bubbles; replies are plain prose
+  with a collapsed `Thought` row; consecutive tool calls, text-less replies and ledger/job lines fold into
+  work groups headed `Worked for <duration> · <n> tool calls` (failed and running counts included), open
+  for the last group, a running call or an operator click. **Expand all work** opens them; deep links and
+  Activity links expand the group they point into.
+- The header is an identity bar: breadcrumb, chips for the model in effect (`profile · model · window`,
+  with an "unreachable" warning), role, a copyable short id and the run state with elapsed time, the
+  standing facts, and a one-line goal with Show all.
+- Each stretch of assistant output carries a chip naming the profile that produced it, and a
+  `model_switched` record is a visible line showing both sides.
+- The composer has a model seat: choosing another profile asks for confirmation, then
+  `POST /api/sessions/{id}/model`; the switch takes effect at the next step and re-reads the prompt once.
+- A stats line under the composer replaces the top-bar speed: tok/s, cache share, context use, step.
+- The sidebar groups missions by workspace with a pinned **Needs you** group; each row has one mark by
+  strict precedence and an identity line `<profile> · <role> · <age>`.
+- The preview fixture signs in from `/#code=fixture` and covers models, the model switch, an unreachable
+  profile and `POST /__fixture/stream`.
+- The top bar (below 1100px) carries the open session's model profile and run state; the sidebar's
+  connection line is short (`Live`, `Reconnecting…`) with the detail in its tooltip; a row's identity line
+  never truncates the profile, and a waiting reason has its own line, including nonblocking questions and
+  ready results. A row's age comes from recorded activity (kept across a reload) or reads "activity not
+  loaded"; an ended-stopped session has its own shape.
+- Work groups update by member, so an open Thought, focus and the output viewer survive live records, a
+  long open group is windowed, warnings are counted in its header, and request-detail lines no longer
+  change the groups. The model seat is disabled for ended sessions and per-session while switching.
+- `loom ls` shows a MODEL column (the session's profile) after ROLE.
+
 ### security_record reads near misses
 
 - `security_record` now reads an operation where its meaning is unambiguous (`ops`/`items` for

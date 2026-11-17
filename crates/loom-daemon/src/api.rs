@@ -40,7 +40,7 @@
 //! |---|---|---|
 //! | `GET /status` | `runtime.health()`, counts from `sessions(true)` and `inbox()`, `statvfs` of the loom home on a blocking thread (`disk`, `null` when it cannot be read) | `StatusView` |
 //! | `GET /sessions?archived=true` | `runtime.sessions(archived)` (default false) | `[SessionInfo]` |
-//! | `POST /sessions` (`NewSession`; `prior` may be left out) | `runtime.create_session` (`404` for a `prior` mission that does not exist, `409` for too many) | `201` `SessionInfo` |
+//! | `POST /sessions` (`NewSession`; `prior` may be left out; `create_workspace` makes a missing workspace folder) | `runtime.create_session_receipt` (`404` for a `prior` mission that does not exist, `409` for too many) | `201` `CreatedSession` (a `SessionInfo` plus `created`: the folder was made) |
 //! | `GET /sessions/{id}` | the session and its children (sessions whose `parent` is it) | `SessionDetail` |
 //! | `GET /sessions/{id}/records?after={seq}&limit={n}` | `runtime.stored_records` (`limit` default 500, at most 2000) | `RecordsPage` (`next_after` = last seq of the page when the page is full, else `null`); a record that comes with its stored line (read as `Event::Unknown`) is that line, verbatim |
 //! | `GET /sessions/{id}/stream?after={seq}` | see *Streams* | SSE |
@@ -54,6 +54,12 @@
 //! | `POST /sessions/{id}/resume` | `runtime.resume` | `202` `{}` |
 //! | `POST /sessions/{id}/reweave` | `runtime.reweave` | `202` `{}` |
 //! | `POST /sessions/{id}/archive` (`ArchiveBody`) | `runtime.archive` | `200` `{}` |
+//! | `POST /sessions/{id}/rename` (`RenameBody`) | `runtime.rename` | `200` `{}` |
+//! | `POST /sessions/{id}/model` (`ModelBody`) | `runtime.set_session_model` | `ModelSwitchReceipt` |
+//! | `GET /sessions/{id}/models` | `runtime.mission_models` | `MissionModels` |
+//! | `POST /sessions/{id}/role-model` (`RoleModelBody`) | `runtime.set_role_model` | `RoleModelReceipt` |
+//! | `GET /models` | `runtime.default_model()`, `runtime.health()` | `ModelsView` |
+//! | `POST /models/reload` | `runtime.reload_models` (no body) | `ModelsReload` |
 //! | `GET /sessions/{id}/window` | `runtime.window` | `WindowView` |
 //! | `GET /sessions/{id}/net?limit={n}` | `runtime.net` (default 200, at most 2000) | `[NetEntry]` |
 //! | `GET /missions` | `runtime.missions` | `[MissionInfo]` |
@@ -64,6 +70,9 @@
 //! | `GET /blobs/{handle}` | `blobs.resolve` + `meta` | `BlobRef` |
 //! | `GET /blobs/{handle}/raw` | the stored bytes | `application/octet-stream`, `Content-Disposition: attachment` |
 //! | `GET /blobs/{handle}/lines?start={a}&end={b}` | `blobs.read_lines` (1-based inclusive; default `1..=2000`; at most 5000 lines per call) | `LinesView` |
+//! | `GET /fs/dirs?path={absolute or ~}` | `fsview::list_dirs` (default: the daemon user's home; folders only, no file names, sizes or contents; the loom home is refused) | `DirsView` (`path`, `parent`, `home`, `entries[{name, path, hidden, link}]`, `more`) |
+//! | `GET /sessions/{id}/files?path={relative}` | `fsview::list_files` in the session's canonical workspace (`meta.workspace`); `..`, absolute paths, links that leave the workspace, `.loom` and anything inside the loom home are refused; the folder is read through one open descriptor; read-only, registers no observation | `FilesView` (`root`, `path`, `entries[{name, kind, size, mtime_ms, hidden, note?, error?}]`, `more`) |
+//! | `GET /sessions/{id}/files/lines?path={relative}&start={n}&count={n}` | `fsview::read_file_lines` (`start` default 1, `count` default 2000, at most 5000; at most 32 MiB of a file is read) | `FileLinesView` (`path`, `text`, `first`, `last`, `total`, `total_lines`, `bytes`, `mtime_ms`, `binary`) |
 //! | `GET /events?deltas=true` | see *Streams* | SSE |
 //! | `POST /gc` (`GcBody`) | `runtime.gc(apply, None)` | `200` `SweepReport` |
 //! | `POST /shutdown` | cancels `state.shutdown` | `202` `{}` |
@@ -121,10 +130,12 @@
 //! - `POST /shutdown` cancels the token.
 
 use crate::auth;
+use crate::fsview;
 use crate::ui;
 use crate::wire::{
-    AnswerBody, ApprovalBody, ArchiveBody, DiskSpace, ErrorBody, GcBody, LinesView, MessageBody, ReleaseBody, RuleBody,
-    ScopeBody, SessionDetail, StatusView, WithdrawBody,
+    AnswerBody, ApprovalBody, ArchiveBody, CreatedSession, DirsView, DiskSpace, ErrorBody, FileLinesView, FilesView,
+    GcBody, LinesView, MessageBody, ModelBody, ModelsView, ReleaseBody, RenameBody, RoleModelBody, RuleBody, ScopeBody,
+    SessionDetail, StatusView, WithdrawBody,
 };
 use axum::body::{Body, Bytes};
 use axum::extract::rejection::QueryRejection;
@@ -206,6 +217,12 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/sessions/{id}/resume", post(resume))
         .route("/api/sessions/{id}/reweave", post(reweave))
         .route("/api/sessions/{id}/archive", post(archive))
+        .route("/api/sessions/{id}/rename", post(rename))
+        .route("/api/sessions/{id}/model", post(set_model))
+        .route("/api/sessions/{id}/models", get(mission_models))
+        .route("/api/sessions/{id}/role-model", post(set_role_model))
+        .route("/api/models", get(models))
+        .route("/api/models/reload", post(reload_models))
         .route("/api/sessions/{id}/window", get(window))
         .route("/api/sessions/{id}/net", get(net))
         .route("/api/missions", get(missions))
@@ -216,6 +233,9 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/blobs/{handle}", get(blob_meta))
         .route("/api/blobs/{handle}/raw", get(blob_raw))
         .route("/api/blobs/{handle}/lines", get(blob_lines))
+        .route("/api/fs/dirs", get(fs_dirs))
+        .route("/api/sessions/{id}/files", get(session_files))
+        .route("/api/sessions/{id}/files/lines", get(session_file_lines))
         .route("/api/events", get(events))
         .route("/api/gc", post(gc))
         .route("/api/shutdown", post(shutdown))
@@ -546,6 +566,8 @@ async fn status(State(s): State<ApiState>) -> Json<StatusView> {
         bind: s.bind.clone(),
         proxy_port: s.runtime.proxy_port(),
         home: s.runtime.paths().home.display().to_string(),
+        sandbox: s.runtime.config().sandbox.mode.as_str().to_string(),
+        network: s.runtime.config().network.mode.as_str().to_string(),
         disk,
         models,
         sessions_total: sessions.len(),
@@ -562,8 +584,8 @@ async fn list_sessions(State(s): State<ApiState>, q: RawQuery) -> Res<Json<Vec<S
 
 async fn create_session(State(s): State<ApiState>, body: Bytes) -> Res<Response> {
     let new: NewSession = json_body(&body)?;
-    let info = s.runtime.create_session(new).await.map_err(rt_err)?;
-    Ok((StatusCode::CREATED, Json(info)).into_response())
+    let (info, created) = s.runtime.create_session_receipt(new).await.map_err(rt_err)?;
+    Ok((StatusCode::CREATED, Json(CreatedSession { info, created })).into_response())
 }
 
 fn known(s: &ApiState, id: &str) -> Res<SessionInfo> {
@@ -688,6 +710,42 @@ async fn archive(State(s): State<ApiState>, Path(id): Path<String>, body: Bytes)
     Ok(ok_empty())
 }
 
+async fn rename(State(s): State<ApiState>, Path(id): Path<String>, body: Bytes) -> Res<Response> {
+    let body: RenameBody = json_body(&body)?;
+    s.runtime.rename(&SessionId::from(id), &body.title).await.map_err(rt_err)?;
+    Ok(ok_empty())
+}
+
+async fn set_model(State(s): State<ApiState>, Path(id): Path<String>, body: Bytes) -> Res<Response> {
+    let body: ModelBody = json_body(&body)?;
+    let receipt = s.runtime.set_session_model(&SessionId::from(id), &body.profile).await.map_err(rt_err)?;
+    Ok(Json(receipt).into_response())
+}
+
+async fn mission_models(State(s): State<ApiState>, Path(id): Path<String>) -> Res<Response> {
+    let view = s.runtime.mission_models(&SessionId::from(id)).map_err(rt_err)?;
+    Ok(Json(view).into_response())
+}
+
+async fn set_role_model(State(s): State<ApiState>, Path(id): Path<String>, body: Bytes) -> Res<Response> {
+    let body: RoleModelBody = json_body(&body)?;
+    let receipt = s
+        .runtime
+        .set_role_model(&SessionId::from(id), &body.role, body.profile.as_deref(), body.now)
+        .await
+        .map_err(rt_err)?;
+    Ok(Json(receipt).into_response())
+}
+
+async fn models(State(s): State<ApiState>) -> Json<ModelsView> {
+    Json(ModelsView { default_model: s.runtime.default_model(), models: s.runtime.health().await })
+}
+
+async fn reload_models(State(s): State<ApiState>) -> Res<Response> {
+    let report = s.runtime.reload_models().await.map_err(rt_err)?;
+    Ok(Json(report).into_response())
+}
+
 async fn window(State(s): State<ApiState>, Path(id): Path<String>) -> Res<Response> {
     let view = s.runtime.window(&SessionId::from(id)).map_err(rt_err)?;
     Ok(Json(view).into_response())
@@ -776,6 +834,56 @@ async fn blob_lines(State(s): State<ApiState>, Path(handle): Path<String>, q: Ra
     })
     .await?;
     Ok(Json(LinesView { text: slice.text, first: slice.first, last: slice.last, total: slice.total }))
+}
+
+// ---------------------------------------------------------------------------------------------
+// API: folders and files (read-only, for the folder picker and the Files panel)
+
+async fn fs_dirs(State(s): State<ApiState>, q: RawQuery) -> Res<Json<DirsView>> {
+    let q = params(q)?;
+    let path = q.get("path").cloned();
+    let paths = s.runtime.paths().clone();
+    let view = blocking(move || {
+        fsview::list_dirs(&paths, loom_agent::runtime::user_home().as_deref(), path.as_deref()).map_err(rt_err)
+    })
+    .await?;
+    Ok(Json(view))
+}
+
+/// The canonical workspace of session `id` (archived ones too).
+fn workspace_of(s: &ApiState, id: &str) -> Res<std::path::PathBuf> {
+    let info = known(s, id)?;
+    std::fs::canonicalize(&info.meta.workspace).map_err(|e| {
+        ApiError::new(
+            StatusCode::CONFLICT,
+            format!("The workspace {} cannot be read: {e}. Check that the folder still exists.", info.meta.workspace),
+        )
+    })
+}
+
+async fn session_files(State(s): State<ApiState>, Path(id): Path<String>, q: RawQuery) -> Res<Json<FilesView>> {
+    let q = params(q)?;
+    let rel = q.get("path").cloned().unwrap_or_default();
+    let root = workspace_of(&s, &id)?;
+    let home = s.runtime.paths().home.clone();
+    let view = blocking(move || fsview::list_files(&root, &home, &rel).map_err(rt_err)).await?;
+    Ok(Json(view))
+}
+
+async fn session_file_lines(
+    State(s): State<ApiState>,
+    Path(id): Path<String>,
+    q: RawQuery,
+) -> Res<Json<FileLinesView>> {
+    let q = params(q)?;
+    let Some(rel) = q.get("path").cloned().filter(|p| !p.trim().is_empty()) else {
+        return Err(ApiError::bad_query("path is required: the file's path relative to the workspace"));
+    };
+    let (start, count) = (number(&q, "start")?, number(&q, "count")?);
+    let root = workspace_of(&s, &id)?;
+    let home = s.runtime.paths().home.clone();
+    let view = blocking(move || fsview::read_file_lines(&root, &home, &rel, start, count).map_err(rt_err)).await?;
+    Ok(Json(view))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1864,6 +1972,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn models_are_listed_reloaded_and_switched_over_the_api() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let (s, v) = e.get("/api/models").await;
+        assert_eq!((s, v["default_model"].as_str()), (200, Some("mock")));
+        assert_eq!(v["models"].as_array().unwrap().len(), 1);
+        let id = e.create("go").await;
+        let (s, b) = e.post(&format!("/api/sessions/{id}/model"), json!({"profile": "other"})).await;
+        assert_eq!(s, 404, "{b}");
+        assert!(b["error"].as_str().unwrap().contains("loom models reload"), "{b}");
+        let (s, _) = e.post(&format!("/api/sessions/{id}/model"), json!({"profile": "mock", "extra": 1})).await;
+        assert_eq!(s, 400, "unknown fields are refused");
+
+        // Added to the file and reloaded: usable at once, without a restart.
+        let url = e.rt.config().models["mock"].base_url.clone();
+        let profile = |name: &str| {
+            format!("[models.{name}]\nbase_url = \"{url}\"\nmodel = \"mock\"\ncontext_window = 1000000\nretry_window_s = 1\nretry_max_delay_s = 1\nstall_timeout_s = 30\n")
+        };
+        let text = format!("default_model = \"mock\"\n\n{}\n{}", profile("mock"), profile("other"));
+        std::fs::write(e.rt.paths().config_file(), text).unwrap();
+        let (s, r) = e.post("/api/models/reload", json!({})).await;
+        assert_eq!((s, &r["added"], &r["changed"]), (200, &json!(["other"]), &json!([])), "{r}");
+        let (s, receipt) = e.post(&format!("/api/sessions/{id}/model"), json!({"profile": "other"})).await;
+        assert_eq!((s, receipt["model"]["profile"].as_str()), (200, Some("other")), "{receipt}");
+        assert_eq!(e.get("/api/models").await.1["models"].as_array().unwrap().len(), 2);
+
+        // The mission's models: one entry per role its lead starts, and a choice per role.
+        let (s, m) = e.get(&format!("/api/sessions/{id}/models")).await;
+        assert_eq!(
+            (s, m["lead"].as_str(), m["lead_model"]["profile"].as_str()),
+            (200, Some(id.as_str()), Some("other"))
+        );
+        assert_eq!(m["roles"][0]["role"], "worker");
+        let (s, b) =
+            e.post(&format!("/api/sessions/{id}/role-model"), json!({"role": "nope", "profile": "mock"})).await;
+        assert_eq!(s, 409, "{b}");
+        assert!(b["error"].as_str().unwrap().contains("Its roles: worker, verifier"), "{b}");
+        let (s, r) =
+            e.post(&format!("/api/sessions/{id}/role-model"), json!({"role": "worker", "profile": "mock"})).await;
+        assert_eq!((s, &r["models"]["roles"][0]["chosen"], &r["switched"]), (200, &json!("mock"), &json!([])), "{r}");
+        let (s, r) = e.post(&format!("/api/sessions/{id}/role-model"), json!({"role": "worker"})).await;
+        assert_eq!(
+            (s, &r["models"]["roles"][0]["chosen"]),
+            (200, &Value::Null),
+            "a choice without a profile clears it"
+        );
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn operations_round_trip_and_refusals_carry_the_runtimes_sentence() {
         let e = env(Script::new(|_, _| finish("done"))).await;
         let id = e.create("first").await;
@@ -2430,5 +2587,260 @@ mod tests {
         let (s, b) = e.post("/api/shutdown", json!({})).await;
         assert_eq!((s, b), (202, json!({})));
         assert!(e.shutdown.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn a_missing_workspace_is_made_only_when_the_request_says_so() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let canon = std::fs::canonicalize(e.dir.path()).unwrap();
+        let missing = canon.join("fresh/ws");
+        let body = |path: &std::path::Path, create: Option<bool>| {
+            let mut b = json!({"workspace": path});
+            if let Some(c) = create {
+                b["create_workspace"] = json!(c);
+            }
+            b
+        };
+
+        // Missing and no flag (or false): refused with the sentence that says what to do; nothing is made.
+        for create in [None, Some(false)] {
+            let (s, b) = e.post("/api/sessions", body(&missing, create)).await;
+            let text = b["error"].as_str().unwrap();
+            assert!(s == 409 && text.contains("does not exist") && text.contains("--create-workspace"), "{s} {b}");
+            assert!(!missing.exists());
+        }
+        // With the flag: made, answered `created: true`, listed as an ordinary session.
+        let (s, b) = e.post("/api/sessions", body(&missing, Some(true))).await;
+        assert_eq!((s, &b["created"], b["workspace"].as_str()), (201, &json!(true), missing.to_str()), "{b}");
+        assert!(missing.is_dir());
+        assert!(b["id"].is_string() && b["status"].is_object(), "still a SessionInfo: {b}");
+        // The same path again exists: started, `created: false`; an ordinary create says false too.
+        let (s, b) = e.post("/api/sessions", body(&missing, Some(true))).await;
+        assert_eq!((s, &b["created"]), (201, &json!(false)), "{b}");
+        let (s, b) = e.post("/api/sessions", json!({"workspace": e.ws})).await;
+        assert_eq!((s, &b["created"]), (201, &json!(false)), "{b}");
+
+        // Refused, with nothing made: inside the loom home, relative, a file in the way.
+        let inside = canon.join("home/newdir");
+        let (s, b) = e.post("/api/sessions", body(&inside, Some(true))).await;
+        assert!(s == 409 && b["error"].as_str().unwrap().contains("loom home"), "{s} {b}");
+        assert!(!inside.exists());
+        let (s, b) = e.post("/api/sessions", body(std::path::Path::new("rel/ws"), Some(true))).await;
+        assert!(s == 409 && b["error"].as_str().unwrap().contains("relative path"), "{s} {b}");
+        let file = canon.join("afile");
+        std::fs::write(&file, "x").unwrap();
+        let (s, b) = e.post("/api/sessions", body(&file.join("sub"), Some(true))).await;
+        assert!(s == 409 && b["error"].as_str().unwrap().contains("is not a directory"), "{s} {b}");
+        let (s, _) = e.post("/api/sessions", json!({"workspace": e.ws, "create_workspace": "yes"})).await;
+        assert_eq!(s, 400);
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn fs_dirs_lists_folders_only_and_refuses_the_loom_home() {
+        let e = env(Script::new(|_, _| finish("x"))).await;
+        let canon = std::fs::canonicalize(e.dir.path()).unwrap();
+        let ws = canon.join("ws");
+        for d in ["b", "A", ".hid"] {
+            std::fs::create_dir_all(ws.join(d)).unwrap();
+        }
+        std::fs::write(ws.join("file.txt"), "secret name").unwrap();
+        std::os::unix::fs::symlink(ws.join("b"), ws.join("lnk")).unwrap();
+        std::os::unix::fs::symlink(ws.join("file.txt"), ws.join("filelink")).unwrap();
+
+        let (s, v) = e.get(&format!("/api/fs/dirs?path={}", ws.display())).await;
+        assert_eq!(s, 200, "{v}");
+        assert_eq!(
+            (v["path"].as_str(), v["parent"].as_str(), v["more"].as_u64()),
+            (ws.to_str(), canon.to_str(), Some(0))
+        );
+        let names: Vec<_> = v["entries"].as_array().unwrap().iter().map(|x| x["name"].as_str().unwrap()).collect();
+        assert_eq!(names, [".hid", "A", "b", "lnk"], "{v}");
+        assert_eq!(v["entries"][0], json!({"name": ".hid", "path": ws.join(".hid"), "hidden": true, "link": false}));
+        assert_eq!(v["entries"][3]["link"], json!(true));
+        assert_eq!(v["entries"][3]["path"], json!(ws.join("b")));
+        assert!(!v.to_string().contains("file.txt"), "no file name is returned: {v}");
+        assert!(v.get("home").is_some());
+        // No path: the home (HOME of this process); relative, missing, a file, the loom home: refused.
+        let (s, v) = e.get("/api/fs/dirs").await;
+        assert!(s == 200 || s == 409, "{s} {v}");
+        let (s, v) = e.get("/api/fs/dirs?path=rel/x").await;
+        assert!(s == 409 && v["error"].as_str().unwrap().contains("not an absolute path"), "{v}");
+        let (s, v) = e.get(&format!("/api/fs/dirs?path={}", ws.join("nope").display())).await;
+        assert_eq!(s, 404, "{v}");
+        let (s, v) = e.get(&format!("/api/fs/dirs?path={}", ws.join("file.txt").display())).await;
+        assert!(s == 409 && v["error"].as_str().unwrap().contains("not a folder"), "{v}");
+        for p in [canon.join("home"), canon.join("home/sessions")] {
+            let (s, v) = e.get(&format!("/api/fs/dirs?path={}", p.display())).await;
+            assert!(s == 409 && v["error"].as_str().unwrap().contains("loom home"), "{p:?} {v}");
+        }
+        // Listing the folder that holds the home does not show it.
+        let (_, v) = e.get(&format!("/api/fs/dirs?path={}", canon.display())).await;
+        assert!(!v["entries"].as_array().unwrap().iter().any(|x| x["name"] == "home"), "{v}");
+        // The token is needed like for every /api route.
+        let r = e.http.get(e.url(&format!("/api/fs/dirs?path={}", ws.display()))).send().await.unwrap();
+        assert_eq!(r.status().as_u16(), 401);
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn workspace_files_are_listed_and_read_inside_the_workspace_only_and_leave_the_record_alone() {
+        let e = env(Script::new(|_, _| finish("done"))).await;
+        let canon = std::fs::canonicalize(e.dir.path()).unwrap();
+        let ws = canon.join("ws");
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        std::fs::create_dir_all(ws.join(".loom")).unwrap();
+        std::fs::write(ws.join(".loom/oracle"), "SECRET").unwrap();
+        std::fs::write(ws.join("src/main.rs"), "fn a() {}\nfn b() {}\nfn c() {}\n").unwrap();
+        std::fs::write(ws.join("README.md"), "hello").unwrap();
+        std::fs::write(ws.join("blob.bin"), [0u8, 1, 2]).unwrap();
+        let outside = canon.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("passwd"), "root").unwrap();
+        std::os::unix::fs::symlink(&outside, ws.join("out")).unwrap();
+        std::os::unix::fs::symlink(outside.join("passwd"), ws.join("pw")).unwrap();
+        std::os::unix::fs::symlink(ws.join(".loom"), ws.join("hl")).unwrap();
+        let id = e.create("look").await;
+        e.wait_turn_ends(&id, 1).await;
+        let before = e.records(&id).await.len();
+        let files = |q: &str| format!("/api/sessions/{id}/files{q}");
+        let lines = |q: &str| format!("/api/sessions/{id}/files/lines{q}");
+
+        let (s, v) = e.get(&files("")).await;
+        assert_eq!(
+            (s, v["root"].as_str(), v["path"].as_str(), v["more"].as_u64()),
+            (200, ws.to_str(), Some(""), Some(0)),
+            "{v}"
+        );
+        let got: Vec<(&str, &str)> = v["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| (x["name"].as_str().unwrap(), x["kind"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (".loom", "dir"),
+                ("src", "dir"),
+                ("blob.bin", "file"),
+                ("hl", "link"),
+                ("out", "link"),
+                ("pw", "link"),
+                ("README.md", "file")
+            ]
+        );
+        assert_eq!(v["entries"][0]["note"], json!("harness files are not shown"));
+        assert_eq!((v["entries"][0]["hidden"].clone(), v["entries"][2]["size"].clone()), (json!(true), json!(3)));
+        assert!(v["entries"][6]["mtime_ms"].as_u64().unwrap() > 0);
+        let (s, v) = e.get(&files("?path=src")).await;
+        assert_eq!(
+            (s, v["path"].as_str(), v["entries"][0]["name"].as_str()),
+            (200, Some("src"), Some("main.rs")),
+            "{v}"
+        );
+
+        // Lines: default, a page, past the end, binary.
+        let (s, v) = e.get(&lines("?path=src/main.rs")).await;
+        assert_eq!(s, 200, "{v}");
+        assert_eq!(
+            (v["text"].as_str(), v["first"].as_u64(), v["last"].as_u64(), v["total"].as_u64()),
+            (Some("fn a() {}\nfn b() {}\nfn c() {}\n"), Some(1), Some(3), Some(3))
+        );
+        assert_eq!(
+            (v["total_lines"].as_u64(), v["bytes"].as_u64(), v["binary"].as_bool()),
+            (Some(3), Some(30), Some(false))
+        );
+        assert_eq!(v["path"], json!("src/main.rs"));
+        let (_, v) = e.get(&lines("?path=src/main.rs&start=2&count=1")).await;
+        assert_eq!(
+            (v["text"].as_str(), v["first"].as_u64(), v["last"].as_u64()),
+            (Some("fn b() {}\n"), Some(2), Some(2))
+        );
+        let (_, v) = e.get(&lines("?path=src/main.rs&start=40")).await;
+        assert_eq!((v["text"].as_str(), v["total"].as_u64()), (Some(""), Some(3)));
+        let (_, v) = e.get(&lines("?path=blob.bin")).await;
+        assert_eq!((v["binary"].as_bool(), v["text"].as_str(), v["bytes"].as_u64()), (Some(true), Some(""), Some(3)));
+
+        // Escapes and the harness folder, by name and through links: refused, never listed or read.
+        let abs = format!("path={}", outside.display());
+        for q in [
+            "?path=..",
+            "?path=../outside",
+            "?path=src/../..",
+            &format!("?{abs}"),
+            "?path=out",
+            "?path=out/passwd",
+            "?path=.loom",
+            "?path=hl",
+            "?path=.loom/oracle",
+            "?path=hl/oracle",
+            "?path=a%00b",
+        ] {
+            let (s, v) = e.get(&files(q)).await;
+            assert_eq!(s, 409, "{q}: {v}");
+            assert!(!v.to_string().contains("SECRET") && !v.to_string().contains("root\""), "{q}: {v}");
+        }
+        for q in [
+            "?path=..",
+            "?path=../outside/passwd",
+            &format!("?{abs}/passwd"),
+            "?path=pw",
+            "?path=out/passwd",
+            "?path=.loom/oracle",
+            "?path=hl/oracle",
+            "?path=src",
+            "?path=a%00b",
+        ] {
+            let (s, v) = e.get(&lines(q)).await;
+            assert_eq!(s, 409, "{q}: {v}");
+            assert!(!v.to_string().contains("SECRET") && !v.to_string().contains("root\n"), "{q}: {v}");
+        }
+        let (s, v) = e.get(&lines("?path=pw")).await;
+        assert!(s == 409 && v["error"].as_str().unwrap().contains("outside the workspace"), "{v}");
+        let (s, v) = e.get(&files("?path=nope")).await;
+        assert_eq!(s, 404, "{v}");
+        let (s, v) = e.get(&lines("?path=nope.txt")).await;
+        assert_eq!(s, 404, "{v}");
+        let (s, _) = e.get(&lines("")).await;
+        assert_eq!(s, 400, "a file route without a path is a bad query");
+        let (s, _) = e.get(&lines("?path=README.md&start=x")).await;
+        assert_eq!(s, 400);
+        let (s, v) = e.get("/api/sessions/s-nope/files").await;
+        assert_eq!((s, v["error"].as_str()), (404, Some("There is no session s-nope.")));
+        let (s, _) = e.get("/api/sessions/s-nope/files/lines?path=x").await;
+        assert_eq!(s, 404);
+        let r = e.http.get(e.url(&files(""))).send().await.unwrap();
+        assert_eq!(r.status().as_u16(), 401);
+
+        // Read-only operator reads: the session's log did not change.
+        assert_eq!(e.records(&id).await.len(), before);
+        e.rt.shutdown().await;
+    }
+    #[tokio::test]
+    async fn a_workspace_that_holds_the_loom_home_cannot_read_its_token_or_keys_and_one_inside_it_is_refused() {
+        let e = env(Script::new(|_, _| finish("done"))).await;
+        let canon = std::fs::canonicalize(e.dir.path()).unwrap();
+        std::fs::create_dir_all(canon.join("home/keys")).unwrap();
+        std::fs::write(canon.join("home/token"), "PERMANENT").unwrap();
+        std::fs::write(canon.join("home/keys/x"), "KEY").unwrap();
+        std::fs::write(canon.join("note.txt"), "fine").unwrap();
+        let (s, b) = e.post("/api/sessions", json!({"workspace": canon})).await;
+        assert_eq!(s, 201, "{b}");
+        let id = b["id"].as_str().unwrap().to_string();
+        let (s, v) = e.get(&format!("/api/sessions/{id}/files/lines?path=note.txt")).await;
+        assert_eq!((s, v["text"].as_str()), (200, Some("fine")), "{v}");
+        for q in ["home/token", "home/keys/x", "home"] {
+            let (s, v) = e.get(&format!("/api/sessions/{id}/files/lines?path={q}")).await;
+            assert_eq!(s, 409, "{q}: {v}");
+            assert!(v["error"].as_str().unwrap().contains("loom home") && !v.to_string().contains("PERMANENT"), "{v}");
+        }
+        for q in ["home", "home/keys"] {
+            let (s, v) = e.get(&format!("/api/sessions/{id}/files?path={q}")).await;
+            assert_eq!(s, 409, "{q}: {v}");
+        }
+        let (s, v) = e.post("/api/sessions", json!({"workspace": canon.join("home")})).await;
+        assert!(s == 409 && v["error"].as_str().unwrap().contains("inside the loom home"), "{s} {v}");
+        e.rt.shutdown().await;
     }
 }

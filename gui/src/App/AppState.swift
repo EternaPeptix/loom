@@ -1,6 +1,7 @@
 import Foundation
 import SwiftUI
 import UserNotifications
+import Network
 
 /// Live counts shown in the menu bar and the status line.
 struct Counts: Equatable {
@@ -43,6 +44,8 @@ final class AppState: ObservableObject {
     @Published var link: Link = .none
     @Published var counts = Counts()
     @Published var feedStatus = DaemonClient.FeedStatus()
+    /// The OS notification permission, so the menu can show it and guide the operator when it is off.
+    @Published var notifStatus: UNAuthorizationStatus = .notDetermined
     @Published var status: String = "not connected"
     /// True while the client's identity check cannot reach the daemon (it keeps retrying); the bar then
     /// shows the link as not connected.
@@ -74,6 +77,15 @@ final class AppState: ObservableObject {
     private var restored = false
     /// `<base>/#code=<one-time code>` minted for the web pane of `paneEpoch`. Handed out once: the code is single use.
     private var pendingEntry: URL?
+
+    /// Auto-reconnect: an SSH tunnel dies on sleep or a network change, so reopen it on wake and when the
+    /// network path returns instead of leaving a dead screen with counts and notifications stopped. Set
+    /// false after a manual disconnect or a daemon-identity mismatch, where reconnecting would not help.
+    private var reconnectable = false
+    private var lastReconnectAt = Date.distantPast
+    private let pathMonitor = NWPathMonitor()
+    private var networkSatisfied = true
+    private var watching = false
 
     private static let lastKey = "loom-desk.lastConnection"
 
@@ -182,6 +194,8 @@ final class AppState: ObservableObject {
         let gen = generation
         paneEpoch += 1
         active = connection
+        // A tunnel connection is worth reopening by itself after a drop; a direct one has nothing to reopen.
+        reconnectable = connection.mode == .sshTunnel
         counts = Counts()
         feedStatus = DaemonClient.FeedStatus()
         webState = .idle
@@ -251,6 +265,7 @@ final class AppState: ObservableObject {
     func disconnect() {
         teardown()
         generation += 1
+        reconnectable = false   // the operator chose to stop; do not reopen it on wake
         link = .none
         status = "not connected"
         counts = Counts()
@@ -284,10 +299,16 @@ final class AppState: ObservableObject {
                     self.counts = c
                 }
             },
-            onBlockingInbox: { [weak self] session, title, text in
+            onNotify: { [weak self] n in
                 Task { @MainActor in
                     guard let self, self.generation == gen else { return }
-                    Notifier.post(session: session, title: title, text: text)
+                    Notifier.post(n)
+                }
+            },
+            onResolve: { [weak self] itemId in
+                Task { @MainActor in
+                    guard let self, self.generation == gen else { return }
+                    Notifier.withdraw(itemId: itemId)
                 }
             },
             onMode: { [weak self] mode in
@@ -296,6 +317,7 @@ final class AppState: ObservableObject {
                     if mode.hasPrefix(DaemonClient.identityModePrefix) {
                         // The daemon was replaced by something that cannot prove itself: stop using the token.
                         self.generation += 1
+                        self.reconnectable = false   // a different daemon now answers; reconnecting won't help
                         self.client.stop()
                         self.tunnel.close()
                         self.token = nil
@@ -333,8 +355,44 @@ final class AppState: ObservableObject {
         pendingEntry = nil
         counts = Counts()
         feedStatus.failed("stream", reason: msg)
-        link = .failed("the SSH tunnel closed: \(msg)")
+        link = .failed("the SSH tunnel closed: \(msg). Reconnecting when the network returns…")
         status = "tunnel closed"
+        // The tunnel typically dies on sleep or a network change; try now in case the network is already
+        // back, and the wake / network-path watchers will try again when it returns.
+        maybeAutoReconnect("tunnel closed")
+    }
+
+    // MARK: auto-reconnect
+
+    /// Watch for system wake and network-path changes so a dropped tunnel reopens itself. Called once at
+    /// launch (idempotent).
+    func beginWatching() {
+        guard !watching else { return }
+        watching = true
+        pathMonitor.pathUpdateHandler = { [weak self] path in
+            let up = path.status == .satisfied
+            Task { @MainActor in
+                guard let self else { return }
+                let cameBack = up && !self.networkSatisfied
+                self.networkSatisfied = up
+                if cameBack { self.maybeAutoReconnect("network returned") }
+            }
+        }
+        pathMonitor.start(queue: DispatchQueue(label: "loom-desk.path"))
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.maybeAutoReconnect("woke") }
+        }
+    }
+
+    /// Reopen a dropped tunnel connection. Event-driven (wake / network return / the drop itself) and
+    /// debounced, never a tight loop; a connect that fails leaves `.failed` and waits for the next event.
+    private func maybeAutoReconnect(_ reason: String) {
+        guard reconnectable, case .failed = link, let a = active, a.mode == .sshTunnel else { return }
+        guard Date().timeIntervalSince(lastReconnectAt) > 4 else { return }
+        lastReconnectAt = Date()
+        connect(a)
     }
 
     // MARK: connections list
@@ -363,6 +421,15 @@ final class AppState: ObservableObject {
 
     // MARK: window / notification routing
 
+    /// Read the OS notification permission into `notifStatus` (so the menu can reflect it). Called at
+    /// launch and when the app becomes active, since the operator may change it in System Settings.
+    func refreshNotificationStatus() {
+        guard Bundle.main.bundleURL.pathExtension == "app" else { return }
+        UNUserNotificationCenter.current().getNotificationSettings { s in
+            Task { @MainActor in self.notifStatus = s.authorizationStatus }
+        }
+    }
+
     /// Bring the window forward; navigate the pane to `session` when given.
     func openWindow(focus session: String? = nil) {
         openWindowTick += 1
@@ -383,19 +450,33 @@ enum Notifier {
 
     static func requestAuthorization() {
         guard available else { return }
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in
+            Task { @MainActor in AppState.shared.refreshNotificationStatus() }
+        }
     }
 
-    /// Title names the mission (the session title), body is the item text, cut.
-    static func post(session: String, title: String, text: String) {
+    /// Title names the mission (the session title), body is the item text, cut. Keyed by the item id,
+    /// so re-notifying the same item replaces its banner rather than stacking, and `withdraw` can clear
+    /// it once the item is answered.
+    static func post(_ n: DaemonClient.InboxNotice) {
         guard available else { return }
         let c = UNMutableNotificationContent()
-        c.title = cut(title.isEmpty ? "loom" : title, 80)
-        c.body = cut(text, 180)
+        let prefix = n.isScope ? "Host request · " : ""
+        c.title = cut(prefix + (n.title.isEmpty ? "loom" : n.title), 80)
+        c.body = cut(n.text, 180)
         c.sound = .default
-        c.userInfo = ["session": session]
-        let req = UNNotificationRequest(identifier: UUID().uuidString, content: c, trigger: nil)
+        c.userInfo = ["session": n.session]
+        let req = UNNotificationRequest(identifier: n.itemId, content: c, trigger: nil)
         UNUserNotificationCenter.current().add(req) { _ in }
+    }
+
+    /// Remove a notification once its item is answered/dismissed, so Notification Center does not keep a
+    /// stale "needs you" banner for something already handled.
+    static func withdraw(itemId: String) {
+        guard available else { return }
+        let center = UNUserNotificationCenter.current()
+        center.removeDeliveredNotifications(withIdentifiers: [itemId])
+        center.removePendingNotificationRequests(withIdentifiers: [itemId])
     }
 
     static func cut(_ s: String, _ n: Int) -> String {
@@ -433,7 +514,8 @@ enum SelfCheck {
         let c = DaemonClient()
         c.start(baseURL: baseURL, token: token,
                 onCounts: { print("counts: \($0)") },
-                onBlockingInbox: { print("blocking: \($0) \($1) \($2)") },
+                onNotify: { print("notify: \($0)") },
+                onResolve: { print("resolved: \($0)") },
                 onMode: { print("mode: \($0)") })
         Thread.sleep(forTimeInterval: 4)
         c.stop()

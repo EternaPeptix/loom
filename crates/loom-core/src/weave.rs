@@ -15,6 +15,7 @@
 //!   they would in the parent.
 //! - `model_response` → `assistant` message with `text`, the tool calls whose `complete` is true (id =
 //!   call id, arguments string verbatim), and `reasoning` when the session's `reasoning_replay` is `All`
+//!   (`session_start`'s, or the latest `model_switched`'s, which applies to the whole history)
 //!   and the reasoning is non-empty. Responses with `finish` `Aborted` or `Error` are not rendered. A
 //!   response with no text and no complete tool calls is not rendered.
 //! - `tool_result` → `tool` message, `tool_call_id` = call id, content = `text` verbatim.
@@ -295,6 +296,14 @@ fn build_with<'a>(records: &'a [Record], pending: Option<&'a Reweave>) -> (Weave
             tools = s.tools.clone();
             break;
         }
+    }
+    // A model switch carries the replay policy of the new model; the latest one applies to the whole
+    // history (the switch is a cold cache already, so re-rendering earlier replies costs nothing more).
+    if let Some(m) = records.iter().rev().find_map(|r| match &r.event {
+        Event::ModelSwitched(m) => Some(m),
+        _ => None,
+    }) {
+        replay_all = m.reasoning_replay == ReasoningReplay::All;
     }
 
     // Pass 1: whole-log state.
@@ -1539,6 +1548,34 @@ mod tests {
                  <harness kind=\"resume\">\nBRIEF <b>\n\n{LEADS_LINE}\nlead: a < b\n</harness>"
             )
         );
+    }
+
+    #[test]
+    fn a_model_switch_sets_the_reasoning_replay_for_the_whole_history() {
+        let switch = |replay: ReasoningReplay| {
+            Event::ModelSwitched(crate::event::ModelSwitched {
+                from: ModelRef { profile: "p".into(), model: "m".into(), context_window: 1000 },
+                to: ModelRef { profile: "q".into(), model: "n".into(), context_window: 2000 },
+                reasoning_replay: replay,
+                reason: "operator".into(),
+            })
+        };
+        let replayed =
+            |recs: &[Record]| weave(recs).messages.iter().any(|m| m.reasoning.as_deref() == Some("thinking"));
+        let mut l = Log::with_replay(ReasoningReplay::All);
+        l.user("go");
+        l.resp("answer", "thinking", &[]);
+        assert!(replayed(&l.recs));
+        // The new model's policy applies to the replies made before the switch too.
+        l.push(Author::Harness, switch(ReasoningReplay::None));
+        assert!(!replayed(&l.recs));
+        // The latest switch wins.
+        l.push(Author::Harness, switch(ReasoningReplay::All));
+        assert!(replayed(&l.recs));
+        // A switch renders nothing of its own: the model is not told.
+        let n = weave(&l.recs).messages.len();
+        l.push(Author::Harness, switch(ReasoningReplay::All));
+        assert_eq!(weave(&l.recs).messages.len(), n);
     }
 
     #[test]
