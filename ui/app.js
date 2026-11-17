@@ -1558,6 +1558,7 @@ async function submitNew(ev) {
     role: $("f-role").value,
     model: $("f-model").value,
     title: $("f-title").value,
+    prior: $("f-prior").value,
     unattended: $("f-unattended").checked,
   });
   const err = $("f-error");
@@ -1572,6 +1573,7 @@ async function submitNew(ev) {
     const info = await api("POST", "/api/sessions", r.body);
     C.applySessionEvent(S.sessions, info);
     $("f-message").value = "";
+    $("f-prior").value = "";
     location.hash = "#/s/" + encodeURIComponent(info.id);
   } catch (e) {
     err.textContent = e.message;

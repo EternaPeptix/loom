@@ -1055,6 +1055,31 @@ test("new session form", () => {
   assert.equal(C.buildNewSession({ workspace: "/w", message: "x", title: "T", unattended: true }).body.title, "T");
 });
 
+test("new session form: earlier missions to recall", () => {
+  const form = (prior) => ({ workspace: "/w", message: "x", prior });
+  // None named: no key at all, whatever the field held.
+  for (const p of [undefined, null, "", "  ", " , ,\n"]) assert.equal("prior" in C.buildNewSession(form(p)).body, false, JSON.stringify(p));
+  // Whitespace and commas separate; the order is kept and repeats are dropped (first kept).
+  assert.deepEqual(C.buildNewSession(form(" m-b,m-a\n m-b\tm-c , m-a ")).body.prior, ["m-b", "m-a", "m-c"]);
+  assert.deepEqual(C.buildNewSession(form("m-1")).body.prior, ["m-1"]);
+  // The id rule: 1 to 128 of A-Z a-z 0-9 _ . -, not starting with a dot.
+  const ok = "m-0123456789ABCDEF_x.y";
+  assert.deepEqual(C.buildNewSession(form(ok)).body.prior, [ok]);
+  assert.equal(C.buildNewSession(form("a".repeat(128))).body.prior.length, 1);
+  for (const bad of ["a".repeat(129), ".hidden", "m-1/../x", "m-1;rm", "m-é", "m-1?x=2", "m-1:2"]) {
+    const r = C.buildNewSession(form(bad));
+    assert.match(r.error, /is not a mission id; mission ids look like m-…\.$/, bad);
+  }
+  assert.equal(C.buildNewSession(form("m-1 /etc/passwd")).error, '"/etc/passwd" is not a mission id; mission ids look like m-….');
+  // At most 8 after repeats are dropped.
+  const nine = Array.from({ length: 9 }, (_, i) => `m-${i}`);
+  assert.equal(C.buildNewSession(form(nine.join(" "))).error, "Name at most 8 earlier missions to recall.");
+  assert.equal(C.buildNewSession(form([...nine.slice(0, 8), "m-0", "m-1"].join(" "))).body.prior.length, 8);
+  assert.equal(C.MAX_PRIOR, 8);
+  // The workspace and the message are checked first.
+  assert.match(C.buildNewSession({ workspace: "", message: "x", prior: ".bad" }).error, /Workspace/);
+});
+
 test("error sentence", () => {
   assert.equal(C.errorSentence(409, '{"error":"Stop the session before archiving it."}'), "Stop the session before archiving it.");
   assert.equal(C.errorSentence(500, ""), "The request failed (500).");
