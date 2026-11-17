@@ -56,7 +56,10 @@
 //!   the journal key when the core has it.
 //! - **Model switches:** a session is relaxed-alignment (one tier up for six categories) when its `session_start`'s
 //!   lineage or its profile says so (`source::prime`), and from a `model_switched` onto a relaxed model on (its
-//!   `to.lineage`, or `to.profile` among the configuration's relaxed profiles); a switch back does not lower it.
+//!   `to.lineage`, or `to.profile` among the configuration's relaxed profiles); a switch back does not lower it. The
+//!   session is named in the `relaxed` of the `cursor` entry that checkpoints the switch, and `prime` reads the fold's
+//!   set, so a restart that resumes past the switch keeps the uptier: after a switch back too, and for a model whose
+//!   served id, not its configured one, made it relaxed.
 //! - **Census:** `Monitor::census` hands the core the last process census and the sessions that have ended; the core
 //!   runs TW-20 over it (S2 for processes of an ended session, S3 when one listens or connects) and feeds the fleet
 //!   book's listeners.
@@ -70,7 +73,7 @@
 //! disabled core keeps the precision list; an S1 target back inside the window counts; a net decision is judged after its grace and after the log; a
 //! mission's authorization follows its journal and its operator messages; the fleet scan runs on its period and reports
 //! once; a memory core writes no file; the status counts what was read; a switch onto a relaxed model uptiers the
-//! session's later hits and a switch back does not lower them.
+//! session's later hits and a switch back does not lower them, across a restart too.
 
 use crate::census::CensusView;
 use crate::monitor::auth::{AuthFacts, Authorization};
@@ -226,6 +229,8 @@ pub struct Core {
     unattr_cur: Cursor,
     shared_faults: BTreeMap<String, String>,
     dirty_cursors: BTreeSet<String>,
+    /// Sessions a switch uptiered since the last checkpoint, written with it (`relaxed` of a `cursor` entry).
+    new_relaxed: BTreeSet<String>,
     first_start: bool,
     started: bool,
     last_discover: u64,
@@ -310,6 +315,7 @@ impl Core {
             unattr_cur: Cursor::default(),
             shared_faults: BTreeMap::new(),
             dirty_cursors: BTreeSet::new(),
+            new_relaxed: BTreeSet::new(),
             first_start: false,
             started: false,
             last_discover: 0,
@@ -772,7 +778,9 @@ impl Core {
             return true;
         }
         let Some(p) = source::prime(&src.dir, name) else { return false };
-        let relaxed = p.ctx.relaxed || self.env.relaxed_profiles.contains(&p.profile);
+        // A switch onto a relaxed model that a checkpoint passed before a restart is not read again: the fold keeps it.
+        let relaxed =
+            p.ctx.relaxed || self.env.relaxed_profiles.contains(&p.profile) || self.fold.relaxed.contains(name);
         let mut ctx = p.ctx.clone();
         ctx.relaxed = relaxed;
         let mission = ctx.mission.clone();
@@ -851,6 +859,8 @@ impl Core {
                     if !ctx.relaxed && self.switched_to_relaxed(m) {
                         ctx.relaxed = true;
                         self.engine.set_ctx(ctx.clone());
+                        // Checkpointed with the cursor that passes this record, so a restart keeps it.
+                        self.new_relaxed.insert(name.to_string());
                     }
                 }
                 if skip {
@@ -1168,10 +1178,11 @@ impl Core {
     fn housekeeping(&mut self, now: u64, before_seq: u64) {
         if self.log.is_none() {
             self.engine.take_new_secrets();
+            self.new_relaxed.clear();
             return;
         }
         let wrote = self.fold.last_seq != before_seq;
-        let pending = !self.dirty_cursors.is_empty() || self.engine.has_new_secrets();
+        let pending = !self.dirty_cursors.is_empty() || self.engine.has_new_secrets() || !self.new_relaxed.is_empty();
         if pending && (wrote || now.saturating_sub(self.last_checkpoint) >= CHECKPOINT_EVERY_MS) {
             let mut map = Map::new();
             for k in std::mem::take(&mut self.dirty_cursors) {
@@ -1188,6 +1199,10 @@ impl Core {
             let mut f = obj(serde_json::json!({ "cursors": map }));
             if !secrets.is_empty() {
                 f.insert("secrets".into(), Value::Array(secrets));
+            }
+            let relaxed: Vec<Value> = std::mem::take(&mut self.new_relaxed).into_iter().map(Value::String).collect();
+            if !relaxed.is_empty() {
+                f.insert("relaxed".into(), Value::Array(relaxed));
             }
             self.emit(EntryKind::Cursor, f);
             self.last_checkpoint = now;

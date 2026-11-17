@@ -2644,6 +2644,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::at(dir.path().join("home"));
         assert_eq!(cmd_config(&paths, ConfigAction::Init), Ok(0));
+        // The start-up checks run before the model policy, and seatbelt (the default) is macOS's: with no OS
+        // sandbox they pass on every host, so the check reaches the policy on Linux too.
+        let init = std::fs::read_to_string(paths.config_file()).unwrap();
+        std::fs::write(paths.config_file(), format!("{init}\n[sandbox]\nmode = \"none\"\n")).unwrap();
         let err = cmd_config(&paths, ConfigAction::Check).unwrap_err();
         assert!(err.starts_with("The model policy is not settled"), "{err}");
         let text = std::fs::read_to_string(paths.config_file()).unwrap();
@@ -2853,17 +2857,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::at(dir.path().join("home"));
         std::fs::create_dir_all(&paths.home).unwrap();
-        let text = "[models.dsv41]\nbase_url = \"http://10.0.0.5:8000/v1\"\nfamily = [\"deepseek\"]\nalignment = \"stock\"\nrecipient = \"lan\"\n";
+        // The start-up checks run before the model policy, and seatbelt (the default) is macOS's: with no OS
+        // sandbox they pass on every host, so the check reaches the policy on Linux too.
+        let text = "[sandbox]\nmode = \"none\"\n\n[models.dsv41]\nbase_url = \"http://10.0.0.5:8000/v1\"\nfamily = [\"deepseek\"]\nalignment = \"stock\"\nrecipient = \"lan\"\n";
         std::fs::write(paths.config_file(), text).unwrap();
         let err = cmd_config(&paths, ConfigAction::Check).unwrap_err();
         assert!(err.contains("models.dsv41 has no eligible reviewer in the core pack"), "{err}");
         assert!(err.contains("tripwires_only_profiles = [\"dsv41\"]"), "{err}");
         std::fs::write(paths.config_file(), format!("{text}[monitor]\ntripwires_only_profiles = [\"dsv41\"]\n"))
             .unwrap();
-        // Past the model policy only the start-up checks remain, and seatbelt (the default) is macOS's.
-        if cfg!(target_os = "macos") {
-            assert_eq!(cmd_config(&paths, ConfigAction::Check), Ok(0));
-        }
+        assert_eq!(cmd_config(&paths, ConfigAction::Check), Ok(0));
         assert_eq!(cmd_models_lineage(&paths, None), Ok(0));
         assert_eq!(cmd_models_lineage(&paths, Some("dsv41")), Ok(0));
         let err = cmd_models_lineage(&paths, Some("nope")).unwrap_err();

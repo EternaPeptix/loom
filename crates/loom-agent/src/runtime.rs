@@ -126,7 +126,8 @@
 //!     started and not yet recorded, so that a restored session keeps its authorizations.
 //!     The policy then has the infrastructure deny (E1): `with_infrastructure(infra_spec(&config))`: the
 //!     daemon's port (`sandbox.daemon_port`), the `host:port` of every model profile's `base_url` (those of the
-//!     start-up configuration and those of the live set a reload made, `Inner::infra_config`), the box's
+//!     start-up configuration, of the live set, and of every profile a reload made live since the start, kept after
+//!     a later reload removes or changes it: `Inner::infra_config`), the box's
 //!     `ssh_host` when the box is enabled, and `network.infrastructure`; `Runtime::start` parses them once
 //!     and refuses to start on an entry it cannot read (`The network configuration cannot be used: …`). The
 //!     spec also carries what `crate::infra` resolved (the box's Docker host from `ssh -G`, the addresses of
@@ -134,7 +135,8 @@
 //!     of the form `user@host` or `ssh://user@host:2222` is reduced to its host, and one whose host the policy
 //!     cannot read is left out with a warning. `Runtime::start` sets `config.sandbox.infra_ports` (the loopback
 //!     ports of model endpoints and `network.infrastructure`, `crate::infra::loopback_ports`); `sandbox_cfg_for`
-//!     adds those of the live profiles' endpoints.
+//!     adds those of the endpoints of the profiles `Inner::infra_config` holds, when the sandbox is made: a running
+//!     session's sandbox keeps the ports it was made with.
 //!     Hosts the operator revoked in this run (`revoke_scope`) are left out of `granted_hosts`.
 //!     Every session gets a grant, also under `deny_all` (in-process fetches go through the proxy
 //!     too, so the policy is what refuses them).
@@ -213,6 +215,11 @@
 //!   A fork selecting a different profile is refused. Distinct verifier profile checks compare names,
 //!   not model families. Discovery and limiter selection follow the chosen profile.
 //! - a request with `harness: true` (the finish gate's verifier) is exempt from both of the last two rules.
+//! - whatever selected the profile (the mission's choice, the pack, the lead's own), `harness` requests included, one
+//!   with `purpose = "review"` in the live set is refused (`The model profile "{p}" has purpose = "review": it is a
+//!   reviewer's, and agents started on it would run unreviewed. …`). `set_role_model` and `reload_models` refuse to make such a choice,
+//!   but `Runtime::start` checks no saved `role_models`: a restart onto a config that turned a chosen profile into
+//!   a reviewer's is caught here, and the choice stays until the operator changes it (`loom models role`).
 //! - the actual child role's `requires_credential` requires explicit matching asset/credential IDs from
 //!   the parent's mission. Missing, unattested, wrong-asset and expired observations refuse dispatch
 //!   before allocation, including harness requests. Canonical IDs are persisted in the brief context.
@@ -518,13 +525,19 @@
 //!   on a changed profile that has not ended (archived ones included) is switched to it again as above,
 //!   with reason `profile reloaded`: a running one records it whatever changed (`settings_changed`: the
 //!   server or `extra_body` may have); one without a task records it
-//!   when next opened only if its model, window or replay policy changed. Sessions still on a removed profile are named in the report: a
+//!   when next opened only if its model, window, lineage (what the monitor knows of it) or replay policy changed. Sessions still on a removed profile are named in the report: a
 //!   running one keeps its client; an idle one cannot be activated until it is switched. A new or
 //!   changed profile whose `api_key_env` is not set in the daemon's environment is noted too (the
-//!   environment is the one the daemon started with). When a profile was added or changed, the
-//!   infrastructure deny takes its endpoint at once (`refresh_infrastructure`: the names resolved again outside
-//!   tests, the floor's policy rebuilt, the policy of every session holding a proxy grant derived again); a
-//!   removed or changed profile's old endpoint stays denied until the restart. The report is a [`ModelsReload`].
+//!   environment is the one the daemon started with). A new or changed profile whose endpoint the infrastructure
+//!   deny cannot read (`http://gpu:/v1`, a host that is not ASCII) refuses the reload, changing nothing (`Profile
+//!   "{name}" cannot be used, so nothing was changed: …`), as `Runtime::start` refuses such a start-up profile. When a
+//!   profile was added or changed, the infrastructure deny takes its endpoint at once (`refresh_infrastructure`: the
+//!   names resolved again outside tests, the floor's policy rebuilt, the policy of every session holding a proxy
+//!   grant derived again); a removed or changed profile's old endpoint, a start-up one or one a reload made live,
+//!   stays denied until the restart (`Inner::reloaded_profiles`). A loopback endpoint's port is refused by the
+//!   sandboxes made from then on, not by those of running sessions (a sandbox is made with its session): when
+//!   `sandbox.loopback_all` or `sandbox.loopback_ports` lets commands connect to that port, the report notes that
+//!   the commands of running sessions can still reach it until the restart. The report is a [`ModelsReload`].
 //! - `answer(item_id, answer)`: the item must be open (`There is no open inbox item {item_id}.`);
 //!   an empty answer to a blocking item is refused (`This item is waiting for an answer; write
 //!   one.`); activate the session; `Input::Answer`; a non-empty answer also resumes the session's
@@ -2017,6 +2030,29 @@ impl Drop for RevokeOnDrop<'_> {
     }
 }
 
+/// What a reload tells the operator of the profiles it made live (`made`: name and profile) that are served on this
+/// machine at a port the sandbox settings let commands connect to (`loopback_all`, `loopback_ports`): the sandboxes
+/// made from now on refuse that port (`infra_ports`), but those of running sessions were made without it. Nothing
+/// under `mode = "none"`, which confines no command anyway.
+fn loopback_reload_notes(sandbox: &SandboxCfg, made: &[(String, loom_core::config::ModelProfile)]) -> Vec<String> {
+    if sandbox.mode == SandboxMode::None {
+        return Vec::new();
+    }
+    let mut notes = Vec::new();
+    for (name, p) in made {
+        for port in crate::infra::endpoint_loopback_ports(endpoint_of(&p.base_url)) {
+            let open = sandbox.loopback_all || sandbox.loopback_ports.contains(&port);
+            if open && !sandbox.infra_ports.contains(&port) {
+                let by = if sandbox.loopback_all { "sandbox.loopback_all" } else { "sandbox.loopback_ports" };
+                notes.push(format!(
+                    "Profile \"{name}\" is served on this machine at port {port}, which {by} lets commands connect to: the sandboxes made from now on refuse it, but the commands of sessions already running can still reach it until the daemon restarts (`loom down && loom up`)."
+                ));
+            }
+        }
+    }
+    notes
+}
+
 /// The sandbox configuration a session of `role` runs under.
 /// Every model profile's `api_key_env` name is withheld from its commands.
 fn sandbox_cfg_for(
@@ -2288,6 +2324,14 @@ fn is_review_profile(p: &loom_core::config::ModelProfile) -> bool {
     p.purpose == Some(ProfilePurpose::Review)
 }
 
+/// Why no agent is chosen for, or started on, the review profile `profile` (a role choice, and a spawn whatever
+/// selected the profile: a choice saved before a restart made the profile a reviewer's is refused here too).
+fn review_agent_refusal(profile: &str) -> String {
+    format!(
+        "The model profile \"{profile}\" has purpose = \"review\": it is a reviewer's, and agents started on it would run unreviewed. Choose an agent profile, or change its purpose."
+    )
+}
+
 /// Refusal of choosing `profile` for `role` in a mission whose lead has role `lead` and runs on
 /// `lead_profile`: the role (as [`check_choice_role`]), an unknown profile, a review profile
 /// (`purpose = "review"`), or the finish gate's verifier on the lead's own profile when the pack wants
@@ -2307,11 +2351,7 @@ fn check_role_choice(
                 models.names()
             ));
         }
-        Some(rt) if is_review_profile(rt.client.profile()) => {
-            return Err(format!(
-                "The model profile \"{profile}\" has purpose = \"review\": it is a reviewer's, and agents started on it would run unreviewed. Choose an agent profile, or change its purpose."
-            ));
-        }
+        Some(rt) if is_review_profile(rt.client.profile()) => return Err(review_agent_refusal(profile)),
         Some(_) => {}
     }
     if lead.verifier.as_deref() == Some(role) && lead.require_distinct_verifier_profile && profile == lead_profile {
@@ -2353,6 +2393,10 @@ struct Inner {
     models: std::sync::RwLock<Arc<ModelTable>>,
     /// Held by a reload and by a switch, so that model changes apply one at a time.
     model_changes: tokio::sync::Mutex<()>,
+    /// Every profile a reload made live since the start (added or changed), kept when a later reload removes or
+    /// changes it again: a session may still run on it, so its endpoint stays infrastructure until the restart
+    /// (`infra_config`). It only grows.
+    reloaded_profiles: Mutex<Vec<loom_core::config::ModelProfile>>,
     proxy: Proxy,
     state: Mutex<State>,
     /// Held across a scan of a mission's logs (`scan_outputs`).
@@ -2546,13 +2590,18 @@ impl Inner {
     }
 
     /// The configuration the infrastructure deny is built from: the start-up one, whose `[models]` also holds every
-    /// profile of the live set (`reload_models` adds and changes profiles while the daemon runs). A profile that was
-    /// removed or changed keeps its start-up endpoint denied too: a session may still run on it.
+    /// profile of the live set and every profile a reload made live since the start (`reloaded_profiles`). A profile
+    /// that was removed or changed, at the start or by a reload, keeps its old endpoint denied until the restart: a
+    /// session may still run on it. The sandboxes take the loopback ports of the same profiles (`sandbox_cfg_for`).
     fn infra_config(&self) -> Config {
         let mut config = self.config.clone();
         for (name, profile) in self.models().configs() {
             // Keyed apart from the start-up profiles; only the values are read.
             config.models.insert(format!("{name} (live)"), profile);
+        }
+        let reloaded = self.reloaded_profiles.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        for (i, profile) in reloaded.into_iter().enumerate() {
+            config.models.insert(format!("{i} (reloaded)"), profile);
         }
         config
     }
@@ -2748,7 +2797,7 @@ impl Orchestrator for Orch {
         let identity = parent.as_str().to_string();
         let (base, models, port) = (
             inner.config.sandbox.clone(),
-            inner.models().configs(),
+            inner.infra_config().models,
             // The commands run with the parent's environment, so on the parent's listener.
             inner.proxy.session_port(parent),
         );
@@ -3686,7 +3735,7 @@ impl Inner {
         let tmp = std::fs::canonicalize(&tmp).map_err(|e| format!("cannot resolve {}: {e}", tmp.display()))?;
         let copies = self.paths.copies_dir();
         let cfg = with_copies(
-            sandbox_cfg_for(&self.config.sandbox, &role, &workspace, &models.configs()),
+            sandbox_cfg_for(&self.config.sandbox, &role, &workspace, &self.infra_config().models),
             &copies,
             meta.copy_of.as_deref(),
         );
@@ -4130,7 +4179,7 @@ impl Inner {
             .map(|p| (p.meta.pack.clone(), p.meta.role.clone()))
             .ok_or_else(|| "Only the lead session of a mission can start agents.".to_string())?;
         let role = self.packs.role(Some(&pack), Some(&role))?.clone();
-        let mut judge_cfg = sandbox_cfg_for(&self.config.sandbox, &role, &source, &self.models().configs());
+        let mut judge_cfg = sandbox_cfg_for(&self.config.sandbox, &role, &source, &self.infra_config().models);
         judge_cfg.mode = loom_core::config::SandboxMode::None;
         let (home, tmp) = (self.paths.home.clone(), self.paths.session_tmp(parent));
         let limits = workcopy::Limits {
@@ -4207,6 +4256,7 @@ impl Inner {
         }
         // Reserve rotation before discovery: parallel fanout siblings get different slots. Restarts
         // derive the initial cursor from persisted child metadata rather than a process-global counter.
+        let models = self.models();
         let (profile_name, inherited_model, inherited_window) = {
             let mut st = self.st();
             let p = st
@@ -4268,6 +4318,11 @@ impl Inner {
             };
             *cursor = cursor.saturating_add(1);
             let profile = selected.unwrap_or_else(|| inherited.0.clone());
+            // Whatever selected it: a mission's choice saved before the profile became a reviewer's (a restart
+            // onto a config with `purpose = "review"` checks no saved choice), the pack's, or the lead's own.
+            if models.get(&profile).is_some_and(|rt| is_review_profile(rt.client.profile())) {
+                return Err(review_agent_refusal(&profile));
+            }
             if req.mode == SpawnMode::Fork && profile != inherited.0 {
                 return Err(texts::cross_profile_fork(&inherited.0, &profile));
             }
@@ -5310,6 +5365,7 @@ impl Runtime {
             key,
             models: std::sync::RwLock::new(models),
             model_changes: tokio::sync::Mutex::new(()),
+            reloaded_profiles: Mutex::new(Vec::new()),
             proxy,
             state: Mutex::new(State::default()),
             scan_lock: tokio::sync::Mutex::new(()),
@@ -6110,8 +6166,18 @@ impl Runtime {
             }
         }
         let old = self.inner.models();
+        // A new or changed endpoint is infrastructure from the reload on, so the deny must be able to read it, as
+        // `Runtime::start` requires of the start-up profiles: otherwise every policy built afterwards (a new session,
+        // an activation, an agent, a grant) would fail. `ModelClient::new` accepts more than the deny reads.
+        for (name, p) in cfg.models.iter().filter(|(n, p)| old.get(n).is_none_or(|rt| rt.client.profile() != *p)) {
+            let mut one = self.inner.config.clone();
+            one.models = BTreeMap::from([(name.clone(), p.clone())]);
+            infra_policy(&one, &crate::infra::Resolution::default())
+                .map_err(|e| format!("Profile \"{name}\" cannot be used, so nothing was changed: {e}"))?;
+        }
         let mut report = ModelsReload { default_model: cfg.default_model.clone(), ..ModelsReload::default() };
         let mut profiles = BTreeMap::new();
+        let mut made_live = Vec::new();
         for (name, p) in &cfg.models {
             match old.get(name) {
                 Some(rt) if rt.client.profile() == p => {
@@ -6121,6 +6187,7 @@ impl Runtime {
                     let client = ModelClient::new(name, p.clone(), &self.inner.paths.model_keys_dir())
                         .map_err(|e| e.to_string())?;
                     profiles.insert(name.clone(), Arc::new(ProfileRt::new(client, p.max_concurrent)));
+                    made_live.push((name.clone(), p.clone()));
                     if before.is_some() {
                         report.changed.push(name.clone());
                     } else {
@@ -6138,9 +6205,19 @@ impl Runtime {
             }
         }
         report.removed = old.profiles.keys().filter(|n| !cfg.models.contains_key(*n)).cloned().collect();
+        report.notes.extend(loopback_reload_notes(&self.inner.config.sandbox, &made_live));
+        // Kept before the table changes, and after the next reload too: the deny never loses an endpoint until the
+        // restart, though a later reload removes or changes the profile (a session may still run on it).
+        self.inner
+            .reloaded_profiles
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .extend(made_live.into_iter().map(|(_, p)| p));
         *self.inner.models.write().unwrap_or_else(|p| p.into_inner()) =
             Arc::new(ModelTable { default_model: cfg.default_model.clone(), profiles });
-        // A new or changed endpoint is infrastructure at once, for the commands of every session (E1).
+        // A new or changed endpoint is infrastructure at once for every connection through the proxy, those of every
+        // session's commands included (E1). A loopback endpoint's port is refused by the sandboxes made from now on:
+        // those of running sessions keep the ports they were made with until they are made again (`sandbox_cfg_for`).
         if !report.added.is_empty() || !report.changed.is_empty() {
             self.inner.refresh_infrastructure().await;
         }
@@ -8176,6 +8253,93 @@ mod tests {
         let cfg = sandbox_cfg_for(&e.rt.inner.config.sandbox, &role, Path::new("/ws"), &e.rt.inner.models().configs());
         assert!(cfg.infra_ports.contains(&9123), "{:?}", cfg.infra_ports);
         e.rt.shutdown().await;
+    }
+
+    /// A session may still run on a profile a later reload removed, so its endpoint stays infrastructure until the
+    /// restart: for the grants refused, the policies derived again, and the sandboxes made from then on.
+    #[tokio::test]
+    async fn an_endpoint_a_reload_made_live_stays_infrastructure_after_a_later_reload_removes_it() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
+        let id = info.meta.id.clone();
+        until("idle", || e.rt.session(&id).is_some_and(|s| s.status.phase == Phase::Idle)).await;
+        // The operator granted the host before it was a model endpoint.
+        e.rt.grant_scope(&id, &["gpu2.example.com:443".to_string()], None).await.unwrap();
+        let rule = || e.rt.inner.proxy.check_name(&id, "gpu2.example.com", 443).map(|v| v.rule).unwrap_or_default();
+        assert!(rule().starts_with("allow "), "{}", rule());
+        let file = e.rt.paths().config_file();
+        let mut cfg = e.config.clone();
+        for (name, url) in [("gpu2", "https://gpu2.example.com/v1"), ("near", "http://127.0.0.1:9124/v1")] {
+            let mut p = cfg.models["mock"].clone();
+            p.base_url = url.into();
+            cfg.models.insert(name.into(), p);
+        }
+        std::fs::write(&file, toml::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(e.rt.reload_models().await.unwrap().added, ["gpu2", "near"]);
+        assert!(rule().starts_with("deny infrastructure: model endpoint gpu2.example.com:443"), "{}", rule());
+        // Reload 2 removes both; nothing on the books may reach them before the restart.
+        std::fs::write(&file, toml::to_string(&e.config).unwrap()).unwrap();
+        assert_eq!(e.rt.reload_models().await.unwrap().removed, ["gpu2", "near"]);
+        // What the periodic refresher does: the floor and every granted session's policy are built again.
+        e.rt.inner.refresh_infrastructure().await;
+        assert!(rule().starts_with("deny infrastructure: model endpoint gpu2.example.com:443"), "{}", rule());
+        let err = e.rt.grant_scope(&id, &["127.0.0.1:9124".to_string()], None).await.unwrap_err();
+        assert!(err.contains("deny infrastructure: "), "{err}");
+        let spec = infra_spec(&e.rt.inner.infra_config());
+        assert!(spec.model_endpoints.iter().any(|m| m == "gpu2.example.com:443"), "{:?}", spec.model_endpoints);
+        let role = e.rt.inner.packs.role(None, None).unwrap().clone();
+        let cfg =
+            sandbox_cfg_for(&e.rt.inner.config.sandbox, &role, Path::new("/ws"), &e.rt.inner.infra_config().models);
+        assert!(cfg.infra_ports.contains(&9124), "{:?}", cfg.infra_ports);
+        e.rt.shutdown().await;
+    }
+
+    /// The start refuses an endpoint the infrastructure deny cannot read; so does a reload, changing nothing, rather
+    /// than leave every policy built afterwards failing.
+    #[tokio::test]
+    async fn a_reload_refuses_an_endpoint_the_infrastructure_deny_cannot_read() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let file = e.rt.paths().config_file();
+        for url in ["http://gpu:/v1", "http://mod\u{e8}le.lan:8000/v1"] {
+            let mut cfg = e.config.clone();
+            let mut p = cfg.models["mock"].clone();
+            p.base_url = url.into();
+            cfg.models.insert("gpu".into(), p);
+            std::fs::write(&file, toml::to_string(&cfg).unwrap()).unwrap();
+            let err = e.rt.reload_models().await.unwrap_err();
+            assert!(err.starts_with("Profile \"gpu\" cannot be used, so nothing was changed: "), "{url}: {err}");
+            assert!(e.rt.health().await.iter().all(|h| h.profile != "gpu"), "{url}");
+            assert!(check_infrastructure(&e.rt.inner.infra_config()).is_ok(), "{url}");
+        }
+        // Every session is still built: the deny was not handed an endpoint it cannot read.
+        let id = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
+        until("idle", || e.rt.session(&id).is_some_and(|s| s.status.phase == Phase::Idle)).await;
+        e.rt.grant_scope(&id, &["lab.example.test".to_string()], None).await.unwrap();
+        e.rt.shutdown().await;
+    }
+
+    #[test]
+    fn a_reload_says_when_running_sandboxes_still_allow_a_new_loopback_endpoint() {
+        let near =
+            |url: &str| vec![("near".to_string(), ModelProfile { base_url: url.into(), ..ModelProfile::default() })];
+        let mut sandbox = SandboxCfg { loopback_ports: vec![8001], infra_ports: vec![8000], ..SandboxCfg::default() };
+        let notes = loopback_reload_notes(&sandbox, &near("http://127.0.0.1:8001/v1"));
+        assert_eq!(notes.len(), 1);
+        assert!(
+            notes[0].contains("\"near\"")
+                && notes[0].contains("port 8001")
+                && notes[0].contains("sandbox.loopback_ports")
+        );
+        assert!(notes[0].contains("sessions already running"), "{}", notes[0]);
+        // Not reachable under the loopback settings, already refused at the start, or not on this machine: nothing.
+        assert!(loopback_reload_notes(&sandbox, &near("http://127.0.0.1:8002/v1")).is_empty());
+        assert!(loopback_reload_notes(&sandbox, &near("http://localhost:8000/v1")).is_empty());
+        assert!(loopback_reload_notes(&sandbox, &near("http://10.0.0.5:8001/v1")).is_empty());
+        sandbox.loopback_all = true;
+        let notes = loopback_reload_notes(&sandbox, &near("http://localhost:8002/v1"));
+        assert!(notes.len() == 1 && notes[0].contains("sandbox.loopback_all"), "{notes:?}");
+        sandbox.mode = SandboxMode::None;
+        assert!(loopback_reload_notes(&sandbox, &near("http://localhost:8002/v1")).is_empty(), "nothing is confined");
     }
 
     /// The tailnet case: the model host is configured by name, the agent asks for its IP address.
@@ -13430,6 +13594,79 @@ mod tests {
         assert_eq!(live.lead_model.profile, "other");
         assert_eq!(live.profiles, ["mock", "other"], "a review profile is not offered");
         e.rt.shutdown().await;
+    }
+
+    /// `loom down && loom up` onto a config that makes a chosen profile a reviewer's checks no saved choice: the agent
+    /// is refused when it would start on it.
+    #[tokio::test]
+    async fn a_saved_choice_of_a_profile_a_restart_made_a_reviewers_starts_no_agent() {
+        let e = env_with(Script::new(|_, _| Action::Stall { ms: 600_000 }), false, |c| {
+            let mock = c.models["mock"].clone();
+            c.models.insert("other".into(), mock);
+        })
+        .await;
+        let mut new = e.new_session(None);
+        new.role_models = std::collections::BTreeMap::from([("worker".to_string(), "other".to_string())]);
+        let id = e.rt.create_session(new).await.unwrap().meta.id;
+        e.rt.shutdown().await;
+        let mut cfg = e.config.clone();
+        cfg.models.get_mut("other").unwrap().purpose = Some(loom_core::config::ProfilePurpose::Review);
+        let rt2 = Runtime::start(cfg, Paths::at(e.dir.path().join("home"))).await.unwrap();
+        assert_eq!(rt2.session(&id).unwrap().meta.role_models.get("worker").map(String::as_str), Some("other"));
+        rt2.send_message(&id, "go").await.unwrap();
+        let req = || SpawnReq {
+            role: "worker".into(),
+            mode: SpawnMode::Fresh,
+            brief: Default::default(),
+            budget: Budget::default(),
+            call_id: CallId::from("c1"),
+            title: "t".into(),
+            awaited: false,
+            harness: false,
+            prerequisite: None,
+            workspace: Workspace::Shared,
+        };
+        let err = rt2.inner.orch.spawn(&id, req()).await.unwrap_err();
+        assert!(err.contains("\"other\" has purpose = \"review\"") && err.contains("unreviewed"), "{err}");
+        assert!(rt2.inner.st().known.values().all(|k| k.meta.parent.is_none()), "no agent was made");
+        // The operator's way out: another choice, and the agent starts.
+        rt2.set_role_model(&id, "worker", Some("mock"), false).await.unwrap();
+        let child = rt2.inner.orch.spawn(&id, req()).await.unwrap();
+        assert_eq!(rt2.session(&child).unwrap().meta.profile, "mock");
+        rt2.shutdown().await;
+    }
+
+    /// A reload that only reclassifies a profile (its `alignment`) reaches a session without a task through its
+    /// `meta.json`; the switch is recorded when the session is next opened, so the monitor sees the new lineage.
+    #[tokio::test]
+    async fn a_reload_that_reclassifies_the_profile_of_an_idle_session_is_recorded_when_it_next_runs() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let id = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
+        until("inbox", || e.rt.inbox().iter().any(|i| i.session == id)).await;
+        // Dismissed, nothing asks for the session at the next start: it stays without a task.
+        let item = e.rt.inbox().remove(0).item.item_id;
+        e.rt.answer(&item, "").await.unwrap();
+        let status = e.rt.paths().session_dir(&id).join("status.json");
+        until("status published", || std::fs::read_to_string(&status).is_ok_and(|s| s.contains("\"open_inbox\": 0")))
+            .await;
+        e.rt.shutdown().await;
+        let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
+        assert!(!rt2.session(&id).unwrap().active);
+        let mut cfg = e.config.clone();
+        cfg.models.get_mut("mock").unwrap().alignment = Some(loom_core::lineage::Alignment::Relaxed);
+        std::fs::write(rt2.paths().config_file(), toml::to_string(&cfg).unwrap()).unwrap();
+        let r = rt2.reload_models().await.unwrap();
+        assert_eq!((r.changed.as_slice(), r.rebound.as_slice()), (&["mock".to_string()][..], &[id.clone()][..]));
+        assert!(switches(rt2.records(&id, None, 2_000).unwrap()).is_empty(), "recorded when it runs");
+        rt2.send_message(&id, "again").await.unwrap();
+        until("the switch recorded", || !switches(rt2.records(&id, None, 2_000).unwrap()).is_empty()).await;
+        let sw = switches(rt2.records(&id, None, 2_000).unwrap());
+        assert_eq!(sw.len(), 1);
+        assert_eq!((sw[0].to.profile.as_str(), sw[0].reason.as_str()), ("mock", crate::session::SWITCH_IDLE));
+        let alignment = |m: &ModelRef| m.lineage.as_ref().map(|l| l.alignment);
+        assert_eq!(alignment(&sw[0].to), Some(loom_core::lineage::Alignment::Relaxed));
+        assert_ne!(alignment(&sw[0].from), alignment(&sw[0].to));
+        rt2.shutdown().await;
     }
 
     #[tokio::test]

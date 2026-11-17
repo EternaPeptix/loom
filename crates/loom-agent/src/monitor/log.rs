@@ -58,6 +58,9 @@
 //! - A `cursor` entry may carry `secrets: [[tag, mission, ts_ms], ...]`: the hashed credential values that missions'
 //!   results showed since the last checkpoint (TW-06). The fold keeps them as a `SecretIndex` (30 days; at most
 //!   `SECRETS_PER_MISSION` per mission, the oldest of that mission first), so a restart keeps the index.
+//! - A `cursor` entry may carry `relaxed: [session, ...]`: the sessions a `model_switched` onto a relaxed-alignment model
+//!   uptiered since the last checkpoint, written with the cursor that passed the switch. The fold keeps the set
+//!   (`Fold::relaxed`), so a restart that resumes past the switch keeps the uptier.
 //! - A restart marks every review that was requested and has no verdict `fault: restart`; that is not counted (I10).
 //!
 //! Built by: M2 (open, fold, append, heartbeat, reserve, anchor); M3 (pause and halt entries are applied through
@@ -416,6 +419,9 @@ pub struct Fold {
     pub halts: BTreeSet<Cohort>,
     /// The latest checkpoint of every source.
     pub cursors: BTreeMap<String, Cursor>,
+    /// Sessions (by directory name) that a `model_switched` onto a relaxed-alignment model uptiered, from the `relaxed`
+    /// of `cursor` entries: a restart resumes past the switch and keeps the uptier.
+    pub relaxed: BTreeSet<String>,
     /// Flags by id, as last written.
     pub flags: BTreeMap<String, FlagRec>,
     /// The history of each (mission, tripwire number).
@@ -472,6 +478,9 @@ impl Fold {
                 }
             }
             EntryKind::Cursor => {
+                if let Some(names) = e.fields.get("relaxed").and_then(Value::as_array) {
+                    self.relaxed.extend(names.iter().filter_map(Value::as_str).map(str::to_string));
+                }
                 if let Some(rows) = e.fields.get("secrets").and_then(Value::as_array) {
                     for row in rows {
                         if let (Some(tag), Some(m), Some(ts)) = (

@@ -469,7 +469,10 @@ holds `eligible`, `select`, `select_with_verifier`, `reachable_profiles`, `check
   words "not LLM-reviewed" in `loom ls`/`loom status`, reachability and vet facts (`Facts`), and the refusal of a spawn that
   collides with the reviewer. Since the merge of model switching (below), `model_switched` carries the new profile's
   lineage in `to.lineage` (resolved from the live profile, as `session_start`'s now is), and the core treats a session
-  switched onto a relaxed model as relaxed from that record on (a switch back does not lower it).
+  switched onto a relaxed model as relaxed from that record on (a switch back does not lower it). The uptier survives a
+  restart: the `cursor` entry that checkpoints past the switch names the session in `relaxed`, and the fold keeps it.
+  A reload that changes only a profile's lineage (`family`, `alignment`) is recorded as a `model_switched` too, also for
+  a session that had no task then (when it is next opened).
 
 **No eligible reviewer.**
 - The profile must be listed in `[monitor] tripwires_only_profiles` (an explicit, recorded choice). Otherwise `loom config check` fails, and **real-target** missions on that profile are refused at creation with a sentence naming the choices. Lab missions are not refused.
@@ -1091,7 +1094,7 @@ purpose = "review"
 
 | kind | fields |
 |---|---|
-| `cursor` | per-source checkpoints |
+| `cursor` | per-source checkpoints; `secrets?` (TW-06 credential tags), `relaxed?` (sessions a switch uptiered) |
 | `heartbeat` | — |
 | `selfprobe` | `{probe, result}` |
 | `review_requested` | `{review, scope: gate\|step\|tree\|fleet, mission, sessions, range, input: sha256, reviewer: {profile, family, model, recipient}, content: full\|features}` |
@@ -1401,6 +1404,7 @@ These are in the tree at P0 and the phases rely on them:
 
 Not in the tree yet, needed by named phases:
 - **Model switching (the ui/pass-2 work), a dependency of M1 and M3:** the `model_switched` record, a mission's `role_models`, `loom models set` and `loom models reload`, and role-model `--now` are in the tree since the merge of the 2026-11-17 release. What the merge settled: a profile with `purpose = "review"` is refused as a role choice, a switch, and a reload that would put a session or a mission's choice on one; `model_switched` records the lineage; the infrastructure deny takes the endpoints of profiles a reload adds; and the monitor's `loom models show [profile]` is `loom models lineage [profile]`, since `loom models show <session>` is a mission's models. Still to build: passing a mission's `role_models` to `reachable_profiles` where `creation_refusal` is wired (M3), the monitor's own view of a reload (`Env` and the reviewer selection read the start-up `[models]`), and the re-choice of a reviewer on a model switch (§2.6).
+  Settled after the merge: a restart checks no saved `role_models`, so an agent's profile is checked when it is started: a choice of a profile the config made `purpose = "review"` (`loom down && loom up` instead of `loom models reload`) refuses the spawn with the role-choice sentence, and the choice stays until the operator changes it. A follow-up could check the role choices of missions that have not ended when the daemon starts, and tell the operator then. A reload refuses a new or changed profile whose endpoint the infrastructure deny cannot read (as the start does), and every endpoint a reload made live stays denied until the restart, though a later reload removes it. A loopback endpoint a reload adds is refused by the sandboxes made from then on only; those of running sessions keep their ports until the restart, and the reload's report says so when the loopback settings let commands connect to it.
 - **The web UI's Agents tab and notification planner (not in this tree yet):** M11.
 - **The audit's open items:** the daemon-port deny and login code off argv (E1); RLIMIT, libproc and box teardown
   (E3); a request-owned seed in the model client (M5); the `creating` state and Parked/Blocker resolution (M3); the

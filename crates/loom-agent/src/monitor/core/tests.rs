@@ -829,4 +829,16 @@ fn a_switch_onto_a_relaxed_model_uptiers_the_session_and_a_switch_back_does_not_
     let relaxed_now = |core: &Core| core.engine.ctx(&SessionId::from("s-1")).map(|c| c.relaxed);
     assert_eq!(relaxed_now(&core), Some(true), "a switch back does not lower it");
     assert_eq!(core.srcs.get("s-1").and_then(|s| s.primed.as_ref()).map(|p| p.ctx.relaxed), Some(true));
+    // The checkpoint that passed the switch names the session, once.
+    let named: Vec<Entry> =
+        of_kind(&h, EntryKind::Cursor).into_iter().filter(|e| e.fields.contains_key("relaxed")).collect();
+    assert_eq!(named.len(), 1);
+    assert_eq!(named[0].fields["relaxed"], serde_json::json!(["s-1"]));
+    // A restart resumes past both switches, and the session started on a stock model: the fold keeps the uptier.
+    drop(core);
+    let mut core = open(&h);
+    assert!(core.fold().relaxed.contains("s-1"));
+    bash(&mut s, "c4", "ps eww 104");
+    core.pump(now + 70_000, &all(), true);
+    assert_eq!(relaxed_now(&core), Some(true), "a restart does not lower it");
 }

@@ -74,7 +74,8 @@
 //!   with no `turn_start` since; the runtime starts a turn for a session that was waiting. Calls
 //!   `deps.ctx.jobs.resume_from(n)` with the highest job number in the log's `job_registered`
 //!   records, those just appended included (`j7` → 7). Then, unless the session has ended, the model:
-//!   when `deps.model` (its profile, model id or window; not its `lineage`, which describes the model) or
+//!   when `deps.model` (its profile, model id or window, and its `lineage` when the log's model has one too: a
+//!   reload that only reclassified the profile is a new model for the monitor) or
 //!   `deps.reasoning_replay` differs from the model the log names (`session_start`'s,
 //!   a fork's from its parent's, then the latest `model_switched`'s), `model_switched{from, to:
 //!   deps.model, reasoning_replay, reason: SWITCH_IDLE}` is appended (it was switched while no task
@@ -656,11 +657,16 @@ pub const SWITCH_RELOADED: &str = "profile reloaded";
 /// The `reason` of a `model_switched` recorded when the session is opened on another model than its log names.
 pub const SWITCH_IDLE: &str = "changed while the session was idle";
 
-/// Whether two records name the same model for the log: profile, served id and window. The lineage the
-/// monitor records with a model (`ModelRef::lineage`) describes it and does not change it, and a log
-/// written before it was recorded has none, so it is left out.
+/// Whether two records name the same model for the log: profile, served id and window, and the lineage the
+/// monitor records with it (`ModelRef::lineage`) when both have one. A reload that changes only a profile's
+/// `family` or `alignment` is a new model for the monitor (a relaxed one uptiers the session), so an idle session
+/// records it when it is next opened. A log written before the lineage was recorded has none: that is not a
+/// change.
 fn same_model(a: &ModelRef, b: &ModelRef) -> bool {
-    a.profile == b.profile && a.model == b.model && a.context_window == b.context_window
+    a.profile == b.profile
+        && a.model == b.model
+        && a.context_window == b.context_window
+        && (a.lineage.is_none() || b.lineage.is_none() || a.lineage == b.lineage)
 }
 
 /// One input of a session's `queued/` directory.
@@ -3877,6 +3883,24 @@ mod tests {
     use loom_tools::Tool;
     use serde_json::json;
     use tokio::sync::mpsc::UnboundedSender;
+
+    /// The log records a reclassified model (a new lineage) as a switch, and a log written before the lineage was
+    /// recorded as none.
+    #[test]
+    fn same_model_compares_the_lineage_when_both_records_have_one() {
+        use loom_core::lineage::Alignment;
+        let lineage = |a: Alignment| {
+            loom_core::lineage::resolve("p", &ModelProfile { alignment: Some(a), ..ModelProfile::default() })
+        };
+        let m = |lineage| ModelRef { profile: "p".into(), model: "m".into(), context_window: 10, lineage };
+        let stock = m(Some(lineage(Alignment::Stock)));
+        assert!(same_model(&stock, &stock.clone()));
+        assert!(same_model(&m(None), &stock), "an old log has no lineage: no change");
+        assert!(same_model(&stock, &m(None)));
+        assert!(!same_model(&stock, &m(Some(lineage(Alignment::Relaxed)))), "reclassified");
+        let wider = ModelRef { context_window: 20, ..stock.clone() };
+        assert!(!same_model(&stock, &wider));
+    }
 
     include!("continuation_tests.rs");
 
