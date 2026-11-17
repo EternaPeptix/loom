@@ -210,11 +210,12 @@ fn count_ascii_bad(s: &str) -> usize {
         .count()
 }
 
-/// True when the input is binary: it has a NUL byte, or more than 30% of its first 8 KiB is neither
-/// printable ASCII, whitespace nor part of valid UTF-8. ESC is not counted against the input: escape
+/// True when the input is binary: NUL bytes are more than 1% of it, or more than 30% of its first 8 KiB
+/// is neither printable ASCII, whitespace nor part of valid UTF-8 (a NUL counts against it). ESC is not counted against the input: escape
 /// sequences are text that normalisation removes.
 fn looks_binary(raw: &[u8]) -> bool {
-    if raw.contains(&0) {
+    let nuls = raw.iter().filter(|b| **b == 0).count();
+    if nuls.saturating_mul(100) > raw.len() {
         return true;
     }
     let head = raw.get(..raw.len().min(8192)).unwrap_or(raw);
@@ -721,6 +722,54 @@ mod tests {
         assert!(!normalize(b"\x1b[1m\x1b[2m\x1b[3m\x1b[4m\x1b[5mx\n").binary);
         assert!(!normalize("日本語のテキスト\n".as_bytes()).binary);
         assert!(!normalize(b"").binary);
+    }
+
+    #[test]
+    fn a_stray_nul_is_escaped_and_the_output_stays_text() {
+        let mut raw = "line of readable text
+"
+        .repeat(20)
+        .into_bytes();
+        raw.extend_from_slice(b"a\x00b\n");
+        let n = normalize(&raw);
+        assert!(!n.binary && n.changed);
+        assert_eq!(n.controls_escaped, 1);
+        assert!(n.text.contains("a\\x00b\n"));
+        assert!(n.text.starts_with("line of readable text\n"));
+    }
+
+    #[test]
+    fn nuls_above_one_percent_make_it_binary() {
+        let mut raw = vec![b'a'; 200];
+        raw[10] = 0;
+        raw[20] = 0;
+        // Two NULs in 200 bytes is exactly 1%: text.
+        assert!(!normalize(&raw).binary);
+        raw[30] = 0;
+        // Three in 200 is 1.5%: binary.
+        let n = normalize(&raw);
+        assert!(n.binary);
+        assert!(n.text.starts_with("binary data, 200 bytes"));
+    }
+
+    #[test]
+    fn for_window_lowers_the_bound_only_for_a_smaller_window() {
+        let p = AdmitPolicy { max_inline_tokens: 8000, head_lines: 7, ..AdmitPolicy::default() };
+        let small = p.for_window(Some(16_000));
+        assert_eq!(small.max_inline_tokens, 2000);
+        assert_eq!(small.head_lines, 7);
+        assert_eq!(small.tail_lines, p.tail_lines);
+        assert_eq!(small.salient_patterns, p.salient_patterns);
+        assert_eq!(p.for_window(Some(1_000_000)).max_inline_tokens, 8000);
+        assert_eq!(p.for_window(None).max_inline_tokens, 8000);
+        assert_eq!(p.for_window(Some(0)).max_inline_tokens, 8000);
+    }
+
+    #[test]
+    fn view_chars_follows_the_estimator() {
+        let p = AdmitPolicy { max_inline_tokens: 100, ..AdmitPolicy::default() };
+        assert_eq!(p.view_chars(&TokenEstimator::with_ratio(2.0)), 200);
+        assert_eq!(p.view_chars(&TokenEstimator::with_ratio(4.0)), 400);
     }
 
     struct Lcg(u64);

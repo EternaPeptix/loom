@@ -65,40 +65,99 @@ pub fn window(start: Option<u64>, end: Option<u64>, total: u64, max_lines: u64) 
     Ok(Some((first, last)))
 }
 
-/// Lines `first..=last` of a stored output as `{n}\t{line}`, long lines shortened.
+/// What [`numbered`] rendered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Numbered {
+    /// The lines as `{n}\t{line}` joined by `\n`; never longer than the `max_chars` asked for (unless one
+    /// character of the first line plus its number does not fit).
+    pub text: String,
+    /// How many of the lines shown were shortened.
+    pub shortened: u64,
+    /// The number of the last line included.
+    pub last: u64,
+}
+
+/// `line` as at most `keep` of its `total` characters, followed by `…[+{k} chars]` when it was cut.
+fn render_line(line: &str, total: usize, keep: usize) -> String {
+    match line.char_indices().nth(keep) {
+        Some((cut, _)) => {
+            let (head, _) = line.split_at(cut);
+            format!("{head}…[+{} chars]", total.saturating_sub(keep))
+        }
+        None => line.to_string(),
+    }
+}
+
+/// Lines `first..=last` of a stored output as `{n}\t{line}`, long lines shortened, and no more lines than
+/// fit in `max_chars` characters. The text ends at a whole line; the first line is always included,
+/// shortened to fit when it alone would pass `max_chars`.
 pub fn numbered(
     blobs: &BlobStore,
     id: &BlobId,
     first: u64,
     last: u64,
     max_line_chars: usize,
-) -> io::Result<(String, u64)> {
+    max_chars: usize,
+) -> io::Result<Numbered> {
     let slice = blobs.read_lines(id, first, last)?;
     if slice.text.is_empty() {
-        return Ok((String::new(), 0));
+        return Ok(Numbered { text: String::new(), shortened: 0, last });
     }
     let body = slice.text.strip_suffix('\n').unwrap_or(&slice.text);
-    let mut out = String::with_capacity(body.len() + 8);
+    let mut out = String::with_capacity(body.len().min(max_chars).saturating_add(8));
+    let mut used = 0usize;
     let mut shortened = 0u64;
     let mut n = slice.first;
+    let mut last_in = slice.first.saturating_sub(1);
     for (i, line) in body.split('\n').enumerate() {
+        let prefix = format!("{n}\t");
+        let prefix_chars = prefix.chars().count();
+        let total = line.chars().count();
+        let mut keep = total.min(max_line_chars);
+        let sep = usize::from(i > 0);
+        let rendered_len = |keep: usize| {
+            let tail = if keep < total { 10usize.saturating_add(digits(total - keep)) } else { 0 };
+            used.saturating_add(sep).saturating_add(prefix_chars).saturating_add(keep).saturating_add(tail)
+        };
+        if rendered_len(keep) > max_chars {
+            if i > 0 {
+                break;
+            }
+            // The first line alone passes the budget: keep as many of its characters as fit, at least one.
+            let mut k = keep;
+            while k > 1 && rendered_len(k) > max_chars {
+                let over = rendered_len(k) - max_chars;
+                k = if k > over { k - over } else { 1 };
+            }
+            keep = k.max(1).min(keep);
+        }
+        let new_used = rendered_len(keep);
         if i > 0 {
             out.push('\n');
         }
-        out.push_str(&n.to_string());
-        out.push('\t');
-        match line.char_indices().nth(max_line_chars) {
-            Some((cut, _)) => {
-                let (head, rest) = line.split_at(cut);
-                out.push_str(head);
-                out.push_str(&format!("…[+{} chars]", rest.chars().count()));
-                shortened += 1;
-            }
-            None => out.push_str(line),
+        out.push_str(&prefix);
+        out.push_str(&render_line(line, total, keep));
+        if keep < total {
+            shortened += 1;
         }
+        used = new_used;
+        last_in = n;
         n = n.saturating_add(1);
     }
-    Ok((out, shortened))
+    Ok(Numbered { text: out, shortened, last: last_in })
+}
+
+fn digits(n: usize) -> usize {
+    n.to_string().len()
+}
+
+/// The fact that says a window ended early for size: `window ended at line {last} to stay within the
+/// size one result may show; continue with start {last+1}`.
+pub fn ended_fact(last: u64) -> String {
+    format!(
+        "window ended at line {last} to stay within the size one result may show; continue with start {}",
+        last.saturating_add(1)
+    )
 }
 
 /// `lines 3-9 of 40 — 31 more below — 2 above`.
@@ -117,6 +176,8 @@ pub fn range_fact(first: u64, last: u64, total: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const BIG: usize = 1_000_000;
 
     fn store() -> (tempfile::TempDir, BlobStore) {
         let dir = tempfile::tempdir().unwrap();
@@ -154,11 +215,11 @@ mod tests {
         let (stored, norm) = store_text(&blobs, b"a\r\nb\x1b[31mred\x1b[0m\nc").unwrap();
         assert!(norm.changed);
         assert_eq!(stored.lines, 3);
-        let (text, short) = numbered(&blobs, &stored.id, 1, 3, 100).unwrap();
-        assert_eq!(text, "1\ta\n2\tbred\n3\tc");
-        assert_eq!(short, 0);
-        let (mid, _) = numbered(&blobs, &stored.id, 2, 2, 100).unwrap();
-        assert_eq!(mid, "2\tbred");
+        let n = numbered(&blobs, &stored.id, 1, 3, 100, BIG).unwrap();
+        assert_eq!(n.text, "1\ta\n2\tbred\n3\tc");
+        assert_eq!((n.shortened, n.last), (0, 3));
+        let mid = numbered(&blobs, &stored.id, 2, 2, 100, BIG).unwrap();
+        assert_eq!(mid.text, "2\tbred");
     }
 
     #[test]
@@ -166,15 +227,16 @@ mod tests {
         let (_d, blobs) = store();
         let (stored, _) = store_text(&blobs, b"a\n\nb\n").unwrap();
         assert_eq!(stored.lines, 3);
-        let (text, _) = numbered(&blobs, &stored.id, 1, 3, 10).unwrap();
-        assert_eq!(text, "1\ta\n2\t\n3\tb");
+        let n = numbered(&blobs, &stored.id, 1, 3, 10, BIG).unwrap();
+        assert_eq!(n.text, "1\ta\n2\t\n3\tb");
     }
 
     #[test]
     fn numbered_empty_output() {
         let (_d, blobs) = store();
         let (stored, _) = store_text(&blobs, b"").unwrap();
-        assert_eq!(numbered(&blobs, &stored.id, 1, 10, 10).unwrap(), (String::new(), 0));
+        let n = numbered(&blobs, &stored.id, 1, 10, 10, BIG).unwrap();
+        assert_eq!((n.text.as_str(), n.shortened), ("", 0));
     }
 
     #[test]
@@ -183,11 +245,77 @@ mod tests {
         let long = "héllo wörld ✓✓✓✓";
         let raw = format!("short\n{long}\n");
         let (stored, _) = store_text(&blobs, raw.as_bytes()).unwrap();
-        let (text, short) = numbered(&blobs, &stored.id, 1, 2, 7).unwrap();
-        assert_eq!(short, 1);
-        assert_eq!(text, "1\tshort\n2\théllo w…[+9 chars]");
-        let (exact, short) = numbered(&blobs, &stored.id, 2, 2, long.chars().count()).unwrap();
-        assert_eq!((exact.as_str(), short), ("2\théllo wörld ✓✓✓✓", 0));
+        let n = numbered(&blobs, &stored.id, 1, 2, 7, BIG).unwrap();
+        assert_eq!(n.shortened, 1);
+        assert_eq!(n.text, "1\tshort\n2\théllo w…[+9 chars]");
+        let exact = numbered(&blobs, &stored.id, 2, 2, long.chars().count(), BIG).unwrap();
+        assert_eq!((exact.text.as_str(), exact.shortened), ("2\théllo wörld ✓✓✓✓", 0));
+    }
+
+    #[test]
+    fn max_chars_stops_at_a_whole_line() {
+        let (_d, blobs) = store();
+        let raw: String = (1..=10).map(|i| format!("line number {i}\n")).collect();
+        let (stored, _) = store_text(&blobs, raw.as_bytes()).unwrap();
+        let all = numbered(&blobs, &stored.id, 1, 10, 100, BIG).unwrap();
+        assert_eq!(all.last, 10);
+        // Room for exactly three lines, joining newlines included.
+        let three = "1\tline number 1\n2\tline number 2\n3\tline number 3";
+        let n = numbered(&blobs, &stored.id, 1, 10, 100, three.chars().count()).unwrap();
+        assert_eq!((n.text.as_str(), n.last, n.shortened), (three, 3, 0));
+        // One character less drops the third line whole.
+        let n = numbered(&blobs, &stored.id, 1, 10, 100, three.chars().count() - 1).unwrap();
+        assert_eq!((n.text.as_str(), n.last), ("1\tline number 1\n2\tline number 2", 2));
+    }
+
+    #[test]
+    fn text_never_passes_max_chars_on_multibyte_text() {
+        let (_d, blobs) = store();
+        let raw: String = (1..=30).map(|i| format!("日本語✓{i}{}\n", "é".repeat(i))).collect();
+        let (stored, _) = store_text(&blobs, raw.as_bytes()).unwrap();
+        for max in [40usize, 57, 100, 333] {
+            let n = numbered(&blobs, &stored.id, 1, 30, 20, max).unwrap();
+            assert!(n.text.chars().count() <= max, "{max}: {}", n.text.chars().count());
+            assert!(n.last >= 1 && n.text.lines().count() as u64 == n.last);
+        }
+    }
+
+    #[test]
+    fn a_first_line_longer_than_max_chars_is_shortened_to_fit() {
+        let (_d, blobs) = store();
+        let raw = format!("{}\nsecond\n", "x".repeat(5000));
+        let (stored, _) = store_text(&blobs, raw.as_bytes()).unwrap();
+        let n = numbered(&blobs, &stored.id, 1, 2, 20_000, 100).unwrap();
+        assert_eq!((n.last, n.shortened), (1, 1));
+        assert!(n.text.starts_with("1\txxx") && n.text.contains("…[+"), "{}", n.text);
+        assert!(n.text.chars().count() <= 100 && n.text.chars().count() >= 90, "{}", n.text.chars().count());
+        // A budget too small for anything keeps one character of the line.
+        let tiny = numbered(&blobs, &stored.id, 1, 2, 20_000, 5).unwrap();
+        assert_eq!(tiny.last, 1);
+        assert!(tiny.text.starts_with("1\tx…[+4999 chars]"), "{}", tiny.text);
+    }
+
+    #[test]
+    fn paging_from_last_plus_one_covers_every_line_once() {
+        let (_d, blobs) = store();
+        let raw: String = (1..=50).map(|i| format!("row {i} {}\n", "z".repeat(i % 7 * 5))).collect();
+        let (stored, _) = store_text(&blobs, raw.as_bytes()).unwrap();
+        let mut start = 1u64;
+        let mut seen = Vec::new();
+        while start <= 50 {
+            let n = numbered(&blobs, &stored.id, start, 50, 100, 120).unwrap();
+            assert!(n.last >= start);
+            seen.extend(start..=n.last);
+            start = n.last + 1;
+        }
+        assert_eq!(seen, (1..=50).collect::<Vec<u64>>());
+    }
+
+    #[test]
+    fn ended_fact_says_where_to_continue() {
+        let f = ended_fact(12);
+        assert!(f.starts_with("window ended at line 12 to stay within the size one result may show"), "{f}");
+        assert!(f.ends_with("continue with start 13"), "{f}");
     }
 
     #[test]

@@ -134,8 +134,9 @@ const CHUNK: usize = 1 << 20;
 const BINARY_PROBE: usize = 8192;
 /// Most bytes kept of one line of a streamed read: room for `MAX_LINE_CHARS` characters.
 const KEEP_LINE_BYTES: usize = MAX_LINE_CHARS * 4;
-/// Most bytes kept of all the lines of one streamed read (4 MiB). The window ends after the line
-/// that reaches it, so at most this much and one more line is held, normalised and stored.
+/// Most bytes kept of all the lines of one streamed read (4 MiB), and never more than `ctx.view_chars`.
+/// The window ends before the line that would pass it (the first line is always kept), so at most this
+/// much is held, normalised and stored, apart from a first line longer than it.
 const WINDOW_BYTES: usize = 4 * 1024 * 1024;
 
 /// The size limits of a `read`. Tests lower them.
@@ -773,7 +774,7 @@ fn read_file(
             ))
             .into();
         }
-        return read_large_range(ctx, given, file, &meta, start, end, limits.window);
+        return read_large_range(ctx, given, file, &meta, start, end, limits.window.min(ctx.view_chars));
     }
     let bytes = match read_open(file, meta.len(), limits.whole, &ctx.cancel) {
         Ok(b) => b,
@@ -808,18 +809,23 @@ fn show_whole(ctx: &ToolCtx, given: &str, bytes: &[u8], start: Option<u64>, end:
         Ok(None) => return ToolOutput::ok("ok", Body::Message("(empty file)".into())).with_more(given.to_string()),
         Err(e) => return ToolOutput::error(e),
     };
-    let (text, shortened) = match view::numbered(&ctx.blobs, &stored.id, first, last, MAX_LINE_CHARS) {
+    let numbered = match view::numbered(&ctx.blobs, &stored.id, first, last, MAX_LINE_CHARS, ctx.view_chars) {
         Ok(r) => r,
         Err(e) => return ToolOutput::error(format!("{given} could not be shown ({e}). Try again.")),
     };
+    let shown_last = numbered.last;
     // The handle of the stored text: `evidence` quotes it, and its lines are the numbers shown here.
     let handle = stored.handle();
-    let mut out = ToolOutput::ok("ok", Body::View { of: stored.id, text, shown: vec![(first, last)] })
-        .with_more(given.to_string())
-        .with_more(view::range_fact(first, last, total))
-        .with_more(handle);
-    if shortened > 0 {
-        out = out.with_more(format!("{shortened} long lines shortened"));
+    let mut out =
+        ToolOutput::ok("ok", Body::View { of: stored.id, text: numbered.text, shown: vec![(first, shown_last)] })
+            .with_more(given.to_string())
+            .with_more(view::range_fact(first, shown_last, total));
+    if shown_last < last {
+        out = out.with_more(view::ended_fact(shown_last));
+    }
+    out = out.with_more(handle);
+    if numbered.shortened > 0 {
+        out = out.with_more(format!("{} long lines shortened", numbered.shortened));
     }
     if let Some(notes) = norm.notes() {
         out = out.with_more(notes);
@@ -879,7 +885,7 @@ fn end_line(w: &mut Window, line_start: usize, full_bytes: u64) {
 }
 
 /// Stream `file`, keeping only lines `first..=last`: at most `KEEP_LINE_BYTES` bytes of each, and no
-/// further line once `max_bytes` are kept.
+/// line that would take the kept bytes past `max_bytes` (the first line is always kept).
 fn stream_window(
     file: File,
     cancel: &CancellationToken,
@@ -908,7 +914,7 @@ fn stream_window(
         }
         if !probed {
             probed = true;
-            // The rule a whole read applies to the file (a NUL, or mostly not text), on its head.
+            // The rule a whole read applies to the file (mostly NULs or not text), on its head.
             if normalize(buf.get(..buf.len().min(BINARY_PROBE)).unwrap_or(buf)).binary {
                 w.binary = true;
                 return Ok(w);
@@ -928,6 +934,16 @@ fn stream_window(
         if ended {
             if in_range {
                 end_line(&mut w, line_start, line_bytes);
+                if w.count > 1 && w.raw.len() > max_bytes {
+                    // This line would pass the size limit: the window ends before it.
+                    w.raw.truncate(line_start);
+                    w.count = w.count.saturating_sub(1);
+                    if w.cut.last().is_some_and(|(at, _)| *at == w.count) {
+                        w.cut.pop();
+                    }
+                    w.full = true;
+                    return Ok(w);
+                }
                 line_start = w.raw.len();
             }
             line_bytes = 0;
@@ -956,9 +972,9 @@ fn stream_window(
 }
 
 /// The lines of a normalised window as `{n}\t{line}`, numbered from `first` and shortened the way
-/// `view::numbered` shortens them; `cut` is `Window::cut`. Returns the text and how many lines were
-/// shortened.
-fn number_window(text: &str, first: u64, cut: &[(u64, u64)]) -> (String, u64) {
+/// `view::numbered` shortens them, each at most `max_line_chars` characters; `cut` is `Window::cut`.
+/// Returns the text and how many lines were shortened.
+fn number_window(text: &str, first: u64, cut: &[(u64, u64)], max_line_chars: usize) -> (String, u64) {
     let body = text.strip_suffix('\n').unwrap_or(text);
     let mut out = String::with_capacity(body.len() + 8);
     let mut shortened = 0u64;
@@ -970,7 +986,7 @@ fn number_window(text: &str, first: u64, cut: &[(u64, u64)]) -> (String, u64) {
         out.push('\t');
         let full_bytes =
             cut.binary_search_by_key(&(i as u64), |(at, _)| *at).ok().and_then(|j| cut.get(j)).map(|(_, bytes)| *bytes);
-        let (head, rest) = match line.char_indices().nth(MAX_LINE_CHARS) {
+        let (head, rest) = match line.char_indices().nth(max_line_chars) {
             Some((at, _)) => line.split_at(at),
             None => (line, ""),
         };
@@ -1034,11 +1050,11 @@ fn read_large_range(
     };
     if norm.binary {
         return ToolOutput::error(format!(
-            "Lines {first}-{shown_last} of {given} are binary data (they contain a NUL byte, or are mostly not text), so they are not shown as lines. Use `bash` with a bounded command that makes them printable, such as `sed -n '{first},{shown_last}p' {given} | cat -v | head -100`."
+            "Lines {first}-{shown_last} of {given} are binary data (they are mostly NUL bytes or other bytes that are not text), so they are not shown as lines. Use `bash` with a bounded command that makes them printable, such as `sed -n '{first},{shown_last}p' {given} | cat -v | head -100`."
         ))
         .into();
     }
-    let (text, shortened) = number_window(&norm.text, first, &w.cut);
+    let (text, shortened) = number_window(&norm.text, first, &w.cut, MAX_LINE_CHARS.min(ctx.view_chars));
     let range = match w.total {
         Some(total) => view::range_fact(first, shown_last, total),
         None if w.full => format!(
@@ -1632,28 +1648,28 @@ mod tests {
     async fn a_streamed_window_is_bounded_in_bytes_and_says_where_to_continue() {
         let e = env();
         put(&e, "rows.txt", numbered_file(200).as_bytes());
-        // `row 10` and the newline are 7 bytes: the third such line takes the window past 20 bytes.
+        // `row 10` and the newline are 7 bytes: the third such line would take the window past 20 bytes.
         let limits = ReadLimits { whole: 100, window: 20 };
         let out = read_limited(&e, "rows.txt", Some(10), Some(50), limits);
         let (text, shown, _) = view_of(&e, &out);
-        assert_eq!((text.as_str(), shown), ("10\trow 10\n11\trow 11\n12\trow 12", vec![(1, 3)]));
+        assert_eq!((text.as_str(), shown), ("10\trow 10\n11\trow 11", vec![(1, 2)]));
         let facts = out.more.join(" · ");
-        assert!(facts.contains("lines 10-12 — more below") && facts.contains("before line 50"), "{facts}");
-        assert!(facts.contains("size limit of 20 bytes") && facts.contains("continue with `start` 13"), "{facts}");
+        assert!(facts.contains("lines 10-11 — more below") && facts.contains("before line 50"), "{facts}");
+        assert!(facts.contains("size limit of 20 bytes") && facts.contains("continue with `start` 12"), "{facts}");
         // The stored window is numbered from 1 while the text shows the file's numbers: no handle, and it says so.
         assert!(
             facts.contains("has no handle") && facts.contains("bounded `bash` command") && !facts.contains("out:"),
             "{facts}"
         );
         // A window that ends at the line asked for, or with the file, was not cut by its size.
-        let out = read_limited(&e, "rows.txt", Some(10), Some(12), limits);
+        let out = read_limited(&e, "rows.txt", Some(10), Some(11), limits);
         assert!(
-            view_of(&e, &out).0.ends_with("12\trow 12") && !out.more.join(" · ").contains("size limit"),
+            view_of(&e, &out).0.ends_with("11\trow 11") && !out.more.join(" · ").contains("size limit"),
             "{:?}",
             out.more
         );
-        let out = read_limited(&e, "rows.txt", Some(198), Some(900), limits);
-        assert!(out.more.iter().any(|f| f.starts_with("lines 198-200 of 200")), "{:?}", out.more);
+        let out = read_limited(&e, "rows.txt", Some(199), Some(900), limits);
+        assert!(out.more.iter().any(|f| f.starts_with("lines 199-200 of 200")), "{:?}", out.more);
 
         // Of one line, 80,000 bytes are kept, cut on a character boundary, and 20,000 characters shown.
         put(&e, "long.txt", format!("short\na{}\nend\n", "é".repeat(60_000)).as_bytes());
@@ -1673,6 +1689,64 @@ mod tests {
             out.more.iter().filter(|f| f.contains("shortened") || f.contains("invalid")).collect::<Vec<_>>(),
             vec!["1 long lines shortened"]
         );
+    }
+
+    #[test]
+    fn a_whole_read_ends_at_a_whole_line_within_the_view_size() {
+        let mut e = env();
+        e.ctx.view_chars = 100;
+        put(&e, "rows.txt", numbered_file(500).as_bytes());
+        let mut start = 1u64;
+        let mut seen = Vec::new();
+        while start <= 500 {
+            let out = read_limited(&e, "rows.txt", Some(start), None, READ_LIMITS);
+            let (text, shown, _) = view_of(&e, &out);
+            assert!(text.chars().count() <= 100, "{}", text.chars().count());
+            let last = shown[0].1;
+            assert!(text.ends_with(&format!("{last}\trow {last}")), "{text}");
+            let facts = out.more.join(" · ");
+            if last < 500 && last - start + 1 < 200 {
+                assert!(facts.contains(&format!("lines {start}-{last} of 500")), "{facts}");
+                assert!(facts.contains(&format!("continue with start {}", last + 1)), "{facts}");
+            }
+            seen.extend(start..=last);
+            start = last + 1;
+        }
+        assert_eq!(seen, (1..=500).collect::<Vec<u64>>());
+    }
+
+    #[test]
+    fn a_whole_read_of_long_lines_shows_the_first_line_shortened_to_fit() {
+        let mut e = env();
+        e.ctx.view_chars = 200;
+        put(&e, "big.jsonl", format!("{}\n{}\n", "a".repeat(2000), "b".repeat(2000)).as_bytes());
+        let out = read_limited(&e, "big.jsonl", None, None, READ_LIMITS);
+        let (text, shown, _) = view_of(&e, &out);
+        assert!(text.chars().count() <= 200 && text.starts_with("1\taaa"), "{text}");
+        assert_eq!(shown, vec![(1, 1)]);
+        let facts = out.more.join(" · ");
+        assert!(facts.contains("line 1 of 2") && facts.contains("continue with start 2"), "{facts}");
+    }
+
+    #[test]
+    fn a_large_file_window_ends_before_the_line_that_would_pass_the_view_size() {
+        let mut e = env();
+        e.ctx.view_chars = 30;
+        put(&e, "rows.txt", numbered_file(200).as_bytes());
+        // Seven bytes a line: four lines are 28 bytes, a fifth would pass 30.
+        let out = read_limited(&e, "rows.txt", Some(10), Some(50), cap(100));
+        let (text, shown, _) = view_of(&e, &out);
+        assert_eq!(text, "10\trow 10\n11\trow 11\n12\trow 12\n13\trow 13");
+        assert_eq!(shown, vec![(1, 4)]);
+        let facts = out.more.join(" · ");
+        assert!(facts.contains("lines 10-13 — more below") && facts.contains("continue with `start` 14"), "{facts}");
+        // The first line is kept and shown at most `view_chars` characters even when it alone passes it.
+        put(&e, "long.txt", format!("{}\nnext\n", "z".repeat(500)).as_bytes());
+        let out = read_limited(&e, "long.txt", Some(1), Some(2), cap(100));
+        let (text, shown, _) = view_of(&e, &out);
+        assert_eq!(shown, vec![(1, 1)]);
+        assert!(text.starts_with("1\tzzz") && text.chars().count() < 80, "{text}");
+        assert!(out.more.iter().any(|f| f.contains("continue with `start` 2")), "{:?}", out.more);
     }
 
     #[tokio::test]

@@ -393,18 +393,40 @@ pub fn finalize(
         meta,
         duration_ms,
     };
+    let budget = admission.policy.view_chars(admission.estimator);
+    // A message longer than one result may show is stored and admitted like raw output.
+    let body = match body {
+        Body::Message(text) if text.chars().count() > budget => Body::Raw(text.into_bytes()),
+        other => other,
+    };
     match body {
         Body::Message(text) => base(status, envelope_plain(&facts, &text), None, false, meta),
         Body::View { of, text, shown } => {
             meta.insert(META_OF_BLOB.into(), json!(of.as_str()));
-            meta.insert(META_SHOWN.into(), ranges_json(&shown));
-            base(status, envelope_plain(&facts, &text), None, false, meta)
+            match cut_view(&text, budget, &handle_of(of.as_str())) {
+                Some(cut) => {
+                    meta.insert(META_SHOWN.into(), ranges_json(&[]));
+                    base(status, envelope_plain(&facts, &cut), None, true, meta)
+                }
+                None => {
+                    meta.insert(META_SHOWN.into(), ranges_json(&shown));
+                    base(status, envelope_plain(&facts, &text), None, false, meta)
+                }
+            }
         }
         Body::ProducedView { blob, text, shown } => {
-            let cut = blob.lines > 0 && !(shown.len() == 1 && shown.first() == Some(&(1, blob.lines)));
             meta.insert(META_OF_BLOB.into(), json!(blob.id.as_str()));
-            meta.insert(META_SHOWN.into(), ranges_json(&shown));
-            base(status, envelope_plain(&facts, &text), Some(blob), cut, meta)
+            match cut_view(&text, budget, &blob.handle()) {
+                Some(cut) => {
+                    meta.insert(META_SHOWN.into(), ranges_json(&[]));
+                    base(status, envelope_plain(&facts, &cut), Some(blob), true, meta)
+                }
+                None => {
+                    let cut = blob.lines > 0 && !(shown.len() == 1 && shown.first() == Some(&(1, blob.lines)));
+                    meta.insert(META_SHOWN.into(), ranges_json(&shown));
+                    base(status, envelope_plain(&facts, &text), Some(blob), cut, meta)
+                }
+            }
         }
         Body::Raw(bytes) => {
             let normalized = normalize(&bytes);
@@ -431,6 +453,34 @@ pub fn finalize(
             }
         }
     }
+}
+
+/// The handle (`out:` and the first 16 characters) of a blob id.
+fn handle_of(id: &str) -> String {
+    format!("out:{}", id.chars().take(16).collect::<String>())
+}
+
+/// `text` cut to at most `budget` characters at a line end, with the line that says so, or `None` when
+/// it is within `budget`.
+fn cut_view(text: &str, budget: usize, handle: &str) -> Option<String> {
+    let total = text.chars().count();
+    if total <= budget {
+        return None;
+    }
+    let end = text.char_indices().nth(budget).map_or(text.len(), |(i, _)| i);
+    let head = text.get(..end).unwrap_or("");
+    let kept = match head.rfind('\n') {
+        Some(i) => head.get(..=i).unwrap_or(head),
+        None => head,
+    };
+    let mut out = kept.to_string();
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&format!(
+        "[cut by harness: this view is {total} characters, more than one result may show ({budget}); the rest is not shown. Nothing was discarded: ask for fewer lines (start/end, or a narrower pattern) of {handle}.]"
+    ));
+    Some(out)
 }
 
 /// The record of a call that was refused before it ran (status `Invalid`). Public so that
@@ -613,5 +663,106 @@ mod tests {
             assert_eq!(refused.status, ToolStatus::Invalid);
             assert!(refused.text.starts_with(&format!("[{name} · not run]\n{says}")), "{}", refused.text);
         }
+    }
+
+    fn small_admission() -> (AdmitPolicy, TokenEstimator) {
+        (AdmitPolicy { max_inline_tokens: 25, ..AdmitPolicy::default() }, TokenEstimator::default())
+    }
+
+    fn spec_of(e: &testutil::TestEnv, name: &str) -> ToolSpec {
+        e.registry.get(name).map(|t| t.spec()).unwrap_or_else(|| panic!("no tool {name}"))
+    }
+
+    fn body_of(text: &str) -> &str {
+        let after = text.split_once('\n').map_or("", |(_, b)| b);
+        after.rsplit_once('\n').map_or("", |(b, _)| b)
+    }
+
+    #[test]
+    fn a_view_over_the_budget_is_cut_at_a_line_with_the_handle() {
+        let e = testutil::env();
+        let (policy, estimator) = small_admission();
+        let admission = Admission { policy: &policy, estimator: &estimator };
+        let budget = policy.view_chars(&estimator);
+        let stored = e.ctx.blobs.put_bytes(b"x\n").unwrap();
+        let text: String = (1..=200).map(|i| format!("{i}\tsome line of text\n")).collect();
+        let out = ToolOutput::ok("ok", Body::View { of: stored.id.clone(), text: text.clone(), shown: vec![(1, 200)] });
+        let r = finalize(&e.ctx, &spec_of(&e, "out_read"), out, &admission, Instant::now());
+        let body = body_of(&r.text);
+        let (kept, marker) = body.rsplit_once('\n').unwrap();
+        assert!(kept.chars().count() <= budget, "{} > {budget}", kept.chars().count());
+        assert!(text.starts_with(kept) && text.get(kept.len()..).unwrap().starts_with('\n'));
+        assert!(marker.starts_with("[cut by harness: this view is "), "{marker}");
+        assert!(marker.contains(&format!("({budget})")) && marker.contains(&stored.handle()), "{marker}");
+        assert!(r.cut && r.output.is_none());
+        assert_eq!(r.meta.get(META_SHOWN), Some(&json!([])));
+        assert_eq!(r.meta.get(META_OF_BLOB), Some(&json!(stored.id.as_str())));
+    }
+
+    #[test]
+    fn a_view_with_no_line_end_is_cut_on_a_character_boundary() {
+        let e = testutil::env();
+        let (policy, estimator) = small_admission();
+        let admission = Admission { policy: &policy, estimator: &estimator };
+        let budget = policy.view_chars(&estimator);
+        let stored = e.ctx.blobs.put_bytes(b"x\n").unwrap();
+        let text = "é✓".repeat(budget);
+        let out = ToolOutput::ok("ok", Body::View { of: stored.id.clone(), text, shown: vec![(1, 1)] });
+        let r = finalize(&e.ctx, &spec_of(&e, "out_read"), out, &admission, Instant::now());
+        let (kept, marker) = body_of(&r.text).rsplit_once('\n').unwrap();
+        assert_eq!(kept.chars().count(), budget);
+        assert!(marker.starts_with("[cut by harness"), "{marker}");
+    }
+
+    #[test]
+    fn a_produced_view_over_the_budget_keeps_its_blob_and_is_cut() {
+        let e = testutil::env();
+        let (policy, estimator) = small_admission();
+        let admission = Admission { policy: &policy, estimator: &estimator };
+        let full: String = (1..=300).map(|i| format!("{i}\tdecompiled\n")).collect();
+        let blob = e.ctx.blobs.put_bytes(full.as_bytes()).unwrap();
+        let out = ToolOutput::ok(
+            "ok",
+            Body::ProducedView { blob: blob.clone(), text: full.clone(), shown: vec![(1, blob.lines)] },
+        );
+        let r = finalize(&e.ctx, &spec_of(&e, "bin_decompile"), out, &admission, Instant::now());
+        assert!(r.cut);
+        assert_eq!(r.output.as_ref().map(|b| b.id.clone()), Some(blob.id.clone()));
+        assert_eq!(r.meta.get(META_SHOWN), Some(&json!([])));
+        assert!(r.text.contains("[cut by harness") && r.text.contains(&blob.handle()), "{}", r.text);
+        assert!(r.text.chars().count() < full.chars().count());
+    }
+
+    #[test]
+    fn a_message_over_the_budget_is_admitted_with_a_handle() {
+        let e = testutil::env();
+        let (policy, estimator) = small_admission();
+        let admission = Admission { policy: &policy, estimator: &estimator };
+        let text: String = (1..=500).map(|i| format!("message line {i}\n")).collect();
+        let out = ToolOutput::ok("ok", Body::Message(text.clone()));
+        let r = finalize(&e.ctx, &spec_of(&e, "bash"), out, &admission, Instant::now());
+        let stored = r.output.as_ref().expect("a handle");
+        assert_eq!(e.ctx.blobs.read_all(&stored.id).unwrap(), text.as_bytes());
+        assert!(r.cut && r.text.contains(&stored.handle()), "{}", r.text);
+        assert!(r.text.chars().count() < text.chars().count());
+    }
+
+    #[test]
+    fn views_and_messages_within_the_budget_are_unchanged() {
+        let e = testutil::env();
+        let (policy, estimator) = small_admission();
+        let admission = Admission { policy: &policy, estimator: &estimator };
+        let budget = policy.view_chars(&estimator);
+        let stored = e.ctx.blobs.put_bytes(b"x\n").unwrap();
+        let text = "a".repeat(budget);
+        let out = ToolOutput::ok("ok", Body::View { of: stored.id.clone(), text: text.clone(), shown: vec![(1, 1)] });
+        let r = finalize(&e.ctx, &spec_of(&e, "out_read"), out, &admission, Instant::now());
+        assert_eq!(body_of(&r.text), text);
+        assert!(!r.cut);
+        assert_eq!(r.meta.get(META_SHOWN), Some(&json!([[1, 1]])));
+        let out = ToolOutput::ok("ok", Body::Message(text.clone()));
+        let r = finalize(&e.ctx, &spec_of(&e, "bash"), out, &admission, Instant::now());
+        assert_eq!(body_of(&r.text), text);
+        assert!(r.output.is_none() && !r.cut);
     }
 }

@@ -469,12 +469,12 @@ fn limited_backend_view(ctx: &ToolCtx, mut output: ToolOutput, bytes: &[u8]) -> 
             output.meta.insert(loom_core::event::META_RAW_BLOB.into(), json!(raw.id.as_str()));
         }
     }
-    let last = blob.lines.min(120);
-    let text = if last == 0 {
-        String::new()
+    let wanted = blob.lines.min(120);
+    let (text, last) = if wanted == 0 {
+        (String::new(), 0)
     } else {
-        match crate::view::numbered(&ctx.blobs, &blob.id, 1, last, 20_000) {
-            Ok((text, _)) => text,
+        match crate::view::numbered(&ctx.blobs, &blob.id, 1, wanted, 20_000, ctx.view_chars) {
+            Ok(n) => (n.text, n.last),
             Err(e) => {
                 return output.with_more(format!(
                     "The bounded backend view could not be read: {e}; its bounded bytes are retained in this result."
@@ -845,6 +845,32 @@ mod tests {
         assert_eq!(record.meta[loom_core::event::META_SHOWN], json!([[1, 120]]));
         assert!(env.stored(&record).contains("line 130"));
         assert!(!record.text.contains("130\tline 130"));
+    }
+
+    #[test]
+    fn a_limited_backend_view_shows_only_the_lines_that_fit_the_view_size() {
+        let mut env = crate::testutil::env();
+        env.ctx.view_chars = 60;
+        let bytes = (1..=130).map(|n| format!("line {n}\n")).collect::<String>().into_bytes();
+        let result = CommandOutcome {
+            written: bytes.len() as u64,
+            bytes: bytes.clone(),
+            ended: crate::proc::Ended::Exit(0),
+            completed: true,
+            stop_reason: None,
+        };
+        let output = limited_backend_view(&env.ctx, result.into_tool_output("backend"), &bytes);
+        let Body::ProducedView { blob, text, shown } = &output.body else { panic!("not a produced view") };
+        assert_eq!(blob.lines, 130);
+        let last = shown[0].1;
+        assert!(last < 120 && text.chars().count() <= 60, "{last}: {text}");
+        assert_eq!(shown, &vec![(1, last)]);
+        assert!(text.ends_with(&format!("{last}\tline {last}")), "{text}");
+        assert!(
+            output.more.iter().any(|f| f.contains(&format!("displayed first {last} of 130 lines"))),
+            "{:?}",
+            output.more
+        );
     }
 
     #[test]
