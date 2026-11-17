@@ -196,13 +196,16 @@ With `[sandbox] mode = "seatbelt"` (the default) commands run under a macOS sand
   `mach_allow = ["<bundle id>.MachPortRendezvousServer.*"]`;
 - a limit on how many processes a command can start: `[sandbox] nproc_headroom` (default 256, 0 for none) is how many
   of the user's process slots (RLIMIT_NPROC) a command leaves unused, so a fork bomb stops before the daemon cannot
-  start the processes that stop it.
+  start the processes that stop it. If the user already holds that many processes (leftovers: see the census), a command
+  does not start, and the error says to stop them or lower the headroom.
 
 The daemon finds what every session left running, whatever it did to its process group and environment, every minute:
 `GET /api/census` (`?now=true` takes one) lists each session's processes and the ports they listen on, the daemon's log
-warns once about what an ended session left, and `POST /api/sessions/<id>/census/kill` stops them. Nothing is stopped
-on its own. If the macOS query it uses does not work on a host, the census falls back to an environment variable and
-the known process groups and says so (`identity_detail`).
+warns once about what an ended or stopped session left, and `POST /api/sessions/<id>/census/kill` stops them. Nothing
+is stopped on its own. Archiving a session stops what it still has running under its sandbox once its tasks have ended (the census no
+longer lists archived sessions), and logs it. If the macOS query it uses does not work on a host (or `sandbox.mode` is `none`), the census falls back to
+an environment variable and the known process groups, says so (`identity_detail`), is logged and notified once
+(`LOOM_KIND=census`) when commands are confined, and never reports a session as having no processes.
 
 Git config/hooks and metadata pointers are protected, including existing nested repositories and
 linked worktrees. Normal source edits still work. Commands that explicitly write shared `/tmp` or

@@ -360,9 +360,12 @@
 //!   unbounded, and again only after it cleared. `LOOM_KIND` is `egress` and `LOOM_SESSION` is empty.
 //! - Census (`crate::census`, `docs/MONITOR.md` §2.2, E3): every 60 s (not under test) the daemon finds the
 //!   processes of its non-archived sessions by sandbox identity, keeps the view (`census()`; `census_now()` takes
-//!   one), and logs once a warning for each process an ended session left running. `census_kill(session)` stops what
-//!   the census finds for one session (`There is no session …` for an id that is not known). Nothing is stopped by the
-//!   periodic census.
+//!   one), and logs once a warning for each process an ended (finished or stopped) session left running, however long
+//!   the process had been running before. `census_kill(session)` stops what the census finds for one session and its
+//!   known process groups (`There is no session …` for an id that is not known; an error when the process table could
+//!   not be read). Nothing is stopped by the periodic census. A census that runs without sandbox identity although
+//!   commands are confined is logged and notified once (kind `census`). Archiving stops, once the family's tasks
+//!   have ended, what the sessions left running by sandbox identity (an archived session is not in the census).
 //! - At start, every restored open blocking item is notified once (`Still waiting: {text}`) and its
 //!   repeat notice is armed as for a live one.
 //!
@@ -1484,6 +1487,11 @@ impl Known {
         self.settlement.is_some() || self.status.phase == Phase::Ended
     }
 
+    /// Nothing of it should be running: it finished or it was stopped (`census::has_ended`).
+    fn census_ended(&self) -> bool {
+        crate::census::has_ended(self.finished(), self.status.phase, self.status.last_end)
+    }
+
     fn outcome(&self) -> ChildOutcome {
         match (&self.settlement, self.status.outcome) {
             (Some(s), _) => s.outcome,
@@ -1591,33 +1599,86 @@ struct Inner {
     egress_problem_told: AtomicBool,
     /// The last process and listener census of the sessions (`crate::census`), `None` until the first finishes.
     census: Mutex<Option<crate::census::CensusView>>,
+    /// The survivors the operator was told of (`crate::census::tell`).
+    census_told: Mutex<crate::census::Told>,
+    /// The operator was told that the census runs without sandbox identity, and it has not had identity since.
+    census_blind_told: AtomicBool,
 }
 
 impl Inner {
-    /// The sessions a census asks about (every one that is not archived) and those of them that have ended:
-    /// nothing of an ended session should be running.
+    /// The sessions a census asks about (every one that is not archived) and those of them that have ended or were
+    /// stopped: nothing of those should be running.
     fn census_sessions(&self) -> (Vec<(String, PathBuf)>, BTreeSet<String>) {
         let st = self.st();
         let live: Vec<SessionId> =
             st.known.iter().filter(|(_, k)| !k.meta.archived).map(|(id, _)| id.clone()).collect();
-        let ended =
-            st.known.iter().filter(|(_, k)| !k.meta.archived && k.finished()).map(|(id, _)| id.as_str().to_string());
+        let ended = st
+            .known
+            .iter()
+            .filter(|(_, k)| !k.meta.archived && k.census_ended())
+            .map(|(id, _)| id.as_str().to_string());
         let ended: BTreeSet<String> = ended.collect();
         (crate::census::members(&self.paths, &live), ended)
     }
 
+    /// Whether commands run under Seatbelt, the only mode in which a process can be told by its profile.
+    fn census_confined(&self) -> bool {
+        self.config.sandbox.mode == SandboxMode::Seatbelt
+    }
+
     /// Takes a census on a blocking thread, keeps it, and logs what an ended session left running that the
-    /// last census did not show.
+    /// operator was not told yet.
     async fn run_census(&self) -> Option<crate::census::CensusView> {
         let (members, ended) = self.census_sessions();
         let home = self.paths.home.clone();
-        let view = tokio::task::spawn_blocking(move || crate::census::take(&home, &members)).await.ok()?;
-        let mut last = self.census.lock().unwrap_or_else(|p| p.into_inner());
-        for (session, process) in crate::census::survivors(last.as_ref(), &view, &ended) {
-            tracing::warn!("{}", crate::census::survivor_line(session, process));
+        let confined = self.census_confined();
+        let view = tokio::task::spawn_blocking(move || crate::census::take(&home, &members, confined)).await.ok()?;
+        let lines = {
+            let mut told = self.census_told.lock().unwrap_or_else(|p| p.into_inner());
+            crate::census::tell(&mut told, &view, &ended)
+        };
+        for line in lines {
+            tracing::warn!("{line}");
         }
-        *last = Some(view.clone());
+        // A census that cannot tell by sandbox is not a failure to hide: it is told, once, until identity returns.
+        if view.readable && confined && !view.identity {
+            let notice = crate::census::blind_notice(&view.identity_detail);
+            tracing::warn!("{notice}");
+            if !self.census_blind_told.swap(true, Ordering::SeqCst) {
+                self.notify("census", &SessionId::from(""), "The process census is blind", &notice);
+            }
+        } else if view.identity {
+            self.census_blind_told.store(false, Ordering::SeqCst);
+        }
+        *self.census.lock().unwrap_or_else(|p| p.into_inner()) = Some(view.clone());
         Some(view)
+    }
+
+    /// Waits until the tasks of `family` have ended, then stops by sandbox identity what each left running (see
+    /// `Runtime::archive`), and says so in the log.
+    async fn stop_leftovers(&self, family: &[SessionId]) {
+        self.until_closed(family).await;
+        let (home, confined) = (self.paths.home.clone(), self.census_confined());
+        let members = crate::census::members(&self.paths, family);
+        let killed = tokio::task::spawn_blocking(move || {
+            let home = crate::census::canonical_home(&home);
+            let mut stopped = Vec::new();
+            for (id, tmp) in &members {
+                let member = loom_tools::sandbox::census::Member { id, tmp };
+                let done = loom_tools::sandbox::census::kill(&home, &[member], &[], &[], confined);
+                if done.killed > 0 || !done.left.is_empty() {
+                    stopped.push((id.clone(), done.killed, done.left.len()));
+                }
+            }
+            stopped
+        })
+        .await
+        .unwrap_or_default();
+        for (id, stopped, left) in killed {
+            tracing::warn!(
+                "Session {id} was archived with processes still running under its sandbox: {stopped} stopped, {left} could not be stopped"
+            );
+        }
     }
 
     /// The last resolution of the infrastructure names and this machine's addresses.
@@ -4273,6 +4334,8 @@ impl Runtime {
             egress_problem_told: AtomicBool::new(problem_told_at_start),
             egress: Mutex::new(initial_egress),
             census: Mutex::new(None),
+            census_told: Mutex::new(crate::census::Told::new()),
+            census_blind_told: AtomicBool::new(false),
         });
 
         let weak = Arc::downgrade(&inner);
@@ -4501,14 +4564,22 @@ impl Runtime {
         if !known {
             return Err(no_session(session));
         }
-        let (id, tmp, home) =
-            (session.as_str().to_string(), self.inner.paths.session_tmp(session), self.inner.paths.home.clone());
+        let hints = crate::census::known_groups(self.census().as_ref(), session.as_str());
+        let (id, home) = (session.as_str().to_string(), self.inner.paths.home.clone());
+        let tmp = crate::census::members(&self.inner.paths, std::slice::from_ref(session)).remove(0).1;
+        let confined = self.inner.census_confined();
         let killed = tokio::task::spawn_blocking(move || {
             let member = loom_tools::sandbox::census::Member { id: &id, tmp: &tmp };
-            loom_tools::sandbox::census::kill(&home, &[member], &[])
+            loom_tools::sandbox::census::kill(&crate::census::canonical_home(&home), &[member], &[], &hints, confined)
         })
         .await
         .map_err(|e| format!("The census kill failed to run: {e}."))?;
+        if !killed.readable {
+            return Err(format!(
+                "The process table could not be read, so nothing of session {} was stopped. Try again, or stop its processes by hand.",
+                session.as_str()
+            ));
+        }
         if !killed.left.is_empty() {
             tracing::warn!(
                 "{} process(es) of session {} survived the census kill; ask for the census again or stop them by hand",
@@ -5214,6 +5285,12 @@ impl Runtime {
         // which reaches the lead when the mission is unarchived.
         drop(closing);
         if archived {
+            // An archived session is not in the census, so what its task did not take with it (a process that left
+            // its process group) is stopped now, once the tasks have ended, while it can still be found.
+            let inner = self.inner.clone();
+            let ids = family.clone();
+            let leftovers = tokio::spawn(async move { inner.stop_leftovers(&ids).await });
+            self.inner.st().tasks.push(leftovers);
             let lead = self.inner.st().known.get(id).map(|k| k.meta.clone()).filter(|m| m.parent.is_none());
             if let Some(lead) = lead {
                 self.inner.box_teardown(&lead.mission);
@@ -8894,6 +8971,84 @@ mod tests {
         assert_eq!(rt.census().map(|v| v.taken_ms), Some(view.taken_ms));
         assert_eq!(rt.census_kill(&SessionId::from("s-nope")).await.unwrap_err(), "There is no session s-nope.");
         rt.shutdown().await;
+    }
+
+    /// A session's job starts a process that leaves its process group and clears its environment; the census lists
+    /// it under that session (through the runtime's own sandbox, members and home), a kill stops it and nothing of
+    /// another session, and archiving a session stops what it left.
+    #[tokio::test]
+    async fn the_census_finds_what_a_session_job_left_and_a_kill_stops_only_that_session() {
+        if !cfg!(target_os = "macos") || !Path::new("/usr/bin/sandbox-exec").exists() {
+            return;
+        }
+        let orphan = |seconds: u32| {
+            format!(
+                "/usr/bin/env -i /usr/bin/perl -MPOSIX -e 'POSIX::setsid(); fork && exit 0; exec \"/bin/sleep\", \"{seconds}\"'"
+            )
+        };
+        let (mine, theirs) = (orphan(73), orphan(74));
+        let e = env_with(
+            Script::new(move |body, _| {
+                let replies =
+                    body["messages"].as_array().map_or(0, |m| m.iter().filter(|m| m["role"] == "assistant").count());
+                match replies {
+                    0 if mentions(body, "ORPHANTWO") => call("bash", json!({ "command": theirs })),
+                    0 => call("bash", json!({ "command": mine })),
+                    _ => finish("ok"),
+                }
+            }),
+            false,
+            with_os_sandbox,
+        )
+        .await;
+        std::fs::create_dir_all(e.ws.join(".loom")).unwrap();
+        let first = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id.clone();
+        let second = e.rt.create_session(e.new_session(Some("ORPHANTWO go"))).await.unwrap().meta.id.clone();
+        let sleeping = |view: &crate::census::CensusView, id: &SessionId| {
+            view.sessions.get(id.as_str()).is_some_and(|p| p.iter().any(|p| p.exe.ends_with("sleep") && p.ppid == 1))
+        };
+        let end = tokio::time::Instant::now() + WAIT;
+        let view = loop {
+            let view = e.rt.census_now().await.unwrap();
+            if sleeping(&view, &first) && sleeping(&view, &second) {
+                break view;
+            }
+            assert!(tokio::time::Instant::now() < end, "the orphans were not listed: {view:?}");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert!(view.identity && view.readable, "{view:?}");
+        // The two sessions' processes are told apart.
+        assert!(view.sessions[first.as_str()].iter().all(|p| p.exe.ends_with("sleep") || p.exe.ends_with("perl")));
+        // Another session's census kill touches only that session.
+        until("the first session has ended its turn", || {
+            e.rt.session(&first).is_some_and(|s| s.status.phase == Phase::Idle)
+        })
+        .await;
+        let killed = e.rt.census_kill(&first).await.unwrap();
+        assert!(killed.left.is_empty() && killed.killed >= 1, "{killed:?}");
+        let view = e.rt.census_now().await.unwrap();
+        assert!(!sleeping(&view, &first), "{view:?}");
+        assert!(sleeping(&view, &second), "another session's process was stopped: {view:?}");
+        // Archiving a session takes with it what its task left (the archived session is no longer in the census).
+        until("the second session has ended its turn", || {
+            e.rt.session(&second).is_some_and(|s| s.status.phase == Phase::Idle)
+        })
+        .await;
+        e.rt.archive(&second, true).await.unwrap();
+        let end = tokio::time::Instant::now() + WAIT;
+        loop {
+            let again = crate::census::take(
+                &e.rt.inner.paths.home,
+                &crate::census::members(&e.rt.inner.paths, std::slice::from_ref(&second)),
+                true,
+            );
+            if !again.sessions.contains_key(second.as_str()) {
+                break;
+            }
+            assert!(tokio::time::Instant::now() < end, "the archived session's process survived: {again:?}");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        e.rt.shutdown().await;
     }
 
     #[tokio::test]

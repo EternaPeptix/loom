@@ -255,7 +255,9 @@
 //! an error that says to use the session id); `env` then adds `LOOM_SANDBOX_ID=<id>`, the fallback by which
 //! `census` finds a session's processes where the sandbox cannot be asked (a command can clear it). The profile is
 //! not changed. `nproc_limit()` is the RLIMIT_NPROC a command started now gets (`procinfo::nproc_limit_now` of
-//! `cfg.nproc_headroom`; `None` when that is 0): `proc::spawn` and the PTY apply it to the command before it starts.
+//! `cfg.nproc_headroom`: the machine's limit less the headroom, whatever else exists; `Ok(None)` when the headroom is
+//! 0): `proc::spawn` and the PTY apply it to the command before it starts, and refuse to start one (an error that says
+//! what to do) when the user already holds as many processes as that limit.
 //!
 //! A sandboxed process can signal itself and the other processes of its sandbox, and nothing else:
 //! not the harness, not other sessions, not any other process of the same user.
@@ -297,6 +299,10 @@
 //! the one to change repository configuration, add a worktree or set up a submodule
 //! (`git worktree add`, `git submodule update --init`); and that a repository of the session's own can be
 //! cloned bare (`git clone --bare <url> <dir>.git`) and used with `git --git-dir=<dir>.git --work-tree=<dir>`.
+//!
+//! `stop_replay_leftovers(tmp)` (blocking) stops, by sandbox identity, whatever a replay's command left running under
+//! the replay profile (it refuses every session's temp dir, so no session's census lists it): the oracle calls it when
+//! the replay's command has returned, before the staging is removed (`census::kill_under`).
 //!
 //! ## `oracle_staging_root()` / `isolated_replay(workspace, tmp)`
 //! Staging is `<loom home>/oracle-runs`, outside all session temp trees. The harness creates a private
@@ -1880,9 +1886,17 @@ impl Sandbox {
         self.identity.as_deref()
     }
 
-    /// The RLIMIT_NPROC of a command started now (`cfg.nproc_headroom`; `loom_tools::procinfo`), `None` when
-    /// the headroom is 0 or the machine's limit is unknown.
-    pub fn nproc_limit(&self) -> Option<u64> {
+    /// Stops what a replay of this sandbox left running once its command has returned (blocking): processes under
+    /// the profile of `isolated_replay` that may read the replay's temp dir `tmp` and not the loom home, which no
+    /// census of a session's temp dir lists (`census::kill_under`). Nothing outside that profile is touched.
+    pub fn stop_replay_leftovers(&self, tmp: &Path) -> census::Killed {
+        census::kill_under(&self.loom_home, tmp)
+    }
+
+    /// The RLIMIT_NPROC of a command started now (`cfg.nproc_headroom`; `loom_tools::procinfo`): `Ok(None)` when
+    /// the headroom is 0 or the machine's limit is unknown, an error (what to do next) when the user already holds
+    /// as many processes as the limit allows.
+    pub fn nproc_limit(&self) -> Result<Option<u64>, String> {
         crate::procinfo::nproc_limit_now(u64::from(self.nproc_headroom))
     }
 

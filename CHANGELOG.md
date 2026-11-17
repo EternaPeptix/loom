@@ -13,13 +13,15 @@
   confirmed stopped (`Ended(TrackingFailed)`) keeps its `.pid` record and owner marker, so the next start can still find and
   kill it (`jobs::clear_leftovers`).
 - **RLIMIT_NPROC headroom** for sandboxed commands and PTYs: new `[sandbox] nproc_headroom` (default 256, `0` sets no limit),
-  soft and hard limit `user limit - headroom`, never below the processes that exist plus 64, set before the command starts.
+  soft and hard limit `user limit - headroom` whatever else exists, set before the command starts; a command is refused
+  (an error that says what to do) when the user already holds that many processes (Linux: threads).
 - **Process census by sandbox identity** (`loom_tools::sandbox::census`, `loom_agent::census`). A process is a session's when
   its sandbox may read the session's temp dir and may not read the loom home (macOS `sandbox_check`, probed once; the profile
   is unchanged), so setsid'd, double-forked and `env -i` processes are found. Every 60 s the daemon finds each non-archived
   session's processes and what they listen on (TCP listening, UDP bound), warns once about processes of an ended session.
-  New: `GET /api/census[?now=true]`, `POST /api/sessions/{id}/census/kill` (SIGSTOP then SIGKILL, up to 5 rounds, only a pid
-  that still has the recorded start time), `Runtime::census`, `census_now`, `census_kill`. Fallback where the query does not
+  New: `GET /api/census[?now=true]`, `POST /api/sessions/{id}/census/kill` (SIGSTOP then SIGKILL, whole process groups when
+  every member is the session's, until two scans find nothing, only a pid that still has the recorded start time; the answer
+  gains `readable`), `Runtime::census`, `census_now`, `census_kill`. Fallback where the query does not
   work: the `LOOM_SANDBOX_ID` variable (`Sandbox::with_identity`, set by `Sandbox::env`) and known process groups. Nothing is
   stopped automatically.
 

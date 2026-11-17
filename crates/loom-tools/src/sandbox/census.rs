@@ -21,52 +21,79 @@
 //! it matches positively, and nothing is killed on a guess.
 //!
 //! ## `probe()`
-//! Runs once per daemon (the result is kept) and says whether the question works on this host: a command started
-//! under a real profile (a throwaway home, workspace and session temp dirs) is refused the home and not its own temp
-//! dir, is refused another session's temp dir, and neither an unsandboxed child nor this process is refused the
-//! home. `Probe { works, detail }`; `detail` names what was seen when it does not work. It takes up to about 3
-//! seconds and runs `sandbox-exec` and `sleep`. Off macOS, and where `sandbox-exec` is missing, it does not work
-//! (and says so).
+//! Says whether the question works on this host: a command started under a real profile (a throwaway home,
+//! workspace and session temp dirs) is refused the home and not its own temp dir, is refused another session's temp
+//! dir, and neither an unsandboxed child nor this process is refused the home. `Probe { works, undetermined, detail }`;
+//! `detail` names what was seen when it does not work. It takes up to about 3 seconds and runs `sandbox-exec` and
+//! `sleep`. Only a settled answer is kept for the daemon's life: `works`, or a host where the question was asked and
+//! did not tell the sandboxes apart (or where `sandbox-exec` is missing, or off macOS). A probe that could not run
+//! (`undetermined`: a process could not be started, a directory could not be made, or the processes were not yet
+//! visible to the query within the time) is not kept and is run again by the next `take` and `kill`: a full process
+//! table or busy CPUs at the daemon's start must not turn identity off for its whole life.
 //!
-//! ## `take(home, sessions, groups)` and `Census`
-//! `home` is the loom home; `sessions` are `Member { id, tmp }` (a session id and its temp dir) to attribute processes to; `groups` are `(session, process group)` pairs the
-//! caller knows (a job's leader). `Census { taken_ms, readable, identity, processes }`:
+//! ## `take(home, sessions, groups, confined)` and `Census`
+//! `home` is the loom home; `sessions` are `Member { id, tmp }` (a session id and its temp dir) to attribute processes
+//! to; `groups` are `(session, process group)` pairs the caller knows (a job's leader); `confined` is whether the
+//! daemon runs commands under Seatbelt (`sandbox.mode`): with `none` nothing is refused the home, so no process is
+//! attributable by identity. `Census { taken_ms, readable, identity, processes }`:
 //! - `readable` is false when the process table could not be read (the census then says nothing; it never claims
 //!   that a session has no processes then);
-//! - `identity` is true when processes were found by sandbox identity (`probe().works`), false when by the
-//!   fallback: the environment variable `LOOM_SANDBOX_ID=<id>` that `Sandbox::env` sets, plus `groups`. The
+//! - `identity` is true when processes were found by sandbox identity (`confined` and `probe().works`), false when by
+//!   the fallback: the environment variable `LOOM_SANDBOX_ID=<id>` that `Sandbox::env` sets, plus `groups`. The
 //!   fallback is best effort: `env -i` and a double fork defeat the first, `setsid` the second (`docs/MONITOR.md`
-//!   X7);
+//!   X7). A fallback census never reads as empty: `is_empty_for` is true only when `identity` holds;
+//! - in identity mode a process under a sandbox that no listed session's temp dir matches (a replay of the oracle
+//!   runs under `Sandbox::isolated_replay`, which refuses every session's temp dir) is attributed by its
+//!   `LOOM_SANDBOX_ID` when that names a listed session (`via: environment`; only sandboxed processes, so nothing
+//!   unconfined is guessed at). The replay itself is cleaned up by `kill_under`;
 //! - `processes` are the live (not zombie) processes of this user other than this process that belong to a listed
-//!   session, with `session` (the id), `pid`, `ppid`, `pgid`, `start`, `exe`, `via` (`identity`, `environment` or `group`) and `listeners`
-//!   (`procinfo::Listener`: TCP sockets in the listening state and bound UDP sockets), sorted by pid.
+//!   session, with `session` (the id), `pid`, `ppid`, `pgid`, `start`, `exe`, `via` (`identity`, `environment` or
+//!   `group`) and `listeners` (`procinfo::Listener`: TCP sockets in the listening state and bound UDP sockets),
+//!   sorted by pid.
 //!
-//! ## `kill(home, sessions, groups)`
-//! Stops every process the census finds for `sessions`:
-//! each round takes a census, sends SIGSTOP to every process (so nothing forks while it is being killed), then
-//! SIGKILL, and takes the next; at most 5 rounds, stopping at the first that finds nothing. A process is signalled
-//! only while it still has the start time the census recorded (a pid that was reused is not signalled).
-//! `Killed { rounds, killed, left }`: `left` is what the last census still found, empty when it succeeded.
-//! It never signals this process, or a pid of 1 or less, and uses only `kill(2)` and the kernel's tables: it
-//! works when the process table is full.
+//! ## `kill(home, sessions, groups, known_groups, confined)` and `kill_under(home, tmp)`
+//! Stops every process the census finds for `sessions`. A process that keeps forking and exiting from a new pid
+//! (`setsid`, then a loop of `fork; exit if parent`) is gone by the time a pid list taken earlier reaches it, so the
+//! scan itself does the stopping: as soon as the scan attributes a process it sends SIGSTOP, and when every live
+//! member of that process's group is also attributed to the same session (checked by identity, so a group that
+//! someone else's process joined is never signalled) it stops the whole group at once with `killpg`, which also
+//! catches the generation that does not exist yet. Then SIGKILL goes to those groups and to each process found, and
+//! the next scan runs; it repeats until two scans in a row find nothing, at most 20 rounds and 15 s. The groups that
+//! were stopped whole, and `known_groups` (`(session, process group)` pairs an earlier census showed), are signalled
+//! again before every scan while they have a live member, whether or not the scan finds one: a process that lives
+//! microseconds is found by a scan only by luck, and once any census has seen one generation its group is known. A
+//! `known_groups` entry is signalled only after the same check (every live member is the session's by its profile),
+//! so a stale pgid that another process now has is never signalled. A process is signalled
+//! only while it still has the start time the census recorded (a pid that was reused is not signalled); a group is
+//! never signalled when it is this process's own, or has pgid 1 or less.
+//! `Killed { rounds, killed, readable, left }`: `left` is what the last census still found, empty when it succeeded;
+//! `readable` is false when the process table could not be read (then `left` is empty and nothing was stopped: it is
+//! not a success). It uses only `kill(2)` and the kernel's tables: it works when the process table is full.
+//! `kill_under(home, tmp)` is the same for what runs under a profile that may read `tmp` and not the home (the oracle's
+//! replay, once it has returned).
 //!
 //! Tests required (macOS with `sandbox-exec`; others skip): `an_identity_is_validated_and_marks_the_environment`,
-//! `the_identity_probe_works_on_this_host`, `a_setsid_orphan_with_a_cleared_environment_is_found_and_killed`,
+//! `the_identity_probe_works_on_this_host`, `a_probe_that_could_not_run_is_asked_again`,
+//! `a_setsid_orphan_with_a_cleared_environment_is_found_and_killed`,
+//! `a_process_that_forks_and_exits_in_a_loop_is_killed_by_its_group`,
+//! `a_group_is_signalled_only_when_all_of_it_is_the_sessions`, `a_replay_orphan_is_found_and_killed`,
 //! `the_census_lists_what_a_session_listens_on`, `a_pid_that_was_reused_is_not_signalled`,
-//! `without_identity_the_environment_and_the_groups_find_what_they_can`, `an_unreadable_table_is_not_an_empty_one`.
+//! `without_identity_the_environment_and_the_groups_find_what_they_can`,
+//! `an_unconfined_daemon_does_not_claim_an_empty_census` and `an_unreadable_table_is_not_an_empty_one`.
 
 use crate::procinfo::{self, Listener};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// The environment variable `Sandbox::env` sets in a sandbox that has an identity (the census's fallback).
 pub const ENV_MARK: &str = "LOOM_SANDBOX_ID";
 
-/// At most this many rounds of stop-and-kill.
-const MAX_ROUNDS: u32 = 5;
+/// At most this many rounds of stop-and-kill, and this long.
+const MAX_ROUNDS: u32 = 20;
+const MAX_KILL_TIME: Duration = Duration::from_secs(15);
 
 /// Whether `id` can be a sandbox identity: 1 to 64 letters, digits, `-` and `_`.
 pub fn valid_id(id: &str) -> Result<(), String> {
@@ -127,14 +154,29 @@ fn in_session(pid: u32, tmp: &Path) -> bool {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Probe {
     pub works: bool,
+    /// The probe could not run (a process or directory could not be made, or the query could not be asked in time):
+    /// the answer is not kept, and the next call asks again.
+    pub undetermined: bool,
     /// What was seen, in a sentence.
     pub detail: String,
 }
 
-/// Whether sandbox identity can be asked on this host; see the contract. Run once, then remembered.
-pub fn probe() -> &'static Probe {
-    static PROBE: OnceLock<Probe> = OnceLock::new();
-    PROBE.get_or_init(run_probe)
+/// Whether sandbox identity can be asked on this host; see the contract. A settled answer is kept.
+pub fn probe() -> Probe {
+    static PROBE: Mutex<Option<Probe>> = Mutex::new(None);
+    probe_cached(&PROBE, run_probe)
+}
+
+/// The kept answer in `cell`, or `run`'s, kept only when it is settled.
+fn probe_cached(cell: &Mutex<Option<Probe>>, run: impl FnOnce() -> Probe) -> Probe {
+    if let Some(kept) = cell.lock().unwrap_or_else(|p| p.into_inner()).clone() {
+        return kept;
+    }
+    let answer = run();
+    if !answer.undetermined {
+        *cell.lock().unwrap_or_else(|p| p.into_inner()) = Some(answer.clone());
+    }
+    answer
 }
 
 #[cfg(target_os = "macos")]
@@ -156,7 +198,9 @@ fn run_probe() -> Probe {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
-    let fail = |detail: String| Probe { works: false, detail };
+    let fail = |detail: String| Probe { works: false, undetermined: false, detail };
+    // The probe could not run: nothing was learned about the host.
+    let unrun = |detail: String| Probe { works: false, undetermined: true, detail };
     if !Path::new(super::SANDBOX_EXEC).exists() {
         return fail(format!("{} is missing, so no command runs under a profile", super::SANDBOX_EXEC));
     }
@@ -168,18 +212,18 @@ fn run_probe() -> Probe {
         (home.join("sessions").join("probe").join("tmp"), home.join("sessions").join("other").join("tmp"));
     for dir in [&ws, &tmp, &other] {
         if let Err(e) = std::fs::create_dir_all(dir) {
-            return fail(format!("the probe directory {} could not be made: {e}", dir.display()));
+            return unrun(format!("the probe directory {} could not be made: {e}", dir.display()));
         }
     }
     let (Ok(home), Ok(ws), Ok(tmp), Ok(other)) =
         (home.canonicalize(), ws.canonicalize(), tmp.canonicalize(), other.canonicalize())
     else {
-        return fail("the probe directories could not be resolved".to_string());
+        return unrun("the probe directories could not be resolved".to_string());
     };
     let cfg = SandboxCfg { mode: SandboxMode::Seatbelt, protect_credentials: false, ..SandboxCfg::default() };
     let sandbox = match Sandbox::new(&cfg, &ws, &tmp, &home, None) {
         Ok(sandbox) => sandbox,
-        Err(e) => return fail(format!("the probe sandbox could not be built: {e}")),
+        Err(e) => return unrun(format!("the probe sandbox could not be built: {e}")),
     };
     let (program, args) = sandbox.command("exec /bin/sleep 30");
     let spawn = |mut cmd: Command| {
@@ -191,10 +235,11 @@ fn run_probe() -> Probe {
     outside.arg("30");
     let (inside, outside) = match (spawn(inside), spawn(outside)) {
         (Ok(a), Ok(b)) => (a, b),
-        (Err(e), _) | (_, Err(e)) => return fail(format!("a probe command could not be started: {e}")),
+        (Err(e), _) | (_, Err(e)) => return unrun(format!("a probe command could not be started: {e}")),
     };
     let deadline = Instant::now() + Duration::from_secs(3);
     let mut seen: String;
+    let mut asked;
     loop {
         let (class, own, foreign) =
             (refused(inside.0.id(), &home), refused(inside.0.id(), &tmp), refused(inside.0.id(), &other));
@@ -203,6 +248,7 @@ fn run_probe() -> Probe {
             "under a profile: the home {class:?}, its own temp dir {own:?}, another session's {foreign:?}; \
              an unsandboxed child: {plain:?}, this process: {me:?}"
         );
+        asked = [class, own, foreign, plain, me].iter().all(Option::is_some);
         if class == Some(true)
             && own == Some(false)
             && foreign == Some(true)
@@ -210,19 +256,29 @@ fn run_probe() -> Probe {
             && me == Some(false)
         {
             drop(guard);
-            return Probe { works: true, detail: "sandbox_check tells the sessions' sandboxes apart".to_string() };
+            return Probe {
+                works: true,
+                undetermined: false,
+                detail: "sandbox_check tells the sessions' sandboxes apart".to_string(),
+            };
         }
         if Instant::now() >= deadline {
             break;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    fail(format!("sandbox_check did not tell a sandboxed process from others ({seen})"))
+    let detail = format!("sandbox_check did not tell a sandboxed process from others ({seen})");
+    // A question that could not be asked (a process not yet visible, a table that would not answer) is not an answer.
+    if asked {
+        fail(detail)
+    } else {
+        unrun(detail)
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
 fn run_probe() -> Probe {
-    Probe { works: false, detail: "sandbox identity is a macOS Seatbelt feature".to_string() }
+    Probe { works: false, undetermined: false, detail: "sandbox identity is a macOS Seatbelt feature".to_string() }
 }
 
 /// How a process was attributed to its session.
@@ -262,22 +318,86 @@ impl Census {
         self.processes.iter().filter(move |p| p.session == session)
     }
 
-    /// Whether `session` has no live process (false when the table could not be read).
+    /// Whether `session` has no live process: false when the table could not be read, and false for a census that
+    /// was not taken by sandbox identity (the fallback finds only what it can, so it cannot say "none").
     pub fn is_empty_for(&self, session: &str) -> bool {
-        self.readable && self.of(session).next().is_none()
+        self.readable && self.identity && self.of(session).next().is_none()
     }
 }
 
 /// The census; see the contract.
-pub fn take(home: &Path, sessions: &[Member<'_>], groups: &[(String, u32)]) -> Census {
-    take_by(home, sessions, groups, probe().works)
+pub fn take(home: &Path, sessions: &[Member<'_>], groups: &[(String, u32)], confined: bool) -> Census {
+    take_by(home, sessions, groups, confined && probe().works)
 }
 
 /// `take` with the method chosen (a test forces the fallback).
 fn take_by(home: &Path, sessions: &[Member<'_>], groups: &[(String, u32)], identity: bool) -> Census {
+    scan(home, sessions, groups, identity, false).0
+}
+
+/// The session a process says it belongs to, by the environment variable `Sandbox::env` sets.
+fn marked_session(pid: u32) -> Option<String> {
+    let prefix = format!("{ENV_MARK}=");
+    procinfo::command_line(pid)?.env.iter().find_map(|e| e.strip_prefix(&prefix).map(str::to_string))
+}
+
+/// Whether `member`'s session owns `pid` by its profile: refused the home, and not refused the session's temp dir.
+/// `None` when the process is gone or cannot be asked about.
+fn owned_by_profile(pid: u32, home: &Path, member: &Member<'_>) -> Option<bool> {
+    if refused(pid, home)? {
+        Some(!refused(pid, member.tmp)?)
+    } else {
+        Some(false)
+    }
+}
+
+/// Whether every live member of process group `pgid` is a process of `member` by its profile (and of this user),
+/// so that the whole group can be signalled: a group that anything else has joined is not ours to signal.
+fn group_is_ours(pgid: u32, member: &Member<'_>, home: &Path, uid: u32) -> bool {
+    // SAFETY: getpgrp takes no arguments.
+    let own = unsafe { libc::getpgrp() };
+    if pgid <= 1 || i64::from(own) == i64::from(pgid) {
+        return false;
+    }
+    let Some(members) = procinfo::group(pgid) else { return false };
+    let mut any = false;
+    for m in members.iter().filter(|m| !m.zombie) {
+        if m.uid != uid {
+            return false;
+        }
+        // A member that exited since the list was read cannot be asked about: it is no longer a member.
+        match owned_by_profile(m.pid, home, member) {
+            Some(true) => any = true,
+            Some(false) => return false,
+            None => {}
+        }
+    }
+    any
+}
+
+/// Sends `sig` to the process group `pgid`.
+fn signal_group(pgid: u32, sig: i32) -> bool {
+    let Ok(pg) = i32::try_from(pgid) else { return false };
+    if pgid <= 1 {
+        return false;
+    }
+    // SAFETY: kill(2) takes plain integers and has no memory effects.
+    unsafe { libc::kill(-pg, sig) == 0 }
+}
+
+/// The census, stopping what it finds as it finds it when `stop` (see `kill`): the process groups that were
+/// stopped as a whole come back with it, with the index in `sessions` of the session each belongs to.
+fn scan(
+    home: &Path,
+    sessions: &[Member<'_>],
+    groups: &[(String, u32)],
+    identity: bool,
+    stop: bool,
+) -> (Census, BTreeMap<u32, usize>) {
     let taken_ms = loom_core::now_ms();
+    let mut frozen: BTreeMap<u32, usize> = BTreeMap::new();
     let Some(pids) = procinfo::pids() else {
-        return Census { taken_ms, readable: false, identity, processes: Vec::new() };
+        return (Census { taken_ms, readable: false, identity, processes: Vec::new() }, frozen);
     };
     let me = std::process::id();
     // SAFETY: geteuid takes no arguments.
@@ -302,68 +422,157 @@ fn take_by(home: &Path, sessions: &[Member<'_>], groups: &[(String, u32)], ident
             continue;
         }
         let Some(info) = procinfo::info(pid).filter(|i| !i.zombie && i.uid == uid) else { continue };
-        if identity {
+        let attributed: Option<(usize, Via)> = if identity {
             if in_a_sandbox(pid, home) {
-                if let Some(member) = sessions.iter().find(|m| in_session(pid, m.tmp)) {
-                    add(info, member.id, Via::Identity);
-                }
+                sessions
+                    .iter()
+                    .position(|m| in_session(pid, m.tmp))
+                    .map(|i| (i, Via::Identity))
+                    // A sandbox no listed session's profile matches (a replay): what it was started with.
+                    .or_else(|| {
+                        let mark = marked_session(pid)?;
+                        sessions.iter().position(|m| m.id == mark).map(|i| (i, Via::Environment))
+                    })
+            } else {
+                None
             }
-        } else if let Some(mark) = procinfo::command_line(pid).and_then(|line| {
-            let prefix = format!("{ENV_MARK}=");
-            line.env.iter().find_map(|e| e.strip_prefix(&prefix).map(str::to_string))
-        }) {
-            if let Some(member) = sessions.iter().find(|m| m.id == mark) {
-                add(info, member.id, Via::Environment);
+        } else {
+            marked_session(pid)
+                .and_then(|mark| sessions.iter().position(|m| m.id == mark))
+                .map(|i| (i, Via::Environment))
+        };
+        let Some((index, via)) = attributed else { continue };
+        let Some(member) = sessions.get(index) else { continue };
+        if stop {
+            // Before anything else is read about it: a process that exits and forks on has no time to wait for that.
+            if via == Via::Identity
+                && group_is_ours(info.pgid, member, home, uid)
+                && signal_group(info.pgid, libc::SIGSTOP)
+            {
+                frozen.insert(info.pgid, index);
             }
+            signal_pid(info.pid, &info.start, libc::SIGSTOP);
         }
+        add(info, member.id, via);
     }
     for (session, pgid) in groups {
         for member in procinfo::group(*pgid).unwrap_or_default() {
             if !member.zombie && member.pid != me && member.pid > 1 {
+                if stop {
+                    signal_pid(member.pid, &member.start, libc::SIGSTOP);
+                }
                 add(member, session, Via::Group);
             }
         }
     }
-    Census { taken_ms, readable: true, identity, processes: found.into_values().collect() }
+    (Census { taken_ms, readable: true, identity, processes: found.into_values().collect() }, frozen)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Killed {
     pub rounds: u32,
     pub killed: usize,
+    /// The process table could be read. When it could not, nothing was stopped and `left` says nothing.
+    pub readable: bool,
     pub left: Vec<Process>,
+}
+
+/// Signals process `pid` while it still has the start time `start`.
+fn signal_pid(pid: u32, start: &str, sig: i32) -> bool {
+    let Ok(raw) = i32::try_from(pid) else { return false };
+    if pid <= 1 || pid == std::process::id() {
+        return false;
+    }
+    let same = procinfo::info(pid).is_some_and(|i| i.start == start && !i.zombie);
+    // SAFETY: kill(2) takes plain integers and has no memory effects.
+    same && unsafe { libc::kill(raw, sig) } == 0
 }
 
 /// Signals `process` while it still is the process the census saw.
 fn signal(process: &Process, sig: i32) -> bool {
-    let Ok(pid) = i32::try_from(process.pid) else { return false };
-    if process.pid <= 1 || process.pid == std::process::id() {
-        return false;
+    signal_pid(process.pid, &process.start, sig)
+}
+
+/// Stops what the census finds for `sessions`; see the contract. `known_groups` are `(session, process group)` pairs
+/// seen in an earlier census.
+pub fn kill(
+    home: &Path,
+    sessions: &[Member<'_>],
+    groups: &[(String, u32)],
+    known_groups: &[(String, u32)],
+    confined: bool,
+) -> Killed {
+    kill_by(home, sessions, groups, known_groups, confined && probe().works)
+}
+
+/// Stops what runs under a profile that may read `tmp` and not the loom home (a replay of the oracle).
+pub fn kill_under(home: &Path, tmp: &Path) -> Killed {
+    kill_by(home, &[Member { id: "replay", tmp }], &[], &[], probe().works)
+}
+
+fn kill_by(
+    home: &Path,
+    sessions: &[Member<'_>],
+    groups: &[(String, u32)],
+    known_groups: &[(String, u32)],
+    identity: bool,
+) -> Killed {
+    // SAFETY: geteuid takes no arguments.
+    let uid = unsafe { libc::geteuid() };
+    let (mut rounds, mut killed, mut quiet) = (0, 0, 0);
+    let began = Instant::now();
+    // Process groups known to be wholly a session's (index into `sessions`): signalled before each scan, whether or
+    // not the scan finds a member (a process that forks and exits has no pid to find).
+    let mut watch: BTreeMap<u32, usize> = BTreeMap::new();
+    if identity {
+        for (session, pgid) in known_groups {
+            if let Some(index) = sessions.iter().position(|m| m.id == session) {
+                watch.insert(*pgid, index);
+            }
+        }
     }
-    let same = procinfo::info(process.pid).is_some_and(|i| i.start == process.start && !i.zombie);
-    // SAFETY: kill(2) takes plain integers and has no memory effects.
-    same && unsafe { libc::kill(pid, sig) } == 0
-}
-
-/// Stops what the census finds for `sessions`; see the contract.
-pub fn kill(home: &Path, sessions: &[Member<'_>], groups: &[(String, u32)]) -> Killed {
-    kill_by(home, sessions, groups, probe().works)
-}
-
-fn kill_by(home: &Path, sessions: &[Member<'_>], groups: &[(String, u32)], identity: bool) -> Killed {
-    let (mut rounds, mut killed) = (0, 0);
     loop {
-        let targets = take_by(home, sessions, groups, identity).processes;
-        if targets.is_empty() || rounds >= MAX_ROUNDS {
-            return Killed { rounds, killed, left: targets };
+        for (pgid, index) in &watch {
+            if sessions.get(*index).is_some_and(|m| group_is_ours(*pgid, m, home, uid)) {
+                let members = procinfo::group(*pgid).map_or(0, |g| g.iter().filter(|m| !m.zombie).count());
+                if signal_group(*pgid, libc::SIGSTOP) && signal_group(*pgid, libc::SIGKILL) {
+                    killed += members;
+                }
+            }
+        }
+        // Everything it finds is already stopped when it returns.
+        let (census, frozen) = scan(home, sessions, groups, identity, true);
+        if !census.readable {
+            return Killed { rounds, killed, readable: false, left: Vec::new() };
+        }
+        let targets = census.processes;
+        watch.extend(frozen.iter().map(|(pgid, index)| (*pgid, *index)));
+        let alive =
+            |pgid: &u32, _: &mut usize| procinfo::group(*pgid).is_some_and(|members| members.iter().any(|m| !m.zombie));
+        let settled = targets.is_empty();
+        if settled {
+            watch.retain(alive);
+        }
+        if settled && watch.is_empty() {
+            // Twice: a process that comes and goes can be missed by one scan.
+            quiet += 1;
+            if quiet >= 2 {
+                return Killed { rounds, killed, readable: true, left: Vec::new() };
+            }
+            std::thread::sleep(Duration::from_millis(30));
+            continue;
+        }
+        quiet = 0;
+        if rounds >= MAX_ROUNDS || began.elapsed() >= MAX_KILL_TIME {
+            return Killed { rounds, killed, readable: true, left: targets };
         }
         rounds += 1;
-        // Stopped first, so that nothing forks while the rest is being killed.
-        for p in &targets {
-            signal(p, libc::SIGSTOP);
+        for pgid in frozen.keys() {
+            signal_group(*pgid, libc::SIGKILL);
         }
         for p in &targets {
-            if signal(p, libc::SIGKILL) {
+            // A group that was killed whole counts its found members (their pids may be gone already).
+            if signal(p, libc::SIGKILL) || frozen.contains_key(&p.pgid) {
                 killed += 1;
             }
         }
@@ -500,9 +709,9 @@ mod tests {
             return;
         }
         let p = probe();
-        assert!(p.works, "{}", p.detail);
+        assert!(p.works && !p.undetermined, "{}", p.detail);
         // Remembered: the second answer is the first.
-        assert!(std::ptr::eq(p, probe()));
+        assert_eq!(p, probe());
     }
 
     #[test]
@@ -556,7 +765,7 @@ mod tests {
             "the unsandboxed sleep was attributed"
         );
 
-        let killed = kill(&home, &members[..1], &[]);
+        let killed = kill(&home, &members[..1], &[], &[], true);
         assert!(killed.killed >= 2 && killed.left.is_empty(), "{killed:?}");
         let mut gone = false;
         for _ in 0..100 {
@@ -568,13 +777,13 @@ mod tests {
         }
         assert!(gone, "the orphan survived");
         assert!(alive(other), "another session's process was killed");
-        assert!(take(&home, &members, &[]).is_empty_for("s-census-1"));
-        assert!(!take(&home, &members, &[]).is_empty_for("s-census-2"));
+        assert!(take(&home, &members, &[], true).is_empty_for("s-census-1"));
+        assert!(!take(&home, &members, &[], true).is_empty_for("s-census-2"));
         // A session that is not listed is not reported, and so is not killed.
-        assert!(take(&home, &members[..1], &[]).of("s-census-2").next().is_none());
-        assert_eq!(kill(&home, &members[..1], &[]).killed, 0);
+        assert!(take(&home, &members[..1], &[], true).of("s-census-2").next().is_none());
+        assert_eq!(kill(&home, &members[..1], &[], &[], true).killed, 0);
         assert!(alive(other));
-        assert!(kill(&home, &members[1..], &[]).left.is_empty());
+        assert!(kill(&home, &members[1..], &[], &[], true).left.is_empty());
     }
 
     #[test]
@@ -603,13 +812,13 @@ mod tests {
         }
         assert!(port > 0, "the listener did not start");
         let members = [Member { id: "s-census-3", tmp: &tmp }];
-        let census = take(&rig.home, &members, &[]);
+        let census = take(&rig.home, &members, &[], true);
         let listening: Vec<&Listener> = census.of("s-census-3").flat_map(|p| &p.listeners).collect();
         assert!(
             listening.iter().any(|l| l.port == port && l.proto == procinfo::Proto::Tcp && l.addr == "127.0.0.1"),
             "{census:?}"
         );
-        assert!(kill(&rig.home, &members, &[]).left.is_empty());
+        assert!(kill(&rig.home, &members, &[], &[], true).left.is_empty());
     }
 
     #[test]
@@ -674,7 +883,7 @@ mod tests {
                 .any(|p| p.exe.ends_with("sleep") && p.pgid != group && p.ppid != 0 && { p.via == Via::Group }),
             "{census:?}"
         );
-        let killed = kill_by(&home, &members, &groups, false);
+        let killed = kill_by(&home, &members, &groups, &[], false);
         assert!(killed.left.is_empty(), "{killed:?}");
         let _ = grouped.wait();
     }
@@ -688,5 +897,158 @@ mod tests {
         assert!(!census.readable && census.processes.is_empty());
         assert!(!census.is_empty_for("s-x"), "an unreadable census must not read as 'no processes'");
         assert!(take_by(&home, &[], &[], false).readable);
+    }
+
+    #[test]
+    fn a_probe_that_could_not_run_is_asked_again() {
+        let unrun = Probe { works: false, undetermined: true, detail: "no process could be started".into() };
+        let works = Probe { works: true, undetermined: false, detail: "ok".into() };
+        let cell = Mutex::new(None);
+        assert_eq!(probe_cached(&cell, || unrun.clone()), unrun);
+        // Not kept: the next call runs the probe again, and its answer is kept.
+        assert_eq!(probe_cached(&cell, || works.clone()), works);
+        assert_eq!(probe_cached(&cell, unreachable_probe), works);
+        // A settled failure (the question was asked and did not tell the sandboxes apart) is kept too.
+        let no = Probe { works: false, undetermined: false, detail: "does not tell them apart".into() };
+        let cell = Mutex::new(None);
+        assert_eq!(probe_cached(&cell, || no.clone()), no);
+        assert_eq!(probe_cached(&cell, || works.clone()), no);
+    }
+
+    fn unreachable_probe() -> Probe {
+        Probe { works: false, undetermined: true, detail: "the probe ran although an answer was kept".into() }
+    }
+
+    #[test]
+    fn an_unconfined_daemon_does_not_claim_an_empty_census() {
+        // With `sandbox.mode = "none"` no process is refused the home: the census is the fallback and cannot say none.
+        let home = std::env::temp_dir();
+        let census = take(&home, &[], &[], false);
+        assert!(census.readable && !census.identity);
+        assert!(!census.is_empty_for("s-x"), "a fallback census read as empty");
+        let by_identity = Census { taken_ms: 1, readable: true, identity: true, processes: Vec::new() };
+        assert!(by_identity.is_empty_for("s-x"));
+    }
+
+    /// The part of `procinfo::group(pgid)` that is not a zombie.
+    fn live_members(pgid: u32) -> usize {
+        procinfo::group(pgid).map_or(0, |g| g.iter().filter(|m| !m.zombie).count())
+    }
+
+    #[test]
+    fn a_process_that_forks_and_exits_in_a_loop_is_killed_by_its_group() {
+        if !available() {
+            return;
+        }
+        assert!(probe().works, "{}", probe().detail);
+        let mut rig = Rig::new();
+        let sb = rig.sandbox("s-census-6");
+        let tmp = rig.tmp("s-census-6");
+        let members = [Member { id: "s-census-6", tmp: &tmp }];
+        // (The trailing command keeps the shell from becoming the perl, which as a group leader cannot setsid.)
+        // After setsid each generation forks the next and exits, so its pid is gone within milliseconds; the group
+        // and the session stay.
+        rig.run(
+            &sb,
+            "/usr/bin/env -i /usr/bin/perl -MPOSIX -e 'POSIX::setsid(); while (1) { select(undef, undef, undef, 0.003); \
+             fork && exit 0 }'; /bin/sleep 75",
+            false,
+        );
+        let home = rig.home.clone();
+        let census = until(&home, &members, &[], true, |c| c.of("s-census-6").any(|p| p.exe.ends_with("perl")));
+        let hopper = census.of("s-census-6").find(|p| p.exe.ends_with("perl")).expect("the hopper was not found");
+        let group = hopper.pgid;
+        assert_eq!(hopper.via, Via::Identity);
+        assert_ne!(group, rig.spawned[0].id(), "setsid took it out of the command's group");
+        // The group is known from the census; no pid in it lasts long enough to be found again.
+        let known = [("s-census-6".to_string(), group)];
+        let killed = kill(&home, &members, &[], &known, true);
+        assert!(killed.readable && killed.left.is_empty(), "{killed:?}");
+        for _ in 0..50 {
+            if live_members(group) == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        assert_eq!(live_members(group), 0, "the hopper's group survived: {:?}", procinfo::group(group));
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(live_members(group), 0, "the hopper came back");
+        assert!(take(&home, &members, &[], true).is_empty_for("s-census-6"));
+    }
+
+    #[test]
+    fn a_group_is_signalled_only_when_all_of_it_is_the_sessions() {
+        if !available() {
+            return;
+        }
+        use std::os::unix::process::CommandExt;
+        assert!(probe().works, "{}", probe().detail);
+        let mut rig = Rig::new();
+        let one = rig.sandbox("s-census-7");
+        let (tmp1, tmp2) = (rig.tmp("s-census-7"), rig.tmp("s-census-8"));
+        let (m1, m2) = (Member { id: "s-census-7", tmp: &tmp1 }, Member { id: "s-census-8", tmp: &tmp2 });
+        rig.run(&one, "/bin/sleep 66 & /bin/sleep 67 & wait", false);
+        let plain = std::process::Command::new("/bin/sleep").arg("68").process_group(0).spawn().expect("spawn");
+        let plain_group = plain.id();
+        rig.spawned.push(plain);
+        let home = rig.home.clone();
+        let group = rig.spawned[0].id();
+        // Not until the shell has become its sandboxed self and started its sleeps.
+        for _ in 0..100 {
+            if live_members(group) >= 3 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // SAFETY: geteuid takes no arguments.
+        let uid = unsafe { libc::geteuid() };
+        assert!(group_is_ours(group, &m1, &home, uid), "the session's own group");
+        assert!(!group_is_ours(group, &m2, &home, uid), "another session's group");
+        assert!(!group_is_ours(plain_group, &m1, &home, uid), "a group of an unsandboxed process");
+        assert!(!group_is_ours(1, &m1, &home, uid) && !group_is_ours(0, &m1, &home, uid));
+        // SAFETY: getpgrp takes no arguments.
+        assert!(!group_is_ours(u32::try_from(unsafe { libc::getpgrp() }).unwrap_or(0), &m1, &home, uid));
+        // A stale hint naming another session's group signals nothing.
+        let hinted = kill(&home, &[m2], &[], &[("s-census-8".to_string(), group)], true);
+        assert_eq!(hinted.killed, 0, "{hinted:?}");
+        assert!(live_members(group) >= 3);
+        assert!(live_members(plain_group) >= 1);
+    }
+
+    #[test]
+    fn a_replay_orphan_is_found_and_killed() {
+        if !available() {
+            return;
+        }
+        assert!(probe().works, "{}", probe().detail);
+        let mut rig = Rig::new();
+        let caller = rig.sandbox("s-census-9");
+        let tmp = rig.tmp("s-census-9");
+        // The oracle's layout: private staging under the home's oracle-runs.
+        let private = caller.oracle_staging_root().join("run-1");
+        let (rws, rtmp) = (private.join("workspace"), private.join("tmp"));
+        for d in [&rws, &rtmp] {
+            std::fs::create_dir_all(d).expect("mkdir");
+        }
+        let replay = caller.isolated_replay(&rws, &rtmp).expect("replay");
+        let members = [Member { id: "s-census-9", tmp: &tmp }];
+        // The candidate's program leaves a process behind: its own session, no environment, nobody to wait for it.
+        rig.run(
+            &replay,
+            "/usr/bin/env -i /usr/bin/perl -MPOSIX -e 'POSIX::setsid(); fork && exit 0; exec \"/bin/sleep\", \"69\"'; \
+             /bin/sleep 70",
+            false,
+        );
+        let home = rig.home.clone();
+        // A replay refuses the session's temp dir, so the environment it was started with is what names the session.
+        let census = until(&home, &members, &[], true, |c| c.of("s-census-9").any(|p| p.exe.ends_with("sleep")));
+        assert!(census.of("s-census-9").any(|p| p.via == Via::Environment), "{census:?}");
+        // The orphan has no environment: only the replay's own profile finds it.
+        let replay_member = [Member { id: "replay", tmp: &rtmp }];
+        let under = until(&home, &replay_member, &[], true, |c| c.of("replay").any(|p| p.ppid == 1));
+        assert!(under.of("replay").any(|p| p.exe.ends_with("sleep") && p.ppid == 1), "{under:?}");
+        let killed = kill_under(&home, &rtmp);
+        assert!(killed.readable && killed.left.is_empty() && killed.killed >= 1, "{killed:?}");
+        assert!(take(&home, &replay_member, &[], true).is_empty_for("replay"));
     }
 }

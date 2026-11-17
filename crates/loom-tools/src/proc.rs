@@ -20,7 +20,8 @@
 //! own process group (`process_group(0)`). A sandboxed command (`Sandbox::nproc_limit`, set by
 //! `sandbox.nproc_headroom`; not a `spawn_launched` one) also has its RLIMIT_NPROC, soft and hard, lowered to that limit
 //! before it starts (`procinfo::set_nproc` in a `pre_exec` hook), so that nothing it starts can fill the user's process
-//! table: the daemon, whose own limit is higher, can still fork the processes that stop it. So `out_path` holds stdout and stderr of the command in
+//! table: the daemon, whose own limit is higher, can still fork the processes that stop it. When the user already
+//! holds as many processes as that limit, `spawn` is an error that says what to do and starts nothing. So `out_path` holds stdout and stderr of the command in
 //! the order they were written, and `exit_path` ends up holding the status as a decimal number.
 //! Anything else in `exit_path` (the sandbox launcher or the shell complaining) means the command did
 //! not start properly: [`Ended::Failed`] carries that text.
@@ -562,6 +563,10 @@ fn group_state(pgid: u32, owner: Option<&str>, own_leader: bool) -> GroupState {
         return GroupState::Gone;
     }
     let Some(members) = procinfo::group(pgid) else { return GroupState::Unknown };
+    // The kernel says the group is alive and no member can be listed: the table is not telling, which is not "gone".
+    if members.is_empty() {
+        return GroupState::Unknown;
+    }
     if members.iter().all(|m| m.zombie) {
         return GroupState::Gone;
     }
@@ -634,6 +639,11 @@ enum How<'a> {
 }
 
 fn spawn_with(how: How<'_>, spec: &Spawn) -> io::Result<Running> {
+    // Asked first: a command that cannot be given room leaves nothing behind.
+    let nproc = match &how {
+        How::Sandboxed(sandbox) => sandbox.nproc_limit().map_err(io::Error::other)?,
+        How::Launched(_) => None,
+    };
     let pid_file = pid_path(&spec.out_path);
     for stale in [&spec.out_path, &spec.exit_path, &pid_file, &owner_path(&spec.exit_path)] {
         remove_stale(stale)?;
@@ -647,13 +657,11 @@ fn spawn_with(how: How<'_>, spec: &Spawn) -> io::Result<Running> {
         marker.write_all(owner.as_bytes())?;
         marker.sync_data()?;
     }
-    let mut nproc = None;
     let (program, args, remote_stop) = match how {
         How::Sandboxed(sandbox) => {
             let (program, mut args) = sandbox.command(WRAPPER);
             args.push(spec.script.clone());
             args.push(owner.clone());
-            nproc = sandbox.nproc_limit();
             (program, args, None)
         }
         How::Launched(launcher) => {
@@ -1261,11 +1269,15 @@ mod tests {
         for d in ["ws", "tmp", "home"] {
             std::fs::create_dir_all(root.join(d)).expect("mkdir");
         }
-        // A headroom bigger than the limit leaves the command `current + 64` processes of room.
-        let cfg = SandboxCfg { mode: SandboxMode::None, nproc_headroom: u32::MAX, ..SandboxCfg::default() };
+        // A headroom that leaves the command 300 processes beyond the ones this user has now.
+        let base = procinfo::nproc_base().expect("a base limit");
+        // SAFETY: geteuid takes no arguments.
+        let mine = procinfo::user_tasks(unsafe { libc::geteuid() }).expect("the user's processes");
+        let headroom = u32::try_from(base.saturating_sub(mine).saturating_sub(300)).expect("headroom");
+        let cfg = SandboxCfg { mode: SandboxMode::None, nproc_headroom: headroom, ..SandboxCfg::default() };
         let sb = Sandbox::new(&cfg, &root.join("ws"), &root.join("tmp"), &root.join("home"), None).expect("sandbox");
-        let limit = sb.nproc_limit().expect("a limit");
-        assert!(limit <= procinfo::nproc_base().unwrap_or(u64::MAX));
+        let limit = sb.nproc_limit().expect("room").expect("a limit");
+        assert!(limit <= base.saturating_sub(u64::from(headroom)).max(1));
         let f = Fx { _dir: dir, root, sb };
         let mut running = f.start("for i in $(seq 1 400); do /bin/sleep 60 & done; wait");
         let end = running.wait(&never(), Some(Duration::from_secs(20)), u64::MAX).await;
@@ -1277,7 +1289,7 @@ mod tests {
         let cfg = SandboxCfg { mode: SandboxMode::None, nproc_headroom: 0, ..SandboxCfg::default() };
         let none =
             Sandbox::new(&cfg, &f.root.join("ws"), &f.root.join("tmp"), &f.root.join("home"), None).expect("sandbox");
-        assert_eq!(none.nproc_limit(), None);
+        assert_eq!(none.nproc_limit(), Ok(None));
     }
 
     #[tokio::test]

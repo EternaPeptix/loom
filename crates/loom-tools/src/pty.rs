@@ -267,7 +267,7 @@ fn spawn(ctx: &ToolCtx, script: &str, pid_file: std::path::PathBuf) -> Result<Pt
         .stdin(Stdio::from(slave.try_clone().map_err(|e| e.to_string())?))
         .stdout(Stdio::from(slave.try_clone().map_err(|e| e.to_string())?))
         .stderr(Stdio::from(slave));
-    let nproc = ctx.sandbox.nproc_limit();
+    let nproc = ctx.sandbox.nproc_limit().map_err(|e| format!("PTY process did not start: {e}"))?;
     unsafe {
         command.pre_exec(move || {
             if libc::setsid() < 0 {

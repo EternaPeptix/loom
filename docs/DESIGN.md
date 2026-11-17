@@ -1104,9 +1104,10 @@ the default evidence grade (§7) and staleness. Each module's documentation is t
     yes`, `tmux new -d`) is not tracked: `job_kill`, stop, the end of the session and daemon shutdown do
     not stop it, although it stays under the seatbelt profile. The 60 s census (`loom-agent::census`,
     `loom-tools::sandbox::census`) finds it by that profile, with what it listens on, and
-    `POST /api/sessions/{id}/census/kill` stops it; nothing is stopped automatically.
-  - A sandboxed command's RLIMIT_NPROC is lowered to `limit - sandbox.nproc_headroom` (default 256; 0 sets none; never
-    below the processes that exist + 64) before it starts, so a fork bomb stops while the daemon can still fork. Who
+    `POST /api/sessions/{id}/census/kill` stops it; nothing is stopped automatically, except that archiving a session
+    stops what it still has running once its tasks have ended.
+  - A sandboxed command's RLIMIT_NPROC is lowered to `limit - sandbox.nproc_headroom` (default 256; 0 sets none; a command is
+    refused when the user already holds that many) before it starts, so a fork bomb stops while the daemon can still fork. Who
     is in a command's group is read from the kernel (`loom-tools::procinfo`: libproc, `/proc`), never by running
     `ps`; a group that cannot be inspected is still signalled unless its leader was replaced, and a job whose group
     could not be confirmed stopped keeps its pid record for the next start.
@@ -1656,6 +1657,8 @@ notification of kind `disk` is raised, and no other until the disk has recovered
 the web UI shows a warning line while `GET /api/status` reports the disk as low. When the sandbox self-probe turns
 egress unbounded one notification of kind `egress` is raised (`LOOM_KIND=egress`), and a problem the probe finds is
 raised too even while `sandbox.allow_fetch_services` already holds egress unbounded; neither again until it cleared.
+A census that runs without sandbox identity although commands are confined raises one notification of kind `census`
+(`LOOM_KIND=census`), again only after identity returned.
 
 **Garbage collection.** Stored outputs are never deleted except by an explicit collection: `POST
 /api/gc {"apply": bool}` (default a dry run), `loom gc [--apply]`. A blob is kept when its full id

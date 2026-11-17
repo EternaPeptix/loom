@@ -10,7 +10,9 @@
 //! only hash-pinned regular files into independent fresh attack/control directories, checks hashes
 //! after execution and requires both the attack criterion and the benign control. Timeout/OOM/exit71
 //! are never successes. Privilege checks require an HMAC-authenticated external supervisor response,
-//! not a PTY marker. Secret keys must be unreadable to agent tools and are never included in receipts.
+//! not a PTY marker. Secret keys must be unreadable to agent tools and are never included in receipts. When a replay's
+//! command has returned, what it left running under the replay profile (a `setsid` or double-forked process) is stopped
+//! by sandbox identity before the staging is removed (`Sandbox::stop_replay_leftovers`), and logged.
 
 use crate::{
     params::{opt, spec},
@@ -240,7 +242,19 @@ async fn replay(
     }
     let args = expanded.iter().map(|a| crate::binary::quote(a)).collect::<Vec<_>>().join(" ");
     let script = format!("cd {} && {args}", crate::binary::quote(&workspace.to_string_lossy()));
-    let result = crate::binary::command(&isolated, script, timeout).await?;
+    let result = crate::binary::command(&isolated, script, timeout).await;
+    // Whatever the candidate left running under the replay profile (`setsid`, a double fork) goes with the staging.
+    let (stopper, replay_tmp) = (isolated.sandbox.clone(), isolated.tmp_dir.clone());
+    if let Ok(left) = tokio::task::spawn_blocking(move || stopper.stop_replay_leftovers(&replay_tmp)).await {
+        if left.killed > 0 || !left.left.is_empty() {
+            tracing::warn!(
+                "A replay of the oracle left processes running: {} stopped, {} could not be stopped",
+                left.killed,
+                left.left.len()
+            );
+        }
+    }
+    let result = result?;
     let completed = result.completed;
     let stop_reason = result.stop_reason;
     let bytes = result.bytes;

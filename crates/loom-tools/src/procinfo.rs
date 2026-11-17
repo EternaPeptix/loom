@@ -21,26 +21,33 @@
 //! - `listeners(pid)`: the TCP sockets in the listening state and the bound UDP sockets of a process
 //!   (`Listener { pid, proto, addr, port }`), empty when it has none or they cannot be read.
 //! - `exe_path(pid)`: the path of the executable a process runs, when the kernel gives it.
-//! - `process_count()`: how many processes the machine has (an upper bound of this user's).
-//! - `nproc_limit(base, headroom, current)`, `nproc_base()` and `set_nproc(limit)`: the RLIMIT_NPROC of a
-//!   sandboxed command. The limit counts every process of the user, so a command whose limit is
-//!   `base - headroom` stops forking `headroom` processes before the user's own limit, and the daemon (which
-//!   has not lowered its own) can still fork its responder and its notifier. The limit is never below
-//!   `current + NPROC_MIN_ROOM` (a command must be able to run on a busy machine) and never above `base`.
-//!   `set_nproc` only calls `setrlimit` and is safe in a `pre_exec` hook; it lowers the soft and hard limit
-//!   together, so the command cannot raise it again.
+//! - `process_count()`: how many processes the machine has.
+//! - `user_tasks(uid)`: what RLIMIT_NPROC counts for `uid`: its processes (macOS) or its processes' threads
+//!   (Linux counts every task); `None` when the table cannot be read.
+//! - `nproc_limit(base, headroom)`, `nproc_admit(base, headroom, current)`, `nproc_base()` and `set_nproc(limit)`: the
+//!   RLIMIT_NPROC of a sandboxed command. The limit counts every process of the user, so a command whose limit is
+//!   `base - headroom` stops forking `headroom` processes before the user's own limit, and the daemon (which has not
+//!   lowered its own) can still fork its responder and its notifier. The limit is exactly that and never more, at least
+//!   1: it does not depend on how many processes exist, so a command started after another one filled its limit gets
+//!   the same limit and not the daemon's. `nproc_admit` also refuses (an error that says what to do) when the user
+//!   already holds `current >= limit` processes: such a command could not fork at all, and giving it more would give
+//!   it the headroom. `nproc_limit_now(headroom)` is that with the live `nproc_base()` and `user_tasks`. `set_nproc` only
+//!   calls `setrlimit` and is safe in a `pre_exec` hook; it lowers the soft and hard limit together, so the command
+//!   cannot raise it again.
+//!
+//! A read the kernel refuses is `None` on macOS as well, where libproc reports a failure as 0 entries with `errno`
+//! set (not as -1): `pids` is `None` for an empty table (this process is always in it) and `group` is `None` for 0
+//! entries with `errno` other than "no such process". `proc` reads a group that the kernel says is alive and lists
+//! no members as `Unknown`.
 //!
 //! Tests required: `a_process_is_described_by_the_kernel_and_a_gone_one_is_not`,
 //! `a_group_lists_its_members_with_zombies_flagged`, `a_command_line_is_read_without_ps`,
 //! `procargs_are_split_into_arguments_and_environment` (malformed input included),
 //! `a_listening_socket_is_found_by_its_process` (macOS and Linux), `the_pid_table_lists_this_process`,
-//! `the_nproc_limit_leaves_headroom_and_never_stops_a_command_from_running` and
+//! `the_nproc_limit_is_the_base_minus_the_headroom_whatever_exists` and
 //! `an_unreadable_table_reads_as_unknown_not_as_gone`.
 
 use std::io;
-
-/// The least number of processes beyond the ones that exist that a command's RLIMIT_NPROC leaves it.
-pub const NPROC_MIN_ROOM: u64 = 64;
 
 /// One process, as the kernel describes it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -149,6 +156,21 @@ mod sys {
     /// More than `socket_fdinfo` is long (792 bytes).
     const SOCKET_INFO_BYTES: usize = 1024;
 
+    fn clear_errno() {
+        // SAFETY: `__error` returns this thread's errno, which is always writable.
+        unsafe { *libc::__error() = 0 };
+    }
+
+    /// Whether the call just made left an error other than "no such process" in errno.
+    fn failed_read() -> bool {
+        matches!(io::Error::last_os_error().raw_os_error(), Some(e) if e != 0 && e != libc::ESRCH)
+    }
+
+    pub fn user_tasks(uid: u32) -> Option<u64> {
+        let all = pids()?;
+        u64::try_from(all.iter().filter(|p| info(**p).is_some_and(|i| i.uid == uid)).count()).ok()
+    }
+
     fn pid_arg(pid: u32) -> Option<libc::c_int> {
         libc::c_int::try_from(pid).ok().filter(|p| *p > 0)
     }
@@ -194,9 +216,11 @@ mod sys {
         loop {
             let mut buf: Vec<libc::pid_t> = vec![0; slots];
             let bytes = i32::try_from(slots.checked_mul(size_of::<libc::pid_t>())?).ok()?;
+            clear_errno();
             // SAFETY: the buffer is `bytes` bytes of live, exclusively borrowed integers.
             let n = unsafe { libc::proc_listallpids(buf.as_mut_ptr().cast(), bytes) };
-            if n < 0 {
+            // libproc reports a failure as 0 entries (with errno set), not as -1; the table always holds this process.
+            if n <= 0 {
                 return None;
             }
             // The count is of entries; a full buffer may have cut the list, so it is made larger.
@@ -218,9 +242,11 @@ mod sys {
         loop {
             let mut buf: Vec<libc::pid_t> = vec![0; slots];
             let bytes = i32::try_from(slots.checked_mul(size_of::<libc::pid_t>())?).ok()?;
+            clear_errno();
             // SAFETY: the buffer is `bytes` bytes of live, exclusively borrowed integers.
             let n = unsafe { libc::proc_listpgrppids(pg, buf.as_mut_ptr().cast(), bytes) };
-            if n < 0 {
+            // A failure is 0 entries with errno set (an empty group is 0 entries and no process).
+            if n < 0 || (n == 0 && failed_read()) {
                 return None;
             }
             // Whether the call counts entries or bytes, what it did not write is still zero.
@@ -364,6 +390,23 @@ mod sys {
         Some(entries.flatten().filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok()).collect())
     }
 
+    /// Linux counts every task (thread) of the user against RLIMIT_NPROC.
+    pub fn user_tasks(uid: u32) -> Option<u64> {
+        let all = pids()?;
+        let mut total = 0u64;
+        for pid in all {
+            if !info(pid).is_some_and(|i| i.uid == uid) {
+                continue;
+            }
+            let threads = std::fs::read_to_string(format!("/proc/{pid}/status"))
+                .ok()
+                .and_then(|t| t.lines().find_map(|l| l.strip_prefix("Threads:")?.trim().parse::<u64>().ok()))
+                .unwrap_or(1);
+            total = total.saturating_add(threads);
+        }
+        Some(total)
+    }
+
     pub fn group_pids(pgid: u32) -> Option<Vec<u32>> {
         let all = pids()?;
         Some(all.into_iter().filter(|p| info(*p).is_some_and(|i| i.pgid == pgid)).collect())
@@ -450,6 +493,9 @@ mod sys {
         None
     }
     pub fn group_pids(_pgid: u32) -> Option<Vec<u32>> {
+        None
+    }
+    pub fn user_tasks(_uid: u32) -> Option<u64> {
         None
     }
     pub fn command_line(_pid: u32) -> Option<CommandLine> {
@@ -553,24 +599,45 @@ pub fn nproc_base() -> Option<u64> {
     }
 }
 
-/// The RLIMIT_NPROC of a command: `base - headroom`, at least `current + NPROC_MIN_ROOM`, at most `base`.
-/// `None` when `headroom` is 0 (no limit is set).
-pub fn nproc_limit(base: u64, headroom: u64, current: u64) -> Option<u64> {
-    if headroom == 0 {
-        return None;
-    }
-    let wanted = base.saturating_sub(headroom).max(current.saturating_add(NPROC_MIN_ROOM));
-    Some(wanted.min(base))
+/// What RLIMIT_NPROC counts for `uid`; see the contract.
+pub fn user_tasks(uid: u32) -> Option<u64> {
+    sys::user_tasks(uid)
 }
 
-/// The limit to give a command started now, for `headroom` processes of room: `None` when the headroom is 0
-/// or the base limit is unknown.
-pub fn nproc_limit_now(headroom: u64) -> Option<u64> {
+/// The RLIMIT_NPROC of a command: `base - headroom` (at least 1), whatever exists. `None` when `headroom` is 0 (no
+/// limit is set).
+pub fn nproc_limit(base: u64, headroom: u64) -> Option<u64> {
     if headroom == 0 {
         return None;
     }
-    let base = nproc_base()?;
-    nproc_limit(base, headroom, process_count().unwrap_or(0))
+    Some(base.saturating_sub(headroom).max(1))
+}
+
+/// `nproc_limit`, or an error that says what to do when the user already holds `current` tasks, at or above that
+/// limit (a command given it could not fork).
+pub fn nproc_admit(base: u64, headroom: u64, current: u64) -> Result<Option<u64>, String> {
+    let Some(limit) = nproc_limit(base, headroom) else { return Ok(None) };
+    if current >= limit {
+        return Err(format!(
+            "This user already has {current} processes, at or above the {limit} a sandboxed command may reach (the \
+             limit of {base} less sandbox.nproc_headroom = {headroom}), so the command could not start anything. \
+             Stop what is left running (the census lists it: POST /api/sessions/<id>/census/kill) or lower \
+             sandbox.nproc_headroom, then run the command again."
+        ));
+    }
+    Ok(Some(limit))
+}
+
+/// The limit to give a command started now, for `headroom` processes of room: `Ok(None)` when the headroom is 0 or
+/// the base limit is unknown, an error when the user is already at the limit (see `nproc_admit`).
+pub fn nproc_limit_now(headroom: u64) -> Result<Option<u64>, String> {
+    if headroom == 0 {
+        return Ok(None);
+    }
+    let Some(base) = nproc_base() else { return Ok(None) };
+    // SAFETY: geteuid takes no arguments.
+    let uid = unsafe { libc::geteuid() };
+    nproc_admit(base, headroom, user_tasks(uid).unwrap_or(0))
 }
 
 /// Lowers this process's RLIMIT_NPROC (soft and hard) to `limit`. Only `setrlimit` runs, so it can be called
@@ -735,19 +802,30 @@ mod tests {
     }
 
     #[test]
-    fn the_nproc_limit_leaves_headroom_and_never_stops_a_command_from_running() {
-        assert_eq!(nproc_limit(2666, 0, 100), None);
-        assert_eq!(nproc_limit(2666, 256, 100), Some(2410));
-        // A busy machine: the command still has room.
-        assert_eq!(nproc_limit(2666, 256, 2500), Some(2564));
-        // Never above the base.
-        assert_eq!(nproc_limit(2666, 256, 2650), Some(2666));
-        assert_eq!(nproc_limit(100, 500, 10), Some(74));
-        assert_eq!(nproc_limit(u64::MAX, 1, u64::MAX), Some(u64::MAX));
-        assert!(nproc_limit_now(0).is_none());
-        if let (Some(base), Some(now)) = (nproc_base(), nproc_limit_now(256)) {
-            assert!(now <= base && now > 0, "{now} of {base}");
+    fn the_nproc_limit_is_the_base_minus_the_headroom_whatever_exists() {
+        assert_eq!(nproc_limit(2666, 0), None);
+        assert_eq!(nproc_limit(2666, 256), Some(2410));
+        assert_eq!(nproc_limit(100, 500), Some(1));
+        assert_eq!(nproc_limit(u64::MAX, 1), Some(u64::MAX - 1));
+        assert_eq!(nproc_admit(2666, 0, 5000), Ok(None));
+        // The limit does not move with the processes that exist, and is never above `base - headroom`: a second
+        // command started after the first filled its limit is refused, not given the daemon's own limit.
+        for current in [0, 100, 2000, 2409] {
+            assert_eq!(nproc_admit(2666, 256, current), Ok(Some(2410)), "{current}");
         }
+        for current in [2410, 2411, 2500, 2650, 2666, 9000] {
+            let e = nproc_admit(2666, 256, current).unwrap_err();
+            assert!(e.contains(&format!("{current} processes")) && e.contains("nproc_headroom"), "{e}");
+            assert!(e.contains("census/kill"), "{e}");
+        }
+        assert_eq!(nproc_limit_now(0), Ok(None));
+        if let (Some(base), Ok(Some(now))) = (nproc_base(), nproc_limit_now(256)) {
+            assert!(now <= base.saturating_sub(256).max(1) && now > 0, "{now} of {base}");
+        }
+        // The user's own count is readable and includes this process.
+        // SAFETY: geteuid takes no arguments.
+        let mine = user_tasks(unsafe { libc::geteuid() });
+        assert!(mine.is_some_and(|n| n >= 1), "{mine:?}");
     }
 
     #[test]

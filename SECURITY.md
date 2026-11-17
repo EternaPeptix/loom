@@ -298,14 +298,20 @@ These are the places where loom does less than the text above might suggest.
   After `setsid`, `daemon()`, `redis-server --daemonize yes` or `tmux new -d`, `job_kill`, stop, the end of the
   session and daemon shutdown do not stop it, although it stays under the seatbelt profile. Every 60 s the daemon
   finds each session's processes by that profile (whatever they did to their process group and environment) with
-  the TCP sockets they listen on (`GET /api/census`), warns once about what an ended session left running, and
-  `POST /api/sessions/{id}/census/kill` stops them. Nothing is stopped automatically (a server may have been started
-  on purpose). The query is a private macOS call (`sandbox_check`), probed at start; where it does not work the census
-  falls back to the `LOOM_SANDBOX_ID` environment variable and known process groups, which `env -i`, a double fork
-  or `setsid` defeat (`docs/MONITOR.md` X7). Under bubblewrap there is no census yet (no cgroup per session).
+  the TCP sockets they listen on (`GET /api/census`), warns once about what an ended or stopped session left running
+  (however long it had been running), and `POST /api/sessions/{id}/census/kill` stops them (whole process groups at once, so a
+  process that forks and exits in a loop cannot outrun it once a census has seen its group). Nothing is stopped automatically (a server may have
+  been started on purpose). Archiving a session stops what it still has running by that profile once its
+  tasks have ended (an archived session is not in the census), and what the oracle's replay leaves running is stopped when the replay returns. The
+  query is a private macOS call (`sandbox_check`); a probe that could not run (a full process table, busy CPUs) is
+  repeated at every census, and a census without identity is logged and notified once. Where the query does not work, or
+  with `sandbox.mode = "none"`, the census falls back to the `LOOM_SANDBOX_ID` environment variable and known process
+  groups, which `env -i`, a double fork or `setsid` defeat (`docs/MONITOR.md` X7); such a census never reads as
+  empty. Under bubblewrap there is no census yet (no cgroup per session).
 - **A fork bomb is limited, not forbidden.** A sandboxed command's RLIMIT_NPROC is the user's limit minus
-  `sandbox.nproc_headroom` (256), never below the processes that exist plus 64, so it cannot take the last process
-  slots the daemon needs to stop it. The daemon inspects and signals processes through libproc (`/proc` on Linux),
+  `sandbox.nproc_headroom` (256) and no more, whatever else exists, so it cannot take the last process slots the
+  daemon needs to stop it. When the user already holds that many processes (on Linux, threads) a command is refused
+  with a sentence that says what to do (stop what is left, or lower the headroom), not given more room. The daemon inspects and signals processes through libproc (`/proc` on Linux),
   never by running `ps`, so a full process table does not blind it; a group it cannot inspect is still signalled unless
   its leader is known to have been replaced.
 - **The configured network policy is per daemon**, and is read at start. In `allowlist` mode a
