@@ -885,8 +885,36 @@ fn end_line(w: &mut Window, line_start: usize, full_bytes: u64) {
     w.count += 1;
 }
 
+/// Close the line `lineno` (see `end_line`) and count it with its `{n}\t` prefix in `counted`. When it
+/// would take `counted` past `max_bytes` and is not the first line kept, it is dropped again, the window
+/// is marked full, and this returns true: the window ends before it.
+fn close_line(
+    w: &mut Window,
+    line_start: usize,
+    full_bytes: u64,
+    lineno: u64,
+    counted: &mut usize,
+    max_bytes: usize,
+) -> bool {
+    end_line(w, line_start, full_bytes);
+    let prefix = lineno.to_string().len().saturating_add(1);
+    let size = w.raw.len().saturating_sub(line_start).saturating_add(prefix);
+    if w.count > 1 && counted.saturating_add(size) > max_bytes {
+        w.raw.truncate(line_start);
+        w.count = w.count.saturating_sub(1);
+        if w.cut.last().is_some_and(|(at, _)| *at == w.count) {
+            w.cut.pop();
+        }
+        w.full = true;
+        return true;
+    }
+    *counted = counted.saturating_add(size);
+    false
+}
+
 /// Stream `file`, keeping only lines `first..=last`: at most `KEEP_LINE_BYTES` bytes of each, and no
-/// line that would take the kept bytes past `max_bytes` (the first line is always kept).
+/// line that would take the kept bytes, each line counted with its `{n}\t` prefix, past `max_bytes` (the
+/// first line is always kept).
 fn stream_window(
     file: File,
     cancel: &CancellationToken,
@@ -901,6 +929,8 @@ fn stream_window(
     let mut line_start = 0usize;
     let mut line_bytes = 0u64;
     let mut probed = false;
+    // The bytes of the kept lines as they will be shown: each with its `{n}\t` prefix.
+    let mut counted = 0usize;
     loop {
         if cancel.is_cancelled() {
             return Err(Fail::Cancelled);
@@ -934,21 +964,13 @@ fn stream_window(
         reader.consume(take + usize::from(ended));
         if ended {
             if in_range {
-                end_line(&mut w, line_start, line_bytes);
-                if w.count > 1 && w.raw.len() > max_bytes {
-                    // This line would pass the size limit: the window ends before it.
-                    w.raw.truncate(line_start);
-                    w.count = w.count.saturating_sub(1);
-                    if w.cut.last().is_some_and(|(at, _)| *at == w.count) {
-                        w.cut.pop();
-                    }
-                    w.full = true;
+                if close_line(&mut w, line_start, line_bytes, lineno, &mut counted, max_bytes) {
                     return Ok(w);
                 }
                 line_start = w.raw.len();
             }
             line_bytes = 0;
-            let full = in_range && w.raw.len() >= max_bytes;
+            let full = in_range && counted >= max_bytes;
             if lineno >= last || full {
                 if reader.fill_buf().map_err(Fail::Io)?.is_empty() {
                     w.total = Some(lineno);
@@ -962,8 +984,11 @@ fn stream_window(
     }
     if line_bytes > 0 {
         // The file ends without a final newline: what was collected is its last line.
-        if lineno >= first && lineno <= last {
-            end_line(&mut w, line_start, line_bytes);
+        if lineno >= first
+            && lineno <= last
+            && close_line(&mut w, line_start, line_bytes, lineno, &mut counted, max_bytes)
+        {
+            return Ok(w);
         }
         w.total = Some(lineno);
     } else {
@@ -1649,7 +1674,7 @@ mod tests {
     async fn a_streamed_window_is_bounded_in_bytes_and_says_where_to_continue() {
         let e = env();
         put(&e, "rows.txt", numbered_file(200).as_bytes());
-        // `row 10` and the newline are 7 bytes: the third such line would take the window past 20 bytes.
+        // `10\trow 10` and the newline are 10 bytes: the third such line would take the window past 20 bytes.
         let limits = ReadLimits { whole: 100, window: 20 };
         let out = read_limited(&e, "rows.txt", Some(10), Some(50), limits);
         let (text, shown, _) = view_of(&e, &out);
@@ -1669,7 +1694,7 @@ mod tests {
             "{:?}",
             out.more
         );
-        let out = read_limited(&e, "rows.txt", Some(199), Some(900), limits);
+        let out = read_limited(&e, "rows.txt", Some(199), Some(900), ReadLimits { whole: 100, window: 40 });
         assert!(out.more.iter().any(|f| f.starts_with("lines 199-200 of 200")), "{:?}", out.more);
 
         // Of one line, 80,000 bytes are kept, cut on a character boundary, and 20,000 characters shown.
@@ -1730,11 +1755,57 @@ mod tests {
     }
 
     #[test]
+    fn large_window_cut_by_finalize_says_to_continue_past_lines_it_did_not_show() {
+        let mut e = env();
+        let policy = loom_core::admit::AdmitPolicy { max_inline_tokens: 91, ..Default::default() };
+        let estimator = loom_core::estimate::TokenEstimator::default();
+        e.ctx.view_chars = policy.view_chars(&estimator);
+        let body: String = "x\n".repeat(10_000);
+        put(&e, "short.txt", body.as_bytes());
+        let out = read_limited(&e, "short.txt", Some(5000), Some(7000), cap(10));
+        let spec = e.registry.get("read").unwrap().spec();
+        let r = crate::finalize(
+            &e.ctx,
+            &spec,
+            out,
+            &crate::Admission { policy: &policy, estimator: &estimator },
+            std::time::Instant::now(),
+        );
+        let last_seen = r.text.lines().filter_map(|l| l.split('\t').next()?.parse::<u64>().ok()).max().unwrap();
+        let cont = r
+            .text
+            .split("continue with `start` ")
+            .nth(1)
+            .and_then(|t| t.split(|c: char| !c.is_ascii_digit()).next())
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap();
+        assert_eq!(cont, last_seen + 1, "{}", r.text);
+    }
+
+    #[test]
+    fn a_last_line_without_a_newline_that_would_pass_the_window_size_is_not_kept() {
+        let mut e = env();
+        e.ctx.view_chars = 20;
+        put(&e, "tail.txt", format!("{}\n{}", "a".repeat(8), "b".repeat(12)).as_bytes());
+        let out = read_limited(&e, "tail.txt", Some(1), Some(5), cap(10));
+        let (text, shown, _) = view_of(&e, &out);
+        assert_eq!(shown, vec![(1, 1)]);
+        assert!(text.starts_with("1\taaaaaaaa") && !text.contains('b'), "{text}");
+        let facts = out.more.join(" · ");
+        assert!(facts.contains("continue with `start` 2"), "{facts}");
+        // As the first line it is kept however long it is.
+        put(&e, "lone.txt", "c".repeat(300).as_bytes());
+        let out = read_limited(&e, "lone.txt", Some(1), Some(5), cap(10));
+        let (_, shown, _) = view_of(&e, &out);
+        assert_eq!(shown, vec![(1, 1)]);
+    }
+
+    #[test]
     fn a_large_file_window_ends_before_the_line_that_would_pass_the_view_size() {
         let mut e = env();
-        e.ctx.view_chars = 30;
+        e.ctx.view_chars = 40;
         put(&e, "rows.txt", numbered_file(200).as_bytes());
-        // Seven bytes a line: four lines are 28 bytes, a fifth would pass 30.
+        // Ten bytes a line with its number: four lines are 40 bytes, a fifth would pass 40.
         let out = read_limited(&e, "rows.txt", Some(10), Some(50), cap(100));
         let (text, shown, _) = view_of(&e, &out);
         assert_eq!(text, "10\trow 10\n11\trow 11\n12\trow 12\n13\trow 13");

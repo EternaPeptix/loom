@@ -396,7 +396,8 @@ pub fn finalize(
         meta,
         duration_ms,
     };
-    let budget = admission.policy.view_chars(admission.estimator);
+    // A view sized for the bound the call ran with is not cut for a lower one that came after it.
+    let budget = ctx.view_chars.max(admission.policy.view_chars(admission.estimator));
     // A message longer than one result may show is stored and admitted like raw output.
     let body = match body {
         Body::Message(text) if text.chars().count() > budget => Body::Raw(text.into_bytes()),
@@ -683,8 +684,9 @@ mod tests {
 
     #[test]
     fn a_view_over_the_budget_is_cut_at_a_line_with_the_handle() {
-        let e = testutil::env();
+        let mut e = testutil::env();
         let (policy, estimator) = small_admission();
+        e.ctx.view_chars = policy.view_chars(&estimator);
         let admission = Admission { policy: &policy, estimator: &estimator };
         let budget = policy.view_chars(&estimator);
         let stored = e.ctx.blobs.put_bytes(b"x\n").unwrap();
@@ -703,9 +705,31 @@ mod tests {
     }
 
     #[test]
-    fn a_view_with_no_line_end_is_cut_on_a_character_boundary() {
-        let e = testutil::env();
+    fn a_view_sized_for_the_calls_own_bound_is_not_cut_by_a_lower_admission() {
+        let mut e = testutil::env();
         let (policy, estimator) = small_admission();
+        let admission = Admission { policy: &policy, estimator: &estimator };
+        let budget = policy.view_chars(&estimator);
+        e.ctx.view_chars = budget * 2;
+        let stored = e.ctx.blobs.put_bytes(b"x\n").unwrap();
+        let line = "some line of text\n";
+        let text: String = line.repeat(budget * 3 / 2 / line.len() + 1);
+        assert!(text.chars().count() > budget && text.chars().count() <= budget * 2);
+        let out = ToolOutput::ok("ok", Body::View { of: stored.id.clone(), text: text.clone(), shown: vec![(1, 1)] });
+        let r = finalize(&e.ctx, &spec_of(&e, "out_read"), out, &admission, Instant::now());
+        assert!(!r.cut && !r.text.contains("[cut by harness"), "{}", r.text);
+        // Over the call's own bound it is still cut.
+        let long = line.repeat(budget * 3 / line.len() + 1);
+        let out = ToolOutput::ok("ok", Body::View { of: stored.id.clone(), text: long, shown: vec![(1, 1)] });
+        let r = finalize(&e.ctx, &spec_of(&e, "out_read"), out, &admission, Instant::now());
+        assert!(r.cut && r.text.contains("[cut by harness"), "{}", r.text);
+    }
+
+    #[test]
+    fn a_view_with_no_line_end_is_cut_on_a_character_boundary() {
+        let mut e = testutil::env();
+        let (policy, estimator) = small_admission();
+        e.ctx.view_chars = policy.view_chars(&estimator);
         let admission = Admission { policy: &policy, estimator: &estimator };
         let budget = policy.view_chars(&estimator);
         let stored = e.ctx.blobs.put_bytes(b"x\n").unwrap();
@@ -719,8 +743,9 @@ mod tests {
 
     #[test]
     fn a_produced_view_over_the_budget_keeps_its_blob_and_is_cut() {
-        let e = testutil::env();
+        let mut e = testutil::env();
         let (policy, estimator) = small_admission();
+        e.ctx.view_chars = policy.view_chars(&estimator);
         let admission = Admission { policy: &policy, estimator: &estimator };
         let full: String = (1..=300).map(|i| format!("{i}\tdecompiled\n")).collect();
         let blob = e.ctx.blobs.put_bytes(full.as_bytes()).unwrap();
@@ -738,8 +763,9 @@ mod tests {
 
     #[test]
     fn a_message_over_the_budget_is_admitted_with_a_handle() {
-        let e = testutil::env();
+        let mut e = testutil::env();
         let (policy, estimator) = small_admission();
+        e.ctx.view_chars = policy.view_chars(&estimator);
         let admission = Admission { policy: &policy, estimator: &estimator };
         let text: String = (1..=500).map(|i| format!("message line {i}\n")).collect();
         let out = ToolOutput::ok("ok", Body::Message(text.clone()));
@@ -752,8 +778,9 @@ mod tests {
 
     #[test]
     fn views_and_messages_within_the_budget_are_unchanged() {
-        let e = testutil::env();
+        let mut e = testutil::env();
         let (policy, estimator) = small_admission();
+        e.ctx.view_chars = policy.view_chars(&estimator);
         let admission = Admission { policy: &policy, estimator: &estimator };
         let budget = policy.view_chars(&estimator);
         let stored = e.ctx.blobs.put_bytes(b"x\n").unwrap();
