@@ -1,5 +1,5 @@
 // Isolated UI fixtures: no model, daemon, credentials, or workspace writes.
-// Run: node tools/ui-preview.mjs [port], then open the printed URL (/#code=fixture signs in, then /#/s/s-audit).
+// Run: node tools/ui-preview.mjs [port], then open the printed URL (/#code=facefeedfacefeed signs in, then /#/s/s-audit).
 // Fixture-only routes: GET /__fixture/state, POST /__fixture/question, POST /__fixture/reconnect, and
 // POST /__fixture/stream (streams a short live reply into s-other: reasoning, text and a tool call as delta frames, then
 // the model_response, tool_call and tool_result records; a second step follows, so a work group grows while it runs).
@@ -22,6 +22,8 @@ import { dirname, join } from "node:path";
 
 const ui = join(dirname(fileURLToPath(import.meta.url)), "..", "ui");
 const now = Date.now();
+// The login code must be lowercase hex, 16–128 chars, so the UI's codeFromHash accepts it (real codes are 32 hex chars).
+const LOGIN_CODE = "facefeedfacefeed";
 const blob = "ab".repeat(32);
 const bigBlob = "cd".repeat(32); // a stored output of 3 MiB, over the 2 MiB a copy button fetches
 const clients = new Set();
@@ -614,7 +616,7 @@ const server = createServer(async (req, res) => {
     }
     if (req.method === "POST" && path === "/api/web-sessions") {
       const data = await body(req); requests.push({ path, body: data });
-      if (data.code !== "fixture") return json(res, { error: "That login code is not valid. Run `loom login` for a new one." }, 401);
+      if (data.code !== LOGIN_CODE) return json(res, { error: "That login code is not valid. Run `loom login` for a new one." }, 401);
       return json(res, { secret: "fixture-secret" });
     }
     if (req.method === "POST" && path.startsWith("/api/")) {
@@ -698,6 +700,6 @@ const server = createServer(async (req, res) => {
 const port = Number(process.argv[2] || 8766);
 server.listen(port, "127.0.0.1", () => {
   const base = `http://127.0.0.1:${server.address().port}`;
-  console.log(`UI fixtures: ${base}/#code=fixture (then /#/s/s-audit)`);
+  console.log(`UI fixtures: ${base}/#code=${LOGIN_CODE} (then /#/s/s-audit)`);
   console.log(`Fixture routes: GET /__fixture/state; POST /__fixture/question, /__fixture/reconnect, /__fixture/stream (a live reply, a running work group and its ticking label in s-other: curl -X POST ${base}/__fixture/stream)`);
 });
