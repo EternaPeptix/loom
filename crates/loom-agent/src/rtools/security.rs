@@ -17,8 +17,25 @@
 //! `Standing::Judge` when it is a child whose role is `read_only` and has the `verdict` tool,
 //! `Standing::Child` otherwise; `tools` is the role's tool list. The tool description is
 //! `shapes::description` of that caller. On success the result is the JSON object
-//! `{"entry": n, "normalized": [notes…], "state": …}`, with `normalized` present only when a note was
-//! made. When the read operation was expanded by N4d (a single hypothesis_open carrying evidence) and
+//! `{"entry": n, "normalized": [notes…], "recorded": {…}, "removed": {…}, "counts": {…}, "more": "…"}`,
+//! with `normalized` present only when a note was made. It names what this write changed, never the
+//! whole state (after a scanner import that ran to tens of thousands of tokens at every write):
+//! - *touched*: for each id-keyed collection of `SecurityState` (`assets`, `credentials`,
+//!   `footholds`, `condition_evidence`, `blocked`, `revisited`, `crashes`, `vector_attempts`,
+//!   `hypotheses`, `relations`, `facts`, `rules`, `aliases`), the keys whose value differs between the
+//!   state read before the append and the state the append returned, new keys included; and of
+//!   `unlocked`, the conditions added. A write by another session between the two reads shows up too.
+//! - `recorded`: `{collection: {id: record}}` of the touched entries (`unlocked`: the list of added
+//!   conditions), each in full, when their JSON together is at most `RECORDED_CHARS` (8 000) characters;
+//!   otherwise `{collection: {"count": k, "ids": [first 20 ids]}}` for each collection touched.
+//!   Collections with nothing touched are left out.
+//! - `removed`: `{collection: [ids]}` of keys present before and gone after; omitted when empty.
+//! - `counts`: `{collection: number of entries}` after the write, for each non-empty collection.
+//! - `more`: `The rest of the security state is unchanged by this write; read it with security_query
+//!   (view: state, assets, coverage, revisit, hypotheses or facts).`
+//! Tests: a single upsert returns that asset in full and the counts, not the other assets; a batch
+//! over the size bound returns counts and ids; a hypothesis_open returns the new hypothesis id; a
+//! retraction lists the removed id. When the read operation was expanded by N4d (a single hypothesis_open carrying evidence) and
 //! the append fails, the error gets the sentence " The evidence given with hypothesis_open was being
 //! attached by a second operation in the same atomic append; nothing was recorded." appended.
 //!

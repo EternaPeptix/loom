@@ -525,7 +525,12 @@ empty one; for a mission whose lead keeps none the API answers `No ledger: this 
 not keep one.` `LedgerState::brief()` is the compact text of the HUD and of the re-weave
 brief: goal, constraints and approvals are the operator's words and never cut; every other line is
 cut at 400 characters; it shows the last 12 decisions and the last 20 dead ends, each list starting
-with `(N older not shown: d1–d3; call `ledger` to read them)` when older ones are left out.
+with `(N older not shown: d1–d3; call `ledger` to read them)` when older ones are left out. The HUD is
+the last message of every request, never cached, so lists that only grow are capped the same way:
+every todo and doing plan step but only the last 5 done ones, every open claim but only the last 10
+settled ones, and the last 20 open obligations, each with `(N older done|settled|open not shown: p1–p9,
+p12; call `ledger` to read them)`. Uncapped, a 504-step mission's brief reached 65 done steps and 74
+claims and its HUD grew from 27 KB to 80 KB, about 20 000 uncached tokens at every step.
 
 Children read the same current mission journal through `ledger` and their request HUD, including
 fresh children whose assignment omits the goal or constraints. A worker may append notes and create

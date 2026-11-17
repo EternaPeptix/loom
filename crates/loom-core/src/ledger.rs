@@ -497,6 +497,23 @@ pub struct LedgerState {
 // `open_items()`: plan steps `Todo`/`Doing`; obligations with no outcome; claims with status `Open`;
 // questions with `blocking` and no answer.
 //
+// Brief caps. The HUD is the last message of every request and is never cached, so every line of the
+// brief is paid for again at every step; lists that only grow are capped (`BriefOpts`), and what a cap
+// leaves out stays one `ledger` call away. Under `Plan:` every `Todo` and `Doing` step is listed, but of
+// the `Done` steps only the last `opts.max_plan_done` (in plan order). Under `Open obligations:` the
+// last `opts.max_obligations` open ones. Under `Claims:` every `Open` claim, but of the settled ones
+// (`Supported`, `Refuted`, `Withdrawn`) only the last `opts.max_claims` (in claim order). Listed items
+// keep their order and their line format. When a cap leaves items out, the section starts, right under
+// its heading, with the elision line `({N} older {what} not shown: {ids}; call `ledger` to read them)`,
+// `{what}` being `done` (plan), `open` (obligations) or `settled` (claims), and `{ids}` the ids left out
+// as runs: consecutive ids of one letter joined `{first}–{last}`, runs joined by `, ` (`p1–p11, p13`).
+// Decisions and dead ends use the same line without a `{what}` (`(2 older not shown: d1–d2; …)`, as
+// before). A cap of 0 lists none of those items. Defaults: `max_plan_done` 5, `max_claims` 10,
+// `max_obligations` 20, `max_decisions` 12, `max_dead_ends` 20, `max_line` 400. Tests: each cap at,
+// below and above its bound, the elision line with non-contiguous ids, open items never left out by the
+// plan and claim caps, and the size of a long mission's brief (65 done steps, 74 claims) with and
+// without the caps.
+//
 // `brief(opts)` renders the compact state text used in the HUD and after a re-weave, in this order,
 // omitting empty sections: `Goal:` (full text), `Constraints:` (active only, verbatim), `Plan:` (one
 // line per non-dropped step: `[x] p1 text — note` / `[>] doing` / `[ ] todo`), `Open obligations:`,
@@ -542,11 +559,24 @@ pub struct BriefOpts {
     pub max_decisions: usize,
     pub max_dead_ends: usize,
     pub max_line: usize,
+    /// `Done` plan steps listed (the last ones); `Todo` and `Doing` steps are always listed.
+    pub max_plan_done: usize,
+    /// Settled claims listed (the last ones); `Open` claims are always listed.
+    pub max_claims: usize,
+    /// Open obligations listed (the last ones).
+    pub max_obligations: usize,
 }
 
 impl Default for BriefOpts {
     fn default() -> Self {
-        Self { max_decisions: 12, max_dead_ends: 20, max_line: 400 }
+        Self {
+            max_decisions: 12,
+            max_dead_ends: 20,
+            max_line: 400,
+            max_plan_done: 5,
+            max_claims: 10,
+            max_obligations: 20,
+        }
     }
 }
 
@@ -2313,7 +2343,7 @@ mod tests {
     #[test]
     fn brief_limits_and_cuts() {
         let s = rich_state();
-        let b = s.brief(&BriefOpts { max_decisions: 2, max_dead_ends: 1, max_line: 400 });
+        let b = s.brief(&BriefOpts { max_decisions: 2, max_dead_ends: 1, max_line: 400, ..BriefOpts::default() });
         assert!(!b.contains("d1:") && b.contains("d2: drop serde — size") && b.contains("d3: pin rust — ci"), "{b}");
         assert!(!b.contains("x1:") && b.contains("x2: peg — slow"), "{b}");
         let long = "y".repeat(100);
@@ -2323,7 +2353,7 @@ mod tests {
             LedgerOp::PlanAdd { text: long.clone() },
             LedgerOp::ClaimAdd { text: "é".repeat(100) },
         ]);
-        let b = s.brief(&BriefOpts { max_decisions: 1, max_dead_ends: 1, max_line: 20 });
+        let b = s.brief(&BriefOpts { max_decisions: 1, max_dead_ends: 1, max_line: 20, ..BriefOpts::default() });
         // the operator's words are never cut
         assert!(b.contains(&format!("Goal: {long}")) && b.contains(&format!("k1: {long}")), "{b}");
         let plan_line = b.lines().find(|l| l.starts_with("[ ] p1")).unwrap_or("");
@@ -2337,10 +2367,10 @@ mod tests {
     #[test]
     fn brief_says_when_older_items_are_hidden() {
         let s = rich_state();
-        let b = s.brief(&BriefOpts { max_decisions: 2, max_dead_ends: 1, max_line: 400 });
+        let b = s.brief(&BriefOpts { max_decisions: 2, max_dead_ends: 1, max_line: 400, ..BriefOpts::default() });
         assert!(b.contains("(1 older not shown: d1; call `ledger` to read them)"), "{b}");
         assert!(b.contains("(1 older not shown: x1; call `ledger` to read them)"), "{b}");
-        let b = s.brief(&BriefOpts { max_decisions: 1, max_dead_ends: 2, max_line: 400 });
+        let b = s.brief(&BriefOpts { max_decisions: 1, max_dead_ends: 2, max_line: 400, ..BriefOpts::default() });
         assert!(b.contains("(2 older not shown: d1–d2; call `ledger` to read them)"), "{b}");
         let b = s.brief(&BriefOpts::default());
         assert!(!b.contains("not shown"), "{b}");
