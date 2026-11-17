@@ -2667,6 +2667,104 @@ mod tests {
     }
 
     #[test]
+    fn elision_line_names_at_most_six_runs() {
+        let ids: Vec<String> = (1..=300).step_by(2).map(|i| format!("p{i}")).collect();
+        let line = elision(ids.iter().map(String::as_str), "done").unwrap_or_default();
+        assert_eq!(line, "(150 older done not shown: p1, p3, p5, …, p295, p297, p299; call `ledger` to read them)");
+        // six runs are named in full, seven are cut
+        let six = ["p1", "p3", "p5", "p7", "p9", "p11"];
+        assert_eq!(id_runs(six.into_iter()), "p1, p3, p5, p7, p9, p11");
+        let seven = ["p1", "p3", "p5", "p7", "p9", "p11", "p13"];
+        assert_eq!(id_runs(seven.into_iter()), "p1, p3, p5, …, p9, p11, p13");
+    }
+
+    #[test]
+    fn elision_line_with_interleaved_dropped_steps_stays_within_max_line() {
+        let mut ops = vec![LedgerOp::PlanSet { steps: (1..=300).map(|i| format!("s{i}")).collect() }];
+        for i in 1..=300 {
+            let status = if i % 2 == 1 { StepStatus::Done } else { StepStatus::Dropped };
+            ops.push(LedgerOp::PlanUpdate { id: format!("p{i}"), status, note: "n".into(), evidence: vec![] });
+        }
+        let b = build(ops).brief(&BriefOpts::default());
+        let elision = b.lines().find(|l| l.contains("not shown")).unwrap_or("");
+        assert!(elision.chars().count() <= BriefOpts::default().max_line, "{elision}");
+        assert!(elision.contains("p1, p3, p5, …, p285, p287, p289;"), "{elision}");
+    }
+
+    fn objection_ledger() -> LedgerState {
+        let mut ops = Vec::new();
+        for i in 0..4 {
+            ops.push(LedgerOp::ObligationOpen {
+                kind: ObligationKind::Job,
+                text: format!("job {i}"),
+                reference: String::new(),
+            });
+        }
+        ops.push(LedgerOp::ObligationOpen {
+            kind: ObligationKind::Objection,
+            text: "no test ran".into(),
+            reference: String::new(),
+        });
+        for i in 4..6 {
+            ops.push(LedgerOp::ObligationOpen {
+                kind: ObligationKind::Job,
+                text: format!("job {i}"),
+                reference: String::new(),
+            });
+        }
+        build(ops)
+    }
+
+    #[test]
+    fn open_objections_are_never_hidden_by_the_obligation_cap() {
+        let s = objection_ledger();
+        for cap in [0, 1, 3] {
+            let b = s.brief(&BriefOpts { max_obligations: cap, ..BriefOpts::default() });
+            assert!(b.contains("(objection) no test ran"), "cap {cap}: {b}");
+            assert_eq!(b.matches("(job)").count(), cap, "cap {cap}: {b}");
+        }
+        let b = s.brief(&BriefOpts { max_obligations: 0, ..BriefOpts::default() });
+        assert!(b.contains("(6 older open not shown: o1–o4, o6–o7;"), "{b}");
+        // the listed ones keep their order
+        let b = s.brief(&BriefOpts { max_obligations: 1, ..BriefOpts::default() });
+        let (obj, job) = (b.find("(objection)"), b.find("job 5"));
+        assert!(obj.is_some() && job.is_some() && obj < job, "{b}");
+    }
+
+    #[test]
+    fn uncapped_lists_everything() {
+        let o = BriefOpts::uncapped();
+        assert_eq!((o.max_plan_done, o.max_claims, o.max_obligations), (usize::MAX, usize::MAX, usize::MAX));
+        assert_eq!(
+            BriefOpts { max_plan_done: 5, max_claims: 10, max_obligations: 20, ..o.clone() },
+            BriefOpts::default()
+        );
+        let mut ops = vec![LedgerOp::PlanSet { steps: (1..=30).map(|i| format!("s{i}")).collect() }];
+        for i in 1..=30 {
+            ops.push(LedgerOp::PlanUpdate {
+                id: format!("p{i}"),
+                status: StepStatus::Done,
+                note: String::new(),
+                evidence: vec![],
+            });
+            ops.push(LedgerOp::ClaimAdd { text: format!("claim {i}") });
+            ops.push(LedgerOp::ClaimUpdate { id: format!("c{i}"), status: ClaimStatus::Withdrawn, note: "no".into() });
+            ops.push(LedgerOp::ObligationOpen {
+                kind: ObligationKind::Job,
+                text: format!("job {i}"),
+                reference: String::new(),
+            });
+        }
+        let s = build(ops);
+        let b = s.brief(&o);
+        assert!(!b.contains("not shown"), "{b}");
+        assert_eq!(b.matches("[x] p").count(), 30, "{b}");
+        assert_eq!(b.matches("[withdrawn]").count(), 30, "{b}");
+        assert_eq!(b.matches("(job)").count(), 30, "{b}");
+        assert!(s.brief(&BriefOpts::default()).contains("not shown"));
+    }
+
+    #[test]
     fn markdown_contains_every_record() {
         let md = rich_state().render_markdown();
         assert!(md.starts_with("<!-- generated from the mission journal; edits here are ignored -->\n"));
@@ -3094,103 +3192,5 @@ mod tests {
         // Optional fields may be absent on the wire for the new ops.
         let op: Result<LedgerOp, _> = serde_json::from_str(r#"{"op":"scope_grant","hosts":["a.example"]}"#);
         assert!(matches!(op, Ok(LedgerOp::ScopeGrant { note: None, .. })));
-    }
-
-    #[test]
-    fn elision_line_names_at_most_six_runs() {
-        let ids: Vec<String> = (1..=300).step_by(2).map(|i| format!("p{i}")).collect();
-        let line = elision(ids.iter().map(String::as_str), "done").unwrap_or_default();
-        assert_eq!(line, "(150 older done not shown: p1, p3, p5, …, p295, p297, p299; call `ledger` to read them)");
-        // six runs are named in full, seven are cut
-        let six = ["p1", "p3", "p5", "p7", "p9", "p11"];
-        assert_eq!(id_runs(six.into_iter()), "p1, p3, p5, p7, p9, p11");
-        let seven = ["p1", "p3", "p5", "p7", "p9", "p11", "p13"];
-        assert_eq!(id_runs(seven.into_iter()), "p1, p3, p5, …, p9, p11, p13");
-    }
-
-    #[test]
-    fn elision_line_with_interleaved_dropped_steps_stays_within_max_line() {
-        let mut ops = vec![LedgerOp::PlanSet { steps: (1..=300).map(|i| format!("s{i}")).collect() }];
-        for i in 1..=300 {
-            let status = if i % 2 == 1 { StepStatus::Done } else { StepStatus::Dropped };
-            ops.push(LedgerOp::PlanUpdate { id: format!("p{i}"), status, note: "n".into(), evidence: vec![] });
-        }
-        let b = build(ops).brief(&BriefOpts::default());
-        let elision = b.lines().find(|l| l.contains("not shown")).unwrap_or("");
-        assert!(elision.chars().count() <= BriefOpts::default().max_line, "{elision}");
-        assert!(elision.contains("p1, p3, p5, …, p285, p287, p289;"), "{elision}");
-    }
-
-    fn objection_ledger() -> LedgerState {
-        let mut ops = Vec::new();
-        for i in 0..4 {
-            ops.push(LedgerOp::ObligationOpen {
-                kind: ObligationKind::Job,
-                text: format!("job {i}"),
-                reference: String::new(),
-            });
-        }
-        ops.push(LedgerOp::ObligationOpen {
-            kind: ObligationKind::Objection,
-            text: "no test ran".into(),
-            reference: String::new(),
-        });
-        for i in 4..6 {
-            ops.push(LedgerOp::ObligationOpen {
-                kind: ObligationKind::Job,
-                text: format!("job {i}"),
-                reference: String::new(),
-            });
-        }
-        build(ops)
-    }
-
-    #[test]
-    fn open_objections_are_never_hidden_by_the_obligation_cap() {
-        let s = objection_ledger();
-        for cap in [0, 1, 3] {
-            let b = s.brief(&BriefOpts { max_obligations: cap, ..BriefOpts::default() });
-            assert!(b.contains("(objection) no test ran"), "cap {cap}: {b}");
-            assert_eq!(b.matches("(job)").count(), cap, "cap {cap}: {b}");
-        }
-        let b = s.brief(&BriefOpts { max_obligations: 0, ..BriefOpts::default() });
-        assert!(b.contains("(6 older open not shown: o1–o4, o6–o7;"), "{b}");
-        // the listed ones keep their order
-        let b = s.brief(&BriefOpts { max_obligations: 1, ..BriefOpts::default() });
-        let (obj, job) = (b.find("(objection)"), b.find("job 5"));
-        assert!(obj.is_some() && job.is_some() && obj < job, "{b}");
-    }
-
-    #[test]
-    fn uncapped_lists_everything() {
-        let o = BriefOpts::uncapped();
-        assert_eq!((o.max_plan_done, o.max_claims, o.max_obligations), (usize::MAX, usize::MAX, usize::MAX));
-        assert_eq!(
-            BriefOpts { max_plan_done: 5, max_claims: 10, max_obligations: 20, ..o.clone() },
-            BriefOpts::default()
-        );
-        let mut ops = vec![LedgerOp::PlanSet { steps: (1..=30).map(|i| format!("s{i}")).collect() }];
-        for i in 1..=30 {
-            ops.push(LedgerOp::PlanUpdate {
-                id: format!("p{i}"),
-                status: StepStatus::Done,
-                note: String::new(),
-                evidence: vec![],
-            });
-            ops.push(LedgerOp::ClaimAdd { text: format!("claim {i}") });
-            ops.push(LedgerOp::ClaimUpdate { id: format!("c{i}"), status: ClaimStatus::Withdrawn, note: "no".into() });
-            ops.push(LedgerOp::ObligationOpen {
-                kind: ObligationKind::Job,
-                text: format!("job {i}"),
-                reference: String::new(),
-            });
-        }
-        let s = build(ops);
-        let b = s.brief(&o);
-        assert!(!b.contains("not shown"), "{b}");
-        assert_eq!(b.matches("[x] p").count(), 30, "{b}");
-        assert_eq!(b.matches("[withdrawn]").count(), 30, "{b}");
-        assert_eq!(b.matches("(job)").count(), 30, "{b}");
-        assert!(s.brief(&BriefOpts::default()).contains("not shown"));
     }
 }
