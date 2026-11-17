@@ -65,7 +65,8 @@
 //!   Outcome `evidence {id} attached to {claim}`. Text: `{id} ({supports|undermines}; {grade}: {tool} call
 //!   in {session}) attached to {claim}.` (`{grade}` is `run`, `analysis`, `read` or `reference`); when the
 //!   grade is `analysis` or `reference`, the line `texts::evidence_not_a_run(grade, tool)`; when the claim is
-//!   still `Open`, the line `The claim is still open — set its status with `claim_update`.` After a quote by lines, what was
+//!   still `Open`, the line `The claim is still open — set its status with `claim_update`.` After a quote by lines,
+//!   what was
 //!   recorded follows, since nothing compared the line numbers with a text and a miscounted range shows
 //!   nowhere else: `Recorded from {handle}, lines {start}-{end}, as stored:`, each line of the text as
 //!   `| {line}`, and `If these are not the lines you meant, attach the right ones.` A quote given with

@@ -119,7 +119,8 @@
 //! **Objections.** Before the open-items check, each open `Objection` obligation is settled (`ObligationSettle`)
 //! when an attested evidence record of kind `Execution` was added after it (by journal entry order); the
 //! outcome names the record. `Execution` is a run: a quote of analysis output (`dep_scan`, a decompilation,
-//! cross-references) or of reference data is `Static` and settles nothing. When the operator released the mission every open objection is settled. Nothing
+//! cross-references) or of reference data is `Static` and settles nothing. When the operator released the mission
+//! every open objection is settled. Nothing
 //! else settles one: answering an inbox item, a question, or calling finish again does not. While one is open
 //! `check_finish_lead` refuses finish.
 //!
@@ -152,7 +153,8 @@
 //! evidence }`; the ledger's own rules refuse a missing goal, a blank note, evidence that is missing,
 //! unattested, not supporting or not a run (the sentence names each cited record's grade and tool and says
 //! why analysis, a read or a lookup is not a run), a repeat, and, for a goal a rejected finish reopened,
-//! evidence with no run recorded after the reopening. The refusal is passed through verbatim. Output: ok, outcome `goal concluded: ...`, saying
+//! evidence with no run recorded after the reopening. The refusal is passed through verbatim. Output: ok, outcome
+//! `goal concluded: ...`, saying
 //! that `finish` may now be called.
 //!
 //! ## `verdict` (verifier role)
@@ -248,7 +250,8 @@
 //! not reset by analysis evidence (the count keeps rising), the verifier's assignment showing each evidence
 //! record's grade and tool, an operator release, verifier ending without a
 //! verdict and spawn failure (retried, then held with a notice, no inbox item), shutdown and cancellation
-//! (error, nothing recorded); `conclude` - met, unreachable with and without open plan steps, unreachable refused in a solvable pack (with and without `report_blocker`), a child,
+//! (error, nothing recorded); `conclude` - met, unreachable with and without open plan steps, unreachable refused in
+//! a solvable pack (with and without `report_blocker`), a child,
 //! met citing only analysis evidence refused with the ledger's sentence (`analysis is not a run`) and nothing
 //! recorded;
 //! `verdict` — each refusal, the settle effect and payload; `ask_user` — blocking and not, child

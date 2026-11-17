@@ -34,8 +34,9 @@
 //! - `Say(text)`: a reply without a call. `Call(name, arguments)`: a call exactly as written, for calls
 //!   that are wrong. `Cut`: a `bash` call the output limit cut before its arguments ended.
 //!
-//! The quote of an `Evidence` or a `Finish` is of line 1 of the latest output the request shows: the handle
-//! in the header of the latest `bash` or `dep_scan` result, or, for a lead that delegated, the first handle of the
+//! The quote of an `Evidence` or a `Finish` is of line 1 of the latest output the request shows: the last
+//! handle in the header of the latest `bash` or `dep_scan` result (the output's own; a `dep_scan` header names
+//! its stored VDR, SBOM and console before it), or, for a lead that delegated, the first handle of the
 //! checked quotes in the latest agent's report. A [`Quote`] says how it is given: `ByLines` (handle and
 //! line numbers, no text), `Exact` (with the line's text) or `Retyped` (with the text as a model writes
 //! it from memory, `holds` become `contains`: it does not occur in the output). With no run in view the
@@ -69,9 +70,10 @@
 //! worker's moves is refused first, with nothing started, unless the first `depscan` on the process's PATH
 //! is a file whose bytes are [`FAKE_DEPSCAN`]: the error says the scenario scans with `dep_scan`, that it
 //! needs the kit's fake `depscan` first on PATH (`install_fake_depscan`), and what was found instead (a
-//! path, or that there is none), because a real scanner, or none, would give another card. Then it writes the workspace under `dir/workspace`, starts a
-//! `MockServer` with the scenario's script and a `Runtime` whose home is `dir/home`, creates a lead
-//! session of the built-in `core` pack with [`MESSAGE`], and waits until its turn has ended for a reason
+//! path, or that there is none), because a real scanner, or none, would give another card. Then it writes the
+//! workspace under `dir/workspace`, starts a `MockServer` with the scenario's script and a `Runtime` whose
+//! home is `dir/home`, creates a lead session of the built-in `core` pack with [`MESSAGE`], and waits until its turn
+//! has ended for a reason
 //! other than `Waiting`. The configuration is the default one with: the mock server as the only model
 //! (window 1 000 000), no sandbox, network `deny_all`, a notification command that does nothing (the
 //! default would raise a desktop notification per run), then `scenario.configure`. So the finish gate's
