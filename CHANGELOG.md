@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+### Monitor E4: proxy controls
+
+- **Cut.** `Proxy::cut(session)` / `cut_sessions` end every open tunnel and forwarded request of a session (reference grants'
+  too) with the fixed reason "the session's connections were closed by loom"; `Runtime::cut_mission(mission)`. A connection
+  that authenticated before a cut is ended when it registers. The bytes of an open tunnel stop within a second.
+- **Veto.** `Proxy::set_veto`: a synchronous hook asked before any lookup, before each connect and for a tunnel's server name;
+  `502` with a fixed sentence and a `vetoed: …` refusal record. The daemon installs `loom_agent::floor::Floor`: canary hosts and
+  the infrastructure classes (a second line behind each session's own policy).
+- **Server-name binding.** A `CONNECT` tunnel's first flight is read before anything goes upstream: a TLS ClientHello must name
+  the destination or another name the session's policy allows; an encrypted ClientHello, an unreadable one and a missing name
+  for a destination that is a name are refused. `NetDecision` gets the optional field `sni` (older records are unchanged and
+  still read). A tunnel that is not TLS passes as before.
+- **Canary users.** `Proxy::add_canary_user`: a decoy proxy user that never authenticates, answered as an unknown user, whose
+  use fires `set_canary_hook` before any answer and is recorded uncapped and attributed to the listener's session.
+- **Lab-listener identity.** For loopback connections the process listening on the port is looked up
+  (`loom_tools::sandbox::census::listener_of`); a listener started inside another session's sandbox is refused.
+- **Box rule counters.** The mission box chain's per-rule packet and byte counters are polled every 60 s and the deltas
+  appended to `<home>/logs/box-counters.jsonl`; `MissionBox::poll_counters`, `Runtime::box_counters_now`.
+- Dev-dependency `base64` for `loom-agent` (tests).
+
 ### Monitor E3: process identity and limits
 
 - **Fork-free process inspection** (`loom_tools::procinfo`: libproc and `sysctl` on macOS, `/proc` on Linux). `proc` no longer

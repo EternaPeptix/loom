@@ -78,6 +78,22 @@
 //! ([`rules_check_args`]); a missing chain or jump is installed again before the command runs, and when that
 //! fails the container is removed and the command is refused.
 //!
+//! ## Counters (E4f)
+//! Every rule of the mission's chain counts the packets it saw. `MissionBox::poll_counters` runs the helper with a
+//! fixed script (`iptables -w 5 -nvx -L "$1"`, [`rules_counters_args`]) and returns, for each rule whose counters
+//! moved since the last poll, a [`RuleCount`] with the **delta**: `rule` (`{target} {protocol} {destination}`
+//! and the match text, e.g. `ACCEPT tcp 203.0.113.7 tcp dpt:443`; the final `DROP` is `DROP all 0.0.0.0/0`),
+//! packets, bytes and `drop` (the target is `DROP`). An ACCEPT delta is traffic the grants allow; a DROP delta
+//! is an attempt the box's chain refused, which the monitor counts as an attempt. `parse_counters(text)` reads the
+//! helper's output (protocols written as names or numbers; anything that is not a rule line is ignored) and
+//! `counter_deltas(previous, now)` is the arithmetic: a counter below its previous value means the chain was
+//! installed again (a grant changed) and counts from zero. The rules are installed with an explicit flush, so
+//! every install resets the counters; when a poll has happened before, the counters are read just before an
+//! install and banked, so what the box did since the last poll is reported by the next one, not lost. `Ok(None)` when the
+//! mission has no running box (nothing to poll), `Err` with a sentence when the helper cannot be run or the chain is
+//! missing. A paused box is polled too. The counters say how much, not what: the box has no per-connection
+//! record (`docs/MONITOR.md` X5).
+//!
 //! ## Life of a box (`MissionBox`, I5)
 //! One per mission, created by the runtime with a source of the mission's grants and effective policy.
 //! Everything that creates, changes or removes a mission's box (`ready`, `reset`, `resync`, `teardown`,
@@ -117,7 +133,10 @@
 //! unpacked is in `boxfs` (I6, I7).
 //!
 //! Tests required: exact argv of `run`, `exec`, the tar push and get, `network create`, `rm`, the helper run and the
-//! kill (I1, I2, I4); the three helper scripts run against stand-ins for `iptables` (R1, R2); a hostile script reaches the launcher as one argv element; the egress plan for a grant
+//! kill (I1, I2, I4); counters: the helper's argv, `parse_counters` on output with names and with numbers for the
+//! protocols and on junk, `counter_deltas` for growth, no change and a reset, `poll_counters` through the fake
+//! (first poll, a poll with no change, one after growth, `None` without a box, `Err` for a missing chain, the
+//! counters banked across an install); the three helper scripts run against stand-ins for `iptables` (R1, R2); a hostile script reaches the launcher as one argv element; the egress plan for a grant
 //! set (private address refused without `allow_private`, wildcard skipped and noticed once, IPv6 skipped,
 //! ports kept); the rules text; names and labels; the ssh argv and the forward supervisor with a fake
 //! `ssh` (stale socket removed, restarted after an exit); container life with a fake `docker` (created
@@ -491,9 +510,89 @@ pub fn rules_remove_args(cfg: &BoxCfg, n: &Names) -> Vec<String> {
     helper_args(cfg, false, RULES_REMOVE, n)
 }
 
+/// The script that prints the mission's chain with its counters (`$1` is the chain).
+const RULES_COUNTERS: &str = ": loom-rules-counters; iptables -w 5 -nvx -L \"$1\"";
+
+/// The helper run that prints the mission's chain with the packet and byte counter of each rule.
+pub fn rules_counters_args(cfg: &BoxCfg, n: &Names) -> Vec<String> {
+    helper_args(cfg, false, RULES_COUNTERS, n)
+}
+
 /// The helper run that checks that the mission's rules are all in place (its status says).
 pub fn rules_check_args(cfg: &BoxCfg, n: &Names) -> Vec<String> {
     helper_args(cfg, false, RULES_CHECK, n)
+}
+
+/// What one rule of the mission's chain counted (see *Counters* in the module contract).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RuleCount {
+    /// `{target} {protocol} {destination}` and the match text, e.g. `ACCEPT tcp 203.0.113.7 tcp dpt:443`.
+    pub rule: String,
+    pub packets: u64,
+    pub bytes: u64,
+    /// The rule's target is `DROP`: what it counted was refused.
+    pub drop: bool,
+}
+
+/// The rules of `iptables -nvx -L <chain>` output, each with its counters as printed (not deltas).
+pub fn parse_counters(text: &str) -> Vec<RuleCount> {
+    let mut out: Vec<RuleCount> = Vec::new();
+    let mut in_rules = false;
+    for line in text.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.first() == Some(&"pkts") {
+            in_rules = true;
+            continue;
+        }
+        if !in_rules || f.len() < 9 {
+            continue;
+        }
+        let (Some(packets), Some(bytes)) =
+            (f.first().and_then(|x| x.parse::<u64>().ok()), f.get(1).and_then(|x| x.parse::<u64>().ok()))
+        else {
+            continue;
+        };
+        let (target, proto, dest) =
+            (f.get(2).copied().unwrap_or(""), f.get(3).copied().unwrap_or(""), f.get(8).copied().unwrap_or(""));
+        let proto = match proto {
+            "6" => "tcp",
+            "17" => "udp",
+            "0" => "all",
+            other => other,
+        };
+        let rest = f.get(9..).map(|r| r.join(" ")).unwrap_or_default();
+        let mut rule = format!("{target} {proto} {dest}");
+        if !rest.is_empty() {
+            rule.push(' ');
+            rule.push_str(&rest);
+        }
+        match out.iter_mut().find(|r| r.rule == rule) {
+            Some(same) => {
+                same.packets = same.packets.saturating_add(packets);
+                same.bytes = same.bytes.saturating_add(bytes);
+            }
+            None => out.push(RuleCount { rule, packets, bytes, drop: target == "DROP" }),
+        }
+    }
+    out
+}
+
+/// The rules of `now` whose counters moved since `previous`, as deltas; `previous` becomes `now`. A counter below
+/// its previous value (the chain was installed again) counts from zero; a rule that is gone is forgotten.
+pub fn counter_deltas(previous: &mut BTreeMap<String, (u64, u64)>, now: &[RuleCount]) -> Vec<RuleCount> {
+    let mut out = Vec::new();
+    for r in now {
+        let (p, b) = previous.get(&r.rule).copied().unwrap_or((0, 0));
+        let reset = r.packets < p || r.bytes < b;
+        let (dp, db) =
+            if reset { (r.packets, r.bytes) } else { (r.packets.saturating_sub(p), r.bytes.saturating_sub(b)) };
+        if dp > 0 || db > 0 {
+            out.push(RuleCount { rule: r.rule.clone(), packets: dp, bytes: db, drop: r.drop });
+        }
+    }
+    previous.clear();
+    previous.extend(now.iter().map(|r| (r.rule.clone(), (r.packets, r.bytes))));
+    out
 }
 
 /// The `iptables-restore` input for the chain: an explicit flush, each allowed address, drop. There is no
@@ -1124,6 +1223,10 @@ pub struct MissionBox {
     state: Mutex<State>,
     wildcards: StdMutex<Vec<String>>,
     told: StdMutex<HashSet<String>>,
+    /// The counters at the last poll, by rule (see *Counters*).
+    counted: StdMutex<BTreeMap<String, (u64, u64)>>,
+    /// Deltas read just before the rules were installed again, for the next poll to report.
+    banked: StdMutex<Vec<RuleCount>>,
 }
 
 impl MissionBox {
@@ -1139,7 +1242,43 @@ impl MissionBox {
             state: Mutex::new(State::default()),
             wildcards: StdMutex::new(Vec::new()),
             told: StdMutex::new(HashSet::new()),
+            counted: StdMutex::new(BTreeMap::new()),
+            banked: StdMutex::new(Vec::new()),
         })
+    }
+
+    /// The counters of the chain now, as printed.
+    async fn read_counts(&self) -> Result<Vec<RuleCount>, String> {
+        let out = self
+            .host
+            .run_ok("Reading the box's rule counters", &rules_counters_args(&self.host.cfg, &self.names), None)
+            .await?;
+        Ok(parse_counters(&String::from_utf8_lossy(&out.stdout)))
+    }
+
+    /// What the rules of the mission's chain counted since the last poll; see *Counters* in the module contract.
+    pub async fn poll_counters(&self) -> Result<Option<Vec<RuleCount>>, String> {
+        {
+            let st = self.state.lock().await;
+            if !st.up || st.closed {
+                return Ok(None);
+            }
+        }
+        let now = self.read_counts().await?;
+        let banked = std::mem::take(&mut *self.banked.lock().unwrap_or_else(|p| p.into_inner()));
+        let fresh = counter_deltas(&mut self.counted.lock().unwrap_or_else(|p| p.into_inner()), &now);
+        let mut deltas: Vec<RuleCount> = Vec::new();
+        for d in banked.into_iter().chain(fresh) {
+            match deltas.iter_mut().find(|x| x.rule == d.rule) {
+                Some(same) => {
+                    same.packets = same.packets.saturating_add(d.packets);
+                    same.bytes = same.bytes.saturating_add(d.bytes);
+                }
+                None => deltas.push(d),
+            }
+        }
+        deltas.sort_by(|a, b| a.rule.cmp(&b.rule));
+        Ok(Some(deltas))
     }
 
     pub fn names(&self) -> &Names {
@@ -1182,10 +1321,24 @@ impl MissionBox {
 
     async fn install_rules(&self, plan: &Egress) -> Result<(), String> {
         let text = rules_text(&self.names, &plan.allowed).into_bytes();
-        self.host
+        // The install flushes the chain and so resets its counters: what they counted since the last poll is
+        // read first (only once polling has begun), and banked for the next one.
+        let polled = !self.counted.lock().unwrap_or_else(|p| p.into_inner()).is_empty();
+        if polled {
+            if let Ok(now) = self.read_counts().await {
+                let fresh = counter_deltas(&mut self.counted.lock().unwrap_or_else(|p| p.into_inner()), &now);
+                self.banked.lock().unwrap_or_else(|p| p.into_inner()).extend(fresh);
+            }
+        }
+        let done = self
+            .host
             .run_ok("Installing the egress rules", &rules_args(&self.host.cfg, &self.names), Some(text))
             .await
-            .map(|_| ())
+            .map(|_| ());
+        if done.is_ok() {
+            self.counted.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        }
+        done
     }
 
     /// Remove the container so that it never runs with rules that are not the grants' (best effort).
@@ -1671,6 +1824,10 @@ case "$sub" in
         case "$*" in
           *": loom-rules-check;"*)
             [ -f "$D/chain-$chain" ] || { echo "iptables: Bad rule (does a matching rule exist in that chain?)" >&2; exit 1; }
+            exit 0;;
+          *": loom-rules-counters;"*)
+            [ -f "$D/chain-$chain" ] || { echo "iptables: No chain/target/match by that name." >&2; exit 1; }
+            [ -f "$D/counters-$chain" ] && cat "$D/counters-$chain"
             exit 0;;
           *": loom-rules-remove;"*)
             [ -f "$D/slow.remove" ] && sleep 1
@@ -2977,6 +3134,79 @@ exit 2
         assert!(!own.iter().any(|l| l.contains("203.0.113.9")), "{own:?}");
         assert!(own.iter().any(|l| l.contains("203.0.113.7/32")) && own.last().unwrap() == "-j DROP", "{own:?}");
         assert!(!own.iter().any(|l| l.contains("ESTABLISHED")), "{own:?}");
+    }
+
+    const COUNTERS: &str = "Chain LOOM-abc (1 references)\n    pkts      bytes target     prot opt in     out     source               destination\n       3      180 ACCEPT     tcp  --  *      *       0.0.0.0/0            203.0.113.7          tcp dpt:443\n       0        0 ACCEPT     udp  --  *      *       0.0.0.0/0            203.0.113.7          udp dpt:443\n      12      720 DROP       all  --  *      *       0.0.0.0/0            0.0.0.0/0           \n";
+
+    #[test]
+    fn counters_are_parsed_from_the_listing_and_read_as_deltas() {
+        let now = parse_counters(COUNTERS);
+        assert_eq!(now.len(), 3, "{now:?}");
+        assert_eq!(
+            now[0],
+            RuleCount { rule: "ACCEPT tcp 203.0.113.7 tcp dpt:443".into(), packets: 3, bytes: 180, drop: false }
+        );
+        assert_eq!(now[2], RuleCount { rule: "DROP all 0.0.0.0/0".into(), packets: 12, bytes: 720, drop: true });
+        // Protocols written as numbers (iptables-nft) read as names; junk lines and a missing header read as nothing.
+        let numeric =
+            COUNTERS.replace(" tcp  --", " 6    --").replace(" udp  --", " 17   --").replace(" all  --", " 0    --");
+        assert_eq!(parse_counters(&numeric), now);
+        assert!(parse_counters("iptables: No chain/target/match by that name.\n3 180 ACCEPT tcp -- * * a b").is_empty());
+        assert!(parse_counters("").is_empty());
+        // First reading: everything counted so far (a rule that counted nothing is left out). Unchanged: nothing. Growth: the difference. A reset: from zero.
+        let mut prev = BTreeMap::new();
+        assert_eq!(counter_deltas(&mut prev, &now).len(), 2, "the rule that counted nothing is not a delta");
+        assert!(counter_deltas(&mut prev, &now).is_empty());
+        let mut grown = now.clone();
+        grown[2].packets = 20;
+        grown[2].bytes = 1200;
+        let d = counter_deltas(&mut prev, &grown);
+        assert_eq!(d, vec![RuleCount { rule: "DROP all 0.0.0.0/0".into(), packets: 8, bytes: 480, drop: true }]);
+        let mut reset = now.clone();
+        reset[0].packets = 1;
+        reset[0].bytes = 60;
+        let d = counter_deltas(&mut prev, &reset);
+        assert!(d.iter().any(|r| r.rule.starts_with("ACCEPT tcp") && r.packets == 1 && r.bytes == 60), "{d:?}");
+        // The helper's argv is fixed: the chain is an argument of a fixed script, never text in it.
+        let cfg = FakeDocker::new(tempfile::tempdir().unwrap().path()).cfg();
+        let args = rules_counters_args(&cfg, &names("m-1"));
+        assert!(args.iter().any(|a| a.starts_with(": loom-rules-counters;")), "{args:?}");
+        assert_eq!(args[args.len() - 2], names("m-1").chain);
+    }
+
+    #[tokio::test]
+    async fn the_counters_of_a_running_box_are_polled_as_deltas_and_survive_an_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = FakeDocker::new(dir.path());
+        let host = f.host();
+        let b = MissionBox::new(host.clone(), "m-1", source(&["203.0.113.7"]));
+        // No box yet: nothing to poll, and no docker call made.
+        let mark = f.calls().len();
+        assert_eq!(b.poll_counters().await.unwrap(), None);
+        assert_eq!(f.calls().len(), mark);
+        b.ready().await.unwrap();
+        let counters = f.dir.join(format!("counters-{}", b.names().chain));
+        let tcp = "ACCEPT tcp 203.0.113.7 tcp dpt:443";
+        std::fs::write(&counters, COUNTERS).unwrap();
+        let first = b.poll_counters().await.unwrap().unwrap();
+        assert_eq!(first.len(), 2, "{first:?}");
+        assert!(b.poll_counters().await.unwrap().unwrap().is_empty(), "nothing moved");
+        // Growth since the last poll, then an install (a grant changed) that resets the chain's counters: what
+        // the old chain counted after the last poll is banked and reported with what the new chain counts.
+        std::fs::write(&counters, COUNTERS.replace("       3      180", "       9      540")).unwrap();
+        b.resync().await;
+        std::fs::write(&counters, COUNTERS.replace("       3      180", "       2      120")).unwrap();
+        let after = b.poll_counters().await.unwrap().unwrap();
+        let tcp_row = after.iter().find(|r| r.rule == tcp).unwrap_or_else(|| panic!("{after:?}"));
+        assert_eq!((tcp_row.packets, tcp_row.bytes), (6 + 2, 360 + 120), "{after:?}");
+        assert!(after.iter().all(|r| r.rule == tcp || r.drop || r.packets > 0), "{after:?}");
+        // A chain that is gone is an error with a sentence, not an empty answer.
+        std::fs::remove_file(f.dir.join(format!("chain-{}", b.names().chain))).unwrap();
+        let err = b.poll_counters().await.unwrap_err();
+        assert!(err.contains("rule counters") && err.contains("No chain"), "{err}");
+        // A torn-down box has nothing to poll.
+        b.teardown().await;
+        assert_eq!(b.poll_counters().await.unwrap(), None);
     }
 
     #[tokio::test]

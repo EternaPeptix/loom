@@ -72,6 +72,20 @@
 //! `kill_under(home, tmp)` is the same for what runs under a profile that may read `tmp` and not the home (the oracle's
 //! replay, once it has returned).
 //!
+//! ## `listener_of(home, sessions, port, confined)` (E4e)
+//! Who listens on loopback TCP `port` (an address of `127.0.0.0/8`, `::1` or the unspecified address), for the proxy's
+//! check that a lab port is not squatted by a sandboxed process: `Listening::Nobody` (no process of this table listens
+//! there), `Outside` (listeners found, none attributed to a loom sandbox: the operator's own service, which a lab
+//! target usually is), `Sandboxed { pid, session, via }` (a listener is attributed to a loom sandbox: by identity
+//! when `confined` and `probe().works`, `session` being the listed session whose temp dir its profile opens, or,
+//! for a sandbox no listed session matches, the session its `LOOM_SANDBOX_ID` names; without identity, by the
+//! variable alone; `session` is `None` only when an identity-attributed process names no session) and `Unknown` (the
+//! process table could not be read, so nothing is claimed). Attribution is the census's: a process under a profile
+//! that no session claims, and carries no mark, is not attributed (a sandboxed application of the operator's
+//! refuses the home too). When several processes listen (a shared port), any sandboxed one is reported. It reads
+//! every process's descriptors, so it costs a scan of the table: call it on a blocking thread, and only for
+//! loopback connections.
+//!
 //! Tests required (macOS with `sandbox-exec`; others skip): `an_identity_is_validated_and_marks_the_environment`,
 //! `the_identity_probe_works_on_this_host`, `a_probe_that_could_not_run_is_asked_again`,
 //! `a_setsid_orphan_with_a_cleared_environment_is_found_and_killed`,
@@ -79,7 +93,8 @@
 //! `a_group_is_signalled_only_when_all_of_it_is_the_sessions`, `a_replay_orphan_is_found_and_killed`,
 //! `the_census_lists_what_a_session_listens_on`, `a_pid_that_was_reused_is_not_signalled`,
 //! `without_identity_the_environment_and_the_groups_find_what_they_can`,
-//! `an_unconfined_daemon_does_not_claim_an_empty_census` and `an_unreadable_table_is_not_an_empty_one`.
+//! `an_unconfined_daemon_does_not_claim_an_empty_census`, `an_unreadable_table_is_not_an_empty_one`,
+//! `a_listener_is_told_apart_by_the_profile_it_runs_under` and `an_unreadable_table_says_unknown_for_a_listener`.
 
 use crate::procinfo::{self, Listener};
 use serde::Serialize;
@@ -322,6 +337,57 @@ impl Census {
     /// was not taken by sandbox identity (the fallback finds only what it can, so it cannot say "none").
     pub fn is_empty_for(&self, session: &str) -> bool {
         self.readable && self.identity && self.of(session).next().is_none()
+    }
+}
+
+/// Who listens on a loopback port; see the contract.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Listening {
+    Nobody,
+    Outside,
+    Sandboxed { pid: u32, session: Option<String>, via: Via },
+    Unknown,
+}
+
+/// Whether `addr` (as `procinfo::Listener` prints it) is a loopback or unspecified address.
+fn is_local_text(addr: &str) -> bool {
+    addr.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback() || ip.is_unspecified())
+}
+
+/// Who listens on loopback TCP `port`; see the contract.
+pub fn listener_of(home: &Path, sessions: &[Member<'_>], port: u16, confined: bool) -> Listening {
+    let Some(pids) = procinfo::pids() else { return Listening::Unknown };
+    let identity = confined && probe().works;
+    let mut found = false;
+    for pid in pids {
+        if pid <= 1 {
+            continue;
+        }
+        let listens = procinfo::listeners(pid)
+            .iter()
+            .any(|l| l.proto == procinfo::Proto::Tcp && l.port == port && is_local_text(&l.addr));
+        if !listens {
+            continue;
+        }
+        found = true;
+        if identity {
+            if !in_a_sandbox(pid, home) {
+                continue;
+            }
+            if let Some(m) = sessions.iter().find(|m| in_session(pid, m.tmp)) {
+                return Listening::Sandboxed { pid, session: Some(m.id.to_string()), via: Via::Identity };
+            }
+            if let Some(mark) = marked_session(pid) {
+                return Listening::Sandboxed { pid, session: Some(mark), via: Via::Environment };
+            }
+        } else if let Some(mark) = marked_session(pid) {
+            return Listening::Sandboxed { pid, session: Some(mark), via: Via::Environment };
+        }
+    }
+    if found {
+        Listening::Outside
+    } else {
+        Listening::Nobody
     }
 }
 
@@ -819,6 +885,83 @@ mod tests {
             "{census:?}"
         );
         assert!(kill(&rig.home, &members, &[], &[], true).left.is_empty());
+    }
+
+    /// Starts a perl listener under `sb` on a loopback port and returns the port.
+    fn listen_under(rig: &mut Rig, sb: &Sandbox, tmp: &Path, clear_env: bool) -> u16 {
+        let port_file = tmp.join(format!("port-{}", rig.spawned.len()));
+        let script = format!(
+            "/usr/bin/perl -MIO::Socket::INET -e '$s=IO::Socket::INET->new(Listen=>1,LocalAddr=>\"127.0.0.1\",\
+             LocalPort=>0,Proto=>\"tcp\") or die; open F,\">{}\"; print F $s->sockport; close F; sleep 60'",
+            port_file.display()
+        );
+        let script = if clear_env { format!("/usr/bin/env -i {script}") } else { script };
+        rig.run(sb, &script, false);
+        for _ in 0..100 {
+            if let Some(p) = std::fs::read_to_string(&port_file).ok().and_then(|t| t.trim().parse().ok()) {
+                return p;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("the listener did not start");
+    }
+
+    #[test]
+    fn a_listener_is_told_apart_by_the_profile_it_runs_under() {
+        if !available() {
+            return;
+        }
+        assert!(probe().works, "{}", probe().detail);
+        let mut rig = Rig::new();
+        let (one, two) = (rig.sandbox("s-listen-1"), rig.sandbox("s-listen-2"));
+        let (tmp1, tmp2) = (rig.tmp("s-listen-1"), rig.tmp("s-listen-2"));
+        let members = [Member { id: "s-listen-1", tmp: &tmp1 }, Member { id: "s-listen-2", tmp: &tmp2 }];
+        let home = rig.home.clone();
+        let plain_port = listen_under(&mut rig, &one, &tmp1, false);
+        // A squatter that cleared its environment is still found: identity is the profile, not the variable.
+        let cleared_port = listen_under(&mut rig, &two, &tmp2, true);
+        // The operator's own service: this process.
+        let own = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let own_port = own.local_addr().expect("addr").port();
+        let ours = |port: u16| listener_of(&home, &members, port, true);
+        match ours(plain_port) {
+            Listening::Sandboxed { session, via, .. } => {
+                assert_eq!(session.as_deref(), Some("s-listen-1"));
+                assert_eq!(via, Via::Identity);
+            }
+            other => panic!("a sandboxed listener was read as {other:?}"),
+        }
+        assert!(
+            matches!(ours(cleared_port), Listening::Sandboxed { session: Some(ref s), .. } if s == "s-listen-2"),
+            "{:?}",
+            ours(cleared_port)
+        );
+        assert_eq!(ours(own_port), Listening::Outside);
+        let free = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            l.local_addr().expect("addr").port()
+        };
+        assert_eq!(ours(free), Listening::Nobody);
+        // A sandbox that no listed session claims and that carries no mark is not attributed: only the first
+        // session is listed here, so the second's listener without its variable reads as outside.
+        assert_eq!(listener_of(&home, &members[..1], cleared_port, true), Listening::Outside);
+        // Without identity (the daemon runs commands unconfined) only the variable tells, so a cleared
+        // environment is missed: the stated limit of the fallback.
+        assert!(matches!(
+            listener_of(&home, &members, plain_port, false),
+            Listening::Sandboxed { via: Via::Environment, .. }
+        ));
+        assert_eq!(listener_of(&home, &members, cleared_port, false), Listening::Outside);
+        assert!(kill(&rig.home, &members, &[], &[], true).left.is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_table_says_unknown_for_a_listener() {
+        let home = std::env::temp_dir();
+        procinfo::UNREADABLE.with(|u| u.set(true));
+        let got = listener_of(&home, &[], 1, true);
+        procinfo::UNREADABLE.with(|u| u.set(false));
+        assert_eq!(got, Listening::Unknown);
     }
 
     #[test]

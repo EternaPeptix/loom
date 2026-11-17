@@ -333,6 +333,21 @@
 //! grant is revoked. Every decision it reports is
 //! appended to the session's `net.jsonl` and published as [`BusEvent::Net`]. Decisions that name no
 //! session are appended to `logs/net-unattributed.jsonl`.
+//! The floor's controls are put into it at start (`crate::floor::Floor::install`, E4): the synchronous veto, the
+//! canary hook and the lab-listener check; `Runtime::floor()` is the handle (canary users and hosts, the events).
+//! `Runtime::cut_mission(mission)` ends the open tunnels and forwards of every session of a mission
+//! (`Proxy::cut_sessions`) and returns how many. The infrastructure policy the veto asks is rebuilt whenever the
+//! daemon resolves its infrastructure names again (every `infra::RESOLVE_EVERY`). A floor event of severity S4
+//! (a decoy credential or host) or S3 (an infrastructure attempt, a squatted lab port) raises a notification of
+//! kind `floor` (`LOOM_KIND=floor`, `LOOM_SESSION` the attributed session or empty), at most once per label (S4) or
+//! per kind and session (S3) every 10 minutes.
+//!
+//! ## Box counters
+//! Every `BOX_COUNTERS_EVERY` (60 s, not under test) the runtime reads the rule counters of each mission box it has a
+//! handle for (`MissionBox::poll_counters`), warns when a DROP rule counted, and appends one line per mission that
+//! moved to `logs/box-counters.jsonl`: `{"ts_ms", "mission", "chain", "rules": [{"rule", "packets", "bytes",
+//! "drop"}]}` with the deltas since the last poll. A box that cannot be read is logged once until it can be again.
+//! `Runtime::box_counters_now()` polls and records now and returns the deltas.
 //!
 //! ## Notifying the operator
 //! For every `inbox_opened` and every `End::Fatal`. `kind` is the inbox kind in snake case
@@ -571,6 +586,10 @@
 //! - background child: its settlement arrives in the parent as an `agent-report` and resumes a
 //!   parent that ended its turn with `wait`;
 //! - `max_children`, unknown role, spawning from a child: refused with the sentences above;
+//! - the floor (E4): `cut_mission` ends the tunnels of one mission's sessions within a second and not another's,
+//!   the runtime's proxy has the veto and the canary hook installed (a decoy user is a `407` and an S4 event
+//!   attributed to the session), the box counters are polled, recorded as deltas only when they moved, and a box
+//!   that cannot be read is not a record;
 //! - stop: stopping the lead while its awaited child is mid-request settles the child `Stopped`
 //!   and ends the lead's turn `Stopped`; `stop_child` on an idle child settles it;
 //! - `poll`: `k` requests whose messages equal the session's stable prefix plus the vote prompt,
@@ -942,6 +961,12 @@ fn infra_spec_resolved(config: &Config, res: &crate::infra::Resolution) -> Infra
     spec.resolved = res.addrs.clone();
     spec.local_addrs = res.local.clone();
     spec
+}
+
+/// A policy of the daemon's infrastructure alone, which the floor's veto asks (`crate::floor`).
+fn infra_policy(config: &Config, res: &crate::infra::Resolution) -> Result<Policy, String> {
+    Policy::new(&loom_core::config::NetworkCfg::default())
+        .and_then(|p| p.with_infrastructure(&infra_spec_resolved(config, res)))
 }
 
 /// The `host:port` a base URL connects to (`http://h:8000/v1` is `h:8000`; no port is 80 for http and 443
@@ -1603,6 +1628,11 @@ struct Inner {
     census_told: Mutex<crate::census::Told>,
     /// The operator was told that the census runs without sandbox identity, and it has not had identity since.
     census_blind_told: AtomicBool,
+    /// The proxy's veto, canary hooks and lab-listener check (`crate::floor`, E4).
+    floor: crate::floor::Floor,
+    /// The missions whose box counters could not be read at the last poll and the operator's log was told so,
+    /// until a poll works again (`poll_box_counters`).
+    box_counters_failed: Mutex<BTreeSet<MissionId>>,
 }
 
 impl Inner {
@@ -1652,6 +1682,56 @@ impl Inner {
         }
         *self.census.lock().unwrap_or_else(|p| p.into_inner()) = Some(view.clone());
         Some(view)
+    }
+
+    /// Reads the rule counters of every mission box that is up, appends what moved since the last poll to
+    /// `<home>/logs/box-counters.jsonl` (one line per mission with a delta: `ts_ms`, `mission`, `chain`, `rules`) and
+    /// returns the deltas. A box that cannot be read is logged once until it can again; a failed write is logged.
+    async fn poll_box_counters(&self) -> Vec<(MissionId, Vec<loom_tools::boxctl::RuleCount>)> {
+        let boxes: Vec<(MissionId, Arc<MissionBox>)> =
+            self.st().boxes.iter().map(|(m, b)| (m.clone(), b.clone())).collect();
+        let mut moved = Vec::new();
+        for (mission, b) in boxes {
+            match b.poll_counters().await {
+                Ok(Some(rules)) => {
+                    self.box_counters_failed.lock().unwrap_or_else(|p| p.into_inner()).remove(&mission);
+                    if rules.is_empty() {
+                        continue;
+                    }
+                    let dropped: u64 = rules.iter().filter(|r| r.drop).map(|r| r.packets).sum();
+                    if dropped > 0 {
+                        tracing::warn!(
+                            "The box of mission {} had {dropped} packet(s) dropped by its egress rules since the last poll.",
+                            mission.as_str()
+                        );
+                    }
+                    let line = serde_json::json!({
+                        "ts_ms": now_ms(),
+                        "mission": mission.as_str(),
+                        "chain": b.names().chain,
+                        "rules": rules,
+                    });
+                    if let Err(e) = append_line(&self.paths.logs_dir().join(BOX_COUNTERS_FILE), &line.to_string()) {
+                        tracing::warn!("The box counters of mission {} could not be recorded: {e}", mission.as_str());
+                    }
+                    moved.push((mission, rules));
+                }
+                Ok(None) => {
+                    self.box_counters_failed.lock().unwrap_or_else(|p| p.into_inner()).remove(&mission);
+                }
+                Err(e) => {
+                    let first =
+                        self.box_counters_failed.lock().unwrap_or_else(|p| p.into_inner()).insert(mission.clone());
+                    if first {
+                        tracing::warn!(
+                            "The rule counters of the box of mission {} could not be read: {e}",
+                            mission.as_str()
+                        );
+                    }
+                }
+            }
+        }
+        moved
     }
 
     /// Waits until the tasks of `family` have ended, then stops by sandbox identity what each left running (see
@@ -4216,6 +4296,24 @@ fn record_net(inner: &Inner, session: SessionId, decision: NetDecision) {
 /// Where the proxy's decisions that name no session are kept, under `logs/`.
 const UNATTRIBUTED_NET: &str = "net-unattributed.jsonl";
 
+/// Where the rule counters of the mission boxes are recorded, under `logs/`.
+const BOX_COUNTERS_FILE: &str = "box-counters.jsonl";
+
+/// How often the mission boxes' rule counters are read.
+#[cfg_attr(test, allow(dead_code))]
+const BOX_COUNTERS_EVERY: Duration = Duration::from_secs(60);
+
+/// Appends `line` and a newline to `path` (made, with its directory, when missing) and syncs it.
+fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    f.write_all(format!("{line}\n").as_bytes())?;
+    f.sync_data()
+}
+
 /// The proxy's audit hook: appends the decision to the session's `net.jsonl` as a chained line, syncs
 /// it to disk, and then publishes the same entry as [`BusEvent::Net`]; so an allowed connection is on
 /// record before it is used. A decision that names no session goes to `logs/net-unattributed.jsonl`.
@@ -4257,9 +4355,8 @@ impl Runtime {
             let config = config.clone();
             tokio::task::spawn_blocking(move || crate::infra::resolve_system(&config)).await.unwrap_or_default()
         };
-        Policy::new(&loom_core::config::NetworkCfg::default())
-            .and_then(|p| p.with_infrastructure(&infra_spec_resolved(&config, &resolution)))
-            .map_err(|e| format!("The network configuration cannot be used: {e}"))?;
+        let floor_policy =
+            infra_policy(&config, &resolution).map_err(|e| format!("The network configuration cannot be used: {e}"))?;
         paths
             .ensure_private_layout()
             .map_err(|e| format!("cannot create {} as a private directory: {e}", paths.home.display()))?;
@@ -4336,6 +4433,8 @@ impl Runtime {
             census: Mutex::new(None),
             census_told: Mutex::new(crate::census::Told::new()),
             census_blind_told: AtomicBool::new(false),
+            floor: crate::floor::Floor::new(floor_policy),
+            box_counters_failed: Mutex::new(BTreeSet::new()),
         });
 
         let weak = Arc::downgrade(&inner);
@@ -4380,6 +4479,9 @@ impl Runtime {
                     let config = config.clone();
                     let fresh = tokio::task::spawn_blocking(move || crate::infra::resolve_system(&config)).await;
                     let (Some(inner), Ok(fresh)) = (weak.upgrade(), fresh) else { return };
+                    if let Ok(policy) = infra_policy(&inner.config, &fresh) {
+                        inner.floor.set_infrastructure(policy);
+                    }
                     *inner.infra.lock().unwrap_or_else(|p| p.into_inner()) = fresh;
                 }
             });
@@ -4402,6 +4504,43 @@ impl Runtime {
                 }
             });
             inner.st().tasks.push(prober);
+        }
+
+        // The floor's controls in the proxy (E4): the veto, the canary hooks and the lab-listener check. The
+        // listener check asks the census's machinery who listens on a loopback port, over the sessions known now.
+        {
+            let weak = Arc::downgrade(&inner);
+            let probe: crate::floor::ListenerProbe = Arc::new(move |port| {
+                let Some(inner) = weak.upgrade() else { return loom_tools::sandbox::census::Listening::Unknown };
+                let (members, _) = inner.census_sessions();
+                let asked: Vec<loom_tools::sandbox::census::Member<'_>> =
+                    members.iter().map(|(id, tmp)| loom_tools::sandbox::census::Member { id, tmp }).collect();
+                let home = crate::census::canonical_home(&inner.paths.home);
+                loom_tools::sandbox::census::listener_of(&home, &asked, port, inner.census_confined())
+            });
+            inner.floor.install(&inner.proxy, Some(probe));
+            let weak = Arc::downgrade(&inner);
+            inner.floor.set_notifier(Some(Arc::new(move |e: &crate::floor::FloorEvent| {
+                let Some(inner) = weak.upgrade() else { return };
+                let session = e.session.clone().unwrap_or_else(|| SessionId::from(""));
+                let (title, text) = crate::floor::notice(e);
+                inner.notify("floor", &session, &title, &text);
+            })));
+        }
+
+        // The mission boxes' rule counters (E4f): every `BOX_COUNTERS_EVERY`. Not under test: a test runtime
+        // has no Docker host to ask unless the test provides one.
+        #[cfg(not(test))]
+        if inner.box_host.is_some() {
+            let weak = Arc::downgrade(&inner);
+            let poller = tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(BOX_COUNTERS_EVERY).await;
+                    let Some(inner) = weak.upgrade() else { return };
+                    inner.poll_box_counters().await;
+                }
+            });
+            inner.st().tasks.push(poller);
         }
 
         // The process and listener census of the sessions (E3): every `census::EVERY`. Not under test: a test
@@ -4588,6 +4727,33 @@ impl Runtime {
             );
         }
         Ok(killed)
+    }
+
+    /// The floor's controls of the proxy (`crate::floor`): canary users and hosts, and the events of the veto, the
+    /// canary hook and the lab-listener check.
+    pub fn floor(&self) -> crate::floor::Floor {
+        self.inner.floor.clone()
+    }
+
+    /// Ends every open tunnel and forwarded request of the sessions of `mission` (its lead, its agents and their
+    /// copies), reference grants' included (`loom_net::Proxy::cut_sessions`, E4a), and returns how many were
+    /// ended. It does not change any policy: a caller that is holding the mission sets the hold first.
+    pub fn cut_mission(&self, mission: &MissionId) -> usize {
+        let sessions: Vec<SessionId> = self
+            .inner
+            .st()
+            .known
+            .iter()
+            .filter(|(_, k)| &k.meta.mission == mission)
+            .map(|(id, _)| id.clone())
+            .collect();
+        self.inner.proxy.cut_sessions(sessions.iter())
+    }
+
+    /// The rule counters of the mission boxes that moved since the last poll, read now (and recorded in
+    /// `<home>/logs/box-counters.jsonl` as the periodic poll does).
+    pub async fn box_counters_now(&self) -> Vec<(MissionId, Vec<loom_tools::boxctl::RuleCount>)> {
+        self.inner.poll_box_counters().await
     }
 
     /// Take a self-probe report as the probe loop does (tests, and a caller that probed by other means).
@@ -6932,6 +7098,7 @@ mod tests {
             allowed: true,
             rule: "mode open".into(),
             resolved: None,
+            sni: None,
         };
         let path = e.rt.paths().session_dir(&id).join("net.jsonl");
         // Lines written before the chain existed still load; new lines chain after them.
@@ -10893,6 +11060,106 @@ mod tests {
         e.rt.shutdown().await;
     }
 
+    // ---- the proxy's floor controls (E4) ---------------------------------------------------------------
+
+    /// A tunnel through the session's own proxy listener to `dest`, answered `200`.
+    async fn tunnel_of(e: &Env, id: &SessionId, dest: &str) -> tokio::net::TcpStream {
+        use base64::Engine as _;
+        use tokio::io::AsyncWriteExt;
+        let policy = Policy::new(&loom_core::config::NetworkCfg {
+            mode: loom_core::config::NetworkMode::Open,
+            allow_private: vec!["127.0.0.1".into()],
+            ..loom_core::config::NetworkCfg::default()
+        })
+        .unwrap();
+        let grant = e.rt.inner.proxy.grant(id, policy).unwrap();
+        let creds = base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", grant.user, grant.password));
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", grant.port)).await.unwrap();
+        s.write_all(format!("CONNECT {dest} HTTP/1.1\r\nProxy-Authorization: Basic {creds}\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut head = Vec::new();
+        let mut b = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            tokio::io::AsyncReadExt::read_exact(&mut s, &mut b).await.unwrap();
+            head.push(b[0]);
+        }
+        assert!(head.starts_with(b"HTTP/1.1 200"), "{}", String::from_utf8_lossy(&head));
+        s
+    }
+
+    #[tokio::test]
+    async fn cut_mission_ends_the_tunnels_of_the_missions_sessions_and_no_others() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = echo.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = echo.accept().await {
+                tokio::spawn(async move {
+                    let (mut r, mut w) = s.split();
+                    let _ = tokio::io::copy(&mut r, &mut w).await;
+                });
+            }
+        });
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let a = e.rt.create_session(e.new_session(Some("a"))).await.unwrap().meta;
+        let b = e.rt.create_session(e.new_session(Some("b"))).await.unwrap().meta;
+        assert_ne!(a.mission, b.mission);
+        let dest = format!("127.0.0.1:{port}");
+        let (mut ta, mut tb) = (tunnel_of(&e, &a.id, &dest).await, tunnel_of(&e, &b.id, &dest).await);
+        async fn echoes(s: &mut tokio::net::TcpStream) -> Option<()> {
+            s.write_all(b"ping").await.ok()?;
+            let mut got = [0u8; 4];
+            tokio::time::timeout(Duration::from_millis(800), s.read_exact(&mut got)).await.ok()?.ok().map(|_| ())
+        }
+        assert!(echoes(&mut ta).await.is_some() && echoes(&mut tb).await.is_some());
+        assert_eq!(e.rt.cut_mission(&a.mission), 1);
+        let mut rest = Vec::new();
+        let ended = tokio::time::timeout(Duration::from_secs(1), ta.read_to_end(&mut rest)).await;
+        assert!(ended.is_ok(), "the mission's tunnel closes within a second");
+        assert!(echoes(&mut tb).await.is_some(), "another mission's tunnel is not touched");
+        assert_eq!(e.rt.cut_mission(&a.mission), 0);
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_runtimes_proxy_has_the_floor_installed() {
+        use base64::Engine as _;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let a = e.rt.create_session(e.new_session(Some("a"))).await.unwrap().meta;
+        let floor = e.rt.floor();
+        floor.add_canary_host("bait.example.test", "CN-4 test").unwrap();
+        floor.add_canary_user("loom-decoy-1", "CN-1 test").unwrap();
+        let port = e.rt.inner.proxy.session_port(&a.id).unwrap();
+        let ask = |creds: String, dest: &'static str| async move {
+            let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            s.write_all(format!("CONNECT {dest} HTTP/1.1\r\nProxy-Authorization: Basic {creds}\r\n\r\n").as_bytes())
+                .await
+                .unwrap();
+            let mut resp = String::new();
+            let _ = tokio::time::timeout(Duration::from_secs(5), s.read_to_string(&mut resp)).await;
+            resp
+        };
+        // The decoy user: 407, an S4 event attributed to the session whose port it was sent to.
+        let resp = ask(base64::engine::general_purpose::STANDARD.encode("loom-decoy-1:x"), "93.184.216.34:443").await;
+        assert!(resp.starts_with("HTTP/1.1 407"), "{resp}");
+        // The session's own credentials to the decoy host: refused before any lookup.
+        let grant =
+            e.rt.inner.proxy.grant(&a.id, Policy::new(&loom_core::config::NetworkCfg::default()).unwrap()).unwrap();
+        let own = base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", grant.user, grant.password));
+        let resp = ask(own, "bait.example.test:443").await;
+        assert!(resp.starts_with("HTTP/1.1 4") || resp.starts_with("HTTP/1.1 502"), "{resp}");
+        let events = floor.events();
+        assert!(
+            events
+                .iter()
+                .any(|ev| ev.kind == crate::floor::FloorKind::CanaryCredential && ev.session.as_ref() == Some(&a.id)),
+            "{events:?}"
+        );
+        e.rt.shutdown().await;
+    }
+
     // ---- the box (I1, I5) -------------------------------------------------------------------------
 
     use loom_tools::boxctl::fake::FakeDocker;
@@ -10969,6 +11236,58 @@ mod tests {
         assert!(rules.contains("-d 198.51.100.4/32 -p tcp -j ACCEPT"), "{rules}");
         assert!(!rules.contains("wild") && rules.trim_end().ends_with("COMMIT"));
         assert!(fake.running(&box_container(&mission)));
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_boxs_rule_counters_are_polled_recorded_as_deltas_and_only_when_they_moved() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeDocker::new(dir.path());
+        let e = box_env(&fake).await;
+        let (id, mission) = idle_lead(&e).await;
+        // No box yet: nothing to poll, no record.
+        assert!(e.rt.box_counters_now().await.is_empty());
+        let b = e.rt.inner.orch.box_access(&id).await.unwrap();
+        b.ready().await.unwrap();
+        let counters = fake.dir.join(format!("counters-{}", b.names().chain));
+        let listing = |accepted: u32, dropped: u32| {
+            format!(
+                "Chain {} (1 references)\n    pkts      bytes target     prot opt in     out     source               destination\n    {accepted:>4} {:>9} ACCEPT     tcp  --  *      *       0.0.0.0/0            198.51.100.4         tcp dpt:443\n    {dropped:>4} {:>9} DROP       all  --  *      *       0.0.0.0/0            0.0.0.0/0           \n",
+                b.names().chain,
+                accepted * 60,
+                dropped * 60
+            )
+        };
+        std::fs::write(&counters, listing(3, 0)).unwrap();
+        let first = e.rt.box_counters_now().await;
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].0, mission);
+        assert_eq!(first[0].1.len(), 1);
+        assert_eq!((first[0].1[0].packets, first[0].1[0].drop), (3, false));
+        // Nothing moved: nothing is recorded.
+        assert!(e.rt.box_counters_now().await.is_empty());
+        // A drop is recorded as a delta, the accept as none.
+        std::fs::write(&counters, listing(3, 5)).unwrap();
+        let second = e.rt.box_counters_now().await;
+        assert_eq!(second[0].1.len(), 1, "{second:?}");
+        assert!(second[0].1[0].drop && second[0].1[0].packets == 5 && second[0].1[0].bytes == 300, "{second:?}");
+        let text = std::fs::read_to_string(e.rt.paths().logs_dir().join("box-counters.jsonl")).unwrap();
+        let lines: Vec<serde_json::Value> = text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        assert_eq!(lines[1]["mission"], mission.as_str());
+        assert_eq!(lines[1]["chain"], b.names().chain.as_str());
+        assert_eq!(lines[1]["rules"][0]["packets"], 5);
+        assert_eq!(lines[1]["rules"][0]["drop"], true);
+        assert!(lines[1]["ts_ms"].as_u64().unwrap_or(0) > 0);
+        // A chain that cannot be read is not a record, and the next good poll goes on from where it was.
+        std::fs::remove_file(fake.dir.join(format!("chain-{}", b.names().chain))).unwrap();
+        assert!(e.rt.box_counters_now().await.is_empty());
+        assert!(e.rt.inner.box_counters_failed.lock().unwrap().contains(&mission));
+        std::fs::write(fake.dir.join(format!("chain-{}", b.names().chain)), "").unwrap();
+        std::fs::write(&counters, listing(3, 6)).unwrap();
+        let third = e.rt.box_counters_now().await;
+        assert_eq!(third[0].1[0].packets, 1, "{third:?}");
+        assert!(e.rt.inner.box_counters_failed.lock().unwrap().is_empty());
         e.rt.shutdown().await;
     }
 

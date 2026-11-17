@@ -823,6 +823,11 @@ pub struct NetDecision {
     pub rule: String,
     #[serde(default)]
     pub resolved: Option<String>,
+    /// The server name the TLS ClientHello of a `CONNECT` tunnel carried, when the proxy read it and it was
+    /// not the destination's own name (another granted name, or the name of a refused tunnel). Absent from
+    /// older records and from every record whose tunnel named its own destination.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sni: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1125,6 +1130,7 @@ mod tests {
                     allowed: false,
                     rule: "deny".into(),
                     resolved: Some("1.2.3.4".into()),
+                    sni: None,
                 }),
             ),
             ("cache_break", Event::CacheBreak { req_id: "r-1".into(), first_diff_message: 2, detail: "d".into() }),

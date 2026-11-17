@@ -938,6 +938,7 @@ name = "loom-agent"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.23.1",
  "futures-util",
  "libc",
  "loom-core",

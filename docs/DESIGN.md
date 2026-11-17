@@ -142,6 +142,7 @@ missions/<mid>/journal.jsonl.lock    its lock file
 missions/<mid>/journal.head          its sealed head record
 logs/loomd.log                       the daemon's output when started by `loom up` or as a service
 logs/net-unattributed.jsonl          proxy answers that name no session, hash-chained
+logs/box-counters.jsonl              per-minute deltas of the packet counters of each mission box's egress rules
 ```
 
 Files made atomically (the token, the journal key) go through a synced temporary file
@@ -1410,6 +1411,15 @@ head within 10 s gets `400`.
   …)`; a check is recorded with method `LOOM-CHECK` and the rule suffixed `(check only)`. Answers that
   name no granted session go to `logs/net-unattributed.jsonl`, at most 10 a minute, the next one saying
   how many were left out; the API has no reader for that file, and these decisions are not published.
+- **Cut, veto, server names, decoys** (`docs/MONITOR.md` §2.2, E4). `Proxy::cut`/`cut_sessions` end a session's open
+  tunnels and forwards (`Runtime::cut_mission` for a mission) within a second. A synchronous veto
+  (`Proxy::set_veto`, installed by `loom-agent::floor`) refuses decoy hosts and infrastructure before any lookup, with `502`
+  and a fixed sentence. After the `200` of a `CONNECT` and before any byte goes upstream the proxy reads the client's first
+  flight: a TLS ClientHello must name the destination or another name the session's policy allows (the record then carries
+  `sni`), and an encrypted ClientHello, an unreadable one, or none for a destination that is a name is refused; a flight
+  that is not TLS passes. A decoy proxy user (`add_canary_user`) never authenticates, is answered as an unknown user and
+  fires a hook. For a loopback connection, a listener started inside another session's sandbox is refused. Each mission
+  box's per-rule packet counters are read every minute into `logs/box-counters.jsonl`.
   Each decision attributed to a session is also published as a `net` event once its record is written.
 - **The audit file is a chain** (`loom-net::netlog`). Each line's `prev` is the SHA-256 of the previous
   line's bytes (64 zeros for the first); appends are serialised and each is synced. Lines written

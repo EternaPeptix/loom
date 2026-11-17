@@ -314,6 +314,15 @@ These are the places where loom does less than the text above might suggest.
   with a sentence that says what to do (stop what is left, or lower the headroom), not given more room. The daemon inspects and signals processes through libproc (`/proc` on Linux),
   never by running `ps`, so a full process table does not blind it; a group it cannot inspect is still signalled unless
   its leader is known to have been replaced.
+- **The proxy can cut, veto and bind names, within limits.** `Runtime::cut_mission` ends a mission's open tunnels within a
+  second; the proxy refuses a destination the daemon's veto closes (decoy hosts, loom's infrastructure) before it looks it up;
+  and it reads a `CONNECT` tunnel's TLS ClientHello before relaying, so a name other than the destination's (or another name
+  the policy allows) and an encrypted ClientHello are refused. Only the first flight is judged: a tunnel that starts in
+  plaintext and upgrades (STARTTLS), a second ClientHello, and a Host header that differs from a matching name inside the
+  TLS session are not (`docs/MONITOR.md` X4). A decoy proxy user is answered as an unknown user and fires an event. A loopback
+  lab port whose listener runs in another session's sandbox is refused; a lab on a port held by a sandboxed process the census
+  cannot attribute (a cleared environment where sandbox identity is unavailable) is not. The box's rule counters are read every
+  minute and recorded, not acted on: what the box did is counted, not described.
 - **The configured network policy is per daemon**, and is read at start. In `allowlist` mode a
   listed host can be used by every session. Data can be sent to an allowed host. On top of it the
   operator can grant a session more hosts while it runs (`loom scope`): a grant is per session,

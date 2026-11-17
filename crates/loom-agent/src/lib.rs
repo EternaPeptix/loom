@@ -2,6 +2,7 @@
 //! alone. See `docs/DESIGN.md` §8 and §9.
 //!
 //! - [`census`] the process and listener census of the sessions, found by sandbox identity
+//! - [`floor`] the proxy's veto, canary users and hosts, and lab-listener identity check
 //! - [`pack`]  roles: prompt, tool list, how a role ends
 //! - [`frontier`] the honest progress picture read from the ledger
 //! - [`prior`] recall of the earlier missions the operator chose for a new one, from their sealed ledgers
@@ -19,6 +20,7 @@ pub mod census;
 pub mod continuation;
 pub mod egress;
 pub mod evalkit;
+pub mod floor;
 pub mod frontier;
 pub mod gate;
 pub mod hud;

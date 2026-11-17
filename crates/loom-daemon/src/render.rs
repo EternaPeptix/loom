@@ -1123,6 +1123,7 @@ mod tests {
                 allowed: false,
                 rule: s.into(),
                 resolved: None,
+                sni: None,
             }),
             Event::CacheBreak { req_id: s.into(), first_diff_message: 2, detail: s.into() },
             Event::Interrupted { reason: s.into() },
@@ -1622,6 +1623,7 @@ mod tests {
             allowed: true,
             rule: "r".into(),
             resolved: None,
+            sni: None,
         });
         assert_eq!(record(&rec(Author::Harness, net), &MONO, &verbose), "");
         assert_eq!(record(&rec(Author::Harness, Event::Unknown), &MONO, &verbose), "");
@@ -2017,6 +2019,7 @@ mod tests {
                 allowed,
                 rule: "default deny".into(),
                 resolved: None,
+                sni: None,
             },
         };
         let text = net_table(&[e(3_723_000, false), e(86_400_000 + 59_000, true)], &MONO);
