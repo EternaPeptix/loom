@@ -53,6 +53,10 @@
 //! Details:
 //! - `Now`: `input.now_ms` as UTC, minute precision (implement the civil-date arithmetic here; no
 //!   date crate).
+//! - `brief_opts(tools)`: `BriefOpts::default()` when `tools` holds `ledger` (the capped lists' elision
+//!   lines send the model there), else `BriefOpts::uncapped()`: a role that cannot read the ledger
+//!   (the ctf and redteam roles) is shown every item, as before the caps. The session passes the role's
+//!   tools, for the HUD and for the re-weave and fresh-start briefs alike.
 //! - Mission state: only when `input.ledger` is `Some` and the brief is non-empty. Followed, when
 //!   `input.ledger_skipped` is `n > 0`, by its own line `{n} ledger entries written by a newer loom are
 //!   not shown` (`1 ledger entry … is not shown`): the ledger as read lacks entries this build cannot parse.

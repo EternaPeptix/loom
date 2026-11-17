@@ -23,19 +23,30 @@
 //! - *touched*: for each id-keyed collection of `SecurityState` (`assets`, `credentials`,
 //!   `footholds`, `condition_evidence`, `blocked`, `revisited`, `crashes`, `vector_attempts`,
 //!   `hypotheses`, `relations`, `facts`, `rules`, `aliases`), the keys whose value differs between the
-//!   state read before the append and the state the append returned, new keys included; and of
-//!   `unlocked`, the conditions added. A write by another session between the two reads shows up too.
+//!   state read before the append and the state the append returned, new keys included; of
+//!   `unlocked`, the conditions added; and `died` and `retraction_limitation` when they differ (a
+//!   retraction's conclusions that no longer hold). A write by another session between the two reads
+//!   shows up too.
+//! - *addressed*: the ids the operation names or creates whatever the state held: the keys of every
+//!   collection of a `SecurityState::default()` to which the (resolved) operation was applied, kept when
+//!   the state after the append has them. An addressed id that was not touched is listed under
+//!   `unchanged` (`{collection: [ids]}`), so a repeated write (an asset already known under its
+//!   canonical locator, a hypothesis already open) still names its id; `unchanged` is omitted when empty.
 //! - `recorded`: `{collection: {id: record}}` of the touched entries (`unlocked`: the list of added
-//!   conditions), each in full, when their JSON together is at most `RECORDED_CHARS` (8 000) characters;
-//!   otherwise `{collection: {"count": k, "ids": [first 20 ids]}}` for each collection touched.
-//!   Collections with nothing touched are left out.
+//!   conditions; `died`: the list; `retraction_limitation`: the text), each in full, when their JSON
+//!   together, pretty-printed as the result is, is at most `RECORDED_CHARS` (8 000) characters;
+//!   otherwise `{collection: {"count": k, "ids": [first 20 ids, each cut to 80 characters]}}` for each
+//!   collection touched (`unlocked` and `died`: the count only). Collections with nothing touched are
+//!   left out.
 //! - `removed`: `{collection: [ids]}` of keys present before and gone after; omitted when empty.
 //! - `counts`: `{collection: number of entries}` after the write, for each non-empty collection.
 //! - `more`: `The rest of the security state is unchanged by this write; read it with security_query
 //!   (view: state, assets, coverage, revisit, hypotheses or facts).`
 //!
 //! Tests: a single upsert returns that asset in full and the counts, not the other assets; a batch
-//! over the size bound returns counts and ids; a hypothesis_open returns the new hypothesis id; a
+//! over the size bound returns counts and ids, and stays near the bound with long keys and many
+//! conditions; a repeated hypothesis_open and an upsert of a known asset under another spelling name
+//! the id under `unchanged`; a fact retraction reports `died`; a hypothesis_open returns the new hypothesis id; a
 //! retraction returns the fact it deactivated (a retraction keeps the record, so `removed` stays empty; it
 //! lists ids a write deletes, tested on the report itself).
 //!

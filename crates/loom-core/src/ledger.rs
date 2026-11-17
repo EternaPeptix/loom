@@ -500,16 +500,23 @@ pub struct LedgerState {
 // Brief caps. The HUD is the last message of every request and is never cached, so every line of the
 // brief is paid for again at every step; lists that only grow are capped (`BriefOpts`), and what a cap
 // leaves out stays one `ledger` call away. Under `Plan:` every `Todo` and `Doing` step is listed, but of
-// the `Done` steps only the last `opts.max_plan_done` (in plan order). Under `Open obligations:` the
-// last `opts.max_obligations` open ones. Under `Claims:` every `Open` claim, but of the settled ones
+// the `Done` steps only the last `opts.max_plan_done` (in plan order). Under `Open obligations:` every
+// open `objection` (each one blocks `finish` and the HUD says to answer each) and, of the other open
+// obligations, only the last `opts.max_obligations`. Under `Claims:` every `Open` claim, but of the settled ones
 // (`Supported`, `Refuted`, `Withdrawn`) only the last `opts.max_claims` (in claim order). Listed items
 // keep their order and their line format. When a cap leaves items out, the section starts, right under
 // its heading, with the elision line `({N} older {what} not shown: {ids}; call `ledger` to read them)`,
 // `{what}` being `done` (plan), `open` (obligations) or `settled` (claims), and `{ids}` the ids left out
-// as runs: consecutive ids of one letter joined `{first}–{last}`, runs joined by `, ` (`p1–p11, p13`).
+// as runs: consecutive ids of one letter joined `{first}–{last}`, runs joined by `, ` (`p1–p11, p13`);
+// with more than `ELISION_RUNS` (6) runs, the first 3, then `…`, then the last 3, so the line stays short
+// however the ids interleave (`p1, p3, p5, …, p285, p287, p289`).
 // Decisions and dead ends use the same line without a `{what}` (`(2 older not shown: d1–d2; …)`, as
 // before). A cap of 0 lists none of those items. Defaults: `max_plan_done` 5, `max_claims` 10,
-// `max_obligations` 20, `max_decisions` 12, `max_dead_ends` 20, `max_line` 400. Tests: each cap at,
+// `max_obligations` 20, `max_decisions` 12, `max_dead_ends` 20, `max_line` 400. The elision line sends the
+// reader to `ledger`, so a caller whose reader holds no `ledger` tool uses `BriefOpts::uncapped()`:
+// the defaults with `max_plan_done`, `max_claims` and `max_obligations` at `usize::MAX` (the brief as it
+// was before the caps). Tests: the run limit with interleaved ids; objections never left out; `uncapped()`
+// lists everything; each cap at,
 // below and above its bound, the elision line with non-contiguous ids, open items never left out by the
 // plan and claim caps, and the size of a long mission's brief (65 done steps, 74 claims) with and
 // without the caps.
