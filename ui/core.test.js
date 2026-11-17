@@ -3051,3 +3051,106 @@ test("Open file's accessible name begins with its visible label", () => {
   assert.ok(C.openFileLabel("notes/a.txt").startsWith("Open file"));
   assert.equal(C.openFileLabel(""), "Open file the workspace folder in the Files tab");
 });
+
+// ---- copying
+
+test("copy texts: a reply's raw text, a message, reasoning, and a code block without its fence", () => {
+  assert.equal(C.replyCopyText({ kind: "response", text: "**hi**\n```js\nx()\n```" }), "**hi**\n```js\nx()\n```");
+  assert.equal(C.replyCopyText({ kind: "response", text: "" }), null);
+  assert.equal(C.replyCopyText({ kind: "user", text: "x" }), null);
+  assert.equal(C.messageCopyText({ kind: "user", text: "  keep my spaces\n" }), "  keep my spaces\n");
+  assert.equal(C.messageCopyText({ kind: "response", text: "x" }), null);
+  assert.equal(C.reasoningCopyText({ kind: "response", reasoning: "think" }), "think");
+  assert.equal(C.reasoningCopyText({ kind: "response", reasoning: "" }), null);
+  const tree = C.proseTree("before\n```rust\nfn a() {}\n\nfn b() {}\n```\nafter");
+  const pre = tree.find((b) => b.type === "pre");
+  assert.equal(C.codeCopyText(pre), "fn a() {}\n\nfn b() {}");
+  assert.equal(C.codeCopyText(tree[0]), null);
+  assert.equal(C.codeCopyText(null), null);
+});
+
+test("toolCommandCopy: the bash command, a file tool's path, else the arguments as pretty JSON", () => {
+  assert.deepEqual(C.toolCommandCopy({ name: "bash", args: { command: "ls -la | wc -l" } }), { text: "ls -la | wc -l", what: "Command" });
+  assert.deepEqual(C.toolCommandCopy({ name: "read", args: { path: "src/a.rs", start: 1 } }), { text: "src/a.rs", what: "Path" });
+  assert.deepEqual(C.toolCommandCopy({ name: "edit", args: { file_path: "/w/x" } }), { text: "/w/x", what: "Path" });
+  assert.deepEqual(C.toolCommandCopy({ name: "grep", args: { pattern: "a", path: "." } }), { text: '{\n  "pattern": "a",\n  "path": "."\n}', what: "Arguments" });
+  assert.deepEqual(C.toolCommandCopy({ name: "weird", args: "raw text" }), { text: "raw text", what: "Arguments" });
+  assert.deepEqual(C.toolCommandCopy({ name: "bash", args: { cmd: 1 } }), { text: '{\n  "cmd": 1\n}', what: "Arguments" });
+  assert.equal(C.toolCommandCopy({ name: "bash", args: undefined }), null);
+  assert.equal(C.toolCommandCopy({ name: "bash", args: null }), null);
+  assert.equal(C.toolCommandCopy(null), null);
+});
+
+test("toolOutputCopy is all the recorded output, and null when there is none", () => {
+  assert.equal(C.toolOutputCopy({ result: { text: "a\nb\nc" } }), "a\nb\nc");
+  assert.equal(C.toolOutputCopy({ result: { text: "" } }), null);
+  assert.equal(C.toolOutputCopy({ result: null }), null);
+});
+
+test("fullOutputPlan: only a cut output with a stored copy, and the cap is judged from the recorded size", () => {
+  const id = "cd".repeat(32);
+  assert.equal(C.fullOutputPlan({ result: { text: "x", cut: false } }), null);
+  assert.equal(C.fullOutputPlan({ result: { text: "x", cut: true } }), null);
+  assert.equal(C.fullOutputPlan({ result: null }), null);
+  assert.deepEqual(C.fullOutputPlan({ result: { text: "x", cut: true, output: { id, bytes: 128000, lines: 5000 } } }), { blob: id, bytes: 128000, tooBig: false });
+  assert.equal(C.fullOutputPlan({ result: { text: "x", cut: true, output: { id, bytes: C.COPY_FULL_CAP, lines: 5 } } }).tooBig, false);
+  assert.equal(C.fullOutputPlan({ result: { text: "x", cut: true, output: { id, bytes: C.COPY_FULL_CAP + 1, lines: 5 } } }).tooBig, true);
+  // a view of another blob: its size is not the output's, so it is found out when it is read
+  assert.deepEqual(C.fullOutputPlan({ result: { text: "x", cut: true, output: { id: "ef".repeat(32), bytes: 9, lines: 1 }, meta: { of_blob: id } } }), { blob: id, bytes: null, tooBig: false });
+  assert.equal(C.rawUrl("a b"), "/api/blobs/a%20b/raw");
+  assert.match(C.COPY_FULL_BIG, /2 MiB/);
+});
+
+test("viewerLinesCopy: the loaded lines, or the whole lines the selection touches, without numbers", () => {
+  const v = { first: 10, lines: ["ten", "eleven", "twelve", "thirteen"] };
+  assert.deepEqual(C.viewerLinesCopy(v, null), { text: "ten\neleven\ntwelve\nthirteen", from: 10, to: 13, count: 4, selected: false });
+  assert.deepEqual(C.viewerLinesCopy(v, { from: 11, to: 12 }), { text: "eleven\ntwelve", from: 11, to: 12, count: 2, selected: true });
+  assert.deepEqual(C.viewerLinesCopy(v, { from: 12, to: 11 }), { text: "eleven\ntwelve", from: 11, to: 12, count: 2, selected: true });
+  assert.deepEqual(C.viewerLinesCopy(v, { from: 12, to: 99 }), { text: "twelve\nthirteen", from: 12, to: 13, count: 2, selected: true });
+  assert.equal(C.viewerLinesCopy(v, { from: 40, to: 50 }).selected, false);
+  assert.equal(C.viewerLinesCopy({ first: 1, lines: [] }, null), null);
+  assert.equal(C.viewerLinesCopy(null, null), null);
+  assert.equal(C.viewerLinesWords(C.viewerLinesCopy(v, { from: 11, to: 12 })), "Copied the selected lines: lines 11–12.");
+  assert.equal(C.viewerLinesWords(C.viewerLinesCopy(v, null)), "Copied the loaded lines: lines 10–13.");
+});
+
+test("evidence and inbox copy texts", () => {
+  assert.equal(C.quoteCopyText({ quote: "full: None," }), "full: None,");
+  assert.equal(C.quoteCopyText({ quote: "" }), null);
+  assert.equal(C.inboxCopyText({ text: "Which branch?" }), "Which branch?");
+  assert.equal(C.inboxCopyText({}), null);
+});
+
+test("copy words say what happened and how to finish by hand", () => {
+  assert.equal(C.copiedChars(1), "Copied 1 character");
+  assert.equal(C.copiedChars(1204), "Copied 1,204 characters");
+  assert.equal(C.copyWords("Reply", "clipboard"), "Reply copied");
+  assert.equal(C.copyWords("Reply", "command"), "Reply copied");
+  assert.equal(C.copyWords("Session id", "selected"), "Session id selected; press Ctrl+C to copy it");
+  assert.equal(C.copyWords("Session id", "selected", true), "Session id selected; press Cmd+C to copy it");
+  assert.equal(C.copyWords("Reply", "none"), "Could not copy reply; select it and press Ctrl+C");
+});
+
+test("copyOnSelectDecision copies only an enabled, new, non-empty selection inside the record, never while typing", () => {
+  const base = { enabled: true, text: "abc", scoped: true, typing: false, same: false };
+  assert.equal(C.copyOnSelectDecision(base), "copy");
+  assert.equal(C.copyOnSelectDecision({ ...base, enabled: false }), "off");
+  assert.equal(C.copyOnSelectDecision({ ...base, typing: true }), "typing");
+  assert.equal(C.copyOnSelectDecision({ ...base, text: "" }), "empty");
+  assert.equal(C.copyOnSelectDecision({ ...base, text: " \n " }), "empty");
+  assert.equal(C.copyOnSelectDecision({ ...base, text: null }), "empty");
+  assert.equal(C.copyOnSelectDecision({ ...base, scoped: false }), "outside");
+  assert.equal(C.copyOnSelectDecision({ ...base, same: true }), "same");
+  // off wins over everything, so nothing is read or said while the preference is off
+  assert.equal(C.copyOnSelectDecision({ enabled: false, text: "", scoped: false, typing: true, same: true }), "off");
+  // typing wins over an empty or foreign selection: the composer is never touched
+  assert.equal(C.copyOnSelectDecision({ ...base, typing: true, scoped: false, text: "" }), "typing");
+});
+
+test("app.js copies only from a user gesture and only through copyText", () => {
+  const app = stripComments(readFileSync(join(here, "app.js"), "utf8"));
+  assert.equal([...app.matchAll(/navigator\.clipboard/g)].length, 1, "one clipboard call, inside copyText");
+  assert.equal([...app.matchAll(/execCommand\("copy"\)/g)].length, 1, "one command fallback, inside copyText");
+  assert.ok(!/execCommand\("(cut|paste)"\)/.test(app));
+  assert.ok(app.includes('"loom_copy_on_select"'));
+});

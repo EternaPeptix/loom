@@ -69,6 +69,7 @@ const S = {
   net: [],
   netError: null,
   viewer: null,
+  copyOnSelect: false, // the "Copy on select" preference (localStorage, off until turned on)
   files: null, // the Files tab of the open session (C.createFilesState + its DOM), made on first need
   liveEl: null,
   now: Date.now(),
@@ -171,7 +172,10 @@ function prose(text) {
     for (const part of parts) target.append(part.type === "text" ? document.createTextNode(part.text) : el(part.type, "", part.text));
   };
   for (const block of C.proseTree(text)) {
-    if (block.type === "pre") root.append(add(el("pre", "out"), el("code", "", block.text)));
+    if (block.type === "pre") {
+      const pre = add(el("pre", "out"), el("code", "", block.text));
+      root.append(add(el("div", "codeblock reveal-copy"), pre, copyButton("Copy code", () => C.codeCopyText(block), { what: "Code", source: pre })));
+    }
     else if (block.type === "ul" || block.type === "ol") {
       const list = el(block.type);
       for (const item of block.items) { const li = el("li"); inline(li, item); list.append(li); }
@@ -1043,6 +1047,132 @@ function renderIdentity(info) {
   renderBar(info, chips);
 }
 
+// ---------------------------------------------------------------------------------------------
+// Copying. Every copy is a user's click or key; nothing copies on load or on arrival.
+
+/** Say something about a copy where a screen reader hears it and, for a failure, where the operator sees it. */
+function announceCopy(text, failed = false) {
+  if (failed) { toast(text); return; }
+  const live = $("copy-live");
+  live.textContent = "";
+  setTimeout(() => { live.textContent = text; }, 30);
+}
+
+function selectContents(node) {
+  const range = document.createRange();
+  range.selectNodeContents(node);
+  const selection = getSelection();
+  selection.removeAllRanges();
+  selection.addRange(range);
+}
+
+/** The browser's own copy command on the current selection; false when it is not offered or refuses. */
+function commandCopy() {
+  try { return document.execCommand("copy"); } catch { return false; }
+}
+
+/**
+ * The one way text reaches the clipboard: `navigator.clipboard.writeText`, else the text is selected and copied with the
+ * browser's own copy command, else it stays selected for Ctrl+C. `source` is a visible element (or a function that makes
+ * one) holding exactly `text`, or "selection" to copy what is already selected without touching it; with none, the text goes
+ * through a scratch field that is removed again. `say(text, failed)` receives the words; `copied` replaces the success words.
+ * Returns "clipboard", "command", "selected" or "none".
+ */
+async function copyText(text, { label = "Text", source = null, say = announceCopy, copied = "" } = {}) {
+  const done = (how) => {
+    const ok = how === "clipboard" || how === "command";
+    say(ok && copied ? copied : C.copyWords(label, how, MAC), !ok);
+    return how;
+  };
+  try {
+    const clipboard = navigator.clipboard;
+    if (clipboard && clipboard.writeText) {
+      await clipboard.writeText(text);
+      return done("clipboard");
+    }
+  } catch {
+    // refused (no focus, no permission, or not offered): fall through to the selection
+  }
+  const asked = typeof source === "function" ? source() : source;
+  if (asked === "selection") {
+    return done(commandCopy() ? "command" : "none");
+  }
+  const before = document.activeElement;
+  const scratch = asked ? null : el("textarea", "copy-scratch");
+  if (scratch) {
+    scratch.value = text;
+    scratch.readOnly = true;
+    scratch.setAttribute("aria-hidden", "true");
+    scratch.tabIndex = -1;
+    // Inside the open dialog when there is one: the page behind a modal dialog is inert and cannot be selected.
+    (document.querySelector("dialog[open]") || document.body).append(scratch);
+    scratch.select();
+  } else selectContents(asked);
+  const ok = commandCopy();
+  // What was selected only to be copied is let go again once it has been; kept only when it is the way to copy by hand.
+  if (ok && !scratch) getSelection().removeAllRanges();
+  if (scratch) {
+    scratch.remove();
+    if (before && before.focus) before.focus({ preventScroll: true });
+  }
+  return done(ok ? "command" : asked ? "selected" : "none");
+}
+
+/** Show "Copied" in a button for a moment, then put back what it held. */
+function flashCopied(button) {
+  const saved = [...button.childNodes];
+  const token = String(Date.now() + Math.random());
+  button.dataset.flash = token;
+  button.classList.add("done");
+  button.replaceChildren(icon("check"), document.createTextNode("Copied"));
+  setTimeout(() => {
+    if (button.dataset.flash !== token) return;
+    delete button.dataset.flash;
+    button.classList.remove("done");
+    button.replaceChildren(...saved);
+  }, 1500);
+}
+
+/**
+ * A copy button: the copy drawing, an accessible name and a tooltip; with `text` the name is also shown beside the drawing.
+ * `getText` returns the text (or a promise of it, or null when there is nothing), and may throw a sentence to be said.
+ * `what` names what was copied for the confirmation. `key` lets focus find the button again after a live update.
+ */
+function copyButton(label, getText, { what = "Text", text = false, source = null, say = announceCopy, key = null, tip = "", busy = "" } = {}) {
+  const b = el("button", "btn small copy-btn " + (text ? "with-icon" : "icon-only"));
+  b.type = "button";
+  b.setAttribute("aria-label", label);
+  b.title = tip || label;
+  if (key) b.dataset.focusKey = key;
+  b.append(icon("copy"));
+  if (text) b.append(document.createTextNode(label));
+  b.addEventListener("click", async () => {
+    if (b.getAttribute("aria-busy") === "true") return;
+    let value;
+    if (busy) {
+      b.setAttribute("aria-busy", "true");
+      b.replaceChildren(icon("refresh"), document.createTextNode(busy));
+    }
+    const rest = () => {
+      if (!busy) return;
+      b.removeAttribute("aria-busy");
+      b.replaceChildren(icon("copy"), ...(text ? [document.createTextNode(label)] : []));
+    };
+    try {
+      value = await getText();
+    } catch (e) {
+      rest();
+      say(e.message, true);
+      return;
+    }
+    rest();
+    if (value === null || value === undefined || value === "") { say("Nothing to copy", true); return; }
+    const how = await copyText(value, { label: what, source, say });
+    if (how === "clipboard" || how === "command") flashCopied(b);
+  });
+  return b;
+}
+
 async function copySessionId() {
   const id = $("s-id");
   const full = id.dataset.full;
@@ -1055,29 +1185,20 @@ async function copySessionId() {
     say("");
     want("header");
   }, ms);
-  const done = (label, ms) => {
-    id.dataset.copying = full;
-    chipContent(id, icon("check"), document.createTextNode(label));
-    finish(ms);
-  };
-  try {
-    await navigator.clipboard.writeText(full);
-    if (id.dataset.full !== full) return; // another session was opened while the clipboard answered
-    say("Session id copied");
-    done("Copied", 1500);
-  } catch {
-    if (id.dataset.full !== full) return;
-    // No clipboard access: show the whole id selected, to be copied by hand.
+  // No clipboard access: the whole id is shown selected, to be copied by hand.
+  const show = () => {
+    if (id.dataset.full !== full) return null;
     id.dataset.copying = full;
     chipContent(id, document.createTextNode(full));
-    const range = document.createRange();
-    range.selectNodeContents(id);
-    const selection = getSelection();
-    selection.removeAllRanges();
-    selection.addRange(range);
-    say("Session id selected; press Ctrl+C or Cmd+C to copy it");
-    finish(6000);
-  }
+    return id;
+  };
+  const how = await copyText(full, { label: "Session id", source: show, say });
+  if (id.dataset.full !== full) return; // another session was opened while the clipboard answered
+  if (how === "clipboard" || how === "command") {
+    id.dataset.copying = full;
+    chipContent(id, icon("check"), document.createTextNode("Copied"));
+    finish(1500);
+  } else finish(6000);
 }
 
 function renderHeader() {
@@ -1574,7 +1695,12 @@ function evidenceCard(evidence) {
   const standing = C.evidenceStanding(evidence);
   card.append(add(el("div", "chips"),
     chip(standing.quote.text, standing.quote.tone, standing.quote.icon), chip(standing.direction.text, standing.direction.tone), chip(evidence.kind, "dim")));
-  if (evidence.quote) card.append(textBox(evidence.quote, "txt out"));
+  let copyQuote = null;
+  if (evidence.quote) {
+    const quote = textBox(evidence.quote, "txt out");
+    card.append(quote);
+    copyQuote = copyButton("Copy quote", () => C.quoteCopyText(evidence), { what: "Quote", text: true, source: quote, key: "copy-quote:" + evidence.id });
+  }
   const producer = evidence.session ? S.sessions.byId.get(evidence.session) : null;
   const tool = evidence.session === S.openId ? S.rec?.calls.get(evidence.call_id)?.name : null;
   const from = el("span", "dim ev-from");
@@ -1591,9 +1717,9 @@ function evidenceCard(evidence) {
     }, e.currentTarget));
     add(source, icon("source"), document.createTextNode(evidence.range ? "Open source at " + evidence.lines : "Open stored source"));
     source.dataset.focusKey = "evidence:" + evidence.id;
-    card.append(add(el("div", "ev-source"), source, evidence.session ? from : null));
+    card.append(add(el("div", "ev-source"), source, copyQuote, evidence.session ? from : null));
   } else {
-    card.append(add(el("div", "ev-source"), el("span", "dim", "No stored source is attached to this item."), evidence.session ? from : null));
+    card.append(add(el("div", "ev-source"), el("span", "dim", "No stored source is attached to this item."), copyQuote, evidence.session ? from : null));
   }
   if (evidence.note) card.append(el("p", "ev-note", evidence.note));
   return card;
@@ -1629,7 +1755,9 @@ function buildBlock(b, ctx = {}) {
   switch (b.kind) {
     case "user": {
       if (b.author !== "user") add(root, el("div", "label", C.authorLabel(b.author)));
-      add(root, textBox(b.text, "txt bubble"));
+      const bubble = textBox(b.text, "txt bubble");
+      root.classList.add("reveal-copy");
+      add(root, bubble, copyButton("Copy message", () => C.messageCopyText(b), { what: "Message", source: bubble, key: "copy-msg:" + b.id }));
       break;
     }
     case "note": {
@@ -1654,7 +1782,8 @@ function buildBlock(b, ctx = {}) {
         const sum = el("summary", "", thought || "Thought");
         sum.dataset.focusKey = "thought:" + b.id;
         remembered(d, b, "thought");
-        add(d, sum, textBox(b.reasoning));
+        const thinking = textBox(b.reasoning);
+        add(d, sum, add(el("div", "copy-row"), copyButton("Copy reasoning", () => C.reasoningCopyText(b), { what: "Reasoning", text: true, source: thinking, key: "copy-thought:" + b.id })), thinking);
         add(root, d);
       }
       if (b.text) {
@@ -1668,8 +1797,14 @@ function buildBlock(b, ctx = {}) {
       }
       for (const n of b.cutCalls) add(root, el("div", "warn", `The reply was cut inside a call to ${n}; the call was not run.`));
       if (b.warning) add(root, el("div", b.warning.level === "bad" ? "bad" : "warn", b.warning.text));
-      const foot = el("div", "foot", C.replyMeta(b, ctx.differs && ctx.model ? ctx.model.profile : "") || b.footer);
-      foot.title = b.footer;
+      const foot = el("div", "foot");
+      const meta = el("span", "foot-text", C.replyMeta(b, ctx.differs && ctx.model ? ctx.model.profile : "") || b.footer);
+      meta.title = b.footer;
+      add(foot, meta);
+      if (C.replyCopyText(b) !== null) {
+        root.classList.add("reveal-copy");
+        add(foot, copyButton("Copy reply", () => C.replyCopyText(b), { what: "Reply", key: "copy-reply:" + b.id, tip: "Copy the reply's exact text, as the raw response shows it." }));
+      }
       add(root, foot);
       break;
     }
@@ -1797,7 +1932,7 @@ function buildTool(root, b) {
   add(root, head);
   if (!open) return;
   const body = el("div", "tbody");
-  add(body, toolOpenRow(b));
+  add(body, toolOpenRow(b), toolCopyRow(b));
   if (b.args !== undefined && b.args !== null) {
     add(body, keyed(btn(b.ui.args ? "hide args" : "args", "link", () => {
       b.ui.args = !b.ui.args;
@@ -1821,6 +1956,50 @@ function buildTool(root, b) {
     add(body, el("div", "tnote", "running…"));
   }
   add(root, body);
+}
+
+/** The copy buttons of an open tool row: its command (or path, or arguments), its recorded output, and the full stored output. */
+function toolCopyRow(b) {
+  const command = C.toolCommandCopy(b);
+  const output = C.toolOutputCopy(b);
+  const plan = C.fullOutputPlan(b);
+  if (!command && output === null && !plan) return null;
+  const row = el("div", "copy-row");
+  if (command) add(row, copyButton("Copy command", () => command.text, { what: command.what, text: true, key: "copy-cmd:" + b.id, tip: `Copy this call's ${command.what.toLowerCase()}.` }));
+  if (output !== null) add(row, copyButton("Copy output", () => output, { what: "Output", text: true, key: "copy-out:" + b.id, tip: "Copy the output recorded in this row: every line the model was shown, not only the folded part." }));
+  if (plan) {
+    add(row, copyButton("Copy full output…", async () => {
+      if (plan.tooBig) throw new Error(C.COPY_FULL_BIG);
+      return fetchStoredText(plan.blob);
+    }, { what: "Full output", text: true, key: "copy-full:" + b.id, busy: "Fetching…", tip: "Fetch the whole stored output (up to 2 MiB) and copy it." }));
+  }
+  return row;
+}
+
+/** The whole stored output as text, read through the blob route; refused above the copy cap without keeping it. */
+async function fetchStoredText(blob) {
+  const r = await fetch(C.rawUrl(blob), { credentials: "omit", headers: authHeaders() });
+  if (r.status === 401) { lost(); throw new Error(C.LOST_TOKEN); }
+  if (!r.ok) throw new Error(C.errorSentence(r.status, await r.text()));
+  const length = Number(r.headers.get("content-length"));
+  if (length > C.COPY_FULL_CAP) { if (r.body) r.body.cancel().catch(() => {}); throw new Error(C.COPY_FULL_BIG); }
+  if (!r.body || !r.body.getReader) {
+    const text = await r.text();
+    if (new TextEncoder().encode(text).length > C.COPY_FULL_CAP) throw new Error(C.COPY_FULL_BIG);
+    return text;
+  }
+  const reader = r.body.getReader();
+  const chunks = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.length;
+    if (total > C.COPY_FULL_CAP) { reader.cancel().catch(() => {}); throw new Error(C.COPY_FULL_BIG); }
+    chunks.push(value);
+  }
+  const decoder = new TextDecoder();
+  return chunks.map((c) => decoder.decode(c, { stream: true })).join("") + decoder.decode();
 }
 
 // ---- the chat: items (blocks, work groups, model chips) reconciled into #blocks
@@ -2267,7 +2446,9 @@ function inboxCard(entry, resolved, context = "inbox") {
     add(h, add(el("span", "dim"), document.createTextNode(result ? "" : "asked "), time,
       document.createTextNode(result || !asker ? "" : asker.parent ? " by an agent" : C.rootNoun(asker) === "lead" ? " by the lead" : "")));
   }
-  add(card, h, textBox(item.text, "txt prose-text item-text"));
+  const itemText = textBox(item.text, "txt prose-text item-text");
+  const copyItem = copyButton("Copy text", () => C.inboxCopyText(item), { what: "Request text", text: true, source: itemText, key: "copy-item:" + context + ":" + item.item_id });
+  add(card, h, itemText, add(el("div", "copy-row"), copyItem));
   if (resolved) {
     const given = el("div", "given");
     // A scope request the operator approved is not "Dismissed": the hosts were granted first.
@@ -3264,7 +3445,74 @@ function renderSessionTab(p, info) {
     }
     row("agents", d);
   }
-  p.replaceChildren(kv);
+  const pref = el("div", "copy-pref");
+  const label = el("label", "check");
+  const box = el("input");
+  box.type = "checkbox";
+  box.id = "copy-on-select";
+  box.checked = S.copyOnSelect;
+  box.setAttribute("aria-describedby", "copy-on-select-note");
+  box.addEventListener("change", () => setCopyOnSelect(box.checked));
+  add(label, box, document.createTextNode(" Copy on select"));
+  add(pref, label, el("p", "dim", "Off by default. When on, text you select in the chat, a tool output or the viewer is copied as you let go of the mouse or key, and a short note says how much. Nothing is copied while you type in a field."));
+  pref.lastChild.id = "copy-on-select-note";
+  p.replaceChildren(kv, pref);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Copy on select: a preference kept in this browser, off until the operator turns it on.
+
+const COPY_SELECT_KEY = "loom_copy_on_select";
+
+function storedCopyOnSelect() {
+  try { return localStorage.getItem(COPY_SELECT_KEY) === "1"; } catch { return false; }
+}
+
+function setCopyOnSelect(on) {
+  S.copyOnSelect = !!on;
+  lastCopiedSelection = null;
+  try {
+    if (on) localStorage.setItem(COPY_SELECT_KEY, "1");
+    else localStorage.removeItem(COPY_SELECT_KEY);
+  } catch {
+    // storage is blocked: the choice holds for this page load only
+  }
+  for (const box of document.querySelectorAll("#copy-on-select")) box.checked = S.copyOnSelect;
+  announceCopy(S.copyOnSelect ? "Copy on select is on" : "Copy on select is off");
+}
+
+let lastCopiedSelection = null; // where the last copied selection was, so the same one is not copied twice
+let selectTimer = 0;
+
+/** A mouse or key gesture ended: copy what is selected when the preference, the place and the focus allow it. */
+function copySelection() {
+  if (!S.copyOnSelect) return;
+  clearTimeout(selectTimer);
+  // The selection settles just after the event (a double click selects a word on its second press).
+  selectTimer = setTimeout(async () => {
+    if (!S.copyOnSelect) return;
+    const selection = getSelection();
+    const range = selection && selection.rangeCount ? selection.getRangeAt(0) : null;
+    const text = selection ? String(selection) : "";
+    const scoped = !!range && ["blocks", "viewer-text"].some((id) => $(id).contains(range.commonAncestorContainer));
+    const same = !!range && !!lastCopiedSelection && lastCopiedSelection.text === text
+      && lastCopiedSelection.sc === range.startContainer && lastCopiedSelection.so === range.startOffset
+      && lastCopiedSelection.ec === range.endContainer && lastCopiedSelection.eo === range.endOffset;
+    const decision = C.copyOnSelectDecision({ enabled: S.copyOnSelect, text, scoped, typing: C.typingTarget(document.activeElement), same });
+    if (decision === "empty") lastCopiedSelection = null;
+    if (decision !== "copy") return;
+    const mark = { text, sc: range.startContainer, so: range.startOffset, ec: range.endContainer, eo: range.endOffset };
+    const inViewer = $("viewer").open;
+    // The selection is already on the page, so the copy command takes it as it is; nothing is moved or reselected.
+    const how = await copyText(text, {
+      label: "Selection", source: "selection",
+      say: (words, failed) => { if (inViewer) viewerStatus(words); else if (failed) toast(words); },
+    });
+    if (how !== "clipboard" && how !== "command") return;
+    lastCopiedSelection = mark;
+    const words = C.copiedChars(text.length);
+    if (inViewer) viewerStatus(words); else toast(words);
+  }, 0);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -3475,15 +3723,44 @@ function viewerFind(delta) {
 async function copyViewerReference() {
   const v = S.viewer;
   if (!v) return;
-  if (v.source.file) {
-    const full = C.joinPath(v.source.file.workspace, v.source.file.path);
-    try { await navigator.clipboard.writeText(full); viewerStatus("Copied path: " + full); }
-    catch { viewerStatus("Copy this path: " + full); }
-    return;
-  }
-  const reference = C.viewerReference(v);
-  try { await navigator.clipboard.writeText(reference); viewerStatus("Copied: " + reference); }
-  catch { viewerStatus("Copy this reference: " + reference); }
+  const button = $("viewer-copy");
+  const [what, text, done, hand] = v.source.file
+    ? ["Path", C.joinPath(v.source.file.workspace, v.source.file.path), "Copied path: ", "Copy this path: "]
+    : ["Reference", C.viewerReference(v), "Copied: ", "Copy this reference: "];
+  const how = await copyText(text, { label: what, say: viewerStatus, copied: done + text });
+  if (how === "clipboard" || how === "command") flashCopied(button);
+  else if (how === "none") viewerStatus(hand + text);
+}
+
+/** The line numbers the selection in the viewer's lines touches ({from, to}), or null when nothing there is selected. */
+function viewerSelection() {
+  const selection = getSelection();
+  const root = $("viewer-text");
+  if (!selection || selection.isCollapsed || !selection.rangeCount) return null;
+  const range = selection.getRangeAt(0);
+  if (!root.contains(range.commonAncestorContainer)) return null;
+  // A boundary in the lines' container itself points between rows: the row after it starts, the row before it ends.
+  const lineAt = (node, offset, end) => {
+    if (node === root) {
+      const row = root.children[end ? Math.max(0, offset - 1) : offset] || root.lastElementChild;
+      return row ? Number(row.dataset.line) : null;
+    }
+    const row = (node.nodeType === 1 ? node : node.parentElement)?.closest(".source-line");
+    return row ? Number(row.dataset.line) : null;
+  };
+  const from = lineAt(range.startContainer, range.startOffset, false);
+  const to = lineAt(range.endContainer, range.endOffset, true);
+  return Number.isFinite(from) && Number.isFinite(to) ? { from, to } : null;
+}
+
+/** "Copy lines": the lines the selection touches, else every loaded line; whole lines, without their numbers. */
+async function copyViewerLines() {
+  const v = S.viewer;
+  if (!v) return;
+  const picked = C.viewerLinesCopy(v, viewerSelection());
+  if (!picked) { viewerStatus("No lines are loaded to copy."); return; }
+  const how = await copyText(picked.text, { label: "Lines", say: viewerStatus, copied: C.viewerLinesWords(picked) });
+  if (how === "clipboard" || how === "command") flashCopied($("viewer-copy-lines"));
 }
 
 function updateDelivery(id) {
@@ -4644,6 +4921,10 @@ $("picker").addEventListener("keydown", pickerEmptyKeys);
   $("viewer-find-next").addEventListener("click", () => viewerFind(1));
   $("viewer-find-prev").addEventListener("click", () => viewerFind(-1));
   $("viewer-copy").addEventListener("click", copyViewerReference);
+  $("viewer-copy-lines").addEventListener("click", copyViewerLines);
+  S.copyOnSelect = storedCopyOnSelect();
+  document.addEventListener("mouseup", copySelection);
+  document.addEventListener("keyup", copySelection);
   // Two fields share the dialog, so the browser submits neither on Enter: each handles its own.
   $("viewer-start").addEventListener("keydown", e => {
     if (e.key === "Enter" && !e.isComposing) { e.preventDefault(); viewerJump(); }

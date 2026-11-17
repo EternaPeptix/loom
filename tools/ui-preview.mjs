@@ -23,6 +23,7 @@ import { dirname, join } from "node:path";
 const ui = join(dirname(fileURLToPath(import.meta.url)), "..", "ui");
 const now = Date.now();
 const blob = "ab".repeat(32);
+const bigBlob = "cd".repeat(32); // a stored output of 3 MiB, over the 2 MiB a copy button fetches
 const clients = new Set();
 const requests = [];
 const logs = new Map();
@@ -205,6 +206,8 @@ append("s-fl-net", "inbox_opened", { ts_ms: now - 9 * MIN, ...inbox.find(e => e.
   t = step("s-tools", t, { command: "sleep 600", status: "timeout", out: "timed out after 120s; the process was killed. Its output so far is stored.", ms: 120000 });
   t = step("s-tools", t, { command: "cargo build --release", status: "interrupted", out: "interrupted: the session was stopped while this ran; its effects are unknown.", ms: 30000 });
   t = step("s-tools", t, { name: "read", cls: "read", args: { path: "big.log", start: 1, end: 200 }, out: lines.slice(0, 200).join("\n"), cut: true, output: { id: blob, bytes: 128000, lines: 5000 }, meta: { shown: [[1, 200]] }, ms: 6 });
+  t = step("s-tools", t, { command: "cat build.log", cut: true, out: "build line 1\nbuild line 2\n[output cut: 3 MiB stored]", output: { id: bigBlob, bytes: 3 * 1024 * 1024, lines: 60000 }, meta: { shown: [[1, 2]] }, ms: 40 });
+  t = step("s-tools", t, { command: "cat build-unsized.log", cut: true, out: "build line 1\n[output cut]", output: { id: bigBlob, lines: 60000 }, meta: { shown: [[1, 1]] }, ms: 40 }); // no recorded size: the length is read from the route
   t = step("s-tools", t, { command: "make test", status: "error", out: "make: *** [test] Error 1", exit: 1 });
   append("s-tools", "turn_end", { ts_ms: t + 1000, reason: "waiting" }, "harness");
 }
@@ -614,6 +617,13 @@ const server = createServer(async (req, res) => {
     if (path.endsWith("/ledger")) return json(res, { state: ledgers.get(decodeURIComponent(path.split("/")[3] || "")) || { entries: 0 }, markdown: "" });
     if (path.endsWith("/window")) return json(res, { est_tokens: 86000, prompt_tokens: 86000, cached_tokens: 84000, epoch: 1, context_window: 1000000, floor_tokens: 180000, target_tokens: 400000, items: [] });
     if (path.endsWith("/net")) return json(res, []);
+    const rawMatch = path.match(/^\/api\/blobs\/([^/]+)\/raw$/);
+    if (rawMatch) {
+      // The whole stored output, as the daemon's blob_raw sends it (an attachment of bytes with a length).
+      const bytes = Buffer.from(decodeURIComponent(rawMatch[1]) === bigBlob ? "x".repeat(3 * 1024 * 1024 - 1) + "\n" : lines.join("\n") + "\n");
+      res.writeHead(200, { "content-type": "application/octet-stream", "content-length": bytes.length, "content-disposition": 'attachment; filename="out-fixture"' });
+      return res.end(bytes);
+    }
     if (path.endsWith("/lines")) {
       const first = Math.max(1, Math.min(lines.length, Number(url.searchParams.get("start") || 1)));
       const last = Math.min(lines.length, first + 4999, Number(url.searchParams.get("end") || first + 999));

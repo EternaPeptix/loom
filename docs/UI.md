@@ -154,7 +154,10 @@ fully loaded sequence seen when leaving are grouped under “New since your last
 ones stay listed below them. Tab-scoped `sessionStorage` holds only the sign-in secret, sequence watermarks (`seen.<id>`), the latest
 record seen per session (`activity.<id>`, which keeps ages across a reload) and the inspector width. The
 switcher, Find, notifications, Agents and the progress line store nothing; message and answer text stays
-in memory.
+in memory. The one thing kept beyond the tab is the **Copy on select** preference: `localStorage` key
+`loom_copy_on_select` (`"1"` when on, absent when off), read and written inside `try`/`catch` so a blocked
+store only means the choice lasts for the page load. loom-desk uses a non-persistent data store, so there
+the preference lasts until the app quits.
 
 Evidence lists claims with their recorded status, source quotes and remaining notes, and can be
 filtered by that status. Each evidence item shows two separate facts: whether its quote matches the
@@ -207,6 +210,67 @@ open their corresponding chat blocks.
   the row or pressing Enter opens its output as before: 24-line clip with show all, the cut note with
   “open full output”, the arguments toggle, "no result recorded" and "running…".
 - The live reply is shown at the bottom as a reply in progress with its model chip.
+
+### Copying
+
+Every copy is the operator's own click or key on a button (or, when the preference is on, the end of a
+selection gesture). Nothing copies on load, on arrival of a record, or on focus.
+
+One function, `copyText(text, {label, source, say, copied})` in `app.js`, puts text on the clipboard:
+`navigator.clipboard.writeText` when it is offered and allowed; otherwise the text is selected (the visible
+element that holds it, or a scratch field that is removed again) and copied with the browser's copy command;
+otherwise it stays selected and the page says to press Ctrl+C or Cmd+C. The session-id chip uses the same
+function, so there is one fallback, not two. On success the button swaps to a check and "Copied" for
+1.5 seconds and a polite live region (`#copy-live`, or the viewer's own status line while the dialog is
+open, since the page behind a modal dialog is inert) says "<what> copied". A failure is said in the toast
+(or the viewer status) with how to finish by hand. What each button copies is decided in `core.js` and tested
+there: nothing hidden, nothing the button does not name.
+
+| Where | Button | Copies |
+| --- | --- | --- |
+| Model reply (footer) | Copy reply | the exact raw text, the same text Raw response shows |
+| Fenced code in a reply | Copy code | that block's text, without the fence lines |
+| Operator or agent message | Copy message | the message as written |
+| Open Thought | Copy reasoning | the recorded reasoning |
+| Open tool row | Copy command | bash: the command; file tools: the path; others: the arguments as pretty JSON |
+| Open tool row | Copy output | the output the row records (all the lines the model was shown, not only the folded 24) |
+| Open tool row, output cut | Copy full output… | the whole stored output, fetched from `/api/blobs/{handle}/raw` |
+| Stored-output or file viewer | Copy lines | the lines the selection touches, else every loaded line; whole lines, no numbers |
+| Stored-output viewer | Copy reference | the citation line (unchanged) |
+| File viewer | Copy path | the absolute path (unchanged) |
+| Inbox card | Copy text | the request text |
+| Evidence card | Copy quote | the quote |
+
+The reply, code and message buttons are icon buttons (the template's copy drawing) with an accessible
+name and a tooltip. They are quiet until the pointer is over their block or focus is inside it, are
+fully visible on focus, and are always visible when the device has no hover or a coarse pointer, where
+every copy button is 44 px. The others sit in a row inside the thing they copy (an expanded tool row, an
+opened Thought, a card), with the name beside the drawing. Copy buttons are `user-select: none`, so a
+selection that spans one never picks up its label.
+
+**Copy full output…** reads the recorded size first and refuses without fetching when it exceeds 2 MiB;
+when no size is recorded it reads the route's `Content-Length`, and a body with none is cut off as soon as
+it passes the cap. The refusal says to open the full output and use Copy lines. While it fetches, the button
+says "Fetching…" and is `aria-busy`; focus stays on it.
+
+**Copy on select** is a checkbox at the foot of the inspector's Session tab, off by default. When on, a
+`mouseup` or `keyup` that leaves a non-empty selection wholly inside the chat or the viewer's lines (a tool
+output is part of the chat; the Files viewer is the same dialog) copies it with the browser's copy command
+or the clipboard API, without moving the selection, and says "Copied N characters" in the toast (the viewer's
+status line while the dialog is open). Never: while a text field or the composer has focus, for a selection
+inside a field, for one that is not wholly in those places, or twice for the same selection (the same text
+between the same two points; deselecting or selecting something else starts over). The decision is
+`copyOnSelectDecision` in `core.js`; with the preference off no selection is read.
+
+**loom-desk.** The web pane is a plain `WKWebView` on a loopback `http` origin with a non-persistent data
+store, and `WebPane.swift` injects no script and sets no preference, so the page's own clipboard calls are
+what run. Checked with a stand-alone `WKWebView` configured the same way (non-persistent store, `http://127.0.0.1`
+page): `isSecureContext` is true, `navigator.clipboard.writeText` is present and resolves, and
+`document.execCommand("copy")` is supported and returns true. That probe ran page script from the app,
+not a real click inside loom-desk, so what is confirmed is that the API is offered and allowed; the fallback
+(selection plus the copy command, then selected-for-Ctrl+C) is there for a build that refuses. The CSP needs no
+change (neither call is a script, style or request), and the purity tests allow exactly one clipboard use and one
+copy command, both inside `copyText`. No Swift change was needed.
 
 ## Drafts, submissions and updates
 
@@ -319,7 +383,7 @@ the role is `lead`, the only form role that starts agents.
 Use a native modal dialog with an accessible title, focus containment, Escape dismissal and focus
 restoration, including when a live update replaces the original source button. The viewer shows
 snapshot identity, producing session/call when available, numbered lines and highlighted citations.
-It supports paging in both directions, Go to line, copying the source reference, and literal Find
+It supports paging in both directions, Go to line, copying the source reference or the lines (see Copying), and literal Find
 in displayed lines. Search is explicitly limited to the loaded range; it does not claim to search
 an entire unseen blob. Jumping to another line updates the copied citation. Loading an old range
 cannot overwrite a newly opened source dialog.
@@ -369,6 +433,13 @@ as `delta` frames, then the `model_response`, `tool_call` and `tool_result` reco
 reply, the running work group and its ticking label can be exercised. A model switch on the ended
 session is refused with the daemon's sentence (409). `GET /__fixture/state` lists only
 synthetic submission receipts.
+
+The copy buttons add to the fixture `GET /api/blobs/{handle}/raw` (the whole stored output with its length) and two
+`bash` rows in `s-tools` over a 3 MiB stored output, one with its size recorded and one without, to reach both
+refusals of Copy full output…. Check every button, keyboard only (Tab to it, Enter or Space), with Copy on select
+off and on, in light and dark and at 320 px. The browser pane refuses `navigator.clipboard.writeText` ("Write
+permission denied"), which exercises the fallback; to see the clipboard path, replace `navigator.clipboard.writeText`
+with a recorder in the console.
 
 Pass 2 adds to the fixture: `GET /api/missions/{id}/score`, a mission of about 12 agents at mixed phases
 and depth 3, a parked item on `necromicon` with a recorded error, a running session whose last record is

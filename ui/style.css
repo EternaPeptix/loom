@@ -299,7 +299,7 @@ input:focus-visible, select:focus-visible, textarea:focus-visible, button:focus-
 /* A reply with text has no bubble; it reads as prose. */
 .block.response { padding: 2px 0; }
 .block.response .txt { color: var(--fg); }
-.foot { font-size: 12px; color: var(--caption); margin-top: 4px; font-variant-numeric: tabular-nums; }
+.foot { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--caption); margin-top: 4px; font-variant-numeric: tabular-nums; }
 .warn { color: var(--warn); }
 .bad { color: var(--bad); }
 .okc { color: var(--ok); }
@@ -723,10 +723,11 @@ button.id-chip:hover { background: var(--bg-3); border-color: var(--line-2); }
   .form-row { flex-direction: column; }
   .vhead { gap: 7px; }
   .viewer { width: calc(100vw - 16px); height: calc(100vh - 24px); height: calc(100dvh - 24px); }
-  /* Title and the two buttons share a row; the loaded range goes under them. */
-  .viewer .vhead { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; padding: 10px; }
+  /* The title and the loaded range take a row each; the three buttons share the one below and wrap if they must. */
+  .viewer .vhead { padding: 10px; }
   .viewer .vhead .spacer { display: none; }
-  .viewer .vhead > .dim { grid-column: 1 / -1; grid-row: 2; }
+  .viewer .vhead h2, .viewer .vhead > .dim { flex: 1 1 100%; }
+  .viewer .vhead .btn { padding-inline: 8px; }
   .viewer-controls { gap: 8px; padding: 10px; }
   .viewer-controls .viewer-search { flex-basis: 100%; margin-left: 0; }
   .viewer-find-count { flex: 1 1 auto; text-align: left; }
@@ -984,3 +985,36 @@ kbd { display: inline-block; min-width: 1.6em; padding: 0 5px; border: 1px solid
   .picker-body { overflow: auto; }
   .picker-body > .dir-list { flex: 0 0 auto; min-height: 180px; max-height: 60vh; }
 }
+
+/* ---- copy buttons: the copy drawing with a name and a tooltip; text is never taken from them when text is selected ---- */
+.copy-btn { user-select: none; -webkit-user-select: none; }
+.copy-btn .icon { width: 14px; height: 14px; stroke-width: 1.2; }
+.copy-btn.icon-only { display: inline-flex; align-items: center; justify-content: center; gap: 5px; min-width: 26px; padding: 3px 5px; background: transparent; border-color: transparent; color: var(--caption); }
+.copy-btn.icon-only:hover, .copy-btn.icon-only:focus-visible, .copy-btn.icon-only.done { background: var(--bg-3); border-color: var(--line); color: var(--fg); }
+.copy-btn.done { color: var(--ok); }
+.copy-btn[aria-busy="true"] { cursor: progress; }
+/* Over a reply, a code block or a message the button is quiet until the pointer or the keyboard comes near. Touch always shows it. */
+.reveal-copy .copy-btn.icon-only { opacity: 0; }
+.reveal-copy:hover .copy-btn.icon-only, .reveal-copy:focus-within .copy-btn.icon-only, .reveal-copy .copy-btn.icon-only:focus-visible, .reveal-copy .copy-btn.icon-only.done { opacity: 1; }
+@media (hover: none), (pointer: coarse) {
+  .reveal-copy .copy-btn.icon-only { opacity: 1; }
+}
+.codeblock { position: relative; margin: 0 0 12px; }
+.codeblock > pre { margin: 0; padding-right: 40px; }
+.codeblock > .copy-btn { position: absolute; top: 4px; right: 4px; }
+.block.user.reveal-copy { position: relative; }
+.block.user > .copy-btn { position: absolute; top: 50%; right: 100%; margin-right: 4px; transform: translateY(-50%); }
+.foot > .foot-text { min-width: 0; overflow-wrap: anywhere; }
+.copy-row { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0 6px; }
+details.reasoning > .copy-row { margin: 4px 0 2px; }
+.inbox-card > .copy-row { margin: 0; }
+.copy-scratch { position: fixed; top: 0; left: 0; width: 1px; height: 1px; padding: 0; border: 0; opacity: 0; pointer-events: none; }
+.copy-pref { margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--line); }
+.copy-pref label { display: flex; align-items: center; gap: 6px; }
+.copy-pref p { margin: 4px 0 0; font-size: 12px; }
+@media (pointer: coarse) {
+  .copy-btn, .copy-btn.icon-only { min-height: 44px; min-width: 44px; }
+  .copy-pref label { min-height: 44px; }
+}
+.btn.done { display: inline-flex; align-items: center; gap: 6px; }
+.btn.done .icon { width: 14px; height: 14px; stroke-width: 1.2; }

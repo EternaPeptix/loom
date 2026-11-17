@@ -1494,6 +1494,139 @@ export function viewerReference(viewer) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Copying: what each copy button copies, and when copy on select copies. Text only; the page does the clipboard.
+
+/** The most a button fetches from a stored output to copy it (2 MiB); beyond it the viewer's Copy lines is the way. */
+export const COPY_FULL_CAP = 2 * 1024 * 1024;
+export const COPY_FULL_BIG = "This stored output is over 2 MiB, too much to copy in one go. Open the full output and use Copy lines for the part you need.";
+
+/** Where a whole stored output is read from. */
+export function rawUrl(blob) {
+  return `/api/blobs/${encodeURIComponent(blob)}/raw`;
+}
+
+const copyText = (value) => (typeof value === "string" && value !== "" ? value : null);
+
+/** "Copy reply": the exact raw text of a model reply, the same text the raw response shows. Null when it has none. */
+export function replyCopyText(block) {
+  return block && block.kind === "response" ? copyText(block.text) : null;
+}
+/** "Copy message": an operator or agent message as it was written. */
+export function messageCopyText(block) {
+  return block && block.kind === "user" ? copyText(block.text) : null;
+}
+/** "Copy reasoning": the reasoning of a reply, as recorded. */
+export function reasoningCopyText(block) {
+  return block && block.kind === "response" ? copyText(block.reasoning) : null;
+}
+/** "Copy code": one fenced block of a reply (a `pre` of proseTree), without its fence lines. */
+export function codeCopyText(codeBlock) {
+  return codeBlock && codeBlock.type === "pre" ? copyText(codeBlock.text) : null;
+}
+
+/**
+ * "Copy command" of a tool call: the command for bash, the path for the file tools, otherwise the arguments as pretty JSON.
+ * Returns {text, what} (`what` names it for the confirmation) or null when the call has no arguments.
+ */
+export function toolCommandCopy(block) {
+  if (!block || block.args === undefined || block.args === null) return null;
+  const args = block.args;
+  if (typeof args === "string") return args === "" ? null : { text: args, what: "Arguments" };
+  if (typeof args === "object" && !Array.isArray(args)) {
+    if (block.name === "bash" && typeof args.command === "string" && args.command !== "") return { text: args.command, what: "Command" };
+    if (FILE_TOOLS.has(block.name)) {
+      const path = toolPathArg(args);
+      if (path !== null) return { text: path, what: "Path" };
+    }
+  }
+  let json;
+  try { json = JSON.stringify(args, null, 2); } catch { json = String(args); }
+  return copyText(json) === null ? null : { text: json, what: "Arguments" };
+}
+
+/** "Copy output": the output the row records (what the model was shown), all of it and not only the folded lines. */
+export function toolOutputCopy(block) {
+  return block && block.result ? copyText(block.result.text) : null;
+}
+
+/**
+ * "Copy full output…": null when the output was not cut or has no stored copy; else {blob, bytes, tooBig}. `bytes` is the stored
+ * size when the record says it, and `tooBig` is true when that already exceeds the cap (nothing is fetched then).
+ */
+export function fullOutputPlan(block) {
+  const result = block && block.result;
+  if (!result) return null;
+  const shown = shownOfTotal(result);
+  if (!shown.cut || !shown.blob) return null;
+  const bytes = !shown.ofBlob && result.output && Number.isFinite(result.output.bytes) ? result.output.bytes : null;
+  return { blob: shown.blob, bytes, tooBig: bytes !== null && bytes > COPY_FULL_CAP };
+}
+
+/** "Copy quote" of an evidence card. */
+export function quoteCopyText(evidence) {
+  return evidence ? copyText(evidence.quote) : null;
+}
+/** "Copy text" of an inbox card. */
+export function inboxCopyText(item) {
+  return item ? copyText(item.text) : null;
+}
+
+/**
+ * "Copy lines" of the stored-output or file viewer. `viewer` has `first` (the number of the first loaded line) and `lines` (the
+ * loaded lines' text). `selected` is the {from, to} line numbers the operator's selection touches, or null. Whole lines are
+ * copied, joined by newlines, without line numbers. Returns {text, from, to, count, selected} or null when nothing is loaded.
+ */
+export function viewerLinesCopy(viewer, selected) {
+  const lines = (viewer && viewer.lines) || [];
+  if (!lines.length) return null;
+  const first = viewer.first;
+  const last = first + lines.length - 1;
+  let from = first, to = last, chosen = false;
+  if (selected && Number.isFinite(selected.from) && Number.isFinite(selected.to)) {
+    from = Math.max(first, Math.min(selected.from, selected.to));
+    to = Math.min(last, Math.max(selected.from, selected.to));
+    chosen = from <= to;
+    if (!chosen) { from = first; to = last; }
+  }
+  const text = lines.slice(from - first, to - first + 1).join("\n");
+  return { text, from, to, count: to - from + 1, selected: chosen };
+}
+
+/** What the viewer says after "Copy lines". */
+export function viewerLinesWords(copy) {
+  const range = sourceRangeWords(copy.from, copy.to);
+  return copy.selected ? `Copied the selected lines: ${range}.` : `Copied the loaded lines: ${range}.`;
+}
+
+/** "Copied 1 character" / "Copied 1,204 characters". */
+export function copiedChars(n) {
+  return `Copied ${num(n)} ${n === 1 ? "character" : "characters"}`;
+}
+
+/** What is said when copying finished: `how` is "clipboard" or "command" (done), "selected" (left selected) or "none". */
+export function copyWords(what, how, mac = false) {
+  const keys = mac ? "Cmd+C" : "Ctrl+C";
+  if (how === "clipboard" || how === "command") return `${what} copied`;
+  if (how === "selected") return `${what} selected; press ${keys} to copy it`;
+  return `Could not copy ${what.toLowerCase()}; select it and press ${keys}`;
+}
+
+/**
+ * Whether a selection should be copied now, with copy on select. Returns "copy" or the reason it is not copied:
+ * "off" (the preference), "typing" (a field is focused: never copy while composing or answering), "empty" (nothing, or only
+ * blanks, is selected), "outside" (the selection is not wholly inside the transcript or a viewer), "same" (this very
+ * selection was copied already).
+ */
+export function copyOnSelectDecision({ enabled, text, scoped, typing, same }) {
+  if (!enabled) return "off";
+  if (typing) return "typing";
+  if (typeof text !== "string" || text.trim() === "") return "empty";
+  if (!scoped) return "outside";
+  if (same) return "same";
+  return "copy";
+}
+
+// ---------------------------------------------------------------------------------------------
 // Context view
 
 /** Bar numbers: how full the view is against the window, with marks for floor and target. */

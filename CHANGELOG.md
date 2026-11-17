@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### Web UI: copy buttons and opt-in copy on select
+
+- Copy buttons: Copy reply (the exact raw text), Copy code (a fenced block without its fence), Copy message
+  (operator and agent), Copy reasoning, and on an open tool row Copy command (the bash command, a file tool's path,
+  else the arguments as JSON), Copy output and Copy full output… (the whole stored output through
+  `/api/blobs/{handle}/raw`, refused above 2 MiB with a pointer to the viewer). The stored-output and file viewers
+  gain Copy lines (the selected lines, else every loaded line, without numbers) beside Copy reference / Copy path;
+  inbox cards gain Copy text and evidence cards Copy quote. Icon buttons have names and tooltips, show on hover and
+  focus and always on touch, and are 44 px on coarse pointers. Success shows "Copied" and is announced politely.
+- One `copyText` helper does every copy: the clipboard API, else the selected text and the copy command, else the
+  text left selected for Ctrl+C; the session-id chip uses it too. What each button copies is decided in `core.js`
+  (tested). An opt-in **Copy on select** checkbox (inspector Session tab, off by default, `localStorage` key
+  `loom_copy_on_select`) copies a selection wholly inside the chat or the viewer on mouseup/keyup, never while typing
+  in a field, never twice for the same selection, and says "Copied N characters".
+- loom-desk needs no change: its `WKWebView` offers `navigator.clipboard.writeText` and the copy command (checked
+  with a stand-alone view configured like `WebPane`). The fixture serves the raw blob route. UI only; no stored shape
+  changed. `docs/UI.md` has a "Copying" section.
+
 ### Workspace folders: create a missing workspace, pick a folder, browse the workspace
 
 - `POST /api/sessions` accepts `create_workspace` (default false). When the workspace does not exist and the flag is
