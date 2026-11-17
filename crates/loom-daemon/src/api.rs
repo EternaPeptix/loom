@@ -1260,6 +1260,28 @@ mod tests {
     // --- the gates -------------------------------------------------------------------------
 
     #[tokio::test]
+    async fn starting_a_session_with_prior_missions_checks_them() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let (s, first) = e.post("/api/sessions", json!({"workspace": e.ws})).await;
+        assert_eq!(s, 201, "{first}");
+        let mission = first["mission"].as_str().unwrap().to_string();
+        assert!(first.get("prior").is_none());
+        let (s, b) = e.post("/api/sessions", json!({"workspace": e.ws, "prior": [mission, "m-nope"]})).await;
+        assert_eq!((s, b["error"].as_str().unwrap()), (404, "There is no mission m-nope to recall."));
+        let many: Vec<String> = (0..9).map(|n| format!("m-{n}")).collect();
+        let (s, b) = e.post("/api/sessions", json!({"workspace": e.ws, "prior": many})).await;
+        assert_eq!(
+            (s, b["error"].as_str().unwrap()),
+            (409, "Name at most 8 earlier missions to recall; 9 were named.")
+        );
+        let (s, b) = e.post("/api/sessions", json!({"workspace": e.ws, "prior": [mission]})).await;
+        assert_eq!(s, 201, "{b}");
+        assert_eq!(b["prior"], json!([mission]));
+        let (s, list) = e.get("/api/sessions").await;
+        assert_eq!((s, list.as_array().unwrap().len()), (200, 2));
+    }
+
+    #[tokio::test]
     async fn the_gates_run_host_then_origin_then_token() {
         let e = env(Script::new(|_, _| finish("x"))).await;
         let anon = |m: Method, p: &str| e.http.request(m, e.url(p));
