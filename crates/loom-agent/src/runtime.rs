@@ -115,7 +115,25 @@
 //! - `job_events`: the receiver of the job table's channel; `sink`: the runtime; `control`: new.
 //!
 //! ## Creating a root session (`create_session`)
-//! 1. `workspace` must be an existing directory (canonicalised). Role: `packs.role(pack, role)`.
+//! 1. `workspace` must be an existing directory (canonicalised); `~` and `~/x` mean the daemon user's home
+//!    directory (`expand_home`, `HOME`). When it does not exist: with `create_workspace` unset the sentence is
+//!    `The workspace {path} does not exist. Create it from the new-mission form (Create), or run `loom run
+//!    --create-workspace`.`; with it set, [`plan_workspace`] checks and, once the role, models and model facts
+//!    of the request are accepted, `create_dir_all` makes it (process umask) and it is canonicalised;
+//!    `create_session_receipt` says `true` for it (`POST /api/sessions` answers `created`). Refused, naming the
+//!    path and what to do, before anything is made: a relative path; a path that is or lies inside the loom
+//!    home or the copies directory (the sandbox refuses those workspaces); a `..` component in a path that does
+//!    not exist; a deepest existing ancestor that is not a directory; `/` or the user's home as the thing to
+//!    create; a failed `create_dir_all` (permission), which names the path; an existing workspace inside the
+//!    loom home. "Inside the loom home or the copies folder" is judged by file identity (`inside_loom_home`,
+//!    `loom_tools::files::is_or_inside`), not by path text, so `/System/Volumes/Data/...` or a link to the
+//!    home is refused too, and again on the canonical path after the folders are made (`make_tracked`): if a
+//!    link swapped in since the check leads the new folder there, what the call made is removed and the creation
+//!    refused. A new workspace gets its reserved `.loom` folder (mode 0700) at once, because a sandbox that
+//!    confines the workspace (Bubblewrap) refuses a workspace without it. A request that fails after the
+//!    folders were made (`build`, the start record, `Session::create`, `meta.json`) removes them again
+//!    (`MadeWorkspace::undo`, `remove_dir`, so nothing that holds files is deleted). The log records nothing extra.
+//!    Role: `packs.role(pack, role)`.
 //!    Profile: `config.profile(model)`.
 //! 2. Model facts: `client.discover()` once per profile (the first success with a window is
 //!    remembered; a discovery that finds no window refuses the creation and is not remembered). On
@@ -604,6 +622,9 @@ pub struct NewSession {
     /// Model choices for the mission's agents (role → profile, [`ANY_ROLE`] for every role), set before
     /// the first message so that the lead's first agents already use them.
     pub role_models: BTreeMap<String, String>,
+    /// Make `workspace` (and the folders above it that are missing) when it does not exist. The receipt of
+    /// the creation says `created`; nothing is recorded in the log beyond what a session start records.
+    pub create_workspace: bool,
 }
 
 /// `meta.json`: what a session is, fixed when it is created.
@@ -975,6 +996,224 @@ const NOTIFY_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// The daemon user's home directory: `$HOME` when it is set and absolute.
+pub fn user_home() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from).filter(|h| h.is_absolute())
+}
+
+/// `~` and `~/x` mean `home`; any other path is returned as it is (`~name` is not expanded and, being relative,
+/// is refused by the caller). Without a home, `~` paths are an error that says to give an absolute path.
+pub fn expand_home(path: &Path, home: Option<&Path>) -> Result<PathBuf, String> {
+    let Some(text) = path.to_str() else { return Ok(path.to_path_buf()) };
+    let rest = match text {
+        "~" => "",
+        _ => match text.strip_prefix("~/") {
+            Some(r) => r,
+            None => return Ok(path.to_path_buf()),
+        },
+    };
+    let Some(home) = home else {
+        return Err(format!(
+            "The path {text} starts with ~, but the daemon does not know your home directory. Give an absolute path."
+        ));
+    };
+    Ok(if rest.is_empty() { home.to_path_buf() } else { home.join(rest) })
+}
+
+/// `path` (absolute, without `.` or `..` components in the part that does not exist) with its deepest existing
+/// ancestor resolved through symlinks: `(resolved path, that ancestor)`. `None` when no ancestor can be resolved.
+pub fn resolve_lenient(path: &Path) -> Option<(PathBuf, PathBuf)> {
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = path.to_path_buf();
+    loop {
+        if let Ok(base) = std::fs::canonicalize(&cur) {
+            let mut resolved = base.clone();
+            resolved.extend(tail.iter().rev());
+            return Some((resolved, base));
+        }
+        tail.push(cur.file_name()?.to_os_string());
+        cur = cur.parent()?.to_path_buf();
+    }
+}
+
+/// Whether `resolved` (see [`resolve_lenient`]) is the loom home or lies inside it. Judged by file identity
+/// (`loom_tools::files::is_or_inside`), so a second spelling of the same folder (macOS
+/// `/System/Volumes/Data/...`, a link) does not get around it.
+pub fn inside_loom_home(paths: &Paths, resolved: &Path) -> bool {
+    loom_tools::files::is_or_inside(resolved, &paths.home)
+}
+
+/// A workspace that has been checked and, when it is to be made, not yet made.
+pub enum WorkspacePlan {
+    Existing(PathBuf),
+    /// `protected`: the loom home and the copies folder, which the made folder must not turn out to be inside.
+    Create {
+        path: PathBuf,
+        ancestor: PathBuf,
+        protected: Vec<PathBuf>,
+    },
+}
+
+/// A workspace made by [`WorkspacePlan::make_tracked`]: the canonical path and the folders this call made.
+#[derive(Debug)]
+pub struct MadeWorkspace {
+    pub path: PathBuf,
+    /// Folders made by this call, outermost first (empty when the workspace already existed). The workspace's own
+    /// `.loom` is made too and is not listed: `undo` removes it first.
+    pub created: Vec<PathBuf>,
+}
+
+impl MadeWorkspace {
+    /// Remove what this call made, the workspace's `.loom` first and then each folder innermost first, with
+    /// `remove_dir`, so a folder that has anything in it is left alone.
+    pub fn undo(&self) {
+        if self.created.is_empty() {
+            return;
+        }
+        let _ = std::fs::remove_dir(self.path.join(".loom"));
+        for dir in self.created.iter().rev() {
+            if std::fs::remove_dir(dir).is_err() {
+                break;
+            }
+        }
+    }
+}
+
+impl WorkspacePlan {
+    /// The canonical workspace, made first when the plan says so; `true` when it was made.
+    pub fn make(self) -> Result<(PathBuf, bool), String> {
+        let made = self.make_tracked()?;
+        let created = !made.created.is_empty();
+        Ok((made.path, created))
+    }
+
+    /// [`WorkspacePlan::make`] that also says which folders it made, so that a request that fails afterwards can
+    /// remove them. A new workspace gets its reserved `.loom` folder (mode 0700) at once, which a sandbox
+    /// that confines the workspace requires. After the folders exist the canonical result is judged again by
+    /// file identity: when a link swapped in since the check leads it into the loom home or the copies folder,
+    /// what this call made is removed and the creation refused.
+    pub fn make_tracked(self) -> Result<MadeWorkspace, String> {
+        match self {
+            WorkspacePlan::Existing(p) => Ok(MadeWorkspace { path: p, created: Vec::new() }),
+            WorkspacePlan::Create { path, ancestor, protected } => {
+                let mut created: Vec<PathBuf> = Vec::new();
+                for dir in path.ancestors() {
+                    if dir.exists() {
+                        break;
+                    }
+                    created.push(dir.to_path_buf());
+                }
+                created.reverse();
+                let made = MadeWorkspace { path: path.clone(), created };
+                let fail = |e: std::io::Error| {
+                    made.undo();
+                    format!(
+                        "The workspace {} could not be created: {e}. Check the permissions of {}, or choose another folder.",
+                        path.display(),
+                        ancestor.display()
+                    )
+                };
+                std::fs::create_dir_all(&path).map_err(fail)?;
+                let canonical = match std::fs::canonicalize(&path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        made.undo();
+                        return Err(format!("The workspace {} cannot be used: {e}", path.display()));
+                    }
+                };
+                if protected.iter().any(|p| loom_tools::files::is_or_inside(&canonical, p)) {
+                    made.undo();
+                    return Err(format!(
+                        "The workspace {} is inside the loom home or its copies folder, which sessions cannot use. Choose a folder elsewhere.",
+                        path.display()
+                    ));
+                }
+                if !canonical.is_dir() {
+                    made.undo();
+                    return Err(format!("The workspace {} is not a directory.", canonical.display()));
+                }
+                if let Err(e) = loom_core::config::ensure_private_dir(&canonical.join(".loom")) {
+                    made.undo();
+                    return Err(format!(
+                        "The workspace {} could not be prepared: its .loom folder cannot be made: {e}. Check the permissions, or choose another folder.",
+                        canonical.display()
+                    ));
+                }
+                Ok(MadeWorkspace { path: canonical, created: made.created })
+            }
+        }
+    }
+}
+
+/// Check `raw` as a session's workspace (see the contract of `create_session`, step 1) without making anything.
+pub fn plan_workspace(paths: &Paths, raw: &Path, create: bool) -> Result<WorkspacePlan, String> {
+    let path = expand_home(raw, user_home().as_deref())?;
+    match std::fs::metadata(&path) {
+        Ok(_) => {
+            let canonical = std::fs::canonicalize(&path)
+                .map_err(|e| format!("The workspace {} cannot be used: {e}", path.display()))?;
+            if !canonical.is_dir() {
+                return Err(format!("The workspace {} is not a directory.", canonical.display()));
+            }
+            if inside_loom_home(paths, &canonical) {
+                return Err(format!(
+                    "The workspace {} is inside the loom home ({}), which sessions cannot use. Choose a folder elsewhere.",
+                    path.display(),
+                    paths.home.display()
+                ));
+            }
+            return Ok(WorkspacePlan::Existing(canonical));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Err(format!("The workspace {} cannot be used: {e}", path.display()));
+        }
+        Err(_) => {}
+    }
+    if !path.is_absolute() {
+        return Err(format!(
+            "The workspace {} is a relative path that does not exist. Give an absolute path, or one that starts with ~/.",
+            path.display()
+        ));
+    }
+    if !create {
+        return Err(format!(
+            "The workspace {} does not exist. Create it from the new-mission form (Create), or run `loom run --create-workspace`.",
+            path.display()
+        ));
+    }
+    if path.components().any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::CurDir)) {
+        return Err(format!(
+            "The workspace {} does not exist and its path contains . or .. . Write the path out in full.",
+            path.display()
+        ));
+    }
+    let Some((resolved, ancestor)) = resolve_lenient(&path) else {
+        return Err(format!(
+            "The workspace {} cannot be created: no folder above it exists. Choose another folder.",
+            path.display()
+        ));
+    };
+    if !ancestor.is_dir() {
+        return Err(format!(
+            "The workspace {} cannot be created: {} is not a directory. Choose a folder inside an existing directory.",
+            path.display(),
+            ancestor.display()
+        ));
+    }
+    if resolved == Path::new("/") || user_home().is_some_and(|h| h == resolved) {
+        return Err(format!("The workspace {} cannot be created: choose a folder of its own.", path.display()));
+    }
+    let copies = paths.copies_dir();
+    if inside_loom_home(paths, &resolved) || loom_tools::files::is_or_inside(&resolved, &copies) {
+        return Err(format!(
+            "The workspace {} is inside the loom home ({}) or its copies folder, which sessions cannot use. Choose a folder elsewhere.",
+            path.display(),
+            paths.home.display()
+        ));
+    }
+    Ok(WorkspacePlan::Create { path, ancestor, protected: vec![paths.home.clone(), copies] })
 }
 
 fn no_session(id: &SessionId) -> String {
@@ -4081,13 +4320,16 @@ impl Runtime {
     }
 
     pub async fn create_session(&self, new: NewSession) -> Result<SessionInfo, String> {
+        self.create_session_receipt(new).await.map(|(info, _)| info)
+    }
+
+    /// [`Runtime::create_session`] that also says whether it made the workspace folder (`create_workspace`
+    /// was set and the path did not exist).
+    pub async fn create_session_receipt(&self, new: NewSession) -> Result<(SessionInfo, bool), String> {
         let inner = &self.inner;
         inner.check_open()?;
-        let workspace = std::fs::canonicalize(&new.workspace)
-            .map_err(|e| format!("The workspace {} cannot be used: {e}", new.workspace.display()))?;
-        if !workspace.is_dir() {
-            return Err(format!("The workspace {} is not a directory.", workspace.display()));
-        }
+        // Checked before anything else; the folder itself is made only once the rest of the request is accepted.
+        let plan = plan_workspace(&inner.paths, &new.workspace, new.create_workspace)?;
         let role = inner.packs.role(new.pack.as_deref(), new.role.as_deref())?.clone();
         inner.check_network(&role.pack)?;
         let profile_name = inner.models().resolve(new.model.as_deref().or(role.model.as_deref()))?;
@@ -4101,6 +4343,9 @@ impl Runtime {
             }
         }
         let (model, window, from_config) = inner.facts(&profile_name).await?;
+        let made = plan.make_tracked()?;
+        let workspace = made.path.clone();
+        let created = !made.created.is_empty();
         let title = match new.title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
             Some(t) => t.to_string(),
             None => {
@@ -4134,9 +4379,11 @@ impl Runtime {
             role_models,
         };
         inner.st().known.insert(id.clone(), Known::new(meta.clone(), idle_status()));
+        // A request that fails from here on takes back the folders it made.
         let forget = |inner: &Inner| {
             inner.proxy.revoke(&id);
             inner.st().known.remove(&id);
+            made.undo();
         };
         let (deps, parts) = match inner.build(&meta, explicit) {
             Ok(x) => x,
@@ -4184,7 +4431,7 @@ impl Runtime {
         if let Some(message) = new.message.as_deref().filter(|m| !m.trim().is_empty()) {
             self.send_message(&id, message).await?;
         }
-        self.session(&id).ok_or_else(|| no_session(&id))
+        self.session(&id).map(|info| (info, created)).ok_or_else(|| no_session(&id))
     }
 
     pub fn sessions(&self, include_archived: bool) -> Vec<SessionInfo> {
@@ -10859,5 +11106,155 @@ mod tests {
         let copy = with_copies(shared.clone(), Path::new("/h-copies"), Some("/ws"));
         assert_eq!(copy.replay_untrusted_paths, ["/x", "/h-copies"]);
         assert_eq!(copy.protected_paths, ["/ws"]);
+    }
+
+    #[test]
+    fn home_is_expanded_only_for_tilde_paths() {
+        let home = Path::new("/Users/me");
+        assert_eq!(expand_home(Path::new("~"), Some(home)).unwrap(), PathBuf::from("/Users/me"));
+        assert_eq!(expand_home(Path::new("~/code/x"), Some(home)).unwrap(), PathBuf::from("/Users/me/code/x"));
+        assert_eq!(expand_home(Path::new("~you/x"), Some(home)).unwrap(), PathBuf::from("~you/x"));
+        assert_eq!(expand_home(Path::new("/a/~/b"), Some(home)).unwrap(), PathBuf::from("/a/~/b"));
+        assert!(expand_home(Path::new("~/x"), None).unwrap_err().contains("absolute path"));
+    }
+
+    #[tokio::test]
+    async fn a_missing_workspace_is_made_only_when_asked_and_only_where_allowed() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let missing = e.dir.path().join("a/b/new");
+        let make = |path: &Path, create: bool| NewSession {
+            workspace: path.to_path_buf(),
+            create_workspace: create,
+            ..NewSession::default()
+        };
+
+        // Missing, flag unset: the sentence says how to create it, and nothing is made.
+        let err = e.rt.create_session_receipt(make(&missing, false)).await.unwrap_err();
+        assert!(err.contains("does not exist") && err.contains("--create-workspace"), "{err}");
+        assert!(!missing.exists());
+
+        // Missing, flag set: made (with the folders above it), the receipt says so, the session starts there.
+        let (info, created) = e.rt.create_session_receipt(make(&missing, true)).await.unwrap();
+        assert!(created && missing.is_dir());
+        assert_eq!(Path::new(&info.meta.workspace), std::fs::canonicalize(&missing).unwrap());
+        // An existing folder is not "created", flag or not.
+        let (_, created) = e.rt.create_session_receipt(make(&missing, true)).await.unwrap();
+        assert!(!created);
+
+        // Inside the loom home or beside it in the copies folder: refused, nothing made.
+        for inside in
+            [e.dir.path().join("home/x"), e.dir.path().join("home/sessions/new"), e.dir.path().join("home-copies/y")]
+        {
+            let err = e.rt.create_session_receipt(make(&inside, true)).await.unwrap_err();
+            assert!(err.contains("loom home"), "{err}");
+            assert!(!inside.exists(), "{}", inside.display());
+        }
+        // A symlink into the home does not get around it.
+        let link = e.dir.path().join("link");
+        std::os::unix::fs::symlink(e.dir.path().join("home"), &link).unwrap();
+        let err = e.rt.create_session_receipt(make(&link.join("viaink"), true)).await.unwrap_err();
+        assert!(err.contains("loom home"), "{err}");
+        assert!(!e.dir.path().join("home/viaink").exists());
+
+        // Relative, `..` in the part that is made, a file in the way.
+        let err = e.rt.create_session_receipt(make(Path::new("rel/ws"), true)).await.unwrap_err();
+        assert!(err.contains("relative path"), "{err}");
+        let err = e.rt.create_session_receipt(make(&e.dir.path().join("a/../zz/q"), true)).await.unwrap_err();
+        assert!(err.contains("..") && !e.dir.path().join("zz").exists(), "{err}");
+        let file = e.dir.path().join("afile");
+        std::fs::write(&file, "x").unwrap();
+        let err = e.rt.create_session_receipt(make(&file.join("sub"), true)).await.unwrap_err();
+        assert!(err.contains("is not a directory"), "{err}");
+        let err = e.rt.create_session_receipt(make(&file, true)).await.unwrap_err();
+        assert!(err.contains("is not a directory"), "{err}");
+
+        // A request refused for another reason makes nothing.
+        let later = e.dir.path().join("later");
+        let bad = NewSession { role: Some("nope".into()), ..make(&later, true) };
+        assert!(e.rt.create_session_receipt(bad).await.is_err());
+        assert!(!later.exists());
+    }
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn the_data_volume_spelling_of_the_loom_home_does_not_get_around_the_refusal() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let real = std::fs::canonicalize(e.dir.path()).unwrap();
+        let alias = Path::new("/System/Volumes/Data").join(real.strip_prefix("/").unwrap());
+        if !alias.join("home").is_dir() {
+            return;
+        }
+        for (inside, name) in
+            [(alias.join("home/made-by-create"), "home/made-by-create"), (alias.join("home-copies/x"), "home-copies/x")]
+        {
+            let make = NewSession { workspace: inside.clone(), create_workspace: true, ..NewSession::default() };
+            let err = e.rt.create_session_receipt(make).await.unwrap_err();
+            assert!(err.contains("loom home"), "{err}");
+            assert!(!e.dir.path().join(name).exists(), "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_new_workspace_gets_its_reserved_folder_and_an_existing_one_in_the_loom_home_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let e = env_with(Script::new(|_, _| finish("ok")), false, with_os_sandbox).await;
+        let made = e.dir.path().join("new/ws");
+        let new = NewSession { workspace: made.clone(), create_workspace: true, ..NewSession::default() };
+        let (info, created) = e.rt.create_session_receipt(new).await.unwrap();
+        assert!(created);
+        let loom = Path::new(&info.meta.workspace).join(".loom");
+        assert!(loom.is_dir(), "the sandbox needs the workspace's .loom");
+        assert_eq!(std::fs::metadata(&loom).unwrap().permissions().mode() & 0o777, 0o700);
+        // An existing workspace inside the loom home is refused like a new one.
+        let err =
+            e.rt.create_session(NewSession { workspace: e.dir.path().join("home"), ..NewSession::default() }).await;
+        assert!(err.unwrap_err().contains("inside the loom home"));
+        // A folder that merely holds the home is fine.
+        assert!(plan_workspace(&Paths::at(e.dir.path().join("home")), e.dir.path(), false).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_request_that_fails_after_the_folder_was_made_takes_it_back() {
+        use std::os::unix::fs::PermissionsExt;
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let sessions = e.dir.path().join("home/sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let made = e.dir.path().join("fresh/deeper/ws");
+        let new = NewSession { workspace: made.clone(), create_workspace: true, ..NewSession::default() };
+        let res = e.rt.create_session_receipt(new).await;
+        std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(res.is_err(), "the session could not be written");
+        assert!(!e.dir.path().join("fresh").exists(), "the folders the request made are removed");
+        // What was there before stays, and a folder that has anything in it is not removed.
+        let plan = plan_workspace(&Paths::at(e.dir.path().join("home")), &e.dir.path().join("keep/ws"), true).unwrap();
+        let made = plan.make_tracked().unwrap();
+        assert_eq!(made.created.len(), 2);
+        std::fs::write(made.path.join("work.txt"), "x").unwrap();
+        made.undo();
+        assert!(made.path.join("work.txt").exists(), "a workspace with files is not deleted");
+        std::fs::remove_file(made.path.join("work.txt")).unwrap();
+        made.undo();
+        assert!(!e.dir.path().join("keep").exists());
+    }
+
+    #[test]
+    fn a_link_swapped_in_after_the_check_is_judged_again_once_the_folders_exist() {
+        let d = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(d.path()).unwrap();
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(base.join("elsewhere")).unwrap();
+        let link = base.join("swap");
+        std::os::unix::fs::symlink(&home, &link).unwrap();
+        // The plan was made when `swap` led elsewhere; a plan made now is refused outright.
+        assert!(plan_workspace(&Paths::at(home.clone()), &link.join("a/b"), true).is_err());
+        let plan =
+            WorkspacePlan::Create { path: link.join("a/b"), ancestor: base.clone(), protected: vec![home.clone()] };
+        let err = plan.make_tracked().unwrap_err();
+        assert!(err.contains("loom home"), "{err}");
+        assert!(!home.join("a").exists(), "what the call made inside the home is removed again");
     }
 }

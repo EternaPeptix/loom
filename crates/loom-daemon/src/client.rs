@@ -63,9 +63,9 @@
 //! and the client prints `unverified_warning` to stderr, once. `Client::new` alone does not ask.
 
 use crate::wire::{
-    AnswerBody, ApprovalBody, ArchiveBody, DaemonFile, ErrorBody, GcBody, LinesView, MessageBody, ModelBody,
-    ModelsView, RecordsPage, ReleaseBody, RenameBody, RoleModelBody, RuleBody, ScopeBody, ScopeReceipt, SessionDetail,
-    StatusView, WithdrawBody,
+    AnswerBody, ApprovalBody, ArchiveBody, CreatedSession, DaemonFile, ErrorBody, GcBody, LinesView, MessageBody,
+    ModelBody, ModelsView, RecordsPage, ReleaseBody, RenameBody, RoleModelBody, RuleBody, ScopeBody, ScopeReceipt,
+    SessionDetail, StatusView, WithdrawBody,
 };
 use loom_agent::runtime::{
     BusEvent, InboxEntry, LedgerView, MissionInfo, MissionModels, ModelSwitchReceipt, ModelsReload, NetEntry,
@@ -449,6 +449,12 @@ impl Client {
     }
 
     pub async fn create(&self, new: &NewSession) -> Result<SessionInfo, String> {
+        let body = serde_json::to_value(new).map_err(|e| format!("The session request cannot be encoded ({e})."))?;
+        self.call(Method::POST, "/api/sessions", &[], Some(body)).await
+    }
+
+    /// [`Client::create`] with the receipt: the session and whether the request made its workspace folder.
+    pub async fn create_receipt(&self, new: &NewSession) -> Result<CreatedSession, String> {
         let body = serde_json::to_value(new).map_err(|e| format!("The session request cannot be encoded ({e})."))?;
         self.call(Method::POST, "/api/sessions", &[], Some(body)).await
     }

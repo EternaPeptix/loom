@@ -1841,6 +1841,8 @@ export function buildNewSession(form) {
   if (form.agentModel && role === "lead") body.role_models = { "*": form.agentModel };
   const title = String(form.title || "").trim();
   if (title) body.title = title;
+  // Only after the operator chose to create a folder that does not exist (the picker's New folder, or the confirmation).
+  if (form.createWorkspace) body.create_workspace = true;
   return { body };
 }
 
@@ -3435,3 +3437,303 @@ export function nextCardId(ids, from) {
   if (at < 0) return list[0];
   return (ids || [])[at + 1] !== undefined ? ids[at + 1] : ids[at - 1] !== undefined ? ids[at - 1] : null;
 }
+
+// ---------------------------------------------------------------------------------------------
+// Workspace folders: the picker of the New mission form, creating a missing workspace, and the Files tab
+
+/** The most workspaces the picker offers as "Recent" shortcuts. */
+export const RECENT_WORKSPACES = 8;
+
+/** A byte count in words: "812 B", "12.3 KiB", "4.0 MiB". */
+export function byteSize(n) {
+  const v = Math.max(0, Number(n) || 0);
+  if (v < 1024) return `${Math.round(v)} B`;
+  const units = ["KiB", "MiB", "GiB", "TiB"];
+  let x = v / 1024;
+  let i = 0;
+  while (x >= 1024 && i < units.length - 1) { x /= 1024; i += 1; }
+  return `${x >= 100 ? Math.round(x) : x.toFixed(1)} ${units[i]}`;
+}
+
+/** The absolute path `GET /api/fs/dirs` lists; no path means the daemon's default (the home directory). */
+export function fsDirsUrl(path) {
+  const p = String(path ?? "").trim();
+  return p ? `/api/fs/dirs?path=${encodeURIComponent(p)}` : "/api/fs/dirs";
+}
+
+/** Join a folder path and one name without doubling the slash ("/" + "x" is "/x"). */
+export function joinPath(base, name) {
+  const b = String(base ?? "");
+  return b.endsWith("/") ? b + name : b + "/" + name;
+}
+
+/** The folder above an absolute path; "/" has none (null). */
+export function parentPath(path) {
+  const p = String(path ?? "").replace(/\/+$/, "");
+  if (!p.startsWith("/") || p === "") return null;
+  const cut = p.lastIndexOf("/");
+  return cut <= 0 ? "/" : p.slice(0, cut);
+}
+
+/** Breadcrumb buttons for an absolute path: [{name:"/", path:"/"}, {name:"Users", path:"/Users"}, …]. */
+export function pathCrumbs(path) {
+  const p = String(path ?? "");
+  if (!p.startsWith("/")) return [];
+  const out = [{ name: "/", path: "/" }];
+  let at = "";
+  for (const part of p.split("/").filter(Boolean)) {
+    at += "/" + part;
+    out.push({ name: part, path: at });
+  }
+  return out;
+}
+
+/**
+ * Workspaces of the sessions the page knows, most recent first, each once. `infos` are session infos
+ * ({id, workspace, created_ms}); `activity` maps a session id to {ts} (the latest record seen). The time
+ * a workspace was used is its newest session's.
+ */
+export function recentWorkspaces(infos, activity = new Map(), limit = RECENT_WORKSPACES) {
+  const latest = new Map();
+  for (const info of infos || []) {
+    const ws = typeof info.workspace === "string" ? info.workspace.trim() : "";
+    if (!ws) continue;
+    const at = Math.max(Number(info.created_ms) || 0, Number(activity && activity.get && activity.get(info.id)?.ts) || 0);
+    if (!latest.has(ws) || at > latest.get(ws)) latest.set(ws, at);
+  }
+  return [...latest.entries()].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1)).slice(0, Math.max(0, limit)).map(([path]) => path);
+}
+
+/** The folders the picker lists: hidden (dot) folders only when asked for. */
+export function visibleDirs(entries, showHidden) {
+  return (entries || []).filter((e) => e && typeof e.name === "string" && (showHidden || !e.hidden));
+}
+
+/** Check the name typed for a new folder: {name} (trimmed) or {error} with a sentence. `existing` are the names already there. */
+export function checkFolderName(text, existing = []) {
+  const name = String(text ?? "").trim();
+  if (!name) return { error: "Type a name for the new folder." };
+  if (name === "." || name === "..") return { error: `"${name}" is not a folder name; choose another.` };
+  if (name.includes("/") || name.includes("\\")) return { error: "A folder name cannot contain a slash; to make a nested folder, make one level at a time." };
+  if (/[\u0000-\u001f\u007f]/.test(name)) return { error: "A folder name cannot contain control characters." };
+  if (new TextEncoder().encode(name).length > 255) return { error: "That name is too long; use 255 bytes or fewer." };
+  if ((existing || []).some((n) => n === name)) return { error: `"${name}" already exists here. Open it, or choose another name.` };
+  return { name };
+}
+
+/** Whether a daemon error on POST /api/sessions says the workspace is missing (and so can be offered "Create it"). */
+export function missingWorkspaceError(message) {
+  return /does not exist\. Create it/i.test(String(message ?? ""));
+}
+
+/** The question the form asks when the workspace is missing. */
+export function createWorkspaceQuestion(path) {
+  return `${path} does not exist. Create it and start the mission?`;
+}
+
+/** The sentence after a mission started in a folder it made. */
+export const CREATED_WORKSPACE_RECEIPT = "The workspace folder did not exist and was created.";
+
+/** `/api/sessions/{id}/files?path=` for a workspace-relative folder ("" is the root). */
+export function filesUrl(session, path) {
+  const p = String(path ?? "");
+  return `/api/sessions/${encodeURIComponent(session)}/files` + (p ? `?path=${encodeURIComponent(p)}` : "");
+}
+
+/** `/api/sessions/{id}/files/lines?path=&start=&count=` for a workspace-relative file. */
+export function fileLinesUrl(session, path, start, count) {
+  return `/api/sessions/${encodeURIComponent(session)}/files/lines?path=${encodeURIComponent(path)}&start=${start}&count=${count}`;
+}
+
+/** Join a workspace-relative folder and a name ("" is the root). */
+export function relJoin(dir, name) {
+  return dir ? `${dir}/${name}` : String(name);
+}
+
+/** The workspace-relative folder above `path`; the root ("") has none (null). */
+export function relParent(path) {
+  const p = String(path ?? "");
+  if (!p) return null;
+  const cut = p.lastIndexOf("/");
+  return cut < 0 ? "" : p.slice(0, cut);
+}
+
+/** Breadcrumbs of a workspace-relative folder, starting at the workspace itself: [{name, path}]. */
+export function relCrumbs(path) {
+  const out = [{ name: "workspace", path: "" }];
+  let at = "";
+  for (const part of String(path ?? "").split("/").filter(Boolean)) {
+    at = relJoin(at, part);
+    out.push({ name: part, path: at });
+  }
+  return out;
+}
+
+/** Normalise "a/./b//c" without ever stepping above the start; null when the path would leave it. */
+function squash(parts) {
+  const out = [];
+  for (const part of parts) {
+    if (part === "" || part === ".") continue;
+    if (part === "..") { if (!out.length) return null; out.pop(); continue; }
+    out.push(part);
+  }
+  return out;
+}
+
+/**
+ * The workspace-relative form of a path a tool was given, or null when it is not inside the workspace:
+ * an absolute path under `workspace`, or a relative path that does not climb out of it. "" is the workspace itself.
+ * This only reads the text; the daemon decides what may be opened.
+ */
+export function workspaceRelative(workspace, text) {
+  const raw = String(text ?? "").trim();
+  const ws = String(workspace ?? "").replace(/\/+$/, "");
+  if (!raw || raw.includes("\u0000") || raw.startsWith("~") || !ws.startsWith("/")) return null;
+  if (raw.startsWith("/")) {
+    const root = squash(ws.split("/"));
+    const parts = squash(raw.split("/"));
+    if (!root || !parts || parts.length < root.length || root.some((p, i) => parts[i] !== p)) return null;
+    return parts.slice(root.length).join("/");
+  }
+  const parts = squash(raw.split("/"));
+  return parts ? parts.join("/") : null;
+}
+
+/** The path a tool call names, from its arguments (`path`, `file_path` or `file`), or null. */
+export function toolPathArg(args) {
+  if (!args || typeof args !== "object" || Array.isArray(args)) return null;
+  for (const k of ["path", "file_path", "file"]) if (typeof args[k] === "string" && args[k].trim()) return args[k];
+  return null;
+}
+
+/** Tools whose path argument "Open file" may follow into the Files tab. */
+const OPEN_FILE_TOOLS = new Set(["read", "write", "edit", "multi_edit", "patch", "ls", "grep", "glob"]);
+
+/** The workspace-relative path "Open file" opens for a tool block, or null when there is none inside the workspace. */
+export function openFileTarget(block, workspace) {
+  if (!block || !OPEN_FILE_TOOLS.has(block.name)) return null;
+  const arg = toolPathArg(block.args);
+  return arg === null ? null : workspaceRelative(workspace, arg);
+}
+
+/** Is this entry the workspace's closed harness folder? The daemon marks it with a `note` (only the root's `.loom`; a nested `.loom` is an ordinary folder). */
+export function isHarnessEntry(entry) {
+  return !!entry && typeof entry.note === "string" && entry.note !== "";
+}
+
+/** Is this entry hidden? The daemon's `hidden` flag, else a leading dot. */
+export function isHiddenEntry(entry) {
+  return !!entry && (typeof entry.hidden === "boolean" ? entry.hidden : String(entry.name || "").startsWith("."));
+}
+
+/** Words for one Files entry: what it is, said without colour. */
+export function fileEntryKind(entry) {
+  if (isHarnessEntry(entry)) return entry.note;
+  if (entry.error) return String(entry.error);
+  if (entry.kind === "dir") return "folder";
+  if (entry.kind === "link") return "link: not opened here";
+  if (entry.kind === "other") return "not a regular file";
+  return "file";
+}
+
+/** Whether a Files entry can be opened (a folder is entered, a file read). */
+export function fileEntryOpens(entry) {
+  if (!entry || isHarnessEntry(entry) || entry.error) return false;
+  return entry.kind === "dir" || entry.kind === "file";
+}
+
+/**
+ * The rows the Files tab shows for a listing: hidden (dot) entries only when asked for, then those whose name holds
+ * `query` (literal, ignoring case). Order is the daemon's (folders first). `.loom` counts as hidden, so it appears only
+ * with Show hidden, as a closed entry.
+ */
+export function fileRows(entries, { query = "", showHidden = false } = {}) {
+  const q = String(query ?? "").trim().toLowerCase();
+  return (entries || []).filter((e) => e && typeof e.name === "string"
+    && (showHidden || !isHiddenEntry(e))
+    && (!q || e.name.toLowerCase().includes(q)));
+}
+
+/** The line under the Files list: how much is shown and what is not. */
+export function fileListWords(listing, shown, { query = "", showHidden = false } = {}) {
+  const total = ((listing && listing.entries) || []).length;
+  const parts = [];
+  const hiddenCount = ((listing && listing.entries) || []).filter((e) => isHiddenEntry(e)).length;
+  if (!total) parts.push("This folder is empty.");
+  else if (String(query).trim()) parts.push(`${num(shown)} of ${count(total, "entry", "entries")} match.`);
+  else parts.push(`${count(shown, "entry", "entries")}.`);
+  if (!showHidden && hiddenCount) parts.push(`${count(hiddenCount, "hidden entry", "hidden entries")} not shown.`);
+  if (listing && listing.more > 0) parts.push(`${num(listing.more)} more are not listed; this folder has too many entries to list at once.`);
+  return parts.join(" ");
+}
+
+/**
+ * Files-tab state for one session: the folders read so far (lazily, one request per folder), the folder shown and its
+ * filter. `cache` maps a relative folder path to its listing; Refresh drops it.
+ */
+export function createFilesState(session, workspace) {
+  return { session, workspace, path: "", cache: new Map(), query: "", showHidden: false, active: "", loading: null, error: "", seq: 0 };
+}
+
+/**
+ * Whether the Files tab still has to read its current folder. `loading` is the path being read, and the workspace
+ * root's path is the empty string, so it is compared with null: a redraw during the first read of the root must not
+ * start a second read that throws the first one (and its focus, pick and mark) away.
+ */
+export function filesNeedsLoad(st) {
+  return !st.cache.has(st.path) && st.loading === null && !st.error;
+}
+
+/** The accessible name of a tool row's Open file button: it starts with the visible words (WCAG 2.5.3). */
+export function openFileLabel(rel) {
+  return `Open file ${rel || "the workspace folder"} in the Files tab`;
+}
+
+/** Keep the roving stop on a row that exists: `active` when it is among `rows`, else the first. */
+export function activeRowName(rows, active) {
+  return (rows || []).some((r) => r.name === active) ? active : ((rows || [])[0] || {}).name || "";
+}
+
+/** The next row name for Arrow/Home/End among `rows` (no wrapping), or null when the key is not a move. */
+export function stepRowName(rows, active, key) {
+  const list = rows || [];
+  if (!list.length) return null;
+  const at = Math.max(0, list.findIndex((r) => r.name === active));
+  if (key === "ArrowDown") return list[Math.min(list.length - 1, at + 1)].name;
+  if (key === "ArrowUp") return list[Math.max(0, at - 1)].name;
+  if (key === "Home") return list[0].name;
+  if (key === "End") return list[list.length - 1].name;
+  return null;
+}
+
+/**
+ * A file's lines, as the viewer pages them: the daemon's `GET …/files/lines` answers like a stored output's lines
+ * ({text, first, last, total}), with `total_lines`, `bytes` and `binary` as well. Returns {text, first, last, total, bytes, binary}.
+ */
+export function fileLinesView(view) {
+  const v = view || {};
+  const total = Number.isFinite(Number(v.total_lines)) ? Number(v.total_lines) : Number(v.total) || 0;
+  const binary = v.binary === true;
+  return {
+    text: binary ? "" : String(v.text ?? ""),
+    first: Number(v.first) || (total > 0 && !binary ? 1 : 0),
+    last: binary ? 0 : Number(v.last) || 0,
+    total: binary ? 0 : total,
+    bytes: Number(v.bytes) || 0,
+    binary,
+  };
+}
+
+/** The line a file's viewer says about where it is: "Modified 3h ago · 12.3 KiB". */
+export function fileMetaWords(entry, now) {
+  const parts = [];
+  if (entry && Number.isFinite(Number(entry.mtime_ms)) && Number(entry.mtime_ms) > 0) {
+    const ago = age(now, entry.mtime_ms);
+    parts.push(ago === "now" ? "modified just now" : `modified ${ago} ago`);
+  }
+  if (entry && Number.isFinite(Number(entry.size))) parts.push(byteSize(entry.size));
+  return parts.join(" · ");
+}
+
+/** The sentence the file viewer carries: this is the file now, not what the agent read. */
+export const FILE_NOW_WORDS = "File in the workspace now — it may have changed since the agent read it.";

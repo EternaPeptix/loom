@@ -266,7 +266,7 @@ unknown while retaining the last update time.
 
 ## Inspector and responsive behavior
 
-The mission inspector is closed by default. It contains Ledger, Context, Network, Models and Session
+The mission inspector is closed by default. It contains Ledger, Context, Network, Models, Session and Files
 tabs.
 On a wide display, opening it adds a resizable side pane. Drag the separator or use its arrow keys;
 Home/End select the bounds. On narrower displays it becomes a drawer. Below 700px the mission
@@ -510,3 +510,28 @@ The mission heading links to the mission's lead. A scope request has
 "Refuse…": a reason field (Enter sends, Escape closes) and "Send refusal", which sends
 `Refused: <reason>` and grants nothing; an empty reason shows an error and sends nothing. An approved scope
 request reads "Approved · hosts granted: …", a refused one "Refused".
+
+## Workspace folders: create, pick, browse
+
+- **Creating a missing workspace.** `POST /api/sessions` carries `create_workspace: true` only when the operator chose it:
+  the picker's New folder (the field then holds exactly that path; editing it drops the flag), or the answer to the inline
+  question the form asks when the daemon says the folder "does not exist": "<path> does not exist. Create it and start the
+  mission?" with **Create and start** and **Cancel** (focus starts on Cancel; the affirmative button ignores auto-repeat).
+  The answer's `created: true` is said in the polite line ("Created <path> and started the mission.").
+- **Folder picker** (`#picker`, opened by `#f-browse`, `GET /api/fs/dirs?path=`): path breadcrumbs, a list of folders (roving
+  tabindex; Enter or Right opens, Backspace, Left or Alt+Up goes up), Up, Home, Show hidden, Recent workspaces (from the
+  sessions the page knows, newest first), **New folder…** (a validated name; nothing is made, the picker never writes) and
+  **Use this folder**, which fills the field and focuses it. A starting path that cannot be listed falls back to the nearest
+  folder above it that can, and says so. In a folder with no subfolders Backspace and Alt+Up still go up (focus is on **Up one folder**). Escape closes and returns focus to Browse.
+- **Files tab** (`#tab-files`, and the header's `#b-files`; `GET /api/sessions/{id}/files?path=`): the session's workspace as
+  breadcrumbs and a list read one folder at a time, on opening and on **Refresh** only (no polling). Keys as in the picker (in an empty folder focus is on the current crumb, and Backspace, Left and Alt+Up go up from there); a
+  filter over the loaded entries; Show hidden (the daemon's `hidden` flag); links, non-files and the root's `.loom` (the
+  entry the daemon marks with a `note`) are listed but closed, each with its reason; a folder the daemon cannot list
+  shows the daemon's sentence (409) in the status line. The tab's DOM is built once per session, so a redraw never loses the filter or the focus.
+- **A file in the viewer** (`GET …/files/lines?path=&start=&count=`): the stored-output dialog in file mode: the relative path,
+  size and age in the header, "File in the workspace now — it may have changed since the agent read it", Go to line and Find
+  in loaded lines, **Copy path** (the absolute path), no citation marks. A binary file says so and shows no lines; a refusal
+  (over the 32 MiB cap, a link, `.loom`; all 409) shows the daemon's sentence. The route's status codes: 404 for a
+  missing path or session, 409 for every other refusal, 400 for a bad query.
+- **Open file** on a tool row (inside the expanded row) shows the Files tab at that path when the call's `path`, `file_path`
+  or `file` is inside the workspace; the entry is selected, and a missing one is said.

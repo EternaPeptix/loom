@@ -69,6 +69,7 @@ const S = {
   net: [],
   netError: null,
   viewer: null,
+  files: null, // the Files tab of the open session (C.createFilesState + its DOM), made on first need
   liveEl: null,
   now: Date.now(),
 };
@@ -1096,6 +1097,7 @@ function renderHeader() {
     idChip.removeAttribute("title");
     idChip.removeAttribute("aria-label");
     $("s-copied").textContent = "";
+    $("b-files").hidden = true;
     $("s-goal").textContent = "";
     $("s-goal-toggle").hidden = true;
     hideBarIdentity();
@@ -1113,6 +1115,7 @@ function renderHeader() {
   $("s-title").title = info.id;
   // Only a mission (lead) is renamed; an agent is named by the question that started it.
   $("b-rename").hidden = !!info.parent;
+  $("b-files").hidden = !info.workspace;
   renderGoal(info);
   renderIdentity(info);
   const currentStep = S.ledger.state?.plan?.find(step => step.status === "doing");
@@ -1794,6 +1797,7 @@ function buildTool(root, b) {
   add(root, head);
   if (!open) return;
   const body = el("div", "tbody");
+  add(body, toolOpenRow(b));
   if (b.args !== undefined && b.args !== null) {
     add(body, keyed(btn(b.ui.args ? "hide args" : "args", "link", () => {
       b.ui.args = !b.ui.args;
@@ -2609,10 +2613,14 @@ function showNew() {
   for (const m of models) agents.append(new Option(m.profile, m.profile));
   agents.disabled = role.value !== "lead";
   $("f-error").hidden = true;
+  hideCreateAsk();
+  $("f-receipt").hidden = true;
+  workspaceNote();
 }
 
-async function submitNew(ev) {
-  ev.preventDefault();
+async function submitNew(ev, create = false) {
+  if (ev) ev.preventDefault();
+  const workspace = $("f-workspace").value.trim();
   const r = C.buildNewSession({
     workspace: $("f-workspace").value,
     message: $("f-message").value,
@@ -2621,8 +2629,11 @@ async function submitNew(ev) {
     agentModel: $("f-agent-model").value,
     title: $("f-title").value,
     unattended: $("f-unattended").checked,
+    // Only for a folder the operator chose to make: the picker's New folder, or the answer to the question below.
+    createWorkspace: create || (pickerCreate !== null && workspace === pickerCreate),
   });
   const err = $("f-error");
+  hideCreateAsk();
   if (r.error) {
     err.textContent = r.error;
     err.hidden = false;
@@ -2630,16 +2641,24 @@ async function submitNew(ev) {
   }
   err.hidden = true;
   $("f-submit").disabled = true;
+  $("f-create-yes").disabled = true;
   try {
-    const info = await api("POST", "/api/sessions", r.body);
+    const answer = await api("POST", "/api/sessions", r.body);
+    // `created` is the receipt of a folder the daemon made; the rest is the session as ever.
+    const { created, ...info } = answer;
     C.applySessionEvent(S.sessions, info);
     $("f-message").value = "";
+    pickerCreate = null;
+    workspaceNote();
     location.hash = "#/s/" + encodeURIComponent(info.id);
+    if (created === true) toast(`Created ${info.workspace || workspace} and started the mission.`);
   } catch (e) {
-    err.textContent = e.message;
-    err.hidden = false;
+    // The daemon is the authority on whether the folder exists; when it says not, ask before making it.
+    if (!r.body.create_workspace && C.missingWorkspaceError(e.message)) askCreate(workspace);
+    else { err.textContent = e.message; err.hidden = false; }
   } finally {
     $("f-submit").disabled = false;
+    $("f-create-yes").disabled = false;
   }
 }
 
@@ -2760,6 +2779,7 @@ function renderRightBody() {
   if (S.tab === "context") return renderContext(p);
   if (S.tab === "network") return renderNetwork(p);
   if (S.tab === "models") return renderModels(p, info);
+  if (S.tab === "files") return renderFiles(p, info);
   return renderSessionTab(p, info);
 }
 
@@ -3261,6 +3281,7 @@ const viewerStatus = (text) => { $("viewer-error").textContent = text; };
  */
 function openViewer(blob, title, total, source = {}, opener = document.activeElement) {
   const dialog = $("viewer");
+  setViewerMode(null);
   $("viewer-title").textContent = title || "Stored output";
   const provenance = $("viewer-provenance");
   provenance.replaceChildren();
@@ -3329,8 +3350,18 @@ async function viewerPage(direction) {
   $("viewer-earlier").disabled = true;
   viewerStatus("Loading stored lines…");
   try {
-    const view = await api("GET", C.linesUrl(v.blob, range.start, range.end));
+    const file = v.source.file || null;
+    const raw = await api("GET", file ? C.fileLinesUrl(file.session, file.path, range.start, range.end - range.start + 1) : C.linesUrl(v.blob, range.start, range.end));
     if (S.viewer !== v) return;
+    const fv = file ? C.fileLinesView(raw) : null;
+    if (fv && fv.binary) {
+      // No lines: a binary file is said to be one, with its size, and nothing of it is drawn.
+      v.done = true;
+      $("viewer-info").textContent = `Binary file · ${C.byteSize(fv.bytes)}`;
+      viewerStatus(`This is a binary file (${C.byteSize(fv.bytes)}); it is not shown as text.`);
+      return;
+    }
+    const view = fv || raw;
     const joined = direction < 0 ? C.applyEarlierLines(v, view) : C.applyLines(v, view);
     if (joined) {
       const texts = C.splitLines(view.text);
@@ -3353,7 +3384,7 @@ async function viewerPage(direction) {
         $("viewer-find-count").textContent = v.match >= 0 ? `${C.num(v.match + 1)} of ${C.num(v.matches.length)}` : C.count(v.matches.length, "match", "matches");
       }
     }
-    $("viewer-info").textContent = v.last >= v.first ? `Lines ${C.num(v.first)}–${C.num(v.last)} of ${C.num(v.total)}` : "No lines stored";
+    $("viewer-info").textContent = fv ? fileInfoWords(v, fv) : v.last >= v.first ? `Lines ${C.num(v.first)}–${C.num(v.last)} of ${C.num(v.total)}` : "No lines stored";
     $("viewer-start").max = String(Math.max(1, v.total));
     // A page that does not meet the loaded lines is not shown, and that is said rather than hidden.
     viewerStatus(joined ? "" : "The lines returned do not join the loaded ones. Close this output and open it again.");
@@ -3396,7 +3427,7 @@ async function viewerJump() {
     await loadViewer(v.blob, v.total, { ...v.source, start: Math.max(1, target.line - 3), end: target.line + C.LINES_PAGE - 4 }, { opener: v.opener, target: target.line });
     if (S.viewer?.target !== target.line || !viewerRow(S.viewer, target.line)) return;
   }
-  viewerStatus(`At line ${C.num(target.line)}. Copy reference now gives this line.`);
+  viewerStatus(v.source.file ? `At line ${C.num(target.line)}.` : `At line ${C.num(target.line)}. Copy reference now gives this line.`);
 }
 
 function clearMatch() {
@@ -3444,6 +3475,12 @@ function viewerFind(delta) {
 async function copyViewerReference() {
   const v = S.viewer;
   if (!v) return;
+  if (v.source.file) {
+    const full = C.joinPath(v.source.file.workspace, v.source.file.path);
+    try { await navigator.clipboard.writeText(full); viewerStatus("Copied path: " + full); }
+    catch { viewerStatus("Copy this path: " + full); }
+    return;
+  }
   const reference = C.viewerReference(v);
   try { await navigator.clipboard.writeText(reference); viewerStatus("Copied: " + reference); }
   catch { viewerStatus("Copy this reference: " + reference); }
@@ -3977,6 +4014,486 @@ function wireKeyboard() {
   wireFind();
 }
 
+// ---------------------------------------------------------------------------------------------
+// New mission: creating a missing workspace, and the folder picker
+
+/** The folder the picker marked "New folder": the create flag goes with the workspace field only while it still holds exactly this path. */
+let pickerCreate = null;
+
+function workspaceNote() {
+  const note = $("f-workspace-note");
+  const value = $("f-workspace").value.trim();
+  const pending = pickerCreate !== null && value === pickerCreate;
+  if (!pending) pickerCreate = null;
+  note.textContent = pending ? "This folder does not exist yet. It is created when the mission starts." : "";
+  note.hidden = !pending;
+}
+
+function hideCreateAsk() {
+  $("f-create").hidden = true;
+}
+
+/** The daemon says the workspace is missing: ask once, inline, before anything is made. Focus goes to the safe button. */
+function askCreate(path) {
+  $("f-create-q").textContent = C.createWorkspaceQuestion(path);
+  $("f-create").hidden = false;
+  $("f-create").dataset.path = path;
+  $("f-create-no").focus();
+}
+
+// ---- the picker (GET /api/fs/dirs)
+
+const PK = { path: "", listing: null, error: "", showHidden: false, active: "", choice: null, seq: 0, loading: false, opener: null, naming: false };
+
+function pickerSay(text, bad = false) {
+  const s = $("picker-status");
+  s.textContent = text;
+  s.classList.toggle("bad", bad);
+}
+
+function openPicker(opener = $("f-browse")) {
+  if (document.querySelector("dialog[open]")) return;
+  PK.opener = opener;
+  PK.naming = false;
+  PK.choice = null;
+  PK.listing = null;
+  PK.error = "";
+  $("picker-hidden").checked = PK.showHidden;
+  $("picker-newrow").hidden = true;
+  $("picker-new").setAttribute("aria-expanded", "false");
+  $("picker").showModal();
+  const typed = $("f-workspace").value.trim();
+  pickerLoad(typed.startsWith("/") || typed.startsWith("~") ? typed : "", { initial: true, focus: true });
+  renderPicker();
+}
+
+function closePicker(restore = null) {
+  PK.seq += 1;
+  if ($("picker").open) $("picker").close();
+  const target = restore || (PK.opener && document.contains(PK.opener) ? PK.opener : $("f-workspace"));
+  target.focus({ preventScroll: true });
+}
+
+/**
+ * List `path` (empty: the daemon's default, the home folder). On the first load a path that cannot be listed (a
+ * folder the operator is about to create, say) falls back to the nearest folder above it that can.
+ */
+async function pickerLoad(path, { initial = false, focus = false, pick = "" } = {}) {
+  const seq = ++PK.seq;
+  PK.loading = true;
+  pickerSay("Loading folders…");
+  let ask = path;
+  let first = "";
+  for (let tries = 0; tries < 12; tries++) {
+    try {
+      const view = await api("GET", C.fsDirsUrl(ask));
+      if (seq !== PK.seq) return;
+      PK.loading = false;
+      PK.listing = view;
+      PK.error = "";
+      PK.choice = { path: view.path, create: false };
+      PK.active = pick || "";
+      renderPicker({ focus });
+      if (initial && first) pickerSay(`${first} Showing ${view.path}.`, false);
+      return;
+    } catch (e) {
+      if (seq !== PK.seq) return;
+      if (!first) first = e.message;
+      const up = initial && ask.startsWith("/") ? C.parentPath(ask) : null;
+      if (up !== null && up !== ask) { ask = up; continue; }
+      if (initial && ask !== "") { ask = ""; continue; }
+      PK.loading = false;
+      PK.error = e.message;
+      renderPicker({ focus });
+      pickerSay(e.message, true);
+      return;
+    }
+  }
+}
+
+function pickerRows() {
+  return PK.listing ? C.visibleDirs(PK.listing.entries, PK.showHidden) : [];
+}
+
+function renderPicker({ focus = false } = {}) {
+  const listing = PK.listing;
+  const crumbs = $("picker-crumbs");
+  crumbs.replaceChildren();
+  if (listing) {
+    const parts = C.pathCrumbs(listing.path);
+    parts.forEach((c, i) => {
+      if (i > 1) crumbs.append(el("span", "crumb-sep", "/"));
+      const b = btn(c.name, "link", () => pickerLoad(c.path, { focus: true, pick: i + 1 < parts.length ? parts[i + 1].name : "" }));
+      if (i === parts.length - 1) b.setAttribute("aria-current", "location");
+      b.title = c.path;
+      crumbs.append(b);
+    });
+  }
+  $("picker-up").disabled = !listing || !listing.parent;
+  const recent = C.recentWorkspaces([...S.sessions.byId.values()], S.activity);
+  const rlist = $("picker-recent");
+  rlist.replaceChildren();
+  for (const path of recent) {
+    const b = btn(path, "small", () => pickerLoad(path, { focus: true }));
+    b.title = "Show " + path;
+    rlist.append(add(el("li"), b));
+  }
+  $("picker-recent-wrap").hidden = recent.length === 0;
+  const rows = pickerRows();
+  PK.active = C.activeRowName(rows, PK.active);
+  const hadFocus = $("picker-list").contains(document.activeElement);
+  const list = $("picker-list");
+  list.replaceChildren();
+  for (const entry of rows) {
+    const b = el("button", "dir-row" + (entry.hidden ? " hid" : ""));
+    b.type = "button";
+    b.dataset.name = entry.name;
+    b.tabIndex = entry.name === PK.active ? 0 : -1;
+    add(b, icon(entry.link ? "link" : "folder"), el("span", "nm", entry.name));
+    if (entry.link) add(b, el("span", "tag", "link"));
+    add(b, el("span", "sr-only", entry.link ? ", folder link" : ", folder"));
+    b.title = entry.path || entry.name;
+    b.addEventListener("click", () => pickerLoad(entry.path || C.joinPath(listing.path, entry.name), { focus: true }));
+    list.append(add(el("li"), b));
+  }
+  if (listing && !PK.loading) {
+    const hiddenCount = listing.entries.filter((e) => e.hidden).length;
+    const words = [rows.length ? `${C.count(rows.length, "folder")} in ${listing.path}.` : `No folders in ${listing.path}.`];
+    if (!PK.showHidden && hiddenCount) words.push(`${C.count(hiddenCount, "hidden folder")} not shown.`);
+    if (listing.more > 0) words.push(`${C.num(listing.more)} more are not listed.`);
+    if (!PK.error) pickerSay(words.join(" "));
+  }
+  const choice = PK.choice;
+  $("picker-choice").textContent = choice ? (choice.create ? `New folder: ${choice.path} (made when the mission starts)` : choice.path) : "";
+  $("picker-use").disabled = !choice;
+  if (focus || hadFocus) {
+    const row = list.querySelector('[tabindex="0"]');
+    if (row) { row.focus({ preventScroll: true }); row.scrollIntoView({ block: "nearest" }); }
+    else if (focus) $("picker-up").disabled ? $("picker-close").focus() : $("picker-up").focus();
+  }
+}
+
+function pickerUp() {
+  const listing = PK.listing;
+  if (!listing || !listing.parent) return;
+  const from = listing.path.slice(listing.path.lastIndexOf("/") + 1);
+  pickerLoad(listing.parent, { focus: true, pick: from });
+}
+
+function pickerListKeys(e) {
+  const row = e.target.closest && e.target.closest(".dir-row");
+  if (!row) return;
+  if (e.key === "ArrowRight" && !e.altKey) { e.preventDefault(); row.click(); return; }
+  if ((e.key === "ArrowLeft" && !e.altKey) || e.key === "Backspace" || (e.key === "ArrowUp" && e.altKey)) { e.preventDefault(); pickerUp(); return; }
+  if (e.altKey || e.ctrlKey || e.metaKey) return;
+  const next = C.stepRowName(pickerRows(), row.dataset.name, e.key);
+  if (next === null) return;
+  e.preventDefault();
+  PK.active = next;
+  for (const r of $("picker-list").querySelectorAll(".dir-row")) r.tabIndex = r.dataset.name === next ? 0 : -1;
+  const target = [...$("picker-list").querySelectorAll(".dir-row")].find((r) => r.dataset.name === next);
+  if (target) { target.focus(); target.scrollIntoView({ block: "nearest" }); }
+}
+
+/** With no folder row to hold the keys, Backspace and Alt+Up still go up (not from a text field, except Alt+Up). */
+function pickerEmptyKeys(e) {
+  if ($("picker-list").querySelector(".dir-row")) return;
+  const typing = e.target.matches && e.target.matches("input, textarea");
+  const up = (e.key === "ArrowUp" && e.altKey) || (!typing && !e.altKey && !e.ctrlKey && !e.metaKey && e.key === "Backspace");
+  if (!up || $("picker-up").disabled) return;
+  e.preventDefault();
+  pickerUp();
+}
+
+function pickerNaming(on) {
+  PK.naming = on;
+  $("picker-newrow").hidden = !on;
+  $("picker-new").setAttribute("aria-expanded", String(on));
+  if (on) { $("picker-newname").value = ""; $("picker-newname").focus(); }
+  else $("picker-new").focus();
+}
+
+function pickerAcceptName() {
+  if (!PK.listing) return;
+  const names = PK.listing.entries.map((e) => e.name);
+  const r = C.checkFolderName($("picker-newname").value, names);
+  if (r.error) { pickerSay(r.error, true); $("picker-newname").focus(); return; }
+  PK.choice = { path: C.joinPath(PK.listing.path, r.name), create: true };
+  pickerNaming(false);
+  renderPicker();
+  pickerSay(`${PK.choice.path} will be created when the mission starts. Nothing was made.`);
+  $("picker-use").focus();
+}
+
+function usePicker() {
+  const choice = PK.choice;
+  if (!choice) return;
+  $("f-workspace").value = choice.path;
+  pickerCreate = choice.create ? choice.path : null;
+  hideCreateAsk();
+  workspaceNote();
+  closePicker($("f-workspace"));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Files: the workspace of the open session, in the inspector (GET /api/sessions/{id}/files)
+
+const FILES_NOTE = "The folder as it is now, read by you. Opening a file here does not change what the model has seen.";
+
+/** The Files state of the open session, made (with its DOM) on first need; a different session or workspace starts over. */
+function ensureFiles(info) {
+  if (S.files && S.files.session === info.id && S.files.workspace === info.workspace) return S.files;
+  const st = C.createFilesState(info.id, info.workspace);
+  const box = el("div", "files-box");
+  const note = el("p", "files-note dim", FILES_NOTE);
+  note.title = info.workspace;
+  const crumbs = el("nav", "files-crumbs");
+  crumbs.setAttribute("aria-label", "Folder path in the workspace");
+  const tools = el("div", "files-tools");
+  const filter = el("input");
+  filter.type = "search";
+  filter.id = "files-filter";
+  filter.setAttribute("aria-label", "Filter the entries shown");
+  filter.placeholder = "Filter loaded entries";
+  filter.autocomplete = "off";
+  const hidden = el("input");
+  hidden.type = "checkbox";
+  hidden.id = "files-hidden";
+  const hiddenLabel = el("label", "check dim");
+  add(hiddenLabel, hidden, document.createTextNode(" Show hidden"));
+  const refresh = btn("Refresh", "small with-icon", () => { st.cache.clear(); filesOpen(st, st.path, { force: true, focus: true, said: "Refreshed. " }); });
+  refresh.prepend(icon("refresh"));
+  refresh.title = "Read this folder again. The list does not update by itself.";
+  add(tools, filter, hiddenLabel, refresh);
+  const status = el("p", "files-status dim");
+  status.setAttribute("role", "status");
+  status.setAttribute("aria-live", "polite");
+  const list = el("ul", "file-list");
+  list.setAttribute("aria-label", "Entries in this folder");
+  add(box, note, crumbs, tools, status, list);
+  st.dom = { box, crumbs, filter, hidden, status, list };
+  filter.addEventListener("input", () => { st.query = filter.value; filesSync(st); });
+  filter.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && filter.value) { e.preventDefault(); e.stopPropagation(); filter.value = ""; st.query = ""; filesSync(st); }
+    else if (e.key === "ArrowDown") { e.preventDefault(); list.querySelector('[tabindex="0"]')?.focus(); }
+  });
+  hidden.addEventListener("change", () => { st.showHidden = hidden.checked; filesSync(st); });
+  list.addEventListener("keydown", (e) => filesKeys(st, e));
+  box.addEventListener("keydown", (e) => filesEmptyKeys(st, e));
+  S.files = st;
+  return st;
+}
+
+function filesRows(st) {
+  const listing = st.cache.get(st.path);
+  return listing ? C.fileRows(listing.entries, { query: st.query, showHidden: st.showHidden }) : [];
+}
+
+/** Show a folder: from the cache, else read it (one request per folder, never polled). `pick` selects an entry; `focus` moves the keyboard to it. */
+async function filesOpen(st, path, { force = false, focus = false, pick = "", mark = false, said = "" } = {}) {
+  const apply = () => {
+    st.path = path;
+    st.error = "";
+    st.loading = null;
+    const listing = st.cache.get(path);
+    if (pick && listing) {
+      const hit = listing.entries.find((e) => e.name === pick);
+      if (hit) {
+        if (pick.startsWith(".") && !st.showHidden) { st.showHidden = true; st.dom.hidden.checked = true; }
+        st.query = "";
+        st.dom.filter.value = "";
+        st.active = pick;
+        st.picked = mark ? pick : "";
+      } else st.missed = pick;
+    }
+    if (!pick || !mark) st.picked = "";
+    filesSync(st, { focus, said });
+  };
+  if (!force && st.cache.has(path)) { apply(); return; }
+  const seq = ++st.seq;
+  st.loading = path;
+  filesSync(st, { loading: true });
+  try {
+    const view = await api("GET", C.filesUrl(st.session, path));
+    if (st.seq !== seq || S.files !== st) return;
+    st.cache.set(path, view);
+    apply();
+  } catch (e) {
+    if (st.seq !== seq || S.files !== st) return;
+    st.loading = null;
+    st.error = e.message;
+    filesSync(st, { focus });
+  }
+}
+
+function filesSay(st, text, bad = false) {
+  st.dom.status.textContent = text;
+  st.dom.status.classList.toggle("bad", bad);
+}
+
+function filesSync(st, { focus = false, loading = false, said = "" } = {}) {
+  const d = st.dom;
+  d.crumbs.replaceChildren();
+  const parts = C.relCrumbs(st.path);
+  parts.forEach((c, i) => {
+    if (i > 1) d.crumbs.append(el("span", "crumb-sep", "/"));
+    const b = btn(c.name, "link", () => filesOpen(st, c.path, { focus: true, pick: i + 1 < parts.length ? parts[i + 1].name : "" }));
+    if (i === parts.length - 1) b.setAttribute("aria-current", "location");
+    b.title = c.path || "The workspace folder";
+    d.crumbs.append(b);
+  });
+  const rows = filesRows(st);
+  st.active = C.activeRowName(rows, st.active);
+  const hadFocus = d.list.contains(document.activeElement);
+  const now = Date.now();
+  d.list.replaceChildren();
+  for (const entry of rows) {
+    const opens = C.fileEntryOpens(entry);
+    const b = el("button", "file-row" + (C.isHiddenEntry(entry) ? " hid" : "") + (entry.name === st.picked ? " picked" : ""));
+    b.type = "button";
+    b.dataset.name = entry.name;
+    b.dataset.focusKey = "file:" + C.relJoin(st.path, entry.name);
+    b.tabIndex = entry.name === st.active ? 0 : -1;
+    if (!opens) b.setAttribute("aria-disabled", "true");
+    add(b, icon(entry.kind === "dir" ? "folder" : entry.kind === "link" ? "link" : "tool-read"), el("span", "nm", entry.name));
+    if (opens && entry.kind === "dir") add(b, el("span", "sr-only", ", folder"));
+    else if (opens) add(b, el("span", "meta", [C.byteSize(entry.size), Number(entry.mtime_ms) > 0 ? C.age(now, entry.mtime_ms) : ""].filter(Boolean).join(" · ")));
+    else add(b, el("span", "tag", C.fileEntryKind(entry)));
+    b.addEventListener("click", () => filesActivate(st, entry, b));
+    d.list.append(add(el("li"), b));
+  }
+  const listing = st.cache.get(st.path);
+  if (loading) filesSay(st, "Loading…");
+  else if (st.error) filesSay(st, st.error, true);
+  else if (listing) {
+    let words = said + C.fileListWords(listing, rows.length, { query: st.query, showHidden: st.showHidden });
+    if (st.missed) { words = `${st.missed} is not in this folder any more; it may have been moved or deleted. ` + words; st.missed = ""; }
+    filesSay(st, words);
+  }
+  if ((focus || hadFocus) && !loading) {
+    const row = d.list.querySelector('[tabindex="0"]');
+    if (row) { row.focus({ preventScroll: true }); row.scrollIntoView({ block: st.picked ? "center" : "nearest" }); }
+    else if (focus) {
+      // No row to hold the keys for going up: a filter that hides everything keeps the focus, otherwise the current crumb does.
+      const here = st.query ? null : d.crumbs.querySelector("[aria-current]");
+      (here || d.filter).focus();
+    }
+  }
+}
+
+function filesActivate(st, entry, row) {
+  if (!C.fileEntryOpens(entry)) {
+    filesSay(st, C.isHarnessEntry(entry) ? ".loom holds the harness's own files; they are not shown here." : `${entry.name}: ${C.fileEntryKind(entry)}.`);
+    return;
+  }
+  st.active = entry.name;
+  const rel = C.relJoin(st.path, entry.name);
+  if (entry.kind === "dir") filesOpen(st, rel, { focus: true });
+  else openFileViewer(st, rel, entry, row);
+}
+
+function filesUp(st) {
+  const up = C.relParent(st.path);
+  if (up === null) return;
+  const from = st.path.slice(st.path.lastIndexOf("/") + 1);
+  filesOpen(st, up, { focus: true, pick: from });
+}
+
+/** With no row to focus, the keys for going up work from anywhere in the box that is not a text field (Alt+Up from the filter too). */
+function filesEmptyKeys(st, e) {
+  if (st.dom.list.querySelector(".file-row")) return;
+  const typing = e.target.matches && e.target.matches("input, textarea");
+  const up = (e.key === "ArrowUp" && e.altKey) || (!typing && !e.altKey && !e.ctrlKey && !e.metaKey && (e.key === "Backspace" || e.key === "ArrowLeft"));
+  if (!up || C.relParent(st.path) === null) return;
+  e.preventDefault();
+  filesUp(st);
+}
+
+function filesKeys(st, e) {
+  const row = e.target.closest && e.target.closest(".file-row");
+  if (!row) return;
+  if (e.key === "ArrowRight" && !e.altKey) { e.preventDefault(); if (row.getAttribute("aria-disabled") !== "true") row.click(); return; }
+  if ((e.key === "ArrowLeft" && !e.altKey) || e.key === "Backspace" || (e.key === "ArrowUp" && e.altKey)) { e.preventDefault(); filesUp(st); return; }
+  if (e.altKey || e.ctrlKey || e.metaKey) return;
+  const rows = filesRows(st);
+  const next = C.stepRowName(rows, row.dataset.name, e.key);
+  if (next === null) return;
+  e.preventDefault();
+  st.active = next;
+  const all = [...st.dom.list.querySelectorAll(".file-row")];
+  for (const r of all) r.tabIndex = r.dataset.name === next ? 0 : -1;
+  const target = all.find((r) => r.dataset.name === next);
+  if (target) { target.focus(); target.scrollIntoView({ block: "nearest" }); }
+}
+
+function renderFiles(p, info) {
+  const st = ensureFiles(info);
+  if (p.firstChild !== st.dom.box || p.childNodes.length !== 1) p.replaceChildren(st.dom.box);
+  if (C.filesNeedsLoad(st)) filesOpen(st, st.path);
+}
+
+/** Open the inspector on the Files tab (the header's Files button). `rel`, when given, is shown with that entry selected. */
+function showFiles(opener, rel = null) {
+  const info = S.sessions.byId.get(S.openId);
+  if (!info) return;
+  setDrawer("left", false);
+  nextOpener = opener;
+  setDrawer("right", true);
+  setTab("files");
+  const st = ensureFiles(info);
+  // Attached now, so a folder already read can take the focus at once instead of waiting for the next redraw.
+  if ($("panel").firstChild !== st.dom.box || $("panel").childNodes.length !== 1) $("panel").replaceChildren(st.dom.box);
+  if (rel === null || rel === "") filesOpen(st, rel === "" ? "" : st.path, { focus: true });
+  else {
+    const parent = C.relParent(rel);
+    filesOpen(st, parent, { focus: true, mark: true, pick: rel.slice(parent ? parent.length + 1 : 0) });
+  }
+}
+
+// ---- a file in the viewer dialog
+
+/** The viewer dialog reads a file of the workspace: its path, size and age in the header, no citations, "Copy path". */
+function openFileViewer(st, rel, entry, opener) {
+  const dialog = $("viewer");
+  const file = { session: st.session, workspace: st.workspace, path: rel, entry };
+  setViewerMode(file);
+  $("viewer-title").textContent = rel;
+  $("viewer-provenance").replaceChildren(el("span", "viewer-file-note", C.FILE_NOW_WORDS));
+  $("viewer-standing").textContent = "Reading it here is an operator action. It does not change what the model has observed, and it is not evidence.";
+  $("viewer-find").value = "";
+  $("viewer-start").value = "1";
+  if (!dialog.open) dialog.showModal();
+  $("viewer-scroll").focus({ preventScroll: true });
+  loadViewer(rel, 0, { file, start: 1 }, { opener });
+}
+
+/** Words and labels of the dialog for a file (`file` set) or a stored output (null). */
+function setViewerMode(file) {
+  $("viewer-copy").textContent = file ? "Copy path" : "Copy reference";
+  $("viewer-controls").setAttribute("aria-label", file ? "Move through the file" : "Move through the stored output");
+  $("viewer-scroll").setAttribute("aria-label", file ? "File lines" : "Stored output lines");
+}
+
+/** What the viewer's info line says about a file's lines. */
+function fileInfoWords(v, fv) {
+  const meta = C.fileMetaWords({ size: v.source.file.entry ? v.source.file.entry.size : fv.bytes, mtime_ms: v.source.file.entry && v.source.file.entry.mtime_ms }, Date.now());
+  const lines = v.total === 0 ? "Empty file" : v.last >= v.first ? `Lines ${C.num(v.first)}–${C.num(v.last)} of ${C.num(v.total)}` : "No lines read";
+  return meta ? `${lines} · ${meta}` : lines;
+}
+
+// ---- a tool row's "Open file"
+
+function toolOpenRow(b) {
+  const info = S.sessions.byId.get(S.openId);
+  const rel = info ? C.openFileTarget(b, info.workspace) : null;
+  if (rel === null) return null;
+  const open = btn("Open file", "small link", (e) => showFiles(e.currentTarget, rel));
+  open.dataset.focusKey = "openfile:" + b.id;
+  open.title = "Show this path in the Files tab, as it is in the workspace now.";
+  open.setAttribute("aria-label", C.openFileLabel(rel));
+  return add(el("div", "tool-open"), open, el("span", "mono", rel || "."));
+}
+
 function wire() {
   wireKeyboard();
   $("btn-inbox").addEventListener("click", () => {
@@ -4086,6 +4603,29 @@ function wire() {
   });
 
   $("new-form").addEventListener("submit", submitNew);
+  $("f-workspace").addEventListener("input", () => { workspaceNote(); hideCreateAsk(); });
+  $("f-browse").addEventListener("click", (e) => openPicker(e.currentTarget));
+  $("f-create-yes").addEventListener("click", () => submitNew(null, true));
+  noRepeat($("f-create-yes"));
+  $("f-create-no").addEventListener("click", () => { hideCreateAsk(); $("f-workspace").focus(); });
+  $("f-create").addEventListener("keydown", (e) => { if (e.key === "Escape") { e.preventDefault(); hideCreateAsk(); $("f-workspace").focus(); } });
+  $("b-files").addEventListener("click", (e) => showFiles(e.currentTarget));
+  $("picker-close").addEventListener("click", () => closePicker());
+  $("picker-cancel").addEventListener("click", () => closePicker());
+  $("picker").addEventListener("cancel", (e) => { e.preventDefault(); if (PK.naming) pickerNaming(false); else closePicker(); });
+  $("picker-up").addEventListener("click", pickerUp);
+  $("picker-home").addEventListener("click", () => pickerLoad("", { focus: true }));
+  $("picker-hidden").addEventListener("change", (e) => { PK.showHidden = e.target.checked; renderPicker(); });
+  $("picker-new").addEventListener("click", () => pickerNaming(!PK.naming));
+  $("picker-newok").addEventListener("click", pickerAcceptName);
+  $("picker-newcancel").addEventListener("click", () => pickerNaming(false));
+  $("picker-newname").addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.isComposing) { e.preventDefault(); pickerAcceptName(); }
+    else if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); pickerNaming(false); }
+  });
+  $("picker-list").addEventListener("keydown", pickerListKeys);
+$("picker").addEventListener("keydown", pickerEmptyKeys);
+  $("picker-use").addEventListener("click", usePicker);
   // Coming back to the page is opening what it shows: the notifications about it are withdrawn.
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") closeNotes(S.view === "inbox" ? { inbox: true } : S.view === "session" ? { session: S.openId } : {});

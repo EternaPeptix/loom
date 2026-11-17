@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+### Workspace folders: create a missing workspace, pick a folder, browse the workspace
+
+- `POST /api/sessions` accepts `create_workspace` (default false). When the workspace does not exist and the flag is
+  set, the daemon makes it (`create_dir_all`) and the 201 answer carries `created: true`; without the flag the refusal
+  says the folder does not exist and how to create it. Refused before anything is made: a relative path, a path inside
+  the loom home or its copies folder, a path under a file, `.`/`..` in the part that does not exist, `/` or the home
+  itself. `~` and `~/x` expand to the daemon user's home. `loom run --create-workspace` (and `loom chat`) does the same
+  and prints `created workspace <path>`.
+- `GET /api/fs/dirs?path=` lists the folders in a folder (folders only, never file names; links marked; the loom home
+  refused). `GET /api/sessions/{id}/files?path=` and `.../files/lines?path=&start=&count=` read a session's workspace
+  (read-only, confined to it, `.loom` never shown, links that leave are not followed, files over 32 MiB refused, binary
+  files named as such); they record nothing in the session. Additive; no stored shape changed.
+- Web UI: a **Browse…** folder picker and a "Create and start" confirmation on the New mission form; a **Files** tab in
+  the inspector (and a Files button in the session header), a file viewer mode, and **Open file** on tool rows. The
+  fixture (`tools/ui-preview.mjs`) mirrors the routes. `docs/UI.md`, `docs/DESIGN.md` section 12 and `docs/RUN.md`
+  are updated.
+- Hardening: "inside the loom home or copies folder" is judged by file identity, so `/System/Volumes/Data/...` and links
+  no longer get around it (also re-judged once a new workspace exists, which is removed again if it landed there); a new
+  workspace gets its `.loom` (0700), so Bubblewrap can start in it, and a request that fails after the folder was made
+  removes what it made; an existing workspace inside the loom home is refused. Both listings read a folder through one
+  open descriptor, and the Files routes refuse anything that resolves into the loom home (a workspace may hold it); a
+  line page keeps no per-line index. UI: the first read of the workspace root is no longer started twice, the folder
+  lists no longer leak scroll height, the focused row is scrolled into view, coarse-pointer targets are 44 px, and
+  Backspace/Alt+Up go up from an empty folder. Additive; no stored shape changed.
+
 ### Web UI pass 2: supervising many missions
 
 - Switcher (Ctrl/Cmd+K, `Switch…`), Alt+Up/Down and Alt+Shift+Up/Down (next mission that needs you), and a `?`

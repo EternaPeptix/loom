@@ -1323,8 +1323,11 @@ POST /api/login-codes                         → {code, expires_in_s: 60}
 API token or web-session secret:
 GET  /api/status                              → StatusView
 GET  /api/sessions?archived=true|false        → [SessionInfo], newest first
-POST /api/sessions                            NewSession → 201 SessionInfo
-                                              {workspace, pack?, role?, model?, title?, unattended?, budget?, message?}
+POST /api/sessions                            NewSession → 201 SessionInfo + created
+                                              {workspace, pack?, role?, model?, title?, unattended?, budget?, message?,
+                                               create_workspace?}; `~` and `~/x` in workspace mean the daemon user's
+                                              home; a missing workspace is made only when create_workspace is true, and
+                                              `created: true` in the answer says it was (409 otherwise, with the sentence)
 GET  /api/sessions/{id}                       → SessionDetail (SessionInfo + children, oldest first)
 GET  /api/sessions/{id}/records?after=&limit= → {records, next_after}   (limit: default 500, at most 2000)
 GET  /api/sessions/{id}/stream?after=         SSE, below (Last-Event-ID when after is absent)
@@ -1339,6 +1342,11 @@ POST /api/sessions/{id}/resume                → 202 {}
 POST /api/sessions/{id}/reweave               → 202 {}
 POST /api/sessions/{id}/archive               {archived} → 200 {}
 GET  /api/sessions/{id}/window                → WindowView
+GET  /api/sessions/{id}/files?path=           → FilesView {root, path, entries: [{name, kind: dir|file|link|other, size, mtime_ms,
+                                              hidden, note?, error?}], more}   (read-only, inside the session's workspace)
+GET  /api/sessions/{id}/files/lines?path=&start=&count=
+                                              → {path, text, first, last, total, total_lines, bytes, mtime_ms, binary}
+                                              (1-based; count default 2000, 1–5000; at most 32 MiB of a file is read)
 GET  /api/sessions/{id}/net?limit=            → [NetEntry], the last `limit` (default 200, at most 2000)
 GET  /api/missions                            → [MissionInfo]
 GET  /api/missions/{id}/ledger                → LedgerView {state, markdown, skipped, skipped_detail, torn_tail, ahead_of_head}
@@ -1348,10 +1356,23 @@ POST /api/inbox/{item_id}                     {answer} → 202 {}
 GET  /api/blobs/{handle}                      → BlobRef {id, bytes, lines}
 GET  /api/blobs/{handle}/raw                  the stored bytes (application/octet-stream, attachment)
 GET  /api/blobs/{handle}/lines?start=&end=    → {text, first, last, total}  (1-based; default 1–2000, ≤ 5000 lines)
+GET  /api/fs/dirs?path=                       → DirsView {path, parent, home, entries: [{name, path, hidden, link}], more}
+                                              (folders only; default the daemon user's home; the loom home is refused)
 GET  /api/events?deltas=true|false            SSE, below
 POST /api/gc                                  {apply?} → SweepReport
 POST /api/shutdown                            → 202 {}
 ```
+
+**Folders and files.** `fs/dirs` and the two `files` routes are operator-side reads: they register no
+observation or evidence, write nothing and add nothing to a session's record. `fs/dirs` returns folder names
+only (at most 2,000, the rest counted in `more`; a link to a folder is listed with `link: true` and the folder
+it resolves to as `path`; the loom home is refused and entries that lead into it are left out). The `files`
+routes are confined to the session's canonical workspace: `..`, absolute paths and NUL are refused (409), a link
+that leads outside is shown as `link` and not followed, and the root's `.loom` is listed as a closed hidden entry
+(`note: "harness files are not shown"`) and never opened by name, case or link. A file is opened with
+`loom_tools::files::open_readable`, which judges the real path of the descriptor; a binary file (a NUL in its
+first 8 KiB) answers `binary: true` with no lines. A session's workspace may be created by `POST /api/sessions`
+only after the path is checked (not relative, not in the loom home or its copies folder, not under a file).
 
 The wire types are `crate::wire` and the serde form of the runtime's types; `docs/UI.md` lists the
 conventions. **Records** are served as this build reads them: a known record is re-encoded field for

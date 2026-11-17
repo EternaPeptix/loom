@@ -8,6 +8,13 @@
 // reweave record). New sessions: m-fleet (13 agents to depth 4, s-fl-*), s-parked (parked on necromicon with a recorded
 // error), s-quiet (running, last record 41 min old), s-notify (running, for /__fixture/end), s-tools (every ToolStatus),
 // s-big (5,000 records for Find).
+// Workspace folders add (shapes and status codes mirror crates/loom-daemon: refusals are 409, a missing path 404, a bad query 400):
+// GET /api/fs/dirs?path= (fake home /fixture/user; /fixture/home is the loom home and is refused;
+// /fixture/user/many has 2,300 folders; /fixture/user/shared is a link), POST /api/sessions (a missing workspace is refused
+// with the daemon's sentence; with create_workspace it is made and the answer carries created: true), and the Files routes
+// GET /api/sessions/{id}/files?path= and .../files/lines?path=&start=&count= over the workspaces /fixture/loom (nested
+// folders, big.log with 20,000 lines, target.bin binary, huge.sql over the 32 MiB cap, outside a link, locked unreadable,
+// pipe not a file, generated with 2,050 entries, .loom closed) and /fixture/indexer.
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
@@ -188,6 +195,11 @@ append("s-fl-net", "inbox_opened", { ts_ms: now - 9 * MIN, ...inbox.find(e => e.
   startOf(sessionOf("s-tools"), t0, "Try the build, write the config, and read the log.");
   t = step("s-tools", t, { text: "Running the tests.", command: "make test", status: "error", out: "make: *** [test] Error 2", exit: 2 });
   t = step("s-tools", t, { command: "make lint", out: "lint: clean", exit: 0 });
+  // Paths for the Files tab's "Open file": inside /fixture/loom (absolute and relative), the binary one, and one that is not there.
+  t = step("s-tools", t, { name: "read", cls: "read", args: { path: "/fixture/loom/crates/loom-agent/src/runtime.rs", start: 1, end: 5 }, out: "//! runtime.rs: fixture source\n    // line 2 of runtime.rs", ms: 12 });
+  t = step("s-tools", t, { name: "edit", cls: "write", args: { path: "notes/no-newline.txt", old: "one", new: "two" }, out: "edited notes/no-newline.txt", ms: 9 });
+  t = step("s-tools", t, { name: "read", cls: "read", args: { path: "target.bin" }, out: "(binary file)", ms: 4 });
+  t = step("s-tools", t, { name: "read", cls: "read", args: { path: "src/removed.rs" }, status: "error", out: "no such file: src/removed.rs", ms: 4 });
   t = step("s-tools", t, { name: "write", cls: "write", args: { path: "/etc/hosts", text: "127.0.0.1 fixture" }, status: "denied", out: "denied: /etc/hosts is outside the sandbox's writable paths (the workspace and /tmp). Nothing was written." });
   t = step("s-tools", t, { name: "read", cls: "read", args: { path: "big.log", start: "top" }, status: "invalid", out: "invalid arguments for read: `start` must be an integer, got \"top\". Nothing ran.", ms: 5 });
   t = step("s-tools", t, { command: "sleep 600", status: "timeout", out: "timed out after 120s; the process was killed. Its output so far is stored.", ms: 120000 });
@@ -306,6 +318,186 @@ function emit(event) { for (const res of clients) res.write("data: " + JSON.stri
 function json(res, value, status = 200) { const body = JSON.stringify(value); res.writeHead(status, { "content-type": "application/json", "cache-control": "no-store" }); res.end(body); }
 async function body(req) { let text = ""; for await (const chunk of req) text += chunk; return text ? JSON.parse(text) : {}; }
 const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
+// ---- Workspace folders: the picker (GET /api/fs/dirs), creating a missing workspace (POST /api/sessions with
+// create_workspace) and the Files tab (GET /api/sessions/{id}/files, .../files/lines). All in memory; nothing is read or written on disk.
+const USER_HOME = "/fixture/user";
+const LOOM_HOME = "/fixture/home"; // /api/status.home: workspaces inside it are refused, as the daemon refuses them
+const FILE_CAP = 32 * 1024 * 1024;
+const dirNode = (children = {}, extra = {}) => ({ kind: "dir", mtime: now - 3600000, children, ...extra });
+const fileNode = (text, mtime = now - 7200000) => ({ kind: "file", mtime, text });
+const rustText = (name) => Array.from({ length: 140 }, (_, i) => i === 0 ? `//! ${name}: fixture source` : i % 9 === 0 ? `fn step_${i}() -> usize { ${i} }` : `    // line ${i + 1} of ${name}`).join("\n") + "\n";
+const bigLog = Array.from({ length: 20000 }, (_, i) => `2026-11-16T10:${String(Math.floor(i / 600) % 60).padStart(2, "0")}:${String(i % 60).padStart(2, "0")}Z INFO tick ${i + 1}${i === 12344 ? " needle: only in the loaded range" : ""}`).join("\n") + "\n";
+function loomTree() {
+  return dirNode({
+    "Cargo.toml": fileNode("[workspace]\nmembers = [\"crates/*\"]\n"),
+    "README.md": fileNode("# loom\n\nA fixture workspace.\n\nA <b>line</b> with markup stays inert text.\n", now - 60000),
+    ".gitignore": fileNode("target/\n"), ".env": fileNode("FIXTURE=1\n"),
+    ".loom": dirNode({ "oracle.key": fileNode("never listed\n") }, { harness: true }),
+    crates: dirNode({
+      "loom-agent": dirNode({ src: dirNode({ "runtime.rs": fileNode(rustText("runtime.rs")), "session.rs": fileNode(rustText("session.rs")), "pack.rs": fileNode(rustText("pack.rs")) }) }),
+      "loom-core": dirNode({ src: dirNode({ "ledger.rs": fileNode(rustText("ledger.rs")), "event.rs": fileNode(rustText("event.rs")) }) }),
+    }),
+    docs: dirNode({ "DESIGN.md": fileNode("# Design\n\nFixture text.\n"), "UI.md": fileNode("# UI\n") }),
+    notes: dirNode({ "empty.txt": fileNode(""), "no-newline.txt": fileNode("one line without a final newline") }),
+    "big.log": fileNode(bigLog, now - 90000),
+    "huge.sql": { kind: "file", mtime: now - 86400000, huge: 40 * 1024 * 1024 },
+    "target.bin": { kind: "file", mtime: now - 5 * 86400000, binary: 4096 },
+    outside: { kind: "link", mtime: now - 86400000 },
+    locked: dirNode({}, { error: "Permission denied (os error 13)" }),
+    pipe: { kind: "other", mtime: now - 86400000 },
+    generated: dirNode({}, { many: 2050 }),
+  });
+}
+function indexerTree() {
+  return dirNode({
+    "bench.toml": fileNode("[corpus]\nsmall = 10\nlarge = 1000\n"), ".loom": dirNode({}, { harness: true }),
+    src: dirNode({ "index.rs": fileNode(rustText("index.rs")) }),
+    results: dirNode({ "baseline.csv": fileNode("corpus,ms\nsmall,412\nlarge,9120\n", now - 600000) }),
+  });
+}
+const wsRoots = new Map([["/fixture/loom", loomTree()], ["/fixture/indexer", indexerTree()], ["/fixture/docs", dirNode({ "plan.md": fileNode("# Plan\n") })], ["/fixture/pipeline", dirNode({ "build.sh": fileNode("#!/bin/sh\n") })]]);
+const fsStatic = new Map([
+  ["/", ["fixture"]],
+  ["/fixture", ["user", "loom", "indexer", "docs", "pipeline", "tmp"]],
+  ["/fixture/home", [".loom"]], ["/fixture/tmp", ["scratch"]],
+  ["/fixture/user", ["code", "Documents", ".config", ".cache", "shared", "many"]],
+  ["/fixture/user/code", ["alpha", "beta", "gamma"]],
+  ["/fixture/user/Documents", ["Invoices", "Notes"]],
+]);
+const fsLinks = new Map([["/fixture/user/shared", "/fixture/tmp"]]);
+const fsFiles = new Set(["/fixture/user/readme.txt"]);
+const expandHome = (p) => p === "~" ? USER_HOME : p.startsWith("~/") ? USER_HOME + p.slice(1) : p;
+const cleanPath = (p) => p.length > 1 ? p.replace(/\/+$/, "") : p;
+const inside = (p, root) => p === root || p.startsWith(root + "/");
+function wsNode(path) {
+  for (const [root, tree] of wsRoots) {
+    if (!inside(path, root)) continue;
+    let node = tree;
+    for (const part of path.slice(root.length).split("/").filter(Boolean)) { node = node.kind === "dir" && node.children ? node.children[part] : null; if (!node) return null; }
+    return node;
+  }
+  return null;
+}
+/** The names of the folders directly in `path` ({name, link?}), or null when there is no folder there. */
+function fsDirs(path) {
+  if (path === "/fixture/user/many") return Array.from({ length: 2300 }, (_, i) => ({ name: "d" + String(i + 1).padStart(4, "0") }));
+  const real = fsLinks.get(path) || path;
+  if (fsStatic.has(real)) {
+    return fsStatic.get(real).map((name) => ({ name, link: fsLinks.has(real === "/" ? "/" + name : real + "/" + name) || undefined }));
+  }
+  // A folder named in its parent's list but with no list of its own is empty.
+  const above = real.slice(0, real.lastIndexOf("/")) || "/";
+  if (fsStatic.has(above) && fsStatic.get(above).includes(real.slice(real.lastIndexOf("/") + 1))) return [];
+  const node = wsNode(real);
+  if (node && node.kind === "dir") return Object.entries(node.children || {}).filter(([, c]) => c.kind === "dir").map(([name]) => ({ name }));
+  return null;
+}
+function fsMkdirp(path) {
+  let at = "";
+  for (const part of path.split("/").filter(Boolean)) {
+    const parent = at || "/"; at += "/" + part;
+    if (fsDirs(at) !== null) continue;
+    if (fsStatic.has(parent)) fsStatic.get(parent).push(part);
+    else { const node = wsNode(parent); if (node && node.children) node.children[part] = dirNode(); }
+    fsStatic.set(at, fsStatic.get(at) || []);
+  }
+  if (!wsNode(path) && !wsRoots.has(path) && !path.startsWith("/fixture/user")) wsRoots.set(path, dirNode());
+}
+function fsListing(rawPath) {
+  const path = cleanPath(expandHome(String(rawPath || USER_HOME)));
+  if (!path.startsWith("/")) return { status: 409, error: `${path} is not an absolute path. Give a path that starts with / or ~/.` };
+  if (inside(path, LOOM_HOME)) return { status: 409, error: `The loom home (${LOOM_HOME}) is not listed: it holds the daemon's keys and sessions. Choose another folder.` };
+  if (fsFiles.has(path)) return { status: 409, error: `${path} is not a folder.` };
+  const dirs = fsDirs(path);
+  if (dirs === null) return { status: 404, error: `There is no folder ${path}.` };
+  const resolved = fsLinks.get(path) || path;
+  const entries = dirs.map((d) => {
+    const full = resolved === "/" ? "/" + d.name : resolved + "/" + d.name;
+    const target = fsLinks.get(full);
+    return { name: d.name, path: target || full, hidden: d.name.startsWith("."), link: !!target };
+  }).sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
+  const shown = entries.slice(0, 2000);
+  return { status: 200, value: { path: resolved, parent: resolved === "/" ? null : resolved.slice(0, resolved.lastIndexOf("/")) || "/", home: USER_HOME, entries: shown, more: entries.length - shown.length } };
+}
+const workspaceOf = (id) => (sessions.find((s) => s.id === id) || {}).workspace;
+/** Resolve a workspace-relative path as the daemon's fsview::resolve_in does (every refusal is a 409 except a missing path, 404). */
+function wsResolve(id, rel) {
+  const ws = workspaceOf(id);
+  if (!ws) return { status: 404, error: `There is no session ${id}.` };
+  const root = wsRoots.get(ws);
+  if (!root) return { status: 404, error: `There is no file or folder ${rel} in the workspace.` };
+  const raw = String(rel || "");
+  if (raw.includes("\0")) return { status: 409, error: "That path is not valid: it contains a NUL character." };
+  if (raw.startsWith("/")) return { status: 409, error: `The path ${raw} is absolute. Give a path relative to the workspace.` };
+  const pieces = raw.split("/").filter((p) => p && p !== ".");
+  if (pieces.includes("..")) return { status: 409, error: `The path ${raw} uses \`..\`. Paths are relative to the workspace and stay inside it.` };
+  const text = pieces.join("/");
+  if (pieces[0] && pieces[0].toLowerCase() === ".loom") return { status: 409, error: `${text} is not shown: harness files are not shown.` };
+  let node = root;
+  for (const part of pieces) {
+    node = node.kind === "dir" ? (node.children || {})[part] : null;
+    if (!node) return { status: 404, error: `There is no file or folder ${text} in the workspace.` };
+    if (node.kind === "link") return { status: 409, error: `${text} is a link that leads outside the workspace (/fixture/outside); it is not followed.` };
+  }
+  return { node, ws, parts: pieces, text };
+}
+const nodeSize = (n) => n.kind === "file" ? (n.huge ?? n.binary ?? Buffer.byteLength(n.text || "")) : 0;
+function filesListing(id, rel) {
+  const r = wsResolve(id, rel);
+  if (r.error) return r;
+  const shown = r.text || "the workspace root";
+  if (r.node.kind !== "dir") return { status: 409, error: `${shown} is a file, not a folder. Read it with the files/lines route.` };
+  if (r.node.error) return { status: 409, error: `${shown} cannot be listed: ${r.node.error}.` };
+  let names = Object.entries(r.node.children || {});
+  if (r.node.many) names = names.concat(Array.from({ length: r.node.many }, (_, i) => [`item-${String(i + 1).padStart(4, "0")}.txt`, fileNode("x\n")]));
+  const entries = names.map(([name, c]) => {
+    const closed = r.parts.length === 0 && name.toLowerCase() === ".loom";
+    return {
+      name, kind: closed ? "dir" : c.kind, size: closed ? 0 : nodeSize(c), mtime_ms: closed ? 0 : c.mtime, hidden: name.startsWith("."),
+      ...(closed ? { note: "harness files are not shown" } : {}),
+    };
+  }).sort((a, b) => (a.kind === "dir" ? 0 : 1) - (b.kind === "dir" ? 0 : 1) || a.name.toLowerCase().localeCompare(b.name.toLowerCase()) || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  return { value: { root: r.ws, path: r.text, entries: entries.slice(0, 2000), more: Math.max(0, entries.length - 2000) } };
+}
+function filesLines(id, rel, start, count) {
+  const r = wsResolve(id, rel);
+  if (r.error) return r;
+  if (!r.text) return { status: 409, error: "Name a file: the path is the workspace root." };
+  if (r.node.kind !== "file") return { status: 409, error: `${r.text} is ${r.node.kind === "dir" ? "a directory" : "not a regular file"}, not a file that can be shown.` };
+  const size = nodeSize(r.node);
+  if (r.node.huge) return { status: 409, error: `${r.text} is ${Math.floor(size / 1048576)} MiB, more than the 32 MiB the viewer reads. Look at part of it with \`sed -n\` or \`head\` in a terminal.` };
+  const mtime_ms = r.node.mtime;
+  if (r.node.binary) return { value: { path: r.text, text: "", first: 0, last: 0, total: 0, total_lines: 0, bytes: size, mtime_ms, binary: true } };
+  // Raw lines, each with its own newline (the last has none when the file has none), as the daemon cuts them.
+  const lines = r.node.text === "" ? [] : r.node.text.match(/[^\n]*\n|[^\n]+$/g);
+  const total = lines.length;
+  const first = Math.max(1, Math.floor(start) || 1);
+  const n = Math.max(1, Math.min(5000, Math.floor(count) || 2000));
+  const last = Math.min(total, first + n - 1);
+  const text = first > total ? "" : lines.slice(first - 1, last).join("");
+  return { value: { path: r.text, text, first, last, total, total_lines: total, bytes: size, mtime_ms, binary: false } };
+}
+let createdSessions = 0;
+async function createSession(data) {
+  const raw = String(data.workspace || "").trim();
+  if (!raw) return { status: 400, error: "A workspace is required." };
+  if (data.create_workspace !== undefined && typeof data.create_workspace !== "boolean") return { status: 400, error: "create_workspace must be true or false." };
+  const path = cleanPath(expandHome(raw));
+  if (!path.startsWith("/")) return { status: 409, error: `The workspace ${raw} is a relative path that does not exist. Give an absolute path, or one that starts with ~/.` };
+  if (inside(path, LOOM_HOME)) return { status: 409, error: `The workspace ${path} is inside the loom home (${LOOM_HOME}) or its copies folder, which sessions cannot use. Choose a folder elsewhere.` };
+  let created = false;
+  if (fsDirs(path) === null) {
+    if (!data.create_workspace) return { status: 409, error: `The workspace ${path} does not exist. Create it from the new-mission form (Create), or run \`loom run --create-workspace\`.` };
+    fsMkdirp(path); created = true;
+  }
+  const id = "s-new-" + (++createdSessions);
+  const info = session(id, String(data.title || "").trim() || String(data.message || "New mission").split("\n")[0].slice(0, 60), { phase: "idle", last_end: "waiting", workspace: path, profile: data.model && profileOf(data.model) ? data.model : "dsv41", mission: "m-" + id, age: 0 });
+  sessions.push(info);
+  append(id, "session_start", { session: id, mission: info.mission, parent: null, workspace: path, pack: info.pack, role: info.role, termination: "explicit", model: modelRef(profileOf(info.profile)), budget: {}, reasoning_replay: "all", tools: [] }, "harness", false);
+  append(id, "user_message", { text: data.message }, "user");
+  emit({ type: "session", info });
+  return { status: 201, value: { ...info, created } };
+}
 const server = createServer(async (req, res) => {
   try {
     const url = new URL(req.url, "http://localhost");
@@ -366,6 +558,7 @@ const server = createServer(async (req, res) => {
     if (req.method === "POST" && path.startsWith("/api/")) {
       const data = await body(req); requests.push({ path, body: data });
       const parts = path.split("/");
+      if (path === "/api/sessions") { const made = await createSession(data); return made.error ? json(res, { error: made.error }, made.status) : json(res, made.value, made.status); }
       if (parts[2] === "inbox") {
         const entry = inbox.find(e => e.item.item_id === parts[3]);
         if (!entry) return json(res, { error: "No such open fixture item." }, 404);
@@ -398,6 +591,20 @@ const server = createServer(async (req, res) => {
       else if (parts[4] === "resume") info.status = { ...info.status, phase: "running", last_end: null };
       else if (parts[4] === "archive") info.archived = data.archived;
       emit({ type: "status", session: id, status: info.status }); return json(res, {}, 202);
+    }
+    if (path === "/api/fs/dirs") { const r = fsListing(url.searchParams.get("path")); return r.error ? json(res, { error: r.error }, r.status) : json(res, r.value); }
+    const filesMatch = path.match(/^\/api\/sessions\/([^/]+)\/files(\/lines)?$/);
+    if (filesMatch && req.method === "GET") {
+      const sid = decodeURIComponent(filesMatch[1]);
+      let r;
+      if (filesMatch[2]) {
+        // The daemon's query rules: path is required, start and count are numbers when present (400 otherwise).
+        const q = url.searchParams, num = (k) => (q.has(k) ? (/^\d+$/.test(q.get(k)) ? Number(q.get(k)) : NaN) : undefined);
+        if (!(q.get("path") || "").trim()) r = { status: 400, error: "path is required: the file's path relative to the workspace" };
+        else if (Number.isNaN(num("start")) || Number.isNaN(num("count"))) r = { status: 400, error: "start and count must be whole numbers." };
+        else r = filesLines(sid, q.get("path"), num("start"), num("count"));
+      } else r = filesListing(sid, url.searchParams.get("path") || "");
+      return r.error ? json(res, { error: r.error }, r.status) : json(res, r.value);
     }
     if (path === "/api/sessions") return json(res, sessions.map(s => ({ ...s, status: { ...s.status, open_inbox: inbox.filter(e => e.session === s.id).length } })));
     if (path === "/api/inbox") return json(res, inbox);

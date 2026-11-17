@@ -837,7 +837,7 @@ kbd { display: inline-block; min-width: 1.6em; padding: 0 5px; border: 1px solid
   .btn.with-keys kbd { display: none; }
 }
 /* A scrolling list holds its own visually hidden text, so a clipped row's hidden words cannot make the page itself scroll. */
-.sessions, .switcher-list, .inbox-list { position: relative; }
+.sessions, .switcher-list, .inbox-list, .dir-list, .file-list { position: relative; }
 
 /* Agents tab: groups in a fixed order, rows in creation order; indent follows depth to 3. */
 .agents-total { margin: 12px 0 16px; padding: 12px 16px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg-2); }
@@ -909,3 +909,78 @@ kbd { display: inline-block; min-width: 1.6em; padding: 0 5px; border: 1px solid
   .keycaps { display: none; }
 }
 @media (max-width: 699px) { .keycaps { display: none; } }
+
+/* Workspace folders: the New mission picker, the create confirmation and the Files tab. */
+.form .field { display: flex; flex-direction: column; gap: 4px; }
+.form .field > label { color: var(--dim); font-size: 12px; }
+.field-row { display: flex; gap: 6px; align-items: stretch; min-width: 0; }
+.field-row input[type="text"] { flex: 1 1 auto; min-width: 0; padding: 8px 10px; border: 1px solid var(--line-2); border-radius: var(--r-md); background: var(--bg-2); color: var(--strong); }
+.field-row .btn { flex: 0 0 auto; }
+.field-note { margin: 0; font-size: 12px; overflow-wrap: anywhere; }
+.field-note[hidden], .create-confirm[hidden] { display: none; }
+.create-confirm { order: 0; flex: 0 0 auto; }
+.form #f-receipt { margin: 0; font-size: 13px; }
+
+.picker { width: min(720px, calc(100vw - 32px)); height: min(640px, calc(100dvh - 64px)); }
+.picker-body { display: flex; flex-direction: column; gap: 8px; min-height: 0; }
+.picker-crumbs { display: flex; flex-wrap: wrap; align-items: center; gap: 2px; font-family: var(--mono); font-size: 12px; }
+.picker-crumbs .btn.link, .files-crumbs .btn.link { padding: 2px 4px; min-height: 24px; font-family: var(--mono); font-size: 12px; }
+.crumb-sep { color: var(--caption); font-size: 12px; }
+.picker-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; }
+.picker-tools label.check, .files-tools label.check { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; }
+.picker-newrow { display: flex; flex-direction: column; gap: 4px; }
+.picker-newrow[hidden], .picker-recent[hidden] { display: none; }
+.picker-recent h3 { margin: 0 0 4px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; color: var(--dim); }
+.picker-recent-list { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 4px; }
+.picker-recent-list .btn { max-width: 100%; font-family: var(--mono); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.picker-status { margin: 0; min-height: 18px; font-size: 12px; overflow-wrap: anywhere; }
+.picker-status.bad { color: var(--bad); }
+.dir-list, .file-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 1px; }
+.dir-list { flex: 1 1 auto; min-height: 96px; overflow: auto; border: 1px solid var(--line); border-radius: var(--r-md); padding: 3px; }
+.dir-row, .file-row { display: flex; align-items: center; gap: 8px; width: 100%; min-height: 30px; padding: 4px 8px; border: 1px solid transparent; border-radius: var(--r-sm); background: none; color: var(--fg); font: inherit; text-align: left; cursor: pointer; min-width: 0; }
+.dir-row:hover, .file-row:hover { background: var(--hover); }
+.dir-row:focus-visible, .file-row:focus-visible, .viewer-scroll:focus-visible { outline: 2px solid var(--info); outline-offset: -2px; }
+.dir-row .icon, .file-row .icon { width: 13px; height: 13px; color: var(--dim); }
+.dir-row .nm, .file-row .nm { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dir-row.hid .nm, .file-row.hid .nm { color: var(--dim); }
+.dir-row .tag, .file-row .tag, .file-row .meta { flex: 0 0 auto; font-size: 11px; color: var(--caption); font-variant-numeric: tabular-nums; }
+.file-row[aria-disabled="true"] { cursor: default; color: var(--dim); }
+.file-row[aria-disabled="true"]:hover { background: none; }
+.file-row.picked { border-color: var(--info); background: var(--sel); }
+.picker-foot { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 10px 14px; border-top: 1px solid var(--line); flex: 0 0 auto; }
+.picker-choice { flex: 1 1 14rem; min-width: 0; margin: 0; font-size: 12px; color: var(--fg); overflow-wrap: anywhere; }
+
+.files-box { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.files-crumbs { display: flex; flex-wrap: wrap; align-items: center; gap: 2px; }
+.files-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; }
+.files-tools input[type="search"] { flex: 1 1 8em; min-width: 0; padding: 4px 8px; border: 1px solid var(--line-2); border-radius: var(--r-sm); background: var(--bg-2); color: var(--strong); font: inherit; }
+.files-status { margin: 0; min-height: 16px; font-size: 12px; overflow-wrap: anywhere; }
+.files-status.bad { color: var(--bad); }
+.files-note { margin: 0 0 4px; font-size: 12px; }
+.panel .file-list li { padding: 0; border-bottom: 0; }
+.tool-open { display: flex; align-items: center; gap: 8px; margin: 0 0 4px; }
+.tool-open .mono { font-size: 12px; color: var(--caption); overflow-wrap: anywhere; }
+.viewer-file-note { margin: 0; font-weight: 600; color: var(--attn-text); }
+@media (max-width: 699px) {
+  .picker { width: calc(100vw - 16px); height: calc(100dvh - 24px); }
+  .field-row { flex-wrap: wrap; }
+  .field-row input[type="text"] { flex: 1 1 100%; }
+}
+@media (pointer: coarse) {
+  .dir-row, .file-row, .picker-tools .btn, .picker-recent-list .btn, .field-row .btn { min-height: 44px; }
+  /* Same specificity as the crumbs' base rule above, which would otherwise keep them at 24px. */
+  .picker-crumbs .btn.link, .files-crumbs .btn.link { min-height: 44px; min-width: 44px; }
+  .picker-tools label.check, .files-tools label.check { min-height: 44px; }
+  .files-tools input[type="search"] { min-height: 44px; }
+}
+.file-row .nm { flex: 1 1 auto; }
+.file-row[aria-disabled="true"] .nm { flex: 0 0 auto; max-width: 55%; }
+.file-row[aria-disabled="true"] .tag { flex: 1 1 0; min-width: 0; white-space: normal; text-align: right; overflow-wrap: anywhere; }
+.picker-body > * { flex: 0 0 auto; }
+.picker-body > .dir-list { flex: 1 1 auto; min-height: 140px; }
+.picker-body { overflow: hidden; }
+.picker-recent-list { max-height: 7.5em; overflow-y: auto; }
+@media (max-width: 699px), (max-height: 700px) {
+  .picker-body { overflow: auto; }
+  .picker-body > .dir-list { flex: 0 0 auto; min-height: 180px; max-height: 60vh; }
+}

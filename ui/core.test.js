@@ -2854,3 +2854,200 @@ test("mergeInboxList: a record that landed while the snapshot was out outranks i
   assert.deepEqual(ids(C.mergeInboxList([e("gone"), e("old"), e("kept")], touched, 4)), ["kept", "new", "old"], "a change from before the request is already in the snapshot");
   assert.deepEqual(ids(C.mergeInboxList([e("kept")], new Map(), 0)), ["kept"]);
 });
+
+// ---- workspace folders: picker, create flow, Files tab ----
+
+test("byteSize and fsDirsUrl", () => {
+  assert.equal(C.byteSize(812), "812 B");
+  assert.equal(C.byteSize(1536), "1.5 KiB");
+  assert.equal(C.byteSize(4 * 1024 * 1024), "4.0 MiB");
+  assert.equal(C.byteSize(300 * 1024), "300 KiB");
+  assert.equal(C.byteSize(-3), "0 B");
+  assert.equal(C.fsDirsUrl(""), "/api/fs/dirs");
+  assert.equal(C.fsDirsUrl("~/a b"), "/api/fs/dirs?path=~%2Fa%20b");
+});
+
+test("picker paths: join, parent, breadcrumbs", () => {
+  assert.equal(C.joinPath("/", "x"), "/x");
+  assert.equal(C.joinPath("/a/b", "c"), "/a/b/c");
+  assert.equal(C.joinPath("/a/b/", "c"), "/a/b/c");
+  assert.equal(C.parentPath("/a/b"), "/a");
+  assert.equal(C.parentPath("/a"), "/");
+  assert.equal(C.parentPath("/"), null);
+  assert.equal(C.parentPath("rel"), null);
+  assert.deepEqual(C.pathCrumbs("/Users/me/code"), [
+    { name: "/", path: "/" }, { name: "Users", path: "/Users" }, { name: "me", path: "/Users/me" }, { name: "code", path: "/Users/me/code" },
+  ]);
+  assert.deepEqual(C.pathCrumbs("/"), [{ name: "/", path: "/" }]);
+  assert.deepEqual(C.pathCrumbs("relative"), []);
+});
+
+test("recentWorkspaces: newest first, each once, activity counts", () => {
+  const infos = [
+    { id: "a", workspace: "/w/one", created_ms: 100 },
+    { id: "b", workspace: "/w/two", created_ms: 300 },
+    { id: "c", workspace: "/w/one", created_ms: 200 },
+    { id: "d", workspace: "", created_ms: 900 },
+    { id: "e", workspace: "/w/three", created_ms: 50 },
+  ];
+  assert.deepEqual(C.recentWorkspaces(infos), ["/w/two", "/w/one", "/w/three"]);
+  // A record seen later in /w/three moves it up.
+  assert.deepEqual(C.recentWorkspaces(infos, new Map([["e", { ts: 1000 }]])), ["/w/three", "/w/two", "/w/one"]);
+  assert.deepEqual(C.recentWorkspaces(infos, new Map(), 2), ["/w/two", "/w/one"]);
+  assert.deepEqual(C.recentWorkspaces([]), []);
+});
+
+test("visibleDirs hides dot folders unless asked", () => {
+  const entries = [{ name: "src", hidden: false }, { name: ".git", hidden: true }];
+  assert.deepEqual(C.visibleDirs(entries, false).map((e) => e.name), ["src"]);
+  assert.deepEqual(C.visibleDirs(entries, true).map((e) => e.name), ["src", ".git"]);
+});
+
+test("checkFolderName validates a new folder's name", () => {
+  assert.deepEqual(C.checkFolderName("  notes "), { name: "notes" });
+  for (const bad of ["", "   ", ".", "..", "a/b", "a\\b", "bad\u0001name", "x".repeat(256)]) assert.ok(C.checkFolderName(bad).error, JSON.stringify(bad));
+  assert.match(C.checkFolderName("src", ["src"]).error, /already exists/);
+  assert.equal(C.checkFolderName("é".repeat(127)).name, "é".repeat(127));
+  assert.ok(C.checkFolderName("é".repeat(128)).error);
+});
+
+test("creating a missing workspace: the flag, the detection and the question", () => {
+  const base = { workspace: " /w/new ", message: "go", role: "lead", unattended: true };
+  assert.equal("create_workspace" in C.buildNewSession(base).body, false);
+  assert.equal(C.buildNewSession({ ...base, createWorkspace: true }).body.create_workspace, true);
+  assert.equal(C.buildNewSession({ ...base, createWorkspace: true }).body.workspace, "/w/new");
+  assert.ok(C.missingWorkspaceError("The workspace /w/new does not exist. Create it from the UI or run `loom run --create-workspace`."));
+  assert.ok(!C.missingWorkspaceError("The workspace is inside the loom home."));
+  assert.ok(!C.missingWorkspaceError("The workspace rel/x is a relative path that does not exist. Give an absolute path, or one that starts with ~/."));
+  assert.equal(C.createWorkspaceQuestion("/w/new"), "/w/new does not exist. Create it and start the mission?");
+});
+
+test("relative paths of the Files tab", () => {
+  assert.equal(C.relJoin("", "a"), "a");
+  assert.equal(C.relJoin("a/b", "c"), "a/b/c");
+  assert.equal(C.relParent("a/b"), "a");
+  assert.equal(C.relParent("a"), "");
+  assert.equal(C.relParent(""), null);
+  assert.deepEqual(C.relCrumbs(""), [{ name: "workspace", path: "" }]);
+  assert.deepEqual(C.relCrumbs("src/ui"), [{ name: "workspace", path: "" }, { name: "src", path: "src" }, { name: "ui", path: "src/ui" }]);
+  assert.equal(C.filesUrl("s-1", ""), "/api/sessions/s-1/files");
+  assert.equal(C.filesUrl("s-1", "a b/c"), "/api/sessions/s-1/files?path=a%20b%2Fc");
+  assert.equal(C.fileLinesUrl("s-1", "a/b.txt", 1, 1000), "/api/sessions/s-1/files/lines?path=a%2Fb.txt&start=1&count=1000");
+});
+
+test("workspaceRelative: inside the workspace only", () => {
+  const ws = "/w/proj";
+  assert.equal(C.workspaceRelative(ws, "/w/proj/src/a.rs"), "src/a.rs");
+  assert.equal(C.workspaceRelative(ws, "/w/proj"), "");
+  assert.equal(C.workspaceRelative(ws + "/", "/w/proj/x"), "x");
+  assert.equal(C.workspaceRelative(ws, "/w/proj/a/../b"), "b");
+  assert.equal(C.workspaceRelative(ws, "/w/proj/../other/x"), null);
+  assert.equal(C.workspaceRelative(ws, "/w/project/x"), null);
+  assert.equal(C.workspaceRelative(ws, "/etc/hosts"), null);
+  assert.equal(C.workspaceRelative(ws, "src/a.rs"), "src/a.rs");
+  assert.equal(C.workspaceRelative(ws, "./src//a.rs"), "src/a.rs");
+  assert.equal(C.workspaceRelative(ws, "../a"), null);
+  assert.equal(C.workspaceRelative(ws, "a/../../b"), null);
+  assert.equal(C.workspaceRelative(ws, "~/a"), null);
+  assert.equal(C.workspaceRelative(ws, ""), null);
+  assert.equal(C.workspaceRelative("relative", "a"), null);
+});
+
+test("openFileTarget follows path arguments of file tools", () => {
+  const ws = "/w/proj";
+  assert.equal(C.openFileTarget({ name: "read", args: { path: "src/a.rs" } }, ws), "src/a.rs");
+  assert.equal(C.openFileTarget({ name: "edit", args: { file_path: "/w/proj/b.txt" } }, ws), "b.txt");
+  assert.equal(C.openFileTarget({ name: "grep", args: { pattern: "x", path: "src" } }, ws), "src");
+  assert.equal(C.openFileTarget({ name: "read", args: { path: "/etc/hosts" } }, ws), null);
+  assert.equal(C.openFileTarget({ name: "bash", args: { command: "cat a" } }, ws), null);
+  assert.equal(C.openFileTarget({ name: "read", args: null }, ws), null);
+  assert.equal(C.openFileTarget({ name: "read", args: ["a"] }, ws), null);
+  assert.equal(C.openFileTarget(null, ws), null);
+});
+
+test("Files rows: hidden, filter, harness entry, words", () => {
+  const entries = [
+    { name: "src", kind: "dir", size: 0, mtime_ms: 1 }, { name: ".loom", kind: "dir", size: 0, mtime_ms: 0, hidden: true, note: "harness files are not shown" },
+    { name: ".env", kind: "file", size: 5, mtime_ms: 1 }, { name: "Readme.md", kind: "file", size: 5, mtime_ms: 1 },
+    { name: "out", kind: "link", size: 0, mtime_ms: 1 }, { name: "locked", kind: "dir", error: "permission denied" },
+  ];
+  assert.deepEqual(C.fileRows(entries).map((e) => e.name), ["src", "Readme.md", "out", "locked"]);
+  assert.deepEqual(C.fileRows(entries, { showHidden: true }).map((e) => e.name), ["src", ".loom", ".env", "Readme.md", "out", "locked"]);
+  assert.deepEqual(C.fileRows(entries, { query: " READ" }).map((e) => e.name), ["Readme.md"]);
+  assert.deepEqual(C.fileRows(null), []);
+  assert.equal(C.isHarnessEntry(entries[1]), true);
+  assert.equal(C.fileEntryOpens(entries[1]), false);
+  assert.equal(C.fileEntryOpens(entries[0]), true);
+  assert.equal(C.fileEntryOpens(entries[3]), true);
+  assert.equal(C.fileEntryOpens(entries[4]), false);
+  assert.equal(C.fileEntryOpens(entries[5]), false);
+  assert.equal(C.fileEntryKind(entries[1]), "harness files are not shown");
+  assert.equal(C.fileEntryKind(entries[4]), "link: not opened here");
+  assert.equal(C.fileEntryKind(entries[5]), "permission denied");
+  assert.equal(C.fileEntryKind(entries[0]), "folder");
+  const listing = { entries, more: 12 };
+  assert.match(C.fileListWords(listing, 4), /4 entries\. 2 hidden entries not shown\. 12 more are not listed/);
+  assert.match(C.fileListWords({ entries: [], more: 0 }, 0), /empty/);
+  assert.match(C.fileListWords(listing, 1, { query: "x" }), /1 of 6 entries match/);
+});
+
+test("Files tab state and roving rows", () => {
+  const st = C.createFilesState("s-1", "/w/p");
+  assert.equal(st.path, "");
+  assert.equal(st.cache.size, 0);
+  const rows = [{ name: "a" }, { name: "b" }, { name: "c" }];
+  assert.equal(C.activeRowName(rows, "b"), "b");
+  assert.equal(C.activeRowName(rows, "gone"), "a");
+  assert.equal(C.activeRowName([], "x"), "");
+  assert.equal(C.stepRowName(rows, "a", "ArrowDown"), "b");
+  assert.equal(C.stepRowName(rows, "c", "ArrowDown"), "c");
+  assert.equal(C.stepRowName(rows, "a", "ArrowUp"), "a");
+  assert.equal(C.stepRowName(rows, "b", "End"), "c");
+  assert.equal(C.stepRowName(rows, "b", "Home"), "a");
+  assert.equal(C.stepRowName(rows, "b", "x"), null);
+  assert.equal(C.stepRowName([], "b", "Home"), null);
+});
+
+test("file lines view accepts the daemon's shape", () => {
+  const v = C.fileLinesView({ text: "a\nb\n", first: 1, last: 2, total_lines: 9, bytes: 4, binary: false });
+  assert.deepEqual(v, { text: "a\nb\n", first: 1, last: 2, total: 9, bytes: 4, binary: false });
+  assert.equal(C.fileLinesView({ text: "a\n", first: 1, last: 1, total: 3 }).total, 3);
+  const bin = C.fileLinesView({ binary: true, bytes: 2048, total_lines: 0 });
+  assert.equal(bin.binary, true);
+  assert.equal(bin.text, "");
+  assert.equal(bin.total, 0);
+  // The loaded lines of a file page like a stored output.
+  const viewer = C.createViewer("f", 0);
+  assert.equal(C.applyLines(viewer, C.fileLinesView({ text: "a\nb\n", first: 1, last: 2, total_lines: 3 })), true);
+  assert.equal(viewer.done, false);
+  assert.equal(C.applyLines(viewer, C.fileLinesView({ text: "c\n", first: 3, last: 3, total_lines: 3 })), true);
+  assert.equal(viewer.done, true);
+  // An empty file is done at once.
+  const empty = C.createViewer("f", 0);
+  C.applyLines(empty, C.fileLinesView({ text: "", first: 0, last: 0, total_lines: 0 }));
+  assert.equal(empty.done, true);
+  assert.equal(C.fileMetaWords({ size: 2048, mtime_ms: 1000 }, 1000 + 3 * 3600 * 1000), "modified 3h ago · 2.0 KiB");
+  assert.equal(C.fileMetaWords({ size: 5, mtime_ms: 1000 }, 1000), "modified just now · 5 B");
+  assert.match(C.FILE_NOW_WORDS, /may have changed since the agent read it/);
+});
+
+test("the Files tab reads a folder once: the root's empty path counts as being read", () => {
+  const st = C.createFilesState("s-1", "/w/p");
+  assert.equal(C.filesNeedsLoad(st), true);
+  st.loading = "";
+  assert.equal(C.filesNeedsLoad(st), false, "a read of the root in flight is not started again");
+  st.loading = "src";
+  assert.equal(C.filesNeedsLoad(st), false);
+  st.loading = null;
+  st.cache.set("", { entries: [] });
+  assert.equal(C.filesNeedsLoad(st), false);
+  st.path = "src";
+  assert.equal(C.filesNeedsLoad(st), true);
+  st.error = "x";
+  assert.equal(C.filesNeedsLoad(st), false);
+});
+
+test("Open file's accessible name begins with its visible label", () => {
+  assert.ok(C.openFileLabel("notes/a.txt").startsWith("Open file"));
+  assert.equal(C.openFileLabel(""), "Open file the workspace folder in the Files tab");
+});

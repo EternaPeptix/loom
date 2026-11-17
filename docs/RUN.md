@@ -249,7 +249,10 @@ loom run -w /path/to/workspace "the task, in plain words"
 ```
 
 `run` starts a lead session whose workspace is the `-w` / `--workspace` directory (without it, the
-current directory) and follows its record on the terminal. Everything after the options is the task;
+current directory; `~` and `~/x` mean your home directory). A workspace that does not exist is refused
+with a sentence saying so; add `--create-workspace` to make it (and the folders above it that are missing),
+and `run` prints `created workspace <path>` before the session id. A path inside the loom home or a relative
+path that does not exist is refused either way and follows its record on the terminal. Everything after the options is the task;
 `-` or no words reads it from standard input. The lead owns a mission ledger (goal, constraints,
 plan, claims with evidence), may delegate to workers and have a verifier attack its `finish`, and
 stops only through a terminating tool. Ctrl-C stops following, not the session.
@@ -294,7 +297,7 @@ Exit status of `run` and `send`: 0 after `Finished` or `Yielded`; 2 when you are
 | `loom models role <session> <role> --clear` | drop that choice: the pack picks again for agents started later |
 | `loom service install` / `uninstall` / `status` | the macOS login service |
 
-Options of `run` and `chat`: `-w/--workspace`, `--pack`, `--role`, `-m/--model` (a profile name),
+Options of `run` and `chat`: `-w/--workspace`, `--create-workspace`, `--pack`, `--role`, `-m/--model` (a profile name),
 `--agent-model ROLE=PROFILE` (repeatable; `all=PROFILE` for every role: the mission's agents start on
 it from the first one, as `loom models role` sets later),
 `-t/--title`, `--attended` (do not resume by itself after a restart), `--max-steps`, `--max-minutes`;

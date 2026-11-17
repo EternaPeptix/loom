@@ -21,7 +21,9 @@
 //!   joined by spaces; `-` or no message reads standard input to its end. Options → `NewSession`
 //!   (`--workspace` defaults to the current directory; `--attended` sets `unattended: false`;
 //!   `--max-steps`/`--max-minutes` → budget; each `--agent-model ROLE=PROFILE` → `role_models`, `all`
-//!   as `*`). Prints `session {id}` to stderr first. With
+//!   as `*`; `--create-workspace` → `create_workspace`: the daemon makes the folder when it does not exist, and
+//!   `created workspace {path}` goes to stderr before `session {id}` when it did; a `~` or `~/x` workspace is sent
+//!   as written, for the daemon to expand; the same options serve `chat`). Prints `session {id}` to stderr first. With
 //!   `--detach`, stops there. Otherwise *follows* (below).
 //! - `chat [options]`: a `chat`-role session on the terminal: prompt `› `, read a line (an empty
 //!   line is ignored, end of input or `/quit` leaves), send it, follow until the turn ends, repeat.
@@ -95,7 +97,7 @@
 //! Tests required (`clap` parsing and the pure parts; the calls themselves are covered by the
 //! client's tests): every command parses with its options and rejects a missing argument; `run`
 //! and `send` message joining and `-`; `--lines` parsing (`10:20`, `10:`, `:20`, bad forms);
-//! `follow_exit_code` for every turn end; `DEFAULT_CONFIG` parses with `Config::parse` and passes
+//! `--create-workspace` parsing and its `NewSession`; `follow_exit_code` for every turn end; `DEFAULT_CONFIG` parses with `Config::parse` and passes
 //! `check()`; `open_url`; `open` hands the address to the browser and writes it only with `--print`.
 
 use crate::client::{self, Client};
@@ -271,6 +273,9 @@ pub struct StartOpts {
     pub max_steps: u32,
     #[arg(long, default_value_t = 0)]
     pub max_minutes: u32,
+    /// Make the workspace folder (and the folders above it) when it does not exist
+    #[arg(long)]
+    pub create_workspace: bool,
 }
 
 #[derive(Args, Debug)]
@@ -716,8 +721,10 @@ fn non_zero(n: u32) -> Option<u32> {
 /// The request `loom run` and `loom chat` make; `cwd` is the default workspace.
 fn new_session(opts: &StartOpts, message: Option<String>, cwd: &Path) -> NewSession {
     let workspace = opts.workspace.clone().unwrap_or_else(|| cwd.to_path_buf());
+    // `~` and `~/x` reach the daemon as they are: it expands them to its user's home.
+    let tilde = workspace.to_str().is_some_and(|w| w == "~" || w.starts_with("~/"));
     NewSession {
-        workspace: std::path::absolute(&workspace).unwrap_or(workspace),
+        workspace: if tilde { workspace } else { std::path::absolute(&workspace).unwrap_or(workspace) },
         pack: opts.pack.clone(),
         role: opts.role.clone(),
         model: opts.model.clone(),
@@ -726,6 +733,7 @@ fn new_session(opts: &StartOpts, message: Option<String>, cwd: &Path) -> NewSess
         budget: Budget { max_steps: non_zero(opts.max_steps), max_minutes: non_zero(opts.max_minutes) },
         message,
         role_models: opts.agent_models.iter().cloned().collect(),
+        create_workspace: opts.create_workspace,
     }
 }
 
@@ -1410,8 +1418,11 @@ async fn cmd_run(paths: &Paths, a: RunArgs) -> Result<i32, String> {
     let c = client_of(paths)?;
     let cwd =
         std::env::current_dir().map_err(|e| format!("Cannot find the current directory ({e}). Pass --workspace."))?;
-    let info = c.create(&new_session(&a.start, Some(message), &cwd)).await?;
-    let id = info.meta.id;
+    let made = c.create_receipt(&new_session(&a.start, Some(message), &cwd)).await?;
+    let id = made.info.meta.id;
+    if made.created {
+        errln(&format!("created workspace {}", made.info.meta.workspace));
+    }
     errln(&format!("session {id}"));
     if a.detach {
         outln(id.as_str())?;
@@ -1431,7 +1442,11 @@ async fn cmd_chat(paths: &Paths, a: ChatArgs) -> Result<i32, String> {
             if new.role.is_none() {
                 new.role = Some("chat".to_string());
             }
-            let id = c.create(&new).await?.meta.id;
+            let made = c.create_receipt(&new).await?;
+            let id = made.info.meta.id;
+            if made.created {
+                errln(&format!("created workspace {}", made.info.meta.workspace));
+            }
             errln(&format!("session {id}"));
             id
         }
@@ -1663,6 +1678,7 @@ mod tests {
             "5",
             "--max-minutes",
             "9",
+            "--create-workspace",
             "-d",
             "--reasoning",
             "--full",
@@ -1674,6 +1690,7 @@ mod tests {
             panic!("not run");
         };
         assert_eq!(a.start.workspace, Some(PathBuf::from("/work")));
+        assert!(a.start.create_workspace);
         assert_eq!(a.start.pack.as_deref(), Some("p"));
         assert_eq!(a.start.role.as_deref(), Some("r"));
         assert_eq!(a.start.model.as_deref(), Some("big"));
@@ -2105,6 +2122,7 @@ mod tests {
             attended: true,
             max_steps: 7,
             max_minutes: 3,
+            create_workspace: true,
             agent_models: vec![("worker".into(), "fast".into()), (ANY_ROLE.into(), "big".into())],
         };
         let n = new_session(&opts, None, cwd);
@@ -2116,6 +2134,9 @@ mod tests {
             ])
         );
         assert_eq!(n.workspace, PathBuf::from("/w"));
+        assert!(n.create_workspace && !new_session(&StartOpts::default(), None, cwd).create_workspace);
+        let tilde = StartOpts { workspace: Some("~/proj".into()), ..StartOpts::default() };
+        assert_eq!(new_session(&tilde, None, cwd).workspace, PathBuf::from("~/proj"));
         assert_eq!(
             (n.pack.as_deref(), n.role.as_deref(), n.model.as_deref(), n.title.as_deref()),
             (Some("p"), Some("r"), Some("m"), Some("t"))

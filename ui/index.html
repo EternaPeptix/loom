@@ -64,6 +64,7 @@
             <button id="b-resume" type="button" class="btn" hidden>Resume</button>
             <button id="b-archive" type="button" class="btn" hidden>Archive</button>
             <button id="b-unarchive" type="button" class="btn" hidden>Unarchive</button>
+            <button id="b-files" type="button" class="btn with-icon" aria-controls="right" title="Browse this session's workspace folder in the inspector." hidden><svg class="icon" viewBox="0 0 14 14" aria-hidden="true"><path d="M1.5 3.5a1 1 0 0 1 1-1h3l1.3 1.5h4.7a1 1 0 0 1 1 1v5.5a1 1 0 0 1-1 1h-9a1 1 0 0 1-1-1Z"/></svg>Files</button>
             <button id="toggle-inspector" type="button" class="btn with-icon" aria-controls="right" aria-expanded="false"><svg class="icon" viewBox="0 0 14 14" aria-hidden="true"><rect x="1.5" y="2" width="11" height="10" rx="1.5"/><path d="M9 2v10"/></svg>Inspector</button>
           </div>
         </div>
@@ -165,7 +166,14 @@
     <section id="view-new" class="view newform" hidden>
       <header class="vhead"><h1 class="stitle">New mission</h1></header>
       <form id="new-form" class="form" autocomplete="off">
-        <label>Workspace <input id="f-workspace" type="text" required placeholder="/path/to/workspace"></label>
+        <div class="field">
+          <label for="f-workspace">Workspace</label>
+          <div class="field-row">
+            <input id="f-workspace" type="text" required placeholder="/path/to/workspace" aria-describedby="f-workspace-note" spellcheck="false" autocapitalize="off">
+            <button id="f-browse" type="button" class="btn" aria-haspopup="dialog">Browse…</button>
+          </div>
+          <p id="f-workspace-note" class="dim field-note" hidden></p>
+        </div>
         <label>Message <textarea id="f-message" rows="6" required></textarea></label>
         <div class="form-row">
           <label>Role <select id="f-role"></select></label>
@@ -175,6 +183,14 @@
         <label>Title (optional) <input id="f-title" type="text"></label>
         <label class="check"><input id="f-unattended" type="checkbox" checked> Resume by itself after a restart</label>
         <p id="f-error" class="error" role="alert" hidden></p>
+        <div id="f-create" class="model-confirm create-confirm" role="group" aria-labelledby="f-create-q" hidden>
+          <p id="f-create-q" class="model-confirm-text"></p>
+          <span class="model-confirm-actions">
+            <button id="f-create-yes" type="button" class="btn small primary">Create and start</button>
+            <button id="f-create-no" type="button" class="btn small">Cancel</button>
+          </span>
+        </div>
+        <p id="f-receipt" class="dim" role="status" aria-live="polite" hidden></p>
         <div><button id="f-submit" type="submit" class="btn primary">Start</button></div>
       </form>
     </section>
@@ -189,6 +205,7 @@
         <button id="tab-network" type="button" class="tab" data-tab="network" role="tab" aria-controls="panel" aria-selected="false" tabindex="-1">Network</button>
         <button id="tab-models" type="button" class="tab" data-tab="models" role="tab" aria-controls="panel" aria-selected="false" tabindex="-1">Models</button>
         <button id="tab-session" type="button" class="tab" data-tab="session" role="tab" aria-controls="panel" aria-selected="false" tabindex="-1">Session</button>
+        <button id="tab-files" type="button" class="tab" data-tab="files" role="tab" aria-controls="panel" aria-selected="false" tabindex="-1">Files</button>
       </nav>
       <button id="close-right" type="button" class="btn small" aria-label="Close inspector">Close</button>
     </header>
@@ -196,6 +213,43 @@
   </aside>
 
   <div id="scrim" class="scrim"></div>
+
+  <dialog id="picker" class="sheet picker" aria-labelledby="picker-title">
+    <header class="vhead">
+      <h2 id="picker-title">Choose a workspace folder</h2>
+      <span class="spacer"></span>
+      <button id="picker-close" type="button" class="btn">Close</button>
+    </header>
+    <div class="sheet-body picker-body">
+      <nav id="picker-crumbs" class="picker-crumbs" aria-label="Folder path"></nav>
+      <div class="picker-tools">
+        <button id="picker-up" type="button" class="btn small" aria-keyshortcuts="Alt+ArrowUp Backspace">Up one folder</button>
+        <button id="picker-home" type="button" class="btn small">Home</button>
+        <button id="picker-new" type="button" class="btn small" aria-expanded="false" aria-controls="picker-newrow">New folder…</button>
+        <label class="check dim"><input id="picker-hidden" type="checkbox"> Show hidden</label>
+      </div>
+      <div id="picker-newrow" class="picker-newrow" hidden>
+        <label for="picker-newname" class="dim">Name of the new folder</label>
+        <div class="field-row">
+          <input id="picker-newname" type="text" autocomplete="off" spellcheck="false" autocapitalize="off" aria-describedby="picker-status">
+          <button id="picker-newok" type="button" class="btn small">Use this name</button>
+          <button id="picker-newcancel" type="button" class="btn small">Cancel</button>
+        </div>
+        <p class="dim field-note">Nothing is created now: the folder is made when the mission starts.</p>
+      </div>
+      <div id="picker-recent-wrap" class="picker-recent" hidden>
+        <h3 id="picker-recent-title">Recent workspaces</h3>
+        <ul id="picker-recent" class="picker-recent-list" aria-labelledby="picker-recent-title"></ul>
+      </div>
+      <p id="picker-status" class="dim picker-status" role="status" aria-live="polite"></p>
+      <ul id="picker-list" class="dir-list" aria-label="Folders"></ul>
+    </div>
+    <footer class="picker-foot">
+      <p id="picker-choice" class="picker-choice mono"></p>
+      <button id="picker-use" type="button" class="btn primary">Use this folder</button>
+      <button id="picker-cancel" type="button" class="btn">Cancel</button>
+    </footer>
+  </dialog>
 
   <dialog id="switcher" class="sheet switcher" aria-labelledby="switcher-title">
     <header class="vhead">
@@ -273,6 +327,9 @@
   <svg data-icon="clock" class="icon" viewBox="0 0 12 12" aria-hidden="true"><circle cx="6" cy="6" r="4.2"/><path d="M6 3.4V6l1.8 1.1"/></svg>
   <svg data-icon="interrupted" class="icon" viewBox="0 0 12 12" aria-hidden="true"><circle cx="6" cy="6" r="4.2"/><path d="M4.8 4.2v3.6M7.2 4.2v3.6"/></svg>
   <svg data-icon="hourglass" class="icon" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 1.5h6M3 10.5h6M3.6 1.5c0 2.4 2.4 3 2.4 4.5S3.6 8.1 3.6 10.5M8.4 1.5C8.4 3.9 6 4.5 6 6s2.4 2.1 2.4 4.5"/></svg>
+  <svg data-icon="folder" class="icon" viewBox="0 0 12 12" aria-hidden="true"><path d="M1.5 3a.8.8 0 0 1 .8-.8h2.4l1 1.2h3.9a.8.8 0 0 1 .8.8v4.6a.8.8 0 0 1-.8.8H2.3a.8.8 0 0 1-.8-.8Z"/></svg>
+  <svg data-icon="link" class="icon" viewBox="0 0 12 12" aria-hidden="true"><path d="M5 7a2 2 0 0 0 2.8 0l1.6-1.6a2 2 0 0 0-2.8-2.8l-.5.5M7 5a2 2 0 0 0-2.8 0L2.6 6.6a2 2 0 0 0 2.8 2.8l.5-.5"/></svg>
+  <svg data-icon="refresh" class="icon" viewBox="0 0 12 12" aria-hidden="true"><path d="M10 6a4 4 0 1 1-1.2-2.8M10 1.8V4H7.8"/></svg>
   <svg data-icon="pin" class="icon" viewBox="0 0 12 12" aria-hidden="true"><path d="M4.4 1.5h3.2l-.4 3 1.5 2H3.3l1.5-2ZM6 6.5v4"/></svg>
 </template>
 <script type="module" src="/app.js"></script>
