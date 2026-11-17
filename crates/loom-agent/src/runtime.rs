@@ -529,6 +529,7 @@
 //!   a mission no session belongs to.
 
 use crate::pack::{self, Packs, PromptEnv, RoleDef};
+use crate::prior;
 use crate::rtools::{
     self, ChildCopy, ChildInfo, Orchestrator, Producer, Run, Settlement, Shared, SpawnReq, Vote, Workspace,
 };
@@ -589,6 +590,9 @@ pub struct NewSession {
     pub budget: Budget,
     /// The first message, sent as soon as the session exists.
     pub message: Option<String>,
+    /// Earlier missions this one may recall: what their sealed ledgers recorded is put into the lead's log
+    /// once, before its first model request (`crate::prior`).
+    pub prior: Vec<MissionId>,
 }
 
 /// `meta.json`: what a session is, fixed when it is created.
@@ -629,6 +633,9 @@ pub struct SessionMeta {
     /// a restart, never to the parent as an agent's report.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate: Option<Brief>,
+    /// The earlier missions the operator chose for this one to recall, in the order given. Empty for a child.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prior: Vec<MissionId>,
 }
 
 /// A session as listed.
@@ -2832,6 +2839,7 @@ impl Inner {
                 unattended: p.meta.unattended,
                 archived: false,
                 gate: req.harness.then(|| req.brief.clone()),
+                prior: Vec::new(),
             };
             let explicit = prole.termination == Termination::Explicit;
             st.known.insert(child_id.clone(), Known::new(meta.clone(), idle_status()));
@@ -3880,6 +3888,7 @@ impl Runtime {
                 }
             }
         };
+        let (prior_ids, recalled) = self.recall_earlier(&new.prior).await?;
         let id = SessionId::generate();
         let explicit = role.termination == Termination::Explicit;
         let meta = SessionMeta {
@@ -3900,6 +3909,7 @@ impl Runtime {
             unattended: new.unattended.unwrap_or(explicit),
             archived: false,
             gate: None,
+            prior: prior_ids,
         };
         inner.st().known.insert(id.clone(), Known::new(meta.clone(), idle_status()));
         let forget = |inner: &Inner| {
@@ -3920,13 +3930,19 @@ impl Runtime {
                 return Err(e);
             }
         };
-        let session = match Session::create(deps, start, None) {
+        let mut session = match Session::create(deps, start, None) {
             Ok(s) => s,
             Err(e) => {
                 forget(inner);
                 return Err(e);
             }
         };
+        if !recalled.is_empty() {
+            if let Err(e) = session.recall(prior::brief(&recalled)) {
+                forget(inner);
+                return Err(e);
+            }
+        }
         if let Err(e) = write_json_atomic(&inner.paths.session_dir(&id).join("meta.json"), &meta) {
             forget(inner);
             return Err(format!("cannot write the session's meta.json: {e}"));
@@ -3953,6 +3969,48 @@ impl Runtime {
             self.send_message(&id, message).await?;
         }
         self.session(&id).ok_or_else(|| no_session(&id))
+    }
+
+    /// The earlier missions `named` by the operator: trimmed, blanks and repeats dropped, each the mission of a
+    /// known session, and what their sealed journals hold (read on a blocking thread).
+    async fn recall_earlier(&self, named: &[MissionId]) -> Result<(Vec<MissionId>, Vec<prior::Recalled>), String> {
+        let mut ids: Vec<MissionId> = Vec::new();
+        for m in named {
+            let m = MissionId::from(m.as_str().trim());
+            if !m.as_str().is_empty() && !ids.contains(&m) {
+                ids.push(m);
+            }
+        }
+        if ids.len() > prior::MAX_PRIOR {
+            return Err(format!(
+                "Name at most {} earlier missions to recall; {} were named.",
+                prior::MAX_PRIOR,
+                ids.len()
+            ));
+        }
+        let mut found: Vec<(MissionId, String, Journal)> = Vec::new();
+        {
+            let st = self.inner.st();
+            for m in &ids {
+                let sessions = || st.known.values().filter(|k| &k.meta.mission == m);
+                let Some(lead) = sessions().find(|k| k.meta.parent.is_none()).or_else(|| sessions().next()) else {
+                    return Err(format!("There is no mission {m} to recall."));
+                };
+                found.push((
+                    m.clone(),
+                    lead.meta.title.clone(),
+                    Journal::new(self.inner.paths.journal(m), self.inner.key.clone()),
+                ));
+            }
+        }
+        let mut recalled = Vec::new();
+        for (id, title, journal) in found {
+            let recall = tokio::task::spawn_blocking(move || prior::read(&journal))
+                .await
+                .map_err(|e| format!("Reading the ledger of mission {id} failed ({e}); try again."))?;
+            recalled.push(prior::Recalled { id, title, recall });
+        }
+        Ok((ids, recalled))
     }
 
     pub fn sessions(&self, include_archived: bool) -> Vec<SessionInfo> {
@@ -4914,7 +4972,7 @@ impl Inner {
 mod tests {
     use super::*;
     use loom_core::config::{ModelProfile, SandboxMode};
-    use loom_core::event::{Brief, InboxKind};
+    use loom_core::event::{Brief, InboxKind, NoteKind};
     use loom_model::mock::{Action, MockServer, Reply, Script};
     use serde_json::{json, Value};
 
@@ -7430,6 +7488,139 @@ mod tests {
         let rs = rt2.records(&b, None, 2_000).unwrap();
         assert!(!rs.iter().any(|r| matches!(r.event, Event::TurnEnd { reason: TurnEndReason::Finished })));
         assert!(rt2.session(&b).unwrap().active);
+        rt2.shutdown().await;
+    }
+
+    /// A lead with a sealed ledger of its own that holds the goal `goal`; returns its mission.
+    async fn mission_with_goal(e: &Env, title: &str, goal: &str) -> MissionId {
+        let mut new = e.new_session(None);
+        new.title = Some(title.into());
+        let mission = e.rt.create_session(new).await.unwrap().meta.mission;
+        let paths = Paths::at(e.dir.path().join("home"));
+        let key = journal::load_or_create_key(&paths.journal_key()).unwrap();
+        Journal::new(paths.journal(&mission), key)
+            .append(&SessionId::from("s-op"), true, loom_core::ledger::LedgerOp::GoalSet { text: goal.into() }, &|_| {
+                Ok(())
+            })
+            .unwrap();
+        mission
+    }
+
+    fn recall_notes(rs: &[Record]) -> Vec<String> {
+        rs.iter()
+            .filter_map(|r| match &r.event {
+                Event::HarnessNote { note: NoteKind::Info, text }
+                    if text.starts_with("Earlier missions the operator") =>
+                {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_lead_recalls_the_missions_the_operator_named_before_its_first_request() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let earlier = mission_with_goal(&e, "Lab sweep", "Map the lab network").await;
+        let mut new = e.new_session(Some("go"));
+        // Blanks and repeats are dropped, the id is trimmed.
+        new.prior = vec![MissionId::from(format!("  {earlier}  ")), MissionId::from(""), earlier.clone()];
+        let info = e.rt.create_session(new).await.unwrap();
+        let id = info.meta.id.clone();
+        assert_eq!(info.meta.prior, vec![earlier.clone()]);
+        until("finished", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Finished }))).await;
+        let rs = e.records(&id);
+        let notes = recall_notes(&rs);
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains(&format!("Mission {earlier} (Lab sweep), last recorded ")), "{}", notes[0]);
+        assert!(notes[0].contains("> Map the lab network"), "{}", notes[0]);
+        let kinds = e.kinds(&id);
+        let note_at = rs
+            .iter()
+            .position(|r| matches!(&r.event, Event::HarnessNote { text, .. } if text.starts_with("Earlier missions")))
+            .unwrap();
+        let request_at = kinds.iter().position(|k| k == "model_request").unwrap();
+        assert_eq!((kinds[0].as_str(), note_at), ("session_start", 1));
+        assert!(note_at < request_at, "{kinds:?}");
+        assert!(mentions(&e.server.requests()[0], "Map the lab network"));
+        // meta.json keeps the missions, in the given order.
+        let meta: Value = serde_json::from_slice(
+            &std::fs::read(e.dir.path().join("home").join("sessions").join(id.as_str()).join("meta.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(meta["prior"], json!([earlier.as_str()]));
+        // A session without any has no such key.
+        let plain = e.rt.create_session(e.new_session(None)).await.unwrap().meta.id;
+        let meta: Value = serde_json::from_slice(
+            &std::fs::read(e.dir.path().join("home").join("sessions").join(plain.as_str()).join("meta.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(meta.get("prior").is_none());
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_earlier_mission_is_recalled_as_unreadable() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let earlier = mission_with_goal(&e, "SECRET-TITLE", "SECRET-GOAL").await;
+        let journal_path = Paths::at(e.dir.path().join("home")).journal(&earlier);
+        let text = std::fs::read_to_string(&journal_path).unwrap();
+        std::fs::write(&journal_path, text.replace("SECRET-GOAL", "SECRET-G0AL")).unwrap();
+        let mut new = e.new_session(None);
+        new.prior = vec![earlier.clone()];
+        let id = e.rt.create_session(new).await.unwrap().meta.id;
+        let notes = recall_notes(&e.records(&id));
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains(&format!("Mission {earlier}: its ledger could not be read")), "{}", notes[0]);
+        assert!(!notes[0].contains("SECRET"));
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_unknown_mission_and_too_many_missions_are_refused_and_leave_no_session() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let earlier = mission_with_goal(&e, "one", "g").await;
+        let before = e.rt.sessions(true).len();
+        let mut new = e.new_session(Some("go"));
+        new.prior = vec![earlier.clone(), MissionId::from("m-nope")];
+        assert_eq!(e.rt.create_session(new).await.unwrap_err(), "There is no mission m-nope to recall.");
+        let mut new = e.new_session(Some("go"));
+        new.prior = (0..9).map(|i| MissionId::from(format!("m-{i}"))).collect();
+        assert_eq!(
+            e.rt.create_session(new).await.unwrap_err(),
+            "Name at most 8 earlier missions to recall; 9 were named."
+        );
+        assert_eq!(e.rt.sessions(true).len(), before);
+        assert!(e.server.requests().is_empty());
+        // Eight is fine, and a repeat counts once.
+        let mut new = e.new_session(None);
+        new.prior = vec![earlier.clone(); 12];
+        assert!(e.rt.create_session(new).await.is_ok());
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_restart_writes_no_second_recall_note() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let earlier = mission_with_goal(&e, "one", "the first goal").await;
+        let mut new = e.new_session(Some("go"));
+        new.prior = vec![earlier.clone()];
+        let id = e.rt.create_session(new).await.unwrap().meta.id;
+        until("finished", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Finished }))).await;
+        e.rt.shutdown().await;
+        let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
+        let info = rt2.session(&id).unwrap();
+        assert_eq!(info.meta.prior, vec![earlier]);
+        assert!(rt2.send_message(&id, "again").await.is_ok());
+        let again = rt2.clone();
+        until("a second turn", || {
+            again.records(&id, None, 2_000).is_ok_and(|rs| {
+                rs.iter().filter(|r| matches!(r.event, Event::TurnEnd { reason: TurnEndReason::Finished })).count() == 2
+            })
+        })
+        .await;
+        assert_eq!(recall_notes(&rt2.records(&id, None, 2_000).unwrap()).len(), 1);
         rt2.shutdown().await;
     }
 
