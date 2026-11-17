@@ -1647,8 +1647,15 @@ mod tests {
     async fn once_the_leader_has_exited_the_pid_record_names_who_is_in_the_group() {
         let f = fx();
         let p = f.pidfile();
-        // A subshell outlives the leader for a second, starts a long sleep and exits.
-        let mut r = f.start(&format!("(sleep 1; sleep 300 & echo $! >> {p}) & echo $! >> {p}", p = p.display()));
+        // A subshell outlives the leader until the test lets it go, then starts a long sleep and exits. The go file,
+        // not a fixed delay, orders the first refresh before the long sleep: on a loaded machine a refresh more than a
+        // second late would record the subshell and the sleep together, and the live sleep would keep that record.
+        let go = f.root.join("go");
+        let mut r = f.start(&format!(
+            "(while [ ! -e {go} ]; do sleep 0.05; done; sleep 300 & echo $! >> {p}) & echo $! >> {p}",
+            go = go.display(),
+            p = p.display()
+        ));
         assert_eq!(finish(&mut r).await, Ended::Exit(0));
         let path = pid_path(&r.out_path);
         assert!(read_pid_record(&path).expect("record").members.is_empty());
@@ -1659,6 +1666,7 @@ mod tests {
         assert!(record.members.contains(&(subshell, process_start(subshell).expect("start"))), "{record:?}");
 
         // When the recorded members are gone and the group is not, the record names who is in it now.
+        std::fs::write(&go, b"").expect("go");
         let sleeper = read_pids(&p, 2).await[1];
         let want = vec![(
             u32::try_from(sleeper).expect("pid"),
