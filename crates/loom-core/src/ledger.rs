@@ -626,15 +626,67 @@ fn ids<'a>(it: impl Iterator<Item = &'a str>) -> String {
     }
 }
 
-/// The line that tells the brief's reader that `hidden` oldest items were left out: it names the ids
-/// hidden and where to read them. `None` when nothing is hidden.
-fn elision<'a>(mut ids: impl Iterator<Item = &'a str>, hidden: usize) -> Option<String> {
-    let first = ids.next().filter(|_| hidden > 0)?;
-    let range = match ids.nth(hidden.saturating_sub(2)).filter(|_| hidden > 1) {
-        Some(last) => format!("{first}–{last}"),
-        None => first.to_string(),
-    };
-    Some(format!("({hidden} older not shown: {range}; call `ledger` to read them)"))
+/// Splits an id into letter prefix and number (`p12` -> (`p`, 12)); `None` when the id has another shape.
+fn id_parts(id: &str) -> Option<(&str, u64)> {
+    let at = id.find(|c: char| c.is_ascii_digit())?;
+    let (prefix, digits) = id.split_at(at);
+    Some((prefix, digits.parse().ok()?))
+}
+
+/// The ids joined as runs: consecutive numbers of one letter prefix become `first–last`, a lone id stays
+/// as it is, runs are joined by `, ` (`p1–p11, p13`).
+fn id_runs<'a>(ids: impl Iterator<Item = &'a str>) -> String {
+    type Run<'a> = (&'a str, &'a str, Option<(&'a str, u64)>);
+    let mut runs: Vec<Run> = Vec::new();
+    for id in ids {
+        let parts = id_parts(id);
+        if let Some(run) = runs.last_mut() {
+            if let (Some((prefix, n)), Some((last_prefix, last_n))) = (parts, run.2) {
+                if prefix == last_prefix && last_n.checked_add(1) == Some(n) {
+                    run.1 = id;
+                    run.2 = parts;
+                    continue;
+                }
+            }
+        }
+        runs.push((id, id, parts));
+    }
+    let runs: Vec<String> =
+        runs.iter().map(|(a, b, _)| if a == b { (*a).to_string() } else { format!("{a}–{b}") }).collect();
+    runs.join(", ")
+}
+
+/// The line that tells the brief's reader that older items were left out: it counts the hidden ids,
+/// names them as runs and says where to read them. `what` qualifies "older" (`done`, `settled`, `open`;
+/// empty for none). `None` when nothing is hidden.
+fn elision<'a>(hidden: impl Iterator<Item = &'a str>, what: &str) -> Option<String> {
+    let hidden: Vec<&str> = hidden.collect();
+    if hidden.is_empty() {
+        return None;
+    }
+    let what = if what.is_empty() { String::new() } else { format!(" {what}") };
+    Some(format!(
+        "({} older{what} not shown: {}; call `ledger` to read them)",
+        hidden.len(),
+        id_runs(hidden.iter().copied())
+    ))
+}
+
+/// Applies a cap to `items`: those for which `capped` is false are always kept; of the others only the
+/// last `keep` are. Returns (kept in order, left out in order).
+fn cap_last<T>(items: Vec<&T>, capped: impl Fn(&T) -> bool, keep: usize) -> (Vec<&T>, Vec<&T>) {
+    let total = items.iter().filter(|i| capped(i)).count();
+    let mut skip = total.saturating_sub(keep);
+    let (mut shown, mut hidden) = (Vec::new(), Vec::new());
+    for item in items {
+        if capped(item) && skip > 0 {
+            skip -= 1;
+            hidden.push(item);
+        } else {
+            shown.push(item);
+        }
+    }
+    (shown, hidden)
 }
 
 /// Refusal text for an id that does not exist: names the ids that do.
@@ -1285,8 +1337,13 @@ impl LedgerState {
         }
 
         let steps: Vec<&PlanStep> = self.plan.iter().filter(|p| p.status != StepStatus::Dropped).collect();
-        if !steps.is_empty() {
+        let (steps, steps_hidden) = cap_last(steps, |p| p.status == StepStatus::Done, opts.max_plan_done);
+        if !steps.is_empty() || !steps_hidden.is_empty() {
             let mut s = String::from("Plan:");
+            if let Some(hidden) = elision(steps_hidden.iter().map(|p| p.id.as_str()), "done") {
+                s.push('\n');
+                s.push_str(&hidden);
+            }
             for p in steps {
                 let mark = match p.status {
                     StepStatus::Done => "[x]",
@@ -1304,8 +1361,13 @@ impl LedgerState {
         }
 
         let obligations: Vec<&Obligation> = self.obligations.iter().filter(|o| o.outcome.is_none()).collect();
-        if !obligations.is_empty() {
+        let (obligations, obligations_hidden) = cap_last(obligations, |_| true, opts.max_obligations);
+        if !obligations.is_empty() || !obligations_hidden.is_empty() {
             let mut s = String::from("Open obligations:");
+            if let Some(hidden) = elision(obligations_hidden.iter().map(|o| o.id.as_str()), "open") {
+                s.push('\n');
+                s.push_str(&hidden);
+            }
             for o in obligations {
                 let mut l = format!("- {} ({}) {}", o.id, obligation_kind(o.kind), o.text);
                 if !blank(&o.reference) {
@@ -1318,8 +1380,14 @@ impl LedgerState {
         }
 
         if !self.claims.is_empty() {
+            let (claims, claims_hidden) =
+                cap_last(self.claims.iter().collect(), |c| c.status != ClaimStatus::Open, opts.max_claims);
             let mut s = String::from("Claims:");
-            for c in &self.claims {
+            if let Some(hidden) = elision(claims_hidden.iter().map(|c| c.id.as_str()), "settled") {
+                s.push('\n');
+                s.push_str(&hidden);
+            }
+            for c in claims {
                 let mut l = format!("- {} [{}] {}", c.id, claim_status(c.status), c.text);
                 if !c.evidence.is_empty() {
                     l.push_str(&format!(" (evidence: {})", c.evidence.join(", ")));
@@ -1333,7 +1401,7 @@ impl LedgerState {
         if opts.max_decisions > 0 && !self.decisions.is_empty() {
             let skip = self.decisions.len().saturating_sub(opts.max_decisions);
             let mut s = String::from("Decisions:");
-            if let Some(hidden) = elision(self.decisions.iter().map(|d| d.id.as_str()), skip) {
+            if let Some(hidden) = elision(self.decisions.iter().take(skip).map(|d| d.id.as_str()), "") {
                 s.push('\n');
                 s.push_str(&hidden);
             }
@@ -1347,7 +1415,7 @@ impl LedgerState {
         if opts.max_dead_ends > 0 && !self.dead_ends.is_empty() {
             let skip = self.dead_ends.len().saturating_sub(opts.max_dead_ends);
             let mut s = String::from("Dead ends:");
-            if let Some(hidden) = elision(self.dead_ends.iter().map(|d| d.id.as_str()), skip) {
+            if let Some(hidden) = elision(self.dead_ends.iter().take(skip).map(|d| d.id.as_str()), "") {
                 s.push('\n');
                 s.push_str(&hidden);
             }
@@ -2362,6 +2430,203 @@ mod tests {
         let claim_line = b.lines().find(|l| l.starts_with("- c1")).unwrap_or("");
         assert_eq!(claim_line.chars().count(), 20);
         assert!(claim_line.ends_with('…'));
+        // a cap of 0 lists none of the capped items, and says how many it left out
+        let s = capped_state(3, 1, 3, 2);
+        let zero = BriefOpts { max_plan_done: 0, max_claims: 0, max_obligations: 0, ..BriefOpts::default() };
+        let b = s.brief(&zero);
+        assert!(!b.contains("[x]") && !b.contains("c1 [") && !b.contains("c2 [") && !b.contains("- o1"), "{b}");
+        assert!(
+            b.contains("(3 older done not shown: p1–p3;") && b.contains("(2 older settled not shown: c1–c2;"),
+            "{b}"
+        );
+        assert!(b.contains("(3 older open not shown: o1–o3;"), "{b}");
+    }
+
+    /// A ledger with `done` done plan steps, `todo` todo ones, `settled` withdrawn claims followed by `open`
+    /// open ones, and `obl` open obligations.
+    fn capped_state(done: usize, todo: usize, obl: usize, settled: usize) -> LedgerState {
+        let mut ops = Vec::new();
+        for i in 0..done + todo {
+            ops.push(LedgerOp::PlanAdd { text: format!("step {i}") });
+        }
+        for i in 0..done {
+            ops.push(LedgerOp::PlanUpdate {
+                id: format!("p{}", i + 1),
+                status: StepStatus::Done,
+                note: String::new(),
+                evidence: vec![],
+            });
+        }
+        for i in 0..obl {
+            ops.push(LedgerOp::ObligationOpen {
+                kind: ObligationKind::Job,
+                text: format!("job {i}"),
+                reference: String::new(),
+            });
+        }
+        for i in 0..settled {
+            ops.push(LedgerOp::ClaimAdd { text: format!("settled claim {i}") });
+            ops.push(LedgerOp::ClaimUpdate {
+                id: format!("c{}", i + 1),
+                status: ClaimStatus::Withdrawn,
+                note: "no".into(),
+            });
+        }
+        ops.push(LedgerOp::ClaimAdd { text: "still open".into() });
+        build(ops)
+    }
+
+    fn plan_ids(b: &str, mark: &str) -> Vec<String> {
+        b.lines()
+            .filter_map(|l| l.strip_prefix(mark))
+            .filter_map(|l| l.split_whitespace().next().map(str::to_string))
+            .collect()
+    }
+
+    #[test]
+    fn brief_caps_done_plan_steps_at_below_and_above_the_bound() {
+        let s = capped_state(7, 2, 0, 0);
+        let b = s.brief(&BriefOpts { max_plan_done: 3, ..BriefOpts::default() });
+        assert_eq!(plan_ids(&b, "[x]"), ["p5", "p6", "p7"], "{b}");
+        assert_eq!(plan_ids(&b, "[ ]"), ["p8", "p9"], "todo steps are always listed: {b}");
+        assert!(b.contains("Plan:\n(4 older done not shown: p1–p4; call `ledger` to read them)\n[x] p5"), "{b}");
+        // exactly at the bound and above it nothing is left out
+        for cap in [7, 8, usize::MAX] {
+            let b = s.brief(&BriefOpts { max_plan_done: cap, ..BriefOpts::default() });
+            assert_eq!(plan_ids(&b, "[x]").len(), 7, "{b}");
+            assert!(!b.contains("not shown"), "{b}");
+        }
+        // one below the bound leaves one out
+        let b = s.brief(&BriefOpts { max_plan_done: 6, ..BriefOpts::default() });
+        assert!(b.contains("(1 older done not shown: p1;"), "{b}");
+    }
+
+    #[test]
+    fn brief_caps_open_obligations_at_below_and_above_the_bound() {
+        let s = capped_state(0, 0, 6, 0);
+        let b = s.brief(&BriefOpts { max_obligations: 4, ..BriefOpts::default() });
+        assert!(
+            b.contains("Open obligations:\n(2 older open not shown: o1–o2; call `ledger` to read them)\n- o3"),
+            "{b}"
+        );
+        assert!(b.contains("- o6") && !b.contains("- o2 "), "{b}");
+        for cap in [6, 7, usize::MAX] {
+            let b = s.brief(&BriefOpts { max_obligations: cap, ..BriefOpts::default() });
+            assert!(b.contains("- o1 ") && !b.contains("not shown"), "{b}");
+        }
+        let b = s.brief(&BriefOpts { max_obligations: 5, ..BriefOpts::default() });
+        assert!(b.contains("(1 older open not shown: o1;"), "{b}");
+    }
+
+    #[test]
+    fn brief_caps_settled_claims_but_never_open_ones() {
+        // c1..c5 settled, c6 open
+        let s = capped_state(0, 0, 0, 5);
+        let b = s.brief(&BriefOpts { max_claims: 2, ..BriefOpts::default() });
+        assert!(
+            b.contains("Claims:\n(3 older settled not shown: c1–c3; call `ledger` to read them)\n- c4 [withdrawn]"),
+            "{b}"
+        );
+        assert!(b.contains("- c5 [withdrawn]") && b.contains("- c6 [open] still open"), "{b}");
+        for cap in [5, 6, usize::MAX] {
+            let b = s.brief(&BriefOpts { max_claims: cap, ..BriefOpts::default() });
+            assert!(b.contains("- c1 [withdrawn]") && !b.contains("not shown"), "{b}");
+        }
+        let b = s.brief(&BriefOpts { max_claims: 4, ..BriefOpts::default() });
+        assert!(b.contains("(1 older settled not shown: c1;"), "{b}");
+        // an open claim older than the settled ones is kept at cap 0
+        let s = build(vec![
+            LedgerOp::ClaimAdd { text: "first, open".into() },
+            LedgerOp::ClaimAdd { text: "second".into() },
+            LedgerOp::ClaimUpdate { id: "c2".into(), status: ClaimStatus::Withdrawn, note: "no".into() },
+        ]);
+        let b = s.brief(&BriefOpts { max_claims: 0, ..BriefOpts::default() });
+        assert!(b.contains("- c1 [open] first, open") && !b.contains("- c2 ") && b.contains("(1 older settled"), "{b}");
+    }
+
+    #[test]
+    fn brief_open_plan_steps_are_never_left_out() {
+        // p1 todo, p2 done, p3 doing, p4 done, p5 done: the todo and doing steps stay at cap 0
+        let s = build(vec![
+            LedgerOp::PlanSet { steps: (1..=5).map(|i| format!("s{i}")).collect() },
+            LedgerOp::PlanUpdate { id: "p2".into(), status: StepStatus::Done, note: String::new(), evidence: vec![] },
+            LedgerOp::PlanUpdate { id: "p3".into(), status: StepStatus::Doing, note: String::new(), evidence: vec![] },
+            LedgerOp::PlanUpdate { id: "p4".into(), status: StepStatus::Done, note: String::new(), evidence: vec![] },
+            LedgerOp::PlanUpdate { id: "p5".into(), status: StepStatus::Done, note: String::new(), evidence: vec![] },
+        ]);
+        let b = s.brief(&BriefOpts { max_plan_done: 1, ..BriefOpts::default() });
+        // non-contiguous hidden ids come out as runs
+        assert!(b.contains("(2 older done not shown: p2, p4;"), "{b}");
+        assert!(b.contains("[ ] p1 s1") && b.contains("[>] p3 s3") && b.contains("[x] p5 s5"), "{b}");
+        let b = s.brief(&BriefOpts { max_plan_done: 0, ..BriefOpts::default() });
+        assert!(b.contains("(3 older done not shown: p2, p4–p5;"), "{b}");
+        assert!(b.contains("[ ] p1 s1") && b.contains("[>] p3 s3") && !b.contains("[x]"), "{b}");
+    }
+
+    #[test]
+    fn elision_ids_are_joined_as_runs() {
+        let say = |ids: &[&str]| elision(ids.iter().copied(), "done");
+        assert_eq!(say(&[]), None);
+        let line =
+            say(&["p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8", "p9", "p10", "p11", "p13"]).unwrap_or_default();
+        assert_eq!(line, "(12 older done not shown: p1–p11, p13; call `ledger` to read them)");
+        assert_eq!(id_runs(["p1", "c2", "c3", "p4", "x"].into_iter()), "p1, c2–c3, p4, x");
+        assert_eq!(
+            elision(["d1", "d2"].into_iter(), "").as_deref(),
+            Some("(2 older not shown: d1–d2; call `ledger` to read them)")
+        );
+    }
+
+    #[test]
+    fn long_mission_brief_is_much_smaller_with_the_caps() {
+        // 65 done and 5 todo steps, 74 claims (60 settled, 14 open), 25 open obligations, lines near 200 chars
+        let text = |what: &str, i: usize| format!("{what} {i} {}", "x".repeat(200 - what.len() - 8));
+        let mut ops = vec![LedgerOp::GoalSet { text: "audit the target".into() }];
+        for i in 0..70 {
+            ops.push(LedgerOp::PlanAdd { text: text("step", i) });
+        }
+        for i in 0..65 {
+            ops.push(LedgerOp::PlanUpdate {
+                id: format!("p{}", i + 1),
+                status: StepStatus::Done,
+                note: String::new(),
+                evidence: vec![],
+            });
+        }
+        for i in 0..25 {
+            ops.push(LedgerOp::ObligationOpen {
+                kind: ObligationKind::Job,
+                text: text("job", i),
+                reference: String::new(),
+            });
+        }
+        for i in 0..74 {
+            ops.push(LedgerOp::ClaimAdd { text: text("claim", i) });
+            if i < 60 {
+                ops.push(LedgerOp::ClaimUpdate {
+                    id: format!("c{}", i + 1),
+                    status: ClaimStatus::Withdrawn,
+                    note: "no".into(),
+                });
+            }
+        }
+        let s = build(ops);
+        let uncapped = s.brief(&BriefOpts {
+            max_plan_done: usize::MAX,
+            max_claims: usize::MAX,
+            max_obligations: usize::MAX,
+            ..BriefOpts::default()
+        });
+        let capped = s.brief(&BriefOpts::default());
+        let (u, c) = (uncapped.chars().count(), capped.chars().count());
+        println!("brief of a long mission: {u} characters uncapped, {c} capped");
+        assert!(c * 2 < u, "uncapped {u}, capped {c}");
+        assert!(capped.contains("(60 older done not shown: p1–p60;"), "{capped}");
+        assert!(capped.contains("(50 older settled not shown: c1–c50;"), "{capped}");
+        assert!(capped.contains("(5 older open not shown: o1–o5;"), "{capped}");
+        // every open claim and every todo step is still listed
+        assert_eq!(capped.matches("[open]").count(), 14, "{capped}");
+        assert_eq!(plan_ids(&capped, "[ ]").len(), 5, "{capped}");
     }
 
     #[test]
