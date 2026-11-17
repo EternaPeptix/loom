@@ -16,7 +16,8 @@
 //!   on their next `git status`, commit or `git submodule update`, in the workspace, in a linked worktree
 //!   outside it, or in a repository moved into place. In every writable root (the workspace, the session
 //!   temp dir — the exception above does not reach it — and `cfg.extra_writable`), whether it exists yet or
-//!   not, and comparing names without regard to case:
+//!   not, and comparing names as the volume folds case (APFS folds more than ASCII case: `ſ`, the Kelvin
+//!   sign and the `ﬁ` ligature count as `s`, `k` and `fi`, so a name made with them is the same name):
 //!   - no `.git` entry can be written, made, removed or renamed, nor, below one, `config`,
 //!     `config.worktree`, `hooks`, `commondir` or `gitdir` (or anything below those) — of the repository,
 //!     of a linked worktree's private gitdir (`.git/worktrees/<name>/…`) and of a submodule's repository
@@ -151,7 +152,13 @@
 //! (deny mach-lookup (global-name "com.apple.trustd.agent") (global-name "com.apple.trustd") (global-name "com.apple.ocspd"))   ; only with `cfg.network_deny_all`
 //! ```
 //!
-//! The Git regexes are written with every letter as a class of both cases (`[gG][iI][tT]`); the writable
+//! The Git regexes are written with every letter as a class of both cases (`[gG][iI][tT]`) and, where the
+//! volume folds other characters to it, an alternation that adds them: `(s|S|ſ)`, `(k|K|K)` (U+212A)
+//! and, for the two letters of `config`, `([fF][iI]|ﬁ)`. On macOS 27 Seatbelt was probed to match a path
+//! as the volume folds it already (a regex or subpath written in lower case refuses `MODULES`, `moduleſ` and
+//! `conﬁg`), so in the profile this is defence in depth against a version that does not; the file tools'
+//! own `check_write` compares names with the same fold, and before it did, `write` could make
+//! `.git/moduleſ/<n>/hooks/<hook>`, which Git then reads as `.git/modules/<n>/hooks/<hook>`. The writable
 //! roots in them are those of `writable`, in its order. The rules for directories below `modules` come one
 //! per recorded directory that is the direct child of a `modules` directory (deeper ones lie inside it),
 //! sorted, each with the repositories below it, sorted.
@@ -279,7 +286,12 @@
 //! `.git/modules/<new>/hooks/x`, `.git/worktrees/<new>`, `.git/modules/third/<new>`, `<tmp>/x/.git` and
 //! `<tmp>/x/.git/config`, each refusal naming the operator and the bare clone, and accepts `objects/` and
 //! `refs/heads/` paths of the workspace's and the submodules' repositories, `<tmp>/x.git/config` and
-//! `<tmp>/x.git/hooks/h`. Under `sandbox-exec`: each of those writes fails, as does making
+//! `<tmp>/x.git/hooks/h`; and refuses every spelling the volume folds to a Git name (`.git/moduleſ/x/hooks`,
+//! `.git/hooKs` with the Kelvin sign, `.git/hookſ`, `.git/conﬁg.worktree`, `.git/worktreeſ/w`, capitals included),
+//! where the profile's two regexes (matched with the `regex` crate) and `git_metadata`/`git_container` agree on
+//! each of them and on names that are none of theirs. Under `sandbox-exec`: each of those writes fails, as does making
+//! `.git/moduleſ/x/hooks`, a Kelvin-sign `hooks` where `hooks` is missing and `.git/conﬁg.worktree`, in a repository
+//! that has none of those names yet, while `.git/conﬂg` (a ligature that is not `fi`) can be made, and as does making
 //! `.git/modules/<new>/hooks` with `mkdir -p`; moving a directory from `$TMPDIR` to `.git/modules/<new>`,
 //! `.git/worktrees/<new>`, `.git/modules/third/<new>` and `.git/modules/<sub>/modules`; renaming `.git/modules`
 //! and `.git/modules/<sub>` away; `git init` in `$TMPDIR`; and moving a bare repository to `$TMPDIR/<d>/.git` —
@@ -455,20 +467,126 @@ fn push_unique<T: PartialEq>(v: &mut Vec<T>, item: T) {
 /// The files of a Git directory that name what Git runs or where its configuration is.
 const GIT_PRIVATE: [&str; 5] = ["config", "config.worktree", "hooks", "commondir", "gitdir"];
 
-/// The lower-cased names of `path` below `root`, when it lies in it.
+/// Characters that the volume (APFS, the macOS default) takes for an ASCII letter besides its two cases: the long s
+/// and the Kelvin sign. Probed on macOS 27; `char::to_lowercase` maps the Kelvin sign already, the long s it does not.
+const FOLD_LETTERS: [(char, char); 2] = [('\u{17f}', 's'), ('\u{212a}', 'k')];
+
+/// Characters that the volume takes for a run of ASCII letters (the sharp s and the Latin ligatures). The dotted and
+/// dotless i, the fullwidth letters and the zero-width characters are not folded.
+const FOLD_EXPANDS: [(char, &str); 9] = [
+    ('\u{df}', "ss"),
+    ('\u{1e9e}', "ss"),
+    ('\u{fb00}', "ff"),
+    ('\u{fb01}', "fi"),
+    ('\u{fb02}', "fl"),
+    ('\u{fb03}', "ffi"),
+    ('\u{fb04}', "ffl"),
+    ('\u{fb05}', "st"),
+    ('\u{fb06}', "st"),
+];
+
+/// `name` as the volume compares it: lower case, with the characters of `FOLD_LETTERS` and `FOLD_EXPANDS` replaced
+/// by the ASCII they stand for. Two names that name the same entry have the same fold; so does the ASCII name.
+fn fold(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars().flat_map(char::to_lowercase) {
+        if let Some((_, to)) = FOLD_LETTERS.iter().find(|(from, _)| *from == c) {
+            out.push(*to);
+        } else if let Some((_, to)) = FOLD_EXPANDS.iter().find(|(from, _)| *from == c) {
+            out.push_str(to);
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The folded names of `path` below `root`, when it lies in it.
 fn names_below(path: &Path, root: &Path) -> Option<Vec<String>> {
     if !under(path, root) {
         return None;
     }
     let names = path.components().skip(root.components().count());
-    Some(names.map(|c| c.as_os_str().to_string_lossy().to_ascii_lowercase()).collect())
+    Some(names.map(|c| fold(&c.as_os_str().to_string_lossy())).collect())
+}
+
+/// The SBPL regex text that matches `text` (a lower-case name) however the volume spells it, character by
+/// character: a letter is both its cases and every character that folds to it (`(s|S|ſ)`), and a run of letters that
+/// a character folds to is that run or the character (`([fF][iI]|ﬁ)`), over the whole stretch where such runs overlap.
+fn fold_regex(text: &str) -> String {
+    let chars: Vec<char> = text.chars().map(|c| c.to_ascii_lowercase()).collect();
+    let mut out = String::new();
+    let mut at = 0_usize;
+    while at < chars.len() {
+        let end = fold_span_end(&chars, at);
+        let spellings = fold_spellings(chars.get(at..end).unwrap_or_default());
+        match spellings.as_slice() {
+            [one] => out.push_str(one),
+            many => {
+                out.push('(');
+                out.push_str(&many.join("|"));
+                out.push(')');
+            }
+        }
+        at = end;
+    }
+    out
+}
+
+/// Where the stretch that starts at `at` and holds every run a folding character stands for ends (after `at`).
+fn fold_span_end(chars: &[char], at: usize) -> usize {
+    let mut end = at.saturating_add(1);
+    let mut p = at;
+    while p < end {
+        for (_, to) in FOLD_EXPANDS {
+            let to: Vec<char> = to.chars().collect();
+            if chars.get(p..).is_some_and(|rest| rest.starts_with(&to)) {
+                end = end.max(p.saturating_add(to.len()));
+            }
+        }
+        p = p.saturating_add(1);
+    }
+    end.min(chars.len())
+}
+
+/// Every way to spell `chars` (lower-case ASCII), each as the regex text of the spelling.
+fn fold_spellings(chars: &[char]) -> Vec<String> {
+    let Some((&first, rest)) = chars.split_first() else { return vec![String::new()] };
+    let head = fold_letter(first);
+    let mut out: Vec<String> = fold_spellings(rest).into_iter().map(|tail| format!("{head}{tail}")).collect();
+    for (from, to) in FOLD_EXPANDS {
+        let to: Vec<char> = to.chars().collect();
+        if chars.starts_with(&to) {
+            let after = chars.get(to.len()..).unwrap_or_default();
+            out.extend(fold_spellings(after).into_iter().map(|tail| format!("{from}{tail}")));
+        }
+    }
+    out
+}
+
+/// The regex text for one character: a letter in both cases and every character that folds to it, else itself.
+fn fold_letter(c: char) -> String {
+    if c.is_ascii_alphabetic() {
+        let upper = c.to_ascii_uppercase();
+        let others: String =
+            FOLD_LETTERS.iter().filter(|(_, to)| *to == c).map(|(from, _)| format!("|{from}")).collect();
+        if others.is_empty() {
+            format!("[{c}{upper}]")
+        } else {
+            format!("({c}|{upper}{others})")
+        }
+    } else if c.is_ascii_alphanumeric() {
+        c.to_string()
+    } else {
+        format!("[{c}]")
+    }
 }
 
 /// Git metadata that cannot be written, made, removed or renamed, at locations that do not exist yet as well,
 /// as `path` lies below the writable root `root`: any `.git` entry, and below one the `config`,
 /// `config.worktree`, `hooks`, `commondir` and `gitdir` of the repository, of a linked worktree's gitdir
 /// (`worktrees/<name>/…`) and of a submodule's repository (`modules/<name>/…`, nested ones included). Names are
-/// compared without regard to case. The profile's first Git rule says the same.
+/// compared as the volume folds case (`fold`). The profile's first Git rule says the same.
 fn git_metadata(path: &Path, root: &Path) -> bool {
     let Some(names) = names_below(path, root) else { return false };
     let private = |name: &String| GIT_PRIVATE.contains(&name.as_str());
@@ -528,7 +646,7 @@ struct GitFound {
 fn plain_roots(plain: &[PlainDir]) -> impl Iterator<Item = &PlainDir> {
     plain.iter().filter(|p| {
         let parent = p.dir.parent().and_then(Path::file_name);
-        parent.is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case("modules"))
+        parent.is_some_and(|n| fold(&n.to_string_lossy()) == "modules")
     })
 }
 
@@ -591,7 +709,7 @@ fn git_directories(workspace: &Path) -> io::Result<GitFound> {
             let entry = entry?;
             let path = entry.path();
             let kind = entry.file_type()?;
-            if entry.file_name().to_string_lossy().eq_ignore_ascii_case(".git") {
+            if fold(&entry.file_name().to_string_lossy()) == ".git" {
                 if path.is_dir() {
                     push_unique(&mut roots, canon(&path)?);
                 } else if let Some(text) = pointer(&path)? {
@@ -1330,20 +1448,11 @@ impl Sandbox {
 
     /// The Git rules of the profile, which must come after every allow and deny that concerns the session temp
     /// dir (the last matching rule wins): they hold in every writable root, the temp dir included. Every letter
-    /// of a name is a class of both cases; `subpaths` writes ` (subpath "<path>")` for each of a list.
+    /// of a name is a class of both cases and of what the volume folds to it (`fold_regex`); `subpaths` writes
+    /// ` (subpath "<path>")` for each of a list.
     fn git_rules(&self, subpaths: &dyn Fn(&[PathBuf]) -> String) -> String {
-        let ci = |text: &str| -> String {
-            let letter = |c: char| {
-                if c.is_ascii_alphabetic() {
-                    format!("[{c}{}]", c.to_ascii_uppercase())
-                } else {
-                    "[.]".to_string()
-                }
-            };
-            text.chars().map(letter).collect()
-        };
-        let (git, worktrees, modules) = (ci(".git"), ci("worktrees"), ci("modules"));
-        let names = GIT_PRIVATE.map(ci).join("|");
+        let (git, worktrees, modules) = (fold_regex(".git"), fold_regex("worktrees"), fold_regex("modules"));
+        let names = GIT_PRIVATE.map(fold_regex).join("|");
         let roots = format!("(require-any{})", subpaths(&self.writable));
         let mut out = format!(
             "(deny file-write* (require-all {roots} (regex #\"^.*/{git}(/(({worktrees}/[^/]+|{modules}/(.+/)?[^/]+)/)?({names})(/.*)?)?$\")))\n\
@@ -1721,12 +1830,14 @@ mod tests {
         Sandbox::with_home(c, &f.ws, &f.tmp, &f.home, None, Some(fake_home.to_path_buf())).expect("sandbox")
     }
 
-    // The Git rules' names, written out: a letter is a class of both cases.
+    // The Git rules' names, written out: a letter is a class of both cases, and where the volume folds other
+    // characters to it (the long s, the Kelvin sign U+212A, the `fi` ligature) an alternation that adds them.
     const G: &str = "[.][gG][iI][tT]";
-    const WT: &str = "[wW][oO][rR][kK][tT][rR][eE][eE][sS]";
-    const MO: &str = "[mM][oO][dD][uU][lL][eE][sS]";
-    const NAMES: &str = "[cC][oO][nN][fF][iI][gG]|[cC][oO][nN][fF][iI][gG][.][wW][oO][rR][kK][tT][rR][eE][eE]|\
-                         [hH][oO][oO][kK][sS]|[cC][oO][mM][mM][oO][nN][dD][iI][rR]|[gG][iI][tT][dD][iI][rR]";
+    const WT: &str = "[wW][oO][rR](k|K|\u{212a})[tT][rR][eE][eE](s|S|\u{17f})";
+    const MO: &str = "[mM][oO][dD][uU][lL][eE](s|S|\u{17f})";
+    const NAMES: &str = "[cC][oO][nN]([fF][iI]|\u{fb01})[gG]|\
+                         [cC][oO][nN]([fF][iI]|\u{fb01})[gG][.][wW][oO][rR](k|K|\u{212a})[tT][rR][eE][eE]|\
+                         [hH][oO][oO](k|K|\u{212a})(s|S|\u{17f})|[cC][oO][mM][mM][oO][nN][dD][iI][rR]|[gG][iI][tT][dD][iI][rR]";
 
     /// The two Git rules over the writable roots `roots` (each written ` (subpath "…")`).
     fn git_lines(roots: &str) -> String {
@@ -4018,6 +4129,199 @@ mod tests {
             .expect("sandbox")
             .check_write(&f.tmp.join("x/.git"))
             .is_err());
+    }
+
+    /// Every spelling of `name` that the volume takes for it, with a few of them: its own, in capitals, each
+    /// position replaced by each equivalent in turn, and every position replaced at once.
+    fn fold_variants(name: &str) -> Vec<String> {
+        let chars: Vec<char> = name.chars().collect();
+        // What can stand at `at`: (spelling, characters of `name` it takes).
+        let choices = |at: usize| -> Vec<(String, usize)> {
+            let c = chars.get(at).copied().unwrap_or('.');
+            let mut out = vec![(c.to_string(), 1), (c.to_ascii_uppercase().to_string(), 1)];
+            out.extend(FOLD_LETTERS.iter().filter(|(_, to)| *to == c).map(|(from, _)| (from.to_string(), 1)));
+            let rest: String = chars.iter().skip(at).collect();
+            out.extend(
+                FOLD_EXPANDS
+                    .iter()
+                    .filter(|(_, to)| rest.starts_with(to))
+                    .map(|(from, to)| (from.to_string(), to.len())),
+            );
+            out
+        };
+        let mut out = vec![name.to_string(), name.to_uppercase()];
+        for pos in 0..chars.len() {
+            for (alt, took) in choices(pos).into_iter().skip(2) {
+                let before: String = chars.iter().take(pos).collect();
+                let after: String = chars.iter().skip(pos + took).collect();
+                out.push(format!("{before}{alt}{after}"));
+            }
+        }
+        let mut all = String::new();
+        let mut at = 0;
+        while at < chars.len() {
+            let (alt, took) = choices(at).pop().unwrap_or((String::new(), 1));
+            all.push_str(&alt);
+            at += took;
+        }
+        out.push(all);
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    #[test]
+    fn fold_is_the_volumes_and_the_regex_matches_what_it_folds() {
+        assert_eq!(fold("Module\u{17f}"), "modules");
+        assert_eq!(fold("HOO\u{212a}S"), "hooks");
+        assert_eq!(fold("con\u{fb01}g.worktree"), "config.worktree");
+        assert_eq!(fold("\u{fb03}"), "ffi");
+        assert_eq!(fold("\u{df}"), "ss");
+        // Not folded by the volume: the dotted and dotless i, the fullwidth s, a zero-width joiner.
+        for other in ["g\u{130}t", "g\u{131}t", "module\u{ff53}", "mo\u{200d}dules"] {
+            assert!(!fold(other).is_ascii(), "{other}");
+        }
+        assert_eq!(fold_regex("modules"), "[mM][oO][dD][uU][lL][eE](s|S|\u{17f})");
+        assert_eq!(fold_regex("hooks"), "[hH][oO][oO](k|K|\u{212a})(s|S|\u{17f})");
+        assert_eq!(fold_regex("config"), "[cC][oO][nN]([fF][iI]|\u{fb01})[gG]");
+        assert_eq!(fold_regex(".git"), "[.][gG][iI][tT]");
+        // Runs that overlap are spelled every way.
+        let re = regex::Regex::new(&format!("^{}$", fold_regex("ffi"))).expect("regex");
+        for yes in ["ffi", "FFI", "\u{fb00}i", "f\u{fb01}", "\u{fb03}", "F\u{fb01}"] {
+            assert!(re.is_match(yes), "{yes}");
+        }
+        for no in ["fi", "\u{fb01}", "ff", "\u{fb02}i"] {
+            assert!(!re.is_match(no), "{no}");
+        }
+        let re = regex::Regex::new(&format!("^{}$", fold_regex("sst"))).expect("regex");
+        for yes in ["sst", "\u{df}t", "s\u{fb06}", "\u{17f}\u{fb05}", "\u{17f}\u{17f}T"] {
+            assert!(re.is_match(yes), "{yes}");
+        }
+    }
+
+    #[test]
+    fn the_regexes_and_the_name_checks_agree_on_every_fold_of_the_git_names() {
+        let f = fx();
+        let sb = build(&f, &cfg(SandboxMode::Seatbelt), None);
+        let profile = sb.profile().expect("profile");
+        let rules: Vec<regex::Regex> = profile
+            .lines()
+            .filter_map(|l| {
+                if !l.contains("(regex #\"^.*/") {
+                    return None;
+                }
+                let start = l.find("(regex #\"")? + "(regex #\"".len();
+                let end = l.rfind("\")))")?;
+                Some(regex::Regex::new(l.get(start..end)?).expect("the profile's regex"))
+            })
+            .collect();
+        assert_eq!(rules.len(), 2, "{profile}");
+        let root = &f.ws;
+        let names: Vec<&str> = GIT_PRIVATE.iter().copied().chain(["modules", "worktrees"]).collect();
+        let mut paths = Vec::new();
+        for gitv in fold_variants(".git") {
+            paths.push(format!("{gitv}/config"));
+            paths.push(gitv.clone());
+        }
+        for name in &names {
+            for v in fold_variants(name) {
+                for prefix in
+                    ["", "worktrees/w/", "modules/a/", "modules/a/b/", "modules/a/modules/b/", "modules/", "worktrees/"]
+                {
+                    for suffix in ["", "/x", "/x/y"] {
+                        paths.push(format!(".git/{prefix}{v}{suffix}"));
+                    }
+                }
+            }
+        }
+        for m in fold_variants("modules") {
+            for w in fold_variants("worktrees") {
+                paths.push(format!(".git/{w}/n/commondir"));
+                paths.push(format!(".git/{m}/n/{w}/x"));
+            }
+            for p in ["config", "hooks"].iter().flat_map(|n| fold_variants(n)) {
+                paths.push(format!(".git/{m}/evil/{p}"));
+                paths.push(format!(".git/{m}/{p}"));
+            }
+        }
+        for p in ["worktrees", "modules"].iter().flat_map(|n| fold_variants(n)) {
+            for q in ["commondir", "gitdir", "config.worktree"].iter().flat_map(|n| fold_variants(n)) {
+                paths.push(format!(".git/{p}/w/{q}"));
+            }
+        }
+        // Names that are none of theirs.
+        for other in [
+            "objects",
+            "refs/heads/x",
+            "modulez/x/hooks",
+            "hooks2",
+            "modules2/x",
+            "configs",
+            "worktree/x/config",
+            "conf\u{fb02}g",
+            "g\u{130}t",
+        ] {
+            paths.push(format!(".git/{other}"));
+        }
+        let mut refused = 0_usize;
+        for rel in &paths {
+            let full = root.join(rel);
+            let text = full.to_string_lossy().to_string();
+            let (meta, container) = (git_metadata(&full, root), git_container(&full, root));
+            let hit = |re: &regex::Regex| re.is_match(&text);
+            assert_eq!(hit(rules.first().expect("rule")), meta, "metadata rule and git_metadata on {text}");
+            assert_eq!(hit(rules.get(1).expect("rule")), container, "container rule and git_container on {text}");
+            if meta || container {
+                refused += 1;
+                assert!(sb.check_write(&full).is_err(), "{text}");
+            }
+        }
+        assert!(refused > 500, "{refused}");
+        // And the ones that matter, by hand.
+        for rel in [
+            ".git/module\u{17f}/x/hooks",
+            ".git/hoo\u{212a}s",
+            ".git/hook\u{17f}/x",
+            ".git/con\u{fb01}g.worktree",
+            ".git/worktree\u{17f}/w",
+            ".git/modules/x/con\u{fb01}g",
+            ".GIT/MODULE\u{17f}/x/CON\u{fb01}G",
+        ] {
+            assert!(sb.check_write(&root.join(rel)).is_err(), "{rel}");
+        }
+        assert!(sb.check_write(&root.join(".git/objects/ab/cdef")).is_ok());
+    }
+
+    #[test]
+    fn names_the_volume_folds_to_the_git_names_cannot_be_made_under_the_profile() {
+        let test = "names_the_volume_folds_to_the_git_names_cannot_be_made_under_the_profile";
+        if !available() {
+            return skipped(test, "sandbox-exec is missing");
+        }
+        let f = fx();
+        // A repository with none of the names yet: an existing entry is judged by the name it is stored under, so
+        // what the profile has to refuse is making one under another spelling.
+        let git = f.ws.join(".git");
+        std::fs::create_dir_all(git.join("objects")).expect("mkdir");
+        std::fs::write(git.join("HEAD"), "ref: refs/heads/main\n").expect("write");
+        let sb = build(&f, &cfg(SandboxMode::Seatbelt), None);
+        for attempt in [
+            "mkdir -p .git/module\u{17f}/x/hooks",
+            "mkdir -p .git/hoo\u{212a}s",
+            "mkdir -p .git/hook\u{17f}",
+            "echo x > .git/con\u{fb01}g.worktree",
+            "mkdir -p .git/worktree\u{17f}/w",
+        ] {
+            let (ok, text) = run(&sb, &f.ws, attempt);
+            assert!(!ok, "`{attempt}` succeeded under the profile: {text}");
+        }
+        for (ok_script, what) in [
+            ("mkdir -p .git/objects/ab && echo x > .git/refs-x", "a name that is none of them"),
+            ("mkdir -p .git/con\u{fb02}g", "a ligature that is not `fi`"),
+        ] {
+            let (ok, text) = run(&sb, &f.ws, ok_script);
+            assert!(ok, "{what}: `{ok_script}` failed under the profile: {text}");
+        }
     }
 
     #[test]

@@ -1121,7 +1121,8 @@ Git metadata is protected, because Git runs what it holds as the operator: a con
 `core.fsmonitor` (and every other command a config names) and hooks run on the operator's next
 `git status`, commit or `git submodule update`, and a `commondir` or `gitdir` pointer decides which
 config that is. Under Seatbelt and in the file tools, in every writable root (the workspace, the
-session temp dir and `extra_writable`), existing or not, names compared without regard to case: no
+session temp dir and `extra_writable`), existing or not, names compared as the volume folds them
+(APFS counts `ſ`, the Kelvin sign and the `ﬁ` ligature as `s`, `k` and `fi`): no
 `.git` can be made, written, removed or renamed; below one, nothing at `config`, `config.worktree`,
 `hooks`, `commondir` or `gitdir` can be written, for the repository itself, for linked worktrees'
 private gitdirs (`.git/worktrees/<name>/`) and for submodule repositories (`.git/modules/<name>/`,

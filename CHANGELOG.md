@@ -15,6 +15,10 @@
   mounted read-only by Bubblewrap). `git init` and non-bare clones no longer work anywhere commands write: a bare
   clone does; `git worktree add` and `git submodule update --init` are for the operator, and the refusal and the
   system prompt say so.
+- The file tools' `check_write` compares those Git names as APFS folds them (`ſ`, the Kelvin sign, `ß` and the
+  `ﬀ`–`ﬆ` ligatures), so `write` can no longer make `.git/moduleſ/<n>/hooks/<hook>`, which Git reads as
+  `.git/modules/<n>/hooks/<hook>`; the profile's Git regexes spell the same folds (Seatbelt already matched
+  the folded name on macOS 27).
 - Under `network.mode = deny_all`, commands can no longer reach `com.apple.trustd.agent`, `com.apple.trustd` or
   `com.apple.ocspd`. A command could have trustd fetch any URL named in a certificate (AIA), past the proxy and
   `net.jsonl`. Programs that check certificates through macOS (Swift, Go, `security`, `codesign --verify`) now
