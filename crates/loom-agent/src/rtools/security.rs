@@ -33,9 +33,13 @@
 //! - `counts`: `{collection: number of entries}` after the write, for each non-empty collection.
 //! - `more`: `The rest of the security state is unchanged by this write; read it with security_query
 //!   (view: state, assets, coverage, revisit, hypotheses or facts).`
+//!
 //! Tests: a single upsert returns that asset in full and the counts, not the other assets; a batch
 //! over the size bound returns counts and ids; a hypothesis_open returns the new hypothesis id; a
-//! retraction lists the removed id. When the read operation was expanded by N4d (a single hypothesis_open carrying evidence) and
+//! retraction returns the fact it deactivated (a retraction keeps the record, so `removed` stays empty; it
+//! lists ids a write deletes, tested on the report itself).
+//!
+//! When the read operation was expanded by N4d (a single hypothesis_open carrying evidence) and
 //! the append fails, the error gets the sentence " The evidence given with hypothesis_open was being
 //! attached by a second operation in the same atomic append; nothing was recorded." appended.
 //!
@@ -219,6 +223,7 @@ impl Tool for SecurityRecord {
             Ok(s) => s,
             Err(e) => return ToolOutput::error(e),
         };
+        let before = state.security.clone();
         let caller = shapes::Caller { standing: standing(&self.0), tools: &self.0.role.tools };
         let operation = args.get("operation").unwrap_or(&Value::Null);
         let read = match shapes::read(&caller, &state.security, operation) {
@@ -258,7 +263,7 @@ impl Tool for SecurityRecord {
                 if !notes.is_empty() {
                     result.insert("normalized".into(), json!(notes));
                 }
-                result.insert("state".into(), json!(state.security));
+                result.extend(touched_report(&before, &state.security));
                 output(&result)
             }
             Err(e) if expanded => ToolOutput::error(format!(
@@ -268,6 +273,98 @@ impl Tool for SecurityRecord {
             Err(e) => ToolOutput::error(e),
         }
     }
+}
+
+/// The most characters of full records `security_record` returns; past it, counts and the first ids.
+const RECORDED_CHARS: usize = 8_000;
+/// Ids named per collection when the touched records are too many to return in full.
+const RECORDED_IDS: usize = 20;
+/// The id-keyed collections of `SecurityState` whose touched entries a write reports.
+const KEYED: [&str; 13] = [
+    "assets",
+    "credentials",
+    "footholds",
+    "condition_evidence",
+    "blocked",
+    "revisited",
+    "crashes",
+    "vector_attempts",
+    "hypotheses",
+    "relations",
+    "facts",
+    "rules",
+    "aliases",
+];
+
+/// What a write changed, as the result fields `recorded`, `removed`, `counts` and `more` (see CONTRACT):
+/// per collection the keys whose value differs between `before` and `after`, the ids that are gone, and
+/// the size of each non-empty collection after the write.
+fn touched_report(before: &SecurityState, after: &SecurityState) -> Map<String, Value> {
+    let (before, after) = (json!(before), json!(after));
+    let empty = Map::new();
+    let mut touched: Map<String, Value> = Map::new();
+    let mut removed: Map<String, Value> = Map::new();
+    let mut counts: Map<String, Value> = Map::new();
+    for name in KEYED {
+        let old = before.get(name).and_then(Value::as_object).unwrap_or(&empty);
+        let new = after.get(name).and_then(Value::as_object).unwrap_or(&empty);
+        let changed: Map<String, Value> =
+            new.iter().filter(|(id, v)| old.get(*id) != Some(v)).map(|(id, v)| (id.clone(), v.clone())).collect();
+        if !changed.is_empty() {
+            touched.insert(name.into(), Value::Object(changed));
+        }
+        let gone: Vec<Value> = old.keys().filter(|id| !new.contains_key(*id)).map(|id| json!(id)).collect();
+        if !gone.is_empty() {
+            removed.insert(name.into(), Value::Array(gone));
+        }
+        if !new.is_empty() {
+            counts.insert(name.into(), json!(new.len()));
+        }
+    }
+    let old = before.get("unlocked").and_then(Value::as_array).cloned().unwrap_or_default();
+    let new = after.get("unlocked").and_then(Value::as_array).cloned().unwrap_or_default();
+    let added: Vec<Value> = new.iter().filter(|c| !old.contains(c)).cloned().collect();
+    if !added.is_empty() {
+        touched.insert("unlocked".into(), Value::Array(added));
+    }
+    if !new.is_empty() {
+        counts.insert("unlocked".into(), json!(new.len()));
+    }
+    let size = serde_json::to_string(&touched).map(|t| t.chars().count()).unwrap_or(usize::MAX);
+    let recorded: Map<String, Value> = if size <= RECORDED_CHARS {
+        touched
+    } else {
+        touched
+            .into_iter()
+            .map(|(name, records)| {
+                let ids: Vec<Value> = match &records {
+                    Value::Object(m) => m.keys().take(RECORDED_IDS).map(|id| json!(id)).collect(),
+                    Value::Array(a) => a.iter().take(RECORDED_IDS).cloned().collect(),
+                    _ => Vec::new(),
+                };
+                let count = match &records {
+                    Value::Object(m) => m.len(),
+                    Value::Array(a) => a.len(),
+                    _ => 0,
+                };
+                (name, json!({"count": count, "ids": ids}))
+            })
+            .collect()
+    };
+    let mut report = Map::new();
+    report.insert("recorded".into(), Value::Object(recorded));
+    if !removed.is_empty() {
+        report.insert("removed".into(), Value::Object(removed));
+    }
+    report.insert("counts".into(), Value::Object(counts));
+    report.insert(
+        "more".into(),
+        json!(
+            "The rest of the security state is unchanged by this write; read it with security_query (view: state, \
+             assets, coverage, revisit, hypotheses or facts)."
+        ),
+    );
+    report
 }
 
 /// The session's standing for hypotheses: the lead, a read-only child with the verdict tool, or another child.
@@ -544,6 +641,103 @@ mod tests {
         assert_eq!(batch.status, Status::Error);
         assert!(batch.text.contains("Operation 2 of 2 in the batch (asset_upsert): "), "{}", batch.text);
         assert!(r.shared.ledger().unwrap().security.assets.len() == 2);
+    }
+
+    fn upsert(locator: &str) -> Value {
+        json!({"action":"asset_upsert","asset":{"kind":"host","locator":locator,"evidence":["e1"]}})
+    }
+
+    #[tokio::test]
+    async fn a_single_upsert_returns_that_asset_and_the_counts_not_the_other_assets() {
+        let r = rig("lead", false, true);
+        let h = r.output("synthetic evidence", "bash", ToolClass::Exec);
+        evidence(&r, &h);
+        for locator in ["10.0.0.1", "10.0.0.2"] {
+            let res = r.call("security_record", json!({ "operation": upsert(locator) })).await;
+            assert_eq!(res.status, Status::Ok, "{}", res.text);
+        }
+        let res = r.call("security_record", json!({"operation": upsert("10.0.0.3")})).await;
+        assert_eq!(res.status, Status::Ok, "{}", res.text);
+        let body = body_json(&res.text);
+        let assets = body["recorded"]["assets"].as_object().unwrap();
+        assert_eq!(assets.len(), 1, "{body}");
+        assert_eq!(assets.values().next().unwrap()["locator"], "10.0.0.3");
+        assert_eq!(body["counts"]["assets"], 3, "{body}");
+        assert!(body.get("state").is_none() && body.get("removed").is_none(), "{body}");
+        assert!(body["more"].as_str().unwrap().starts_with("The rest of the security state is unchanged"), "{body}");
+        assert!(!res.text.contains("10.0.0.1") && !res.text.contains("10.0.0.2"), "{}", res.text);
+    }
+
+    #[tokio::test]
+    async fn a_batch_over_the_size_bound_returns_counts_and_ids() {
+        let r = rig("lead", false, true);
+        let h = r.output("synthetic evidence", "bash", ToolClass::Exec);
+        evidence(&r, &h);
+        let ops: Vec<Value> = (0..60).map(|i| upsert(&format!("10.1.0.{i}"))).collect();
+        let res = r.call("security_record", json!({"operation":{"action":"batch","ops":ops}})).await;
+        assert_eq!(res.status, Status::Ok, "{}", res.text);
+        let body = body_json(&res.text);
+        assert_eq!(body["recorded"]["assets"]["count"], 60, "{body}");
+        let ids = body["recorded"]["assets"]["ids"].as_array().unwrap();
+        assert_eq!(ids.len(), RECORDED_IDS);
+        assert!(ids.iter().all(|id| r.shared.ledger().unwrap().security.assets.contains_key(id.as_str().unwrap())));
+        assert_eq!(body["counts"]["assets"], 60, "{body}");
+        assert!(res.text.chars().count() < RECORDED_CHARS, "{}", res.text.chars().count());
+    }
+
+    #[tokio::test]
+    async fn a_hypothesis_open_returns_the_new_hypothesis_id() {
+        let r = rig("lead", false, true);
+        let res = r
+            .call(
+                "security_record",
+                json!({"operation":{"action":"hypothesis_open","hypothesis":{"statement":"candidate","priority":"high"}}}),
+            )
+            .await;
+        assert_eq!(res.status, Status::Ok, "{}", res.text);
+        let body = body_json(&res.text);
+        let id = stable_id("hy", &["candidate"]);
+        assert_eq!(body["recorded"]["hypotheses"][&id]["id"], json!(id), "{body}");
+        assert_eq!(body["counts"]["hypotheses"], 1, "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_retraction_reports_the_fact_it_deactivated() {
+        let r = rig("lead", false, true);
+        let h = r.output("synthetic evidence", "bash", ToolClass::Exec);
+        evidence(&r, &h);
+        let asserted = r
+            .call(
+                "security_record",
+                json!({"operation":{"action":"fact_assert","fact":{"predicate":"seen","args":["dummy"]},"evidence":["e1"]}}),
+            )
+            .await;
+        assert_eq!(asserted.status, Status::Ok, "{}", asserted.text);
+        let id = r.shared.ledger().unwrap().security.facts.keys().next().unwrap().clone();
+        let res =
+            r.call("security_record", json!({"operation":{"action":"fact_retract","id":id,"reason":"mistaken"}})).await;
+        assert_eq!(res.status, Status::Ok, "{}", res.text);
+        let body = body_json(&res.text);
+        assert_eq!(body["recorded"]["facts"][&id]["active"], false, "{body}");
+        assert_eq!(body["counts"]["facts"], 1, "{body}");
+    }
+
+    #[test]
+    fn touched_report_lists_removed_ids_and_added_conditions() {
+        let mut before = SecurityState::default();
+        before.aliases.insert("web".into(), "as-1".into());
+        before.aliases.insert("db".into(), "as-2".into());
+        before.revisited.insert("r1".into(), 3);
+        let mut after = before.clone();
+        after.aliases.remove("db");
+        after.revisited.insert("r1".into(), 4);
+        after.unlocked.insert(Condition { kind: ConditionKind::Cred, value: "admin".into() });
+        let report = touched_report(&before, &after);
+        assert_eq!(report["removed"]["aliases"], json!(["db"]), "{report:?}");
+        assert_eq!(report["recorded"]["revisited"], json!({"r1": 4}), "{report:?}");
+        assert_eq!(report["recorded"]["unlocked"].as_array().map(Vec::len), Some(1), "{report:?}");
+        assert!(report["recorded"].get("aliases").is_none(), "{report:?}");
+        assert_eq!((report["counts"]["aliases"].clone(), report["counts"]["unlocked"].clone()), (json!(1), json!(1)));
     }
 
     #[tokio::test]
