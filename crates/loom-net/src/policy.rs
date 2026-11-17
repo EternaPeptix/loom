@@ -184,6 +184,22 @@ impl Pattern {
     }
 }
 
+/// True when the host pattern `pattern` (the grammar of `allow` and of operator grants: `host`, `*.suffix`,
+/// optionally `:port`) covers `host`. With `port` of `None` a port written in the pattern is ignored, so the answer is
+/// "does this grant cover the host on some port". A wildcard covers its subdomains, never the apex. An invalid
+/// pattern covers nothing.
+pub fn pattern_covers(pattern: &str, host: &str, port: Option<u16>) -> bool {
+    let Ok(p) = Pattern::parse(pattern) else { return false };
+    let h = normalize_host(host);
+    match port {
+        Some(port) => p.matches(&h, port),
+        None => {
+            let any_port = Pattern { port: None, ..p };
+            any_port.matches(&h, 0)
+        }
+    }
+}
+
 /// Splits `host[:port]`, `[v6]` and `[v6]:port`; a bare IPv6 literal has no port.
 fn split_host_port(text: &str) -> Result<(&str, Option<u16>), String> {
     let parse_port = |p: &str| p.parse::<u16>().map_err(|_| format!("`{p}` is not a port number"));
@@ -671,6 +687,16 @@ mod tests {
     }
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn pattern_covers_follows_the_grant_grammar() {
+        assert!(pattern_covers("*.lab.example", "X1.Lab.Example", None));
+        assert!(!pattern_covers("*.lab.example", "lab.example", None), "a wildcard does not cover the apex");
+        assert!(pattern_covers("lab.example:8443", "lab.example", None));
+        assert!(pattern_covers("lab.example:8443", "lab.example", Some(8443)));
+        assert!(!pattern_covers("lab.example:8443", "lab.example", Some(443)));
+        assert!(!pattern_covers("not a host", "lab.example", None));
     }
 
     #[test]

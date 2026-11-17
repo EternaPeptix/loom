@@ -104,8 +104,10 @@ pub struct Monitor {
 
 impl Monitor {
     /// Open `<home>/monitor`, fold its log, and start the workers (M2). The fold completes before this returns, so the
-    /// caller can activate sessions afterwards (I9). A failed MAC or an unwritable log is `Unavailable`: the caller
-    /// starts without a monitor and the daemon shows the "down" state (`docs/MONITOR.md` §2.8).
+    /// caller can activate sessions afterwards (I9). A failed MAC or an unwritable log is `Unavailable`: the monitor is
+    /// down and the daemon shows the "down" state (`docs/MONITOR.md` §2.8), but down never lifts a pause: the caller
+    /// holds every mission that has a pause or halt record (every mission when it cannot tell) until the operator
+    /// acknowledges, whatever `monitor_down` says (`log.rs` CONTRACT).
     pub async fn start(_home: &std::path::Path) -> Result<Monitor, MonitorError> {
         not_built("start-up", "M2")
     }

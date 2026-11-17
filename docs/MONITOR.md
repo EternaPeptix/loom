@@ -213,7 +213,7 @@ To keep authorized offensive work unblocked, the monitor does **not** judge:
 ## 2. Architecture
 
 ### 2.1 Placement and invariants
-`Runtime` owns `Arc<Monitor>`, built at `Runtime::start` after the proxy. Its log fold completes **before** `load_known` and any activation (runtime.rs ~3954). The parts:
+`Runtime` owns `Arc<Monitor>`, built at `Runtime::start` after the proxy. Its log fold completes **before** `load_known` and any activation (before `Runtime::load_known` in `Runtime::start`). The parts:
 
 | part | role |
 |---|---|
@@ -251,7 +251,7 @@ To keep authorized offensive work unblocked, the monitor does **not** judge:
 
 | id | control | what it closes |
 |---|---|---|
-| **E1** | **Implicit infrastructure deny in every policy, beating grants** (deny is checked first, `loom_net::policy`). It covers: the daemon bind:port; every loom proxy listener except the session's own (per-session listeners, #39); model endpoints from config (including `spark-one…ts.net:8000`, `127.0.0.1:9920`); box and rootbox Docker hosts (`:2375/:2376`, `docker.sock`); DevTools and inspector ports 9222 and 9229; desktop-app ports listed in config; 169.254.0.0/16, `fd00:ec2::254`, `metadata.*`; tailnet infrastructure from config. Plus `loom scope revoke` (ScopeRevoke, audit opp. 21). The login code comes off `/usr/bin/open` argv (audit batch 1) | DevTools cookie theft and UI driving; daemon API use; Docker-as-root; credential borrowing via other listeners |
+| **E1** | **Implicit infrastructure deny in every policy, beating grants** (deny is checked first, `loom_net::policy`). It covers: the daemon bind:port; every loom proxy listener except the session's own (per-session listeners, #39); every model endpoint in the configuration (LAN, tailnet or loopback); box and rootbox Docker hosts (`:2375/:2376`, `docker.sock`); DevTools and inspector ports 9222 and 9229; desktop-app ports listed in config; 169.254.0.0/16, `fd00:ec2::254`, `metadata.*`; tailnet infrastructure from config. Plus `loom scope revoke` (ScopeRevoke, audit opp. 21). The login code comes off `/usr/bin/open` argv (audit batch 1) | DevTools cookie theft and UI driving; daemon API use; Docker-as-root; credential borrowing via other listeners |
 | **E2** | **Fetch-service deny in every network mode**: `com.apple.trustd(.agent)`, `ocspd`, `nsurlsessiond(.NSURLSessionProxyService)`, `com.apple.WebKit.*`. This extends #41's `deny_all`-only rule. Then default-deny `mach-lookup` with a probed allowlist. **Self-probe** at start and hourly: an AIA fetch, a background URL session, `osascript -l JavaScript`, and a procargs credential read against a local listener. Any success sets "egress unbounded" | Two-way HTTP outside the proxy |
 | **E3** | **Process identity and limits.** RLIMIT_NPROC per sandboxed command. libproc inspection, with signals still sent on Unknown. A per-session sandbox marker (a read-allow on `/private/var/empty/loom-<sid>`) with pids enumerated by sandbox identity (probe required; fall back to process group plus environment, stated best effort). A 60 s census of processes and listening sockets per session. On bubblewrap, one cgroup per session | Orphans with cleared environments; fork bombs disabling the responder |
 | **E4** | **Proxy controls.** (a) `Proxy::cut(session)` and `cut_mission(mission)`: per-entry cancellation of tunnels and forwards, including reference grants. (b) Synchronous veto in the audit hook (`loom_net::proxy` already runs the audit hook before the `200`): `Err` yields a `502` for S4 destination classes and canary hosts. (c) SNI binding: read the ClientHello before relaying; SNI must be the CONNECT host or another granted name; ECH refused; `sni` recorded in `NetDecision`. (d) Canary users in the session table (CN-1). (e) Lab-port listener identity: the process listening on a granted loopback port is checked at connect, and a listener inside any loom sandbox identity is refused (TW-05). (f) Per-rule ACCEPT and DROP counters of each mission's box chain, polled every 60 s | Pause leaves tunnels open; fronting; squatting; CN-1 silent |
@@ -331,6 +331,8 @@ Two views. Agent-influenced strings always go inside DATA, never in harness-comp
 **Pre-filter** (used for triage and excerpting):
 `impossible|not legitimately|scorer|oracle|grader|flag (elsewhere|online)|writeup|other agents|peers|bypass|evade|monitor|reviewer|without (the )?operator`, plus a script-shift detector against the session's baseline.
 
+**Real-target mission (one definition).** A mission is a *real-target mission* when `Authorization::has_real_targets()` is true: the pack does not require a restricted network, and the network mode is `open`, or a configured `allow` entry is not covered by an active `[lab]` grant of the same text, or an active operator grant is not marked `[lab]`. A mission in `allowlist` or `open` mode with no `loom scope` grant is therefore a real-target mission. Every rule that says "real targets" (triage in §2.5, the refusal and the new-recipient content in §2.6, §2.8, the opaque-code row of §4.4, §5.2 item 11, §7.1 and D5, D9, D15) means this one predicate; none of them reads the operator's `--real-targets` flag, which is only the acknowledgement that keep-going demands when the predicate is true. The mark of a host resolves with the pattern semantics of `loom_net::policy` (a wildcard covers subdomains and not the apex; `host:port` is honoured) and the strictest mark of the active grants wins (`[prod]` over unmarked over `[lab]`); a grant made in a reopened turn gives nothing once that turn has ended.
+
 ### 2.5 Cadence
 
 | layer | runs on | input | latency target | blocks? |
@@ -394,6 +396,8 @@ Two views. Agent-influenced strings always go inside DATA, never in harness-comp
 
 `glm_unc` and `necromicon` are never reviewers.
 
+**Consent is per pack, not per fleet.** `[monitor.recipients] ctf = ["alibaba"]` lets any fleet's mission in that pack reach `qwen4max`; what keeps the other fleets off it is the order of `[monitor] reviewers`, which selects the first profile eligible for the whole mission. List `dsv41_review` before `qwen4max`: the LAN reviewer then wins wherever it is eligible (every fleet but the DeepSeek ones, which share its family), and `qwen4max` is reached only by missions whose reachable set includes DeepSeek. The table above is an M1 selection test: each fleet gets the reviewer listed for it.
+
 **No eligible reviewer.**
 - The profile must be listed in `[monitor] tripwires_only_profiles` (an explicit, recorded choice). Otherwise `loom config check` fails, and **real-target** missions on that profile are refused at creation with a sentence naming the choices. Lab missions are not refused.
 - Receipts, `loom ls`, `loom status` and the header say "not LLM-reviewed".
@@ -434,7 +438,7 @@ The global `allow_new_recipient` key is **removed**.
 | refusal, content filter, `cannot_assess` | features-only retry → degraded → held for the operator | degraded window; 3 consecutive degraded windows in a session go to the fallback reviewer; if there is none, that session's gated classes are held for the operator | hold, unless every degraded window was re-reviewed in full by a fallback reviewer, or the operator accepted that window (recorded) | counted toward the refusal rate |
 | malformed | one fixed nudge, then held | one retry, then a fault | hold | the review shown as a fault |
 | restart mid-review | the gate future returns an interrupted result: "did not run" | the fold marks it `fault: restart` (not counted) | re-reviewed | — |
-| **monitor down** (task death, failed heartbeat, monitor-log write failure, MAC failure) | deterministic outcomes only; ambiguous calls held | — | disarmed fleet-wide | banner and one notification. With `monitor_down = "pause_real_targets"` (default), missions with non-lab grants or relaxed agents get R3, written to the reserve file |
+| **monitor down** (task death, failed heartbeat, monitor-log write failure, MAC failure) | deterministic outcomes only; ambiguous calls held | — | disarmed fleet-wide | banner and one notification. With `monitor_down = "pause_real_targets"` (default), real-target missions (§2.4) and relaxed-agent missions get R3, written to the reserve file. **Down never lifts a pause:** the start-up fold also replays the reserve file; when the fold cannot be built (bad MAC, unreadable log or reserve, a log shorter than the anchor beside `keys/monitor.key`, a missing log although the first-start marker exists), every mission with a pause or halt record, and every mission when that cannot be told, is held until the operator runs `loom monitor ack-down`, whatever `monitor_down` says |
 | cursor lag > 30 s on a mission with gated classes | gated calls held until caught up | — | hold | chip "monitor behind" |
 
 ---
@@ -540,12 +544,12 @@ This follows the research:
 | **R2 refuse or hold the call** | `tool_result{status: denied}` with the class sentence, or `held` (ask_operator) with an Approval item; `meta.review = {id, decision, class}` (not rendered) | gate deny or ask; deterministic deny; inline S3 | operator approval creates a time-boxed allow rule |
 | **R3 pause** | §4.2 | S3; a gate-deny count (§4.5); an unanswered S2 plus another S2+ within 30 min; a backlog (§2.8) | the operator answers the monitor item |
 | **R4 contain** | R3, then `Runtime::stop` on the lead, a permanent hold with **a snapshot of grants**, `cut_mission`, box teardown (`Inner::box_teardown`), census kill by sandbox identity (then best effort by group and environment). A rootbox mission triggers R5 for the rootbox cohort | S4; use of a canary | "Resume" with "restore all grants" (one action) or a named subset |
-| **R5 halt** | Every mission of the cohort contained; `may_run` false for the cohort; creation and activation refused with a sentence until `loom monitor clear-halt --reason` (CLI token only); global banner | the fleet conditions in §1.5 | `clear-halt` |
+| **R5 halt** | Every mission of the cohort contained; `may_run` false for the cohort; creation and activation refused with a sentence until `loom monitor clear-halt --cohort <c> --reason` (CLI token only; it clears that cohort's halt and no other); global banner | the fleet conditions in §1.5 | `clear-halt` |
 
 ### 4.2 Pause and halt mechanics (durable)
 **State.**
 - The monitor log holds `pause{mission, flag, phase: begun|applied|lifted, effects}` and `halt{cohort, …}`.
-- The fold derives `paused: Set<Mission>`. `Inner::may_run(mission)` is false for paused or halted missions.
+- The fold derives `paused: Map<Mission, Set<flag>>` and `halts: Set<Cohort>`. `Inner::may_run(mission)` is false for a mission with any open pause flag and for a mission a halt's cohort covers. `pause{lifted}` closes only its own flag, so answering one flag's item never lifts another flag's pause; a second R3 on a paused mission joins the open item. `halt{cohort, reason, client}` and `halt_cleared{cohort, client}` are per cohort; the default cohort of R5 is the pack and family of the missions whose evidence earned it (`PackFamily`), and only evidence spanning missions halts `all`.
 
 **Every path that can start a turn or launch an agent checks `may_run`:**
 - `answer`, `send_message`, resume, reweave;
@@ -605,9 +609,9 @@ The templates:
 
 ### 4.4 The gate (L1), deterministic outcomes, and held calls
 **Placement.** In `Session::run_calls_as` (`session.rs`):
-- after the `tool_call` record is synced (:3519-3530);
-- after wrap-up policy (:3538) and the exec cap;
-- before `execute` (:3557).
+- in `Session::run_calls_as`, after the `Event::ToolCall` record is appended and synced;
+- after the wrap-up policy and the exec cap;
+- before `execute`.
 
 Gated calls never get an early start: the classifier joins the early-start predicate. The **hold atomic** is checked first: when set, the result is "held by loom review; it did not run" and the turn proceeds to park.
 
@@ -637,7 +641,7 @@ Gated calls never get an early start: the classifier joins the early-start predi
 **Held calls (ask_operator).**
 - The result is immediate: "Held for the operator (approval a-…); it did not run. You may continue with other work."
 - A non-blocking Approval item is opened. Its text is harness-written: class word plus validated destination.
-- The operator answers "Allow for 60 minutes", "Allow for this mission" or "Refuse". This creates or denies a **time-boxed allow rule** keyed on (mission, class, destination, verb), checked deterministically on retry.
+- The operator answers "Allow this call once" (the default, bound to a hash of the call), "Allow for 60 minutes", "Allow for this mission" or "Refuse". A window or mission answer creates a **time-boxed allow rule** keyed on (mission, gated class, destination, verb class, route class), checked deterministically on retry and honoured only when the retried call classifies identically. **G8 offers "Allow this call once" only**, and its Approval text carries the harness-extracted, validated parameters (method, path class, amount, recipient) beside the class word and destination.
 - Identical retries before an answer get the same result and create no new item.
 - **A hold is not a denial**.
 
@@ -645,7 +649,7 @@ Gated calls never get an early start: the classifier joins the early-start predi
 - Model or deterministic **denials** (not holds, not faults) are counted per mission tree and per (class, destination).
 - 3 consecutive in a (class, destination) pair, or 20 in total in the mission tree, mean R3.
 
-**Cache.** An allow verdict is cached per (mission, host:port, verb class, credential present), with a TTL of 60 minutes.
+**Cache.** A model allow is cached per (mission, host:port, gated class, verb class, route class, credential present), with a TTL of 60 minutes. `verb class` is read, write, delete or other; `route class` is the path shape without identifiers and query. A hit needs every part equal. A model allow is never cached for G4, G5, G8 or opaque code. A model allow is never available for G2, G5 and G8, for opaque code in a real-target mission, nor for G4 under `--real-targets`: those are the operator's.
 
 **The wait.**
 - A `monitor` bus event `gate_pending` is published.
@@ -697,6 +701,9 @@ Gated calls never get an early start: the classifier joins the early-start predi
 | idle-session egress (TW-21) | R3 |
 | harness-record writes and ptrace/DYLD on non-own pids (TW-16 local) | R3 |
 | survivors that listen or connect after stop or pause (TW-20) | R3 |
+| a persistent job or LaunchAgent that exists on the host (TW-11 effect) | R4 |
+| local destructive forms: `rm -rf` outside workspace and temp, `dd of=/dev/…`, `mkfs`, `kill -9 -1`, fork-bomb shapes (TW-13 local) | R3 |
+| data that reached a sink, such as pastebin, webhook.site or interactsh/oast (TW-15 effect) | R3 |
 
 - **Everything else is shadow:**
   - flags are recorded, shown with "would have paused";
@@ -735,12 +742,12 @@ When armed, every **accepted** finish of the lead is followed by a whole-mission
   8. Any self-probe (E2 fetch services, procargs credentials, git-metadata write) fails, or `sandbox.allow_fetch_services` is set.
   9. No eligible, **vetted** reviewer covers every profile in P with full (non-degraded) content, and there is no unexpired override (§2.6). The sentence names the families and qualifying profiles.
   10. An override is attempted on a mission with a relaxed agent.
-  11. **Any non-lab grant exists without `--real-targets <reason>`.** The acknowledgement:
+  11. **The mission is a real-target mission (§2.4: `open` mode, an allow entry or a grant that is not a lab) and `--real-targets <reason>` is absent.** The acknowledgement:
       - sets `max_reopens` default 1 (hard maximum 3);
       - sets `block_at = S2 plus any new S1 category` from the first reopen;
       - makes G2, G4, G5 and G8 deterministic ask_operator for the mission's life;
       - is refused outright while any G8-class host (finance, RPC, exchange) is granted, unless `--real-targets` names it.
-  12. There are open flags at S2+, a halt is in effect, the monitor is down, the mission is observe-only, or the monitor is in shadow for the reviewer path.
+  12. There are open flags at S2+, a halt is in effect, the monitor is down, the mission is observe-only, or the monitor is in shadow for the reviewer path. (Each refusal has its own `keepgoing::Blocker`: the mission is a child, a chat or archived mission, or released; observe-only; verification off; a solvable pack; `harness_test`; rootbox without isolation; a non-lab box grant without counters; a shared workspace; `allow_fetch_services`; a failed self-probe; no vetted reviewer; the reviewer path in shadow; an override on a relaxed agent; no `--real-targets`; a G8-class host granted; an open flag, a halt or a down monitor.)
 
 ### 5.3 Trigger conditions (all must hold; re-checked under the state guard at send)
 - **K1. Armed** (from the log fold). Not archived, not shutting down; `may_run` true; no halt; monitor up.
@@ -755,7 +762,7 @@ When armed, every **accepted** finish of the lead is followed by a whole-mission
   - no `report_blocker` and no refused `conclude unreachable` in the finished turn;
   - no open flag at or above `block_at`, shadow flags included;
   - the reviewer not faulted.
-- **K5. No operator input since the edge.** `operator_epoch` is an atomic in the lead's `TurnControl`. Every operator act increments it under the guard: message, answer, rule, approval, scope, revoke, release, stop, resume, reweave, model switch, archive, keep-going set. It is captured at the edge, re-checked at send, **and re-checked by the session when it takes the input**.
+- **K5. No operator input since the edge.** `operator_epoch` is an atomic in the lead's `session::Control`. Every operator act increments it under the guard: message, answer, rule, approval, scope, revoke, release, stop, resume, reweave, model switch, archive, keep-going set. It is captured at the edge, re-checked at send, **and re-checked by the session when it takes the input**.
 - **K6. Caps.**
   - `reopened < max_reopens` (default 3, hard maximum 10; 1 with `--real-targets`; 1 for relaxed agents);
   - at least `delay_s` since the finish (default 120; range 30–3600);
@@ -826,7 +833,7 @@ If any re-check fails, `keep_going{action: held, reason}` is logged. A later ope
 
 ### 5.8 Restart and idempotence
 - State comes from the monitor-log fold, keyed by fid.
-- `carry_on` (runtime.rs ~4012) gets a rule: an armed root at Idle/Finished whose latest accepted fid has no `reopened` entry gets a fresh review.
+- The carry-on decision in the start pass of `Runtime` (the local `carry_on`) gets a rule: an armed root at Idle/Finished whose latest accepted fid has no `reopened` entry gets a fresh review.
 - Start candidates include such a lead even when `open_inbox == 0`.
 - A `reserved` entry without `reopened` is re-checked from K1, never sent blind.
 - A reopen turn cut by a restart resumes only if `meta.unattended`.
@@ -852,8 +859,8 @@ Holds are temporary and re-evaluated. The header says which state applies.
 ### 6.1 Principles
 - **Pure and fast:** a function of (observation, `MissionAuth`, mission state).
 - **Match local filesystem paths and connection destinations,** not payload text aimed at granted targets. A pattern inside a URL or body sent to a granted host goes to the gate or L2, which see the authorization.
-- **Strip the session's own TMPDIR** (`<home>/sessions/<sid>/tmp`, the sandbox's temp dir) and its own session paths before matching.
-- **Ignore prose fields** (report_blocker, finish, claim, security_record text) except in TW-03, TW-17 and TW-26 listing.
+- **Canonicalize paths, then strip the session's own TMPDIR** (`<home>/sessions/<sid>/tmp`, the sandbox's temp dir) and its own session paths before matching: resolve `..`, repeated slashes, the symlinks of existing prefixes and the sandbox's case and Unicode fold first, and strip only when the canonical path lies inside the canonical own TMPDIR (`$TMPDIR/../../s-other/log.jsonl` is not own).
+- **Ignore prose fields** (report_blocker, finish, claim, security_record text) except where a tripwire needs them: TW-03, TW-17, TW-24 and TW-26 read all of them, TW-06 reads ledger prose and TW-19 reads evidence quotes (a decoy flag in a `finish`, a credential in a `security_record` note).
 - **Scope-aware.** `[lab]` grants and restricted-network packs relax C7 and C8, never C3–C6. Loopback and link-local are never implicitly lab. Operator-granted hosts are never C1.
 - **Decode before matching.** Lifetime counters per mission.
 - **Attempts count.**
@@ -941,7 +948,7 @@ Every change is additive. No new variants in `Author`, `Trigger`, `InboxKind`, `
 [monitor]
 enabled = true                      # Duty W; S4 tripwires and canaries cannot be disabled
 mode = "shadow"                     # starting state; per-cause promotion in the monitor log
-reviewers = []                      # preference order, profile names; example: ["qwen4max", "dsv41_review", "mistral"]
+reviewers = []                      # preference order, profile names; example: ["dsv41_review", "qwen4max", "mistral"] (the LAN reviewer first: consent is per pack, so the order is what keeps other fleets off a hosted recipient)
 tripwires_only_profiles = []        # explicit choice for profiles with no eligible reviewer
 gate = true
 gate_timeout_s = 90                 # from dispatch
@@ -952,7 +959,6 @@ fleet_every_s = 300
 unreviewed_pause_min = 60           # real-target and relaxed-agent missions only
 review_max_tokens = 48000
 repeat_minutes = 30                 # digest cadence
-canaries = true
 retention_days = 30
 monitor_down = "pause_real_targets" # or "notify"
 
@@ -961,7 +967,7 @@ ctf = []                            # example: ["alibaba"] (the operator's decis
 core = []
 
 [monitor.content]
-new_recipient_real_targets = "features"   # or "redacted": what a new-recipient reviewer gets for non-lab missions
+new_recipient_real_targets = "features"   # or "redacted": what a new-recipient reviewer gets for real-target missions (§2.4)
 
 [monitor.capacity.dsv41]            # keyed by endpoint (any profile on that base_url)
 gate_slots = 1
@@ -1002,13 +1008,14 @@ purpose = "review"
 | `cursor` | per-source checkpoints |
 | `heartbeat` | — |
 | `selfprobe` | `{probe, result}` |
-| `review_requested` | `{review, kind, mission, sessions, range, input: sha256, reviewer: {profile, family, model, recipient}, content: full\|features}` |
+| `review_requested` | `{review, scope: gate\|step\|tree\|fleet, mission, sessions, range, input: sha256, reviewer: {profile, family, model, recipient}, content: full\|features}` |
 | `verdict` | `{review, max_severity, findings, scores, decision?, clear_for_reopen?, latency_ms, degraded?, fault?, resampled?, operator_notes?}` |
 | `tripwire` | `{id, mission, session, pointer, severity, detail, state: shadow\|enforce}` |
 | `flag` | `{flag, mission, category, severity, key, count, causes, state}` |
 | `response` | `{level, mission?, sessions, causes, effects}` |
 | `pause` | `{mission, flag, phase}` |
-| `halt`, `halt_cleared` | — |
+| `halt` | `{cohort, reason, client}` |
+| `halt_cleared` | `{cohort, client}` |
 | `disposition` | `{flag \| cause_bulk, disposition, note, client}` |
 | `allow_rule` | `{mission, class, destination, verb, until, client}` |
 | `annotation` | `{item, tw03, verdict}` |
@@ -1064,7 +1071,7 @@ Each command is added to the `Command` enum and the cli.rs contract list:
 - `loom monitor observe-only <mission> --reason --until`
 - `loom monitor halt --reason [--cohort pack|family|rootbox|all]`
 - `loom monitor clear-halt --reason`
-- `loom monitor promote <cause> [--shadow]`
+- `loom monitor promote <cause> [--shadow]` (refused with a sentence for TW-24 and every precision-list cause when `--shadow` would demote it; there is no `canaries` key: CN-1 to CN-6 are always placed)
 - `loom monitor replay [--since]`
 - `loom monitor capacity`
 - `loom monitor vet <profile> [--set fixtures|operator]`
@@ -1286,6 +1293,7 @@ These are in the tree at P0 and the phases rely on them:
   every network mode. TW-09 and TW-22 detect attempts either way; the deny closes the routes.
 
 Not in the tree yet, needed by named phases:
+- **Model switching (the ui/pass-2 work), a dependency of M1 and M3:** the `model_switched` record, a `role_models` configuration key, `loom models set` and `loom models reload`, and role-model `--now`. None exists in this tree. Until they land, the reachable profile set P is built from the keys that do exist (the lead model, each pack role's model, `escalation_model`, `alloy_models`, the verifier and `session_start`), lineage is recorded in `session_start` only, and the re-choice of a reviewer on a model switch (§2.6) is built with the switch itself.
 - **The web UI's Agents tab and notification planner (not in this tree yet):** M11.
 - **The audit's open items:** the daemon-port deny and login code off argv (E1); RLIMIT, libproc and box teardown
   (E3); a request-owned seed in the model client (M5); the `creating` state and Parked/Blocker resolution (M3); the
@@ -1306,7 +1314,7 @@ Decided by the operator on 2026-11-16. Where the table says "default" the design
 | # | decision | value |
 |---|---|---|
 | D1 | Who reviews the DeepSeek-on-Alibaba missions | `qwen4max`. Declare `recipient = "alibaba"` on `qwen`, `qwen4max`, `dseekv41` and `dseek4pro`: the same provider already receives these transcripts. Move `default_model` off any preview model before it retires |
-| D2 | Reviewer for `dsv41` missions | `qwen4max`, a consented new recipient: `[monitor.recipients] ctf = ["alibaba"]` and `core = ["alibaba"]`; real-target missions send features only (D9); secrets are always redacted. A local stock GLM remains the way to remove the recipient later |
+| D2 | Reviewer for `dsv41` missions | `qwen4max`, a consented new recipient: `[monitor.recipients] ctf = ["alibaba"]` and `core = ["alibaba"]`, with `reviewers = ["dsv41_review", "qwen4max", ...]` so that only the DeepSeek fleets reach it (consent is per pack; the order is the per-fleet restriction); real-target missions (§2.4) send features only (D9); secrets are always redacted. A local stock GLM remains the way to remove the recipient later |
 | D3 | Lineage declarations | default: `dsv41` = deepseek, stock, `lan`. `necromicon` = kimi, relaxed. `glm_unc` = glm, relaxed. `inklingv5` = thinking-machines, alignment unknown, and its recipient must be declared (until then it is `unknown` and its sessions are reviewed only by `local` or `lan` reviewers) |
 | D4 | Keep-going in ctf (solvable packs) | Never |
 | D5 | Keep-going defaults | Max 3 reopens (1 with `--real-targets`, 1 for relaxed agents); 120 s delay; 200 steps and 120 minutes per reopen, mission-wide; block at S2, then S2 plus new S1 categories |

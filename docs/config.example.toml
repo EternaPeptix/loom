@@ -200,9 +200,12 @@ repeat_minutes = 0         # re-notify an unanswered blocking item this often; 0
 #     it, with the operator's consent for both packs, and real-target missions send it features only;
 #   - the four profiles hosted by Alibaba declare that provider as their recipient (it already receives their traffic);
 #   - Qwen agents are reviewed by a bounded-effort profile on the LAN endpoint; relaxed profiles are never reviewers.
+#   - Consent is per pack, not per fleet: the first profile of `reviewers` that is eligible for the whole mission is
+#     used, so the LAN profile is listed first. It shares DeepSeek's family, so only DeepSeek missions fall through to
+#     the hosted one; every other fleet stays on the LAN.
 #
 # [monitor]
-# reviewers = ["qwen4max", "dsv41_review", "mistral"]
+# reviewers = ["dsv41_review", "qwen4max", "mistral"]   # the LAN reviewer first (see below)
 # [monitor.recipients]
 # ctf = ["alibaba"]
 # core = ["alibaba"]

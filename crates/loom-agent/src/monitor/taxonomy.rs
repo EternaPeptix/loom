@@ -11,7 +11,10 @@
 //!   records, never in anything an agent sees (`sentences`).
 //! - `Severity` is `s0`..`s4`, ordered. `up()` is one tier higher and saturates at `s4`.
 //! - `Basis` is `action` or `reasoning`. `Severity::capped_for(Basis::Reasoning)` is at most `s2`: a concern based
-//!   on reasoning with no action is never more.
+//!   on reasoning with no action is never more. The cap
+//!   applies **last**: `Severity::assess(category, relaxed, basis)` is the one entry point and applies the relaxed uptier
+//!   first and the reasoning cap after it, so a reasoning-only finding about a relaxed agent is at most `s2` (never S3,
+//!   never an R3 pause on reasoning alone). Callers use `assess`, not `for_agent` and `capped_for` in sequence.
 //! - `Category::relaxed_raises()` is true for C2, C4, C5, C6, C9 and C14: a finding in one of them about a
 //!   relaxed-alignment agent is one tier up (`Severity::for_agent`). No other category is raised.
 //! - `s1_escalates(distinct_in_window, lifetime)` is true when one category has at least `S1_DISTINCT_IN_WINDOW` (3)
@@ -22,7 +25,7 @@
 //!   a cause that is not promoted (shadow) gives R0 whatever the severity. R2 is the gate's and is never earned by a
 //!   tripwire alone; R5 is the fleet's (`docs/MONITOR.md` §1.5) and is never earned by a single severity.
 //!
-//! Tests required: slugs and numbers round-trip for all 14 and match the list above; `from_slug` refuses an unknown
+//! Tests required: the reasoning cap comes after the relaxed uptier; slugs and numbers round-trip for all 14 and match the list above; `from_slug` refuses an unknown
 //! one; severity order; `up` saturates; the reasoning cap; the relaxed uptier touches exactly the six categories;
 //! the S1 aggregation boundaries (2 and 3 in the window, 9 and 10 over a lifetime); `Response::earned` for every
 //! severity, promoted and not; serde forms of severity and response.
@@ -151,6 +154,12 @@ impl Severity {
         }
     }
 
+    /// The severity of a finding in `category` about a relaxed (or not) agent, resting on `basis`: the relaxed uptier,
+    /// then the reasoning cap (the cap is last).
+    pub fn assess(self, category: Category, relaxed: bool, basis: Basis) -> Severity {
+        self.for_agent(category, relaxed).capped_for(basis)
+    }
+
     /// The severity of a finding in `category` about an agent that is (or is not) relaxed.
     pub fn for_agent(self, category: Category, relaxed: bool) -> Severity {
         if relaxed && category.relaxed_raises() {
@@ -257,6 +266,15 @@ mod tests {
         assert_eq!(Severity::S4.capped_for(Basis::Reasoning), Severity::S2);
         assert_eq!(Severity::S1.capped_for(Basis::Reasoning), Severity::S1);
         assert_eq!(Severity::S4.capped_for(Basis::Action), Severity::S4);
+    }
+
+    #[test]
+    fn the_reasoning_cap_applies_after_the_relaxed_uptier() {
+        let (c, s) = (Category::CredentialMisuse, Severity::S2);
+        assert_eq!(s.capped_for(Basis::Reasoning).for_agent(c, true), Severity::S3, "the wrong order reaches S3");
+        assert_eq!(s.assess(c, true, Basis::Reasoning), Severity::S2);
+        assert_eq!(s.assess(c, true, Basis::Action), Severity::S3);
+        assert_eq!(Severity::S4.assess(c, true, Basis::Reasoning), Severity::S2);
     }
 
     #[test]

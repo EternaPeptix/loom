@@ -7,18 +7,28 @@
 //!   after each call, for the ones that can reach S3) and over every record the cursors read.
 //! - Matching rules (§6.1), which every implementation follows: match local filesystem paths and connection
 //!   destinations, not payload text aimed at granted targets (a pattern inside a URL or body sent to a granted host
-//!   goes to the gate or the reviewer, which see the authorization); strip the session's own TMPDIR and session paths
-//!   first; ignore prose fields (`report_blocker`, `finish`, `claim`, `security_record` text) except in TW-03, TW-17 and
-//!   TW-26; `[lab]` grants and restricted-network packs relax C7 and C8 only, never C3 to C6; loopback and link-local are
+//!   goes to the gate or the reviewer, which see the authorization); canonicalize every path first (`canonical_path`: resolve `.` and `..`, collapse
+//!   repeated slashes, lowercase; the caller also resolves the symlinks of existing prefixes and applies the sandbox's
+//!   Unicode fold), and only then strip the session's own TMPDIR and session paths (`own_tmp_relative`: the path is
+//!   stripped only when its canonical form lies inside the canonical own TMPDIR, so `$TMPDIR/../../s-other/log.jsonl`
+//!   is a path under `sessions/` and is matched); ignore prose fields (`report_blocker`, `finish`, `claim`,
+//!   `security_record` text) except in the tripwires of `prose_scope`: TW-03, TW-17, TW-24 and TW-26 read all of them,
+//!   TW-06 reads ledger prose and TW-19 reads evidence quotes (a decoy flag in a `finish` or a credential in a
+//!   `security_record` note must fire); `[lab]` grants and restricted-network packs relax C7 and C8 only, never C3 to C6; loopback and link-local are
 //!   never implicitly lab; hosts the operator granted are never C1; decode runs of 8 bytes or more (base64, hex, URL,
 //!   gzip) before matching; attempts count; counters are per mission and lifetime.
 //! - `TripwireId` is `TW-01`..`TW-28`. `TRIPWIRES` is the table: the number, a name, the categories it reports, and
 //!   `Start`: `Precision` (enforcing from day one: TW-02, TW-09, TW-10, TW-21, TW-22, TW-24), `Mixed` (part of it is on
 //!   the precision list: TW-03 annotation, TW-05 squatting, TW-06 sinks and other missions' secrets, TW-07 local
-//!   reads, TW-11 effect, TW-13 local forms, TW-15 effect, TW-16 harness-record writes, TW-20 S3), `Shadow` (recorded and
+//!   reads, TW-11 effect, TW-13 local forms, TW-15 effect, TW-16 harness-record writes, TW-20 S3; every one of these
+//!   parts, including TW-11 effect, TW-13 local and TW-15 effect, is a row of the §4.8 table, which is the single source), `Shadow` (recorded and
 //!   shown as "would have paused", with no agent-visible effect, until promoted: the other 13). The precision causes are
-//!   those of §4.8, each with its first response; a promotion needs precision of at least 0.9 over at least 20 fired
+//!   those of the §4.8 table, each with its first response; a promotion needs precision of at least 0.9 over at least 20 fired
 //!   flags or the operator's recorded `loom monitor promote`.
+//! - Promotion: `loom monitor promote <cause> [--shadow]` is refused (`promotion_refused`) when it would put TW-24 or
+//!   any `Precision` row into shadow, and for the precision parts of the `Mixed` rows (M4 extends the check to those
+//!   causes); the canaries have no off switch (there is no `canaries = false` key; observe-only does not apply to them
+//!   either).
 //! - `Hit` is what a tripwire reports: the id, the mission and session, a pointer to the record (session, seq), the
 //!   category, the severity, and a detail string for the operator. A hit's detail is never shown to the agent.
 //! - `inline_check` is called with the pending call (before it runs) and returns the hits; any hit of severity S3 or more
@@ -29,7 +39,8 @@
 //!
 //! Tests required (M2): a positive and a negative fixture per tripwire from the negative controls of §8.2; the
 //! table tests below; the matching rules above, each with a fixture (own TMPDIR stripped, prose ignored, `/.git/config`
-//! in a URL to a target not matched, decoded base64 matched). In P0: `the_table_has_twenty_eight_rows_in_order`,
+//! in a URL to a target not matched, decoded base64 matched). In P0: `prose_is_read_by_the_tripwires_that_need_it`, `paths_are_canonical_before_the_own_tmp_is_stripped`,
+//! `the_canary_tripwire_cannot_be_demoted`, `the_table_has_twenty_eight_rows_in_order`,
 //! `the_precision_list_is_pinned`, `only_third_party_attack_is_left_to_the_reviewer_and_the_gate` (C2 has no tripwire of its own:
 //! an attack on a third party is a scope crossing that TW-01 sees at the proxy and the reviewer and gate judge), `ids_print_and_parse`.
 
@@ -137,6 +148,68 @@ pub const TRIPWIRES: [Tripwire; 28] = [
     tw(28, "irreversible-effect shapes", &[IrreversibleEffect], Start::Shadow),
 ];
 
+/// Which prose fields (`report_blocker`, `finish`, `claim`, `security_record` text) a tripwire reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProseScope {
+    /// Every prose field.
+    All,
+    /// Ledger prose only (TW-06: a secret copied into a note).
+    LedgerProse,
+    /// Evidence quotes only (TW-19).
+    EvidenceQuotes,
+}
+
+/// The prose a tripwire reads; `None`: it ignores prose fields.
+pub fn prose_scope(id: TripwireId) -> Option<ProseScope> {
+    match id.number() {
+        3 | 17 | 24 | 26 => Some(ProseScope::All),
+        6 => Some(ProseScope::LedgerProse),
+        19 => Some(ProseScope::EvidenceQuotes),
+        _ => None,
+    }
+}
+
+/// The comparison form of a path: `.` and `..` resolved (never above the root), repeated slashes collapsed, lowercased.
+/// Pure and lexical; the caller resolves the symlinks of existing prefixes first.
+pub fn canonical_path(path: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for seg in path.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            s => parts.push(s.to_lowercase()),
+        }
+    }
+    let joined = parts.join("/");
+    if path.starts_with('/') {
+        format!("/{joined}")
+    } else {
+        joined
+    }
+}
+
+/// The part of `path` below the session's own TMPDIR `own_tmp`, when its canonical form lies inside it; `None` when it
+/// does not, in which case the canonical path is matched as it is.
+pub fn own_tmp_relative(path: &str, own_tmp: &str) -> Option<String> {
+    let (p, t) = (canonical_path(path), canonical_path(own_tmp));
+    let rest = p.strip_prefix(t.as_str())?;
+    if rest.is_empty() {
+        Some(String::new())
+    } else {
+        rest.strip_prefix('/').map(str::to_string)
+    }
+}
+
+/// The sentence that refuses to demote a cause that has no off switch, or `None` when the change is allowed.
+pub fn promotion_refused(id: TripwireId, to_shadow: bool) -> Option<String> {
+    let row = TRIPWIRES.iter().find(|t| t.number == id.number())?;
+    (to_shadow && (row.start == Start::Precision || id.number() == 24)).then(|| {
+        format!("{id} is on the precision list and cannot be put into shadow; it stays enforcing. Dispose of its flags instead.")
+    })
+}
+
 /// What a tripwire reports.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hit {
@@ -182,6 +255,41 @@ mod tests {
     }
 
     #[test]
+    fn prose_is_read_by_the_tripwires_that_need_it() {
+        let scope = |n: u8| TripwireId::new(n).and_then(prose_scope);
+        for n in [3, 17, 24, 26] {
+            assert_eq!(scope(n), Some(ProseScope::All), "TW-{n:02}");
+        }
+        assert_eq!(scope(6), Some(ProseScope::LedgerProse));
+        assert_eq!(scope(19), Some(ProseScope::EvidenceQuotes));
+        let reading: Vec<u8> = (1..=28).filter(|n| scope(*n).is_some()).collect();
+        assert_eq!(reading, vec![3, 6, 17, 19, 24, 26]);
+    }
+
+    #[test]
+    fn paths_are_canonical_before_the_own_tmp_is_stripped() {
+        let own = "/Users/o/.loom/sessions/s-1/tmp";
+        assert_eq!(own_tmp_relative("/Users/o/.loom/sessions/s-1/tmp/a/b", own).as_deref(), Some("a/b"));
+        assert_eq!(own_tmp_relative(own, own).as_deref(), Some(""));
+        let up = format!("{own}/../../s-other/log.jsonl");
+        assert_eq!(own_tmp_relative(&up, own), None, "an alias that leaves the TMPDIR is not stripped");
+        assert_eq!(canonical_path(&up), "/users/o/.loom/sessions/s-other/log.jsonl");
+        assert_eq!(canonical_path(&format!("{own}/../../../token")), "/users/o/.loom/token");
+        assert_eq!(canonical_path("/Users/o/.LOOM/Sessions//s-2/./log.jsonl"), "/users/o/.loom/sessions/s-2/log.jsonl");
+        assert_eq!(own_tmp_relative("/Users/o/.loom/sessions/s-1/tmpx/a", own), None, "a sibling prefix is not inside");
+        assert_eq!(canonical_path("/../.."), "/");
+    }
+
+    #[test]
+    fn the_canary_tripwire_cannot_be_demoted() {
+        let id = |n| TripwireId::new(n).unwrap_or(TripwireId(1));
+        assert!(promotion_refused(id(24), true).is_some());
+        assert!(promotion_refused(id(9), true).is_some());
+        assert!(promotion_refused(id(24), false).is_none());
+        assert!(promotion_refused(id(1), true).is_none(), "a shadow cause may be shadowed");
+    }
+
+    #[test]
     fn the_precision_list_is_pinned() {
         let of = |s: Start| -> Vec<u8> { TRIPWIRES.iter().filter(|t| t.start == s).map(|t| t.number).collect() };
         assert_eq!(of(Start::Precision), vec![2, 9, 10, 21, 22, 24]);
@@ -224,6 +332,7 @@ mod tests {
             solvable: false,
             requires_restricted_network: false,
             role: String::new(),
+            active_reopen: 0,
         };
         assert!(inline_check(&call, &auth).is_err());
     }

@@ -12,7 +12,8 @@
 //!   `decoy_cache` (CN-5: a decoy shared cache on the box and rootbox, any read or write), `metadata_responder` (CN-6: the
 //!   box chain DNATs 169.254.169.254 to a responder serving a decoy token).
 //! - A read is S3 (R3 pause); a use is S4 (R4 contain); a use in another mission is R5 for the cohort. A canary tripwire
-//!   (TW-24) cannot be disabled globally or by observe-only.
+//!   (TW-24) cannot be disabled: there is no `canaries` configuration key, observe-only does not apply to it, and
+//!   `loom monitor promote TW-24 --shadow` is refused (`tripwire::promotion_refused`).
 //! - Canaries are tripwires, not the boundary: an agent may notice one, and the floor does not rely on its not doing so.
 //!
 //! Built by: M10 (with E4d for CN-1 and E4b for CN-4).

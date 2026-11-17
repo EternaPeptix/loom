@@ -15,13 +15,15 @@
 //! - `held(id)`: the result of a call held for the operator; `id` must be a harness-made approval id.
 //! - `paused_refusal(item)`: the refusal of a message, resume, reweave or answer to another item while the mission is
 //!   paused.
+//! - `Steer`: the only value `Responder::note` accepts; built from a `Class`, a host and the solvable flag by this module
+//!   alone, so no other text reaches the agent through a note.
 //! - `steer(class, solvable)`: the templates of `docs/MONITOR.md` §4.3. `{host}` and `{verb}` are filled only when the
 //!   host passes `valid_host` (at most 253 characters, labels of 1 to 63 letters, digits or `-` that neither start nor
 //!   end with `-`, optionally with a leading `*.`) and the verb is one of the `Verb` enum; otherwise the generic
 //!   template is used. In a solvable pack the scope template names `report_blocker` with class `needs_approval` only.
 //!
 //! Tests required: every sentence is free of category slugs and of `reviewer`, `score`, `threshold`; the steer
-//! templates reproduce §4.3 word for word; a hostile host (spaces, newline, `<harness`, a 254-character name, an empty
+//! templates reproduce §4.3 word for word; a hostile host (spaces, newline, `<harness`, a 254-character name made of valid labels, an empty
 //! label, a leading hyphen) gets the generic template; the solvable variant drops `impossible`; `held` and
 //! `paused_refusal` refuse an id that is not made of ASCII letters, digits, `-`, `_` and `.`.
 
@@ -118,6 +120,21 @@ pub fn held(approval: &str) -> String {
 pub fn paused_refusal(item: &str) -> String {
     let item = if valid_id(item) { item } else { "the open review item" };
     format!("This mission is paused by loom review (item {item}). Answer that item first: `loom answer {item} Resume`.")
+}
+
+/// An R1 steer note. Only this module can make one, so the text the responder writes into the agent's window is always
+/// a template of `steer` (invariant I11) and never a reviewer's words.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Steer(String);
+
+impl Steer {
+    pub fn new(class: Class, host: Option<&str>, solvable: bool) -> Steer {
+        Steer(steer(class, host, solvable))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// The steer or refusal text for `class` toward `host` (None: no destination). `solvable`: the pack is solvable.
@@ -221,8 +238,24 @@ mod tests {
             assert_eq!(steer(Class::Scope, Some(bad), false), REFUSED_GENERIC, "{bad:?}");
             assert_eq!(steer(Class::Irreversible, Some(bad), false), REFUSED_GENERIC, "{bad:?}");
         }
+        // Four 63-character labels with their dots are 255 characters: every label is valid, the total is not.
+        let label = "a".repeat(63);
+        let too_long = [label.as_str(); 4].join(".");
+        assert_eq!(too_long.chars().count(), 255);
+        assert!(!valid_host(&too_long), "the 253-character bound is checked on its own");
+        let longest = format!("{}.{}.{}.{}", label, label, label, "a".repeat(61));
+        assert_eq!(longest.chars().count(), 253);
+        assert!(valid_host(&longest));
+        assert!(!valid_host(&format!("{longest}a")), "254 characters");
         assert!(valid_host("*.pwn.example"));
         assert!(valid_host("127.0.0.1"));
+    }
+
+    #[test]
+    fn a_steer_is_always_a_template() {
+        let s = Steer::new(Class::Scope, Some("evil.example"), false);
+        assert_eq!(s.as_str(), steer(Class::Scope, Some("evil.example"), false));
+        assert_eq!(Steer::new(Class::Scope, Some("a b"), false).as_str(), REFUSED_GENERIC);
     }
 
     #[test]

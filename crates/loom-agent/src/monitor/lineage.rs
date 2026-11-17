@@ -36,12 +36,25 @@
 //!   creation with a sentence naming the three choices (a reviewer on a consented recipient, a local stock model, the
 //!   explicit list).
 //!
+//! - Family and recipient names are compared **normalized**: `normalize_name` trims, ASCII-lowercases and maps `_` to `-`
+//!   (`Qwen`, ` qwen ` and `thinking_machines` equal `qwen` and `thinking-machines`). `shares_family` and
+//!   `is_operator_owned` normalize both sides themselves, whatever the config held; `loom config check` (M1) also rejects a
+//!   family name outside the inference vocabulary unless the operator lists it as allowed, so a typo cannot make a
+//!   same-family reviewer look disjoint.
+//! - The selection order is what keeps a fleet off a recipient: consent (`[monitor.recipients] <pack>`) is per pack, so
+//!   every pack that consents to a provider lets any fleet's mission reach it. The first eligible profile of `reviewers`
+//!   wins; list the LAN reviewer (`dsv41_review`) before a hosted one (`qwen4max`), and the hosted one is reached only
+//!   when the LAN one is ineligible (the DeepSeek fleet, whose family it shares). The §2.6 assignment table is an M1
+//!   selection test.
+//!
 //! Built by: M1 (profile keys, inference, eligibility, `config check`); M6 uses it.
 //!
 //! Tests required (M1): inference for every pattern above and for a name that matches none; a distill in two
 //! families; loopback is unknown; every clause of eligibility with a failing and a passing case; selection order and
 //! fallback never leaving the allowed recipients; a colliding verifier re-chooses; `config check` fails and prints the
-//! lines to add. In P0: `parsing_and_forms`, `eligibility_is_not_built_yet`.
+//! lines to add. the §2.6 assignment table as selection cases (each fleet gets its listed reviewer; a non-DeepSeek fleet never reaches
+//! `qwen4max` while `dsv41_review` is eligible). In P0: `parsing_and_forms`, `names_are_compared_normalized`,
+//! `eligibility_is_not_built_yet`.
 
 use crate::monitor::{not_built, MonitorError};
 use serde::{Deserialize, Serialize};
@@ -74,15 +87,22 @@ pub struct Lineage {
     pub source: Source,
 }
 
+/// The comparison form of a family or recipient name: trimmed, ASCII-lowercase, `_` as `-`.
+pub fn normalize_name(name: &str) -> String {
+    name.trim().to_ascii_lowercase().replace('_', "-")
+}
+
 impl Lineage {
     /// True when the recipient is `local` or `lan`: no data leaves the operator's hosts.
     pub fn is_operator_owned(&self) -> bool {
-        self.recipient == "local" || self.recipient == "lan"
+        matches!(normalize_name(&self.recipient).as_str(), "local" | "lan")
     }
 
-    /// True when the family sets overlap, or either is unknown (empty).
+    /// True when the family sets overlap, or either is unknown (empty). Names are compared normalized.
     pub fn shares_family(&self, other: &Lineage) -> bool {
-        self.family.is_empty() || other.family.is_empty() || self.family.intersection(&other.family).next().is_some()
+        let norm = |l: &Lineage| -> BTreeSet<String> { l.family.iter().map(|f| normalize_name(f)).collect() };
+        let (a, b) = (norm(self), norm(other));
+        a.is_empty() || b.is_empty() || a.intersection(&b).next().is_some()
     }
 }
 
@@ -133,6 +153,19 @@ mod tests {
         assert!(!a.shares_family(&b));
         assert!(distill.shares_family(&a) && distill.shares_family(&b));
         assert!(l("unk", &[], "unknown").shares_family(&a), "an unknown family matches every family");
+    }
+
+    #[test]
+    fn names_are_compared_normalized() {
+        let qwen_agent = l("qwen", &["qwen"], "lan");
+        assert!(l("r", &["Qwen"], "alibaba").shares_family(&qwen_agent), "mixed case is the same family");
+        assert!(l("r", &[" qwen "], "alibaba").shares_family(&qwen_agent), "trailing space is the same family");
+        let tm = l("inkling", &["thinking-machines"], "lan");
+        assert!(l("r", &["thinking_machines"], "x").shares_family(&tm));
+        assert!(!l("r", &["Mistral"], "x").shares_family(&qwen_agent));
+        assert!(l("r", &["qwen"], " LAN ").is_operator_owned());
+        assert!(l("r", &["qwen"], "Local").is_operator_owned());
+        assert_eq!(normalize_name(" Thinking_Machines "), "thinking-machines");
     }
 
     #[test]
