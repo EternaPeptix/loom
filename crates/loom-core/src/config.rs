@@ -32,7 +32,8 @@
 //! in name order (`dir` is `Paths::model_keys_dir()`). When `is_set(var)` (the variable is present and not
 //! empty in the environment the daemon has or will be started with): the key of `models.{p}` is in the
 //! daemon's environment, where every command can read it, and how to move it: write it to `{dir}/{p}`
-//! (`mkdir -p -m 700 {dir}`, then `(umask 077; printenv {VAR} > {dir}/{p})`), replace
+//! (`mkdir -p -m 700 {dir}`, then `(umask 077; printenv {VAR} > {dir}/{p})`, or, when the variable is not
+//! set, `(umask 077; cat > {dir}/{p})` and the key pasted), replace
 //! `api_key_env = "{VAR}"` with `api_key_file = "{p}"` in `[models.{p}]`, and restart the daemon. Otherwise:
 //! `{VAR}` is not set, so requests of `models.{p}` carry no key, and the same move. Never the value.
 //!
@@ -665,10 +666,17 @@ impl Config {
         for (name, profile) in &self.models {
             let Some(var) = &profile.api_key_env else { continue };
             let dir = dir.display();
+            let set = is_set(var);
+            // Where the variable is not set, `printenv` would write an empty file: the key is pasted instead.
+            let write = if set {
+                format!("`(umask 077; printenv {var} > {dir}/{name})`")
+            } else {
+                format!("`(umask 077; cat > {dir}/{name})` and paste the key, then Ctrl-D")
+            };
             let mv = format!(
-                "To move it, write the key to {dir}/{name} (`mkdir -p -m 700 {dir}`, then `(umask 077; printenv {var} > {dir}/{name})`), replace `api_key_env = \"{var}\"` with `api_key_file = \"{name}\"` in [models.{name}], and restart the daemon."
+                "To move it, write the key to {dir}/{name} (`mkdir -p -m 700 {dir}`, then {write}), replace `api_key_env = \"{var}\"` with `api_key_file = \"{name}\"` in [models.{name}], and restart the daemon."
             );
-            if is_set(var) {
+            if set {
                 out.push(format!(
                     "The key of models.{name} is in the daemon's environment as {var}, where every command can read it. {mv}"
                 ));
@@ -718,7 +726,8 @@ pub fn read_model_key(dir: &Path, name: &str) -> Result<String, String> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let path = dir.join(name);
     let shown = path.display();
-    let open = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(&path);
+    // Non-blocking, so that a FIFO put in the key's place is refused below instead of hanging the start.
+    let open = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(&path);
     let file = match open {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -1123,11 +1132,11 @@ allow = ["*.example.test"]
         assert!(w[0].contains("models.a") && w[0].contains("A_KEY") && w[0].contains("every command can read it"));
         assert!(w[1].contains("models.b") && w[1].contains("B_KEY is not set"));
         for line in &w {
-            assert!(
-                line.contains("printenv") && line.contains("api_key_file = ") && line.contains("restart the daemon")
-            );
+            assert!(line.contains("api_key_file = ") && line.contains("restart the daemon"), "{line}");
         }
-        assert!(w[0].contains("printenv A_KEY > /h/keys/models/a"));
+        assert!(w[0].contains("printenv A_KEY > /h/keys/models/a"), "{}", w[0]);
+        // An unset variable would give an empty file through printenv: the key is pasted instead.
+        assert!(!w[1].contains("printenv") && w[1].contains("cat > /h/keys/models/b"), "{}", w[1]);
         assert!(Config::default().key_env_warnings(dir, |_| true).is_empty());
     }
 
