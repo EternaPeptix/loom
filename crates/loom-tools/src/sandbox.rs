@@ -245,7 +245,17 @@
 //!
 //! A process that leaves its command's process group (`setsid`, `daemon()`, `redis-server --daemonize
 //! yes`, `tmux new -d`) is not tracked: `job_kill`, stop, the end of the session and daemon shutdown do
-//! not stop it, although it stays under this profile.
+//! not stop it, although it stays under this profile. `sandbox::census` finds it by that profile (the session's
+//! temp directory, which only that session's profile opens, and the loom home, which every profile refuses: a
+//! process is the session's when it may read the first and not the second) whatever it did to its process group
+//! and environment, and can stop it (`docs/MONITOR.md` §2.2, E3).
+//!
+//! ## `with_identity(id)`, `identity()` and `nproc_limit()`
+//! `with_identity(id)` gives the sandbox the id of its session (1 to 64 letters, digits, `-` and `_`; anything else is
+//! an error that says to use the session id); `env` then adds `LOOM_SANDBOX_ID=<id>`, the fallback by which
+//! `census` finds a session's processes where the sandbox cannot be asked (a command can clear it). The profile is
+//! not changed. `nproc_limit()` is the RLIMIT_NPROC a command started now gets (`procinfo::nproc_limit_now` of
+//! `cfg.nproc_headroom`; `None` when that is 0): `proc::spawn` and the PTY apply it to the command before it starts.
 //!
 //! A sandboxed process can signal itself and the other processes of its sandbox, and nothing else:
 //! not the harness, not other sessions, not any other process of the same user.
@@ -318,7 +328,8 @@
 //! name and value test alone (without `secret_env` and `env_pass`), for the daemon's start warning. Bubblewrap additionally
 //! always removes LD_*, DYLD_*, BASH_FUNC_*, BASH_ENV, ENV, SHELLOPTS and BASHOPTS before its trusted
 //! host launcher; tools can set needed library variables inside the confined script. Added: `TERM=dumb`,
-//! `NO_COLOR=1`, `PAGER=cat`, `GIT_PAGER=cat`, `GIT_TERMINAL_PROMPT=0`, `TMPDIR=<session temp dir>`.
+//! `NO_COLOR=1`, `PAGER=cat`, `GIT_PAGER=cat`, `GIT_TERMINAL_PROMPT=0`, `TMPDIR=<session temp dir>`, and
+//! `LOOM_SANDBOX_ID=<id>` when the sandbox has an identity.
 //!
 //! ## `describe()`
 //! Two or three plain sentences for the system prompt: where commands may write, what they may not
@@ -437,6 +448,7 @@
 //! `sw_vers`, `id`); a `mach_allow` entry makes a service lookup work that fails without it (the pasteboard:
 //! `pbpaste` exits 0 with it); `describe` says what is said above.
 
+pub mod census;
 mod linux;
 pub mod selfprobe;
 
@@ -587,6 +599,10 @@ pub struct Sandbox {
     unix_sockets: Vec<PathBuf>,
     env_pass: Vec<String>,
     secret_env: Vec<String>,
+    /// `cfg.nproc_headroom`: processes of the user's limit that a command leaves unused.
+    nproc_headroom: u32,
+    /// The session this sandbox belongs to (`with_identity`): the id `Sandbox::env` gives commands.
+    identity: Option<String>,
 }
 
 fn invalid(msg: String) -> io::Error {
@@ -1817,6 +1833,8 @@ impl Sandbox {
             unix_sockets,
             env_pass: cfg.env_pass.clone(),
             secret_env: cfg.secret_env.clone(),
+            nproc_headroom: cfg.nproc_headroom,
+            identity: None,
         })
     }
 
@@ -1846,6 +1864,26 @@ impl Sandbox {
         sbpl(&dir)?;
         self.jobs_dir = Some(dir);
         Ok(self)
+    }
+
+    /// This sandbox with the identity of session `id`, which `Sandbox::env` gives commands as `LOOM_SANDBOX_ID`
+    /// (the fallback of `census`; the census finds a session's processes by the profile they run under, which
+    /// needs no identity here: see `sandbox::census`). `id` is 1 to 64 letters, digits, `-` and `_`.
+    pub fn with_identity(mut self, id: &str) -> io::Result<Sandbox> {
+        census::valid_id(id).map_err(invalid)?;
+        self.identity = Some(id.to_string());
+        Ok(self)
+    }
+
+    /// The session this sandbox was given (`with_identity`).
+    pub fn identity(&self) -> Option<&str> {
+        self.identity.as_deref()
+    }
+
+    /// The RLIMIT_NPROC of a command started now (`cfg.nproc_headroom`; `loom_tools::procinfo`), `None` when
+    /// the headroom is 0 or the machine's limit is unknown.
+    pub fn nproc_limit(&self) -> Option<u64> {
+        crate::procinfo::nproc_limit_now(u64::from(self.nproc_headroom))
     }
 
     /// Harness-owned staging lives outside all sessions, whose mutable temp trees are excluded from
@@ -2385,6 +2423,10 @@ impl Sandbox {
             out.insert(k.to_string(), v.to_string());
         }
         out.insert("TMPDIR".to_string(), self.tmp_dir.display().to_string());
+        if let Some(id) = &self.identity {
+            // Where the sandbox identity cannot be asked (a host without it), `census` falls back to this.
+            out.insert(census::ENV_MARK.to_string(), id.clone());
+        }
         out
     }
 

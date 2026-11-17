@@ -33,6 +33,9 @@
 //! - A job whose output passes `max_output_bytes` is killed (SIGKILL, no grace) by its watcher and
 //!   settles as `Killed` with `detail` saying the output limit was reached. Output is never read back
 //!   beyond its first `max_output_bytes`; `detail` says when the rest was discarded.
+//! - A job that settles as `Ended(TrackingFailed)` (its group could not be confirmed stopped, or no longer is
+//!   the recorded one) keeps its pid record and owner marker, so that the clearing below can still find and
+//!   stop it at the next start; every other job removes them.
 //! - `JobTable::new` clears what a crashed daemon left in `dir` (`clear_leftovers`, which can also be
 //!   called for a directory without building a table): for every `jN.pid` record it kills the recorded
 //!   process group if that group is confirmed to be the recorded one (`proc::kill_recorded_group`), then
@@ -1058,8 +1061,12 @@ async fn watch(
     // Only a complete group has final output. A failed ownership/inspection check is reported as
     // a failure, with the available snapshot and its explicit detail, rather than a successful kill.
     let path = lock(&shared.st).info.out_path.clone();
-    let _ = std::fs::remove_file(proc::pid_path(&path));
-    running.remove_owner();
+    // A group that could not be confirmed stopped may still be running: its pid record (and the owner marker
+    // that goes with it) stay, so the next start of the daemon can still find and stop it.
+    if !matches!(state, JobState::Ended(Ended::TrackingFailed(_))) {
+        let _ = std::fs::remove_file(proc::pid_path(&path));
+        running.remove_owner();
+    }
     let output = store_output(&blobs, &path, max_output_bytes, &mut detail);
     let info = {
         let mut st = lock(&shared.st);
@@ -1448,6 +1455,48 @@ mod tests {
         assert!(v.new_output.is_empty());
         assert_eq!(v.from, 14);
         assert_eq!(v.info.output_bytes, 14);
+    }
+
+    /// A group that could not be confirmed stopped keeps its pid record, so that a later daemon can still stop it.
+    #[tokio::test]
+    async fn a_job_that_could_not_be_tracked_keeps_its_pid_record() {
+        let mut f = fx();
+        let (id, out_path, exit_path) = f.table.allocate().await.expect("allocate");
+        let env =
+            [("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")].iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let spec = Spawn {
+            script: "sleep 300".into(),
+            cwd: f.root.clone(),
+            env,
+            out_path: out_path.clone(),
+            exit_path: exit_path.clone(),
+        };
+        let mut real = spawn(&f.sb, &spec).expect("spawn");
+        let pid = real.pid;
+        real.disarm();
+        // The watcher is given a record whose owner marker is not the process's: the group cannot be told from a
+        // replacement, so it is reported as untracked and never signalled.
+        std::fs::write(format!("{}.owner", exit_path.display()), "loom-owner-someone-else").expect("owner");
+        let adopted = Running::adopt(pid, out_path.clone(), exit_path.clone(), 0);
+        f.table.register(&id, &CallId::from("call-1"), "sleep 300", adopted).await;
+        let settled = loop {
+            if let JobEvent::Settled { info, .. } = f.event().await {
+                break info;
+            }
+        };
+        assert!(matches!(settled.state, JobState::Ended(Ended::TrackingFailed(_))), "{:?}", settled.state);
+        assert!(proc::pid_path(&out_path).exists(), "the pid record of an untracked group was removed");
+        assert!(std::path::Path::new(&format!("{}.owner", exit_path.display())).exists());
+        // A job that ends properly removes its record.
+        let ok = f.start("true").await;
+        loop {
+            if let JobEvent::Settled { .. } = f.event().await {
+                break;
+            }
+        }
+        assert!(!proc::pid_path(&ok.out_path).exists());
+        // SAFETY: kill(2) takes plain integers; the group is the test's own.
+        unsafe { libc::kill(-i32::try_from(pid).expect("pid"), libc::SIGKILL) };
     }
 
     #[tokio::test]

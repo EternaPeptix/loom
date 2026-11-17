@@ -83,6 +83,8 @@ loopback_all = false       # true lets commands connect to any loopback port
 # mach_allow = ["com.apple.pasteboard.1", "com.example.helper*"]  # more services a tool needs: exact names, or a prefix ending in *
 #   (headless Chromium of Playwright/Puppeteer works as is; Edge or Electron need "<bundle id>.MachPortRendezvousServer.*")
 # (found with: log show --last 5m --predicate 'eventMessage CONTAINS "deny(1) mach-lookup"'; never a fetch or disk service)
+# nproc_headroom = 256  # processes of the user's limit (RLIMIT_NPROC) a command leaves unused, so a fork bomb stops before
+#   the daemon cannot start the processes that stop it; never below the processes that exist plus 64; 0 sets no limit
 allow_fetch_services = false  # true lets commands use the fetch services: egress is then reported "unbounded" (loom status) and keep-going refuses to turn on
 
 [network]

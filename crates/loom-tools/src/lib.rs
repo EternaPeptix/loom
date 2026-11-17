@@ -61,6 +61,7 @@ pub mod outputs;
 pub mod outview;
 pub mod params;
 pub mod proc;
+pub mod procinfo;
 pub mod pty;
 pub mod sandbox;
 pub mod schema;

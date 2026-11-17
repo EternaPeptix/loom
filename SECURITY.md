@@ -294,9 +294,20 @@ These are the places where loom does less than the text above might suggest.
   sessions in one daemon run new sessions can fail to get a port (with a sentence saying so) until the
   daemon is restarted. Do not export secrets in the shell you start loom from, and do not pass secrets to
   commands on their command lines.
-- **A process that leaves its command's process group is not tracked.** After `setsid`, `daemon()`,
-  `redis-server --daemonize yes` or `tmux new -d`, `job_kill`, stop, the end of the session and daemon
-  shutdown do not stop it, although it stays under the seatbelt profile.
+- **A process that leaves its command's process group is not tracked by the job table, but the census finds it.**
+  After `setsid`, `daemon()`, `redis-server --daemonize yes` or `tmux new -d`, `job_kill`, stop, the end of the
+  session and daemon shutdown do not stop it, although it stays under the seatbelt profile. Every 60 s the daemon
+  finds each session's processes by that profile (whatever they did to their process group and environment) with
+  the TCP sockets they listen on (`GET /api/census`), warns once about what an ended session left running, and
+  `POST /api/sessions/{id}/census/kill` stops them. Nothing is stopped automatically (a server may have been started
+  on purpose). The query is a private macOS call (`sandbox_check`), probed at start; where it does not work the census
+  falls back to the `LOOM_SANDBOX_ID` environment variable and known process groups, which `env -i`, a double fork
+  or `setsid` defeat (`docs/MONITOR.md` X7). Under bubblewrap there is no census yet (no cgroup per session).
+- **A fork bomb is limited, not forbidden.** A sandboxed command's RLIMIT_NPROC is the user's limit minus
+  `sandbox.nproc_headroom` (256), never below the processes that exist plus 64, so it cannot take the last process
+  slots the daemon needs to stop it. The daemon inspects and signals processes through libproc (`/proc` on Linux),
+  never by running `ps`, so a full process table does not blind it; a group it cannot inspect is still signalled unless
+  its leader is known to have been replaced.
 - **The configured network policy is per daemon**, and is read at start. In `allowlist` mode a
   listed host can be used by every session. Data can be sent to an allowed host. On top of it the
   operator can grant a session more hosts while it runs (`loom scope`): a grant is per session,

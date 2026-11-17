@@ -270,12 +270,19 @@ pub struct SandboxCfg {
     /// tool that fails under the default-deny of `mach-lookup`: exact names, or a name ending in `*` for a prefix.
     /// An entry that would allow a fetch service or a disk-mounting service is refused.
     pub mach_allow: Vec<String>,
+    /// How many processes of the user's limit (RLIMIT_NPROC) a sandboxed command leaves unused: a command can
+    /// fork until the user has `limit - nproc_headroom` processes, so a fork bomb stops while the daemon can
+    /// still start the processes that stop it. 0 sets no limit. Never below the processes that exist plus 64.
+    pub nproc_headroom: u32,
     /// Loopback ports of infrastructure (a model endpoint or a `network.infrastructure` entry on this
     /// machine) that no command may connect to, whatever else allows loopback. Set by the runtime; not a
     /// config key.
     #[serde(skip)]
     pub infra_ports: Vec<u16>,
 }
+
+/// The default of `sandbox.nproc_headroom`.
+pub const DEFAULT_NPROC_HEADROOM: u32 = 256;
 
 /// Loopback ports that are never reachable to a command: Chrome DevTools, the Node inspector and the Docker
 /// API. `sandbox.loopback_ports` may not list them, and the sandbox refuses them under `loopback_all`.
@@ -377,6 +384,7 @@ impl Default for SandboxCfg {
             daemon_port: None,
             allow_fetch_services: false,
             mach_allow: Vec::new(),
+            nproc_headroom: DEFAULT_NPROC_HEADROOM,
             infra_ports: Vec::new(),
         }
     }
@@ -1655,6 +1663,14 @@ allow = ["*.example.test"]
         }
         assert!(Config::parse("[sandbox]\nallow_fetch_services = true").unwrap().sandbox.allow_fetch_services);
         assert!(!Config::default().sandbox.allow_fetch_services);
+    }
+
+    #[test]
+    fn nproc_headroom_defaults_to_256_and_zero_turns_the_limit_off() {
+        assert_eq!(Config::default().sandbox.nproc_headroom, 256);
+        assert_eq!(Config::parse("[sandbox]\nnproc_headroom = 0").unwrap().sandbox.nproc_headroom, 0);
+        assert_eq!(Config::parse("[sandbox]\nnproc_headroom = 1000").unwrap().sandbox.nproc_headroom, 1000);
+        assert!(Config::parse("[sandbox]\nnproc_headroom = -1").is_err());
     }
 
     #[test]

@@ -55,6 +55,8 @@
 //! | `POST /sessions/{id}/resume` | `runtime.resume` | `202` `{}` |
 //! | `POST /sessions/{id}/reweave` | `runtime.reweave` | `202` `{}` |
 //! | `POST /sessions/{id}/archive` (`ArchiveBody`) | `runtime.archive` | `200` `{}` |
+//! | `GET /census` | `runtime.census()`: the last process and listener census of the sessions, found by sandbox identity (`null` until the first has finished; `?now=true` takes one first) | `CensusView` or `null` |
+//! | `POST /sessions/{id}/census/kill` | `runtime.census_kill`: SIGSTOP then SIGKILL of every process the census finds for the session (`404` for an id that is not a session) | `200` `Killed` (`rounds`, `killed`, `left`) |
 //! | `GET /sessions/{id}/window` | `runtime.window` | `WindowView` |
 //! | `GET /sessions/{id}/net?limit={n}` | `runtime.net` (default 200, at most 2000) | `[NetEntry]` |
 //! | `GET /missions` | `runtime.missions` | `[MissionInfo]` |
@@ -207,6 +209,8 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/sessions/{id}/resume", post(resume))
         .route("/api/sessions/{id}/reweave", post(reweave))
         .route("/api/sessions/{id}/archive", post(archive))
+        .route("/api/census", get(census))
+        .route("/api/sessions/{id}/census/kill", post(census_kill))
         .route("/api/sessions/{id}/window", get(window))
         .route("/api/sessions/{id}/net", get(net))
         .route("/api/missions", get(missions))
@@ -674,6 +678,17 @@ async fn release(State(s): State<ApiState>, Path(id): Path<String>, body: Bytes)
     let body: ReleaseBody = json_body(&body)?;
     let receipt = s.runtime.release(&SessionId::from(id), &body.reason).await.map_err(rt_err)?;
     Ok((StatusCode::ACCEPTED, Json(receipt)).into_response())
+}
+
+async fn census(State(s): State<ApiState>, q: RawQuery) -> Res<Response> {
+    let now = params(q)?.get("now").is_some_and(|v| v == "true");
+    let view = if now { Some(s.runtime.census_now().await.map_err(rt_err)?) } else { s.runtime.census() };
+    Ok(Json(view).into_response())
+}
+
+async fn census_kill(State(s): State<ApiState>, Path(id): Path<String>) -> Res<Response> {
+    let killed = s.runtime.census_kill(&SessionId::from(id)).await.map_err(rt_err)?;
+    Ok(Json(killed).into_response())
 }
 
 async fn stop(State(s): State<ApiState>, Path(id): Path<String>) -> Res<Response> {
@@ -1823,6 +1838,29 @@ mod tests {
             assert_eq!(s, 404, "{bad}: {b}");
             assert!(b["error"].as_str().unwrap().starts_with("There is no mission"), "{b}");
         }
+    }
+
+    #[tokio::test]
+    async fn the_census_routes_show_what_sessions_run_and_stop_only_a_known_one() {
+        let e = env(lead_script(json!({"question": "CHILDMARK find it"}))).await;
+        let id = e.create("go").await;
+        e.wait_turn_ends(&id, 1).await;
+        // The background census may or may not have finished: the view or `null`. `now=true` takes one, which names
+        // no session without processes.
+        let (s, b) = e.get("/api/census").await;
+        assert!(s == 200 && (b.is_null() || b["readable"] == json!(true)), "{b}");
+        let (s, b) = e.get("/api/census?now=true").await;
+        assert_eq!(s, 200, "{b}");
+        assert_eq!((b["readable"].clone(), b["sessions"].clone()), (json!(true), json!({})));
+        let (s, b) = e.get("/api/census").await;
+        assert_eq!((s, b["readable"].clone()), (200, json!(true)));
+        // A known session with nothing running: nothing to kill.
+        let (s, b) = e.post(&format!("/api/sessions/{id}/census/kill"), json!({})).await;
+        assert_eq!(s, 200, "{b}");
+        assert_eq!((b["killed"].clone(), b["left"].clone()), (json!(0), json!([])));
+        let (s, b) = e.post("/api/sessions/s-nope/census/kill", json!({})).await;
+        assert_eq!(s, 404, "{b}");
+        assert_eq!(b["error"], "There is no session s-nope.");
     }
 
     #[tokio::test]

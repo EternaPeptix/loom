@@ -1102,7 +1102,14 @@ the default evidence grade (§7) and staleness. Each module's documentation is t
   - Cancellation sends TERM to the whole group, then KILL after `tools.kill_grace_s` (5).
   - A process that leaves its command's process group (`setsid`, `daemon()`, `redis-server --daemonize
     yes`, `tmux new -d`) is not tracked: `job_kill`, stop, the end of the session and daemon shutdown do
-    not stop it, although it stays under the seatbelt profile.
+    not stop it, although it stays under the seatbelt profile. The 60 s census (`loom-agent::census`,
+    `loom-tools::sandbox::census`) finds it by that profile, with what it listens on, and
+    `POST /api/sessions/{id}/census/kill` stops it; nothing is stopped automatically.
+  - A sandboxed command's RLIMIT_NPROC is lowered to `limit - sandbox.nproc_headroom` (default 256; 0 sets none; never
+    below the processes that exist + 64) before it starts, so a fork bomb stops while the daemon can still fork. Who
+    is in a command's group is read from the kernel (`loom-tools::procinfo`: libproc, `/proc`), never by running
+    `ps`; a group that cannot be inspected is still signalled unless its leader was replaced, and a job whose group
+    could not be confirmed stopped keeps its pid record for the next start.
   - In seatbelt mode a failure whose output mentions `Operation not permitted` gets a reminder fact
     about the sandbox.
 - **Jobs** (`loom-tools::jobs`, `proc`). Ids `j1`, `j2`, … per session. `job_wait` returns the output

@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+### Monitor E3: process identity and limits
+
+- **Fork-free process inspection** (`loom_tools::procinfo`: libproc and `sysctl` on macOS, `/proc` on Linux). `proc` no longer
+  runs `/bin/ps` (about 12 to 17 forks a second for every leftover job, and no signal at all when the process table was full);
+  who is in a command's group, who its leader is and what its argument vector says come from the kernel. A command that has run
+  for 10 s is looked at every 200 ms instead of every 50.
+- **A group that cannot be inspected is still stopped.** `Unknown` no longer means "do not signal": the group is signalled
+  unless its recorded leader is known to have been replaced (start time read and different). A job whose group could not be
+  confirmed stopped (`Ended(TrackingFailed)`) keeps its `.pid` record and owner marker, so the next start can still find and
+  kill it (`jobs::clear_leftovers`).
+- **RLIMIT_NPROC headroom** for sandboxed commands and PTYs: new `[sandbox] nproc_headroom` (default 256, `0` sets no limit),
+  soft and hard limit `user limit - headroom`, never below the processes that exist plus 64, set before the command starts.
+- **Process census by sandbox identity** (`loom_tools::sandbox::census`, `loom_agent::census`). A process is a session's when
+  its sandbox may read the session's temp dir and may not read the loom home (macOS `sandbox_check`, probed once; the profile
+  is unchanged), so setsid'd, double-forked and `env -i` processes are found. Every 60 s the daemon finds each non-archived
+  session's processes and what they listen on (TCP listening, UDP bound), warns once about processes of an ended session.
+  New: `GET /api/census[?now=true]`, `POST /api/sessions/{id}/census/kill` (SIGSTOP then SIGKILL, up to 5 rounds, only a pid
+  that still has the recorded start time), `Runtime::census`, `census_now`, `census_kill`. Fallback where the query does not
+  work: the `LOOM_SANDBOX_ID` variable (`Sandbox::with_identity`, set by `Sandbox::env`) and known process groups. Nothing is
+  stopped automatically.
+
 ### Monitor E2: fetch services denied in every network mode, `mach-lookup` default-deny, and the sandbox self-probe
 
 - **Commands cannot reach the macOS fetch services in any network mode.** `com.apple.trustd(.agent)`, `ocspd`,

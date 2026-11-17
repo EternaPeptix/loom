@@ -104,7 +104,9 @@
 //!     the sandbox `child_copy` builds for commands run in an agent's copy uses the port of the session
 //!     whose environment those commands get, `proxy.session_port(..)`, and `None` when it holds no grant), then
 //!     `.with_jobs_dir(<session dir>/jobs)` (commands' own output files are there: their metadata can be read,
-//!     not their content; `child_copy` uses the parent's), with the config's `SandboxCfg`; for a role with
+//!     not their content; `child_copy` uses the parent's) and `.with_identity(<session id>)` (`child_copy`: the
+//!     parent's, whose environment and commands they are; the census finds a session's processes, `crate::census`),
+//!     with the config's `SandboxCfg`; for a role with
 //!     `read_only`, `extra_writable` is retained as internal
 //!     replay-untrusted metadata before its grants are emptied, and the
 //!     workspace is added to `protected_paths`; every model profile's `api_key_env` name is added to
@@ -356,6 +358,11 @@
 //!   raised, and no other until it was bounded again; a problem the probe finds (a leak, a probe that cannot run,
 //!   the resolver's socket) is told once too, even while `sandbox.allow_fetch_services` already holds egress
 //!   unbounded, and again only after it cleared. `LOOM_KIND` is `egress` and `LOOM_SESSION` is empty.
+//! - Census (`crate::census`, `docs/MONITOR.md` §2.2, E3): every 60 s (not under test) the daemon finds the
+//!   processes of its non-archived sessions by sandbox identity, keeps the view (`census()`; `census_now()` takes
+//!   one), and logs once a warning for each process an ended session left running. `census_kill(session)` stops what
+//!   the census finds for one session (`There is no session …` for an id that is not known). Nothing is stopped by the
+//!   periodic census.
 //! - At start, every restored open blocking item is notified once (`Still waiting: {text}`) and its
 //!   repeat notice is armed as for a live one.
 //!
@@ -1582,9 +1589,37 @@ struct Inner {
     /// socket) while the level was `Unbounded`, and the problem has not cleared since. Kept apart from
     /// `egress_told` so a problem is told even when the setting `allow_fetch_services` already made egress unbounded.
     egress_problem_told: AtomicBool,
+    /// The last process and listener census of the sessions (`crate::census`), `None` until the first finishes.
+    census: Mutex<Option<crate::census::CensusView>>,
 }
 
 impl Inner {
+    /// The sessions a census asks about (every one that is not archived) and those of them that have ended:
+    /// nothing of an ended session should be running.
+    fn census_sessions(&self) -> (Vec<(String, PathBuf)>, BTreeSet<String>) {
+        let st = self.st();
+        let live: Vec<SessionId> =
+            st.known.iter().filter(|(_, k)| !k.meta.archived).map(|(id, _)| id.clone()).collect();
+        let ended =
+            st.known.iter().filter(|(_, k)| !k.meta.archived && k.finished()).map(|(id, _)| id.as_str().to_string());
+        let ended: BTreeSet<String> = ended.collect();
+        (crate::census::members(&self.paths, &live), ended)
+    }
+
+    /// Takes a census on a blocking thread, keeps it, and logs what an ended session left running that the
+    /// last census did not show.
+    async fn run_census(&self) -> Option<crate::census::CensusView> {
+        let (members, ended) = self.census_sessions();
+        let home = self.paths.home.clone();
+        let view = tokio::task::spawn_blocking(move || crate::census::take(&home, &members)).await.ok()?;
+        let mut last = self.census.lock().unwrap_or_else(|p| p.into_inner());
+        for (session, process) in crate::census::survivors(last.as_ref(), &view, &ended) {
+            tracing::warn!("{}", crate::census::survivor_line(session, process));
+        }
+        *last = Some(view.clone());
+        Some(view)
+    }
+
     /// The last resolution of the infrastructure names and this machine's addresses.
     fn infra(&self) -> crate::infra::Resolution {
         self.infra.lock().unwrap_or_else(|p| p.into_inner()).clone()
@@ -1746,6 +1781,7 @@ impl Orchestrator for Orch {
         let (record, log) = (inner.paths.session_dir(&child).join(COPY_MANIFEST), inner.paths.session_log(&child));
         let (tmp, home, copies) = (inner.paths.session_tmp(parent), inner.paths.home.clone(), inner.paths.copies_dir());
         let parent_jobs = inner.paths.session_dir(parent).join("jobs");
+        let identity = parent.as_str().to_string();
         let (base, models, port) = (
             inner.config.sandbox.clone(),
             inner.config.models.clone(),
@@ -1776,6 +1812,7 @@ impl Orchestrator for Orch {
             let bubblewrap = cfg.mode == SandboxMode::Bubblewrap;
             let sandbox = Sandbox::new(&cfg, &dir, &tmp, &home, if bubblewrap { None } else { port })
                 .and_then(|s| s.with_jobs_dir(&parent_jobs))
+                .and_then(|s| s.with_identity(&identity))
                 .map_err(|e| format!("The sandbox for the copy of agent {} cannot be set up: {e}", child.as_str()))?;
             Ok(ChildCopy { agent: child, dir, manifest, running, runs, sandbox: Arc::new(sandbox) })
         });
@@ -2684,6 +2721,7 @@ impl Inner {
         let mut revoke = RevokeOnDrop { proxy: &self.proxy, session: id, armed: true };
         let sandbox = Sandbox::new(&cfg, &workspace, &tmp, &self.paths.home, (!bubblewrap).then_some(grant.port))
             .and_then(|s| s.with_jobs_dir(&jobs_dir))
+            .and_then(|s| s.with_identity(id.as_str()))
             .map_err(|e| format!("The sandbox for this session cannot be set up: {e}"))?;
         let (events_tx, job_events) = unbounded_channel();
         let jobs = Arc::new(JobTable::new(jobs_dir, self.blobs.clone(), events_tx, self.config.tools.max_output_bytes));
@@ -4234,6 +4272,7 @@ impl Runtime {
             egress_told: AtomicBool::new(initial_egress.level == crate::egress::Level::Unbounded),
             egress_problem_told: AtomicBool::new(problem_told_at_start),
             egress: Mutex::new(initial_egress),
+            census: Mutex::new(None),
         });
 
         let weak = Arc::downgrade(&inner);
@@ -4300,6 +4339,22 @@ impl Runtime {
                 }
             });
             inner.st().tasks.push(prober);
+        }
+
+        // The process and listener census of the sessions (E3): every `census::EVERY`. Not under test: a test
+        // runtime must not scan the machine's process table.
+        #[cfg(not(test))]
+        {
+            let weak = Arc::downgrade(&inner);
+            let census = tokio::spawn(async move {
+                loop {
+                    let Some(inner) = weak.upgrade() else { return };
+                    inner.run_census().await;
+                    drop(inner);
+                    tokio::time::sleep(crate::census::EVERY).await;
+                }
+            });
+            inner.st().tasks.push(census);
         }
 
         inner.load_known();
@@ -4424,6 +4479,44 @@ impl Runtime {
     /// (`crate::egress`), `Unprobed` until the first one finishes.
     pub fn egress(&self) -> crate::egress::EgressView {
         self.inner.egress.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// The last process and listener census (`crate::census`), `None` until the first one has finished.
+    pub fn census(&self) -> Option<crate::census::CensusView> {
+        self.inner.census.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// A census taken now, and kept as the last one.
+    pub async fn census_now(&self) -> Result<crate::census::CensusView, String> {
+        self.inner
+            .run_census()
+            .await
+            .ok_or_else(|| "The census could not be taken: the thread that reads the process table failed.".to_string())
+    }
+
+    /// Stops every process the census finds for `session` (a lead or an agent; a child's commands in the
+    /// parent's copy are the parent's): SIGSTOP then SIGKILL, repeated until none is left. Nothing else is stopped.
+    pub async fn census_kill(&self, session: &SessionId) -> Result<loom_tools::sandbox::census::Killed, String> {
+        let known = self.inner.st().known.contains_key(session);
+        if !known {
+            return Err(no_session(session));
+        }
+        let (id, tmp, home) =
+            (session.as_str().to_string(), self.inner.paths.session_tmp(session), self.inner.paths.home.clone());
+        let killed = tokio::task::spawn_blocking(move || {
+            let member = loom_tools::sandbox::census::Member { id: &id, tmp: &tmp };
+            loom_tools::sandbox::census::kill(&home, &[member], &[])
+        })
+        .await
+        .map_err(|e| format!("The census kill failed to run: {e}."))?;
+        if !killed.left.is_empty() {
+            tracing::warn!(
+                "{} process(es) of session {} survived the census kill; ask for the census again or stop them by hand",
+                killed.left.len(),
+                session.as_str()
+            );
+        }
+        Ok(killed)
     }
 
     /// Take a self-probe report as the probe loop does (tests, and a caller that probed by other means).
@@ -8786,6 +8879,21 @@ mod tests {
         // The forwarder is one task; the repeat notice of the restored item is another.
         assert!(rt2.inner.st().tasks.len() >= 2, "the repeat notice was not armed");
         rt2.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_census_is_kept_and_a_kill_names_only_a_known_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = MockServer::start(Script::new(|_, _| finish("ok"))).await.unwrap();
+        let config = config_for(&server, None);
+        let rt = Runtime::start(config, Paths::at(dir.path().join("home"))).await.unwrap();
+        // The loop is not started under test: no view until one is asked for.
+        assert!(rt.census().is_none());
+        let view = rt.census_now().await.unwrap();
+        assert!(view.readable && view.sessions.is_empty(), "{view:?}");
+        assert_eq!(rt.census().map(|v| v.taken_ms), Some(view.taken_ms));
+        assert_eq!(rt.census_kill(&SessionId::from("s-nope")).await.unwrap_err(), "There is no session s-nope.");
+        rt.shutdown().await;
     }
 
     #[tokio::test]

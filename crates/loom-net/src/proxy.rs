@@ -3593,7 +3593,9 @@ mod tests {
         assert_eq!(echoes(&mut a_cut).await, Some(*b"ping"));
         // A pattern that covers nothing of the session cuts nothing.
         assert_eq!(p.cut_hosts(&a, "example.test"), 0);
-        assert_eq!(p.cut_hosts(&a, &format!("127.0.0.1:{}", echo.wrapping_add(1))), 0, "another port");
+        // (Not `echo + 1`: the system hands out ports in sequence, so that can be `other_echo`'s.)
+        let unused = (1..u16::MAX).map(|d| echo.wrapping_add(d)).find(|p| *p != other_echo && *p != echo).unwrap();
+        assert_eq!(p.cut_hosts(&a, &format!("127.0.0.1:{unused}")), 0, "another port");
         // The destination of one tunnel of A: only that tunnel ends, and the other session's tunnel to the
         // same destination stays.
         assert_eq!(p.cut_hosts(&a, &format!("127.0.0.1:{echo}")), 1);

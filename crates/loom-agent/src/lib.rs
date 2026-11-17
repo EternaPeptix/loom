@@ -1,6 +1,7 @@
 //! loom-agent: the runtime that turns a model and a set of tools into an agent that can be left
 //! alone. See `docs/DESIGN.md` §8 and §9.
 //!
+//! - [`census`] the process and listener census of the sessions, found by sandbox identity
 //! - [`pack`]  roles: prompt, tool list, how a role ends
 //! - [`frontier`] the honest progress picture read from the ledger
 //! - [`prior`] recall of the earlier missions the operator chose for a new one, from their sealed ledgers
@@ -14,6 +15,7 @@
 //!   `docs/MONITOR.md`; phase P0 has the contracts and vocabulary only, and nothing calls it)
 //! - [`evalkit`] scripted models played against the runtime, and the scorecard of each run
 
+pub mod census;
 pub mod continuation;
 pub mod egress;
 pub mod evalkit;

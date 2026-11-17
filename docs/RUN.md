@@ -193,7 +193,16 @@ With `[sandbox] mode = "seatbelt"` (the default) commands run under a macOS sand
   tool that needs one more is fixed with `[sandbox] mach_allow`. Headless Chromium (Playwright, Puppeteer) finds its child
   processes through `org.chromium.Chromium`, `com.google.Chrome` and `com.google.chrome.for.testing` rendezvous names, which
   are allowed (the launch itself was not run on the gate host); another build (Edge, Electron) needs
-  `mach_allow = ["<bundle id>.MachPortRendezvousServer.*"]`.
+  `mach_allow = ["<bundle id>.MachPortRendezvousServer.*"]`;
+- a limit on how many processes a command can start: `[sandbox] nproc_headroom` (default 256, 0 for none) is how many
+  of the user's process slots (RLIMIT_NPROC) a command leaves unused, so a fork bomb stops before the daemon cannot
+  start the processes that stop it.
+
+The daemon finds what every session left running, whatever it did to its process group and environment, every minute:
+`GET /api/census` (`?now=true` takes one) lists each session's processes and the ports they listen on, the daemon's log
+warns once about what an ended session left, and `POST /api/sessions/<id>/census/kill` stops them. Nothing is stopped
+on its own. If the macOS query it uses does not work on a host, the census falls back to an environment variable and
+the known process groups and says so (`identity_detail`).
 
 Git config/hooks and metadata pointers are protected, including existing nested repositories and
 linked worktrees. Normal source edits still work. Commands that explicitly write shared `/tmp` or
