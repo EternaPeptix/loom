@@ -218,7 +218,9 @@ These are the places where loom does less than the text above might suggest.
   ports: a process that left its command's process group under the previous daemon keeps a profile that
   allows its old port, which a session of the new daemon may be given. A command that holds every free
   loopback port stops new sessions from starting (they cannot get a port), as it stops other outgoing
-  connections. Do not export secrets in the shell you start loom from, and do not pass secrets to
+  connections. Ports of ended sessions are freed only by a restart, so after some sixteen thousand
+  sessions in one daemon run new sessions can fail to get a port (with a sentence saying so) until the
+  daemon is restarted. Do not export secrets in the shell you start loom from, and do not pass secrets to
   commands on their command lines.
 - **A process that leaves its command's process group is not tracked.** After `setsid`, `daemon()`,
   `redis-server --daemonize yes` or `tmux new -d`, `job_kill`, stop, the end of the session and daemon
