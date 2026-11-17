@@ -106,8 +106,9 @@ mod tests {
     use loom_core::event::ToolStatus;
     use loom_tools::rootbox::fake::FakeSsh;
 
-    fn with_root(f: impl FnOnce(&mut loom_core::config::RootBoxCfg)) -> (crate::rtools::testkit::Rig, FakeSsh, tempfile::TempDir)
-    {
+    fn with_root(
+        f: impl FnOnce(&mut loom_core::config::RootBoxCfg),
+    ) -> (crate::rtools::testkit::Rig, FakeSsh, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let fake = FakeSsh::new(dir.path());
         let mut cfg = fake.cfg();
@@ -126,7 +127,11 @@ mod tests {
         let rig = rootbox_rig();
         let r = rig.call("rootbox_exec", json!({"command": "id"})).await;
         assert_eq!(r.status, ToolStatus::Error);
-        assert!(r.text.contains("No root box is configured. The operator sets [rootbox] in config.toml."), "{}", r.text);
+        assert!(
+            r.text.contains("No root box is configured. The operator sets [rootbox] in config.toml."),
+            "{}",
+            r.text
+        );
         assert_eq!(NO_ROOTBOX, "No root box is configured. The operator sets [rootbox] in config.toml.");
         // A call without its argument, with or without a root box.
         // (The schema check refuses it before `run`, as for box_exec; the sentence in `run` is the backstop.)
