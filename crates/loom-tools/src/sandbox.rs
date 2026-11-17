@@ -38,12 +38,18 @@
 //!     `include.path` and `includeIf.<condition>.path` (whatever the condition), read from the `config` and
 //!     `config.worktree` of every repository found and from the user's global configuration
 //!     (`~/.gitconfig`, and `$XDG_CONFIG_HOME/git/config` or else `~/.config/git/config`), included files
-//!     read in turn (at most 10 deep, each file once). A value is resolved as Git resolves it: `~/` from the
-//!     home directory; a relative `hooksPath` from the top of the repository's working tree (the parent of a
-//!     `.git` directory or of a linked worktree's `.git` file; for any other repository the repository
-//!     itself); a relative include from the directory of the file that names it. Each one that lies in a
-//!     writable root is a protected path (as written and as resolved), and so are `~/.gitconfig` and the
-//!     `git` directory of the user's XDG configuration when they do. (Probed: with `core.hooksPath = .husky`
+//!     read in turn (at most 10 deep, each file once), and from the configuration of the repository that
+//!     encloses the workspace when the workspace lies below its working tree (found by looking up from the
+//!     workspace's parent for a `.git`, as Git does). A value is resolved as Git resolves it: `~/` from the
+//!     home directory and `~<user>/` from that user's (a user that is not known resolves to nothing, never to
+//!     a relative path); an include relative to the directory of the file that names it. Git takes a relative
+//!     `hooksPath` from the top of the working tree it runs in, and one configuration serves several (a
+//!     common directory's serves every linked worktree), so every relative `hooksPath` read anywhere is joined
+//!     to the top of every working tree found: of each repository found, its `core.worktree` (resolved from
+//!     the repository) when set — a submodule's repository sets it — else the parent of a `.git` directory,
+//!     the worktree named by a linked worktree's `gitdir` file, and for a bare repository the repository
+//!     itself. Each one that lies in a writable root is a protected path (as written and as resolved), and so
+//!     are `~/.gitconfig` and the `git` directory of the user's XDG configuration when they do. (Probed: with `core.hooksPath = .husky`
 //!     a command wrote `.husky/post-checkout` and the operator's next checkout ran it.) These files are read
 //!     without running Git: a syntax this reading does not understand protects nothing (a residual, in
 //!     SECURITY.md, with the scripts a hook or a config names in the working tree, which stay writable).
@@ -57,15 +63,20 @@
 //!   `core.worktree`); a bare repository, `<name>.git`, can be made and used with `--git-dir` and
 //!   `--work-tree`. Existing repositories are found at construction without running Git or following a link
 //!   to a directory: every directory in the workspace that is a repository (a regular file `HEAD` and an
-//!   `objects` directory or a `commondir` file; a bare one included, and not searched further), every
-//!   `.git` directory, and the target of every `.git` file's `gitdir:` when that target is a repository;
+//!   `objects` directory or a `commondir` file; a bare one included) and that holds no `.git` of its own,
+//!   every `.git` directory, and the target of every `.git` file's `gitdir:` when that target is a
+//!   repository. The search goes on below every directory, a repository's included (but not into its
+//!   `objects`): a command can give any directory a `HEAD` and an `objects`, and the next session must
+//!   still find what lies below it (the re-review made the whole workspace look like one bare repository,
+//!   and the next session found nothing else and protected no hooks directory);
 //!   then for each repository found, its `commondir` target (when it is a repository), every directory in its
 //!   `worktrees`, and below its `modules` every directory that is a repository, whose own `worktrees` and
 //!   `modules` are searched in turn. The `config`, `config.worktree`, `hooks`, `commondir` and `gitdir` of
 //!   every repository found are protected paths, as found and as resolved, and Bubblewrap mounts every
-//!   repository found read-only as a whole (`git_dirs`) — except one that is or contains the loom home or the
-//!   user's home directory, which a pointer could otherwise name to mount what Bubblewrap hides back in (its
-//!   private files stay protected). A directory of the workspace that cannot be read refuses construction with
+//!   repository found read-only as a whole (`git_dirs`) — except one that is, contains or lies inside the
+//!   loom home, or (while credentials are protected, which hides it) the user's home directory, unless it lies
+//!   in a writable root: a pointer could otherwise name one to mount what Bubblewrap hides back in (its private
+//!   files stay protected). A directory of the workspace that cannot be read refuses construction with
 //!   a sentence naming it; so do a pointer larger than 4096 bytes, more than 100000 workspace directories,
 //!   and more than 4096 repositories and directories below `modules` together;
 //! - mounting: commands cannot mount a file system over a directory: `file-mount` is denied, and so are the
@@ -364,6 +375,16 @@
 //! repository (the user's home) and a `commondir` of `../../..` add nothing to `git_dirs`, and a repository
 //! that contains the loom home is not in `git_dirs`. A workspace directory that cannot be read refuses
 //! construction with a sentence that names it.
+//!
+//! Git, third round (the re-review's reproductions, with real `git`, each shown to fail before; `check_write`,
+//! the profile, and the operator's `git checkout` afterwards): `core.hooksPath = .husky` in a real
+//! submodule's repository (which sets `core.worktree`) protects `<submodule>/.husky`; in the common config of
+//! a repository whose linked worktree is the workspace, `<worktree>/.husky`; with `HEAD` and `objects/`
+//! planted at the workspace root (and, in another case, in a directory that holds a nested repository), the
+//! next sandbox still finds the `.git` and nested repositories and protects `.husky`; a value
+//! `~<user>/…/.husky` naming the workspace protects it; a workspace that is a subdirectory of a repository
+//! whose config has `hooksPath = <subdir>/.husky` protects it; a repository inside the (hidden) user home
+//! named by a planted `commondir` is not in `git_dirs`, while the workspace's own `.git` inside the home is.
 //!
 //! Mounting and preferences (under `sandbox-exec`): `hdiutil attach -nobrowse -mountpoint <dir>` of an image
 //! made with `hdiutil makehybrid` mounts nothing (checked with `mount`, as `hdiutil` may exit 0), and
