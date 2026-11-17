@@ -436,9 +436,11 @@
 //!   `default_model`, without a restart; nothing else in the file is reread. Refused, changing
 //!   nothing, when the file does not load, it has no `[models]`, or `Packs::check_profiles` fails. A
 //!   profile whose settings are unchanged keeps its client, slots and discovery; a new or changed one
-//!   gets new ones. Every session on a changed profile that has not ended (archived ones included) is
-//!   switched to it again as above, with reason `profile reloaded`: a running one records it whatever
-//!   changed (`settings_changed`: the server or `extra_body` may have); one without a task records it
+//!   gets new ones, made as at start (`ModelClient::new(name, profile, paths.model_keys_dir())`), so its
+//!   `api_key_file` is read again and one it cannot use refuses the reload, changing nothing. Every session
+//!   on a changed profile that has not ended (archived ones included) is switched to it again as above,
+//!   with reason `profile reloaded`: a running one records it whatever changed (`settings_changed`: the
+//!   server or `extra_body` may have); one without a task records it
 //!   when next opened only if its model, window or replay policy changed. Sessions still on a removed profile are named in the report: a
 //!   running one keeps its client; an idle one cannot be activated until it is switched. A new or
 //!   changed profile whose `api_key_env` is not set in the daemon's environment is noted too (the
@@ -3310,7 +3312,7 @@ impl Inner {
             .map(|p| (p.meta.pack.clone(), p.meta.role.clone()))
             .ok_or_else(|| "Only the lead session of a mission can start agents.".to_string())?;
         let role = self.packs.role(Some(&pack), Some(&role))?.clone();
-        let mut judge_cfg = sandbox_cfg_for(&self.config.sandbox, &role, &source, &self.config.models);
+        let mut judge_cfg = sandbox_cfg_for(&self.config.sandbox, &role, &source, &self.models().configs());
         judge_cfg.mode = loom_core::config::SandboxMode::None;
         let (home, tmp) = (self.paths.home.clone(), self.paths.session_tmp(parent));
         let limits = workcopy::Limits {
@@ -11116,6 +11118,37 @@ mod tests {
         std::fs::write(&file, "[models\n").unwrap();
         assert!(e.rt.reload_models().await.is_err());
         assert!(e.rt.health().await.iter().any(|h| h.profile == "mock"));
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_reload_reads_the_key_file_of_a_new_profile_and_refuses_one_it_cannot_use() {
+        use std::os::unix::fs::PermissionsExt;
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let file = e.rt.paths().config_file();
+        let mut cfg = e.config.clone();
+        let mut p = cfg.models["mock"].clone();
+        p.api_key_env = None;
+        p.api_key_file = Some("keyed".into());
+        cfg.models.insert("keyed".into(), p);
+        std::fs::write(&file, toml::to_string(&cfg).unwrap()).unwrap();
+        // No key file yet: refused, naming the profile and the file, and nothing changes.
+        let key = e.rt.paths().model_keys_dir().join("keyed");
+        let err = e.rt.reload_models().await.unwrap_err();
+        assert!(err.contains("'keyed'") && err.contains(&key.display().to_string()), "{err}");
+        assert!(e.rt.health().await.iter().all(|h| h.profile != "keyed"));
+        // A key file others can read is refused too.
+        std::fs::create_dir_all(key.parent().unwrap()).unwrap();
+        std::fs::write(&key, "sk-test\n").unwrap();
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let err = e.rt.reload_models().await.unwrap_err();
+        assert!(err.contains("chmod 600") && !err.contains("sk-test"), "{err}");
+        assert!(e.rt.health().await.iter().all(|h| h.profile != "keyed"));
+        // With the key file in order, the profile is added.
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let r = e.rt.reload_models().await.unwrap();
+        assert_eq!(r.added, vec!["keyed".to_string()]);
+        assert!(e.rt.health().await.iter().any(|h| h.profile == "keyed"));
         e.rt.shutdown().await;
     }
 
