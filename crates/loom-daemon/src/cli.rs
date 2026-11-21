@@ -61,8 +61,9 @@
 //! - `inbox`: `render::inbox_list`. `answer <item> <text…>`: `client.answer`; `answered {item}`.
 //! - `ledger <session|mission>`: the ledger's `markdown`, then one line for each of `LedgerView::notices`
 //!   (entries written by a newer loom that are not shown, an ignored torn tail, entries past the head record).
-//! - `score <session|mission> [--json]`: `client.score` of the mission, as `render::score_table`; with
-//!   `--json` the `ScoreView` itself, indented, for a script that compares runs.
+//! - `score <session|mission> [--json]`: `client.score` of the mission, as `render::score_table`
+//!   followed by `Harness tax: <summary>`; with `--json` the `ScoreView` itself, indented, for a
+//!   script that compares runs.
 //! - `window <session>`: `render::window_table`. `net <session> [-n <limit>]`: `render::net_table`, then
 //!   `render::granted_hosts_line` from the mission's ledger (left out when the ledger cannot be read).
 //! - `out <handle> [--lines <a>:<b>]`: the stored output's lines (all of it, paged 5 000 lines at a
@@ -637,6 +638,15 @@ fn block(text: &str) -> Result<(), String> {
     }
 }
 
+fn format_score_text(view: &loom_agent::runtime::ScoreView, style: &Style) -> String {
+    let mut text = render::score_table(view, style);
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(&format!("Harness tax: {}\n", view.total.harness_tax_summary()));
+    text
+}
+
 fn terminal_width() -> usize {
     if let Some(n) = std::env::var("COLUMNS").ok().and_then(|v| v.trim().parse::<usize>().ok()).filter(|&n| n > 0) {
         return n;
@@ -1087,22 +1097,33 @@ async fn print_records(
     }
 }
 
+fn rest_code(status: &loom_agent::session::Status) -> Option<i32> {
+    match status.phase {
+        Phase::Ended => Some(status.outcome.map(outcome_code).unwrap_or(0)),
+        Phase::Idle => status.last_end.and_then(follow_exit_code),
+        Phase::Running => None,
+    }
+}
+
 /// `tail`: what exists, then what arrives, until the turn that is running (or the next one) ends. A
 /// session at rest — ended, or idle after a turn that ended — has nothing to wait for: its records
 /// are printed and the code is that of its last turn.
 async fn tail_with(c: &Client, a: &TailArgs, cfg: &FollowCfg<'_>, out: &mut dyn Write) -> Result<i32, String> {
     let id = c.resolve(&a.session).await?;
     let status = c.session(&id).await?.info.status;
-    let at_rest_code = match status.phase {
-        Phase::Ended => Some(status.outcome.map(outcome_code).unwrap_or(0)),
-        Phase::Idle => status.last_end.and_then(follow_exit_code),
-        Phase::Running => None,
-    };
+    let at_rest_code = rest_code(&status);
     if a.no_follow || at_rest_code.is_some() {
         print_records(c, &id, a.since, cfg.render, out).await?;
         return Ok(if a.no_follow { 0 } else { at_rest_code.unwrap_or(0) });
     }
     let floor = last_seq(c, &id).await?;
+    // Re-check after computing `floor`: if the running turn finished before `floor` was read,
+    // `floor` already includes its `TurnEnd`/`SessionEnd` and `follow` would wait forever.
+    let status = c.session(&id).await?.info.status;
+    if let Some(code) = rest_code(&status) {
+        print_records(c, &id, a.since, cfg.render, out).await?;
+        return Ok(code);
+    }
     let cfg = FollowCfg { stop_floor: floor, ..*cfg };
     Ok(follow(c, &id, a.since, &cfg, out).await?.code)
 }
@@ -1305,7 +1326,7 @@ async fn dispatch(command: Command) -> Result<i32, String> {
             let text = if a.json {
                 serde_json::to_string_pretty(&view).map_err(|e| format!("The score could not be written: {e}"))?
             } else {
-                render::score_table(&view, &style())
+                format_score_text(&view, &style())
             };
             block(&text).map(|()| 0)
         }
@@ -2749,5 +2770,114 @@ mod tests {
         let mut out = Vec::new();
         print_blob(&c, handle, Some((5, None)), &|s: &str| s.to_string(), &mut out).await.unwrap();
         assert_eq!(String::from_utf8(out).unwrap().lines().count(), 3);
+    }
+
+    #[tokio::test]
+    async fn tail_does_not_hang_if_turn_finishes_before_stop_floor() {
+        use axum::extract::Query;
+        use axum::http::header;
+        use axum::response::Response;
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let log = vec![note(0), note(1), turn_end(2, TurnEndReason::Asked)];
+        let sessions_body = json(&vec![info("s-1", 1, false)]);
+        let running_body = detail_with(Phase::Running, None, None);
+        let idle_body = detail_with(Phase::Idle, Some(TurnEndReason::Asked), None);
+
+        let app = axum::Router::new()
+            .route(
+                "/api/sessions",
+                axum::routing::get({
+                    let sessions_body = sessions_body.clone();
+                    move || async move { sessions_body }
+                }),
+            )
+            .route(
+                "/api/sessions/s-1",
+                axum::routing::get({
+                    let calls = calls.clone();
+                    move || async move {
+                        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                            running_body.clone()
+                        } else {
+                            idle_body.clone()
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/api/sessions/s-1/records",
+                axum::routing::get({
+                    let log = log.clone();
+                    move |Query(q): Query<HashMap<String, String>>| async move {
+                        let after = q.get("after").and_then(|v| v.parse::<Seq>().ok());
+                        let limit = q.get("limit").and_then(|v| v.parse::<usize>().ok()).unwrap_or(500);
+                        let records: Vec<Record> =
+                            log.iter().filter(|r| after.is_none_or(|a| r.seq > a)).take(limit).cloned().collect();
+                        let next_after = (records.len() == limit).then(|| records.last().map(|r| r.seq)).flatten();
+                        json(&crate::wire::RecordsPage { records, next_after })
+                    }
+                }),
+            )
+            .route(
+                "/api/sessions/s-1/stream",
+                axum::routing::get(|| async move {
+                    let pending = futures_util::stream::pending::<Result<axum::body::Bytes, std::io::Error>>();
+                    Response::builder()
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(axum::body::Body::from_stream(pending))
+                        .unwrap()
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let c = Client::new(&format!("http://{addr}"), "tok-123");
+        let render_record = rendered;
+        let cfg = cfg(&render_record);
+        let mut out = Vec::new();
+        let code = tokio::time::timeout(Duration::from_secs(2), tail_with(&c, &tail_args(None, false), &cfg, &mut out))
+            .await
+            .expect("tail_with must not hang")
+            .unwrap();
+        srv.abort();
+        assert_eq!(code, 2);
+        assert_eq!(String::from_utf8(out).unwrap(), "#0\n#1\n#2\n");
+    }
+
+    #[test]
+    fn score_text_appends_harness_tax_summary_after_score_table() {
+        use loom_agent::runtime::{ScoreView, SessionScore};
+        use loom_core::scorecard::Scorecard;
+        let card = Scorecard {
+            steps: 5,
+            calls: 4,
+            malformed_calls: 1,
+            text_only_nudges: 1,
+            repaired_calls: 2,
+            ceremony_refusals: 1,
+            ..Scorecard::default()
+        };
+        let view = ScoreView {
+            mission: MissionId::from("m-1"),
+            sessions: vec![SessionScore {
+                session: SessionId::from("s-1"),
+                role: "lead".into(),
+                parent: None,
+                card: card.clone(),
+            }],
+            total: card.clone(),
+        };
+        let style = Style { color: false, width: 100 };
+        let rendered = format_score_text(&view, &style);
+        let table = render::score_table(&view, &style);
+        assert_eq!(rendered, format!("{table}Harness tax: {}\n", card.harness_tax_summary()));
+        assert!(rendered.ends_with(&format!("Harness tax: {}\n", card.harness_tax_summary())));
     }
 }

@@ -35,7 +35,7 @@ build_local() {
         -framework SwiftUI -framework AppKit -framework WebKit -framework UserNotifications \
         -o "$out/Contents/MacOS/$APP" $srcs || return $?
     cp Info.plist "$out/Contents/Info.plist"
-    [ -d Resources ] && cp -R Resources/. "$out/Contents/Resources/" 2>/dev/null
+    if [ -d Resources ]; then cp -R Resources/. "$out/Contents/Resources/" || return 6; fi
     plutil -lint "$out/Contents/Info.plist" >/dev/null || return 3
     codesign --force --deep --sign - --options runtime "$out" || return 4
     codesign --verify --deep --strict "$out" || return 5
@@ -57,6 +57,6 @@ QFLAGS="$(printf '%q' "${LOOM_SWIFTFLAGS:-}")"
 
 if [ "${1:-}" = "--pull" ]; then
     mkdir -p "$HERE/dist"
-    rsync -a "$HOST:$REMOTE/dist/$APP.app" "$HERE/dist/" || exit 92
+    rsync -a --delete "$HOST:$REMOTE/dist/$APP.app" "$HERE/dist/" || exit 92
     echo "pulled to $HERE/dist/$APP.app — clear quarantine before first run: xattr -dr com.apple.quarantine '$HERE/dist/$APP.app'"
 fi

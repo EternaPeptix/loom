@@ -280,6 +280,16 @@ final class DaemonClient: @unchecked Sendable {
         return ["127.0.0.1", "localhost", "::1", "[::1]"].contains(h)
     }
 
+    private final class NoRedirectDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+        func urlSession(_ session: URLSession,
+                        task: URLSessionTask,
+                        willPerformHTTPRedirection response: HTTPURLResponse,
+                        newRequest request: URLRequest,
+                        completionHandler: @escaping (URLRequest?) -> Void) {
+            completionHandler(nil)
+        }
+    }
+
     /// `GET <base>/healthz?nonce=<N>` (no token is sent): the daemon must answer with the HMAC proof for
     /// this token. Call before every use of the token.
     static func verifyIdentity(baseURL: String, token: String) async -> IdentityOutcome {
@@ -294,7 +304,7 @@ final class DaemonClient: @unchecked Sendable {
         cfg.timeoutIntervalForRequest = 5
         cfg.httpShouldSetCookies = false
         cfg.httpCookieAcceptPolicy = .never
-        let session = URLSession(configuration: cfg)
+        let session = URLSession(configuration: cfg, delegate: NoRedirectDelegate(), delegateQueue: nil)
         defer { session.finishTasksAndInvalidate() }
         do {
             let (data, resp) = try await session.data(for: req)
@@ -332,8 +342,14 @@ final class DaemonClient: @unchecked Sendable {
             switch ev.type {
             case "session":
                 if let info = ev.info {
-                    if info.archived == true { sessions[info.id] = nil } else { sessions[info.id] = info }
-                    return (info.status?.open_inbox ?? 0) > 0 ? [.inbox] : []
+                    let before = sessions[info.id]?.status?.open_inbox ?? 0
+                    if info.archived == true {
+                        sessions[info.id] = nil
+                        return [.inbox]
+                    }
+                    sessions[info.id] = info
+                    let open = info.status?.open_inbox ?? 0
+                    return (open > 0 || open != before) ? [.inbox] : []
                 }
                 return [.sessions]
             case "status":
@@ -388,6 +404,7 @@ final class DaemonClient: @unchecked Sendable {
         private var failures: [String: String] = [:]
 
         var stale: Bool { !pending.isEmpty || !failures.isEmpty }
+        var needsSessionsRefresh: Bool { pending.contains("sessions") || failures["sessions"] != nil }
         var detail: String { failures.keys.sorted().compactMap { failures[$0] }.joined(separator: "; ") }
 
         mutating func succeeded(_ resource: String, at now: Date) {
@@ -398,6 +415,11 @@ final class DaemonClient: @unchecked Sendable {
 
         mutating func failed(_ resource: String, reason: String) {
             failures[resource] = reason
+        }
+
+        mutating func unreachable(reason: String) {
+            mode = .polling
+            failed("stream", reason: reason)
         }
 
         mutating func recoveredSnapshot(at now: Date) {
@@ -449,9 +471,10 @@ final class DaemonClient: @unchecked Sendable {
     }
 
     /// Append a chunk to `buffer` and return the `data:` payloads of every frame it completes; the
-    /// incomplete tail stays in `buffer`. CRLF is accepted. Pure helper.
+    /// incomplete tail stays in `buffer`. CRLF is accepted (including across chunk boundaries). Pure helper.
     static func sseEvents(appending chunk: String, to buffer: inout String) -> [String] {
-        buffer += chunk.replacingOccurrences(of: "\r\n", with: "\n")
+        buffer += chunk
+        buffer = buffer.replacingOccurrences(of: "\r\n", with: "\n")
         var out: [String] = []
         while let r = buffer.range(of: "\n\n") {
             let frame = String(buffer[buffer.startIndex..<r.lowerBound])
@@ -487,6 +510,82 @@ final class DaemonClient: @unchecked Sendable {
         t?.cancel()
     }
 
+    /// Coordinated model + feed + notification state with monotonic fetch sequence numbers so an older
+    /// periodic poll response never overwrites a newer SSE-triggered refresh or withdraws new notices.
+    struct SyncState {
+        var model = Model()
+        var feed = FeedStatus()
+        var seen = Set<String>()
+        var notified = Set<String>()   // items we raised a notification for, to withdraw on resolve
+        var seeded = false
+        var lastCounts: Counts?
+        private var sessionsSeq: UInt64 = 0
+        private var inboxSeq: UInt64 = 0
+
+        mutating func beginSessionsFetch() -> UInt64 {
+            sessionsSeq &+= 1
+            return sessionsSeq
+        }
+
+        mutating func completeSessionsFetch(seq: UInt64, list: [SessionLite], at now: Date) -> Bool {
+            guard seq == sessionsSeq else { return false }
+            model.replaceSessions(list)
+            feed.succeeded("sessions", at: now)
+            return true
+        }
+
+        mutating func failSessionsFetch(seq: UInt64, reason: String) {
+            guard seq == sessionsSeq else { return }
+            feed.failed("sessions", reason: reason)
+        }
+
+        mutating func beginInboxFetch() -> UInt64 {
+            inboxSeq &+= 1
+            return inboxSeq
+        }
+
+        mutating func completeInboxFetch(seq: UInt64, list: [InboxLite], at now: Date) -> (fresh: [InboxNotice], resolved: [String])? {
+            guard seq == inboxSeq else { return nil }
+            model.replaceInbox(list)
+            feed.succeeded("inbox", at: now)
+            let present = Set(list.map { $0.item.item_id })
+            // Items we notified that are no longer open have been answered/dismissed: withdraw them.
+            let gone = notified.subtracting(present)
+            notified.subtract(gone)
+            // New items that need a human: blocking questions and scope requests (an agent
+            // waiting for host approval). The first snapshot seeds silently so a reconnect does
+            // not re-announce what was already open.
+            var fresh: [InboxNotice] = []
+            if seeded {
+                for e in list where (e.item.isBlocking || e.item.isScopeRequest) && !seen.contains(e.item.item_id) {
+                    fresh.append(notice(for: e))
+                    notified.insert(e.item.item_id)
+                }
+            }
+            for e in list { seen.insert(e.item.item_id) }
+            seeded = true
+            return (fresh, Array(gone))
+        }
+
+        mutating func failInboxFetch(seq: UInt64, reason: String) {
+            guard seq == inboxSeq else { return }
+            feed.failed("inbox", reason: reason)
+        }
+
+        /// Build the notice for an inbox item; a scope request names the hosts it waits on.
+        func notice(for e: InboxLite) -> InboxNotice {
+            let base = e.item.text ?? ""
+            let text: String
+            if e.item.isScopeRequest {
+                let hosts = (e.item.options ?? []).joined(separator: ", ")
+                text = hosts.isEmpty ? base : "Wants network access to \(hosts). \(base)"
+            } else {
+                text = base
+            }
+            return InboxNotice(itemId: e.item.item_id, session: e.session, title: e.title ?? e.session, text: text, isScope: e.item.isScopeRequest)
+        }
+    }
+
     // MARK: runner
 
     private final class Runner: @unchecked Sendable {
@@ -500,12 +599,7 @@ final class DaemonClient: @unchecked Sendable {
         let session: URLSession
 
         private let lock = NSLock()
-        private var model = Model()
-        private var seen = Set<String>()
-        private var notified = Set<String>()   // items we raised a notification for, to withdraw on resolve
-        private var seeded = false
-        private var lastCounts: Counts?
-        private var feed = FeedStatus()
+        private var sync = SyncState()
 
         init(baseURL: String, token: String?,
              onCounts: @escaping @Sendable (Counts) -> Void,
@@ -539,22 +633,33 @@ final class DaemonClient: @unchecked Sendable {
             return data
         }
 
-        struct HTTPError: Error, CustomStringConvertible {
+        struct HTTPError: Error, LocalizedError, CustomStringConvertible {
             var status: Int
             var description: String { status == 401 ? "the daemon rejected the token (401)" : "HTTP \(status)" }
+            var errorDescription: String? { description }
+        }
+
+        private static func isCancellation(_ error: Error) -> Bool {
+            error is CancellationError || (error as? URLError)?.code == .cancelled || Task.isCancelled
         }
 
         /// The token goes out only to a daemon that has just proven it holds it. On failure reports it
         /// (a wrong answer with `identityModePrefix`, so the app can mark the link; no usable answer as
-        /// `unreachableMessage`, since this loop does try again), waits, and says false.
+        /// `unreachableMessage`, since this loop does try again), marks the feed stale, waits, and says false.
         private func proven() async -> Bool {
             guard let token else { return true }
             let outcome = await DaemonClient.verifyIdentity(baseURL: baseURL, token: token)
             if case .proven = outcome { return true }
             if Task.isCancelled { return false }
             switch outcome {
-            case .mismatch(let why): onMode(DaemonClient.identityModePrefix + why)
-            case .unreachable(let e): onMode(DaemonClient.unreachableMessage(e))
+            case .mismatch(let why):
+                lock.withLock { sync.feed.failed("stream", reason: why) }
+                publishFeed()
+                onMode(DaemonClient.identityModePrefix + why)
+            case .unreachable(let e):
+                lock.withLock { sync.feed.unreachable(reason: e) }
+                publishFeed()
+                onMode(DaemonClient.unreachableMessage(e))
             case .proven: break
             }
             try? await Task.sleep(nanoseconds: 4_000_000_000)
@@ -574,8 +679,8 @@ final class DaemonClient: @unchecked Sendable {
                 }
                 if Task.isCancelled { break }
                 lock.withLock {
-                    feed.mode = .polling
-                    feed.failed("stream", reason: reason)
+                    sync.feed.mode = .polling
+                    sync.feed.failed("stream", reason: reason)
                 }
                 publishFeed()
                 // Whatever ended the stream may have freed the port for another listener: prove the daemon
@@ -599,15 +704,17 @@ final class DaemonClient: @unchecked Sendable {
             if let h = resp as? HTTPURLResponse, h.statusCode != 200 { throw HTTPError(status: h.statusCode) }
             // Subscribed, then snapshot again: nothing between the first snapshot and now is lost.
             await refresh(sessions: true, inbox: true)
-            lock.withLock { feed.mode = .live }
+            lock.withLock { sync.feed.mode = .live }
             publishFeed()
             onMode("live")
             try await withThrowingTaskGroup(of: Void.self) { group in
                 group.addTask { [self] in
-                    // Belt and braces: the inbox set is re-read now and then even if no event says so.
+                    // Belt and braces: the inbox set is re-read now and then even if no event says so,
+                    // and a failed/pending sessions snapshot is retried so live status can recover.
                     while !Task.isCancelled {
                         try await Task.sleep(nanoseconds: 20_000_000_000)
-                        await refresh(sessions: false, inbox: true)
+                        let needSessions = lock.withLock { sync.feed.needsSessionsRefresh }
+                        await refresh(sessions: needSessions, inbox: true)
                     }
                 }
                 group.addTask { [self] in
@@ -632,8 +739,11 @@ final class DaemonClient: @unchecked Sendable {
 
         func handle(_ payload: String) async {
             guard let ev = try? JSONDecoder().decode(BusEvent.self, from: Data(payload.utf8)) else { return }
-            let need = lock.withLock { model.apply(ev) }
-            lock.withLock { feed.receivedEvent(at: Date()) }
+            let need = lock.withLock {
+                let n = sync.model.apply(ev)
+                sync.feed.receivedEvent(at: Date())
+                return n
+            }
             publish()
             publishFeed()
             if !need.isEmpty { await refresh(sessions: need.contains(.sessions), inbox: need.contains(.inbox)) }
@@ -642,76 +752,56 @@ final class DaemonClient: @unchecked Sendable {
         func refresh(sessions: Bool, inbox: Bool) async {
             var complete = true
             if sessions {
+                let seq = lock.withLock { sync.beginSessionsFetch() }
                 do {
                     let data = try await get("/api/sessions")
                     guard let list = DaemonClient.decodeList(SessionLite.self, from: data) else {
                         throw URLError(.cannotParseResponse)
                     }
-                    lock.withLock { model.replaceSessions(list); feed.succeeded("sessions", at: Date()) }
+                    let applied = lock.withLock { sync.completeSessionsFetch(seq: seq, list: list, at: Date()) }
+                    if !applied { complete = false }
                 } catch {
                     complete = false
-                    lock.withLock { feed.failed("sessions", reason: "Session refresh failed: \(error.localizedDescription)") }
+                    if !Self.isCancellation(error) {
+                        let reason = (error as? HTTPError)?.description ?? error.localizedDescription
+                        lock.withLock { sync.failSessionsFetch(seq: seq, reason: "Session refresh failed: \(reason)") }
+                    }
                 }
             }
             if inbox {
+                let seq = lock.withLock { sync.beginInboxFetch() }
                 do {
                     let data = try await get("/api/inbox")
                     guard let list = DaemonClient.decodeList(InboxLite.self, from: data) else {
                         throw URLError(.cannotParseResponse)
                     }
-                    let (fresh, resolved): ([InboxNotice], [String]) = lock.withLock {
-                        model.replaceInbox(list)
-                        feed.succeeded("inbox", at: Date())
-                        let present = Set(list.map { $0.item.item_id })
-                        // Items we notified that are no longer open have been answered/dismissed: withdraw them.
-                        let gone = notified.subtracting(present)
-                        notified.subtract(gone)
-                        // New items that need a human: blocking questions and scope requests (an agent
-                        // waiting for host approval). The first snapshot seeds silently so a reconnect does
-                        // not re-announce what was already open.
-                        var fresh: [InboxNotice] = []
-                        if seeded {
-                            for e in list where (e.item.isBlocking || e.item.isScopeRequest) && !seen.contains(e.item.item_id) {
-                                fresh.append(notice(for: e))
-                                notified.insert(e.item.item_id)
-                            }
-                        }
-                        for e in list { seen.insert(e.item.item_id) }
-                        seeded = true
-                        return (fresh, Array(gone))
+                    let result = lock.withLock { sync.completeInboxFetch(seq: seq, list: list, at: Date()) }
+                    if let (fresh, resolved) = result {
+                        for n in fresh { onNotify(n) }
+                        for id in resolved { onResolve(id) }
+                    } else {
+                        complete = false
                     }
-                    for n in fresh { onNotify(n) }
-                    for id in resolved { onResolve(id) }
                 } catch {
                     complete = false
-                    lock.withLock { feed.failed("inbox", reason: "Inbox refresh failed: \(error.localizedDescription)") }
+                    if !Self.isCancellation(error) {
+                        let reason = (error as? HTTPError)?.description ?? error.localizedDescription
+                        lock.withLock { sync.failInboxFetch(seq: seq, reason: "Inbox refresh failed: \(reason)") }
+                    }
                 }
             }
-            if sessions && inbox && complete { lock.withLock { feed.recoveredSnapshot(at: Date()) } }
+            if sessions && inbox && complete { lock.withLock { sync.feed.recoveredSnapshot(at: Date()) } }
             publish()
             publishFeed()
         }
 
-        /// Build the notice for an inbox item; a scope request names the hosts it waits on.
-        private func notice(for e: InboxLite) -> InboxNotice {
-            let base = e.item.text ?? ""
-            let text: String
-            if e.item.isScopeRequest {
-                let hosts = (e.item.options ?? []).joined(separator: ", ")
-                text = hosts.isEmpty ? base : "Wants network access to \(hosts). \(base)"
-            } else {
-                text = base
-            }
-            return InboxNotice(itemId: e.item.item_id, session: e.session, title: e.title ?? e.session, text: text, isScope: e.item.isScopeRequest)
-        }
-
-        func publishFeed() { onFeedStatus(lock.withLock { feed }) }
+        func publishFeed() { onFeedStatus(lock.withLock { sync.feed }) }
 
         func publish() {
             let (c, changed): (Counts, Bool) = lock.withLock {
-                let c = model.counts
-                let ch = c != lastCounts
-                if ch { lastCounts = c }
+                let c = sync.model.counts
+                let ch = c != sync.lastCounts
+                if ch { sync.lastCounts = c }
                 return (c, ch)
             }
             if changed { onCounts(c) }
@@ -734,6 +824,11 @@ final class DaemonClient: @unchecked Sendable {
         chk(buf.isEmpty, "buffer not drained: \(buf)")
         chk(parseFrame("id: 4\ndata:no-space") == "no-space", "data without space")
         chk(parseFrame(": only a comment") == nil, "comment frame yielded data")
+        var splitBuf = ""
+        chk(sseEvents(appending: "data: a\r\n\r", to: &splitBuf).isEmpty, "incomplete split CRLF frame emitted early")
+        chk(sseEvents(appending: "\n", to: &splitBuf) == ["a"] && splitBuf.isEmpty, "split \\r\\n\\r + \\n frame failed")
+        chk(sseEvents(appending: "data: b\r", to: &splitBuf).isEmpty, "incomplete trailing CR emitted early")
+        chk(sseEvents(appending: "\n\r\n", to: &splitBuf) == ["b"] && splitBuf.isEmpty, "split \\r + \\n\\r\\n frame failed")
 
         // Counts derivation from real-shaped JSON.
         let sessions = Data("""
@@ -785,8 +880,35 @@ final class DaemonClient: @unchecked Sendable {
         feed.recoveredSnapshot(at: initial.addingTimeInterval(60))
         chk(!feed.stale && feed.label(at: initial) == "Polling", "complete polling snapshot recovers counts")
         feed.failed("sessions", reason: "offline")
+        chk(feed.needsSessionsRefresh, "failed sessions refresh must request retry")
         feed.succeeded("inbox", at: initial.addingTimeInterval(70))
         chk(feed.stale && feed.lastUpdated == initial.addingTimeInterval(60), "inbox success must retain failed sessions and their last-known age")
+        feed.succeeded("sessions", at: initial.addingTimeInterval(75))
+        chk(!feed.stale && !feed.needsSessionsRefresh, "sessions recovery clears retry flag")
+        feed.unreachable(reason: "connection refused")
+        chk(feed.stale && feed.lastUpdated == initial.addingTimeInterval(75)
+            && feed.label(at: initial.addingTimeInterval(90)) == "Reconnecting · last update 15s ago",
+            "unreachable proven() must mark feed stale while retaining last-known timestamp")
+
+        // Concurrent fetch ordering: older periodic poll must not overwrite newer SSE refresh or withdraw notices.
+        var sync = SyncState()
+        let seedSeq = sync.beginInboxFetch()
+        let seedRes = sync.completeInboxFetch(seq: seedSeq, list: [], at: initial)
+        chk(seedRes?.fresh.isEmpty == true && sync.seeded, "initial empty inbox seed")
+        let pollSeq = sync.beginInboxFetch()
+        let sseSeq = sync.beginInboxFetch()
+        let newBlocking = InboxLite(session: "s1", title: "Mission", item: ItemLite(item_id: "i9", item_kind: "question", text: "Go?", blocking: true, options: nil))
+        let sseRes = sync.completeInboxFetch(seq: sseSeq, list: [newBlocking], at: initial.addingTimeInterval(5))
+        chk(sseRes?.fresh.count == 1 && sseRes?.fresh.first?.itemId == "i9" && sseRes?.resolved.isEmpty == true,
+            "newer SSE inbox refresh must notify new item")
+        let stalePollRes = sync.completeInboxFetch(seq: pollSeq, list: [], at: initial.addingTimeInterval(6))
+        chk(stalePollRes == nil && sync.model.inbox["i9"] != nil && sync.notified.contains("i9"),
+            "older periodic poll must be discarded instead of withdrawing/suppressing i9")
+        let sPollSeq = sync.beginSessionsFetch()
+        let sSseSeq = sync.beginSessionsFetch()
+        chk(sync.completeSessionsFetch(seq: sSseSeq, list: ss, at: initial.addingTimeInterval(7)), "newer sessions refresh accepted")
+        chk(!sync.completeSessionsFetch(seq: sPollSeq, list: [], at: initial.addingTimeInterval(8)) && sync.model.sessions.count == 3,
+            "older sessions poll must be discarded")
 
         // Event folding.
         var m = Model()
@@ -802,6 +924,13 @@ final class DaemonClient: @unchecked Sendable {
             "{\"type\":\"record\",\"session\":\"s1\",\"record\":{\"seq\":3,\"kind\":\"inbox_opened\",\"x\":1}}".utf8))
         if let rec { var m2 = m; chk(m2.apply(rec).contains(.inbox), "inbox_opened must refresh inbox") }
         else { f.append("DaemonClient: record event did not decode") }
+        let arch = try? JSONDecoder().decode(BusEvent.self, from: Data(
+            "{\"type\":\"session\",\"info\":{\"id\":\"s1\",\"archived\":true,\"status\":{\"phase\":\"idle\",\"open_inbox\":0}}}".utf8))
+        if let arch {
+            var m3 = m
+            let need = m3.apply(arch)
+            chk(need.contains(.inbox) && m3.sessions["s1"] == nil, "archived session event must remove session and refresh inbox")
+        } else { f.append("DaemonClient: archived session event did not decode") }
 
         // Login entry URL: it carries a code and never the token.
         chk(codeEntryURL(base: "http://127.0.0.1:7878", code: "0a1b2c")?.absoluteString == "http://127.0.0.1:7878/#code=0a1b2c",

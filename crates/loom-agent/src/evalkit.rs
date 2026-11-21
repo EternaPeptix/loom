@@ -107,6 +107,8 @@
 //!   refused because analysis is not a run, so the `finish` after it is held by the goal pre-gate. A harness
 //!   that took a scan for a run (`dep_scan` is an `Exec` tool) would let this model finish on the scan with
 //!   `sum.txt` never written.
+//! - `repaired_aliases`: begins with common training aliases (`bash` with `cmd`, `shell` with `command`)
+//!   that are transparently repaired without costing extra malformed steps before finishing normally.
 //!
 //! ## `table(outcomes)`
 //! The outcomes as text, one row each under a header line, columns separated by two spaces and as wide
@@ -278,8 +280,8 @@ pub fn suite() -> Vec<Scenario> {
             name: "malformed_calls",
             plays: "begins with an argument the tool does not have, a tool that does not exist and a call cut short",
             lead: &[
-                Call("bash", r#"{"cmd": "cat numbers.txt"}"#),
-                Call("shell", r#"{"command": "cat numbers.txt"}"#),
+                Call("bash", r#"{"bogus": "cat numbers.txt"}"#),
+                Call("no_such_tool", r#"{"command": "cat numbers.txt"}"#),
                 Cut,
                 Run,
                 Claim,
@@ -358,6 +360,23 @@ pub fn suite() -> Vec<Scenario> {
                 Run,
                 Evidence(ByLines),
                 Conclude("e2"),
+                Finish(ByLines),
+            ],
+            ..base
+        },
+        Scenario {
+            name: "repaired_aliases",
+            plays: "calls bash with `cmd` and `shell` with `command` before finishing normally",
+            lead: &[
+                Call("bash", r#"{"cmd": "cat numbers.txt"}"#),
+                Call(
+                    "shell",
+                    r#"{"command": "s=0; while read n; do s=$((s+n)); done < numbers.txt; echo $s > sum.txt; echo sum.txt now holds $(cat sum.txt)"}"#,
+                ),
+                Claim,
+                Evidence(ByLines),
+                Support,
+                Conclude("e1"),
                 Finish(ByLines),
             ],
             ..base
@@ -748,8 +767,12 @@ mod tests {
         assert_eq!((o.end, o.solved, o.sessions), (TurnEndReason::Finished, true, 2));
         // Refused once for the goal not concluded and once for the open claim; neither is a quote's
         // fault, and neither reached a verifier: one was started, for the finish that was delivered.
-        assert_eq!(o.lead, card(8, Some(8), 8, 0, (3, 2), 0, (1, 0), 0));
-        assert_eq!(o.mission, card(10, Some(8), 10, 0, (3, 2), 0, (1, 0), 0));
+        let mut expected_lead = card(8, Some(8), 8, 0, (3, 2), 0, (1, 0), 0);
+        expected_lead.ceremony_refusals = 2;
+        assert_eq!(o.lead, expected_lead);
+        let mut expected_mission = card(10, Some(8), 10, 0, (3, 2), 0, (1, 0), 0);
+        expected_mission.ceremony_refusals = 2;
+        assert_eq!(o.mission, expected_mission);
     }
 
     #[tokio::test]
@@ -760,6 +783,18 @@ mod tests {
         assert_eq!(o.lead, card(9, Some(9), 9, 3, (1, 0), 0, (1, 0), 0));
         assert_eq!(o.lead.malformed_call_rate(), Some(3.0 / 9.0));
         assert_eq!(o.mission, card(11, Some(9), 11, 3, (1, 0), 0, (1, 0), 0));
+    }
+
+    #[tokio::test]
+    async fn zero_training_aliases_are_repaired_without_cost() {
+        let o = played_named("repaired_aliases").await;
+        assert_eq!((o.end, o.solved, o.sessions), (TurnEndReason::Finished, true, 2));
+        assert!(o.lead.repaired_calls >= 2, "{:?}", o.lead);
+        assert_eq!(o.lead.malformed_calls, 0);
+        assert!(o.lead.finished);
+        let mut expected = card(7, Some(7), 7, 0, (1, 0), 0, (1, 0), 0);
+        expected.repaired_calls = 2;
+        assert_eq!(o.lead, expected);
     }
 
     #[tokio::test]
@@ -800,7 +835,9 @@ mod tests {
         let o = played_named("gives_up").await;
         assert_eq!((o.end, o.solved, o.sessions), (TurnEndReason::Parked, false, 1));
         // One look, then four replies without a call: three nudged, the fourth parked.
-        assert_eq!(o.lead, card(5, None, 1, 0, (0, 0), 0, (0, 0), 0));
+        let mut expected = card(5, None, 1, 0, (0, 0), 0, (0, 0), 0);
+        expected.text_only_nudges = 3;
+        assert_eq!(o.lead, expected);
         assert_eq!(o.lead.verifier_accept_rate(), None);
         assert_eq!(o.mission, o.lead);
     }
@@ -818,7 +855,9 @@ mod tests {
         let o = played(&scenario).await;
         // The work was done, and nothing was delivered: solved by the outside check, not finished.
         assert_eq!((o.end, o.solved, o.sessions), (TurnEndReason::Parked, true, 1));
-        assert_eq!(o.lead, card(5, None, 1, 0, (0, 0), 0, (0, 0), 0));
+        let mut expected = card(5, None, 1, 0, (0, 0), 0, (0, 0), 0);
+        expected.text_only_nudges = 3;
+        assert_eq!(o.lead, expected);
     }
 
     /// Set in the child process that plays `concludes_on_a_scan`.
@@ -864,8 +903,12 @@ mod tests {
         let o = run(&scan_scenario(), dir.path()).await.unwrap();
         assert_eq!((o.end, o.solved, o.sessions), (TurnEndReason::Finished, true, 2));
         // scan, claim, evidence, claim_update, conclude (refused), finish (held), run, evidence, conclude, finish.
-        assert_eq!(o.lead, card(10, Some(10), 10, 0, (2, 1), 0, (1, 0), 0));
-        assert_eq!(o.mission, card(12, Some(10), 12, 0, (2, 1), 0, (1, 0), 0));
+        let mut expected_lead = card(10, Some(10), 10, 0, (2, 1), 0, (1, 0), 0);
+        expected_lead.ceremony_refusals = 1;
+        assert_eq!(o.lead, expected_lead);
+        let mut expected_mission = card(12, Some(10), 12, 0, (2, 1), 0, (1, 0), 0);
+        expected_mission.ceremony_refusals = 1;
+        assert_eq!(o.mission, expected_mission);
         let refusal = refused_conclusion(&dir.path().join("home")).expect("no refused conclude in the logs");
         assert!(refusal.contains("analysis is not a run"), "{refusal}");
         assert!(refusal.contains("e1 analysis by dep_scan"), "{refusal}");

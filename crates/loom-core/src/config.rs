@@ -369,6 +369,12 @@ pub struct AgentsCfg {
     /// duplicates them. On a file system that clones files (APFS) a copy takes no space until files
     /// are changed, and this limit is not applied.
     pub copy_max_mb: u64,
+    /// Use compact tool descriptions and schemas to reduce prompt token overhead.
+    pub compact_tools: bool,
+    /// Allow explicit-termination sessions to treat a plain reply without open ledger items as implicit finish.
+    pub implicit_finish: bool,
+    /// Add a nudge paragraph when a lead stops idle with an open goal and no open plan step.
+    pub idle_ledger_nudge: bool,
 }
 
 impl Default for AgentsCfg {
@@ -386,6 +392,9 @@ impl Default for AgentsCfg {
             unavailable_notice_s: 300,
             copy_max_files: 300_000,
             copy_max_mb: 20_480,
+            compact_tools: false,
+            implicit_finish: false,
+            idle_ledger_nudge: true,
         }
     }
 }
@@ -1156,6 +1165,30 @@ allow = ["*.example.test"]
     fn speculation_is_on_unless_switched_off() {
         assert!(Config::parse("").unwrap().tools.speculate);
         assert!(!Config::parse("[tools]\nspeculate = false").unwrap().tools.speculate);
+    }
+
+    #[test]
+    fn agents_ergonomic_flags_defaults_and_overrides() {
+        let def = AgentsCfg::default();
+        assert!(!def.compact_tools);
+        assert!(!def.implicit_finish);
+        assert!(def.idle_ledger_nudge);
+
+        let empty = Config::parse("").unwrap();
+        assert_eq!(empty.agents, def);
+
+        let partial = Config::parse("[agents]\nmax_children = 2\n").unwrap();
+        assert!(!partial.agents.compact_tools);
+        assert!(!partial.agents.implicit_finish);
+        assert!(partial.agents.idle_ledger_nudge);
+
+        let overridden =
+            Config::parse("[agents]\ncompact_tools = true\nimplicit_finish = true\nidle_ledger_nudge = false\n")
+                .unwrap();
+        overridden.check().unwrap();
+        assert!(overridden.agents.compact_tools);
+        assert!(overridden.agents.implicit_finish);
+        assert!(!overridden.agents.idle_ledger_nudge);
     }
 
     #[test]

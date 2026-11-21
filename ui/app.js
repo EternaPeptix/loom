@@ -44,6 +44,7 @@ const S = {
   sinceSeq: null,
   jumpFrom: null, // the last record seq held when the operator scrolled away from the end (the count behind Jump to latest)
   ask: null, // an inline confirmation waiting in the inspector: {kind:"fold"} | {kind:"lead", lead, value} | {kind:"role", lead, role, value}
+  headAsk: null, // an inline confirmation waiting in the session header: {kind:"stop"|"archive", session}
   section: "chat",
   profiles: null, // GET /api/models for the model seat: {default_model, models: [...]} (null until fetched)
   seat: null, // a model switch waiting for the operator's answer: {session, profile}
@@ -52,6 +53,7 @@ const S = {
   stamp: 0, // an increasing counter: the newer of a switch note and a message state is the one the status line shows
   attempts: 0, // failed attempts to open the event stream in a row
   workState: new Map(), // work group key -> true (operator opened it) | false (operator folded it)
+  openGroups: new Set(), // work groups kept expanded while scrolled away from the end
   expandAll: false,
   details: false,
   activity: new Map(), // session id -> {seq, ts} of the latest record seen on the stream
@@ -62,6 +64,9 @@ const S = {
   claimFilter: "all", // which claims the Evidence view lists
   view: "empty", // empty | session | inbox | new
   openId: null,
+  inspectorPref: false, // desktop inspector open preference across non-session routes
+  childBlocker: null,
+  newForm: { model: null, agentModel: null },
   rec: null, // record store of the open session
   r: null, // what is rendered of it: {from, end, nodes, fresh}
   follow: true,
@@ -75,7 +80,7 @@ const S = {
   ledger: { mission: null, model: null, state: null, error: null, stale: true },
   // The Models tab: the open mission's models (`GET /api/sessions/{id}/models`).
   models: { view: null, error: "", loading: false, busy: false, now: false },
-  win: { data: null, error: null, stale: true, hideFolded: false, from: null },
+  win: { data: null, error: null, stale: true, hideFolded: false, from: null, notesOpen: false },
   rules: null, // the rules form of the open session: {session, box, note, hint, lists, reason, asking, shown}
   net: [],
   netError: null,
@@ -461,16 +466,20 @@ function updateInboxBadge() {
   n.textContent = String(c.open);
   n.hidden = c.open === 0;
   b.classList.toggle("urgent", c.blocking > 0);
+  const inboxLabel = c.open === 0
+    ? "Inbox: nothing waiting"
+    : c.blocking > 0
+      ? `Inbox: ${c.open} open, ${c.blocking} ${c.blocking === 1 ? "needs" : "need"} you`
+      : `Inbox: ${c.open} open`;
   // The red "urgent" tint is the only on-screen signal that some items block work; give the same
   // information in text so it does not depend on colour (a screen reader reads this label).
-  b.setAttribute(
-    "aria-label",
-    c.open === 0
-      ? "Inbox: nothing waiting"
-      : c.blocking > 0
-        ? `Inbox: ${c.open} open, ${c.blocking} ${c.blocking === 1 ? "needs" : "need"} you`
-        : `Inbox: ${c.open} open`,
-  );
+  b.setAttribute("aria-label", inboxLabel);
+  const eb = $("empty-inbox");
+  const en = $("empty-inbox-count");
+  en.textContent = String(c.open);
+  eb.hidden = c.open === 0;
+  eb.classList.toggle("urgent", c.blocking > 0);
+  eb.setAttribute("aria-label", inboxLabel);
   document.title = C.pageTitle(c);
   // The Missions button on a phone says how many need the operator: a diamond and a number, and the same in words.
   $("bar-needs").hidden = c.blocking === 0;
@@ -494,32 +503,50 @@ function route() {
   }
   if (r.view === "inbox") return showInbox();
   if (r.view === "new") return showNew();
-  setView(S.openId ? "session" : "empty");
+  setView("empty");
 }
 
 function setView(v) {
-  if (S.view === "session" && v !== "session") saveSeen();
+  const was = S.view;
   S.view = v;
-  if (v !== "session") { renderStats(); stopRunTimer(); hideBarIdentity(); }
+  if (was === "session" && v !== "session") {
+    saveSeen();
+    if (!matchMedia("(max-width: 1099px)").matches) S.inspectorPref = document.body.classList.contains("show-right");
+    if (document.body.classList.contains("show-right")) setDrawer("right", false);
+  }
+  if (v !== "session") { renderStats(); stopRunTimer(); hideBarIdentity(); $("child-blocker").hidden = true; want("right"); }
   $("view-empty").hidden = v !== "empty";
   $("view-session").hidden = v !== "session";
   $("view-inbox").hidden = v !== "inbox";
   $("view-new").hidden = v !== "new";
-  if (v === "session") markRead();
+  if (v === "session") {
+    markRead();
+    if (was !== "session" && !matchMedia("(max-width: 1099px)").matches && S.inspectorPref && !document.body.classList.contains("show-right")) {
+      setDrawer("right", true);
+    }
+  }
   want("list");
 }
 
 function openSession(id) {
   closeNotes({ session: id });
   if (S.openId === id && S.rec) {
-    if (S.view !== "session") S.sinceSeq = recalled("seen." + id, null);
+    if (S.view !== "session") {
+      S.sinceSeq = recalled("seen." + id, null);
+      if (!toastKeep) dismissToast();
+    }
+    toastKeep = false;
     setView("session");
     markRead(); // what happened while the operator was elsewhere is on screen now: the row is no longer "new"
     want("header", "blocks", "right", "overview");
     return;
   }
+  if (!toastKeep) dismissToast();
+  toastKeep = false;
   saveSeen();
   S.openId = id;
+  S.headAsk = null;
+  hideHeadConfirm();
   S.seatNote.delete(id); // a switch sentence from an earlier visit is not news
   let ancestor = S.sessions.byId.get(id)?.parent;
   const walked = new Set();
@@ -529,6 +556,7 @@ function openSession(id) {
   S.rec.initialComplete = false;
   S.r = { from: 0, end: 0, nodes: new Map(), items: [], forced: new Set(), fresh: true, landed: false };
   S.workState = new Map();
+  S.openGroups = new Set();
   S.scrollAt = {};
   S.seat = null;
   S.follow = true;
@@ -536,11 +564,13 @@ function openSession(id) {
   S.net = [];
   S.netError = null;
   S.liveEl = null;
-  S.win = { ...S.win, data: null, error: null, stale: true, from: null };
+  S.win = { ...S.win, data: null, error: null, stale: true, from: null, notesOpen: false };
   S.ledger = { mission: null, model: null, state: null, error: null, stale: true };
   S.rules = null;
   S.ask = null;
   S.jumpFrom = null;
+  S.childBlocker = null;
+  $("child-blocker").hidden = true;
   closeFind(false);
   const opened = S.sessions.byId.get(id);
   S.ledger.mission = opened ? opened.mission : null;
@@ -645,6 +675,7 @@ function setSection(section, navigate = true) {
   for (const [name, id] of Object.entries(SECTION_PANEL)) $(id).hidden = name !== S.section;
   $("composer").classList.toggle("off-chat", S.section !== "chat");
   updateJump();
+  updateChildBlocker();
   if (navigate && S.openId) location.hash = C.sessionHash(S.openId, S.section);
   if (COMPACT.matches && previous !== S.section) {
     // One scroller serves every tab: each comes back where it was left, Chat at the end while it follows.
@@ -1142,12 +1173,13 @@ async function copyText(text, { label = "Text", source = null, say = announceCop
   let write = null;
   try {
     if (pending && clipboard && clipboard.write && typeof ClipboardItem !== "undefined") {
-      write = clipboard.write([new ClipboardItem({
-        "text/plain": pending.then((t) => {
-          if (t === null || t === undefined || t === "") throw new Error("Nothing to copy");
-          return new Blob([t], { type: "text/plain" });
-        }),
-      })]);
+      const blob = pending.then((t) => {
+        if (t === null || t === undefined || t === "") throw new Error("Nothing to copy");
+        return new Blob([t], { type: "text/plain" });
+      });
+      blob.catch(() => {});
+      write = clipboard.write([new ClipboardItem({ "text/plain": blob })]);
+      if (write && typeof write.catch === "function") write.catch(() => {});
     }
   } catch {
     write = null;
@@ -1247,8 +1279,8 @@ function flashCopied(button) {
  * `getText` returns the text (or a promise of it, or null when there is nothing), and may throw a sentence to be said.
  * `what` names what was copied for the confirmation. `key` lets focus find the button again after a live update.
  */
-function copyButton(label, getText, { what = "Text", text = false, source = null, say = announceCopy, key = null, tip = "", busy = "" } = {}) {
-  const b = el("button", "btn small copy-btn " + (text ? "with-icon" : "icon-only"));
+function copyButton(label, getText, { what = "Text", text = false, cls = "", source = null, say = announceCopy, key = null, tip = "", busy = "" } = {}) {
+  const b = el("button", "btn small copy-btn " + (text ? "with-icon" : "icon-only") + (cls ? " " + cls : ""));
   b.type = "button";
   b.setAttribute("aria-label", label);
   b.title = tip || label;
@@ -1353,6 +1385,58 @@ async function copySessionId() {
   } else finish(6000);
 }
 
+function hideHeadConfirm() {
+  S.headAsk = null;
+  const box = $("shead-confirm");
+  if (box) box.hidden = true;
+}
+
+function cancelHeadConfirm(restore = true) {
+  const ask = S.headAsk;
+  hideHeadConfirm();
+  if (restore && ask && ask.opener && document.contains(ask.opener) && !ask.opener.hidden) {
+    ask.opener.focus({ preventScroll: true });
+  }
+}
+
+function askHeaderConfirm(kind, info, opener) {
+  if (!info) return;
+  let text = null;
+  if (kind === "stop") text = C.stopQuestion(info);
+  else if (kind === "archive") {
+    text = C.archiveQuestion(info, missionEntries().length);
+    if (!text) { sessionAction("archive", { archived: true }); return; }
+  }
+  if (!text) return;
+  S.headAsk = { kind, session: info.id, opener };
+  $("shead-confirm-text").textContent = text;
+  const yes = $("shead-confirm-yes");
+  yes.textContent = kind === "stop" ? "Stop it" : "Archive";
+  yes.className = kind === "stop" ? "btn small danger" : "btn small primary";
+  $("shead-confirm-cancel").textContent = kind === "stop" ? "Keep running" : "Keep open";
+  $("shead-confirm").hidden = false;
+  $("shead-confirm-cancel").focus({ preventScroll: true });
+}
+
+function updateChildBlocker() {
+  const bar = $("child-blocker");
+  if (!bar) return;
+  if (S.view !== "session" || S.section !== "chat" || !S.openId) {
+    bar.hidden = true;
+    S.childBlocker = null;
+    return;
+  }
+  const hit = C.childBlockingItem([...S.sessions.byId.values()], [...S.inbox.items.values()], S.openId);
+  if (!hit) {
+    bar.hidden = true;
+    S.childBlocker = null;
+    return;
+  }
+  S.childBlocker = hit;
+  $("child-blocker-text").textContent = `${hit.title} needs your answer`;
+  bar.hidden = false;
+}
+
 function renderHeader() {
   const info = S.sessions.byId.get(S.openId);
   if (!info) {
@@ -1373,6 +1457,11 @@ function renderHeader() {
     $("b-files").hidden = true;
     $("s-goal").textContent = "";
     $("s-goal-toggle").hidden = true;
+    hideHeadConfirm();
+    $("agent-bar").hidden = true;
+    $("closed-note").hidden = true;
+    document.querySelector(".composer-card")?.classList.remove("is-agent");
+    $("child-blocker").hidden = true;
     hideBarIdentity();
     stopRunTimer();
     $("model-confirm").hidden = true;
@@ -1387,7 +1476,7 @@ function renderHeader() {
   if ($("s-title").dataset.editing !== "true") $("s-title").textContent = info.title || info.id;
   $("s-title").title = info.id;
   // Only a mission (lead) is renamed; an agent is named by the question that started it.
-  $("b-rename").hidden = !!info.parent;
+  $("b-rename").hidden = !!info.parent || $("s-title").dataset.editing === "true";
   $("b-files").hidden = !info.workspace;
   renderGoal(info);
   renderIdentity(info);
@@ -1411,10 +1500,19 @@ function renderHeader() {
   $("b-resume").hidden = !a.resume;
   $("b-archive").hidden = !a.archive;
   $("b-unarchive").hidden = !a.unarchive;
+  if (S.headAsk && (S.headAsk.session !== info.id || (S.headAsk.kind === "stop" && !a.stop) || (S.headAsk.kind === "archive" && !a.archive))) {
+    hideHeadConfirm();
+  }
   // The text box and Send go with the ability to send; the model seat stays, so an ended session can still be re-seated.
   $("msg").hidden = !a.send;
   $("send").hidden = !a.send;
-  $("agent-note").hidden = !info.parent;
+  const isAgent = !!info.parent;
+  document.querySelector(".composer-card")?.classList.toggle("is-agent", isAgent);
+  $("agent-bar").hidden = !isAgent;
+  $("agent-note").hidden = !isAgent;
+  const leadSession = isAgent ? [...S.sessions.byId.values()].find(s => !s.parent && s.mission === info.mission) || (info.parent ? { id: info.parent } : null) : null;
+  $("agent-go-lead").hidden = !isAgent || !leadSession;
+  $("agent-go-lead").dataset.lead = leadSession ? leadSession.id : "";
   const closed = $("closed-note");
   closed.hidden = !!info.parent || a.send;
   closed.textContent = info.archived ? "This session is archived; unarchive it to send messages." : "This session has ended.";
@@ -1450,8 +1548,8 @@ function renderHeader() {
   $("send").title = sendLabel === "Send" ? (COARSE.matches ? "Send" : "Send (Enter)") : sendLabel;
   $("send").setAttribute("aria-busy", String(sending || !!pendingReceipt));
   const question = renderSeat(info);
-  // The switch question is said here, in the live region, so a screen reader hears it when the profile is picked; otherwise the newer of the switch note and the message state.
-  $("send-state").textContent = question ? question.text : C.sendStateText({ loaded: !!S.rec?.initialComplete, seat: S.seatNote.get(info.id), message });
+  $("send-state").textContent = question ? "" : C.sendStateText({ loaded: !!S.rec?.initialComplete, seat: S.seatNote.get(info.id), message });
+  updateChildBlocker();
   growMsg();
   if (S.sheet.open) want("sheet");
 }
@@ -1993,7 +2091,7 @@ function renderProgress(info) {
  * next Tab continues from there. `done(node)` is called once it is shown. While the jump settles `S.jumping` keeps the scroll handler
  * from deciding that the chat is following the end again (widening the window keeps the bottom offset and would say so).
  */
-function jumpToRecord(seq, { focus = false, done = null } = {}) {
+function jumpToRecord(seq, { focus = false, highlight = true, done = null } = {}) {
   setSection("chat");
   S.jumping = true;
   requestAnimationFrame(() => {
@@ -2012,8 +2110,10 @@ function jumpToRecord(seq, { focus = false, done = null } = {}) {
       S.jumping = false;
       if (node) {
         node.scrollIntoView({ block: jumpBlock(node) });
-        node.classList.add("record-highlight");
-        setTimeout(() => node.classList.remove("record-highlight"), 2500);
+        if (highlight) {
+          node.classList.add("record-highlight");
+          setTimeout(() => node.classList.remove("record-highlight"), 2500);
+        }
         node.tabIndex = -1;
         if (focus) node.focus({ preventScroll: true });
         if (done) done(node);
@@ -2092,7 +2192,7 @@ function evidenceCard(evidence) {
   if (evidence.quote) {
     const quote = textBox(evidence.quote, "txt out");
     card.append(quote);
-    copyQuote = copyButton("Copy quote", () => C.quoteCopyText(evidence), { what: "Quote", text: true, source: quote, key: "copy-quote:" + evidence.id });
+    copyQuote = copyButton("Copy quote", () => C.quoteCopyText(evidence), { what: "Quote", text: true, cls: "ghost", source: quote, key: "copy-quote:" + evidence.id });
   }
   const producer = evidence.session ? S.sessions.byId.get(evidence.session) : null;
   const tool = evidence.session === S.openId ? S.rec?.calls.get(evidence.call_id)?.name : null;
@@ -2358,8 +2458,8 @@ function toolCopyRow(b) {
   const plan = C.fullOutputPlan(b);
   if (!command && output === null && !plan) return null;
   const row = el("div", "copy-row");
-  if (command) add(row, copyButton("Copy " + command.what.toLowerCase(), () => command.text, { what: command.what, text: true, key: "copy-cmd:" + b.id, tip: `Copy this call's ${command.what.toLowerCase()}.` }));
-  if (output !== null) add(row, copyButton("Copy output", () => output, { what: "Output", text: true, key: "copy-out:" + b.id, tip: "Copy the output recorded in this row: every line the model was shown, not only the folded part." }));
+  if (command) add(row, copyButton("Copy " + command.what.toLowerCase(), () => command.text, { what: command.what, text: true, cls: "ghost", key: "copy-cmd:" + b.id, tip: `Copy this call's ${command.what.toLowerCase()}.` }));
+  if (output !== null) add(row, copyButton("Copy output", () => output, { what: "Output", text: true, cls: "ghost", key: "copy-out:" + b.id, tip: "Copy the output recorded in this row: every line the model was shown, not only the folded part." }));
   if (plan) {
     add(row, copyButton("Copy full output…", async () => {
       if (plan.tooBig) throw new Error(C.COPY_FULL_BIG);
@@ -2421,8 +2521,18 @@ function groupSpoken(it) {
 }
 
 function toggleGroup(it) {
+  if (it.open) S.openGroups.delete(it.key);
   S.workState.set(it.key, !it.open);
   syncChat();
+}
+
+function pinOpenGroups() {
+  if (!S.r || S.follow) return;
+  for (const it of S.r.items || []) {
+    if (it.type === "group" && it.open && S.workState.get(it.key) !== false) {
+      S.openGroups.add(it.key);
+    }
+  }
 }
 
 // The group's counts, in the order the header words say them: [field, outcome kind, words].
@@ -2550,7 +2660,7 @@ function itemDirty(it, dirty) {
 /** The chat items of the open record under the operator's folds, windowed to what is shown. */
 function chatView() {
   const store = S.rec;
-  const open = new Set([...S.workState].filter(([, v]) => v).map(([k]) => k));
+  const open = new Set([...S.openGroups, ...[...S.workState].filter(([, v]) => v).map(([k]) => k)]);
   const items = C.chatItems(store.blocks, { expandAll: S.expandAll, details: S.details, open, models: store.models, sinceSeq: S.sinceSeq, lastSeq: C.lastSeq(store) });
   if (!S.expandAll) for (const it of items) if (it.type === "group" && S.workState.has(it.key)) it.open = S.workState.get(it.key);
   // A group that crosses the window start keeps only its members inside it, so a long open run is not rendered in full.
@@ -2561,6 +2671,7 @@ function syncChat() {
   const store = S.rec;
   const R = S.r;
   if (!store || !R || S.view !== "session") return;
+  if (!S.follow) pinOpenGroups();
   const holder = $("blocks");
   const dirty = new Set([...C.takeDirty(store), ...R.forced]);
   R.forced.clear();
@@ -2640,13 +2751,15 @@ function renderBlocks() {
     const need = S.section === "chat" ? ownBlockingBlock() : null;
     if (need) {
       S.follow = false;
-      jumpToRecord(need.seq);
+      jumpToRecord(need.seq, { highlight: false });
       updateJump();
+      updateChildBlocker();
       return;
     }
   }
   if (S.follow) scroller.scrollTop = scroller.scrollHeight;
   updateJump();
+  updateChildBlocker();
 }
 
 /** The open session's own blocking question: the block that holds it, or null. */
@@ -2693,7 +2806,7 @@ function updateJump() {
     return;
   }
   if (S.jumpFrom === null) S.jumpFrom = C.lastSeq(S.rec);
-  const label = C.jumpLabel(S.jumpFrom === null || S.jumpFrom === undefined ? 0 : C.recordsAfter(S.rec.blocks, S.jumpFrom, C.lastSeq(S.rec)));
+  const label = C.jumpLabel(S.jumpFrom === null || S.jumpFrom === undefined ? 0 : C.visibleRecordsAfter(S.rec.blocks, S.jumpFrom, S.details));
   if (jump.dataset.label !== label) { jump.dataset.label = label; jump.replaceChildren(document.createTextNode(label)); }
 }
 
@@ -2806,7 +2919,8 @@ function waysOut(entry, context) {
   const info = S.sessions.byId.get(entry.session);
   const title = (info && info.title) || entry.title || entry.session;
   add(box, el("div", "ways-head", "Ways out"));
-  const known = entry.session === S.openId && S.rec ? C.lastRecordedError(S.rec.blocks) : null;
+  const rawErr = entry.session === S.openId && S.rec ? C.lastRecordedError(S.rec.blocks) : null;
+  const known = C.dedupeParkedError(entry.item.text, rawErr);
   if (known) {
     const line = el("p", "ways-error");
     add(line, el("span", "label", "Last recorded error "), el("span", "txt", known));
@@ -2897,7 +3011,7 @@ function inboxCard(entry, resolved, context = "inbox") {
       document.createTextNode(result || !asker ? "" : asker.parent ? " by an agent" : C.rootNoun(asker) === "lead" ? " by the lead" : "")));
   }
   const itemText = textBox(item.text, "txt prose-text item-text");
-  const copyItem = copyButton("Copy text", () => C.inboxCopyText(item), { what: "Request text", text: true, source: itemText, key: "copy-item:" + context + ":" + item.item_id });
+  const copyItem = copyButton("Copy text", () => C.inboxCopyText(item), { what: "Request text", text: true, cls: "ghost", source: itemText, key: "copy-item:" + context + ":" + item.item_id });
   add(card, h, itemText, add(el("div", "copy-row"), copyItem));
   if (resolved) {
     const given = el("div", "given");
@@ -3064,6 +3178,32 @@ function parkControls(entry, choices, ta, sync, send, err) {
   const reason = ruleInput("Why it is closed without the goal established (required)");
   const confirm = el("div", "rule-row");
   confirm.hidden = true;
+  let acceptBtn = null;
+  let pendingChoice = null;
+  const draftConfirm = el("div", "model-confirm");
+  draftConfirm.setAttribute("role", "group");
+  draftConfirm.hidden = true;
+  const draftText = el("p", "model-confirm-text");
+  const draftYes = btn("Replace and send", "small primary", () => {
+    const choice = pendingChoice;
+    pendingChoice = null;
+    draftConfirm.hidden = true;
+    if (!choice) return;
+    ta.value = choice.answer;
+    sync();
+    send(ta.value, []);
+  });
+  noRepeat(draftYes);
+  const draftNo = btn("Keep draft", "small", () => {
+    pendingChoice = null;
+    draftConfirm.hidden = true;
+    ta.focus();
+  });
+  draftConfirm.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); draftNo.click(); }
+  });
+  add(draftConfirm, draftText, add(el("span", "model-confirm-actions"), draftYes, draftNo));
+
   const close = btn("Close as blocked", "small", async () => {
     const req = C.releaseRequest(entry.session, reason.value);
     if (req.error) return fail(err, req.error);
@@ -3072,7 +3212,7 @@ function parkControls(entry, choices, ta, sync, send, err) {
     try {
       await api("POST", req.path, req.body);
       // The release closes the mission and its open items; the lists are read again to show it.
-      notice(C.RELEASED_WORDS + ".");
+      toast(C.RELEASED_WORDS + ".");
       loadInbox();
       loadLedger();
       loadSessions();
@@ -3081,13 +3221,27 @@ function parkControls(entry, choices, ta, sync, send, err) {
       fail(err, e.message);
     }
   });
+  reason.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.isComposing) { e.preventDefault(); close.click(); }
+    else if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); confirm.hidden = true; acceptBtn?.focus(); }
+  });
   add(confirm, reason, close, btn("Keep it open", "small", () => {
     confirm.hidden = true;
+    acceptBtn?.focus();
   }));
   for (const c of choices) {
-    add(opts, btn(c.label, "", () => {
+    const b = btn(c.label, "", () => {
       err.hidden = true;
       if (c.action === "answer") {
+        if (ta.value.trim() && ta.value.trim() !== c.answer.trim()) {
+          pendingChoice = c;
+          draftText.textContent = `Replace your typed draft with "${c.answer}" and send?`;
+          draftConfirm.hidden = false;
+          draftNo.focus();
+          return;
+        }
+        pendingChoice = null;
+        draftConfirm.hidden = true;
         ta.value = c.answer;
         sync();
         send(ta.value, []);
@@ -3097,9 +3251,11 @@ function parkControls(entry, choices, ta, sync, send, err) {
         confirm.hidden = false;
         reason.focus();
       }
-    }));
+    });
+    if (c.action === "release") acceptBtn = b;
+    add(opts, b);
   }
-  add(box, opts, confirm);
+  add(box, opts, draftConfirm, confirm);
   return box;
 }
 
@@ -3154,7 +3310,8 @@ function reconcileInbox(box, entries, context, groups = null) {
   const cardNode = (entry) => {
     const id = entry.item.item_id;
     // The open session's last error and seat are part of what the card shows, so a change in them redraws it.
-    const known = entry.session === S.openId && S.rec && C.parkChoices(entry.item) ? C.lastRecordedError(S.rec.blocks) : null;
+    const rawErr = entry.session === S.openId && S.rec && C.parkChoices(entry.item) ? C.lastRecordedError(S.rec.blocks) : null;
+    const known = C.dedupeParkedError(entry.item.text, rawErr);
     const signature = JSON.stringify([entry.session, entry.title, entry.item, S.answered.get(id), known, S.sessions.byId.get(entry.session)?.title]);
     let saved = cards.get(id);
     if (!saved || saved.signature !== signature) {
@@ -3236,14 +3393,20 @@ function showNew() {
     role.addEventListener("change", () => { $("f-agent-model").disabled = role.value !== "lead"; });
   }
   const model = $("f-model");
+  const prevModel = model.options.length ? model.value : S.newForm.model;
   model.replaceChildren();
   const models = (S.status && S.status.models) || [];
   for (const m of models) model.append(new Option(m.profile + (m.reachable ? "" : " (not reachable)"), m.profile));
   if (models.length === 0) model.append(new Option("default", ""));
+  if (prevModel !== null && prevModel !== undefined && [...model.options].some(o => o.value === prevModel)) model.value = prevModel;
+  S.newForm.model = model.value;
   // The model the mission's agents start on, before the lead's first one; empty: as the pack says.
   const agents = $("f-agent-model");
+  const prevAgentModel = agents.options.length ? agents.value : S.newForm.agentModel;
   agents.replaceChildren(new Option("As the pack says", ""));
   for (const m of models) agents.append(new Option(m.profile, m.profile));
+  if (prevAgentModel !== null && prevAgentModel !== undefined && [...agents.options].some(o => o.value === prevAgentModel)) agents.value = prevAgentModel;
+  S.newForm.agentModel = agents.value;
   agents.disabled = role.value !== "lead";
   $("f-error").hidden = true;
   hideCreateAsk();
@@ -3282,11 +3445,12 @@ async function submitNew(ev, create = false) {
     const { created, ...info } = answer;
     C.applySessionEvent(S.sessions, info);
     $("f-message").value = "";
+    $("f-title").value = "";
     $("f-prior").value = "";
     pickerCreate = null;
     workspaceNote();
     location.hash = "#/s/" + encodeURIComponent(info.id);
-    if (created === true) toast(`Created ${info.workspace || workspace} and started the mission.`);
+    if (created === true) toast(`Created ${info.workspace || workspace} and started the mission.`, { keep: true });
   } catch (e) {
     // The daemon is the authority on whether the folder exists; when it says not, ask before making it.
     if (!r.body.create_workspace && C.missingWorkspaceError(e.message)) askCreate(workspace);
@@ -3407,7 +3571,7 @@ function renderRightBody() {
   const p = $("panel");
   for (const b of document.querySelectorAll("#tabs .tab")) b.classList.toggle("sel", b.dataset.tab === S.tab);
   const info = S.sessions.byId.get(S.openId);
-  if (!info) {
+  if (!info || S.view !== "session") {
     p.replaceChildren(el("p", "dim", "Open a session to see its state."));
     return;
   }
@@ -3521,7 +3685,7 @@ function askClose(opener) {
 function setLeadModel(lead, profile) {
   return changeModels(async () => {
     const r = await api("POST", "/api/sessions/" + encodeURIComponent(lead) + "/model", { profile });
-    notice(`The lead now uses ${r.model.profile}, ${r.live ? "from its next step" : "when it next runs"}.`);
+    toast(`The lead now uses ${r.model.profile}, ${r.live ? "from its next step" : "when it next runs"}.`);
   });
 }
 
@@ -3532,7 +3696,7 @@ function setRoleModel(lead, role, value, now) {
     S.models.view = r.models;
     const who = role === "*" ? "every role" : role;
     const moved = r.switched.length ? ` Moved now: ${r.switched.join(", ")}.` : "";
-    notice(body.profile ? `New agents of ${who} start on ${body.profile}.${moved}` : `The choice for ${who} is cleared: the pack chooses again.`);
+    toast(body.profile ? `New agents of ${who} start on ${body.profile}.${moved}` : `The choice for ${who} is cleared: the pack chooses again.`);
   });
 }
 
@@ -3600,14 +3764,17 @@ function renderModels(p, info) {
     now.type = "checkbox";
     now.checked = S.models.now;
     now.disabled = S.models.busy;
+    now.dataset.focusKey = "models:now";
     now.addEventListener("change", () => { S.models.now = now.checked; });
     parts.push(add(el("label", "check"), now, document.createTextNode(" Also move the running agents of a role when choosing for it (read when a choice is made)")));
   }
+  const refresh = btn("Refresh", "", () => loadModels());
+  refresh.dataset.focusKey = "models:refresh";
   parts.push(
     el("p", "dim", m.roles.length
       ? "A choice is used for agents started from then on; a forked agent shares the lead's model. Profiles are the config's [models] (loom models reload)."
       : "This lead starts no agents."),
-    btn("Refresh", "", () => loadModels()),
+    refresh,
   );
   // The question is read out once when it opens; focus stays on the select.
   if (q && askSaid !== q.text) toast(q.text);
@@ -3630,12 +3797,25 @@ function ruleInput(placeholder) {
  */
 async function sendRule(form, b, req, inputs = []) {
   if (req.error) {
-    notice(req.error);
+    form.note.className = "rule-note error";
+    form.note.setAttribute("role", "alert");
+    form.note.textContent = req.error;
     return false;
   }
   b.disabled = true;
+  form.note.className = "rule-note warn";
+  form.note.setAttribute("role", "status");
   form.note.textContent = "";
-  const receipt = await act(api("POST", req.path, req.body));
+  let receipt;
+  try {
+    receipt = await api("POST", req.path, req.body);
+  } catch (e) {
+    b.disabled = false;
+    form.note.className = "rule-note error";
+    form.note.setAttribute("role", "alert");
+    form.note.textContent = e.message;
+    return false;
+  }
   b.disabled = false;
   if (!receipt) return false;
   for (const i of inputs) i.value = "";
@@ -3654,12 +3834,29 @@ function rulesForm() {
   const id = S.openId;
   if (S.rules && S.rules.session === id) return S.rules;
   const form = { session: id, box: el("div", "rules"), note: el("div", "rule-note warn"), hint: el("div", "rule-note dim"), lists: el("div"), reason: ruleInput("Why it is withdrawn (optional)"), asking: null, shown: "" };
+  form.note.setAttribute("role", "status");
   const rule = ruleInput("Standing rule for this mission");
   const addRule = btn("Add rule", "small", () => sendRule(form, addRule, C.ruleRequest(id, rule.value), [rule]));
+  rule.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.isComposing) { e.preventDefault(); addRule.click(); } });
   const appr = ruleInput("Approve something");
   const scope = ruleInput("What it covers (optional)");
   const addAppr = btn("Approve", "small", () => sendRule(form, addAppr, C.approvalRequest(id, appr.value, scope.value), [appr, scope]));
-  add(form.box, h2("Rules and approvals"), add(el("div", "rule-row"), rule, addRule), add(el("div", "rule-row"), appr, scope, addAppr), form.note, form.hint, form.lists);
+  for (const input of [appr, scope]) {
+    input.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.isComposing) { e.preventDefault(); addAppr.click(); } });
+  }
+  form.reason.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.isComposing) { e.preventDefault(); form.lists.querySelector(".withdraw-go")?.click(); }
+    else if (e.key === "Escape") {
+      e.preventDefault();
+      e.stopPropagation();
+      const target = form.asking;
+      form.asking = null;
+      form.reason.value = "";
+      renderRuleLists(form, S.ledger.model);
+      if (target) form.lists.querySelector(`[data-focus-key="withdraw:${CSS.escape(target)}"]`)?.focus({ preventScroll: true });
+    }
+  });
+  add(form.box, h2("Rules and approvals"), add(el("div", "rule-row rule-add"), rule, addRule), add(el("div", "rule-row approval-add"), appr, scope, addAppr), form.note, form.hint, form.lists);
   S.rules = form;
   return form;
 }
@@ -3675,11 +3872,12 @@ function renderRuleLists(form, model) {
   const shown = JSON.stringify(lists);
   if (form.shown === shown) return;
   form.shown = shown;
-  const ask = (ruleId) => {
+  const ask = (ruleId, restoreKey = null) => {
     form.asking = ruleId;
     form.reason.value = "";
     renderRuleLists(form, S.ledger.model);
     if (ruleId) form.reason.focus();
+    else if (restoreKey) form.lists.querySelector(`[data-focus-key="${CSS.escape(restoreKey)}"]`)?.focus({ preventScroll: true });
   };
   // The reason field is one node that outlives the redraws, so the text typed in it is kept.
   const typing = document.activeElement === form.reason;
@@ -3687,11 +3885,15 @@ function renderRuleLists(form, model) {
   if (lists.rules.length) {
     nodes.push(ul(...lists.rules.map((r) => {
       const item = li(el("span", "k", r.id), document.createTextNode(r.text + " "));
-      if (r.id !== lists.asking) return add(item, btn("Withdraw", "small", () => ask(r.id)));
-      const go = btn("Withdraw " + r.id, "small", async () => {
+      if (r.id !== lists.asking) {
+        const w = btn("Withdraw", "small", () => ask(r.id));
+        w.dataset.focusKey = "withdraw:" + r.id;
+        return add(item, w);
+      }
+      const go = btn("Withdraw " + r.id, "small withdraw-go", async () => {
         if (await sendRule(form, go, C.withdrawRequest(form.session, r.id, form.reason.value))) ask(null);
       });
-      return add(item, add(el("div", "rule-row"), form.reason, go, btn("Keep", "small", () => ask(null))));
+      return add(item, add(el("div", "rule-row"), form.reason, go, btn("Keep", "small", () => ask(null, "withdraw:" + r.id))));
     })));
   }
   if (lists.approvals.length) {
@@ -3844,10 +4046,14 @@ function contextCard(w, where, ask) {
       const dl = el("dl");
       for (const n of m.notes) add(dl, el("dt", "", n.label), el("dd", "", n.note));
       const sum = el("summary", "", "What these mean");
+      const prefix = where === "sheet" ? "sheet:" : "panel:";
+      sum.dataset.focusKey = prefix + "notes";
       if (where === "sheet") {
-        sum.dataset.focusKey = "sheet:notes";
         d.open = !!S.sheet.notesOpen;
         d.addEventListener("toggle", () => { S.sheet.notesOpen = d.open; });
+      } else {
+        d.open = !!S.win.notesOpen;
+        d.addEventListener("toggle", () => { S.win.notesOpen = d.open; });
       }
       add(d, sum, dl);
       box.append(d);
@@ -3869,7 +4075,7 @@ function contextCard(w, where, ask) {
     actions.append(confirmRow(modelAsk(ask), async () => {
       if (where === "sheet") { S.sheet.ask = null; want("sheet"); requestAnimationFrame(() => focusKey("sheet:ask:fold")); } else askClose("ask:fold");
       if (await act(api("POST", "/api/sessions/" + encodeURIComponent(S.openId) + "/reweave")) !== undefined) {
-        notice(C.FOLD_RECEIPT);
+        toast(C.FOLD_RECEIPT);
         loadWindow();
       }
     }, () => { if (where === "sheet") { S.sheet.ask = null; want("sheet"); requestAnimationFrame(() => focusKey("sheet:ask:fold")); } else askClose("ask:fold"); }, prefix));
@@ -3885,8 +4091,8 @@ function focusKey(key) {
 
 function renderContext(p) {
   const w = S.win.data;
-  if (S.win.error && !w) return p.replaceChildren(el("p", "dim", S.win.error));
-  if (!w) return p.replaceChildren(el("p", "dim", "loading…"));
+  if (S.win.error && !w) { preserveFocus(p, () => p.replaceChildren(el("p", "dim", S.win.error))); return; }
+  if (!w) { preserveFocus(p, () => p.replaceChildren(el("p", "dim", "loading…"))); return; }
   const frag = document.createDocumentFragment();
   const sum = C.windowSummary(w);
   frag.append(contextCard(w, "panel", S.ask));
@@ -3896,6 +4102,7 @@ function renderContext(p) {
   const cb = el("input");
   cb.type = "checkbox";
   cb.checked = S.win.hideFolded;
+  cb.dataset.focusKey = "ctx:hide-folded";
   cb.addEventListener("change", () => {
     S.win.hideFolded = cb.checked;
     S.win.from = null;
@@ -3908,10 +4115,12 @@ function renderContext(p) {
   const rows = C.windowRows(w, { hideFolded: S.win.hideFolded });
   if (S.win.from === null) S.win.from = C.initialFrom(rows.length);
   if (S.win.from > 0) {
-    frag.append(btn(`Show earlier (${C.num(S.win.from)} more)`, "", () => {
+    const earlier = btn(`Show earlier (${C.num(S.win.from)} more)`, "", () => {
       S.win.from = C.earlierFrom(S.win.from);
       want("right");
-    }));
+    });
+    earlier.dataset.focusKey = "ctx:earlier";
+    frag.append(earlier);
   }
   for (const r of rows.slice(S.win.from)) {
     const row = el("div", "wrow" + (r.folded ? " folded" : ""));
@@ -3923,15 +4132,18 @@ function renderContext(p) {
     row.lastChild.append(el("span", "st-" + r.state, r.stateWords), document.createTextNode(` · ${r.size}${r.pinned ? " · pinned" : ""}`));
     frag.append(row);
   }
-  p.replaceChildren(frag);
+  preserveFocus(p, () => p.replaceChildren(frag));
 }
 
 function renderNetwork(p) {
+  const sel = getSelection();
+  if (sel && !sel.isCollapsed && sel.rangeCount && p.contains(sel.getRangeAt(0).commonAncestorContainer)) return;
   // A failed load (a damaged audit log among them) stays in view next to the decisions that arrive live.
   const error = S.netError ? [el("p", "error", S.netError)] : [];
   const granted = S.ledger.model ? [el("p", "dim", C.scopeLine(S.ledger.model))] : [];
   if (S.net.length === 0) {
-    return p.replaceChildren(...granted, ...(error.length ? error : [el("p", "dim", "No network decisions recorded for this session.")]));
+    preserveFocus(p, () => p.replaceChildren(...granted, ...(error.length ? error : [el("p", "dim", "No network decisions recorded for this session.")])));
+    return;
   }
   const t = el("table", "net");
   for (const e of S.net.slice(-500).reverse().map(C.netRow)) {
@@ -3939,7 +4151,7 @@ function renderNetwork(p) {
     add(tr, el("td", "", clock(e.ts)), el("td", "", e.verdict), el("td", "", e.method), el("td", "", e.target), el("td", "", e.rule));
     t.append(tr);
   }
-  p.replaceChildren(...granted, ...error, t);
+  preserveFocus(p, () => p.replaceChildren(...granted, ...error, t));
 }
 
 function budgetWords(b) {
@@ -4331,7 +4543,15 @@ async function sendMessage() {
   const key = "message:" + id;
   const text = $("msg").value;
   const previous = S.messageState.get(id);
-  if (!id || !text.trim() || S.sending.has(id) || !S.rec?.initialComplete || (previous?.accepted && previous.recordedSeq === undefined && previous.state !== "failed")) return;
+  if (!id || !text.trim() || S.sending.has(id)) return;
+  if (!S.rec?.initialComplete) {
+    toast("Wait for the session record to finish loading before sending.");
+    return;
+  }
+  if (previous?.accepted && previous.recordedSeq === undefined && previous.state !== "failed") {
+    toast("Waiting for the previous message to be recorded…");
+    return;
+  }
   const info = S.sessions.byId.get(id);
   if (!info || !C.sessionActions(info).send) return;
   C.setDraft(S.drafts, key, text);
@@ -4467,33 +4687,37 @@ function renameSession() {
   const h = $("s-title");
   if (h.dataset.editing === "true") return;
   h.dataset.editing = "true";
+  $("b-rename").hidden = true;
   const current = info.title || "";
   const input = el("input", "stitle-edit");
   input.type = "text";
   input.value = current;
   input.maxLength = 200;
   input.setAttribute("aria-label", "Mission title");
-  const restore = () => {
+  const restore = (refocus = false) => {
     h.dataset.editing = "";
-    h.textContent = (S.sessions.byId.get(id) || {}).title || id;
+    const cur = S.sessions.byId.get(id) || info;
+    h.textContent = cur.title || id;
+    $("b-rename").hidden = !!cur.parent || S.openId !== id;
+    if (refocus && !$("b-rename").hidden) $("b-rename").focus({ preventScroll: true });
   };
   const submit = async () => {
     const title = input.value.trim();
-    if (!title || title === current) return restore();
+    if (!title || title === current) return restore(true);
     input.disabled = true;
     try {
       await api("POST", "/api/sessions/" + encodeURIComponent(id) + "/rename", { title });
       const cur = S.sessions.byId.get(id);
       if (cur) S.sessions.byId.set(id, { ...cur, title });
-      restore();
+      restore(true);
       want("list", "header", "overview");
     } catch (e) { input.disabled = false; notice(e.message); }
   };
   const row = el("div", "rename-row");
-  add(row, input, btn("Save", "primary small", submit), btn("Cancel", "small", restore));
+  add(row, input, btn("Save", "primary small", submit), btn("Cancel", "small", () => restore(true)));
   input.addEventListener("keydown", (e) => {
     if (e.key === "Enter") { e.preventDefault(); submit(); }
-    else if (e.key === "Escape") { e.preventDefault(); restore(); }
+    else if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); restore(true); }
   });
   h.replaceChildren(row);
   input.focus();
@@ -4532,6 +4756,7 @@ function setDrawer(side, open) {
   if (open) drawerOpener = asked || document.activeElement;
   document.body.classList.toggle("show-" + side, open);
   const rightOpen = document.body.classList.contains("show-right");
+  if (side === "right" && !narrow && S.view === "session") S.inspectorPref = rightOpen;
   const leftOpen = document.body.classList.contains("show-left");
   $("right").inert = !rightOpen || (mobile && leftOpen);
   $("left").inert = (mobile && !leftOpen) || (narrow && rightOpen);
@@ -4575,12 +4800,25 @@ function resizeInspector(width) {
 
 const MAC = /Mac|iPhone|iPad/.test((typeof navigator === "object" && (navigator.platform || navigator.userAgent)) || "");
 let toastTimer = 0;
+let toastKeep = false;
+function dismissToast() {
+  clearTimeout(toastTimer);
+  toastTimer = 0;
+  toastKeep = false;
+  const t = $("keys-live");
+  if (t) t.textContent = "";
+}
 /** A short line for everyone: shown for a few seconds and read out politely. Never an alert. */
-function toast(text) {
+function toast(text, { keep = false } = {}) {
   const t = $("keys-live");
   t.textContent = text;
+  toastKeep = keep;
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => { t.textContent = ""; }, 4000);
+  toastTimer = setTimeout(() => {
+    toastTimer = 0;
+    toastKeep = false;
+    t.textContent = "";
+  }, 4000);
 }
 
 const SW_SHOWN = 60;
@@ -4652,8 +4890,10 @@ function chooseSwitcher(i = SW.active) {
   setTimeout(() => document.querySelector('#mission-tabs [aria-selected="true"]')?.focus({ preventScroll: true }), 60);
 }
 
+let keysOpener = null;
 function openKeys() {
   if (document.querySelector("dialog[open]")) return;
+  keysOpener = document.activeElement;
   const body = $("keys-body");
   body.replaceChildren();
   for (const group of C.keySheet(MAC)) {
@@ -4715,8 +4955,8 @@ function keyboard(e) {
     return;
   }
   if (modal) return;
-  // A modal drawer makes the main column inert: Find would open where the keyboard cannot go.
-  if (action === "find" && document.querySelector('#left[aria-modal="true"], #right[aria-modal="true"]')) return;
+  // A modal drawer makes the main column inert: global navigation, shortcut sheet and Find must not fire behind it.
+  if (document.querySelector('#left[aria-modal="true"], #right[aria-modal="true"]')) return;
   e.preventDefault();
   if (action === "row-next") stepRow(1);
   else if (action === "row-prev") stepRow(-1);
@@ -4802,7 +5042,11 @@ function wireFind() {
   $("btn-find").addEventListener("click", () => { if ($("find-bar").hidden) openFind(); else closeFind(); });
   $("bar-find").addEventListener("click", () => { if ($("find-bar").hidden) openFind(); else closeFind(); });
   $("find-close").addEventListener("click", () => closeFind());
-  $("find-go").addEventListener("click", () => { if (FIND.node && FIND.node.isConnected) FIND.node.focus(); });
+  $("find-go").addEventListener("click", () => {
+    if (FIND.node && FIND.node.isConnected) { FIND.node.focus(); return; }
+    const hit = FIND.result && FIND.cur >= 0 ? FIND.result.hits[FIND.cur] : null;
+    if (hit) jumpToRecord(hit.seq, { focus: true, done: (node) => { FIND.node = node; } });
+  });
   $("find-next").addEventListener("click", () => findStep(1));
   $("find-prev").addEventListener("click", () => findStep(-1));
   $("find-q").addEventListener("input", () => {
@@ -4839,6 +5083,10 @@ function wireKeyboard() {
     if (!SW.chose && SW.opener && document.contains(SW.opener)) SW.opener.focus({ preventScroll: true });
     SW.opener = null;
   });
+  $("keys").addEventListener("close", () => {
+    if (keysOpener && document.contains(keysOpener)) keysOpener.focus({ preventScroll: true });
+    keysOpener = null;
+  });
   document.addEventListener("keydown", keyboard);
   wireFind();
 }
@@ -4860,19 +5108,21 @@ function workspaceNote() {
 
 function hideCreateAsk() {
   $("f-create").hidden = true;
+  $("f-submit").hidden = false;
 }
 
 /** The daemon says the workspace is missing: ask once, inline, before anything is made. Focus goes to the safe button. */
 function askCreate(path) {
   $("f-create-q").textContent = C.createWorkspaceQuestion(path);
   $("f-create").hidden = false;
+  $("f-submit").hidden = true;
   $("f-create").dataset.path = path;
   $("f-create-no").focus();
 }
 
 // ---- the picker (GET /api/fs/dirs)
 
-const PK = { path: "", listing: null, error: "", showHidden: false, active: "", choice: null, seq: 0, loading: false, opener: null, naming: false };
+const PK = { path: "", listing: null, error: "", showHidden: false, query: "", active: "", choice: null, seq: 0, loading: false, opener: null, naming: false };
 
 function pickerSay(text, bad = false) {
   const s = $("picker-status");
@@ -4887,6 +5137,8 @@ function openPicker(opener = $("f-browse")) {
   PK.choice = null;
   PK.listing = null;
   PK.error = "";
+  PK.query = "";
+  $("picker-filter").value = "";
   $("picker-hidden").checked = PK.showHidden;
   $("picker-newrow").hidden = true;
   $("picker-new").setAttribute("aria-expanded", "false");
@@ -4910,6 +5162,8 @@ function closePicker(restore = null) {
 async function pickerLoad(path, { initial = false, focus = false, pick = "" } = {}) {
   const seq = ++PK.seq;
   PK.loading = true;
+  PK.query = "";
+  $("picker-filter").value = "";
   pickerSay("Loading folders…");
   let ask = path;
   let first = "";
@@ -4941,7 +5195,9 @@ async function pickerLoad(path, { initial = false, focus = false, pick = "" } = 
 }
 
 function pickerRows() {
-  return PK.listing ? C.visibleDirs(PK.listing.entries, PK.showHidden) : [];
+  const rows = PK.listing ? C.visibleDirs(PK.listing.entries, PK.showHidden) : [];
+  const q = PK.query.trim().toLowerCase();
+  return q ? rows.filter((e) => e.name.toLowerCase().includes(q)) : rows;
 }
 
 function renderPicker({ focus = false } = {}) {
@@ -4986,8 +5242,12 @@ function renderPicker({ focus = false } = {}) {
     list.append(add(el("li"), b));
   }
   if (listing && !PK.loading) {
+    const allVisible = C.visibleDirs(listing.entries, PK.showHidden);
     const hiddenCount = listing.entries.filter((e) => e.hidden).length;
-    const words = [rows.length ? `${C.count(rows.length, "folder")} in ${listing.path}.` : `No folders in ${listing.path}.`];
+    const q = PK.query.trim();
+    const words = q
+      ? [rows.length ? `${C.count(rows.length, "matching folder")} of ${C.num(allVisible.length)} in ${listing.path}.` : `No folder matches "${q}" in ${listing.path}.`]
+      : [rows.length ? `${C.count(rows.length, "folder")} in ${listing.path}.` : `No folders in ${listing.path}.`];
     if (!PK.showHidden && hiddenCount) words.push(`${C.count(hiddenCount, "hidden folder")} not shown.`);
     if (listing.more > 0) words.push(`${C.num(listing.more)} more are not listed.`);
     if (!PK.error) pickerSay(words.join(" "));
@@ -5336,6 +5596,25 @@ function wire() {
     if (location.hash === "#/new") route();
     else location.hash = "#/new";
   });
+  $("empty-new").addEventListener("click", () => {
+    if (location.hash === "#/new") route();
+    else location.hash = "#/new";
+  });
+  $("empty-inbox").addEventListener("click", () => {
+    if (location.hash === "#/inbox") route();
+    else location.hash = "#/inbox";
+  });
+  $("empty-missions").addEventListener("click", (e) => {
+    if (matchMedia("(max-width: 699px)").matches) {
+      setDrawer("right", false);
+      nextOpener = e.currentTarget;
+      setDrawer("left", true);
+    } else {
+      const target = $("sessions").querySelector("a.row") || $("btn-new");
+      if (target) target.focus({ preventScroll: true });
+    }
+  });
+  $("keys-live").addEventListener("click", dismissToast);
   $("show-archived").addEventListener("change", (e) => {
     S.showArchived = e.target.checked;
     want("list");
@@ -5381,6 +5660,8 @@ function wire() {
     if (e.currentTarget !== s || S.jumping || S.section !== "chat") return;
     const was = S.follow;
     S.follow = C.atEnd(s.scrollTop, s.clientHeight, s.scrollHeight);
+    if (!S.follow && was) pinOpenGroups();
+    else if (S.follow && !was) S.openGroups.clear();
     updateJump();
     if (S.follow && !was) want("blocks");
   };
@@ -5394,6 +5675,7 @@ function wire() {
     const need = S.jumpNeed;
     if (need) { jumpToRecord(need.seq, { focus: true }); return; }
     S.follow = true;
+    S.openGroups.clear();
     want("blocks");
   });
   $("btn-earlier").addEventListener("click", showEarlier);
@@ -5418,11 +5700,38 @@ function wire() {
   $("s-goal-toggle").addEventListener("click", () => { S.goalOpen = !S.goalOpen; renderHeader(); });
   $("b-rename").addEventListener("click", renameSession);
   $("b-rename").title = "Rename this mission.";
-  $("b-stop").addEventListener("click", () => sessionAction("stop"));
+  $("b-stop").addEventListener("click", (e) => askHeaderConfirm("stop", S.sessions.byId.get(S.openId), e.currentTarget));
   $("b-stop").title = "Stop this session and cancel its descendant agents and tracked jobs.";
   $("b-resume").addEventListener("click", () => sessionAction("resume"));
-  $("b-archive").addEventListener("click", () => sessionAction("archive", { archived: true }));
+  $("b-archive").addEventListener("click", (e) => askHeaderConfirm("archive", S.sessions.byId.get(S.openId), e.currentTarget));
   $("b-unarchive").addEventListener("click", () => sessionAction("archive", { archived: false }));
+  noRepeat($("shead-confirm-yes"));
+  $("shead-confirm-yes").addEventListener("click", () => {
+    const ask = S.headAsk;
+    if (!ask || ask.session !== S.openId) { hideHeadConfirm(); return; }
+    hideHeadConfirm();
+    if (ask.kind === "stop") sessionAction("stop");
+    else if (ask.kind === "archive") sessionAction("archive", { archived: true });
+  });
+  $("shead-confirm-cancel").addEventListener("click", () => cancelHeadConfirm());
+  $("shead-confirm").addEventListener("keydown", (e) => {
+    if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); cancelHeadConfirm(); }
+  });
+  $("agent-go-lead").addEventListener("click", () => {
+    const id = $("agent-go-lead").dataset.lead;
+    if (!id) return;
+    const hash = C.sessionHash(id);
+    if (location.hash === hash) route(); else location.hash = hash;
+    rescueFocus();
+  });
+  $("child-blocker-go").addEventListener("click", () => {
+    const hit = S.childBlocker;
+    const id = hit && (hit.item?.session || hit.session?.id);
+    if (!id) return;
+    const hash = C.sessionHash(id);
+    if (location.hash === hash) route(); else location.hash = hash;
+    rescueFocus();
+  });
 
   $("model-seat").addEventListener("change", (e) => {
     const info = S.sessions.byId.get(S.openId);
@@ -5446,6 +5755,8 @@ function wire() {
   });
 
   $("new-form").addEventListener("submit", submitNew);
+  $("f-model").addEventListener("change", (e) => { S.newForm.model = e.target.value; });
+  $("f-agent-model").addEventListener("change", (e) => { S.newForm.agentModel = e.target.value; });
   $("f-workspace").addEventListener("input", () => { workspaceNote(); hideCreateAsk(); });
   $("f-browse").addEventListener("click", (e) => openPicker(e.currentTarget));
   $("f-create-yes").addEventListener("click", () => submitNew(null, true));
@@ -5453,9 +5764,23 @@ function wire() {
   $("f-create-no").addEventListener("click", () => { hideCreateAsk(); $("f-workspace").focus(); });
   $("f-create").addEventListener("keydown", (e) => { if (e.key === "Escape") { e.preventDefault(); hideCreateAsk(); $("f-workspace").focus(); } });
   $("b-files").addEventListener("click", (e) => showFiles(e.currentTarget));
+  $("picker").addEventListener("click", (e) => { if (e.target === $("picker")) closePicker(); });
   $("picker-close").addEventListener("click", () => closePicker());
   $("picker-cancel").addEventListener("click", () => closePicker());
   $("picker").addEventListener("cancel", (e) => { e.preventDefault(); if (PK.naming) pickerNaming(false); else closePicker(); });
+  $("picker-filter").addEventListener("input", (e) => { PK.query = e.target.value; renderPicker(); });
+  $("picker-filter").addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && $("picker-filter").value) {
+      e.preventDefault();
+      e.stopPropagation();
+      $("picker-filter").value = "";
+      PK.query = "";
+      renderPicker();
+    } else if (e.key === "ArrowDown") {
+      const row = $("picker-list").querySelector('[tabindex="0"], .dir-row');
+      if (row) { e.preventDefault(); row.focus({ preventScroll: true }); }
+    }
+  });
   $("picker-up").addEventListener("click", pickerUp);
   $("picker-home").addEventListener("click", () => pickerLoad("", { focus: true }));
   $("picker-hidden").addEventListener("change", (e) => { PK.showHidden = e.target.checked; renderPicker(); });
@@ -5481,6 +5806,7 @@ $("picker").addEventListener("keydown", pickerEmptyKeys);
     }
     renderInbox();
   });
+  $("viewer").addEventListener("click", (e) => { if (e.target === $("viewer")) closeViewer(); });
   $("viewer-close").addEventListener("click", closeViewer);
   $("viewer").addEventListener("cancel", e => { e.preventDefault(); closeViewer(); });
   $("viewer-jump").addEventListener("click", viewerJump);
@@ -5530,9 +5856,13 @@ $("picker").addEventListener("keydown", pickerEmptyKeys);
     if (document.querySelector("dialog[open]")) return;
     const side = matchMedia("(max-width: 1099px)").matches && document.body.classList.contains("show-right") ? "right"
       : matchMedia("(max-width: 699px)").matches && document.body.classList.contains("show-left") ? "left" : null;
-    if (e.key === "Escape" && side) { e.preventDefault(); setDrawer(side, false); }
+    if (e.key === "Escape" && side) { e.preventDefault(); setDrawer(side, false); return; }
+    if (e.key === "Escape" && !side && !e.defaultPrevented && S.view === "session") {
+      if (!$("shead-confirm").hidden) { e.preventDefault(); cancelHeadConfirm(); return; }
+      if (!$("find-bar").hidden) { e.preventDefault(); closeFind(); return; }
+    }
     if (e.key === "Tab" && side) {
-      const focusable = [...$(side).querySelectorAll("button:not([disabled]), a, input:not([disabled]), textarea:not([disabled]), select:not([disabled]), summary, [tabindex='0']")].filter(n => n.getClientRects().length);
+      const focusable = [...$(side).querySelectorAll("button:not([disabled]):not([tabindex='-1']), a:not([tabindex='-1']), input:not([disabled]):not([tabindex='-1']), textarea:not([disabled]):not([tabindex='-1']), select:not([disabled]):not([tabindex='-1']), summary:not([tabindex='-1']), [tabindex='0']")].filter(n => n.getClientRects().length);
       const first = focusable[0], last = focusable[focusable.length - 1];
       if (!first) return;
       if (e.shiftKey && (document.activeElement === first || !$(side).contains(document.activeElement))) { e.preventDefault(); last.focus(); }
@@ -5556,7 +5886,7 @@ async function start() {
   setSection("chat", false);
   setDrawer("left", false);
   setDrawer("right", false);
-  resizeInspector(Number(recalled("inspector-width", 360)) || 360);
+  resizeInspector(Number(recalled("inspector-width", 396)) || 396);
   renderDot();
   connect();
   await Promise.all([loadSessions(), loadInbox(), loadStatus()]);

@@ -121,68 +121,183 @@ impl Pty {
         prompt: Option<&regex::Regex>,
         seconds: u64,
     ) -> (Vec<u8>, String) {
+        match self.exec(ctx, &[], frame, prompt, seconds).await {
+            Ok(res) => res,
+            Err(e) => (Vec::new(), e),
+        }
+    }
+
+    /// Write `data` using non-blocking I/O while draining echoed/emitted PTY output so writes larger
+    /// than the kernel PTY line-discipline buffer cannot deadlock or fail with `WouldBlock`, then
+    /// continue reading until `frame`, `prompt`, EOF, output limit, cancel, or `seconds` deadline.
+    async fn exec(
+        &mut self,
+        ctx: &ToolCtx,
+        data: &[u8],
+        frame: Option<&str>,
+        prompt: Option<&regex::Regex>,
+        seconds: u64,
+    ) -> Result<(Vec<u8>, String), String> {
         let start = Instant::now();
+        let deadline = Duration::from_secs(seconds);
         let mut bytes = Vec::new();
         let cap = ctx.cfg.max_output_bytes.min(4_000_000) as usize;
+        let mut offset = 0usize;
+
+        while offset < data.len() {
+            if self.last_checkpoint.elapsed() >= Duration::from_millis(250) {
+                self.checkpoint();
+            }
+            if ctx.cancel.is_cancelled() || self.close.is_cancelled() {
+                self.stop();
+                return Err(
+                    "PTY input was not fully written (cancelled; terminal closed); some bytes may have arrived.".into(),
+                );
+            }
+            let write_res = match self.master.as_mut() {
+                Some(master) => master.write(&data[offset..]),
+                None => return Err("PTY input was not fully written (terminal already closed); some bytes may have arrived. Poll before retrying.".into()),
+            };
+            match write_res {
+                Ok(0) => {
+                    self.stop();
+                    return Err(
+                        "PTY input was not fully written (EOF on write; terminal closed); some bytes may have arrived."
+                            .into(),
+                    );
+                }
+                Ok(n) => {
+                    offset += n;
+                    continue;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // Drain available output while waiting so PTY ECHO cannot fill the slave buffer.
+                    let mut chunk = [0u8; 8192];
+                    loop {
+                        let read = match self.master.as_mut() {
+                            Some(master) => master.read(&mut chunk),
+                            None => return Err("PTY input was not fully written (terminal already closed); some bytes may have arrived.".into()),
+                        };
+                        match read {
+                            Ok(0) => {
+                                self.stop();
+                                return Err("PTY input was not fully written (EOF; terminal closed); some bytes may have arrived.".into());
+                            }
+                            Ok(n) => {
+                                let room = cap.saturating_sub(bytes.len());
+                                bytes.extend_from_slice(chunk.get(..n.min(room)).unwrap_or_default());
+                                if n > room || bytes.len() >= cap {
+                                    self.stop();
+                                    return Ok((bytes, "output limit; terminal closed".into()));
+                                }
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(e) if e.raw_os_error() == Some(libc::EIO) => {
+                                self.stop();
+                                return Err("PTY input was not fully written (terminal closed (EIO)); some bytes may have arrived.".into());
+                            }
+                            Err(e) => {
+                                self.stop();
+                                return Err(format!(
+                                    "PTY input was not fully written ({e}); some bytes may have arrived."
+                                ));
+                            }
+                        }
+                    }
+                    if start.elapsed() >= deadline {
+                        self.checkpoint();
+                        return Err("PTY input was not fully written (timed out waiting for terminal); some bytes may have arrived. Poll before retrying.".into());
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                Err(e) => {
+                    if e.raw_os_error() == Some(libc::EIO) {
+                        self.stop();
+                    }
+                    return Err(format!(
+                        "PTY input was not fully written ({e}); some bytes may have arrived. Poll before retrying."
+                    ));
+                }
+            }
+        }
+
+        let mut pending_scan = !bytes.is_empty();
+        let mut unscanned_bytes = bytes.len();
         loop {
             if self.last_checkpoint.elapsed() >= Duration::from_millis(250) {
                 self.checkpoint();
             }
             if ctx.cancel.is_cancelled() || self.close.is_cancelled() {
                 self.stop();
-                return (bytes, "cancelled; terminal closed".into());
+                return Ok((bytes, "cancelled; terminal closed".into()));
             }
             let mut chunk = [0u8; 8192];
             let read = match self.master.as_mut() {
                 Some(master) => master.read(&mut chunk),
-                None => return (bytes, "terminal already closed".into()),
+                None => return Ok((bytes, "terminal already closed".into())),
             };
+            let mut idle_read = false;
             match read {
                 Ok(0) => {
                     self.stop();
-                    return (bytes, "EOF; terminal closed".into());
+                    return Ok((bytes, "EOF; terminal closed".into()));
                 }
                 Ok(n) => {
                     let room = cap.saturating_sub(bytes.len());
-                    bytes.extend_from_slice(chunk.get(..n.min(room)).unwrap_or_default());
+                    let take = n.min(room);
+                    bytes.extend_from_slice(chunk.get(..take).unwrap_or_default());
+                    unscanned_bytes = unscanned_bytes.saturating_add(take);
+                    pending_scan = true;
                     if n > room || bytes.len() >= cap {
                         self.stop();
-                        return (bytes, "output limit; terminal closed".into());
+                        return Ok((bytes, "output limit; terminal closed".into()));
                     }
-                    let text = String::from_utf8_lossy(&bytes);
-                    if let Some(frame) = frame {
-                        if text.lines().any(|line| {
-                            line.trim().strip_prefix(frame).is_some_and(|code| code.trim().parse::<i32>().is_ok())
-                        }) {
-                            self.checkpoint();
-                            return (bytes, "untrusted completion frame observed".into());
-                        }
-                    }
-                    let tail: String = text.chars().rev().take(1000).collect::<String>().chars().rev().collect();
-                    if prompt.is_some_and(|p| p.is_match(&tail))
-                        || ["[sudo] password", "Password:", "(gdb) ", "(gdb)\r", "msf6 >"]
-                            .iter()
-                            .any(|p| tail.ends_with(p))
-                    {
-                        self.checkpoint();
-                        return (bytes, "untrusted prompt observed; send input to continue".into());
+                    if unscanned_bytes < 65_536 && start.elapsed() < deadline {
+                        continue;
                     }
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    idle_read = true;
+                }
                 Err(e) if e.raw_os_error() == Some(libc::EIO) => {
                     self.stop();
-                    return (bytes, "terminal closed (EIO)".into());
+                    return Ok((bytes, "terminal closed (EIO)".into()));
                 }
                 Err(e) => {
                     self.stop();
-                    return (bytes, format!("PTY read failed; terminal closed: {e}"));
+                    return Ok((bytes, format!("PTY read failed; terminal closed: {e}")));
                 }
             }
-            if start.elapsed() >= Duration::from_secs(seconds) {
-                self.checkpoint();
-                return (bytes, "deadline; command may still be running in this PTY".into());
+            if pending_scan {
+                pending_scan = false;
+                unscanned_bytes = 0;
+                let text = String::from_utf8_lossy(&bytes);
+                if let Some(frame) = frame {
+                    if text.lines().any(|line| {
+                        line.trim().strip_prefix(frame).is_some_and(|code| code.trim().parse::<i32>().is_ok())
+                    }) {
+                        self.checkpoint();
+                        return Ok((bytes, "untrusted completion frame observed".into()));
+                    }
+                }
+                let tail: String = text.chars().rev().take(1000).collect::<String>().chars().rev().collect();
+                if prompt.is_some_and(|p| p.is_match(&tail))
+                    || ["[sudo] password", "Password:", "(gdb) ", "(gdb)\r", "msf6 >"].iter().any(|p| tail.ends_with(p))
+                {
+                    self.checkpoint();
+                    return Ok((bytes, "untrusted prompt observed; send input to continue".into()));
+                }
             }
-            tokio::time::sleep(Duration::from_millis(15)).await;
+            if start.elapsed() >= deadline {
+                self.checkpoint();
+                return Ok((bytes, "deadline; command may still be running in this PTY".into()));
+            }
+            if idle_read {
+                tokio::time::sleep(Duration::from_millis(15)).await;
+            }
         }
     }
 }
@@ -199,7 +314,12 @@ impl PtyTable {
     fn resolve(&self, given: &str) -> Result<(String, PtyHandle), String> {
         let table = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let id = if given == "last" {
-            format!("S{}", table.next)
+            table
+                .items
+                .keys()
+                .max_by_key(|k| k.strip_prefix('S').and_then(|n| n.parse::<u64>().ok()).unwrap_or(0))
+                .cloned()
+                .unwrap_or_default()
         } else {
             format!("S{}", given.trim_start_matches(['#', 'S', 's']))
         };
@@ -253,7 +373,7 @@ fn spawn(ctx: &ToolCtx, script: &str, pid_file: std::path::PathBuf) -> Result<Pt
     if flags < 0 || unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
         return Err("Could not make PTY reads bounded.".into());
     }
-    let (program, args) = ctx.sandbox.command(script);
+    let (program, args) = ctx.sandbox.pty_command(script);
     let parent = std::env::vars().collect();
     let mut env = ctx.sandbox.env(&parent);
     env.extend(ctx.env.iter().map(|(k, v)| (k.clone(), v.clone())));
@@ -394,31 +514,18 @@ impl Tool for PtyExec {
         if send.len() > 1_000_000 {
             return ToolOutput::error("PTY input exceeds one million bytes; write a script file and run it instead.");
         }
+        let timeout_s = args.get("timeout_s").and_then(Value::as_u64).unwrap_or(5).clamp(1, 60);
         let mut pty = pty.terminal.lock().await;
-        let written = pty
-            .master
-            .as_mut()
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "terminal already closed"))
-            .and_then(|master| master.write_all(send.as_bytes()));
-        if let Err(e) = written {
-            return ToolOutput::error(format!(
-                "PTY input was not fully written ({e}); some bytes may have arrived. Poll before retrying."
-            ));
-        }
-        let (bytes, reason) = pty
-            .read(
-                ctx,
-                command.map(|_| frame.as_str()),
-                prompt.as_ref(),
-                args.get("timeout_s").and_then(Value::as_u64).unwrap_or(5).clamp(1, 60),
-            )
-            .await;
+        let res = pty.exec(ctx, send.as_bytes(), command.map(|_| frame.as_str()), prompt.as_ref(), timeout_s).await;
         let stopped = pty.stopped;
         drop(pty);
         if stopped {
             ctx.capabilities.ptys.remove(&id);
         }
-        output(&id, bytes, reason)
+        match res {
+            Ok((bytes, reason)) => output(&id, bytes, reason),
+            Err(e) => ToolOutput::error(e),
+        }
     }
 }
 #[async_trait]
@@ -527,5 +634,45 @@ mod tests {
         let out = PtyOpen.run(&env.ctx, json!({"command":"exit 0", "timeout_s":1}).as_object().unwrap()).await;
         assert_eq!(out.status, ToolStatus::Ok);
         assert!(env.ctx.capabilities.ptys.ids().is_empty());
+    }
+
+    #[tokio::test]
+    async fn multi_kb_pty_exec_succeeds_without_wouldblock_error() {
+        let env = crate::testutil::env();
+        let ctx = &env.ctx;
+        let open = PtyOpen.run(ctx, json!({}).as_object().unwrap()).await;
+        assert_eq!(open.status, ToolStatus::Ok);
+        let pad = "a".repeat(80);
+        let mut script = String::with_capacity(20_000);
+        for _ in 0..220 {
+            script.push_str(": ");
+            script.push_str(&pad);
+            script.push('\n');
+        }
+        script.push_str("printf 'DONE_LARGE_PTY\\n'");
+        let out = PtyExec.run(ctx, json!({"pty":"S1","command":script,"timeout_s":5}).as_object().unwrap()).await;
+        assert_eq!(out.status, ToolStatus::Ok, "{out:?}");
+        let Body::Raw(b) = out.body else { panic!() };
+        assert!(
+            String::from_utf8_lossy(&b).lines().any(|l| l.trim() == "DONE_LARGE_PTY"),
+            "{}",
+            String::from_utf8_lossy(&b)
+        );
+        PtyClose.run(ctx, json!({"pty":"S1"}).as_object().unwrap()).await;
+    }
+
+    #[tokio::test]
+    async fn last_alias_resolves_remaining_pty_after_latest_closes() {
+        let env = crate::testutil::env();
+        let ctx = &env.ctx;
+        assert_eq!(PtyOpen.run(ctx, json!({}).as_object().unwrap()).await.status, ToolStatus::Ok);
+        assert_eq!(PtyOpen.run(ctx, json!({}).as_object().unwrap()).await.status, ToolStatus::Ok);
+        assert_eq!(PtyClose.run(ctx, json!({"pty":"S2"}).as_object().unwrap()).await.status, ToolStatus::Ok);
+        let out = PtyExec
+            .run(ctx, json!({"pty":"last","command":"printf 'STILL_S1\\n'","timeout_s":2}).as_object().unwrap())
+            .await;
+        assert_eq!(out.status, ToolStatus::Ok, "{out:?}");
+        assert_eq!(out.meta["pty"], "S1");
+        PtyClose.run(ctx, json!({"pty":"S1"}).as_object().unwrap()).await;
     }
 }

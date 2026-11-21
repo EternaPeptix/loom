@@ -154,6 +154,12 @@ test("tokensPerSecond counts the tokens after the first over the time after the 
   // The latest reply first, then all counted replies together: (200 + 100) tokens over (4 + 4) seconds.
   const two = C.sessionSpeed([r(201, 500, 4500), { kind: "tool" }, r(1, 100, 200), r(101, 1000, 5000)]);
   assert.equal(two.label, "25.0 tok/s · 37.5 tok/s over 2 replies");
+  // When last and mean format to the same tok/s string, say "(N replies)" instead of repeating the speed twice.
+  const same = C.sessionSpeed([r(99, 100, 1100), r(99, 100, 1100), r(99, 100, 1100)]);
+  assert.equal(same.label, "98.0 tok/s (3 replies)");
+  // Even slightly different raw floats that round to the same display string collapse cleanly.
+  const roundedSame = C.sessionSpeed([r(99, 100, 1100.3), r(99, 100, 1099.7)]);
+  assert.equal(roundedSame.label, "98.0 tok/s (2 replies)");
   assert.equal(C.sessionSpeed([{ kind: "user" }]).label, "");
   assert.equal(C.sessionSpeed(undefined).label, "");
 });
@@ -2631,6 +2637,42 @@ test("recordsAfter counts new records for Jump, and jumpLabel says it", () => {
   assert.equal(C.jumpLabel(12000), "Jump to latest · 12,000 new");
 });
 
+test("visibleRecordsAfter excludes hidden bookkeeping records unless details is true", () => {
+  reset();
+  const store = storeOf([
+    start(),
+    R("turn_start", { trigger: "user" }),
+    R("budget_clock", { running: true }),
+    R("model_request", { req_id: "r1", step: 1, epoch: 0, purpose: "step", est_tokens: 5 }),
+    call("c1"),
+    R("user_message", { text: "x" }, undefined, "user"),
+    result("c1"),
+    reply("r", "t"),
+  ]); // 0..7
+  assert.equal(C.recordsAfter(store.blocks, 0, C.lastSeq(store)), 7);
+  assert.equal(C.visibleRecordsAfter(store.blocks, 0), 4, "excludes turn_start, budget_clock, model_request");
+  assert.equal(C.visibleRecordsAfter(store.blocks, 0, true), 5, "details=true includes model_request");
+  assert.equal(C.visibleRecordsAfter(store.blocks, 5), 2, "result (6) and reply (7)");
+  assert.equal(C.visibleRecordsAfter(store.blocks, 7), 0);
+  assert.equal(C.visibleRecordsAfter(store.blocks, null), 0);
+  assert.equal(C.visibleRecordsAfter(store.blocks, undefined), 0);
+  assert.equal(C.visibleRecordsAfter(null, 1), 0);
+  // Also handles synthetic blocks with raw bookkeeping kinds or id-only blocks.
+  const synthetic = [
+    { id: 1, kind: "user" },
+    { id: 2, kind: "turn_start" },
+    { id: 3, kind: "budget_clock" },
+    { id: 4, kind: "model_request" },
+    { id: 5, kind: "response" },
+  ];
+  assert.equal(C.visibleRecordsAfter(synthetic, 1), 1);
+  assert.equal(C.visibleRecordsAfter(synthetic, 1, true), 4);
+  // chatItems unread divider uses visible records rather than raw lastSeq delta.
+  const sinceItems = C.chatItems(store.blocks, { models: store.models, sinceSeq: 4, lastSeq: C.lastSeq(store) });
+  const divider = sinceItems.find((i) => i.type === "since");
+  assert.equal(divider.count, 3, "only user_message (5), result (6), reply (7)");
+});
+
 test("findInRecord: literal, over every loaded block including folded groups, with an honest count", () => {
   reset();
   const recs = [start(), R("user_message", { text: "Check port 8443 please" }, undefined, "user"), reply("r1", "", { tool_calls: [{ call_id: "c1", name: "bash", arguments: "{}", complete: true }] })];
@@ -2664,6 +2706,33 @@ test("findInRecord: literal, over every loaded block including folded groups, wi
   const inGroup = items.find((i) => i.type === "group" && !i.open);
   assert.ok(inGroup, "the group is folded");
   assert.ok(all.hits.some((h) => inGroup.blocks.some((b) => b.id === h.id)));
+});
+
+test("findFields and findInRecord include reasoning in all and messages scopes only", () => {
+  reset();
+  const store = storeOf([
+    start(),
+    R("user_message", { text: "find clue" }, undefined, "user"),
+    reply("r1", "", { reasoning: "internal clue Alpha", tool_calls: [{ call_id: "c1", name: "bash", arguments: "{}", complete: true }] }),
+    call("c1"),
+    result("c1", "ok", { text: "done" }),
+    reply("r2", "visible reply", { reasoning: "secret Beta", finish: "length" }),
+  ]);
+  const r2 = store.blocks[store.blocks.length - 1];
+  assert.deepEqual(C.findFields(r2, "all").map((f) => f[0]), ["text", "reasoning"]);
+  assert.deepEqual(C.findFields(r2, "messages").map((f) => f[0]), ["text", "reasoning"]);
+  assert.deepEqual(C.findFields(r2, "tools").map((f) => f[0]), ["text"]);
+  assert.deepEqual(C.findFields(r2, "failures").map((f) => f[0]), ["text"]);
+
+  const allAlpha = C.findInRecord(store.blocks, "Alpha");
+  assert.equal(allAlpha.count, 1);
+  assert.equal(allAlpha.hits[0].field, "reasoning");
+  assert.deepEqual(allAlpha.hits[0].snippet, { before: "internal clue ", match: "Alpha", after: "" });
+
+  assert.equal(C.findInRecord(store.blocks, "Beta", "all").count, 1);
+  assert.equal(C.findInRecord(store.blocks, "Beta", "messages").count, 1);
+  assert.equal(C.findInRecord(store.blocks, "Beta", "tools").count, 0);
+  assert.equal(C.findInRecord(store.blocks, "Beta", "failures").count, 0, "reasoning is not searched under failures");
 });
 
 test("findWords: the count wording is honest about scope and cut outputs", () => {
@@ -2804,6 +2873,64 @@ test("lastRecordedError reads the failure sentence the daemon records in a parke
   assert.equal(C.lastRecordedError([{ kind: "line", sub: "interrupted", reason: "model request failed: x" }]), null, "an interruption is an operator stop, a restart or damage, not a failure");
   assert.equal(C.lastRecordedError([]), null);
   assert.equal(C.lastRecordedError(null), null);
+});
+
+test("dedupeParkedError suppresses errors already present in the parked item text", () => {
+  const err = "The model request failed after 3 attempts: connection refused on local port 8080";
+  const itemText = "The session could not continue.\nThe model request failed after 3 attempts:\n  connection   refused on local port 8080\nNothing was lost: answer.";
+  assert.equal(C.dedupeParkedError(itemText, err), null, "whitespace-normalized duplicate is suppressed");
+  assert.equal(C.dedupeParkedError(itemText, null), null);
+  assert.equal(C.dedupeParkedError(itemText, ""), null);
+  assert.equal(C.dedupeParkedError(itemText, "   "), null);
+  assert.equal(C.dedupeParkedError(itemText, "request timed out."), "request timed out.");
+  const longPrefix = "The model request failed after 3 attempts because the upstream server closed the socket";
+  assert.ok(longPrefix.length > 80);
+  const longItem = `The session could not continue. ${longPrefix} while streaming chunk 99. Nothing was lost.`;
+  const truncatedErr = `${longPrefix} while streaming…`;
+  assert.equal(C.dedupeParkedError(longItem, truncatedErr), null, "matches first 80 normalized chars when longer than 80");
+});
+
+test("childBlockingItem finds the oldest child blocker when the open session is not itself blocked", () => {
+  const sessions = [
+    info("lead", { mission: "m-1", title: "Fleet Lead" }),
+    info("w1", { mission: "m-1", parent: "lead", title: "Worker One" }),
+    info("w2", { mission: "m-1", parent: "lead", title: "" }),
+    info("other", { mission: "m-2", title: "Other Mission" }),
+  ];
+  const inboxArr = [
+    { session: "other", mission: "m-2", opened_ms: 10, item: { item_id: "i0", blocking: true } },
+    { session: "lead", mission: "m-1", opened_ms: 20, item: { item_id: "i1", blocking: false } },
+    { session: "w1", mission: "m-1", opened_ms: 200, item: { item_id: "i2", blocking: true } },
+    { session: "w2", mission: "m-1", opened_ms: 100, item: { item_id: "i3", blocking: true } },
+  ];
+  const hit = C.childBlockingItem(sessions, inboxArr, "lead");
+  assert.ok(hit);
+  assert.equal(hit.item.item.item_id, "i3");
+  assert.equal(hit.session.id, "w2");
+  assert.equal(hit.title, "w2", "falls back to session.id when session.title is empty");
+
+  // Also works with SessionStore + Inbox store objects.
+  const store = C.createSessionStore();
+  C.applySessionList(store, sessions);
+  const inbox = C.createInbox();
+  C.applyInboxList(inbox, inboxArr);
+  const storeHit = C.childBlockingItem(store, inbox, "lead");
+  assert.equal(storeHit.item.item.item_id, "i3");
+  assert.equal(storeHit.session.id, "w2");
+
+  // Returns null if openSessionId itself already has a blocking item.
+  const withOwnBlock = [...inboxArr, { session: "lead", mission: "m-1", opened_ms: 300, item: { item_id: "i4", blocking: true } }];
+  assert.equal(C.childBlockingItem(sessions, withOwnBlock, "lead"), null);
+
+  // Falls back to item.session when the blocked session is not in sessions, and handles flat blocking items.
+  const flatHit = C.childBlockingItem(
+    [{ id: "lead", mission: "m-1", title: "Lead" }],
+    [{ session: "w-missing", mission: "m-1", blocking: true, opened_ms: 50 }],
+    "lead",
+  );
+  assert.deepEqual(flatHit, { item: { session: "w-missing", mission: "m-1", blocking: true, opened_ms: 50 }, session: null, title: "w-missing" });
+  assert.equal(C.childBlockingItem(sessions, inboxArr, "unknown"), null);
+  assert.equal(C.childBlockingItem(null, null, "lead"), null);
 });
 
 test("inboxGroups puts missions that block first, each group oldest first", () => {
@@ -3399,6 +3526,15 @@ test("stopQuestion: only a root says it can be resumed", () => {
   const agent = C.stopQuestion({ id: "s-2", title: "Worker", parent: "s-1" });
   assert.doesNotMatch(agent, /can be resumed/);
   assert.match(agent, /cannot be resumed/);
+});
+
+test("archiveQuestion warns only when open inbox items remain", () => {
+  assert.equal(C.archiveQuestion({ id: "s-1", title: "Net" }), null);
+  assert.equal(C.archiveQuestion({ id: "s-1", title: "Net" }, 0), null);
+  assert.equal(C.archiveQuestion({ id: "s-1", title: "Net" }, -2), null);
+  assert.equal(C.archiveQuestion({ id: "s-1", title: "Net" }, 1), "Archive Net? It still has 1 open inbox item, which will be dismissed.");
+  assert.equal(C.archiveQuestion({ id: "s-1", title: "" }, 3), "Archive s-1? It still has 3 open inbox items, which will be dismissed.");
+  assert.equal(C.archiveQuestion({ id: "s-1" }, 1200), "Archive s-1? It still has 1,200 open inbox items, which will be dismissed.");
 });
 
 test("contextCardModel: a fold mark inside the scale is drawn even when it folds down to nothing", () => {

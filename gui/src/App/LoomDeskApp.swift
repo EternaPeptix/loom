@@ -28,6 +28,13 @@ struct LoomDeskApp: App {
                 .frame(minWidth: 900, minHeight: 600)
         }
         .defaultSize(width: 1200, height: 800)
+        .commands {
+            CommandGroup(after: .toolbar) {
+                Button("Reload") { state.reload() }
+                    .keyboardShortcut("r", modifiers: .command)
+                    .disabled(!state.isConnected)
+            }
+        }
 
         // The menu-bar presence: counts + quick actions. Lives even with no window open.
         MenuBarExtra {
@@ -57,7 +64,7 @@ struct MenuBarLabel: View {
         case .failed: return ("loom · disconnected", false)
         case .connecting: return ("loom · connecting…", false)
         default:
-            let stale = state.feedStatus.stale && state.link != .none
+            let stale = (state.feedStatus.stale || state.daemonUnreachable) && state.link != .none
             let text = stale ? "loom · state unknown" : state.counts.menuLabel
             return (text, state.counts.waiting > 0 && !stale)
         }
@@ -68,7 +75,7 @@ struct MenuBarLabel: View {
         if urgent {
             // The menu bar tints plain text as a template; a rendered, non-template image keeps the red.
             let r = ImageRenderer(content: Text(text).font(.system(size: 13, weight: .semibold)).foregroundColor(.red).padding(.horizontal, 2))
-            let _ = { r.scale = NSScreen.main?.backingScaleFactor ?? 2 }()
+            let _ = { r.scale = NSScreen.screens.map(\.backingScaleFactor).max() ?? 2 }()
             if let img = r.nsImage {
                 let _ = { img.isTemplate = false }()
                 // Without a label VoiceOver reads only "image" for the most urgent state.
@@ -89,14 +96,19 @@ struct MenuBarMenu: View {
 
     var body: some View {
         Group {
-            Text(state.active.map { "Connection: \($0.name)" } ?? "No connection")
-            Text(state.status)
-            if state.link != .none {
-                TimelineView(.periodic(from: .now, by: 5)) { context in
-                    Text(state.feedStatus.label(at: context.date))
+            Text(state.active.map { "Connection: \($0.name.isEmpty ? $0.sshHost : $0.name)" } ?? "No connection")
+            if !state.isConnected || state.daemonUnreachable {
+                Text(state.status)
+            }
+            if state.isConnected {
+                if !state.daemonUnreachable || state.feedStatus.lastUpdated != nil {
+                    TimelineView(.periodic(from: .now, by: 5)) { context in
+                        Text(state.feedStatus.label(at: context.date))
+                    }
                 }
                 if state.feedStatus.lastUpdated != nil {
-                    Text((state.feedStatus.stale ? "Last known: " : "") + state.counts.summary)
+                    let stale = state.feedStatus.stale || state.daemonUnreachable
+                    Text((stale ? "Last known: " : "") + state.counts.summary)
                     if state.counts.waiting > 0 { Text("\(state.counts.waiting) blocking \(state.counts.waiting == 1 ? "item" : "items") need an answer") }
                 }
             }
@@ -105,9 +117,9 @@ struct MenuBarMenu: View {
             if !state.connections.isEmpty {
                 Menu("Connections") {
                     ForEach(state.connections) { c in
-                        let isActive = c.id == state.active?.id
-                        // A tap on the active connection is ignored, so a stray click cannot tear down
-                        // the live tunnel; the checkmark shows which one is current.
+                        let isActive = state.isCurrentlyActive(c)
+                        // A tap on a currently connecting/connected entry is ignored so a stray click
+                        // cannot tear down an active link; disconnected/failed entries always reconnect.
                         Button { if !isActive { state.connect(c) } } label: {
                             Label(c.name.isEmpty ? c.sshHost : c.name, systemImage: isActive ? "checkmark" : "")
                         }
@@ -143,7 +155,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         if Bundle.main.bundleURL.pathExtension == "app" {
             UNUserNotificationCenter.current().delegate = self
         }
-        Task { @MainActor in
+        MainActor.assumeIsolated {
             AppState.shared.restoreLast()
             AppState.shared.refreshNotificationStatus()
             AppState.shared.beginWatching()
@@ -153,6 +165,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     // The operator may flip the permission in System Settings while the app runs; re-read it on focus.
     func applicationDidBecomeActive(_ notification: Notification) {
         Task { @MainActor in AppState.shared.refreshNotificationStatus() }
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag {
+            Task { @MainActor in AppState.shared.openWindow() }
+        }
+        return true
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
@@ -176,7 +195,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         let session = response.notification.request.content.userInfo["session"] as? String
         Task { @MainActor in
             AppState.shared.openWindow(focus: session)
-            completionHandler()
         }
+        completionHandler()
     }
 }

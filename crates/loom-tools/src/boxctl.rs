@@ -128,7 +128,7 @@ use crate::bash::Launch;
 use crate::boxfs::{self, Manifest};
 use crate::proc::{Launcher, RemoteStop};
 use crate::sandbox::Sandbox;
-use loom_core::config::BoxCfg;
+use loom_core::config::{normalize_cap, BoxCfg};
 use loom_net::policy::Policy;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsStr;
@@ -259,6 +259,18 @@ pub fn running_args(n: &Names) -> Vec<String> {
     ]
 }
 
+/// `docker inspect` of the mission's container as one JSON object.
+pub fn container_inspect_args(n: &Names) -> Vec<String> {
+    vec![
+        "inspect".into(),
+        "--type".into(),
+        "container".into(),
+        "--format".into(),
+        "{{json .}}".into(),
+        n.container.clone(),
+    ]
+}
+
 /// `docker run` of the box (I2). `cfg.cap_add` has passed `BoxCfg::check`. `hosts` are the granted names with the
 /// addresses that passed the policy: each becomes one `--add-host name:ip`, from a validated name and an
 /// `Ipv4Addr`, so nothing in a grant can become a flag or a second value.
@@ -321,7 +333,7 @@ pub fn pid_file(call_id: &str) -> String {
 /// The fixed text the container's outer bash runs. `$1` is the pid file and `$2` the agent's script.
 // `setsid -w`: under `docker exec` the command already leads its process group, so `setsid` forks; without
 // `--wait` its parent exits 0 at once, the exec ends, and the command's output and status are lost.
-const EXEC_WRAP: &str = r#"exec setsid -w /bin/bash -c 'echo $$ > "$0"; exec /bin/bash -c "$1"' "$1" "$2""#;
+const EXEC_WRAP: &str = r#"exec setsid -w /bin/bash -c 'echo $$ > "$0.tmp" && mv -f "$0.tmp" "$0"; [ -e "$0.stop" ] && exit 143; exec /bin/bash -c "$1"' "$1" "$2""#;
 
 /// A directory under `/work`: relative, plain components only.
 pub fn work_dir(cwd: Option<&str>) -> Result<String, String> {
@@ -362,8 +374,11 @@ pub fn kill_args(n: &Names, pid_file: &str, signal: &str) -> Vec<String> {
     a.push(n.container.clone());
     a.extend(strings(["/bin/sh", "-c"]));
     // No `--`: dash (Debian/Ubuntu `/bin/sh`) refuses `kill -SIG -- -PGID` ("Illegal number"), and bash and dash
-    // both read `kill -SIG -PGID` as a signal to the process group.
-    a.push(format!("kill -{sig} -$(cat \"$0\")"));
+    // both read `kill -SIG -PGID` as a signal to the process group. If `$0` does not exist yet, plant `.stop`
+    // so `EXEC_WRAP` exits before starting the user command and wait briefly for `$0` to appear.
+    a.push(format!(
+        "kill -{sig} $(sed 's/^/-/' \"$0\" 2>/dev/null) 2>/dev/null && exit 0; [ -s \"$0\" ] && exit 0; : > \"$0.stop\"; i=0; while [ ! -s \"$0\" ] && [ \"$i\" -lt 40 ]; do sleep 0.05 2>/dev/null || break; i=$((i+1)); done; [ -s \"$0\" ] && kill -{sig} $(sed 's/^/-/' \"$0\" 2>/dev/null) 2>/dev/null; exit 0"
+    ));
     a.push(pid_file.to_string());
     a
 }
@@ -623,9 +638,27 @@ pub async fn resolve_names(names: &[String]) -> BTreeMap<String, Vec<IpAddr>> {
     out
 }
 
-/// Whether the policy lets `addr` be reached on every port.
-fn every_port_ok(policy: &Policy, host: &str, addr: IpAddr) -> bool {
-    (0..=u16::MAX).all(|p| policy.check_addr(host, p, addr, "granted").allowed)
+/// The first policy rule refusing `host` (`addr`) on `port`, or `None` if permitted.
+fn port_refusal(policy: &Policy, host: &str, port: u16, addr: IpAddr) -> Option<String> {
+    let v = policy.check_addr(host, port, addr, "granted");
+    if !v.allowed {
+        return Some(v.rule);
+    }
+    if policy.matches_reference(host, port) {
+        let nv = policy.check_name(host, port);
+        if !nv.allowed {
+            return Some(nv.rule);
+        }
+    }
+    None
+}
+
+/// The first policy rule refusing `host` (`addr`) on `port` (or any port when `None`).
+fn first_refusal(policy: &Policy, host: &str, port: Option<u16>, addr: IpAddr) -> Option<String> {
+    match port {
+        Some(p) => port_refusal(policy, host, p, addr),
+        None => (0..=u16::MAX).find_map(|p| port_refusal(policy, host, p, addr)),
+    }
 }
 
 /// What `grants` allow the box, under `policy`, with names resolved to `resolved` (I4).
@@ -658,12 +691,7 @@ pub fn plan_egress(grants: &[String], policy: &Policy, resolved: &BTreeMap<Strin
                 plan.skipped.push(format!("{grant}: {addr} is IPv6, and the box network has none"));
                 continue;
             };
-            let ok = match port {
-                Some(p) => policy.check_addr(&host, p, addr, "granted").allowed,
-                None => every_port_ok(policy, &host, addr),
-            };
-            if !ok {
-                let why = policy.check_addr(&host, port.unwrap_or(0), addr, "granted").rule;
+            if let Some(why) = first_refusal(policy, &host, port, addr) {
                 plan.skipped.push(format!("{grant}: {addr} is refused by the network policy ({why})"));
                 continue;
             }
@@ -1313,15 +1341,38 @@ impl MissionBox {
             st.forget();
         }
         let plan = self.plan().await?;
-        if self.is_running().await {
-            // A box from before a restart of the daemon: bring its rules to the grants of now.
-            self.install_rules(&plan).await?;
-            st.forget();
-            st.up = true;
-            // What it was created with is not known: its names count as pending until `box_reset`.
-            st.wanted_hosts = plan.hosts;
-            st.verified = Some(Instant::now());
-            return Ok(());
+        let inspected = self.host.docker(&container_inspect_args(&self.names), None, SMALL_OUT).await?;
+        if inspected.ok() {
+            match inspect_container(&inspected.stdout, &self.names, &self.home, &self.host.cfg)? {
+                ContainerFound::Ours { paused } => {
+                    // A box from before a restart of the daemon: bring its rules to the grants of now
+                    // and resume it if it had been paused for missing rules.
+                    st.forget();
+                    st.up = true;
+                    st.paused = paused;
+                    // What it was created with is not known: its names count as pending until `box_reset`.
+                    st.wanted_hosts = plan.hosts.clone();
+                    self.install_rules(&plan).await?;
+                    self.rules_ok(st).await?;
+                    return Ok(());
+                }
+                ContainerFound::Stale(why) => {
+                    tracing::warn!(
+                        mission = %self.names.mission,
+                        "box: replacing stale container {}: {why}",
+                        self.names.container
+                    );
+                }
+                ContainerFound::Foreign(why) => {
+                    return Err(foreign_container_err(&self.names.container, &why));
+                }
+            }
+        } else if !inspected.stderr.contains("No such object") && !inspected.stderr.contains("No such container") {
+            return Err(format!(
+                "Inspecting the box container {} failed on the Docker host: {}",
+                self.names.container,
+                inspected.why()
+            ));
         }
         // Leftovers of an earlier box of this mission (stopped container, network).
         let _ = self.host.docker(&rm_args(&self.names), None, SMALL_OUT).await;
@@ -1352,7 +1403,26 @@ impl MissionBox {
             return Err(BOX_CLOSED.to_string());
         }
         self.host.ensure_forward().await?;
-        self.run_ok("Removing the box", rm_args(&self.names)).await?;
+        if !st.up {
+            let inspected = self.host.docker(&container_inspect_args(&self.names), None, SMALL_OUT).await?;
+            if inspected.ok() {
+                if let ContainerFound::Foreign(why) =
+                    inspect_container(&inspected.stdout, &self.names, &self.home, &self.host.cfg)?
+                {
+                    return Err(foreign_container_err(&self.names.container, &why));
+                }
+            } else if !inspected.stderr.contains("No such object") && !inspected.stderr.contains("No such container") {
+                return Err(format!(
+                    "Inspecting the box container {} failed on the Docker host: {}",
+                    self.names.container,
+                    inspected.why()
+                ));
+            }
+        }
+        match self.host.docker(&rm_args(&self.names), None, SMALL_OUT).await? {
+            o if o.ok() || o.stderr.contains("No such container") => {}
+            o => return Err(format!("Removing the box failed on the Docker host: {}", o.why())),
+        }
         st.forget();
         self.ensure_locked(&mut st).await
     }
@@ -1499,7 +1569,8 @@ impl MissionBox {
         let stop = move |sig: i32| {
             let name = if sig == libc::SIGKILL { "KILL" } else { "TERM" };
             let (program, args) = host.argv(&kill_args(&n, &pid, name));
-            // Detached: the signal path of a job must not wait for docker.
+            let wait = sig == libc::SIGKILL && crate::proc::awaiting_remote_stop();
+            // Detached unless `Running::kill` asked to await remote SIGKILL on a blocking worker.
             if let Ok(mut child) = std::process::Command::new(program)
                 .args(args)
                 .env_clear()
@@ -1510,6 +1581,16 @@ impl MissionBox {
                 .stderr(Stdio::null())
                 .spawn()
             {
+                if wait {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    loop {
+                        match child.try_wait() {
+                            Ok(Some(_)) | Err(_) => return,
+                            Ok(None) if Instant::now() >= deadline => break,
+                            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                        }
+                    }
+                }
                 std::thread::spawn(move || {
                     let _ = child.wait();
                 });
@@ -1527,6 +1608,64 @@ impl MissionBox {
             env: self.host.docker_env(),
         })
     }
+}
+
+/// What `docker inspect --type container --format '{{json .}}'` says about an existing container.
+#[derive(Debug, PartialEq, Eq)]
+enum ContainerFound {
+    Ours { paused: bool },
+    Stale(String),
+    Foreign(String),
+}
+
+fn foreign_container_err(container: &str, why: &str) -> String {
+    format!(
+        "A container named {container} already exists on the Docker host and is not this box's ({why}), so it was left alone and no box was made. Remove or rename that container on the Docker host."
+    )
+}
+
+/// Judge the JSON of `docker inspect --type container --format '{{json .}}'`.
+fn inspect_container(json: &[u8], n: &Names, home: &str, cfg: &BoxCfg) -> Result<ContainerFound, String> {
+    let v: serde_json::Value = serde_json::from_slice(json)
+        .map_err(|e| format!("The existing box container {} could not be understood ({e}).", n.container))?;
+    let label = |key: &str| v.pointer("/Config/Labels").and_then(|l| l.get(key)).and_then(|x| x.as_str());
+    if label("loom.home") != Some(home) {
+        return Ok(ContainerFound::Foreign("it is not labelled with this loom home".to_string()));
+    }
+    if label("loom.mission") != Some(n.mission.as_str()) {
+        return Ok(ContainerFound::Foreign("it is not labelled with this mission".to_string()));
+    }
+    if v.pointer("/State/Running").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Ok(ContainerFound::Stale("it is not running".to_string()));
+    }
+    if v.pointer("/Config/Image").and_then(serde_json::Value::as_str) != Some(cfg.image.as_str()) {
+        return Ok(ContainerFound::Stale("its image changed".to_string()));
+    }
+    let nets = v.pointer("/NetworkSettings/Networks").and_then(serde_json::Value::as_object);
+    if !nets.is_some_and(|m| m.len() == 1 && m.contains_key(&n.network)) {
+        return Ok(ContainerFound::Stale(format!("its network is not {}", n.network)));
+    }
+    if let Some(hc) = v.pointer("/HostConfig").and_then(serde_json::Value::as_object) {
+        if hc.get("Privileged").and_then(serde_json::Value::as_bool) == Some(true) {
+            return Ok(ContainerFound::Stale("it is privileged".to_string()));
+        }
+        if hc.get("ReadonlyRootfs").and_then(serde_json::Value::as_bool) == Some(false) {
+            return Ok(ContainerFound::Stale("its rootfs is not read-only".to_string()));
+        }
+        if let Some(cap_val) = hc.get("CapAdd") {
+            let got: BTreeSet<String> = match cap_val {
+                serde_json::Value::Null => BTreeSet::new(),
+                serde_json::Value::Array(arr) => arr.iter().filter_map(|x| x.as_str()).map(normalize_cap).collect(),
+                _ => return Ok(ContainerFound::Stale("its capabilities could not be read".to_string())),
+            };
+            let want: BTreeSet<String> = cfg.caps().into_iter().collect();
+            if got != want {
+                return Ok(ContainerFound::Stale("its capabilities changed".to_string()));
+            }
+        }
+    }
+    let paused = v.pointer("/State/Paused").and_then(serde_json::Value::as_bool).unwrap_or(false);
+    Ok(ContainerFound::Ours { paused })
 }
 
 /// What `docker network inspect` says about a network that is in the way.
@@ -1680,12 +1819,29 @@ case "$sub" in
         touch "$D/chain-$chain"
         exit 0;;
     esac
-    name=""; net=""; prev=""; for a in "$@"; do [ "$prev" = "--name" ] && name="$a"; [ "$prev" = "--network" ] && net="$a"; prev="$a"; done
+    name=""; net=""; h=""; m=""; img=""; caps=""; prev=""; after_ep=0
+    for a in "$@"; do
+      if [ "$after_ep" = "1" ]; then
+        img="$a"; after_ep=2
+      else
+        case "$prev" in
+          --name) name="$a";;
+          --network) net="$a";;
+          --label) case "$a" in loom.home=*) h="${a#loom.home=}";; loom.mission=*) m="${a#loom.mission=}";; esac;;
+          --cap-add) if [ -z "$caps" ]; then caps="\"$a\""; else caps="$caps,\"$a\""; fi;;
+          --entrypoint) after_ep=1;;
+        esac
+      fi
+      prev="$a"
+    done
+    jesc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
     # A container that starts while the chain of its bridge is not there is a hole: note it.
     if [ -f "$D/netif-$net" ]; then short=$(sed 's/^lb-//' "$D/netif-$net"); [ -f "$D/chain-LOOM-$short" ] || echo "$name" >> "$D/violations"; fi
-    touch "$D/ctr-$name"; echo "fakeid"; exit 0;;
+    touch "$D/ctr-$name"
+    printf '{"State":{"Running":true,"Paused":false},"Config":{"Image":"%s","Labels":{"loom.home":"%s","loom.mission":"%s"}},"HostConfig":{"Privileged":false,"ReadonlyRootfs":true,"CapAdd":[%s]},"NetworkSettings":{"Networks":{"%s":{}}}}\n' "$(jesc "$img")" "$(jesc "$h")" "$(jesc "$m")" "$caps" "$(jesc "$net")" > "$D/ctrjson-$name"
+    echo "fakeid"; exit 0;;
   rm) for a in "$@"; do last="$a"; done
-      if [ -f "$D/ctr-$last" ]; then rm -f "$D/ctr-$last" "$D/paused-$last"; exit 0; fi
+      if [ -f "$D/ctr-$last" ]; then rm -f "$D/ctr-$last" "$D/paused-$last" "$D/ctrjson-$last"; exit 0; fi
       echo "Error: No such container: $last" >&2; exit 1;;
   pause) for a in "$@"; do last="$a"; done
       if [ -f "$D/ctr-$last" ]; then touch "$D/paused-$last"; echo "$last"; exit 0; fi
@@ -1693,9 +1849,26 @@ case "$sub" in
   unpause) for a in "$@"; do last="$a"; done
       if [ -f "$D/paused-$last" ]; then rm -f "$D/paused-$last"; echo "$last"; exit 0; fi
       echo "Error response from daemon: Container $last is not paused" >&2; exit 1;;
-  inspect) for a in "$@"; do last="$a"; done
-      if [ -f "$D/ctr-$last" ]; then echo true; exit 0; fi
-      echo "Error: No such object: $last" >&2; exit 1;;
+  inspect)
+      fmt=""; prev=""; last=""
+      for a in "$@"; do [ "$prev" = "--format" ] && fmt="$a"; prev="$a"; last="$a"; done
+      if [ ! -f "$D/ctr-$last" ]; then echo "Error: No such object: $last" >&2; exit 1; fi
+      paused=false; [ -f "$D/paused-$last" ] && paused=true
+      case "$fmt" in
+        "{{.State.Paused}}") echo "$paused"; exit 0;;
+        "{{json .}}")
+          if [ -f "$D/ctrjson-$last" ]; then
+            if [ "$paused" = "true" ]; then
+              sed 's/"Paused":false/"Paused":true/' "$D/ctrjson-$last"
+            else
+              cat "$D/ctrjson-$last"
+            fi
+          else
+            printf '{"State":{"Running":true,"Paused":%s},"Config":{"Image":"","Labels":null},"NetworkSettings":{"Networks":{}}}\n' "$paused"
+          fi
+          exit 0;;
+        *) echo true; exit 0;;
+      esac;;
   network)
     case "$1" in
       create) h=""; m=""; iface=""; prev=""; last=""
@@ -1743,7 +1916,7 @@ case "$sub" in
         esac
         set -- "$@" "$a"
       done
-      exec tar "$@"
+      COPYFILE_DISABLE=1 exec tar "$@"
     fi
     command -v setsid >/dev/null 2>&1 || PATH="$D/bin:$PATH"
     export PATH
@@ -2029,24 +2202,14 @@ mod tests {
     fn the_kill_tar_network_and_rm_argv_are_exactly_this() {
         let n = names("m-1");
         let kill = kill_args(&n, "/tmp/.loom-c.pid", "TERM");
+        assert_eq!(kill[..6], ["exec", "--user", "1000:1000", "loom-m-1", "/bin/sh", "-c"]);
+        assert!(kill[6].starts_with("kill -TERM "), "{}", kill[6]);
+        assert_eq!(kill[7], "/tmp/.loom-c.pid");
+        assert_eq!(kill_args(&n, "/p", "KILL")[6], kill[6].replace("kill -TERM ", "kill -KILL "));
+        assert_eq!(kill_args(&n, "/p", "x; rm")[6], kill[6], "the signal is one of two fixed words");
         assert_eq!(
-            kill,
-            [
-                "exec",
-                "--user",
-                "1000:1000",
-                "loom-m-1",
-                "/bin/sh",
-                "-c",
-                "kill -TERM -$(cat \"$0\")",
-                "/tmp/.loom-c.pid"
-            ]
-        );
-        assert_eq!(kill_args(&n, "/p", "KILL")[6], "kill -KILL -$(cat \"$0\")");
-        assert_eq!(
-            kill_args(&n, "/p", "x; rm")[6],
-            "kill -TERM -$(cat \"$0\")",
-            "the signal is one of two fixed words"
+            container_inspect_args(&n),
+            ["inspect", "--type", "container", "--format", "{{json .}}", "loom-m-1"]
         );
         assert_eq!(network_inspect_args(&n), ["network", "inspect", "--format", "{{json .}}", "loom-m-1"]);
         assert_eq!(
@@ -2183,6 +2346,48 @@ mod tests {
             [Some(80)],
             "all ports are refused when one is denied"
         );
+    }
+
+    #[test]
+    fn i4_reference_hosts_cannot_be_granted_into_box_egress() {
+        let g = grants(&[
+            "docs.internal.test",
+            "docs.internal.test:80",
+            "api.ref.test",
+            "api.ref.test:443",
+            "api.ref.test:80",
+            "203.0.113.44",
+            "203.0.113.44:8443",
+            "203.0.113.44:80",
+            "ok.test",
+        ]);
+        let res = resolved(&[
+            ("docs.internal.test", &["203.0.113.10"]),
+            ("api.ref.test", &["203.0.113.20"]),
+            ("ok.test", &["203.0.113.30"]),
+        ]);
+        let cfg = NetworkCfg {
+            mode: NetworkMode::Open,
+            reference_hosts: vec!["docs.internal.test".into(), "*.ref.test:443".into(), "203.0.113.44:8443".into()],
+            ..NetworkCfg::default()
+        };
+        for pol in [Policy::new(&cfg).unwrap(), Policy::with_hosts(&cfg, &g).unwrap()] {
+            let plan = plan_egress(&g, &pol, &res);
+            let a = |ip: &str, port: Option<u16>| Allowed { ip: ip.parse().unwrap(), port };
+            let want: BTreeSet<Allowed> =
+                [a("203.0.113.20", Some(80)), a("203.0.113.30", None), a("203.0.113.44", Some(80))]
+                    .into_iter()
+                    .collect();
+            assert_eq!(plan.allowed, want);
+            assert_eq!(plan.hosts.keys().map(String::as_str).collect::<Vec<_>>(), ["api.ref.test", "ok.test"]);
+            let skipped = plan.skipped.join("\n");
+            for blocked in
+                ["docs.internal.test", "api.ref.test:", "api.ref.test:443", "203.0.113.44:", "203.0.113.44:8443"]
+            {
+                assert!(skipped.contains(blocked), "expected {blocked} to be skipped:\n{skipped}");
+            }
+            assert!(skipped.contains("reference host requires the in-process GET client"), "{skipped}");
+        }
     }
 
     #[test]
@@ -2450,6 +2655,25 @@ mod tests {
         b.resync().await;
         assert!(f.sub("run").iter().all(|r| r.iter().any(|a| a == "--entrypoint" || a == "--name")));
         assert!(f.calls().len() <= n + 2);
+    }
+
+    #[tokio::test]
+    async fn reset_recreates_the_box_when_no_container_exists_yet() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = FakeDocker::new(dir.path());
+        let b = MissionBox::new(f.host(), "m-1", source(&["203.0.113.7"]));
+        // Cold reset before any container exists ignores "No such container" and creates the box.
+        b.reset().await.unwrap();
+        assert!(f.running("loom-m-1"));
+        // External removal while `st.up == true` is also handled cleanly by reset.
+        std::fs::remove_file(f.dir.join("ctr-loom-m-1")).unwrap();
+        std::fs::remove_file(f.dir.join("ctrjson-loom-m-1")).unwrap();
+        b.reset().await.unwrap();
+        assert!(f.running("loom-m-1"));
+        // Real rm failures still surface.
+        std::fs::write(f.dir.join("fail.rm"), "").unwrap();
+        let err = b.reset().await.unwrap_err();
+        assert!(err.contains("Removing the box failed") && err.contains("boom: rm failed"), "{err}");
     }
 
     #[tokio::test]
@@ -3235,5 +3459,130 @@ exit 2
             !text.lines().any(|l| l.starts_with("LOOM") || l.starts_with("RUST") || l.starts_with("CARGO")),
             "{text}"
         );
+    }
+
+    #[tokio::test]
+    async fn cold_adoption_recovers_paused_box_and_verifies_labels_image_and_network() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = FakeDocker::new(dir.path());
+        let host = f.host();
+        host.set_recheck(Duration::ZERO);
+        host.set_retry_delay(Duration::ZERO);
+
+        // 1. Paused before daemon restart -> fresh MissionBox adopts, installs rules, and unpauses.
+        let b1 = MissionBox::new(host.clone(), "m-paused", source(&["203.0.113.7"]));
+        b1.ready().await.unwrap();
+        std::fs::remove_file(f.dir.join(format!("chain-{}", b1.names().chain))).unwrap();
+        std::fs::write(f.dir.join("rules.fail"), "").unwrap();
+        assert!(b1.ready().await.is_err() && f.paused("loom-m-paused"));
+        drop(b1);
+
+        // If rules still fail across restart, the restarted handle stays paused and fails closed.
+        let b2 = MissionBox::new(host.clone(), "m-paused", source(&["203.0.113.7"]));
+        assert!(b2.ready().await.is_err());
+        assert!(f.paused("loom-m-paused"));
+
+        // Once rules succeed again, even a brand-new handle unpauses the container on ready().
+        std::fs::remove_file(f.dir.join("rules.fail")).unwrap();
+        let b3 = MissionBox::new(host.clone(), "m-paused", source(&["203.0.113.7"]));
+        let mark = f.calls().len();
+        b3.ready().await.unwrap();
+        assert!(!f.paused("loom-m-paused") && f.running("loom-m-paused"));
+        assert!(kinds_since(&f, mark).contains(&"unpause".to_string()));
+
+        // 2. Foreign container (different loom.home) is refused and left untouched by ready() and reset().
+        let foreign_n = names("m-foreign");
+        std::fs::write(f.dir.join(format!("ctr-{}", foreign_n.container)), "").unwrap();
+        std::fs::write(
+            f.dir.join(format!("ctrjson-{}", foreign_n.container)),
+            format!(
+                r#"{{"State":{{"Running":true,"Paused":false}},"Config":{{"Image":"{}","Labels":{{"loom.home":"other-home","loom.mission":"m-foreign"}}}},"NetworkSettings":{{"Networks":{{"{}":{{}}}}}}}}"#,
+                f.cfg().image,
+                foreign_n.network
+            ),
+        )
+        .unwrap();
+        let mark = f.calls().len();
+        let foreign_box = MissionBox::new(host.clone(), "m-foreign", source(&[]));
+        let err = foreign_box.ready().await.unwrap_err();
+        assert!(err.contains("left alone") && err.contains("loom home"), "{err}");
+        let err_reset = foreign_box.reset().await.unwrap_err();
+        assert!(err_reset.contains("left alone"), "{err_reset}");
+        assert!(f.running(&foreign_n.container));
+        assert!(!subs(&f)[mark..].iter().any(|s| s == "rm"), "foreign container must not be removed");
+
+        // 3. Own container with wrong/extra network or stale image is replaced with a fresh one.
+        let home = host.home_hash();
+        for (mission, bad_json) in [
+            (
+                "m-badnet",
+                format!(
+                    r#"{{"State":{{"Running":true,"Paused":false}},"Config":{{"Image":"{}","Labels":{{"loom.home":"{home}","loom.mission":"m-badnet"}}}},"NetworkSettings":{{"Networks":{{"loom-m-badnet":{{}},"bridge":{{}}}}}}}}"#,
+                    f.cfg().image
+                ),
+            ),
+            (
+                "m-badimg",
+                format!(
+                    r#"{{"State":{{"Running":true,"Paused":false}},"Config":{{"Image":"stale:old","Labels":{{"loom.home":"{home}","loom.mission":"m-badimg"}}}},"NetworkSettings":{{"Networks":{{"loom-m-badimg":{{}}}}}}}}"#
+                ),
+            ),
+        ] {
+            let n = names(mission);
+            std::fs::write(f.dir.join(format!("ctr-{}", n.container)), "").unwrap();
+            std::fs::write(f.dir.join(format!("ctrjson-{}", n.container)), bad_json).unwrap();
+            let b = MissionBox::new(host.clone(), mission, source(&[]));
+            let mark = f.calls().len();
+            b.ready().await.unwrap();
+            assert!(kinds_since(&f, mark).contains(&"rm".to_string()), "{mission}");
+            assert!(kinds_since(&f, mark).contains(&"container".to_string()), "{mission}");
+            let updated = std::fs::read_to_string(f.dir.join(format!("ctrjson-{}", n.container))).unwrap();
+            assert!(updated.contains(&f.cfg().image) && !updated.contains("\"bridge\""), "{updated}");
+        }
+    }
+
+    #[tokio::test]
+    async fn early_kill_before_pid_file_is_written_aborts_exec_wrap_via_stop_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = FakeDocker::new(dir.path());
+        let host = f.host();
+        let b = MissionBox::new(host.clone(), "m-1", source(&[]));
+        b.ready().await.unwrap();
+        let call = format!("early-stop-{}", std::process::id());
+        let pf = pid_file(&call);
+        let marker = format!("{pf}.stop");
+        let ran = f.dir.join("should-not-run");
+        let _ = std::fs::remove_file(&pf);
+        let _ = std::fs::remove_file(&marker);
+
+        let (prog, kargs) = host.argv(&kill_args(b.names(), &pf, "TERM"));
+        let env = host.docker_env();
+        let run_dir = host.run_dir().to_path_buf();
+        let killer = tokio::spawn(async move {
+            tokio::process::Command::new(prog)
+                .args(kargs)
+                .env_clear()
+                .envs(env)
+                .current_dir(run_dir)
+                .status()
+                .await
+                .unwrap()
+        });
+        // Wait until `.stop` is planted before starting `exec_args` (simulating a kill racing `EXEC_WRAP`).
+        for _ in 0..100 {
+            if Path::new(&marker).exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(Path::new(&marker).exists());
+        let script = format!("touch '{}'; sleep 300", ran.display());
+        let out = host.docker(&exec_args(b.names(), &call, "/work", &script), None, SMALL_OUT).await.unwrap();
+        assert!(out.code == 143 || out.code == -1, "{out:?}");
+        assert!(!ran.exists(), "user script must not start once .stop was planted");
+        assert!(killer.await.unwrap().success());
+        assert!(std::fs::read_to_string(&pf).is_ok_and(|s| s.trim().parse::<i32>().is_ok()));
+        let _ = std::fs::remove_file(&pf);
+        let _ = std::fs::remove_file(&marker);
     }
 }

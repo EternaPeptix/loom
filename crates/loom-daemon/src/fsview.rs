@@ -309,6 +309,26 @@ fn list_files_with(root: &Path, loom_home: &Path, rel: &str, after_check: &dyn F
     Ok(FilesView { root: lossless(root).unwrap_or_default(), path: text, entries: found, more })
 }
 
+fn read_bounded(file: std::fs::File, meta_bytes: u64, text: &str) -> Result<Vec<u8>, String> {
+    let too_large = |size: u64| {
+        format!(
+            "{text} is {} MiB, more than the {} MiB the viewer reads. Look at part of it with `sed -n` or `head` in a terminal.",
+            size / (1024 * 1024),
+            READ_CAP / (1024 * 1024)
+        )
+    };
+    if meta_bytes > READ_CAP {
+        return Err(too_large(meta_bytes));
+    }
+    let mut data = Vec::with_capacity(usize::try_from(meta_bytes).unwrap_or(0).saturating_add(1));
+    file.take(READ_CAP.saturating_add(1)).read_to_end(&mut data).map_err(|e| format!("{text} cannot be read: {e}."))?;
+    let size = data.len() as u64;
+    if size > READ_CAP {
+        return Err(too_large(size));
+    }
+    Ok(data)
+}
+
 /// Lines `start..start+count` of file `rel` of `root`.
 pub fn read_file_lines(
     root: &Path,
@@ -328,16 +348,7 @@ pub fn read_file_lines(
         NotOpened::NotRegular(t) => format!("{text} is {}, not a file that can be shown.", describe_type(&t)),
         NotOpened::Denied(s) => s,
     })?;
-    let bytes = meta.len();
-    if bytes > READ_CAP {
-        return Err(format!(
-            "{text} is {} MiB, more than the {} MiB the viewer reads. Look at part of it with `sed -n` or `head` in a terminal.",
-            bytes / (1024 * 1024),
-            READ_CAP / (1024 * 1024)
-        ));
-    }
-    let mut data = Vec::with_capacity(usize::try_from(bytes).unwrap_or(0).saturating_add(1));
-    file.take(READ_CAP.saturating_add(1)).read_to_end(&mut data).map_err(|e| format!("{text} cannot be read: {e}."))?;
+    let data = read_bounded(file, meta.len(), &text)?;
     let mtime = mtime_ms(&meta);
     let size = data.len() as u64;
     if data.iter().take(BINARY_PROBE).any(|b| *b == 0) {
@@ -791,5 +802,17 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn read_bounded_refuses_file_that_grew_past_cap_after_stat() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("growing.bin");
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(READ_CAP + 1).unwrap();
+        let opened = std::fs::File::open(&path).unwrap();
+        // Simulate metadata captured when file was smaller than READ_CAP before it grew.
+        let err = read_bounded(opened, 128, "growing.bin").unwrap_err();
+        assert!(err.contains("32 MiB") && err.contains("sed -n"), "{err}");
     }
 }

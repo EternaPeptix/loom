@@ -54,8 +54,8 @@ unqualified scope is an unauthorized engagement.
 
 ### Expanding the scope later
 
-If an experiment genuinely needs a host that is not authorized, call `request_scope` (researcher, scout
-and chat have it); a judge reports a blocker (`report_blocker`). Give the requested hosts, the
+If an experiment genuinely needs a host that is not authorized, call `request_scope` (researcher and chat
+have it); a scout or judge reports it back (`not_established` or `report_blocker`). Give the requested hosts, the
 blocked work, the justification, the programme text that supports it, and the risk if the request is
 wrong. Shorthand is not a justification — "needed for testing" says nothing. Keep working on what the
 current scope allows while you wait.

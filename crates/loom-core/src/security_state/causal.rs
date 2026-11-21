@@ -7,6 +7,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 const MAX_FACTS: usize = 10_000;
 const MAX_WORK: usize = 200_000;
+const MAX_EXPLAIN_NODES: usize = 1024;
+
+pub(crate) const BUILTIN_ARITIES: &[(&str, usize)] =
+    &[("asset", 3), ("credential", 3), ("foothold", 4), ("related", 3), ("condition", 2)];
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -101,13 +105,8 @@ pub fn validate_rules(rules: &[Rule]) -> Result<BTreeMap<String, usize>, String>
     if rules.len() > 128 {
         return Err("Install at most 128 active causal rules in a mission.".into());
     }
-    let mut arities = BTreeMap::from([
-        ("asset".to_string(), 3),
-        ("credential".into(), 3),
-        ("foothold".into(), 4),
-        ("related".into(), 3),
-        ("condition".into(), 2),
-    ]);
+    let mut arities: BTreeMap<String, usize> =
+        BUILTIN_ARITIES.iter().map(|&(name, arity)| (name.to_string(), arity)).collect();
     let mut strata = BTreeMap::new();
     for rule in rules {
         text(&rule.name, "rule name")?;
@@ -203,11 +202,12 @@ impl Projection {
         self.facts.iter().any(|f| &f.fact == fact)
     }
     pub fn why(&self, fact: &Fact) -> Option<Explanation> {
-        self.explain(fact, &mut BTreeSet::new())
+        let mut nodes = 0usize;
+        self.explain(fact, &mut BTreeSet::new(), &mut nodes)
     }
-    fn explain(&self, fact: &Fact, seen: &mut BTreeSet<Fact>) -> Option<Explanation> {
+    fn explain(&self, fact: &Fact, seen: &mut BTreeSet<Fact>, nodes: &mut usize) -> Option<Explanation> {
         let d = self.facts.iter().find(|d| &d.fact == fact)?;
-        if seen.len() >= 128 || !seen.insert(fact.clone()) {
+        if *nodes >= MAX_EXPLAIN_NODES || seen.len() >= 128 || !seen.insert(fact.clone()) {
             return Some(Explanation {
                 fact: fact.clone(),
                 source: d.source.clone(),
@@ -217,7 +217,8 @@ impl Projection {
                 truncated: true,
             });
         }
-        let premises = d.premises.iter().filter_map(|p| self.explain(p, seen)).collect();
+        *nodes = nodes.saturating_add(1);
+        let premises = d.premises.iter().filter_map(|p| self.explain(p, seen, nodes)).collect();
         seen.remove(fact);
         Some(Explanation {
             fact: fact.clone(),
@@ -439,4 +440,85 @@ pub fn evaluate(state: &SecurityState, assume: &[Fact], retract: &[String]) -> W
     let added = projection.facts.iter().filter(|f| !before.contains(&f.fact)).map(|f| f.fact.clone()).collect();
     let died = before.facts.iter().filter(|f| !projection.contains(&f.fact)).map(|f| f.fact.clone()).collect();
     WhatIf { projection, added, died }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ledger::{Entry, Evidence, EvidenceInput, EvidenceKind, LedgerOp, LedgerState};
+    use crate::security_state::SecurityOp;
+    use crate::CallId;
+
+    fn has_truncated(e: &Explanation) -> bool {
+        e.truncated || e.premises.iter().any(has_truncated)
+    }
+
+    #[test]
+    fn why_bounds_diamond_dag_expansion() {
+        let mut l = LedgerState::default();
+        l.evidence.push(Evidence {
+            id: "e1".into(),
+            n: 1,
+            input: EvidenceInput {
+                claim: "c1".into(),
+                kind: EvidenceKind::Execution,
+                supports: true,
+                session: "s-source".into(),
+                call_id: CallId::from("call"),
+                blob: None,
+                lines: None,
+                quote: None,
+                note: "test".into(),
+                attested: true,
+                tool: None,
+                grade: None,
+            },
+        });
+        let mut apply = |op: SecurityOp| {
+            l.validate(&LedgerOp::Security(op.clone()), false).unwrap();
+            l.apply(&Entry {
+                n: l.entries + 1,
+                ts_ms: 0,
+                session: "s-lead".into(),
+                from_user: false,
+                op: LedgerOp::Security(op),
+                mac: String::new(),
+            });
+        };
+        for i in 0..25 {
+            apply(SecurityOp::FactAssert {
+                fact: Fact {
+                    predicate: "sum".into(),
+                    args: vec![i.to_string(), (i + 1).to_string(), (i + 2).to_string()],
+                },
+                evidence: vec!["e1".into()],
+            });
+        }
+        apply(SecurityOp::FactAssert {
+            fact: Fact { predicate: "fib".into(), args: vec!["0".into()] },
+            evidence: vec!["e1".into()],
+        });
+        apply(SecurityOp::FactAssert {
+            fact: Fact { predicate: "fib".into(), args: vec!["1".into()] },
+            evidence: vec!["e1".into()],
+        });
+        apply(SecurityOp::RuleInstall {
+            rule: Rule {
+                name: "fib_step".into(),
+                head: Atom { predicate: "fib".into(), args: vec!["?n".into()] },
+                body: vec![
+                    Literal {
+                        atom: Atom { predicate: "sum".into(), args: vec!["?a".into(), "?b".into(), "?n".into()] },
+                        negated: false,
+                    },
+                    Literal { atom: Atom { predicate: "fib".into(), args: vec!["?a".into()] }, negated: false },
+                    Literal { atom: Atom { predicate: "fib".into(), args: vec!["?b".into()] }, negated: false },
+                ],
+            },
+        });
+        let proj = l.security.projection();
+        assert!(proj.complete);
+        let exp = proj.why(&Fact { predicate: "fib".into(), args: vec!["26".into()] }).unwrap();
+        assert!(has_truncated(&exp));
+    }
 }

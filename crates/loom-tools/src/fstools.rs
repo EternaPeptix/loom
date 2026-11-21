@@ -797,6 +797,9 @@ impl Tool for Read {
 
     async fn run(&self, ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
         let given = string(args, "path");
+        if given.starts_with("out:") {
+            return crate::outview::read_handle(ctx, given, args).await;
+        }
         let path = match checked(ctx, given, false) {
             Ok(p) => p,
             Err(denied) => return *denied,
@@ -1286,13 +1289,14 @@ impl Tool for Edit {
     fn spec(&self) -> ToolSpec {
         params::spec(
             "edit",
-            "Replace text in a file. `old` must be copied exactly from the file (same indentation and line breaks, without the line-number prefix that `read` shows) and must occur exactly once, unless `all` is true. You must have read the file in this session. The result shows the change as a diff; if `old` is not found, the result shows the closest text in the file.",
+            "Replace text in a file. Give `old` and `new`, or a `patch` hunk(s). `old` should be copied from the file (without the line-number prefix that `read` shows) and occur once unless `all` is true. You must have read the file in this session. The result shows the change as a diff; if `old` is not found, the result shows the closest text in the file.",
             ToolClass::Write,
             &[
                 params::req("path", "string", "Path of the file (absolute, or relative to the workspace)."),
-                params::req("old", "string", "The exact text to replace."),
-                params::req("new", "string", "The text to put in its place."),
+                params::opt("old", "string", "The exact text to replace (required unless `patch` is given)."),
+                params::opt("new", "string", "The text to put in its place (required unless `patch` is given)."),
                 params::opt("all", "boolean", "Replace every occurrence of `old` (default false)."),
+                params::opt("patch", "string", "Unified diff (or *** Update File) patch hunk(s) to apply instead of old/new."),
             ],
         )
     }
@@ -1303,11 +1307,144 @@ impl Tool for Edit {
             Ok(p) => p,
             Err(denied) => return *denied,
         };
-        let all = args.get("all").and_then(Value::as_bool).unwrap_or(false);
-        let (given, old, new) = (given.to_string(), string(args, "old").to_string(), string(args, "new").to_string());
+        let has_old = args.get("old").and_then(Value::as_str).map(str::to_string);
+        let has_new = args.get("new").and_then(Value::as_str).map(str::to_string);
+        let has_patch = args.get("patch").and_then(Value::as_str).map(str::to_string);
+        if has_patch.is_some() && (has_old.is_some() || has_new.is_some()) {
+            return ToolOutput::error("Give either `old` and `new`, or `patch`, not both.");
+        }
+        let given = given.to_string();
         let target = path.clone();
+        if let Some(patch) = has_patch {
+            let out = off_thread(ctx, "edit", &path, move |c| patch_file(&c, &given, &target, &patch)).await;
+            return with_path(out, &path);
+        }
+        let (old, new) = match (has_old, has_new) {
+            (Some(old), Some(new)) => (old, new),
+            (Some(_), None) => {
+                return ToolOutput::error("`old` was given without `new`. Give both `old` and `new`, or give `patch`.");
+            }
+            (None, Some(_)) => {
+                return ToolOutput::error("`new` was given without `old`. Give both `old` and `new`, or give `patch`.");
+            }
+            (None, None) => {
+                return ToolOutput::error("Give either `old` and `new`, or `patch`.");
+            }
+        };
+        let all = args.get("all").and_then(Value::as_bool).unwrap_or(false);
         let out = off_thread(ctx, "edit", &path, move |c| edit_file(&c, &given, &target, &old, &new, all)).await;
         with_path(out, &path)
+    }
+}
+
+fn line_list(text: &str, positions: &[usize]) -> String {
+    positions
+        .iter()
+        .take(10)
+        .map(|&i| text.get(..i).map_or(0, |head| head.matches('\n').count() + 1).to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn more_count(count: usize) -> String {
+    if count > 10 {
+        format!(" (the first 10 of {count})")
+    } else {
+        String::new()
+    }
+}
+
+struct PhysLine {
+    start: usize,
+    content_end: usize,
+    full_end: usize,
+    trimmed: String,
+    collapsed: String,
+}
+
+struct FuzzyMatch {
+    start: usize,
+    end: usize,
+    line: usize,
+}
+
+fn collapse_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn split_phys_lines(text: &str) -> Vec<PhysLine> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let bytes = text.as_bytes();
+    while start < bytes.len() {
+        let rel_nl = bytes.get(start..).and_then(|s| s.iter().position(|&b| b == b'\n'));
+        let (content_end, full_end) = match rel_nl {
+            Some(pos) => {
+                let nl = start + pos;
+                let ce = if nl > start && bytes.get(nl - 1) == Some(&b'\r') { nl - 1 } else { nl };
+                (ce, nl + 1)
+            }
+            None => (bytes.len(), bytes.len()),
+        };
+        let slice = text.get(start..content_end).unwrap_or("");
+        out.push(PhysLine {
+            start,
+            content_end,
+            full_end,
+            trimmed: slice.trim().to_string(),
+            collapsed: collapse_ws(slice),
+        });
+        start = full_end;
+    }
+    out
+}
+
+fn find_norm_matches<F, G>(phys: &[PhysLine], old: &str, norm_fn: F, key_fn: G) -> Vec<FuzzyMatch>
+where
+    F: Fn(&str) -> String,
+    G: Fn(&PhysLine) -> &str,
+{
+    let old_trailing_nl = old.ends_with('\n');
+    let old_body = old.strip_suffix("\r\n").or_else(|| old.strip_suffix('\n')).unwrap_or(old);
+    let old_norms: Vec<String> = old_body.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)).map(norm_fn).collect();
+    let k = old_norms.len();
+    if k == 0 || k > phys.len() {
+        return Vec::new();
+    }
+    let mut matches = Vec::new();
+    for i in 0..=phys.len() - k {
+        let ok = (0..k).all(|j| {
+            let line_key = phys.get(i + j).map(&key_fn);
+            let old_key = old_norms.get(j).map(String::as_str);
+            line_key.is_some() && line_key == old_key
+        });
+        if ok {
+            if let (Some(first), Some(last)) = (phys.get(i), phys.get(i + k - 1)) {
+                matches.push(FuzzyMatch {
+                    start: first.start,
+                    end: if old_trailing_nl { last.full_end } else { last.content_end },
+                    line: i + 1,
+                });
+            }
+        }
+    }
+    matches
+}
+
+fn fuzzy_find(text: &str, old: &str) -> Option<Vec<FuzzyMatch>> {
+    if old.trim().is_empty() {
+        return None;
+    }
+    let phys = split_phys_lines(text);
+    let trimmed = find_norm_matches(&phys, old, |s| s.trim().to_string(), |p| p.trimmed.as_str());
+    if !trimmed.is_empty() {
+        return Some(trimmed);
+    }
+    let collapsed = find_norm_matches(&phys, old, collapse_ws, |p| p.collapsed.as_str());
+    if !collapsed.is_empty() {
+        Some(collapsed)
+    } else {
+        None
     }
 }
 
@@ -1360,24 +1497,39 @@ fn edit_file(ctx: &ToolCtx, given: &str, path: &Path, old: &str, new: &str, all:
         if crlf { (old.replace('\n', "\r\n"), new.replace('\n', "\r\n")) } else { (old.to_string(), new.to_string()) };
 
     let positions: Vec<usize> = text.match_indices(old.as_str()).map(|(i, _)| i).collect();
-    if positions.is_empty() {
+    let (updated, n, used_fuzzy) = if !positions.is_empty() {
+        if positions.len() > 1 && !all {
+            let lines = line_list(&text, &positions);
+            let more = more_count(positions.len());
+            return ToolOutput::error(format!(
+                "`old` occurs {} times in {given}, at lines {lines}{more}. Nothing was changed. Extend `old` with the surrounding lines so it matches exactly once, or set `all` to true to replace every occurrence.",
+                positions.len(),
+            ))
+            .into();
+        }
+        (text.replace(old.as_str(), &new), positions.len(), false)
+    } else if let Some(fuzzy) = fuzzy_find(&text, &old) {
+        if fuzzy.len() > 1 {
+            let line_nums: Vec<String> = fuzzy.iter().take(10).map(|m| m.line.to_string()).collect();
+            let more = more_count(fuzzy.len());
+            return ToolOutput::error(format!(
+                "`old` (with whitespace normalization) occurs {} times in {given}, at lines {}{more}. Nothing was changed. Extend `old` with the surrounding lines so it matches exactly once.",
+                fuzzy.len(),
+                line_nums.join(", "),
+            ))
+            .into();
+        }
+        let Some(m) = fuzzy.first() else {
+            return ToolOutput::error(no_match_message(given, &text, &old)).into();
+        };
+        let mut out = String::with_capacity(text.len() + new.len());
+        out.push_str(text.get(..m.start).unwrap_or(""));
+        out.push_str(&new);
+        out.push_str(text.get(m.end..).unwrap_or(""));
+        (out, 1, true)
+    } else {
         return ToolOutput::error(no_match_message(given, &text, &old)).into();
-    }
-    if positions.len() > 1 && !all {
-        let lines: Vec<String> = positions
-            .iter()
-            .take(10)
-            .map(|&i| text.get(..i).map_or(0, |head| head.matches('\n').count() + 1).to_string())
-            .collect();
-        let more = if positions.len() > 10 { format!(" (the first 10 of {})", positions.len()) } else { String::new() };
-        return ToolOutput::error(format!(
-            "`old` occurs {} times in {given}, at lines {}{more}. Nothing was changed. Extend `old` with the surrounding lines so it matches exactly once, or set `all` to true to replace every occurrence.",
-            positions.len(),
-            lines.join(", ")
-        ))
-        .into();
-    }
-    let updated = text.replace(old.as_str(), &new);
+    };
     // As for `write`: nothing is written by a call that has been reported as interrupted.
     if ctx.cancel.is_cancelled() {
         return cancelled("edit").into();
@@ -1385,11 +1537,471 @@ fn edit_file(ctx: &ToolCtx, given: &str, path: &Path, old: &str, new: &str, all:
     if let Err(fail) = write_atomic(&ctx.sandbox, path, updated.as_bytes()) {
         return write_failed(given, fail, "check that the file is writable and try again.").into();
     }
-    let n = positions.len();
     let count = if n == 1 { "1 replacement".to_string() } else { format!("{n} replacements") };
-    let out = ToolOutput::ok("edited", Body::Raw(unified_diff(given, &text, &updated).into_bytes()))
+    let mut out = ToolOutput::ok("edited", Body::Raw(unified_diff(given, &text, &updated).into_bytes()))
         .with_more(given.to_string())
         .with_more(count);
+    if used_fuzzy {
+        out = out.with_more("matched old with whitespace normalization");
+    }
+    Worked { out, seen: Some(Seen::of_bytes(updated.as_bytes())) }
+}
+
+enum HunkOp {
+    Context(String),
+    Remove(String),
+    Add(String),
+}
+
+struct PatchHunk {
+    old_start: Option<usize>,
+    hint: Option<String>,
+    ops: Vec<HunkOp>,
+    eof_anchor: bool,
+    old_no_eof_nl: bool,
+    new_no_eof_nl: bool,
+}
+
+impl PatchHunk {
+    fn old_lines(&self) -> Vec<&str> {
+        self.ops
+            .iter()
+            .filter_map(|op| match op {
+                HunkOp::Context(s) | HunkOp::Remove(s) => Some(s.as_str()),
+                HunkOp::Add(_) => None,
+            })
+            .collect()
+    }
+}
+
+fn parse_hunk_header(line: &str) -> Option<(Option<usize>, Option<String>)> {
+    if !line.starts_with("@@") {
+        return None;
+    }
+    if line == "@@" {
+        return Some((None, None));
+    }
+    if let Some(after_prefix) = line.strip_prefix("@@ ") {
+        if let Some((range_part, rest)) = after_prefix.split_once(" @@") {
+            let mut parts = range_part.split_whitespace();
+            if let (Some(old_tok), Some(new_tok), None) = (parts.next(), parts.next(), parts.next()) {
+                if let (Some(old_rest), Some(new_rest)) = (old_tok.strip_prefix('-'), new_tok.strip_prefix('+')) {
+                    let old_ok = old_rest.split_once(',').map_or_else(
+                        || old_rest.parse::<usize>().ok(),
+                        |(s, c)| c.parse::<usize>().ok().and(s.parse::<usize>().ok()),
+                    );
+                    let new_ok = new_rest.split_once(',').map_or_else(
+                        || new_rest.parse::<usize>().ok(),
+                        |(s, c)| c.parse::<usize>().ok().and(s.parse::<usize>().ok()),
+                    );
+                    if let (Some(old_start), Some(_)) = (old_ok, new_ok) {
+                        let hint = rest.trim();
+                        return Some((Some(old_start), (!hint.is_empty()).then(|| hint.to_string())));
+                    }
+                }
+            }
+        }
+        let hint = after_prefix.trim();
+        return Some((None, (!hint.is_empty()).then(|| hint.to_string())));
+    }
+    None
+}
+
+fn is_diff_preamble(line: &str) -> bool {
+    line.is_empty()
+        || line.starts_with("diff --git ")
+        || line.starts_with("index ")
+        || line.starts_with("--- ")
+        || line.starts_with("+++ ")
+        || line.starts_with("old mode ")
+        || line.starts_with("new mode ")
+        || line.starts_with("similarity index ")
+        || line.starts_with("rename from ")
+        || line.starts_with("rename to ")
+        || line == "*** Begin Patch"
+}
+
+fn parse_patch_hunks(patch: &str) -> Result<Vec<PatchHunk>, String> {
+    let raw_lines: Vec<&str> = patch.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)).collect();
+    let mut hunks = Vec::new();
+    let mut cur: Option<PatchHunk> = None;
+    let mut saw_file_directive = false;
+    let mut last_was_add = false;
+
+    for (idx, &line) in raw_lines.iter().enumerate() {
+        if line == "*** End Patch" {
+            break;
+        }
+        if line.starts_with("*** Add File:") || line.starts_with("*** Delete File:") {
+            return Err("Use `write` or `bash` to add or delete files; `edit` only modifies existing files.".into());
+        }
+        if line.starts_with("*** Move to:") {
+            return Err("Use `bash` to rename or move files; `edit` modifies a file in place.".into());
+        }
+        if line.starts_with("*** Update File:") {
+            if saw_file_directive {
+                return Err("`patch` references multiple files; `edit` modifies one file at a time.".into());
+            }
+            if let Some(h) = cur.take() {
+                hunks.push(h);
+            }
+            saw_file_directive = true;
+            last_was_add = false;
+            continue;
+        }
+        if line == "*** End of File" {
+            if let Some(ref mut h) = cur {
+                h.eof_anchor = true;
+            }
+            continue;
+        }
+        if let Some((old_start, hint)) = parse_hunk_header(line) {
+            if let Some(h) = cur.take() {
+                hunks.push(h);
+            }
+            cur = Some(PatchHunk {
+                old_start,
+                hint,
+                ops: Vec::new(),
+                eof_anchor: false,
+                old_no_eof_nl: false,
+                new_no_eof_nl: false,
+            });
+            last_was_add = false;
+            continue;
+        }
+
+        let Some(ref mut hunk) = cur else {
+            if line.starts_with("diff --git ") && !hunks.is_empty() {
+                return Err("`patch` references multiple files; `edit` modifies one file at a time.".into());
+            }
+            if is_diff_preamble(line) {
+                continue;
+            }
+            return Err(format!("Invalid patch header line before first `@@`: {line}"));
+        };
+
+        if let Some(rest) = line.strip_prefix(' ') {
+            hunk.ops.push(HunkOp::Context(rest.to_string()));
+            last_was_add = false;
+        } else if let Some(rest) = line.strip_prefix('-') {
+            hunk.ops.push(HunkOp::Remove(rest.to_string()));
+            last_was_add = false;
+        } else if let Some(rest) = line.strip_prefix('+') {
+            hunk.ops.push(HunkOp::Add(rest.to_string()));
+            last_was_add = true;
+        } else if line.starts_with('\\') {
+            if last_was_add {
+                hunk.new_no_eof_nl = true;
+            } else {
+                hunk.old_no_eof_nl = true;
+            }
+        } else if line.is_empty() {
+            // An empty line between hunk operations means a blank context line whose leading space
+            // was stripped; before another header or at trailing EOF it is just separator noise.
+            let continues_hunk = raw_lines.get(idx + 1).is_some_and(|next| {
+                !next.is_empty()
+                    && !next.starts_with("@@")
+                    && !next.starts_with("*** ")
+                    && !next.starts_with("diff --git ")
+            });
+            if continues_hunk {
+                hunk.ops.push(HunkOp::Context(String::new()));
+                last_was_add = false;
+            }
+        } else if line.starts_with("diff --git ") {
+            return Err("`patch` references multiple files; `edit` modifies one file at a time.".into());
+        } else {
+            return Err(format!("Invalid patch line inside hunk (expected `' '`, `'-'`, `'+'`, or `@@`): {line}"));
+        }
+    }
+    if let Some(h) = cur.take() {
+        hunks.push(h);
+    }
+    if hunks.is_empty() {
+        return Err("`patch` contains no `@@` hunks.".into());
+    }
+    Ok(hunks)
+}
+
+fn find_slice_matches<F>(file_lines: &[String], old: &[&str], from: usize, to: usize, norm: F) -> Vec<usize>
+where
+    F: Fn(&str) -> String,
+{
+    if old.is_empty() || old.len() > file_lines.len() {
+        return Vec::new();
+    }
+    let max_start = (file_lines.len() - old.len()).min(to);
+    if from > max_start {
+        return Vec::new();
+    }
+    let normed_old: Vec<String> = old.iter().map(|s| norm(s)).collect();
+    let mut hits = Vec::new();
+    for pos in from..=max_start {
+        let matched = (0..old.len()).all(|j| file_lines.get(pos + j).map(|s| norm(s)) == normed_old.get(j).cloned());
+        if matched {
+            hits.push(pos);
+        }
+    }
+    hits
+}
+
+fn slice_matches_at<F>(file_lines: &[String], old: &[&str], pos: usize, norm: F) -> bool
+where
+    F: Fn(&str) -> String,
+{
+    if old.is_empty() || pos + old.len() > file_lines.len() {
+        return false;
+    }
+    old.iter().enumerate().all(|(j, line)| file_lines.get(pos + j).is_some_and(|fl| norm(fl) == norm(line)))
+}
+
+fn narrow_by_hint(file_lines: &[String], hits: &[usize], hint: Option<&str>, from: usize) -> Option<usize> {
+    let hint = hint?;
+    let mut hint_lines = (from..file_lines.len()).filter(|&i| file_lines.get(i).is_some_and(|l| l.contains(hint)));
+    let anchor = hint_lines.next()?;
+    let after: Vec<usize> = hits.iter().copied().filter(|&pos| pos >= anchor).collect();
+    if after.len() == 1 {
+        after.first().copied()
+    } else {
+        None
+    }
+}
+
+fn locate_hunk(
+    file_lines: &[String],
+    hunk: &PatchHunk,
+    hunk_num: usize,
+    search_from: usize,
+    line_delta: isize,
+) -> Result<(usize, bool), String> {
+    let old = hunk.old_lines();
+    if old.is_empty() {
+        if file_lines.is_empty() {
+            return Ok((0, false));
+        }
+        if let Some(start) = hunk.old_start {
+            let idx = if start == 0 { 0 } else { ((start as isize) + line_delta).max(0) as usize };
+            return Ok((idx.min(file_lines.len()), false));
+        }
+        if hunk.eof_anchor {
+            return Ok((file_lines.len(), false));
+        }
+        return Err(format!("Patch hunk {hunk_num} has no context or removed lines and no line number."));
+    }
+    let end_bound = file_lines.len();
+    let expected = hunk.old_start.map(|s| ((s.saturating_sub(1)) as isize + line_delta).max(0) as usize);
+
+    if hunk.eof_anchor {
+        if let Some(eof_pos) = file_lines.len().checked_sub(old.len()) {
+            if slice_matches_at(file_lines, &old, eof_pos, |s| s.to_string()) {
+                return Ok((eof_pos, false));
+            }
+            if slice_matches_at(file_lines, &old, eof_pos, |s| s.trim().to_string()) {
+                return Ok((eof_pos, true));
+            }
+            if slice_matches_at(file_lines, &old, eof_pos, collapse_ws) {
+                return Ok((eof_pos, true));
+            }
+        }
+    }
+
+    if let Some(pos) = expected {
+        if slice_matches_at(file_lines, &old, pos, |s| s.to_string()) {
+            return Ok((pos, false));
+        }
+    }
+
+    let exact_after = find_slice_matches(file_lines, &old, search_from, end_bound, |s| s.to_string());
+    if exact_after.len() == 1 {
+        if let Some(&pos) = exact_after.first() {
+            return Ok((pos, false));
+        }
+    }
+    if exact_after.len() > 1 {
+        if let Some(pos) = narrow_by_hint(file_lines, &exact_after, hunk.hint.as_deref(), search_from) {
+            return Ok((pos, false));
+        }
+        return Err(format!(
+            "Patch hunk {hunk_num} matches {} locations; include more surrounding context lines.",
+            exact_after.len()
+        ));
+    }
+
+    if search_from > 0 {
+        let exact_all = find_slice_matches(file_lines, &old, 0, end_bound, |s| s.to_string());
+        if exact_all.len() == 1 {
+            if let Some(&pos) = exact_all.first() {
+                return Ok((pos, false));
+            }
+        }
+        if exact_all.len() > 1 {
+            return Err(format!(
+                "Patch hunk {hunk_num} matches {} locations; include more surrounding context lines.",
+                exact_all.len()
+            ));
+        }
+    }
+
+    if old.iter().any(|l| !l.trim().is_empty()) {
+        for norm in [|s: &str| s.trim().to_string(), collapse_ws] {
+            if let Some(pos) = expected {
+                if slice_matches_at(file_lines, &old, pos, norm) {
+                    return Ok((pos, true));
+                }
+            }
+            let fuzzy_after = find_slice_matches(file_lines, &old, search_from, end_bound, norm);
+            if fuzzy_after.len() == 1 {
+                if let Some(&pos) = fuzzy_after.first() {
+                    return Ok((pos, true));
+                }
+            }
+            if fuzzy_after.len() > 1 {
+                return Err(format!(
+                    "Patch hunk {hunk_num} (with whitespace normalization) matches {} locations; include more surrounding context lines.",
+                    fuzzy_after.len()
+                ));
+            }
+            if search_from > 0 {
+                let fuzzy_all = find_slice_matches(file_lines, &old, 0, end_bound, norm);
+                if fuzzy_all.len() == 1 {
+                    if let Some(&pos) = fuzzy_all.first() {
+                        return Ok((pos, true));
+                    }
+                }
+                if fuzzy_all.len() > 1 {
+                    return Err(format!(
+                        "Patch hunk {hunk_num} (with whitespace normalization) matches {} locations; include more surrounding context lines.",
+                        fuzzy_all.len()
+                    ));
+                }
+            }
+        }
+    }
+
+    let preview = old.first().copied().unwrap_or("");
+    Err(format!("Patch hunk {hunk_num} could not be matched in the file (starts near `{preview}`)."))
+}
+
+/// Apply unified diff or `*** Begin Patch` hunks to an existing read file.
+fn patch_file(ctx: &ToolCtx, given: &str, path: &Path, patch: &str) -> Worked {
+    if patch.trim().is_empty() {
+        return ToolOutput::error("`patch` is empty, so there is nothing to apply.").into();
+    }
+    let hunks = match parse_patch_hunks(patch) {
+        Ok(h) => h,
+        Err(msg) => return ToolOutput::error(msg).into(),
+    };
+    if path.is_dir() {
+        return ToolOutput::error(format!("{given} is a directory. Give the path of a file to edit.")).into();
+    }
+    let readable = readable_in(ctx);
+    let fresh = match ctx.files.freshness(path, &readable) {
+        Ok(f) => f,
+        Err(e) => return check_failed(given, "edit", "editing", e).into(),
+    };
+    if fresh == Freshness::Missing {
+        return ToolOutput::error(format!(
+            "{given} does not exist, so there is nothing to edit. Create it with `write`, or check the path (`glob` finds files)."
+        ))
+        .into();
+    }
+    if let Some(refusal) = freshness_refusal(&fresh, given, "edit") {
+        return refusal.into();
+    }
+    let bytes = match read_bounded(path, READ_CAP, &ctx.cancel, &readable) {
+        Ok(b) => b,
+        Err(f) => return fail_output(f, given, "edit", "Use `bash` for a change to a file this large.").into(),
+    };
+    let text = match String::from_utf8(bytes) {
+        Ok(t) => t,
+        Err(_) => {
+            return ToolOutput::error(format!(
+                "{given} is not valid UTF-8 text, and binary files are not edited. Use `bash` for a binary change."
+            ))
+            .into()
+        }
+    };
+
+    let crlf = text.contains("\r\n") && text.matches('\n').count() == text.matches("\r\n").count();
+    let orig_had_trailing_nl = text.ends_with('\n');
+    let text_lf = if crlf { text.replace("\r\n", "\n") } else { text.clone() };
+    let mut file_lines: Vec<String> = if text_lf.is_empty() {
+        Vec::new()
+    } else {
+        let body = text_lf.strip_suffix('\n').unwrap_or(&text_lf);
+        body.split('\n').map(str::to_string).collect()
+    };
+
+    let mut search_from = 0usize;
+    let mut line_delta = 0isize;
+    let mut used_fuzzy = false;
+    let mut trailing_nl = orig_had_trailing_nl;
+    let n_hunks = hunks.len();
+
+    for (idx, hunk) in hunks.iter().enumerate() {
+        let (pos, fuzzy) = match locate_hunk(&file_lines, hunk, idx + 1, search_from, line_delta) {
+            Ok(found) => found,
+            Err(msg) => return ToolOutput::error(msg).into(),
+        };
+        if fuzzy {
+            used_fuzzy = true;
+        }
+        let old_len = hunk.old_lines().len();
+        let matched: Vec<String> = file_lines.get(pos..pos + old_len).unwrap_or(&[]).to_vec();
+        let at_eof = pos + old_len == file_lines.len();
+        let mut replacement = Vec::new();
+        let mut m_idx = 0usize;
+        for op in &hunk.ops {
+            match op {
+                HunkOp::Context(_) => {
+                    if let Some(orig) = matched.get(m_idx) {
+                        replacement.push(orig.clone());
+                    }
+                    m_idx += 1;
+                }
+                HunkOp::Remove(_) => {
+                    m_idx += 1;
+                }
+                HunkOp::Add(line) => {
+                    replacement.push(line.clone());
+                }
+            }
+        }
+        let new_len = replacement.len();
+        file_lines.splice(pos..pos + old_len, replacement);
+        line_delta += new_len as isize - old_len as isize;
+        search_from = pos + new_len;
+        if idx + 1 == n_hunks && (at_eof || hunk.old_no_eof_nl || hunk.new_no_eof_nl) {
+            if hunk.new_no_eof_nl {
+                trailing_nl = false;
+            } else if (hunk.old_no_eof_nl || (at_eof && !orig_had_trailing_nl)) && !file_lines.is_empty() {
+                trailing_nl = true;
+            }
+        }
+    }
+
+    let line_sep = if crlf { "\r\n" } else { "\n" };
+    let mut updated = file_lines.join(line_sep);
+    if trailing_nl && !file_lines.is_empty() {
+        updated.push_str(line_sep);
+    }
+    if updated == text {
+        return ToolOutput::error("`patch` made no changes to the file.").into();
+    }
+    if ctx.cancel.is_cancelled() {
+        return cancelled("edit").into();
+    }
+    if let Err(fail) = write_atomic(&ctx.sandbox, path, updated.as_bytes()) {
+        return write_failed(given, fail, "check that the file is writable and try again.").into();
+    }
+    let hunk_note = if n_hunks == 1 { "1 hunk".to_string() } else { format!("{n_hunks} hunks") };
+    let mut out = ToolOutput::ok("edited", Body::Raw(unified_diff(given, &text, &updated).into_bytes()))
+        .with_more(given.to_string())
+        .with_more(hunk_note);
+    if used_fuzzy {
+        out = out.with_more("matched old with whitespace normalization");
+    }
     Worked { out, seen: Some(Seen::of_bytes(updated.as_bytes())) }
 }
 
@@ -2307,11 +2919,10 @@ mod tests {
         let e = env();
         put(&e, "w.py", b"def f():\n    if x:\n        return 1\n    return 2\n");
         e.call("read", json!({"path": "w.py"})).await;
-        let r = e.call("edit", json!({"path": "w.py", "old": "if x:\n    return 1", "new": "pass"})).await;
-        assert!(is_err(&r), "{}", r.text);
-        assert!(r.text.contains("lines 2-3") && r.text.contains("whitespace"), "{}", r.text);
-        assert!(r.text.contains("2\t    if x:\n3\t        return 1"), "{}", r.text);
-        assert_eq!(std::fs::read(ws(&e, "w.py")).unwrap(), b"def f():\n    if x:\n        return 1\n    return 2\n");
+        let r = e.call("edit", json!({"path": "w.py", "old": "if x:\n    return 1", "new": "    pass"})).await;
+        assert_eq!(r.status, ToolStatus::Ok, "{}", r.text);
+        assert!(r.text.contains("matched old with whitespace normalization"), "{}", r.text);
+        assert_eq!(std::fs::read(ws(&e, "w.py")).unwrap(), b"def f():\n    pass\n    return 2\n");
     }
 
     #[tokio::test]
@@ -2605,5 +3216,115 @@ mod tests {
         let r = e.call("edit", json!({"path": target, "old": "key", "new": "x"})).await;
         assert_eq!(r.status, ToolStatus::Denied);
         assert_eq!(std::fs::read(secret.join("k.txt")).unwrap(), b"key");
+    }
+
+    #[tokio::test]
+    async fn read_delegates_out_handle() {
+        let e = env();
+        let stored = e.ctx.blobs.put_bytes(b"alpha\nbeta\ngamma\ndelta\n").unwrap();
+        let h = stored.handle();
+        let r = e.call("read", json!({"path": h, "start": 2, "end": 3})).await;
+        assert_eq!(r.status, ToolStatus::Ok, "{}", r.text);
+        assert!(r.text.contains("2\tbeta"), "{}", r.text);
+        assert!(r.text.contains("3\tgamma"), "{}", r.text);
+        assert!(!r.text.contains("1\talpha"), "{}", r.text);
+        assert!(!r.text.contains("4\tdelta"), "{}", r.text);
+    }
+
+    #[tokio::test]
+    async fn edit_fuzzy_whitespace_collapsed_crlf_and_refusals() {
+        let e = env();
+        put(&e, "c.txt", b"fn main() {\r\n    let   x  =  1;\r\n}\r\n");
+        e.call("read", json!({"path": "c.txt"})).await;
+        let r = e.call("edit", json!({"path": "c.txt", "old": "let x = 1;", "new": "    let x = 2;"})).await;
+        assert_eq!(r.status, ToolStatus::Ok, "{}", r.text);
+        assert!(r.text.contains("matched old with whitespace normalization"), "{}", r.text);
+        assert_eq!(std::fs::read(ws(&e, "c.txt")).unwrap(), b"fn main() {\r\n    let x = 2;\r\n}\r\n");
+
+        // Ambiguous fuzzy match (>1) refuses even with all=true.
+        put(&e, "dup.py", b"def a():\n    x  =  1\ndef b():\n        x   =   1\n");
+        e.call("read", json!({"path": "dup.py"})).await;
+        let r = e.call("edit", json!({"path": "dup.py", "old": "x = 1", "new": "y = 2", "all": true})).await;
+        assert!(is_err(&r), "{}", r.text);
+        assert!(r.text.contains("occurs 2 times"), "{}", r.text);
+        assert_eq!(std::fs::read(ws(&e, "dup.py")).unwrap(), b"def a():\n    x  =  1\ndef b():\n        x   =   1\n");
+
+        // Zero fuzzy match still emits no-match error cleanly.
+        let r = e.call("edit", json!({"path": "dup.py", "old": "missing_fn():\n    z = 9", "new": "pass"})).await;
+        assert!(is_err(&r), "{}", r.text);
+        assert!(r.text.contains("`old` was not found in dup.py"), "{}", r.text);
+    }
+
+    #[tokio::test]
+    async fn edit_patch_unified_diff_and_shifted_hunks() {
+        let e = env();
+        put(&e, "u.rs", b"header\r\nalpha\r\nbeta\r\ngamma\r\ndelta\r\nepsilon\r\n");
+        e.call("read", json!({"path": "u.rs"})).await;
+        // Shifted @@ offset (line 10 instead of 2) plus second hunk adjusting later lines.
+        let patch = "\
+--- a/u.rs
++++ b/u.rs
+@@ -10,3 +10,4 @@
+ alpha
+-beta
++BETA
++beta_extra
+ gamma
+@@ -5,2 +6,2 @@
+ delta
+-epsilon
++EPSILON";
+        let r = e.call("edit", json!({"path": "u.rs", "patch": patch})).await;
+        assert_eq!(r.status, ToolStatus::Ok, "{}", r.text);
+        assert!(r.text.contains("2 hunks"), "{}", r.text);
+        assert_eq!(
+            std::fs::read(ws(&e, "u.rs")).unwrap(),
+            b"header\r\nalpha\r\nBETA\r\nbeta_extra\r\ngamma\r\ndelta\r\nEPSILON\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_patch_begin_patch_and_eof_anchor() {
+        let e = env();
+        put(&e, "b.txt", b"first\nmiddle\nlast\n");
+        e.call("read", json!({"path": "b.txt"})).await;
+        let patch = "\
+*** Begin Patch
+*** Update File: b.txt
+@@
+ first
+-middle
++CENTER
+@@
+ last
++tail
+*** End of File
+*** End Patch";
+        let r = e.call("edit", json!({"path": "b.txt", "patch": patch})).await;
+        assert_eq!(r.status, ToolStatus::Ok, "{}", r.text);
+        assert_eq!(std::fs::read(ws(&e, "b.txt")).unwrap(), b"first\nCENTER\nlast\ntail\n");
+    }
+
+    #[tokio::test]
+    async fn edit_patch_validation_and_error_preservation() {
+        let e = env();
+        put(&e, "v.txt", b"hello\nworld\n");
+        e.call("read", json!({"path": "v.txt"})).await;
+
+        let empty_old = e.call("edit", json!({"path": "v.txt", "old": "", "new": "x"})).await;
+        assert!(is_err(&empty_old) && empty_old.text.contains("`old` is empty"), "{}", empty_old.text);
+
+        let same = e.call("edit", json!({"path": "v.txt", "old": "hello", "new": "hello"})).await;
+        assert!(is_err(&same) && same.text.contains("`old` and `new` are identical"), "{}", same.text);
+
+        let both =
+            e.call("edit", json!({"path": "v.txt", "old": "hello", "new": "hi", "patch": "@@\n-hello\n+hi"})).await;
+        assert!(is_err(&both) && both.text.contains("not both"), "{}", both.text);
+
+        let neither = e.call("edit", json!({"path": "v.txt"})).await;
+        assert!(is_err(&neither) && neither.text.contains("`old` and `new`, or `patch`"), "{}", neither.text);
+
+        let no_match = e.call("edit", json!({"path": "v.txt", "patch": "@@\n-missing\n+found"})).await;
+        assert!(is_err(&no_match) && no_match.text.contains("could not be matched"), "{}", no_match.text);
     }
 }

@@ -551,10 +551,11 @@ use loom_core::admit::AdmitPolicy;
 use loom_core::config::{AgentsCfg, Paths};
 use loom_core::estimate::TokenEstimator;
 use loom_core::event::{
-    Author, Budget, ChildCompleted, ChildOutcome, ChildSettled, Event, FinishReason, Forked, InboxItem, InboxKind,
-    ModelRef, ModelRequest, ModelResponse, ModelSwitched, NoteKind, Purpose, ReasoningReplay, Record, Reweave, Seq,
-    SessionOutcome, SessionStart, StoredAction, Termination, Timing, ToolCall, ToolCallRequest, ToolClass, ToolSpec,
-    ToolStatus, Trigger, TurnEndReason, Usage, META_DEFERRED_OBSERVATION, META_EXIT_CODE, META_JOB, META_SIGNAL,
+    Author, Budget, ChildCompleted, ChildOutcome, ChildSettled, Event, EvidenceGrade, FinishReason, Forked, InboxItem,
+    InboxKind, ModelRef, ModelRequest, ModelResponse, ModelSwitched, NoteKind, Purpose, ReasoningReplay, Record,
+    Reweave, Seq, SessionOutcome, SessionStart, StoredAction, Termination, Timing, ToolCall, ToolCallRequest,
+    ToolClass, ToolSpec, ToolStatus, Trigger, TurnEndReason, Usage, META_DEFERRED_OBSERVATION, META_EXIT_CODE,
+    META_JOB, META_SIGNAL,
 };
 use loom_core::ids::{new_item_id, new_request_id, CallId, SessionId};
 use loom_core::ledger::{LedgerOp, LedgerState};
@@ -570,14 +571,14 @@ use loom_model::request::{ChatRequest, ToolChoice};
 use loom_tools::files::FileTracker;
 use loom_tools::jobs::{JobEvent, JobInfo, JobState};
 use loom_tools::proc::Ended;
-use loom_tools::{execute, prepare, refused, Admission, Ran, Registry, ToolCtx};
+use loom_tools::{canonical_tool_alias, execute, prepare, refused, Admission, Ran, Registry, ToolCtx};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
+use tokio::sync::mpsc::{error::TryRecvError, unbounded_channel, UnboundedReceiver};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -777,6 +778,9 @@ pub struct Control {
     /// The harness is going down: a cancelled turn is recorded as cut by the restart, and a child is
     /// not settled by it.
     shutting: std::sync::atomic::AtomicBool,
+    /// The session's inputs were closed outside shutdown (for example, archived): cancel any starting or
+    /// waking turn as an operator stop rather than a restart cut.
+    closed: std::sync::atomic::AtomicBool,
 }
 
 impl Control {
@@ -796,17 +800,27 @@ impl Control {
         self.stop_turn();
     }
 
+    /// Cancel any starting or waking turn when the session's inputs are closed (for example, on archive).
+    pub(crate) fn stop_for_close(&self) {
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.stop_turn();
+    }
+
     fn is_shutting(&self) -> bool {
         self.shutting.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Install and return the token of a new turn.
     pub(crate) fn begin_turn(&self) -> CancellationToken {
         let token = CancellationToken::new();
         *self.turn.lock().unwrap_or_else(|p| p.into_inner()) = token.clone();
-        // Read after the token is installed: a shutdown that began before this point is seen here,
-        // one that begins after it cancels the installed token.
-        if self.is_shutting() {
+        // Read after the token is installed: a shutdown or close that began before this point is seen
+        // here; one that begins after it cancels the installed token.
+        if self.is_shutting() || self.is_closed() {
             token.cancel();
         }
         token
@@ -937,7 +951,7 @@ impl CallPolicy {
         match name {
             "out_read" | "out_grep" | "ledger" | "mission_state" | "security_query" | "codec_calc" | "pty_close"
             | "note" | "evidence" | "claim_update" | "finish" | "conclude" | "verdict" | "report_blocker"
-            | "ask_user" | "wait" | "agent_stop" | "agent_list" | "job_kill" => true,
+            | "ask_user" | "ask_for" | "hand_off" | "wait" | "agent_stop" | "agent_list" | "job_kill" => true,
             "security_record" => args.get("operation").is_some_and(|op| {
                 let has = |key| op.get(key).and_then(Value::as_str).is_some_and(|s| !s.trim().is_empty());
                 match op.get("action").and_then(Value::as_str) {
@@ -966,6 +980,35 @@ impl CallPolicy {
             _ => false,
         }
     }
+}
+
+/// Tools omitted from wire `ToolSpec`s when `agents.compact_tools` is enabled (still runnable if called).
+const COMPACT_HIDDEN_TOOLS: &[&str] = &[
+    "attempt",
+    "agent_adopt",
+    "agent_message",
+    "agent_stop",
+    "decide",
+    "pin",
+    "reflect",
+    "ask_for",
+    "conclude",
+    "out_read",
+    "out_grep",
+    "step",
+];
+
+/// Build the static wire `ToolSpec` list once at session creation so KV prompt cache stays stable.
+fn wire_tools(registry: &Registry, deps: &Deps) -> Vec<ToolSpec> {
+    let hidden = &deps.shared.role.hidden_tools;
+    let compact = deps.agents.compact_tools;
+    registry
+        .specs()
+        .into_iter()
+        .filter(|spec| {
+            !hidden.iter().any(|h| h == &spec.name) && !(compact && COMPACT_HIDDEN_TOOLS.contains(&spec.name.as_str()))
+        })
+        .collect()
 }
 
 /// A step request as the re-weave check needs it.
@@ -1218,7 +1261,7 @@ impl Early {
     }
 
     fn may_start(&self, name: &str) -> bool {
-        self.registry.get(name).is_some_and(|t| t.speculative())
+        self.registry.resolve(name).is_some_and(|(t, _)| t.speculative())
     }
 
     /// Follow the stream: a ready call may start; a new attempt voids what the earlier ones started.
@@ -1259,7 +1302,8 @@ impl Early {
         if self.runs.contains_key(&index) || self.turn.is_cancelled() || running >= MAX_EARLY {
             return;
         }
-        if !matches!(serde_json::from_str::<Value>(arguments), Ok(Value::Object(ref a)) if self.policy.allows(name, &Value::Object(a.clone())))
+        let policy_name = self.registry.resolve(name).and_then(|(_, canon)| canon).unwrap_or(name);
+        if !matches!(serde_json::from_str::<Value>(arguments), Ok(Value::Object(ref a)) if self.policy.allows(policy_name, &Value::Object(a.clone())))
         {
             return;
         }
@@ -1430,6 +1474,9 @@ pub struct Session {
     estimator: TokenEstimator,
     guard: PrefixGuard,
     inputs: Option<UnboundedReceiver<Input>>,
+    /// True once `inputs` has been observed open and empty (`TryRecvError::Empty`), distinguishing a
+    /// live channel that closes mid-turn from test fixtures that pre-load `inputs` and drop the sender.
+    inputs_seen_open: bool,
     jobs_open: bool,
     token: CancellationToken,
     /// Replies in a row that made no progress: nudged by the gate, cut off by the output limit with
@@ -1675,6 +1722,7 @@ impl Session {
             estimator: TokenEstimator::default(),
             guard: PrefixGuard::new(),
             inputs: None,
+            inputs_seen_open: false,
             jobs_open: true,
             token: CancellationToken::new(),
             nudges: 0,
@@ -1701,7 +1749,7 @@ impl Session {
         let path = deps.paths.session_log(&deps.shared.session);
         let log = SessionLog::create(&path, Durability::Always).map_err(|e| e.to_string())?;
         let mut start = start;
-        start.tools = registry.specs();
+        start.tools = wire_tools(&registry, &deps);
         let mut session = Session::bare(deps, log, Vec::new(), registry);
         session.append(Author::Harness, Event::SessionStart(start)).map_err(|e| e.0)?;
         if let Some((parent, text)) = assignment {
@@ -2118,6 +2166,25 @@ Name them when you start a new mission instead."
 
     // ---- the idle loop -------------------------------------------------------------------------
 
+    async fn close_idle(&mut self) -> R<End> {
+        // Closed for good (the session was archived, or its runtime let go of it): a child
+        // settles, or its parent would wait for it for ever. A shutdown closes the inputs too,
+        // but it cuts the child for the next start to resume, so nothing is settled then.
+        if self.deps.shared.is_child() && !self.deps.control.is_shutting() {
+            return Ok(End::Settled(self.stop_idle_child(texts::REASON_OPERATOR).await?));
+        }
+        // Between turns no `interrupted` note goes with the jobs a shutdown stops: their ends say why.
+        let why = if self.deps.control.is_shutting() { texts::JOB_SHUTDOWN_DETAIL } else { "" };
+        self.deps.ctx.capabilities.ptys.close_all().await;
+        self.deps.ctx.jobs.kill_all_because(self.grace(), why).await;
+        // Nothing reads the job events after this task: what the jobs reported (killed just
+        // now, or ended before) is recorded now, or the next `open` would take them for lost.
+        while let Ok(event) = self.deps.job_events.try_recv() {
+            self.on_job_event(event).await?;
+        }
+        Ok(End::Closed)
+    }
+
     async fn drive(&mut self) -> R<End> {
         if self.st.ended.is_some() {
             self.phase = Phase::Ended;
@@ -2128,6 +2195,9 @@ Name them when you start a new mission instead."
         self.publish();
         for input in self.kept_inputs() {
             self.arrival(input).await?;
+        }
+        if self.deps.control.is_closed() {
+            return self.close_idle().await;
         }
         if self.deps.shared.is_child() && !self.st.has_turn {
             if let Some(settled) = self.turn(Trigger::Start).await? {
@@ -2151,24 +2221,8 @@ Name them when you start a new mission instead."
                 Ev::Input(Some(Input::Stop)) if self.deps.shared.is_child() => {
                     return Ok(End::Settled(self.stop_idle_child(texts::REASON_PARENT).await?));
                 }
-                // Closed for good (the session was archived, or its runtime let go of it): a child
-                // settles, or its parent would wait for it for ever. A shutdown closes the inputs too,
-                // but it cuts the child for the next start to resume, so nothing is settled then.
-                Ev::Input(None) if self.deps.shared.is_child() && !self.deps.control.is_shutting() => {
-                    return Ok(End::Settled(self.stop_idle_child(texts::REASON_OPERATOR).await?));
-                }
-                Ev::Input(None) => {
-                    // Between turns no `interrupted` note goes with the jobs a shutdown stops: their ends say why.
-                    let why = if self.deps.control.is_shutting() { texts::JOB_SHUTDOWN_DETAIL } else { "" };
-                    self.deps.ctx.capabilities.ptys.close_all().await;
-                    self.deps.ctx.jobs.kill_all_because(self.grace(), why).await;
-                    // Nothing reads the job events after this task: what the jobs reported (killed just
-                    // now, or ended before) is recorded now, or the next `open` would take them for lost.
-                    while let Ok(event) = self.deps.job_events.try_recv() {
-                        self.on_job_event(event).await?;
-                    }
-                    return Ok(End::Closed);
-                }
+                Ev::Input(None) => return self.close_idle().await,
+                Ev::Input(Some(_)) if self.deps.control.is_closed() => return self.close_idle().await,
                 Ev::Input(Some(input)) => self.idle_input(input).await?,
                 Ev::Job(Some(event)) => self.on_job_event(event).await?,
                 Ev::Job(None) => {
@@ -2176,6 +2230,9 @@ Name them when you start a new mission instead."
                     None
                 }
             };
+            if self.deps.control.is_closed() {
+                return self.close_idle().await;
+            }
             if let Some(trigger) = trigger {
                 if let Some(settled) = self.turn(trigger).await? {
                     return Ok(End::Settled(settled));
@@ -2191,7 +2248,11 @@ Name them when you start a new mission instead."
                 let token = self.deps.control.begin_turn();
                 let woven = self.woven();
                 let fold = self.operator_fold(&woven);
-                self.reweave(&woven, "operator", true, &token, fold).await?;
+                let res = self.reweave(&woven, "operator", true, &token, fold).await;
+                if self.st.clock.as_ref().is_some_and(|c| c.running_from.is_some()) {
+                    let _ = self.clock_set(false);
+                }
+                res?;
                 Ok(None)
             }
             Input::Stop => {
@@ -3232,6 +3293,10 @@ Name them when you start a new mission instead."
                 && shared.role.tools.iter().any(|t| t == "conclude"),
             solvable: shared.role.solvable,
         });
+        if let Some(activity) = hud::recent_activity(self.own()) {
+            text.push_str("\n\n");
+            text.push_str(&activity);
+        }
         if shared.is_child() {
             text.push_str(if shared.role.read_only {
                 "\n\nMission ledger access: read-only. Return observations through your report or verdict."
@@ -3242,15 +3307,30 @@ Name them when you start a new mission instead."
         text
     }
 
+    fn try_next_input(&mut self) -> Option<Input> {
+        let rx = self.inputs.as_mut()?;
+        match rx.try_recv() {
+            Ok(input) => Some(input),
+            Err(TryRecvError::Empty) => {
+                self.inputs_seen_open = true;
+                None
+            }
+            Err(TryRecvError::Disconnected) => {
+                if self.deps.control.is_closed() || self.inputs_seen_open {
+                    self.token.cancel();
+                }
+                None
+            }
+        }
+    }
+
     /// Record what arrived while the turn was running. Nothing here starts a turn.
     async fn drain_arrivals(&mut self) -> R<bool> {
         let mut force = false;
         while let Ok(event) = self.deps.job_events.try_recv() {
             self.on_job_event(event).await?;
         }
-        loop {
-            let next = self.inputs.as_mut().and_then(|rx| rx.try_recv().ok());
-            let Some(input) = next else { break };
+        while let Some(input) = self.try_next_input() {
             match input {
                 Input::Reweave => force = true,
                 Input::Resume => {}
@@ -3339,6 +3419,9 @@ Name them when you start a new mission instead."
 
     /// A stretch of own steps with no ledger record, file change or child activity gets one note.
     fn check_stall(&mut self) -> R<()> {
+        if !self.deps.agents.idle_ledger_nudge {
+            return Ok(());
+        }
         let n = self.deps.agents.stall_steps;
         if n == 0 || self.st.termination != Some(Termination::Explicit) || self.deps.shared.journal.is_none() {
             return Ok(());
@@ -3486,6 +3569,24 @@ Name them when you start a new mission instead."
     /// Ask the model, on the existing prefix `w`, for notes about what is about to be folded away.
     /// The request waits for the limiter at the session's own priority: the step waits for it.
     async fn ask_digest(&mut self, w: &Weave, token: &CancellationToken) -> R<Option<String>> {
+        let was_running = self.st.clock.as_ref().is_some_and(|c| c.running_from.is_some());
+        let res = self.ask_digest_inner(w, token).await;
+        if !was_running && self.st.clock.as_ref().is_some_and(|c| c.running_from.is_some()) {
+            match res {
+                Ok(val) => {
+                    self.clock_set(false)?;
+                    return Ok(val);
+                }
+                Err(e) => {
+                    let _ = self.clock_set(false);
+                    return Err(e);
+                }
+            }
+        }
+        res
+    }
+
+    async fn ask_digest_inner(&mut self, w: &Weave, token: &CancellationToken) -> R<Option<String>> {
         let req_id = new_request_id();
         self.append(
             Author::Harness,
@@ -3580,8 +3681,21 @@ Name them when you start a new mission instead."
             self.note(Author::Harness, NoteKind::Nudge, texts::REASONING_ONLY.to_string())?;
             return Ok(Flow::Next);
         }
+        let termination = self.st.termination.unwrap_or(Termination::Explicit);
+        if self.deps.agents.implicit_finish
+            && termination == Termination::Explicit
+            && running_jobs == 0
+            && running_children == 0
+            && !c.text.trim().is_empty()
+            && names.iter().any(|n| n == "finish")
+            && !names.iter().any(|n| n == "verdict")
+        {
+            if let Some(flow) = self.try_implicit_finish(req_id, c.text.trim(), ledger.as_ref(), w_tools).await? {
+                return Ok(flow);
+            }
+        }
         let verdict = gate::on_yield(&YieldCtx {
-            termination: self.st.termination.unwrap_or(Termination::Explicit),
+            termination,
             is_child: shared.is_child(),
             tools: &names,
             ledger: ledger.as_ref(),
@@ -3608,6 +3722,78 @@ Name them when you start a new mission instead."
                 }
             }
         }
+    }
+
+    async fn try_implicit_finish(
+        &mut self,
+        req_id: &str,
+        answer: &str,
+        ledger: Option<&LedgerState>,
+        w_tools: &[ToolSpec],
+    ) -> R<Option<Flow>> {
+        let mut handles = extract_out_handles(answer);
+        if handles.is_empty() {
+            let goal_concluded = ledger.is_some_and(|l| !gate::goal_unconcluded(l));
+            let candidate = self.recent_exec_output_handle();
+            if !goal_concluded && candidate.is_none() {
+                return Ok(None);
+            }
+            if let Some(handle) = candidate {
+                handles.push(handle);
+            }
+        }
+        let mut quotes = Vec::with_capacity(handles.len());
+        for handle in handles {
+            let end = match loom_tools::outputs::open(&self.deps.ctx, &handle).await {
+                Ok(id) => match self.deps.ctx.blobs.meta(&id) {
+                    Ok(meta) if meta.lines > 0 => meta.lines.min(20),
+                    _ => 20,
+                },
+                Err(_) => 20,
+            };
+            quotes.push(json!({ "handle": handle, "start": 1, "end": end }));
+        }
+        let synthetic = ToolCallRequest {
+            call_id: CallId(format!("implicit_finish_{}", self.st.step)),
+            name: "finish".into(),
+            arguments: json!({ "answer": answer, "quotes": quotes }).to_string(),
+            complete: true,
+        };
+        let early = Early::new(
+            false,
+            self.registry.clone(),
+            self.deps.ctx.clone(),
+            &self.token,
+            HashSet::new(),
+            self.early_counts.clone(),
+        );
+        let calls = self.run_calls(req_id, std::slice::from_ref(&synthetic), w_tools, early).await?;
+        match calls.effect {
+            Some(Effect::EndTurn(reason)) => return Ok(Some(Flow::End(reason))),
+            Some(Effect::Settle(d)) => return Ok(Some(Flow::Settle(d))),
+            None => {}
+        }
+        if calls.cancelled {
+            return self.cancelled().await.map(Some);
+        }
+        if self.nudges < self.deps.agents.max_nudges {
+            self.nudges = self.nudges.saturating_add(1);
+            return Ok(Some(Flow::Next));
+        }
+        Ok(None)
+    }
+
+    fn recent_exec_output_handle(&self) -> Option<String> {
+        self.records.iter().rev().find_map(|r| match &r.event {
+            Event::ToolResult(t)
+                if t.class == ToolClass::Exec
+                    && t.status == ToolStatus::Ok
+                    && EvidenceGrade::of_tool_result(&t.name, t.class, &t.meta) == EvidenceGrade::Run =>
+            {
+                t.output.as_ref().filter(|b| b.lines > 0).map(BlobRef::handle)
+            }
+            _ => None,
+        })
     }
 
     /// Count a reply that made no progress as a nudge. Past `agents.max_nudges` of them in a row the
@@ -3658,8 +3844,10 @@ Name them when you start a new mission instead."
                 out.cancelled = true;
                 break;
             }
-            let tool = self.registry.get(&call.name);
-            let class = tool.as_ref().map(|t| t.spec().class).unwrap_or(ToolClass::State);
+            let resolved = self.registry.resolve(&call.name);
+            let tool = resolved.as_ref().map(|(t, _)| t);
+            let policy_name = resolved.as_ref().and_then(|(_, canon)| *canon).unwrap_or(call.name.as_str());
+            let class = tool.map(|t| t.spec().class).unwrap_or(ToolClass::State);
             let args = serde_json::from_str::<Value>(&call.arguments)
                 .unwrap_or_else(|_| Value::String(call.arguments.clone()));
             self.append(
@@ -3680,10 +3868,14 @@ Name them when you start a new mission instead."
             let started = Instant::now();
             let mut result = if let Some(first) = &ender {
                 refused(&ctx, &call.name, class, texts::not_run_after(first), started)
-            } else if tool.is_none() && w_tools.iter().any(|t| t.name == call.name) {
+            } else if tool.is_none()
+                && w_tools
+                    .iter()
+                    .any(|t| t.name == call.name || canonical_tool_alias(&call.name) == Some(t.name.as_str()))
+            {
                 let message = texts::not_in_assignment(&call.name, &self.deps.shared.role.name, &self.registry.names());
                 refused(&ctx, &call.name, class, message, started)
-            } else if !(CallPolicy { wrapup: self.st.budget_note_step.is_some() }).allows(&call.name, &args) {
+            } else if !(CallPolicy { wrapup: self.st.budget_note_step.is_some() }).allows(policy_name, &args) {
                 refused(&ctx, &call.name, class, texts::wrapup_refused(&call.name), started)
             } else if class == ToolClass::Exec
                 && self.deps.shared.role.max_exec_calls.is_some_and(|cap| self.exec_count() >= u64::from(cap))
@@ -3840,6 +4032,37 @@ Name them when you start a new mission instead."
     }
 }
 
+/// Extract unique `out:<hex>` handles (`out:[0-9a-f]{8,64}`) in order of first appearance.
+fn extract_out_handles(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while let Some(rel) = text.get(i..).and_then(|s| s.find("out:")) {
+        let start = i + rel;
+        let prev_ok = start == 0
+            || text.get(..start).and_then(|s| s.chars().next_back()).is_none_or(|c| !c.is_ascii_alphanumeric());
+        let hex_start = start + 4;
+        let hex_len = bytes
+            .get(hex_start..)
+            .unwrap_or_default()
+            .iter()
+            .take_while(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
+            .count();
+        let hex_end = hex_start + hex_len;
+        let next_ok = text.get(hex_end..).and_then(|s| s.chars().next()).is_none_or(|c| !c.is_ascii_alphanumeric());
+        if prev_ok && (8..=64).contains(&hex_len) && next_ok {
+            if let Some(handle) = text.get(start..hex_end) {
+                if seen.insert(handle.to_string()) {
+                    out.push(handle.to_string());
+                }
+            }
+        }
+        i = hex_end.max(start + 4);
+    }
+    out
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {
@@ -3864,6 +4087,7 @@ mod tests {
         records: Mutex<Vec<Record>>,
         deltas: Mutex<Vec<(String, StreamEvent)>>,
         statuses: Mutex<Vec<Status>>,
+        orch: Mutex<Option<Arc<FakeOrch>>>,
     }
 
     impl Collect {
@@ -3876,7 +4100,21 @@ mod tests {
     }
 
     impl Sink for Collect {
-        fn record(&self, _session: &SessionId, record: &Record) {
+        fn record(&self, session: &SessionId, record: &Record) {
+            if let Event::ToolResult(t) = &record.event {
+                if let Some(out) = &t.output {
+                    if let Some(orch) = self.orch.lock().unwrap().as_ref() {
+                        orch.produced_graded(
+                            out,
+                            session.as_str(),
+                            &t.call_id.0,
+                            &t.name,
+                            t.class,
+                            EvidenceGrade::of_tool_result(&t.name, t.class, &t.meta),
+                        );
+                    }
+                }
+            }
             self.records.lock().unwrap().push(record.clone());
         }
         fn delta(&self, _session: &SessionId, req_id: &str, event: &StreamEvent) {
@@ -3890,7 +4128,7 @@ mod tests {
     struct Fx {
         _dir: tempfile::TempDir,
         server: MockServer,
-        _orch: Arc<FakeOrch>,
+        orch: Arc<FakeOrch>,
         sink: Arc<Collect>,
         control: Arc<Control>,
         shared: Arc<Shared>,
@@ -3944,7 +4182,7 @@ mod tests {
             Fx {
                 _dir: dir,
                 server,
-                _orch: orch,
+                orch,
                 sink: Arc::new(Collect::default()),
                 control: Arc::new(Control::new()),
                 shared,
@@ -4040,6 +4278,10 @@ mod tests {
 
         fn log_path(&self) -> std::path::PathBuf {
             self.paths.session_log(&SessionId::from("s-test"))
+        }
+
+        fn track_producers(&self) {
+            *self.sink.orch.lock().unwrap() = Some(self.orch.clone());
         }
     }
 
@@ -5613,12 +5855,12 @@ mod tests {
     #[tokio::test]
     async fn no_notice_is_opened_when_the_retry_window_ends_first() {
         let (script, seen) = down_then(usize::MAX, Vec::new());
-        // The notice would be due as the window ends; the request fails at the attempt after that.
-        let mut fx = retrying_fx(script, 1, 1).await;
+        // The retry window (1 s) ends before the unavailable notice (2 s) falls due.
+        let mut fx = retrying_fx(script, 2, 1).await;
         let session = fx.create();
         run_with(session, vec![user("go")]).await;
         let rs = fx.sink.records();
-        assert!(seen.lock().unwrap().len() >= 3, "the request retried past the notice time");
+        assert!(seen.lock().unwrap().len() >= 2, "the request retried before the window ended");
         let items = inbox(&rs);
         assert_eq!(items.len(), 1, "{:?}", kinds(&rs));
         assert_eq!((items[0].kind, items[0].blocking), (InboxKind::Parked, true));
@@ -7875,6 +8117,8 @@ mod tests {
             "claim_update",
             "report_blocker",
             "finish",
+            "ask_for",
+            "hand_off",
             "verdict",
             "ledger",
             "agent_stop",
@@ -8186,5 +8430,407 @@ mod tests {
         wait_until(&fx.sink, "stopped", |rs| turn_ends(rs).contains(&TurnEndReason::Stopped)).await;
         assert!(fx.ctx.capabilities.ptys.ids().is_empty());
         assert_eq!(finish_task(tx, task).await, End::Closed);
+    }
+
+    #[tokio::test]
+    async fn idle_operator_reweave_digest_pauses_clock_and_excludes_idle_wait() {
+        fn long() -> Reply {
+            Reply::tool("bash", json!({ "command": BIG }).to_string()).with_text("t".repeat(100_000))
+        }
+        let script = with_digest(vec![long().into(), long().into(), Reply::text("ok").into()], Some("lead A"));
+        let mut fx = Fx::new("chat", false, false, script).await;
+        fx.context =
+            ReweavePolicy { target_tokens: 100_000, floor_tokens: 1_000, keep_recent_steps: 1, stub_tail_lines: 3 };
+        let session = fx.create();
+        let (tx, task) = spawn_run(session);
+        tx.send(user("go")).unwrap();
+        wait_until(&fx.sink, "turn end", |rs| count(rs, "turn_end") == 1).await;
+        assert!(reweave_records(&fx.sink.records()).is_empty());
+
+        tx.send(Input::Reweave).unwrap();
+        wait_until(&fx.sink, "reweave", |rs| count(rs, "reweave") == 1).await;
+        let rs = fx.sink.records();
+        assert!(
+            rs.iter().any(|r| matches!(&r.event, Event::ModelRequest(m) if m.purpose == Purpose::Digest)),
+            "idle operator reweave should have requested a digest"
+        );
+        let pause_ts = rs
+            .iter()
+            .rev()
+            .find_map(|r| match r.event {
+                Event::BudgetClock { running: false } => Some(r.ts_ms),
+                _ => None,
+            })
+            .expect("idle digest must pause clock");
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert_eq!(finish_task(tx, task).await, End::Closed);
+        let after_idle = Session::open(fx.deps()).unwrap().st.clock.unwrap();
+        assert_eq!(after_idle.running_from, None, "clock must be paused after idle reweave");
+        assert!(now_ms().saturating_sub(pause_ts) >= 100, "idle window should have elapsed");
+        assert_eq!(
+            after_idle.elapsed(now_ms()),
+            after_idle.elapsed(pause_ts),
+            "idle time after digest must not drain budget"
+        );
+
+        // Also check cancellation during an idle digest leaves the clock paused.
+        let cancel_script = Script::new(move |body, _| {
+            let m = body["messages"].as_array().unwrap();
+            if m.last().and_then(|l| l["content"].as_str()).is_some_and(|c| c == texts::DIGEST_PROMPT) {
+                return Action::Stall { ms: 600_000 };
+            }
+            let tools = m.iter().filter(|x| x["role"] == "tool").count();
+            if tools < 2 {
+                long().into()
+            } else {
+                Reply::text("ok").into()
+            }
+        });
+        let mut fx = Fx::new("chat", false, false, cancel_script).await;
+        fx.context =
+            ReweavePolicy { target_tokens: 100_000, floor_tokens: 1_000, keep_recent_steps: 1, stub_tail_lines: 3 };
+        let session = fx.create();
+        let (tx, task) = spawn_run(session);
+        tx.send(user("go")).unwrap();
+        wait_until(&fx.sink, "turn end", |rs| count(rs, "turn_end") == 1).await;
+        tx.send(Input::Reweave).unwrap();
+        wait_until(&fx.sink, "digest request", |rs| {
+            rs.iter().any(|r| matches!(&r.event, Event::ModelRequest(m) if m.purpose == Purpose::Digest))
+        })
+        .await;
+        fx.control.stop_turn();
+        assert_eq!(finish_task(tx, task).await, End::Closed);
+        let reopened = Session::open(fx.deps()).unwrap();
+        assert_eq!(reopened.st.clock.unwrap().running_from, None, "cancelled idle digest must pause clock");
+    }
+
+    #[tokio::test]
+    async fn drain_arrivals_cancels_turn_when_live_inputs_channel_disconnects_mid_turn() {
+        let mut fx = Fx::new(
+            "chat",
+            false,
+            false,
+            seq(vec![
+                Reply::tool(
+                    "bash",
+                    json!({"command": "touch ready && while [ ! -f go ]; do sleep 0.02; done; echo step1"}).to_string(),
+                )
+                .into(),
+                Reply::text("should not run step 2").into(),
+            ]),
+        )
+        .await;
+        let ws = fx.ctx.workspace.clone();
+        let session = fx.create();
+        let (tx, task) = spawn_run(session);
+        tx.send(user("go")).unwrap();
+        for _ in 0..250 {
+            if ws.join("ready").exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(ws.join("ready").exists(), "step 1 bash never started");
+        // Close the live inputs channel mid-turn without calling stop_turn() or sending Input::Stop.
+        drop(tx);
+        std::fs::write(ws.join("go"), "1").unwrap();
+        let end = tokio::time::timeout(Duration::from_secs(10), task).await.expect("session exited").unwrap();
+        assert_eq!(end, End::Closed);
+        let rs = fx.sink.records();
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Stopped], "{:?}", kinds(&rs));
+        assert_eq!(fx.server.requests().len(), 1, "step 2 must not execute after channel disconnect");
+    }
+
+    #[tokio::test]
+    async fn wrapup_allows_child_hand_off_and_lead_ask_for() {
+        let child_script = seq(vec![
+            bash("echo step1").into(),
+            Reply::tool(
+                "hand_off",
+                json!({"state":"partial progress","leads":["try port 8080"],"ask":"more_steps","why":"ran out of steps"})
+                    .to_string(),
+            )
+            .into(),
+        ]);
+        let mut fx = Fx::new("worker", true, true, child_script).await;
+        let session = fx.create_with(
+            Budget { max_steps: Some(1), max_minutes: None },
+            Some((SessionId::from("s-lead"), "Question: find the bug".into())),
+        );
+        let end = run_with(session, vec![]).await;
+        let End::Settled(settled) = end else { panic!("expected settlement, got {end:?}") };
+        assert_eq!(settled.outcome, ChildOutcome::Returned);
+        assert_eq!(settled.payload["handed_off"]["ask"], "more_steps");
+
+        let lead_script = seq(vec![
+            bash("echo step1").into(),
+            Reply::tool(
+                "ask_for",
+                json!({"kind":"budget","what":"10 more steps","why":"need to finish check","meanwhile":"wait"})
+                    .to_string(),
+            )
+            .into(),
+            Reply::tool("wait", json!({}).to_string()).into(),
+        ]);
+        let mut fx = Fx::new("lead", false, true, lead_script).await;
+        let session = fx.create_with(Budget { max_steps: Some(1), max_minutes: None }, None);
+        run_with(session, vec![user("go")]).await;
+        let rs = fx.sink.records();
+        assert!(
+            results(&rs).iter().any(|r| r.name == "ask_for" && r.status == ToolStatus::Ok),
+            "ask_for must succeed during wrapup: {:?}",
+            results(&rs)
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_tools_and_hidden_tools_filter_wire_specs_while_keeping_registry_and_aliases() {
+        let mut baseline_fx = Fx::build("lead", false, true, AgentsCfg::default(), seq(vec![])).await;
+        let mut baseline_session = baseline_fx.create();
+        let baseline_wire = baseline_session.woven().weave.tools;
+        let baseline_names: Vec<&str> = baseline_wire.iter().map(|t| t.name.as_str()).collect();
+        assert!(baseline_names.contains(&"out_read"));
+        assert!(baseline_names.contains(&"step"));
+        assert!(baseline_names.contains(&"note"));
+
+        // With compact_tools = true and hidden_tools = ["note"], wire specs shrink statically while
+        // all tools remain registered, callable directly (even when hidden), and resolvable via aliases.
+        let mut role_no_conclude = core_role("lead");
+        role_no_conclude.hidden_tools = vec!["note".into()];
+        role_no_conclude.tools.retain(|t| t != "conclude" && t != "request_scope");
+        let script = seq(vec![
+            Reply::tool("read_file", json!({"path": "Cargo.toml"}).to_string()).into(),
+            Reply::tool("todo_write", json!({"steps": ["check result"]}).to_string()).into(),
+            Reply::tool("step", json!({"id": "p1", "status": "done", "note": "checked"}).to_string()).into(),
+            Reply::tool(
+                "note",
+                json!({"kind": "decision", "text": "hidden tool still runs", "why": "test"}).to_string(),
+            )
+            .into(),
+            Reply::tool("shell", json!({"command": "echo aliased-exec"}).to_string()).into(),
+            finish_call("done").into(),
+        ]);
+        let mut fx = Fx::build_with(
+            role_no_conclude,
+            "lead",
+            false,
+            true,
+            AgentsCfg { compact_tools: true, verify_finish: false, ..AgentsCfg::default() },
+            script,
+        )
+        .await;
+        std::fs::write(fx.ctx.workspace.join("Cargo.toml"), "[package]\nname = \"probe\"\n").unwrap();
+        let mut session = fx.create();
+        let wire = session.woven().weave.tools;
+        assert!(wire.len() < baseline_wire.len(), "wire={} baseline={}", wire.len(), baseline_wire.len());
+        for hidden in ["note", "step", "out_read", "out_grep", "pin", "reflect", "ask_for", "decide"] {
+            assert!(!wire.iter().any(|t| t.name == hidden), "{hidden} should be hidden on wire");
+        }
+        assert!(session.registry.get("step").is_some());
+        assert!(session.registry.get("note").is_some());
+        assert!(session.registry.resolve("read_file").is_some_and(|(t, c)| t.speculative() && c == Some("read")));
+
+        run_with(session, vec![user("go")]).await;
+        let rs = fx.sink.records();
+        // Wire tool schemas sent to the server stay identical across every step for KV cache stability.
+        let reqs = fx.server.requests();
+        assert!(reqs.len() >= 5);
+        for req in &reqs[1..] {
+            assert_eq!(req["tools"], reqs[0]["tools"]);
+        }
+        let res = results(&rs);
+        assert!(res.iter().any(|r| r.name == "read" && r.status == ToolStatus::Ok));
+        assert!(res.iter().any(|r| r.name == "plan" && r.status == ToolStatus::Ok));
+        assert!(res.iter().any(|r| r.name == "step" && r.status == ToolStatus::Ok));
+        assert!(res.iter().any(|r| r.name == "note" && r.status == ToolStatus::Ok));
+        assert!(res.iter().any(|r| r.name == "bash" && r.status == ToolStatus::Ok));
+        // `shell` resolved to `ToolClass::Exec` so `ExecStarted` was logged cleanly.
+        assert_eq!(rs.iter().filter(|r| matches!(r.event, Event::ExecStarted { .. })).count(), 1);
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Finished]);
+    }
+
+    #[tokio::test]
+    async fn implicit_finish_delivers_child_and_lead_through_gate_and_preserves_verifier_rejection() {
+        // 1) Child implicit finish: runs bash, yields prose -> settles Returned via synthetic finish.
+        let child_script = seq(vec![bash("echo 42").into(), Reply::text("The sum is 42.").into()]);
+        let child_agents = AgentsCfg { implicit_finish: true, verify_finish: false, ..AgentsCfg::default() };
+        let mut kid = Fx::build("worker", true, true, child_agents, child_script).await;
+        kid.track_producers();
+        let session = kid.create_with(Budget::default(), Some((SessionId::from("s-lead"), "Compute sum".into())));
+        let End::Settled(settled) = run_with(session, vec![]).await else {
+            panic!("expected child to settle");
+        };
+        assert_eq!(settled.outcome, ChildOutcome::Returned);
+        assert!(settled.report.contains("The sum is 42."), "{}", settled.report);
+        assert!(settled.report.contains("42"), "{}", settled.report);
+        let krs = kid.sink.records();
+        assert!(krs.iter().any(|r| matches!(&r.event, Event::ToolCall(c) if c.call_id.0.starts_with("implicit_finish_") && c.name == "finish")));
+
+        // 2) Lead implicit finish when goal is unconcluded is refused by the gate (Flow::Next), NEVER bypassing it.
+        let unconcluded_script = seq(vec![
+            bash("echo 42").into(),
+            Reply::text("Premature prose answer").into(),
+            Reply::tool(
+                "report_blocker",
+                json!({"class": "impossible", "what": "cannot conclude", "tried": "echo 42", "needs": "operator"})
+                    .to_string(),
+            )
+            .into(),
+        ]);
+        let mut fx = Fx::build(
+            "lead",
+            false,
+            true,
+            AgentsCfg { implicit_finish: true, verify_finish: false, ..AgentsCfg::default() },
+            unconcluded_script,
+        )
+        .await;
+        fx.track_producers();
+        let session = fx.create();
+        run_with(session, vec![user("go")]).await;
+        let rs = fx.sink.records();
+        assert!(results(&rs).iter().any(|r| r.name == "finish" && r.status == ToolStatus::Error));
+        assert_ne!(turn_ends(&rs), vec![TurnEndReason::Finished]);
+
+        // 3) Lead implicit finish goes through the verifier gate; rejection flows back to the model.
+        let turn = std::sync::atomic::AtomicUsize::new(0);
+        let verify_script = Script::new(move |body, _| {
+            let step = turn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let msgs = body["messages"].as_array().unwrap();
+            let tool_msgs: Vec<&str> =
+                msgs.iter().filter(|m| m["role"] == "tool").filter_map(|m| m["content"].as_str()).collect();
+            let extract_handle = |s: &str| {
+                s.split("out:")
+                    .nth(1)
+                    .and_then(|rest| rest.split(|c: char| !c.is_ascii_hexdigit()).next())
+                    .map(|hex| format!("out:{hex}"))
+            };
+            match step {
+                0 => bash("echo 42").into(),
+                1 => Reply::tool("claim", json!({"text": "output is 42"}).to_string()).into(),
+                2 => {
+                    let h = extract_handle(tool_msgs[0]).unwrap();
+                    Reply::tool(
+                        "evidence",
+                        json!({"claim": "c1", "handle": h, "start": 1, "end": 1, "note": "run output"}).to_string(),
+                    )
+                    .into()
+                }
+                3 => Reply::tool(
+                    "claim_update",
+                    json!({"id": "c1", "status": "supported", "note": "verified"}).to_string(),
+                )
+                .into(),
+                4 => Reply::tool(
+                    "conclude",
+                    json!({"status": "met", "note": "echoed 42", "evidence": ["e1"]}).to_string(),
+                )
+                .into(),
+                5 => {
+                    let h = extract_handle(tool_msgs[0]).unwrap();
+                    Reply::text(format!("Delivered from {h}: output is 42.")).into()
+                }
+                6 => bash("echo 42 rechecked").into(),
+                7 => {
+                    let h = extract_handle(tool_msgs.last().unwrap()).unwrap();
+                    Reply::tool(
+                        "evidence",
+                        json!({"claim": "c1", "handle": h, "start": 1, "end": 1, "note": "rechecked"}).to_string(),
+                    )
+                    .into()
+                }
+                8 => Reply::tool(
+                    "conclude",
+                    json!({"status": "met", "note": "rechecked 42", "evidence": ["e2"]}).to_string(),
+                )
+                .into(),
+                _ => Reply::text("Final answer after addressing objection.").into(),
+            }
+        });
+        let mut fx = Fx::build(
+            "lead",
+            false,
+            true,
+            AgentsCfg { implicit_finish: true, verify_finish: true, ..AgentsCfg::default() },
+            verify_script,
+        )
+        .await;
+        fx.track_producers();
+        {
+            let mut settlements = fx.orch.settlements.lock().unwrap();
+            settlements.insert(
+                SessionId::from("s-kid1"),
+                Settlement {
+                    child: SessionId::from("s-kid1"),
+                    role: "verifier".into(),
+                    outcome: ChildOutcome::Returned,
+                    report: "Verdict: not accepted".into(),
+                    full: None,
+                    payload: json!({"accepted": false, "objections": ["Re-run check needed."], "opened": []}),
+                    steps: 1,
+                    usage: Usage::default(),
+                },
+            );
+            settlements.insert(
+                SessionId::from("s-kid2"),
+                Settlement {
+                    child: SessionId::from("s-kid2"),
+                    role: "verifier".into(),
+                    outcome: ChildOutcome::Returned,
+                    report: "Verdict: accepted".into(),
+                    full: None,
+                    payload: json!({"accepted": true, "objections": [], "opened": []}),
+                    steps: 1,
+                    usage: Usage::default(),
+                },
+            );
+        }
+        let session = fx.create();
+        run_with(session, vec![user("go")]).await;
+        let rs = fx.sink.records();
+        let finishes: Vec<_> = results(&rs).into_iter().filter(|r| r.name == "finish").collect();
+        assert_eq!(finishes.len(), 2, "expected rejected then accepted finish: {finishes:?}");
+        assert_eq!(finishes[0].status, ToolStatus::Error);
+        assert!(finishes[0].text.contains("Re-run check needed."));
+        assert_eq!(finishes[1].status, ToolStatus::Ok);
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Finished]);
+
+        // 4) Verifier role (has `verdict`) never triggers implicit_finish even when implicit_finish = true.
+        let v_script = seq(vec![Reply::text("Looks good to me.").into(), Reply::text("Still prose.").into()]);
+        let v_agents = AgentsCfg { implicit_finish: true, max_nudges: 1, verify_finish: false, ..AgentsCfg::default() };
+        let mut v_fx = Fx::build("verifier", true, true, v_agents, v_script).await;
+        let v_session = v_fx.create_with(Budget::default(), Some((SessionId::from("s-lead"), "Verify".into())));
+        let End::Settled(v_end) = run_with(v_session, vec![]).await else { panic!("expected settlement") };
+        assert_eq!(v_end.outcome, ChildOutcome::Failed);
+        assert!(!results(&v_fx.sink.records()).iter().any(|r| r.name == "finish"));
+    }
+
+    #[tokio::test]
+    async fn idle_ledger_nudge_false_suppresses_stall_note_while_true_emits_it() {
+        for enabled in [false, true] {
+            let agents =
+                AgentsCfg { stall_steps: 3, idle_ledger_nudge: enabled, verify_finish: false, ..AgentsCfg::default() };
+            let mut actions: Vec<Action> = (0..5).map(|_| bash("echo hi").into()).collect();
+            actions.push(finish_call("done").into());
+            let mut role = core_role("lead");
+            role.tools.retain(|t| t != "conclude" && t != "request_scope");
+            let mut fx = Fx::build_with(role, "lead", false, true, agents, seq(actions)).await;
+            let session = fx.create();
+            run_with(session, vec![user("go")]).await;
+            let n = notes(&fx.sink.records(), NoteKind::Stall);
+            if enabled {
+                assert_eq!(n, vec![texts::stall(3)]);
+            } else {
+                assert!(n.is_empty(), "expected no stall note when idle_ledger_nudge = false, got {n:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn extract_out_handles_ignores_embedded_words_and_deduplicates() {
+        let found = extract_out_handles(
+            "see out:0123abcd and about:deadbeef and `out:89abcdef01234567`, plus out:0123abcd and short out:1234",
+        );
+        assert_eq!(found, vec!["out:0123abcd".to_string(), "out:89abcdef01234567".to_string()]);
     }
 }

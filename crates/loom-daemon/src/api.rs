@@ -148,14 +148,14 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use loom_agent::runtime::{BusEvent, NewSession, Runtime, SessionInfo};
 use loom_agent::session::Phase;
-use loom_core::event::Seq;
+use loom_core::event::{Event as LogEvent, Seq};
 use loom_core::log::StoredRecord;
 use loom_core::{BlobRef, MissionId, Record, SessionId};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::json;
 use serde_json::value::RawValue;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
@@ -826,7 +826,9 @@ async fn blob_raw(State(s): State<ApiState>, Path(handle): Path<String>) -> Res<
 async fn blob_lines(State(s): State<ApiState>, Path(handle): Path<String>, q: RawQuery) -> Res<Json<LinesView>> {
     let q = params(q)?;
     let start = number(&q, "start")?.unwrap_or(1).max(1);
-    let end = number(&q, "end")?.unwrap_or(LINES_DEFAULT_END).min(start.saturating_add(LINES_MAX - 1));
+    let end = number(&q, "end")?
+        .unwrap_or_else(|| start.saturating_add(LINES_DEFAULT_END - 1))
+        .min(start.saturating_add(LINES_MAX - 1));
     let blobs = s.runtime.blobs().clone();
     let slice = blocking(move || {
         let id = resolve_blob(&blobs, &handle)?;
@@ -999,9 +1001,43 @@ async fn session_stream(
     Ok(sse_response(rx))
 }
 
+/// Tracks request ids completed (or ended by a turn/session boundary) during log replay so stale
+/// buffered `BusEvent::Delta`s from those requests are never emitted after their records.
+#[derive(Default)]
+struct ReplayReqs {
+    pending: HashSet<String>,
+    completed: HashSet<String>,
+}
+
+impl ReplayReqs {
+    fn note(&mut self, event: &LogEvent) {
+        match event {
+            LogEvent::ModelRequest(m) => {
+                if !self.completed.contains(&m.req_id) {
+                    self.pending.insert(m.req_id.clone());
+                }
+            }
+            LogEvent::ModelResponse(m) => {
+                self.pending.remove(&m.req_id);
+                self.completed.insert(m.req_id.clone());
+            }
+            LogEvent::TurnEnd { .. } | LogEvent::Interrupted { .. } | LogEvent::SessionEnd { .. } => {
+                self.completed.extend(self.pending.drain());
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Send the records after `*after` from the log, page by page, advancing `*after`. False when the
 /// stream should end (client gone, or the log cannot be read).
-async fn replay(runtime: &Runtime, id: &SessionId, after: &mut Option<Seq>, tx: &mpsc::Sender<Event>) -> bool {
+async fn replay(
+    runtime: &Runtime,
+    id: &SessionId,
+    after: &mut Option<Seq>,
+    tx: &mpsc::Sender<Event>,
+    reqs: &mut ReplayReqs,
+) -> bool {
     loop {
         let page = {
             let (runtime, sid, from) = (runtime.clone(), id.clone(), *after);
@@ -1017,6 +1053,7 @@ async fn replay(runtime: &Runtime, id: &SessionId, after: &mut Option<Seq>, tx: 
         let full = page.len() >= REPLAY_PAGE;
         for stored in page {
             *after = Some(stored.record.seq);
+            reqs.note(&stored.record.event);
             if !send(tx, replayed_event(id, stored)).await {
                 return false;
             }
@@ -1039,7 +1076,8 @@ async fn pump_session(
     if !push(&tx, &BusEvent::Status { session: id.clone(), status: info.status.clone() }).await {
         return;
     }
-    if !replay(&runtime, &id, &mut after, &tx).await {
+    let mut reqs = ReplayReqs::default();
+    if !replay(&runtime, &id, &mut after, &tx, &mut reqs).await {
         return;
     }
     loop {
@@ -1055,8 +1093,13 @@ async fn pump_session(
                     return;
                 }
                 // Records among the missed events are still in the log.
-                if !replay(&runtime, &id, &mut after, &tx).await {
+                if !replay(&runtime, &id, &mut after, &tx, &mut reqs).await {
                     return;
+                }
+                if let Some(current) = runtime.session(&id) {
+                    if !push(&tx, &BusEvent::Status { session: id.clone(), status: current.status }).await {
+                        return;
+                    }
                 }
                 continue;
             }
@@ -1068,10 +1111,12 @@ async fn pump_session(
                     false
                 } else {
                     after = Some(record.seq);
+                    reqs.note(&record.event);
                     true
                 }
             }
-            BusEvent::Delta { session, .. } | BusEvent::Status { session, .. } => *session == id,
+            BusEvent::Delta { session, req_id, .. } => *session == id && !reqs.completed.contains(req_id),
+            BusEvent::Status { session, .. } => *session == id,
             _ => false,
         };
         if wanted && !push(&tx, &event).await {
@@ -2847,6 +2892,69 @@ mod tests {
         }
         let (s, v) = e.post("/api/sessions", json!({"workspace": canon.join("home")})).await;
         assert!(s == 409 && v["error"].as_str().unwrap().contains("inside the loom home"), "{s} {v}");
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn blob_lines_defaults_end_relative_to_start() {
+        let e = env(Script::new(|_, _| finish("x"))).await;
+        let text: String = (1..=3_000).map(|n| format!("line {n}\n")).collect();
+        let blob = e.rt.blobs().put_bytes(text.as_bytes()).unwrap();
+        let (s, body) = e.get(&format!("/api/blobs/{}/lines?start=2500", blob.handle())).await;
+        assert_eq!(s, 200);
+        assert_eq!((body["first"].clone(), body["last"].clone()), (json!(2500), json!(3000)));
+        assert!(body["text"].as_str().unwrap().starts_with("line 2500\n"));
+        assert!(body["text"].as_str().unwrap().ends_with("line 3000\n"));
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn pump_session_drops_stale_deltas_of_replayed_requests_and_refreshes_status_on_lag() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let id = e.create("hi").await;
+        e.wait_turn_ends(&id, 1).await;
+        let info = e.rt.session(&SessionId::from(id.as_str())).unwrap();
+        let sid = info.meta.id.clone();
+        let records = e.records(&id).await;
+        let req_id = records
+            .iter()
+            .find_map(|r| (r["kind"] == "model_response").then(|| r["req_id"].as_str().map(str::to_string)).flatten())
+            .expect("model_response req_id");
+
+        let (bus_tx, bus_rx) = broadcast::channel(4);
+        // Overflow so recv() hits Lagged, leaving both a stale completed req_id delta and a live one.
+        for _ in 0..5 {
+            bus_tx
+                .send(BusEvent::Delta {
+                    session: sid.clone(),
+                    req_id: req_id.clone(),
+                    delta: Delta::Text { text: "stale".into() },
+                })
+                .unwrap();
+        }
+        bus_tx
+            .send(BusEvent::Delta {
+                session: sid.clone(),
+                req_id: "live-req".into(),
+                delta: Delta::Text { text: "fresh".into() },
+            })
+            .unwrap();
+        drop(bus_tx);
+
+        let (tx, rx) = mpsc::channel(STREAM_BUFFER);
+        tokio::spawn(pump_session(e.rt.clone(), info, None, bus_rx, tx, CancellationToken::new()));
+        let bytes = axum::body::to_bytes(sse_response(rx).into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(bytes.to_vec()).unwrap();
+        let events: Vec<Value> = body
+            .split("\n\n")
+            .filter_map(|b| b.lines().find_map(|l| l.strip_prefix("data:")))
+            .map(|d| serde_json::from_str(d.trim()).unwrap())
+            .collect();
+        let lagged = events.iter().position(|v| v["type"] == "lagged").expect("lagged event");
+        assert_eq!(events.get(lagged + 1).map(|v| &v["type"]), Some(&json!("status")));
+        let deltas: Vec<&str> =
+            events.iter().filter(|v| v["type"] == "delta").filter_map(|v| v["delta"]["text"].as_str()).collect();
+        assert_eq!(deltas, vec!["fresh"]);
         e.rt.shutdown().await;
     }
 }

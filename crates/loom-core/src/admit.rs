@@ -388,7 +388,7 @@ pub fn admit(
     let handle = blob.handle();
     let lines = split_lines(&text);
     let n = lines.len();
-    let est = estimator.tokens(text.chars().count());
+    let est = estimator.tokens(text.len());
 
     let mut cut = false;
     let mut shown: Vec<(u64, u64)> = Vec::new();
@@ -423,13 +423,14 @@ pub fn admit(
         };
         let inp =
             CutInput { text: &text, lines: &lines, starts: &starts, matching: &matching, handle: &handle, policy };
+        let body_budget = byte_budget(estimator, policy.max_inline_tokens);
         let mut head = usize::try_from(policy.head_lines).unwrap_or(usize::MAX);
         let mut tail = usize::try_from(policy.tail_lines).unwrap_or(usize::MAX);
         // Halve head and tail until something is omitted and the body fits (never below one line each).
         let r = loop {
-            let r = render_cut(&inp, head, tail);
+            let r = render_cut(&inp, head, tail, body_budget);
             let omission = head.saturating_add(tail) < n;
-            let fits = estimator.tokens(r.body.chars().count()) <= policy.max_inline_tokens;
+            let fits = !r.scan_starved && estimator.tokens(r.body.len()) <= policy.max_inline_tokens;
             if (omission && fits) || (head <= 1 && tail <= 1) {
                 break r;
             }
@@ -492,12 +493,25 @@ fn cut_line(line: &str, max: usize) -> Option<String> {
     Some(format!("{kept}…[+{rest} chars]"))
 }
 
+const MIN_SCAN_LINE_CHARS: usize = 120;
+
+fn byte_budget(estimator: &TokenEstimator, max_inline_tokens: u64) -> usize {
+    let mut bytes = estimator.chars(max_inline_tokens);
+    while bytes > 0 && estimator.tokens(bytes) > max_inline_tokens {
+        bytes -= 1;
+    }
+    bytes
+}
+
 struct Rendered {
     body: String,
     /// Zero-based indexes of the lines present in full (lines cut at `max_line_chars` are not).
     shown: Vec<usize>,
     long_lines_cut: u64,
     scan_listed: u64,
+    /// True when head + tail left less than a quarter of the budget for an oversized salient scan
+    /// while `head` or `tail` can still be halved.
+    scan_starved: bool,
 }
 
 struct CutInput<'a> {
@@ -515,68 +529,171 @@ fn halve(x: usize) -> usize {
     (x / 2).max(1).min(x)
 }
 
-fn render_cut(inp: &CutInput<'_>, head: usize, tail: usize) -> Rendered {
+struct ScanEntry {
+    idx: usize,
+    formatted: String,
+    was_cut: bool,
+}
+
+fn build_scan_entries(
+    inp: &CutInput<'_>,
+    hits: &[usize],
+    k: usize,
+    line_cap: usize,
+) -> (usize, String, Vec<ScanEntry>) {
+    let m = hits.len();
+    let banner = format!(
+        "[pattern scan of the lines not shown — {k} of {m} matching lines, by line number; this is a text match, not a reading:]"
+    );
+    let mut total_bytes = 1usize.saturating_add(banner.len());
+    let mut entries = Vec::with_capacity(k);
+    for j in 0..k {
+        // Evenly spread over the matches, first and last included.
+        let pick = if k == 1 { 0 } else { ((j as u128 * (m as u128 - 1)) / (k as u128 - 1)) as usize };
+        if let Some(&idx) = hits.get(pick) {
+            let line = inp.lines.get(idx).copied().unwrap_or("");
+            let (text, was_cut) = match cut_line(line, line_cap) {
+                Some(c) => (c, true),
+                None => (line.to_string(), false),
+            };
+            let formatted = format!("{}: {text}", idx + 1);
+            total_bytes = total_bytes.saturating_add(1usize.saturating_add(formatted.len()));
+            entries.push(ScanEntry { idx, formatted, was_cut });
+        }
+    }
+    (total_bytes, banner, entries)
+}
+
+fn fit_scan(
+    inp: &CutInput<'_>,
+    hits: &[usize],
+    max_k: usize,
+    scan_budget: usize,
+    can_halve: bool,
+    quarter_budget: usize,
+) -> (Option<(String, Vec<ScanEntry>)>, bool) {
+    if max_k == 0 || scan_budget == 0 {
+        let starved = max_k > 0 && can_halve && scan_budget < quarter_budget;
+        return (None, starved);
+    }
+    let max_cap = inp.policy.max_line_chars;
+    let (uncapped_bytes, uncapped_banner, uncapped_entries) = build_scan_entries(inp, hits, max_k, max_cap);
+    if uncapped_bytes <= scan_budget {
+        return (Some((uncapped_banner, uncapped_entries)), false);
+    }
+    if can_halve && scan_budget < quarter_budget {
+        return (None, true);
+    }
+    let upper_k = max_k.min(scan_budget / 4);
+    for k in (1..=upper_k).rev() {
+        let min_cap = if k == 1 { 1.min(max_cap) } else { MIN_SCAN_LINE_CHARS.min(max_cap) };
+        if k < max_k {
+            let (bytes, banner, entries) = build_scan_entries(inp, hits, k, max_cap);
+            if bytes <= scan_budget {
+                return (Some((banner, entries)), false);
+            }
+        }
+        if min_cap >= max_cap {
+            continue;
+        }
+        let (min_bytes, min_banner, min_entries) = build_scan_entries(inp, hits, k, min_cap);
+        if min_bytes > scan_budget {
+            continue;
+        }
+        let (mut lo, mut hi) = (min_cap + 1, max_cap.saturating_sub(1));
+        let (mut best_banner, mut best_entries) = (min_banner, min_entries);
+        while lo <= hi {
+            let mid = lo + (hi - lo) / 2;
+            let (bytes, banner, entries) = build_scan_entries(inp, hits, k, mid);
+            if bytes <= scan_budget {
+                best_banner = banner;
+                best_entries = entries;
+                lo = mid + 1;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        return (Some((best_banner, best_entries)), false);
+    }
+    (None, false)
+}
+
+fn render_cut(inp: &CutInput<'_>, head: usize, tail: usize, body_budget: usize) -> Rendered {
     let n = inp.lines.len();
     let max = inp.policy.max_line_chars;
     let head = head.min(n);
     let tail = tail.min(n - head);
-    let mut out: Vec<String> = Vec::new();
+    let mut head_out: Vec<String> = Vec::with_capacity(head);
+    let mut tail_out: Vec<String> = Vec::with_capacity(tail);
     let mut shown = Vec::new();
     let mut long_cut = 0u64;
     let mut listed = 0u64;
-    let push_line =
-        |out: &mut Vec<String>, shown: &mut Vec<usize>, long_cut: &mut u64, idx: usize, prefix: Option<usize>| {
-            let line = inp.lines.get(idx).copied().unwrap_or("");
-            let (text, was_cut) = match cut_line(line, max) {
-                Some(c) => (c, true),
-                None => (line.to_string(), false),
-            };
-            if was_cut {
-                *long_cut += 1;
-            } else {
-                shown.push(idx);
-            }
-            out.push(match prefix {
-                Some(no) => format!("{no}: {text}"),
-                None => text,
-            });
+    let push_line = |out: &mut Vec<String>, shown: &mut Vec<usize>, long_cut: &mut u64, idx: usize| {
+        let line = inp.lines.get(idx).copied().unwrap_or("");
+        let (text, was_cut) = match cut_line(line, max) {
+            Some(c) => (c, true),
+            None => (line.to_string(), false),
         };
+        if was_cut {
+            *long_cut += 1;
+        } else {
+            shown.push(idx);
+        }
+        out.push(text);
+    };
     for idx in 0..head {
-        push_line(&mut out, &mut shown, &mut long_cut, idx, None);
+        push_line(&mut head_out, &mut shown, &mut long_cut, idx);
     }
     let first_omitted = head;
     let end_omitted = n - tail;
+    for idx in end_omitted..n {
+        push_line(&mut tail_out, &mut shown, &mut long_cut, idx);
+    }
+    let mut out = head_out;
+    let mut scan_starved = false;
     if first_omitted < end_omitted {
         let at = |i: usize| inp.starts.get(i).copied().unwrap_or(inp.text.len());
         let omitted_bytes = at(end_omitted).saturating_sub(at(first_omitted));
-        out.push(format!(
+        let marker = format!(
             "[cut by harness: lines {}-{} of {} are not shown here ({} bytes). Nothing was discarded.\n Read them with out_read(\"{h}\", start, end) or search with out_grep(\"{h}\", pattern).]",
             first_omitted + 1,
             end_omitted,
             n,
             omitted_bytes,
             h = inp.handle
-        ));
+        );
+        let non_scan_bytes = out
+            .iter()
+            .map(String::len)
+            .sum::<usize>()
+            .saturating_add(marker.len())
+            .saturating_add(tail_out.iter().map(String::len).sum::<usize>())
+            .saturating_add(out.len())
+            .saturating_add(tail_out.len());
+        out.push(marker);
         let hits: Vec<usize> =
             inp.matching.iter().copied().filter(|i| *i >= first_omitted && *i < end_omitted).collect();
-        let m = hits.len();
-        let k = m.min(inp.policy.salient_max);
-        if k > 0 {
-            out.push(format!("[pattern scan of the lines not shown — {k} of {m} matching lines, by line number; this is a text match, not a reading:]"));
-            for j in 0..k {
-                // Evenly spread over the matches, first and last included.
-                let pick = if k == 1 { 0 } else { ((j as u128 * (m as u128 - 1)) / (k as u128 - 1)) as usize };
-                if let Some(&idx) = hits.get(pick) {
-                    push_line(&mut out, &mut shown, &mut long_cut, idx, Some(idx + 1));
+        let max_k = hits.len().min(inp.policy.salient_max);
+        if max_k > 0 {
+            let scan_budget = body_budget.saturating_sub(non_scan_bytes);
+            let (fitted, starved) = fit_scan(inp, &hits, max_k, scan_budget, head > 1 || tail > 1, body_budget / 4);
+            scan_starved = starved;
+            if let Some((banner, entries)) = fitted {
+                out.push(banner);
+                for entry in entries {
+                    if entry.was_cut {
+                        long_cut += 1;
+                    } else {
+                        shown.push(entry.idx);
+                    }
+                    out.push(entry.formatted);
                     listed += 1;
                 }
             }
         }
     }
-    for idx in end_omitted..n {
-        push_line(&mut out, &mut shown, &mut long_cut, idx, None);
-    }
-    Rendered { body: out.join("\n"), shown, long_lines_cut: long_cut, scan_listed: listed }
+    out.extend(tail_out);
+    Rendered { body: out.join("\n"), shown, long_lines_cut: long_cut, scan_listed: listed, scan_starved }
 }
 
 fn merge_ranges(mut idx: Vec<usize>) -> Vec<(u64, u64)> {
@@ -1045,6 +1162,43 @@ mod tests {
         };
         let (a, _) = admit_text(&text, &policy);
         assert!(a.cut);
-        assert!(TokenEstimator::with_ratio(1.5).tokens(a.text.chars().count()) <= 500 + 60);
+        assert!(TokenEstimator::with_ratio(1.5).tokens(a.text.len()) <= 500 + 60);
+    }
+
+    #[test]
+    fn salient_scan_is_budgeted_without_crushing_head_and_tail() {
+        // 400 lines of 2000-byte error lines (800 KB total), on a 128k window (16_000 tokens).
+        let pad = "x".repeat(1985);
+        let text: String = (1..=400).map(|i| format!("ERROR line {i:03} {pad}\n")).collect();
+        let policy = AdmitPolicy::default().for_window(Some(128_000));
+        assert_eq!(policy.max_inline_tokens, 16_000);
+        let est = TokenEstimator::default();
+        let (_d, s) = store();
+        let b = s.put_bytes(text.as_bytes()).unwrap();
+        let a = admit(&s, &b, &facts(), &policy, &est).unwrap();
+        assert!(a.cut);
+        assert!(a.scan_listed > 0);
+        // The body fits within max_inline_tokens and head/tail were not crushed down to 1 line each.
+        let body = a.text.split_once('\n').unwrap().1.rsplit_once('\n').unwrap().0;
+        assert!(est.tokens(body.len()) <= policy.max_inline_tokens, "body tokens {}", est.tokens(body.len()));
+        assert!(a.shown.iter().any(|&(lo, hi)| lo == 1 && hi >= 4), "head/tail crushed: {:?}", a.shown);
+    }
+
+    #[test]
+    fn multibyte_output_uses_byte_budget() {
+        // 600 3-byte CJK chars = 1800 UTF-8 bytes; 600 / 1.5 = 400 <= 500, while 1800 / 1.5 = 1200 > 500.
+        let line = "日".repeat(30);
+        let text: String = (0..20).map(|_| format!("{line}\n")).collect();
+        let policy = AdmitPolicy {
+            max_inline_tokens: 500,
+            head_lines: 10,
+            tail_lines: 10,
+            salient_patterns: vec![],
+            ..AdmitPolicy::default()
+        };
+        let (a, _) = admit_text(&text, &policy);
+        assert!(a.cut);
+        let body = a.text.split_once('\n').unwrap().1.rsplit_once('\n').unwrap().0;
+        assert!(TokenEstimator::with_ratio(1.5).tokens(body.len()) <= 500, "body bytes {}", body.len());
     }
 }

@@ -117,6 +117,10 @@ pub struct RoleDef {
     pub flag_regex: Option<String>,
     /// Copied from the pack's `solvable` key at load: the operator built this mission to be solved.
     pub solvable: bool,
+    /// Optional default shell routing for `bash` ("host" or "box").
+    pub default_shell: Option<String>,
+    /// Optional per-role tool names omitted from wire tool specs (still runnable if called).
+    pub hidden_tools: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -206,6 +210,9 @@ struct RawRole {
     #[serde(default)]
     require_distinct_verifier_profile: bool,
     flag_regex: Option<String>,
+    default_shell: Option<String>,
+    #[serde(default)]
+    hidden_tools: Vec<String>,
 }
 
 fn valid_name(s: &str) -> bool {
@@ -386,6 +393,11 @@ fn parse_pack(
         if r.max_steps == Some(0) {
             return Err(format!("{at}: max_steps must be at least one; omit it to inherit the dispatch budget"));
         }
+        if let Some(shell) = &r.default_shell {
+            if !matches!(shell.as_str(), "host" | "box") {
+                return Err(format!("{at}: `default_shell` = \"{shell}\" is invalid; use host or box"));
+            }
+        }
         let verifier = resolve_verifier(&at, rname == "verifier", r, &raw.roles, &role_list)?;
         roles.insert(
             rname.clone(),
@@ -410,6 +422,8 @@ fn parse_pack(
                 require_distinct_verifier_profile: r.require_distinct_verifier_profile,
                 flag_regex: r.flag_regex.clone(),
                 solvable: raw.solvable,
+                default_shell: r.default_shell.clone(),
+                hidden_tools: r.hidden_tools.clone(),
             },
         );
     }
@@ -785,14 +799,14 @@ mod tests {
         let p = Packs::load(&dir).unwrap();
         let known = crate::rtools::known_tools();
         let has = |pack: &str, role: &str, tool: &str| p.get(pack).unwrap().roles[role].tools.iter().any(|t| t == tool);
-        for (pack, role) in [("core", "lead"), ("vr", "researcher"), ("vr", "scout")] {
+        for (pack, role) in [("core", "lead"), ("vr", "researcher")] {
             assert!(has(pack, role, "request_scope") && has(pack, role, "conclude"), "{pack}/{role}");
         }
         // A read-only chat asks for scope; it concludes nothing.
         for pack in ["core", "vr"] {
             assert!(has(pack, "chat", "request_scope") && !has(pack, "chat", "conclude"), "{pack}/chat");
         }
-        for (pack, role) in [("core", "worker"), ("core", "verifier"), ("vr", "judge")] {
+        for (pack, role) in [("core", "worker"), ("core", "verifier"), ("vr", "scout"), ("vr", "judge")] {
             assert!(!has(pack, role, "request_scope") && !has(pack, role, "conclude"), "{pack}/{role}");
         }
         assert!(known.iter().any(|t| t == "request_scope") && known.iter().any(|t| t == "conclude"));
@@ -1075,6 +1089,31 @@ mod tests {
         for (pack, lead, child) in [("core", "lead", "worker"), ("vr", "researcher", "scout")] {
             assert!(has(pack, lead, "ask_for") && !has(pack, lead, "hand_off"), "{pack}/{lead}");
             assert!(has(pack, child, "hand_off") && !has(pack, child, "ask_for"), "{pack}/{child}");
+        }
+    }
+
+    #[test]
+    fn default_shell_and_hidden_tools_validate_and_default_cleanly() {
+        let baseline = Packs::load(mk(GOOD).path()).unwrap();
+        let base_role = baseline.role(Some("mine"), Some("a")).unwrap();
+        assert_eq!(base_role.default_shell, None);
+        assert!(base_role.hidden_tools.is_empty());
+
+        for shell in ["host", "box"] {
+            let text = GOOD.replace(
+                "[roles.a]",
+                &format!("[roles.a]\ndefault_shell = \"{shell}\"\nhidden_tools = [\"step\", \"out_read\"]"),
+            );
+            let packs = Packs::load(mk(&text).path()).unwrap();
+            let role = packs.role(Some("mine"), Some("a")).unwrap();
+            assert_eq!(role.default_shell.as_deref(), Some(shell));
+            assert_eq!(role.hidden_tools, vec!["step".to_string(), "out_read".to_string()]);
+        }
+
+        for bad_shell in ["container", "HOST", ""] {
+            let bad = GOOD.replace("[roles.a]", &format!("[roles.a]\ndefault_shell = \"{bad_shell}\""));
+            let e = err(&bad);
+            assert!(e.contains("default_shell") && e.contains("host or box"), "{bad_shell}: {e}");
         }
     }
 }

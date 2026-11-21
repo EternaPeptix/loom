@@ -74,16 +74,15 @@
 //! costs a step; line numbers are what the numbered views (`out_read`, `out_grep`, `read`) give the
 //! model for nothing. After the handle and range checks above, with no text to pin the place, the range
 //! is taken at its word:
-//! - `end` past the last line is refused, not clamped: `quote {i}: {handle} has {total} lines, so end
-//!   {end} is past its end. A quote without its text is exactly the lines you name; give a range within
-//!   1-{total}.`
-//! - more than `observe::REF_QUOTE_MAX_LINES` (20) lines: `quote {i}: lines {start}-{end} are {n} lines; a
-//!   quote without its text takes at most 20. Name only the lines that show the point, or give several
+//! - `end` past the last line is clamped to `total` when `1 <= start <= total`; only `start == 0`,
+//!   `start > end`, or `start > total` is refused as an out-of-range start/range.
+//! - more than `observe::REF_QUOTE_MAX_LINES` (40) lines (after clamping `end`): `quote {i}: lines {start}-{end} are {n} lines; a
+//!   quote without its text takes at most 40. Name only the lines that show the point, or give several
 //!   quotes.` (a range costs nothing to widen, and a quote is the lines that show a point);
 //! - `observe::lines_as_quote(lines, start)` is `None`: `quote {i}: lines {start}-{end} of {handle} are
 //!   blank. Name the lines that carry the text.`
-//! - its text has more than `observe::REF_QUOTE_MAX_CHARS` (2000) characters: `quote {i}: lines
-//!   {start}-{end} of {handle} have {n} characters; a quote without its text takes at most 2000. Name
+//! - its text has more than `observe::REF_QUOTE_MAX_CHARS` (4000) characters: `quote {i}: lines
+//!   {start}-{end} of {handle} have {n} characters; a quote without its text takes at most 4000. Name
 //!   fewer lines, or give the text of the part that shows the point, copied exactly.`
 //!
 //! Otherwise it is verified with that text and the numbers of its first and last line (blank lines at
@@ -489,6 +488,25 @@ pub async fn check_quotes(ctx: &ToolCtx, quotes: &[Quote]) -> Result<Vec<Verifie
     }
 }
 
+fn wrong_line_error(i: usize, handle: &str, quoted: u64, actual: u64) -> String {
+    format!(
+        "quote {i}: the text is on line {actual} of {handle}, not line {quoted}. Fix the line number, or quote the text without line numbers."
+    )
+}
+
+fn too_short_error(i: usize) -> String {
+    format!(
+        "quote {i}: a quote that is only part of a line needs at least {} non-space characters. Quote more of the line, or the whole line with its indentation.",
+        observe::MIN_PARTIAL_QUOTE_CHARS
+    )
+}
+
+fn inside_token_error(i: usize, handle: &str, line: u64) -> String {
+    format!(
+        "quote {i}: the text occurs on line {line} of {handle} only inside a longer word or number. Quote from the start of that word or number to its end, or quote the whole line."
+    )
+}
+
 /// The checks on one quote whose handle opened as `id`.
 fn check_one(blobs: &BlobStore, q: &Quote, i: usize, id: BlobId) -> Result<VerifiedQuote, String> {
     let handle = &q.handle;
@@ -496,20 +514,67 @@ fn check_one(blobs: &BlobStore, q: &Quote, i: usize, id: BlobId) -> Result<Verif
         .meta(&id)
         .map_err(|e| format!("quote {i}: the stored output {handle} could not be read ({e}); try again."))?
         .lines;
-    if q.start < 1 || q.end < q.start {
-        return Err(format!(
-            "quote {i}: the line range {}-{} is not valid; lines are numbered from 1 and start must not be after end.",
-            q.start, q.end
-        ));
-    }
-    if q.start > total {
-        return Err(format!(
-            "quote {i}: {handle} has {total} lines, so start {} is past its end; give a range within 1-{total}.",
-            q.start
-        ));
+    let omitted_range = q.start == 0 && q.end == 0 && !q.text.trim().is_empty();
+    if !omitted_range {
+        if q.start < 1 || q.end < q.start {
+            return Err(format!(
+                "quote {i}: the line range {}-{} is not valid; lines are numbered from 1 and start must not be after end.",
+                q.start, q.end
+            ));
+        }
+        if q.start > total {
+            return Err(format!(
+                "quote {i}: {handle} has {total} lines, so start {} is past its end; give a range within 1-{total}.",
+                q.start
+            ));
+        }
     }
     if q.text.trim().is_empty() {
         return by_lines(blobs, q, &id, total, i);
+    }
+    let read_full = || -> Result<String, String> {
+        if total == 0 {
+            return Ok(String::new());
+        }
+        blobs
+            .read_lines(&id, 1, total)
+            .map(|s| s.text)
+            .map_err(|e| format!("quote {i}: the stored output {handle} could not be read ({e}); try again."))
+    };
+    if omitted_range {
+        let full_text = read_full()?;
+        return match observe::find_unique_quote(&full_text, &q.text) {
+            Ok(Some((actual_start, actual_end, recorded))) => {
+                Ok(VerifiedQuote { blob: id, start: actual_start, end: actual_end, text: recorded })
+            }
+            Err(observe::QuoteError::TooShort) => Err(too_short_error(i)),
+            Err(observe::QuoteError::InsideToken { line }) => Err(inside_token_error(i, handle, line)),
+            Ok(None) | Err(observe::QuoteError::NotFound | observe::QuoteError::WrongLine { .. }) => {
+                if total == 0 {
+                    return Err(format!(
+                        "quote {i}: {handle} is empty; the text does not occur in it. Copy the text exactly from the output."
+                    ));
+                }
+                match observe::check_quote_at(&full_text, &q.text, 1) {
+                    Ok(_) => Err(format!(
+                        "quote {i}: the text occurs more than once in {handle}; give `start` and `end` line numbers to name which occurrence you mean."
+                    )),
+                    Err(observe::QuoteError::WrongLine { quoted, actual }) => {
+                        Err(wrong_line_error(i, handle, quoted, actual))
+                    }
+                    Err(observe::QuoteError::TooShort) => Err(too_short_error(i)),
+                    Err(observe::QuoteError::InsideToken { line }) => Err(inside_token_error(i, handle, line)),
+                    Err(observe::QuoteError::NotFound) => {
+                        let mut msg = format!("quote {i}: the text does not occur in {handle} lines 1-{total}.");
+                        if let Some((n, line)) = observe::nearest_line(&full_text, &q.text) {
+                            msg.push_str(&format!(" The closest line there is {n}: {}", cut_chars(&line, 200)));
+                        }
+                        msg.push_str(" Copy the text exactly from the output.");
+                        Err(msg)
+                    }
+                }
+            }
+        };
     }
     let end = q.end.min(total);
     let slice = blobs
@@ -522,22 +587,24 @@ fn check_one(blobs: &BlobStore, q: &Quote, i: usize, id: BlobId) -> Result<Verif
             return Ok(VerifiedQuote { blob: id, start: first, end: last, text });
         }
         Err(observe::QuoteError::WrongLine { quoted, actual }) => {
-            return Err(format!(
-                "quote {i}: the text is on line {actual} of {handle}, not line {quoted}. Fix the line number, or quote the text without line numbers."
-            ));
+            return Err(wrong_line_error(i, handle, quoted, actual));
         }
         Err(observe::QuoteError::TooShort) => {
-            return Err(format!(
-                "quote {i}: a quote that is only part of a line needs at least {} non-space characters. Quote more of the line, or the whole line with its indentation.",
-                observe::MIN_PARTIAL_QUOTE_CHARS
-            ));
+            return Err(too_short_error(i));
         }
         Err(observe::QuoteError::InsideToken { line }) => {
-            return Err(format!(
-                "quote {i}: the text occurs on line {line} of {handle} only inside a longer word or number. Quote from the start of that word or number to its end, or quote the whole line."
-            ));
+            return Err(inside_token_error(i, handle, line));
         }
         Err(observe::QuoteError::NotFound) => {}
+    }
+    let full_text = read_full()?;
+    match observe::find_unique_quote(&full_text, &q.text) {
+        Ok(Some((actual_start, actual_end, recorded))) => {
+            return Ok(VerifiedQuote { blob: id, start: actual_start, end: actual_end, text: recorded });
+        }
+        Err(observe::QuoteError::TooShort) => return Err(too_short_error(i)),
+        Err(observe::QuoteError::InsideToken { line }) => return Err(inside_token_error(i, handle, line)),
+        Ok(None) | Err(observe::QuoteError::NotFound | observe::QuoteError::WrongLine { .. }) => {}
     }
     let mut msg = format!("quote {i}: the text does not occur in {handle} lines {}-{end}.", q.start);
     if let Some((n, line)) = observe::nearest_line(&slice.text, &q.text) {
@@ -552,13 +619,8 @@ fn check_one(blobs: &BlobStore, q: &Quote, i: usize, id: BlobId) -> Result<Verif
 /// `q.start` is known to be a line of the output, and not after `q.end`.
 fn by_lines(blobs: &BlobStore, q: &Quote, id: &BlobId, total: u64, i: usize) -> Result<VerifiedQuote, String> {
     let handle = &q.handle;
-    let (start, end) = (q.start, q.end);
-    // No text pins the place, so the range is taken at its word: nothing is clamped.
-    if end > total {
-        return Err(format!(
-            "quote {i}: {handle} has {total} lines, so end {end} is past its end. A quote without its text is exactly the lines you name; give a range within 1-{total}."
-        ));
-    }
+    let start = q.start;
+    let end = q.end.min(total);
     let count = end.saturating_sub(start).saturating_add(1);
     if count > observe::REF_QUOTE_MAX_LINES {
         return Err(format!(
@@ -1105,38 +1167,43 @@ To keep working, call a tool. To deliver your result, call finish; if the assign
     }
 
     #[tokio::test]
-    async fn a_quote_without_its_text_is_taken_at_its_word_and_kept_small() {
+    async fn a_quote_without_its_text_clamps_end_and_is_kept_small() {
         let (_d, ctx, h) = store_with(OUT);
-        // With no text to pin the place, a range past the end is not clamped.
-        let e = check_quotes(&ctx, &[q(&h, 3, 9, "")]).await.err().unwrap_or_default();
+        let id = ctx.blobs.resolve(&h).unwrap_or_else(|e| panic!("{e}"));
+        // With `1 <= start <= total` and `end > total`, `end` clamps to `total`.
+        let ok = check_quotes(&ctx, &[q(&h, 3, 9, "")]).await.unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(
-            e,
-            format!("quote 1: {h} has 4 lines, so end 9 is past its end. A quote without its text is exactly the lines you name; give a range within 1-4.")
+            ok,
+            vec![VerifiedQuote { blob: id, start: 3, end: 4, text: "gamma line three\ndelta line four".into() }]
         );
-        // The checks of any quote come first.
+        // `start == 0`, `start > end`, and `start > total` are still refused.
+        let e = check_quotes(&ctx, &[q(&h, 0, 2, "")]).await.err().unwrap_or_default();
+        assert!(e.contains("not valid"), "{e}");
+        let e = check_quotes(&ctx, &[q(&h, 4, 2, "")]).await.err().unwrap_or_default();
+        assert!(e.contains("not valid"), "{e}");
         let e = check_quotes(&ctx, &[q(&h, 9, 12, "")]).await.err().unwrap_or_default();
         assert!(e.contains("start 9 is past its end"), "{e}");
         let e = check_quotes(&ctx, &[q("out:0123456789abcdef", 1, 1, "")]).await.err().unwrap_or_default();
         assert!(e.contains("no output of this mission has the handle"), "{e}");
-        // At most 20 lines.
-        let many: String = (1..=30).map(|n| format!("line {n}\n")).collect();
+        // At most 40 lines.
+        let many: String = (1..=50).map(|n| format!("line {n}\n")).collect();
         let (_d, ctx, h) = store_with(&many);
-        assert_eq!(check_quotes(&ctx, &[q(&h, 5, 24, "")]).await.map(|v| (v[0].start, v[0].end)), Ok((5, 24)));
-        let e = check_quotes(&ctx, &[q(&h, 5, 25, "")]).await.err().unwrap_or_default();
+        assert_eq!(check_quotes(&ctx, &[q(&h, 5, 44, "")]).await.map(|v| (v[0].start, v[0].end)), Ok((5, 44)));
+        let e = check_quotes(&ctx, &[q(&h, 5, 45, "")]).await.err().unwrap_or_default();
         assert_eq!(
             e,
-            "quote 1: lines 5-25 are 21 lines; a quote without its text takes at most 20. Name only the lines that show the point, or give several quotes."
+            "quote 1: lines 5-45 are 41 lines; a quote without its text takes at most 40. Name only the lines that show the point, or give several quotes."
         );
         // Blank lines carry nothing.
         let (_d, ctx, h) = store_with("a\n\n  \nb\n");
         let e = check_quotes(&ctx, &[q(&h, 2, 3, "")]).await.err().unwrap_or_default();
         assert_eq!(e, format!("quote 1: lines 2-3 of {h} are blank. Name the lines that carry the text."));
-        // At most 2000 characters: a long line is quoted by the part that matters.
-        let (_d, ctx, h) = store_with(&format!("short\n{}\n", "x".repeat(2_001)));
+        // At most 4000 characters: a long line is quoted by the part that matters.
+        let (_d, ctx, h) = store_with(&format!("short\n{}\n", "x".repeat(4_001)));
         let e = check_quotes(&ctx, &[q(&h, 2, 2, "")]).await.err().unwrap_or_default();
         assert_eq!(
             e,
-            format!("quote 1: lines 2-2 of {h} have 2001 characters; a quote without its text takes at most 2000. Name fewer lines, or give the text of the part that shows the point, copied exactly.")
+            format!("quote 1: lines 2-2 of {h} have 4001 characters; a quote without its text takes at most 4000. Name fewer lines, or give the text of the part that shows the point, copied exactly.")
         );
         assert!(check_quotes(&ctx, &[q(&h, 1, 1, "")]).await.is_ok());
     }
@@ -1234,8 +1301,8 @@ To keep working, call a tool. To deliver your result, call finish; if the assign
                 q(&h, 1, 1, "alpha line one"),
                 q(&h, 1, 1, "zzz"),
                 q("out:ffffffffffffffff", 1, 1, "x"),
-                q(&h, 2, 2, ""),
                 q(&h, 2, 7, ""),
+                q(&h, 9, 12, ""),
             ],
         )
         .await
@@ -1245,7 +1312,7 @@ To keep working, call a tool. To deliver your result, call finish; if the assign
         assert_eq!(lines.len(), 3);
         assert!(lines[0].starts_with("quote 2: the text does not occur"));
         assert!(lines[1].starts_with("quote 3: no output of this mission has the handle"));
-        assert!(lines[2].starts_with("quote 5: ") && lines[2].contains("end 7 is past its end"), "{}", lines[2]);
+        assert!(lines[2].starts_with("quote 5: ") && lines[2].contains("start 9 is past its end"), "{}", lines[2]);
     }
 
     #[tokio::test]
@@ -1380,5 +1447,73 @@ The agent's own words follow, unverified. Every line of them starts with \">\"; 
             full_handle: "out:feed",
         });
         assert!(!r.contains("report cut"));
+    }
+
+    #[tokio::test]
+    async fn unique_text_quotes_auto_locate_and_preserve_errors() {
+        let blob_text =
+            "alpha line one\nbeta line two\nshared pattern here\ngamma: 10 failed; 0 ignored\nshared pattern here\n";
+        let (_d, ctx, h) = store_with(blob_text);
+        let id = ctx.blobs.resolve(&h).unwrap_or_else(|e| panic!("{e}"));
+
+        // Omitted line numbers (0, 0) locate unique whole lines, fragments, and matching numbered lines.
+        let ok = check_quotes(
+            &ctx,
+            &[
+                q(&h, 0, 0, "beta line two"),
+                q(&h, 0, 0, "10 failed; 0 ignored"),
+                q(&h, 0, 0, "1: alpha line one\n2: beta line two"),
+            ],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            ok,
+            vec![
+                VerifiedQuote { blob: id.clone(), start: 2, end: 2, text: "beta line two".into() },
+                VerifiedQuote { blob: id.clone(), start: 4, end: 4, text: "gamma: 10 failed; 0 ignored".into() },
+                VerifiedQuote { blob: id.clone(), start: 1, end: 2, text: "alpha line one\nbeta line two".into() },
+            ]
+        );
+
+        // Named wrong range falls back to unique full-blob match (and respects matching line prefixes).
+        let ok =
+            check_quotes(&ctx, &[q(&h, 1, 2, "10 failed; 0 ignored"), q(&h, 1, 2, "4: gamma: 10 failed; 0 ignored")])
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            ok,
+            vec![
+                VerifiedQuote { blob: id.clone(), start: 4, end: 4, text: "gamma: 10 failed; 0 ignored".into() },
+                VerifiedQuote { blob: id, start: 4, end: 4, text: "gamma: 10 failed; 0 ignored".into() },
+            ]
+        );
+
+        // Ambiguous (non-unique) quote fails both with (0, 0) and when outside the named range.
+        let e = check_quotes(&ctx, &[q(&h, 0, 0, "shared pattern here")]).await.err().unwrap_or_default();
+        assert!(e.contains("more than once"), "{e}");
+        let e = check_quotes(&ctx, &[q(&h, 1, 2, "shared pattern here")]).await.err().unwrap_or_default();
+        assert!(e.contains("does not occur in") && e.contains("lines 1-2"), "{e}");
+
+        // InsideToken, TooShort, and WrongLine (when in range) remain strictly enforced.
+        let e = check_quotes(&ctx, &[q(&h, 0, 0, "0 failed; 0 ignored")]).await.err().unwrap_or_default();
+        assert!(e.contains("only inside a longer word or number") && e.contains("line 4"), "{e}");
+        let e = check_quotes(&ctx, &[q(&h, 1, 2, "0 failed; 0 ignored")]).await.err().unwrap_or_default();
+        assert!(e.contains("only inside a longer word or number") && e.contains("line 4"), "{e}");
+        let e = check_quotes(&ctx, &[q(&h, 0, 0, "alpha")]).await.err().unwrap_or_default();
+        assert!(e.contains("at least 8 non-space characters"), "{e}");
+        let e = check_quotes(&ctx, &[q(&h, 1, 2, "7: beta line two")]).await.err().unwrap_or_default();
+        assert!(e.contains("on line 2") && e.contains("not line 7"), "{e}");
+        let e = check_quotes(&ctx, &[q(&h, 0, 0, "7: beta line two")]).await.err().unwrap_or_default();
+        assert!(e.contains("on line 2") && e.contains("not line 7"), "{e}");
+
+        // Missing quote with (0, 0) names the closest line if any, or says not found; empty blob is refused cleanly.
+        let e = check_quotes(&ctx, &[q(&h, 0, 0, "beta line TWO")]).await.err().unwrap_or_default();
+        assert!(e.contains("does not occur") && e.contains("closest line there is 2: beta line two"), "{e}");
+        let (_d2, empty_ctx, empty_h) = store_with("");
+        let e = check_quotes(&empty_ctx, &[q(&empty_h, 0, 0, "anything here")]).await.err().unwrap_or_default();
+        assert!(e.contains("is empty"), "{e}");
+        let e = check_quotes(&ctx, &[q(&h, 0, 2, "beta line two")]).await.err().unwrap_or_default();
+        assert!(e.contains("not valid"), "{e}");
     }
 }

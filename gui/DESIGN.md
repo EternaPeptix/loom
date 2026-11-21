@@ -48,7 +48,7 @@ gui/
     UI/WebPane.swift          NSViewRepresentable around WKWebView; loads the tunneled daemon UI
 ```
 
-A `Resources/` directory, when present, is copied into the bundle by `build.sh`; none ships today.
+A `Resources/` directory, when present, is copied into the bundle by `build.sh` (holds `AppIcon.icns`).
 
 ## Connection model (`Model/Connection.swift`)
 

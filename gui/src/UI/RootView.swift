@@ -14,21 +14,34 @@ struct RootView: View {
                 let epoch = state.paneEpoch
                 ZStack {
                     WebPane(entryTick: state.entryTick,
+                            routeTick: state.routeTick,
                             takeEntry: { state.takeEntryURL() },
+                            takeRoute: { state.takeRoute() },
+                            isTunnelAlive: { state.isTunnelAlive },
                             onCreated: { state.requestWebEntry(for: epoch) },
-                            focusSession: $state.focusSession,
                             onState: { s in if state.paneEpoch == epoch { state.webState = s } })
                         .id(epoch)
                     overlay
                 }
             case .connecting(let phrase):
-                centered(ProgressView(), phrase)
+                VStack(spacing: 12) {
+                    ProgressView()
+                    Text(phrase).foregroundStyle(.secondary)
+                    Button("Cancel") { state.disconnect() }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             case .failed(let err):
                 VStack(spacing: 12) {
                     Image(systemName: "exclamationmark.triangle").font(.largeTitle)
-                    Text(err).foregroundStyle(.secondary).textSelection(.enabled).multilineTextAlignment(.center)
+                    Text(err)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 460)
                     HStack {
-                        if let a = state.active { Button("Retry") { state.connect(a) } }
+                        if let a = state.active {
+                            Button("Retry") { state.connect(a) }.buttonStyle(.borderedProminent)
+                        }
                         Button("Connections") { state.disconnect() }
                     }
                 }
@@ -49,9 +62,13 @@ struct RootView: View {
                 // A generic headline: this fires for an auth/login-code failure too, where the daemon
                 // is reachable and the fix is just Reconnect. The specific reason and action is the body.
                 Text("Can't show the loom page").font(.headline)
-                Text(msg).foregroundStyle(.secondary).textSelection(.enabled).multilineTextAlignment(.center)
+                Text(msg)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 460)
                 HStack {
-                    Button("Retry") { state.reload() }
+                    Button("Retry") { state.reload() }.buttonStyle(.borderedProminent)
                     if let a = state.active { Button("Reconnect") { state.connect(a) } }
                 }
             }
@@ -72,11 +89,6 @@ struct RootView: View {
     // Only a pane's first load is covered (a reload builds a new pane); the page's own later navigations
     // keep it visible.
     private var pageEverLoaded: Bool { state.webLoadedOnce }
-
-    private func centered(_ icon: some View, _ text: String) -> some View {
-        VStack(spacing: 12) { icon; Text(text).foregroundStyle(.secondary) }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
 }
 
 /// The bar above the web pane: active connection name, link status, reload, copy address.
@@ -84,34 +96,54 @@ struct ConnectionBar: View {
     @EnvironmentObject var state: AppState
 
     var body: some View {
+        let activeName = state.active.map { $0.name.isEmpty ? $0.sshHost : $0.name } ?? "loom"
+        let countsStale = state.feedStatus.stale || state.daemonUnreachable
         HStack(spacing: 10) {
             Circle().fill(dotColor).frame(width: 8, height: 8)
                 .accessibilityLabel("Connection status: \(dotLabel)")
-            Text(state.active?.name ?? "loom").font(.headline)
+            Text(activeName).font(.headline).lineLimit(1).truncationMode(.tail)
             if state.link != .none {
                 Menu {
                     ForEach(state.connections) { c in
-                        let isActive = c.id == state.active?.id
+                        let isActive = state.isCurrentlyActive(c)
                         Button { if !isActive { state.connect(c) } } label: {
                             Label(c.name.isEmpty ? c.sshHost : c.name, systemImage: isActive ? "checkmark" : "")
                         }
                     }
-                } label: { Image(systemName: "arrow.left.arrow.right") }
-                    .menuStyle(.borderlessButton).fixedSize()
-                    .help("Switch connection")
-                    .accessibilityLabel("Switch connection")
+                } label: {
+                    Image(systemName: "arrow.left.arrow.right")
+                        .padding(4)
+                        .contentShape(Rectangle())
+                }
+                .menuStyle(.borderlessButton).fixedSize()
+                .help("Switch connection")
+                .accessibilityLabel("Switch connection")
             }
             Spacer()
             if state.feedStatus.lastUpdated != nil {
-                Text((state.feedStatus.stale ? "Last known: " : "") + state.counts.summary)
-                    .font(.caption).foregroundStyle(.secondary)
+                Text((countsStale ? "Last known: " : "") + state.counts.summary)
+                    .font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 if state.counts.waiting > 0 {
-                    Text("\(state.counts.waiting) needs you")
-                        .font(.caption).foregroundStyle(state.feedStatus.stale ? Color.secondary : Color.orange)
+                    Button { state.openInbox() } label: {
+                        Text("\(state.counts.waiting) needs you")
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(countsStale ? Color.secondary : Color.orange)
+                            .lineLimit(1)
+                            .padding(.horizontal, 6).padding(.vertical, 2)
+                            .contentShape(Rectangle())
+                    }
+                    .disabled(!state.isConnected)
+                    .help("Open inbox in the web UI")
                 }
                 if state.counts.requests > 0 {
-                    Text("\(state.counts.requests) asking for hosts")
-                        .font(.caption).foregroundStyle(.secondary)
+                    Button { state.openInbox() } label: {
+                        Text("\(state.counts.requests) asking for hosts")
+                            .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                            .padding(.horizontal, 4).padding(.vertical, 2)
+                            .contentShape(Rectangle())
+                    }
+                    .disabled(!state.isConnected)
+                    .help("Open inbox in the web UI")
                 }
             }
             if case .connected = state.link, !state.daemonUnreachable {
@@ -122,30 +154,44 @@ struct ConnectionBar: View {
                 .help(state.feedStatus.detail.isEmpty ? state.status : state.feedStatus.detail)
             } else {
                 Text(state.status).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    .help(state.status)
             }
             if case .connected = state.link {
-                Button { state.reload() } label: { Image(systemName: "arrow.clockwise") }
-                    .help("Reload the page")
-                    .accessibilityLabel("Reload the page")
+                Button { state.reload() } label: {
+                    Image(systemName: "arrow.clockwise").padding(4).contentShape(Rectangle())
+                }
+                .help("Reload the page (⌘R)")
+                .accessibilityLabel("Reload the page")
                 Button {
                     state.copyAddress()
+                    copyResetTask?.cancel()
                     justCopied = true
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { justCopied = false }
-                } label: { Image(systemName: justCopied ? "checkmark" : "link") }
-                    .help("Copy the daemon's address (no login code, no token)")
-                    .accessibilityLabel(justCopied ? "Address copied" : "Copy the daemon's address")
+                    copyResetTask = Task {
+                        try? await Task.sleep(for: .seconds(1.5))
+                        guard !Task.isCancelled else { return }
+                        justCopied = false
+                    }
+                } label: {
+                    Image(systemName: justCopied ? "checkmark" : "link").padding(4).contentShape(Rectangle())
+                }
+                .help("Copy the daemon's address (no login code, no token)")
+                .accessibilityLabel(justCopied ? "Address copied" : "Copy the daemon's address")
             }
             if state.link != .none {
-                Button { state.disconnect() } label: { Image(systemName: "xmark.circle") }
-                    .help("Disconnect")
-                    .accessibilityLabel("Disconnect")
+                Button { state.disconnect() } label: {
+                    Image(systemName: "xmark.circle").padding(4).contentShape(Rectangle())
+                }
+                .help("Disconnect")
+                .accessibilityLabel("Disconnect")
             }
         }
         .buttonStyle(.borderless)
         .padding(.horizontal, 12).padding(.vertical, 6)
+        .onDisappear { copyResetTask?.cancel() }
     }
 
     @State private var justCopied = false
+    @State private var copyResetTask: Task<Void, Never>?
 
     /// A worded version of the status dot, for VoiceOver.
     private var dotLabel: String {

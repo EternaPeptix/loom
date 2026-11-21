@@ -103,6 +103,15 @@ use tokio_util::sync::CancellationToken;
 /// Runs the script in `$0` and then appends its exit status, as a number, to stderr (the exit file).
 const WRAPPER: &str = "/bin/bash -c \"$0\" 2>&1; echo $? >&2";
 
+fn seatbelt_wrapper(sandbox: &crate::sandbox::Sandbox, script: &str) -> String {
+    if sandbox.mode() == loom_core::config::SandboxMode::Seatbelt && script.contains("<<") {
+        if let Some(modern) = crate::sandbox::Sandbox::modern_bash() {
+            return format!("{modern} -c \"$0\" 2>&1; echo $? >&2");
+        }
+    }
+    WRAPPER.to_string()
+}
+
 /// Runs the launcher's program and arguments (`$@`, an inert owner marker is `$0`) and then appends the
 /// exit status, as `WRAPPER` does. The arguments are never parsed by this shell.
 const LAUNCH_WRAPPER: &str = "\"$@\" 2>&1; echo $? >&2";
@@ -119,6 +128,28 @@ const UNINSPECTABLE: &str =
 /// It must return quickly and may be called more than once.
 #[derive(Clone)]
 pub struct RemoteStop(pub Arc<dyn Fn(i32) + Send + Sync>);
+
+std::thread_local! {
+    static AWAIT_REMOTE_STOP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// True inside [`Running::kill`] while invoking [`RemoteStop`] on a blocking worker, so callers like
+/// `boxctl` can wait for `docker exec kill -KILL` to finish without ever blocking `Drop` or an async worker.
+pub(crate) fn awaiting_remote_stop() -> bool {
+    AWAIT_REMOTE_STOP.with(std::cell::Cell::get)
+}
+
+fn call_remote_stop_awaiting(remote: &RemoteStop, signal: i32) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            AWAIT_REMOTE_STOP.with(|c| c.set(false));
+        }
+    }
+    AWAIT_REMOTE_STOP.with(|c| c.set(true));
+    let _reset = Reset;
+    (remote.0)(signal);
+}
 
 impl std::fmt::Debug for RemoteStop {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -692,9 +723,17 @@ fn spawn_with(how: How<'_>, spec: &Spawn) -> io::Result<Running> {
         marker.write_all(owner.as_bytes())?;
         marker.sync_data()?;
     }
+    let extra_tmpdir = match &how {
+        How::Sandboxed(sandbox) if sandbox.mode() == loom_core::config::SandboxMode::Seatbelt => {
+            let _ = std::fs::create_dir_all(sandbox.tmp_dir());
+            (!spec.env.iter().any(|(k, _)| k == "TMPDIR")).then(|| sandbox.tmp_dir().to_path_buf())
+        }
+        _ => None,
+    };
     let (program, args, remote_stop) = match how {
         How::Sandboxed(sandbox) => {
-            let (program, mut args) = sandbox.command(WRAPPER);
+            let wrapper = seatbelt_wrapper(sandbox, &spec.script);
+            let (program, mut args) = sandbox.command(&wrapper);
             args.push(spec.script.clone());
             args.push(owner.clone());
             (program, args, None)
@@ -706,15 +745,11 @@ fn spawn_with(how: How<'_>, spec: &Spawn) -> io::Result<Running> {
         }
     };
     let mut cmd = tokio::process::Command::new(program);
-    cmd.args(args)
-        .env_clear()
-        .envs(&spec.env)
-        .current_dir(&spec.cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(out))
-        .stderr(Stdio::from(exit))
-        .process_group(0)
-        .kill_on_drop(false);
+    cmd.args(args).env_clear().envs(&spec.env).current_dir(&spec.cwd);
+    if let Some(tmpdir) = extra_tmpdir {
+        cmd.env("TMPDIR", tmpdir);
+    }
+    cmd.stdin(Stdio::null()).stdout(Stdio::from(out)).stderr(Stdio::from(exit)).process_group(0).kill_on_drop(false);
     let child = match cmd.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -969,8 +1004,16 @@ impl Running {
     /// now) and waits for the leader and the group to go. A group that survives the KILL, or that
     /// cannot be inspected safely, is reported as [`Ended::TrackingFailed`].
     pub async fn kill(&mut self) -> Ended {
-        if self.group_alive() && !self.signal(libc::SIGKILL) {
-            return Ended::TrackingFailed(UNINSPECTABLE.to_string());
+        if self.group_alive() {
+            if let Some(remote) = self.remote_stop.clone() {
+                let _ = tokio::task::spawn_blocking(move || {
+                    call_remote_stop_awaiting(&remote, libc::SIGKILL);
+                })
+                .await;
+            }
+            if self.group_alive() && !self.signal_local(libc::SIGKILL) {
+                return Ended::TrackingFailed(UNINSPECTABLE.to_string());
+            }
         }
         let limit = Instant::now() + KILL_SETTLE;
         loop {
@@ -1000,6 +1043,10 @@ impl Running {
                 return true;
             }
         }
+        self.signal_local(signal)
+    }
+
+    fn signal_local(&self, signal: i32) -> bool {
         match group_state(self.pid, self.owner.as_deref(), self.child.is_some()) {
             GroupState::Gone => true,
             GroupState::Live => {
@@ -1658,6 +1705,37 @@ mod tests {
         let r = spawn_launched(&launcher, &f.spec("")).expect("spawn");
         drop(r);
         assert_eq!(*seen.lock().expect("lock"), [libc::SIGKILL]);
+    }
+
+    #[tokio::test]
+    async fn kill_awaits_remote_stop_before_returning_while_drop_does_not_await() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let f = fx();
+        let finished = Arc::new(AtomicBool::new(false));
+        let drop_saw_await = Arc::new(AtomicBool::new(false));
+        let kill_saw_await = Arc::new(AtomicBool::new(false));
+        let (fin, drop_flag, kill_flag) = (finished.clone(), drop_saw_await.clone(), kill_saw_await.clone());
+        let launcher = Launcher {
+            program: "/bin/sh".to_string(),
+            args: vec!["-c".into(), "sleep 30".into()],
+            remote_stop: Some(RemoteStop(Arc::new(move |sig| {
+                if awaiting_remote_stop() {
+                    kill_flag.store(true, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(80));
+                    fin.store(true, Ordering::SeqCst);
+                } else if sig == libc::SIGKILL {
+                    drop_flag.store(true, Ordering::SeqCst);
+                }
+            }))),
+        };
+        let mut r = spawn_launched(&launcher, &f.spec("")).expect("spawn");
+        let _ = r.kill().await;
+        assert!(kill_saw_await.load(Ordering::SeqCst));
+        assert!(finished.load(Ordering::SeqCst), "kill must not return before remote_stop completes");
+        assert!(!drop_saw_await.load(Ordering::SeqCst));
+        let r2 = spawn_launched(&launcher, &f.spec("")).expect("spawn");
+        drop(r2);
+        assert!(drop_saw_await.load(Ordering::SeqCst), "Drop runs non-awaiting remote_stop");
     }
 
     #[tokio::test]

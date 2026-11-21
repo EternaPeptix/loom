@@ -199,7 +199,11 @@ export function sessionSpeed(blocks, span = 10) {
   }
   if (last === null) return { last: null, mean: null, replies: 0, label: "" };
   const mean = tokens / (ms / 1000);
-  const label = used > 1 ? `${speedText(last)} · ${speedText(mean)} over ${used} replies` : speedText(last);
+  const lastText = speedText(last);
+  const meanText = speedText(mean);
+  const label = used > 1
+    ? (lastText === meanText ? `${lastText} (${used} replies)` : `${lastText} · ${meanText} over ${used} replies`)
+    : lastText;
   return { last, mean, replies: used, label };
 }
 
@@ -510,6 +514,13 @@ export function stopQuestion(info) {
   return info.parent
     ? `Stop ${name}? It and its tracked jobs stop. An agent cannot be resumed; its lead can start a new one.`
     : `Stop ${name}? It, its agents and their tracked jobs stop. It can be resumed.`;
+}
+
+/** The question the Archive confirmation asks when a mission still has open inbox items; null when none. */
+export function archiveQuestion(info, openInboxCount = 0) {
+  if (!(openInboxCount > 0)) return null;
+  const name = (info && (info.title || info.id)) || "this mission";
+  return `Archive ${name}? It still has ${count(openInboxCount, "open inbox item")}, which will be dismissed.`;
 }
 
 /** Which buttons the transcript header offers. */
@@ -2389,7 +2400,7 @@ export function chatItems(blocks, opts = {}) {
   for (const it of items) if (!(it.type === "block" && it.block.detail)) last = it;
   if (last) last.last = true;
   for (const it of items) if (it.type === "group") it.open = !!(expandAll || it.running || it.last || open.has(it.key));
-  if (Number.isInteger(opts.sinceSeq)) placeSince(items, blocks, opts.sinceSeq, opts.lastSeq);
+  if (Number.isInteger(opts.sinceSeq)) placeSince(items, blocks, opts.sinceSeq, details);
   return items;
 }
 
@@ -2403,6 +2414,8 @@ function blockSeqs(b) {
   }
   return [b.seq];
 }
+
+const HIDDEN_RECORD_KINDS = new Set(["turn_start", "budget_clock", "model_request"]);
 
 /**
  * recordsAfter(blocks, seq, lastSeq): how many records were recorded after `seq`. With `lastSeq` (the store's last seq, as lastSeq()
@@ -2421,6 +2434,23 @@ export function recordsAfter(blocks, seq, lastSeq) {
   return n;
 }
 
+/**
+ * visibleRecordsAfter(blocks, afterSeq, details = false): like recordsAfter, counts visible chat records recorded after `afterSeq`,
+ * excluding hidden bookkeeping kinds (`turn_start`, `budget_clock`, `model_request`) and request-detail lines when `!details`.
+ */
+export function visibleRecordsAfter(blocks, afterSeq, details = false) {
+  if (!blocks || afterSeq == null || !Number.isInteger(afterSeq)) return 0;
+  let n = 0;
+  for (const b of blocks) {
+    if (!b) continue;
+    if (!details && (b.detail || HIDDEN_RECORD_KINDS.has(b.kind))) continue;
+    const seqs = blockSeqs(b);
+    const ids = seqs.some(Number.isInteger) ? seqs : (Number.isInteger(b.id) ? [b.id] : []);
+    for (const q of ids) if (Number.isInteger(q) && q > afterSeq) n++;
+  }
+  return n;
+}
+
 /** The label of the Jump button: "Jump to latest" or "Jump to latest · 12 new". */
 export function jumpLabel(newCount) {
   return newCount > 0 ? `Jump to latest · ${num(newCount)} new` : "Jump to latest";
@@ -2428,7 +2458,7 @@ export function jumpLabel(newCount) {
 
 // Put the "since your last visit" item before the first item that holds a record after `sinceSeq`. Nothing is put when every
 // item is new (a first sight has no watermark) or none is.
-function placeSince(items, blocks, sinceSeq, lastSeq) {
+function placeSince(items, blocks, sinceSeq, details = false) {
   const newIn = (it) => {
     if (it.type === "block") return blockSeqs(it.block).some((q) => q > sinceSeq);
     if (it.type === "group") return it.blocks.some((b) => !b.detail && blockSeqs(b).some((q) => q > sinceSeq));
@@ -2436,7 +2466,7 @@ function placeSince(items, blocks, sinceSeq, lastSeq) {
     return false;
   };
   const at = items.findIndex(newIn);
-  const count = recordsAfter(blocks, sinceSeq, lastSeq);
+  const count = visibleRecordsAfter(blocks, sinceSeq, details);
   if (at <= 0 || !count) return;
   const first = items[at];
   const head = first.type === "group" ? first.blocks.find((b) => !b.detail) : null;
@@ -3448,11 +3478,18 @@ const FIND_KINDS = new Set(["all", "messages", "tools", "failures"]);
 const FIND_CAP = 2000;
 
 // The searchable pieces of a block: [field, text]; `seq` is the record that holds the text (for the jump).
-function findFields(b) {
+export function findFields(b, kind = "all") {
+  if (!b) return [];
   switch (b.kind) {
     case "user": return [["text", b.text, b.seq]];
     case "note": return [["text", b.text, b.seq]];
-    case "response": return [["text", b.text, b.seq]];
+    case "response": {
+      const fields = [["text", b.text, b.seq]];
+      if (kind === "all" || kind === "messages" || !FIND_KINDS.has(kind)) {
+        fields.push(["reasoning", b.reasoning, b.seq]);
+      }
+      return fields;
+    }
     case "inbox": return [["text", b.item && b.item.text, b.seq], ["answer", b.resolved && b.resolved.answer, b.resolved && b.resolved.seq]];
     case "child_settled": return [["text", b.report, b.seq]];
     case "child_spawned": return [["text", typeof b.brief === "string" ? b.brief : b.brief && (b.brief.task || b.brief.text || b.brief.goal), b.seq]];
@@ -3473,7 +3510,7 @@ const FIND_IN = {
 
 /**
  * findInRecord(blocks, query, kind, loaded): a literal, case-insensitive search of every loaded block (folded groups and blocks outside the
- * rendered window included; request-detail lines and reasoning are not searched). kind: "all" | "messages" | "tools" (calls, outputs,
+ * rendered window included; request-detail lines are not searched; reasoning is searched in "all" and "messages"). kind: "all" | "messages" | "tools" (calls, outputs,
  * jobs) | "failures" (calls that did not end ok, warnings, failed ends). Returns {query, kind, hits, count, capped, searched, cutOutputs}:
  * a hit is {id (block id), seq (the record holding the text), field, snippet:{before, match, after}}, one per block, in record
  * order; `searched` the number of loaded records (whatever the kind; `loaded`, the store's record count, when given); `cutOutputs` how many results are longer than the text held here, which the output viewer
@@ -3490,7 +3527,7 @@ export function findInRecord(blocks, query, kind = "all", loaded) {
     if (!needle || !inKind(b)) continue;
     if (b.kind === "tool" && b.result && (b.result.cut || (b.result.output && b.result.output.lines > b.result.lines))) out.cutOutputs++;
     if (out.hits.length >= FIND_CAP) { out.capped = true; continue; }
-    for (const [field, text, seq] of findFields(b)) {
+    for (const [field, text, seq] of findFields(b, k)) {
       if (!text) continue;
       const s = String(text);
       const at = s.toLowerCase().indexOf(needle);
@@ -3610,6 +3647,73 @@ export function lastRecordedError(blocks) {
     if (b.item.item_kind === "parked" && parked && parked[1].trim() && !/budget is used up/i.test(parked[1])) return oneLine(parked[1], 400);
   }
   return null;
+}
+
+/**
+ * dedupeParkedError(itemText, lastError): normalize whitespace on both strings; return null when `!lastError` or
+ * when normalized `itemText` already includes normalized `lastError` (or its first 80 chars if longer than 80);
+ * otherwise return `lastError`.
+ */
+export function dedupeParkedError(itemText, lastError) {
+  if (!lastError) return null;
+  const normErr = String(lastError).replace(/\s+/g, " ").trim();
+  if (!normErr) return null;
+  const normItem = String(itemText ?? "").replace(/\s+/g, " ").trim();
+  if (normItem.includes(normErr) || (normErr.length > 80 && normItem.includes(normErr.slice(0, 80)))) return null;
+  return lastError;
+}
+
+function sessionMapFrom(sessions) {
+  if (!sessions) return new Map();
+  if (sessions.byId instanceof Map) return sessions.byId;
+  if (sessions instanceof Map) return sessions;
+  if (Array.isArray(sessions)) {
+    const map = new Map();
+    for (const s of sessions) if (s && s.id) map.set(s.id, s);
+    return map;
+  }
+  return new Map();
+}
+
+function inboxEntriesFrom(inbox) {
+  if (!inbox) return [];
+  if (inbox.items instanceof Map) return [...inbox.items.values()];
+  if (inbox instanceof Map) return [...inbox.values()];
+  if (Array.isArray(inbox)) return inbox;
+  return [];
+}
+
+/**
+ * childBlockingItem(sessions, inbox, openSessionId): when `openSessionId` itself has no blocking open inbox item,
+ * find the oldest/first open blocking inbox item belonging to another session in the same mission.
+ * Returns `{ item, session, title }` or null.
+ */
+export function childBlockingItem(sessions, inbox, openSessionId) {
+  if (!openSessionId) return null;
+  const byId = sessionMapFrom(sessions);
+  const open = byId.get(openSessionId);
+  if (!open || !open.mission) return null;
+  const entries = inboxEntriesFrom(inbox);
+  const isBlocking = (e) => !!(e && !e.resolved && (e.item ? e.item.blocking : e.blocking));
+  if (entries.some((e) => e && e.session === openSessionId && isBlocking(e))) return null;
+  let best = null;
+  let bestSession = null;
+  let bestOpened = Infinity;
+  for (const e of entries) {
+    if (!isBlocking(e) || !e.session || e.session === openSessionId) continue;
+    const sess = byId.get(e.session) || null;
+    const mission = (sess && sess.mission) || e.mission || "";
+    if (mission !== open.mission) continue;
+    const opened = Number.isFinite(e.opened_ms) ? e.opened_ms : Infinity;
+    if (!best || opened < bestOpened) {
+      best = e;
+      bestSession = sess;
+      bestOpened = opened;
+    }
+  }
+  if (!best) return null;
+  const title = (bestSession && (bestSession.title || bestSession.id)) || best.session;
+  return { item: best, session: bestSession, title };
 }
 
 /**
