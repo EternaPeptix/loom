@@ -1671,9 +1671,13 @@ mod tests {
         let jobs = e.dir.path().canonicalize().expect("canonical").join("home/sessions/s1/jobs");
         let mut commands =
             vec![("cat f.txt", "hello world"), ("printf x | cat", "x"), ("echo err >&2; echo out", "err")];
+        // On macOS these are developer-tool stubs, which print an error when their lookup cache cannot be written.
         if std::path::Path::new("/usr/bin/python3").exists() {
             commands.push(("python3 -c 'print(42)'", "42"));
             commands.push(("python3 -c 'import sys; sys.stderr.write(\"E\")'", "E"));
+        }
+        if std::path::Path::new("/usr/bin/git").exists() {
+            commands.push(("/usr/bin/git --version", "git version"));
         }
         for (command, expected) in commands {
             let r = e.call("bash", json!({"command": command})).await;

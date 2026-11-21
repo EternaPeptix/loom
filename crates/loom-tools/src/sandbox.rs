@@ -293,7 +293,24 @@
 //! name and value test alone (without `secret_env` and `env_pass`), for the daemon's start warning. Bubblewrap additionally
 //! always removes LD_*, DYLD_*, BASH_FUNC_*, BASH_ENV, ENV, SHELLOPTS and BASHOPTS before its trusted
 //! host launcher; tools can set needed library variables inside the confined script. Added: `TERM=dumb`,
-//! `NO_COLOR=1`, `PAGER=cat`, `GIT_PAGER=cat`, `GIT_TERMINAL_PROMPT=0`, `TMPDIR=<session temp dir>`.
+//! `NO_COLOR=1`, `PAGER=cat`, `GIT_PAGER=cat`, `GIT_TERMINAL_PROMPT=0`, `TMPDIR=<session temp dir>`, and in
+//! seatbelt mode `xcrun_db=<session temp dir>/.xcrun_db` (each over what `parent` and `env_pass` give; modes
+//! `none` and `bubblewrap` add no `xcrun_db`, and in `none` a parent's passes like any other variable).
+//!
+//! `xcrun_db` is the developer-tool stubs' lookup cache. `/usr/bin/python3`, `git`, `clang`, `make`, `xcrun` and
+//! the other stubs find the tool they stand for in a cache that is by default `$(getconf DARWIN_USER_TEMP_DIR)xcrun_db`,
+//! the operator's, outside every writable root. An entry is keyed by tool, `SDKROOT`, `TOOLCHAINS` and
+//! `DEVELOPER_DIR`, and the file can be missing, cleaned, or reset after an Xcode update; on a miss the stub runs
+//! `xcodebuild -find` and writes a new cache beside the old one (`<cache>-XXXXXXXX`, renamed over it), which the
+//! profile refuses, so it printed `<tool>: error: couldn't create cache file '…' (errno=Operation not permitted)`
+//! on stderr, then ran the tool (probed on macOS 26.5 and 27, xcrun 72: a hit only reads the cache). The stubs
+//! take the cache from `xcrun_db` when its value is absolute (a relative one is ignored, with a warning), so each
+//! sandbox gets one of its own in its temp dir: a miss fills it (about half a second per tool, once per temp dir)
+//! and nothing is printed. The operator's cache stays unwritable: a command that could write it could point the
+//! operator's own `git` at a program of its choosing. A command can write the private one, and so point its own
+//! stubs at any program, which it could run directly anyway; the variable is given only to commands under this
+//! profile. A command that clears its environment falls back to the operator's cache (and, on a miss, the
+//! warning).
 //!
 //! ## `describe()`
 //! Two or three plain sentences for the system prompt: where commands may write, what they may not
@@ -320,7 +337,8 @@
 //! Tests required: profile text for a representative config (exact string); escaping; canonical
 //! paths; `check_write`/`check_read` accept and refuse per rule, including a symlink escape, a
 //! not-yet-existing file in a writable dir, `..`, and the protected directory inside the workspace;
-//! mode `none`; `resolve`; `env` scrubbing and `env_pass`; `check_read` refuses, in every mode, the
+//! mode `none`; `resolve`; `env` scrubbing and `env_pass`; `env`'s `xcrun_db` in seatbelt mode over a parent's
+//! value and `env_pass`, and a parent's kept in mode `none`; `check_read` refuses, in every mode, the
 //! session's own and another session's `log.jsonl`, a stored output under `blobs/`, a mission journal,
 //! `logs/`, `config.toml`, an installed pack, a listing of `<loom home>/sessions`, and a workspace
 //! symlink that resolves into the loom home, while a file in the session temp dir is accepted; a
@@ -335,7 +353,16 @@
 //! dir and what is in it; through the production layout `cat`, `printf x | cat` and `python3 -c 'print(1)'`
 //! keep their output, while `cat` and `ls` of the jobs directory fail; `check_read` and construction judge
 //! a path written through `/System/Volumes/Data` as the plain one; the analysis staging dir is readable and
-//! not writable; the `check_read` test also builds a Bubblewrap sandbox where that is possible.
+//! not writable; the `check_read` test also builds a Bubblewrap sandbox where that is possible. The commands
+//! these tests run get the variables `env` adds.
+//!
+//! Developer-tool stubs (under `sandbox-exec`, in the production layout, where `/usr/bin/xcrun`,
+//! `/usr/bin/python3` and `/usr/bin/git` exist): with a parent `xcrun_db` that names a missing file outside the
+//! writable roots (the operator's cache without the tools), `python3 -c 'print(42)'` and `git --version` run with
+//! `env` print their own output and nothing on stderr, the private cache is in the temp dir afterwards, and
+//! nothing is made at the parent's path; given the parent's value instead, the same commands still run and make
+//! nothing there, and what they print on stderr, when anything, is the stubs' `couldn't create cache file` (the
+//! failure the variable prevents; a host whose stubs print nothing is noted, not failed).
 //!
 //! Git (built with real `git` where it runs, skipped otherwise, beside `check_write` cases on hand-made trees):
 //! construction finds an external linked worktree's `.git/worktrees/<n>`, an initialized and a deinitialized
@@ -415,6 +442,11 @@ const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 const DEVICE_LITERALS: [&str; 3] = ["/dev/null", "/dev/tty", "/dev/dtracehelper"];
 
 const BWRAP: &str = "/usr/bin/bwrap";
+
+/// The variable from which macOS's developer-tool stubs take the path of their lookup cache (when it is absolute).
+const XCRUN_DB_VAR: &str = "xcrun_db";
+/// The name of the lookup cache seatbelt commands get in their temp dir (see `env`).
+const XCRUN_DB: &str = ".xcrun_db";
 
 const SECRET_WORDS: [&str; 10] =
     ["KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "PASSPHRASE", "CREDENTIAL", "AUTH_TOKEN", "COOKIE", "SESSION_KEY"];
@@ -2350,6 +2382,9 @@ impl Sandbox {
             out.insert(k.to_string(), v.to_string());
         }
         out.insert("TMPDIR".to_string(), self.tmp_dir.display().to_string());
+        if self.mode == SandboxMode::Seatbelt {
+            out.insert(XCRUN_DB_VAR.to_string(), self.tmp_dir.join(XCRUN_DB).display().to_string());
+        }
         out
     }
 
@@ -3169,7 +3204,8 @@ mod tests {
                 "PATH",
                 "PWD",
                 "TERM",
-                "TMPDIR"
+                "TMPDIR",
+                "xcrun_db"
             ]
         );
         assert_eq!(env["MY_API_KEY"], "kept");
@@ -3182,6 +3218,24 @@ mod tests {
         assert_eq!(env["GIT_TERMINAL_PROMPT"], "0");
         assert_eq!(env["NO_COLOR"], "1");
         assert_eq!(env["TMPDIR"], s(&f.tmp));
+    }
+
+    /// The developer-tool stubs of seatbelt commands use a lookup cache in the temp dir, never the operator's.
+    #[test]
+    fn env_gives_seatbelt_commands_their_own_xcrun_cache() {
+        let f = fx();
+        let parent: BTreeMap<String, String> = [("xcrun_db", "/operator/T/xcrun_db"), ("PATH", "/usr/bin")]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let own = s(&f.tmp.join(".xcrun_db")).to_string();
+        assert_eq!(build(&f, &cfg(SandboxMode::Seatbelt), None).env(&parent)["xcrun_db"], own);
+        // Over `env_pass` too, as `TMPDIR` is: the operator's cache is not writable under the profile.
+        let c = SandboxCfg { env_pass: vec!["xcrun_db".into()], ..cfg(SandboxMode::Seatbelt) };
+        assert_eq!(build(&f, &c, None).env(&parent)["xcrun_db"], own);
+        // Not confined: the stubs use whatever cache the parent names, as in the operator's own shell.
+        assert_eq!(build(&f, &cfg(SandboxMode::None), None).env(&parent)["xcrun_db"], "/operator/T/xcrun_db");
+        assert!(!build(&f, &cfg(SandboxMode::None), None).env(&BTreeMap::new()).contains_key("xcrun_db"));
     }
 
     #[test]
@@ -3472,7 +3526,8 @@ mod tests {
     /// (succeeded, stdout + stderr)
     fn run(sb: &Sandbox, cwd: &Path, script: &str) -> (bool, String) {
         let (prog, args) = sb.command(script);
-        let out = Command::new(prog).args(args).current_dir(cwd).env("TMPDIR", &sb.tmp_dir).output().expect("run");
+        // On the inherited environment, the variables the sandbox adds (`TMPDIR`, the stubs' own `xcrun_db`, …).
+        let out = Command::new(prog).args(args).current_dir(cwd).envs(sb.env(&BTreeMap::new())).output().expect("run");
         let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
         (out.status.success(), text)
     }
@@ -4068,6 +4123,45 @@ mod tests {
         let walk = "python3 -c \"from pathlib import Path; c=Path.cwd(); print([str(d) for d in [c,*c.parents] if (d/'pyproject.toml').is_file() or (d/'.git').exists()])\"";
         let (ok, text) = run(&sb, &f.tmp, walk);
         assert!(ok && text.trim() == "[]", "{text}");
+    }
+
+    /// `/usr/bin/python3`, `git` and the other developer-tool stubs write a new lookup cache when theirs lacks the
+    /// tool, and print an error when they cannot (on 512S1 that broke the exact-output tests of two commands until an
+    /// unsandboxed `python3` filled the operator's cache). With `env`, their cache is the session's own.
+    #[test]
+    fn developer_tool_stubs_print_only_their_output_with_a_cold_cache() {
+        let stubs = ["/usr/bin/xcrun", "/usr/bin/python3", "/usr/bin/git"].iter().all(|p| Path::new(p).exists());
+        if !available() || !stubs {
+            return;
+        }
+        let f = fx_prod();
+        let sb = build(&f, &cfg(SandboxMode::Seatbelt), None);
+        // The operator's cache, without the tools in it: a missing file where commands cannot write.
+        let operator = f.root.join("operator-T").join("xcrun_db");
+        std::fs::create_dir_all(operator.parent().expect("parent")).expect("mkdir");
+        let mut parent: BTreeMap<String, String> = std::env::vars().collect();
+        parent.insert("xcrun_db".into(), s(&operator).to_string());
+        let (prog, args) = sb.command("/usr/bin/python3 -c 'print(42)' && /usr/bin/git --version");
+        let go = |env: BTreeMap<String, String>| {
+            let out = Command::new(&prog).args(&args).current_dir(&f.ws).env_clear().envs(env).output().expect("run");
+            let text = |b: &[u8]| String::from_utf8_lossy(b).into_owned();
+            (out.status.success(), text(&out.stdout), text(&out.stderr))
+        };
+        let (ok, stdout, stderr) = go(sb.env(&parent));
+        assert!(ok && stdout.starts_with("42\ngit version ") && stderr.is_empty(), "{stdout}{stderr}");
+        assert!(f.tmp.join(".xcrun_db").is_file(), "the stubs did not use the private cache: {:?}", f.tmp);
+        assert!(!operator.exists());
+        // The same commands looking up in the operator's cache: they try to write beside it and are refused.
+        let mut bare = sb.env(&parent);
+        bare.insert("xcrun_db".into(), s(&operator).to_string());
+        let (ok, stdout, stderr) = go(bare);
+        assert!(ok && stdout.starts_with("42\ngit version "), "{stdout}{stderr}");
+        assert!(std::fs::read_dir(operator.parent().expect("parent")).expect("list").next().is_none());
+        if stderr.is_empty() {
+            eprintln!("note: the stubs here print nothing when their cache cannot be written");
+        } else {
+            assert!(stderr.lines().all(|l| l.contains("couldn't create cache file")), "{stderr}");
+        }
     }
 
     /// Node treats anything but ENOENT as fatal when it looks for a `package.json` above a script, and libuv ends
