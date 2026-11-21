@@ -577,7 +577,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
+use tokio::sync::mpsc::{error::TryRecvError, unbounded_channel, UnboundedReceiver};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -777,6 +777,9 @@ pub struct Control {
     /// The harness is going down: a cancelled turn is recorded as cut by the restart, and a child is
     /// not settled by it.
     shutting: std::sync::atomic::AtomicBool,
+    /// The session's inputs were closed outside shutdown (for example, archived): cancel any starting or
+    /// waking turn as an operator stop rather than a restart cut.
+    closed: std::sync::atomic::AtomicBool,
 }
 
 impl Control {
@@ -796,17 +799,27 @@ impl Control {
         self.stop_turn();
     }
 
+    /// Cancel any starting or waking turn when the session's inputs are closed (for example, on archive).
+    pub(crate) fn stop_for_close(&self) {
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.stop_turn();
+    }
+
     fn is_shutting(&self) -> bool {
         self.shutting.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Install and return the token of a new turn.
     pub(crate) fn begin_turn(&self) -> CancellationToken {
         let token = CancellationToken::new();
         *self.turn.lock().unwrap_or_else(|p| p.into_inner()) = token.clone();
-        // Read after the token is installed: a shutdown that began before this point is seen here,
-        // one that begins after it cancels the installed token.
-        if self.is_shutting() {
+        // Read after the token is installed: a shutdown or close that began before this point is seen
+        // here; one that begins after it cancels the installed token.
+        if self.is_shutting() || self.is_closed() {
             token.cancel();
         }
         token
@@ -937,7 +950,7 @@ impl CallPolicy {
         match name {
             "out_read" | "out_grep" | "ledger" | "mission_state" | "security_query" | "codec_calc" | "pty_close"
             | "note" | "evidence" | "claim_update" | "finish" | "conclude" | "verdict" | "report_blocker"
-            | "ask_user" | "wait" | "agent_stop" | "agent_list" | "job_kill" => true,
+            | "ask_user" | "ask_for" | "hand_off" | "wait" | "agent_stop" | "agent_list" | "job_kill" => true,
             "security_record" => args.get("operation").is_some_and(|op| {
                 let has = |key| op.get(key).and_then(Value::as_str).is_some_and(|s| !s.trim().is_empty());
                 match op.get("action").and_then(Value::as_str) {
@@ -1430,6 +1443,9 @@ pub struct Session {
     estimator: TokenEstimator,
     guard: PrefixGuard,
     inputs: Option<UnboundedReceiver<Input>>,
+    /// True once `inputs` has been observed open and empty (`TryRecvError::Empty`), distinguishing a
+    /// live channel that closes mid-turn from test fixtures that pre-load `inputs` and drop the sender.
+    inputs_seen_open: bool,
     jobs_open: bool,
     token: CancellationToken,
     /// Replies in a row that made no progress: nudged by the gate, cut off by the output limit with
@@ -1675,6 +1691,7 @@ impl Session {
             estimator: TokenEstimator::default(),
             guard: PrefixGuard::new(),
             inputs: None,
+            inputs_seen_open: false,
             jobs_open: true,
             token: CancellationToken::new(),
             nudges: 0,
@@ -2118,6 +2135,25 @@ Name them when you start a new mission instead."
 
     // ---- the idle loop -------------------------------------------------------------------------
 
+    async fn close_idle(&mut self) -> R<End> {
+        // Closed for good (the session was archived, or its runtime let go of it): a child
+        // settles, or its parent would wait for it for ever. A shutdown closes the inputs too,
+        // but it cuts the child for the next start to resume, so nothing is settled then.
+        if self.deps.shared.is_child() && !self.deps.control.is_shutting() {
+            return Ok(End::Settled(self.stop_idle_child(texts::REASON_OPERATOR).await?));
+        }
+        // Between turns no `interrupted` note goes with the jobs a shutdown stops: their ends say why.
+        let why = if self.deps.control.is_shutting() { texts::JOB_SHUTDOWN_DETAIL } else { "" };
+        self.deps.ctx.capabilities.ptys.close_all().await;
+        self.deps.ctx.jobs.kill_all_because(self.grace(), why).await;
+        // Nothing reads the job events after this task: what the jobs reported (killed just
+        // now, or ended before) is recorded now, or the next `open` would take them for lost.
+        while let Ok(event) = self.deps.job_events.try_recv() {
+            self.on_job_event(event).await?;
+        }
+        Ok(End::Closed)
+    }
+
     async fn drive(&mut self) -> R<End> {
         if self.st.ended.is_some() {
             self.phase = Phase::Ended;
@@ -2128,6 +2164,9 @@ Name them when you start a new mission instead."
         self.publish();
         for input in self.kept_inputs() {
             self.arrival(input).await?;
+        }
+        if self.deps.control.is_closed() {
+            return self.close_idle().await;
         }
         if self.deps.shared.is_child() && !self.st.has_turn {
             if let Some(settled) = self.turn(Trigger::Start).await? {
@@ -2151,24 +2190,8 @@ Name them when you start a new mission instead."
                 Ev::Input(Some(Input::Stop)) if self.deps.shared.is_child() => {
                     return Ok(End::Settled(self.stop_idle_child(texts::REASON_PARENT).await?));
                 }
-                // Closed for good (the session was archived, or its runtime let go of it): a child
-                // settles, or its parent would wait for it for ever. A shutdown closes the inputs too,
-                // but it cuts the child for the next start to resume, so nothing is settled then.
-                Ev::Input(None) if self.deps.shared.is_child() && !self.deps.control.is_shutting() => {
-                    return Ok(End::Settled(self.stop_idle_child(texts::REASON_OPERATOR).await?));
-                }
-                Ev::Input(None) => {
-                    // Between turns no `interrupted` note goes with the jobs a shutdown stops: their ends say why.
-                    let why = if self.deps.control.is_shutting() { texts::JOB_SHUTDOWN_DETAIL } else { "" };
-                    self.deps.ctx.capabilities.ptys.close_all().await;
-                    self.deps.ctx.jobs.kill_all_because(self.grace(), why).await;
-                    // Nothing reads the job events after this task: what the jobs reported (killed just
-                    // now, or ended before) is recorded now, or the next `open` would take them for lost.
-                    while let Ok(event) = self.deps.job_events.try_recv() {
-                        self.on_job_event(event).await?;
-                    }
-                    return Ok(End::Closed);
-                }
+                Ev::Input(None) => return self.close_idle().await,
+                Ev::Input(Some(_)) if self.deps.control.is_closed() => return self.close_idle().await,
                 Ev::Input(Some(input)) => self.idle_input(input).await?,
                 Ev::Job(Some(event)) => self.on_job_event(event).await?,
                 Ev::Job(None) => {
@@ -2176,6 +2199,9 @@ Name them when you start a new mission instead."
                     None
                 }
             };
+            if self.deps.control.is_closed() {
+                return self.close_idle().await;
+            }
             if let Some(trigger) = trigger {
                 if let Some(settled) = self.turn(trigger).await? {
                     return Ok(End::Settled(settled));
@@ -2191,7 +2217,11 @@ Name them when you start a new mission instead."
                 let token = self.deps.control.begin_turn();
                 let woven = self.woven();
                 let fold = self.operator_fold(&woven);
-                self.reweave(&woven, "operator", true, &token, fold).await?;
+                let res = self.reweave(&woven, "operator", true, &token, fold).await;
+                if self.st.clock.as_ref().is_some_and(|c| c.running_from.is_some()) {
+                    let _ = self.clock_set(false);
+                }
+                res?;
                 Ok(None)
             }
             Input::Stop => {
@@ -3242,15 +3272,30 @@ Name them when you start a new mission instead."
         text
     }
 
+    fn try_next_input(&mut self) -> Option<Input> {
+        let rx = self.inputs.as_mut()?;
+        match rx.try_recv() {
+            Ok(input) => Some(input),
+            Err(TryRecvError::Empty) => {
+                self.inputs_seen_open = true;
+                None
+            }
+            Err(TryRecvError::Disconnected) => {
+                if self.deps.control.is_closed() || self.inputs_seen_open {
+                    self.token.cancel();
+                }
+                None
+            }
+        }
+    }
+
     /// Record what arrived while the turn was running. Nothing here starts a turn.
     async fn drain_arrivals(&mut self) -> R<bool> {
         let mut force = false;
         while let Ok(event) = self.deps.job_events.try_recv() {
             self.on_job_event(event).await?;
         }
-        loop {
-            let next = self.inputs.as_mut().and_then(|rx| rx.try_recv().ok());
-            let Some(input) = next else { break };
+        while let Some(input) = self.try_next_input() {
             match input {
                 Input::Reweave => force = true,
                 Input::Resume => {}
@@ -3486,6 +3531,24 @@ Name them when you start a new mission instead."
     /// Ask the model, on the existing prefix `w`, for notes about what is about to be folded away.
     /// The request waits for the limiter at the session's own priority: the step waits for it.
     async fn ask_digest(&mut self, w: &Weave, token: &CancellationToken) -> R<Option<String>> {
+        let was_running = self.st.clock.as_ref().is_some_and(|c| c.running_from.is_some());
+        let res = self.ask_digest_inner(w, token).await;
+        if !was_running && self.st.clock.as_ref().is_some_and(|c| c.running_from.is_some()) {
+            match res {
+                Ok(val) => {
+                    self.clock_set(false)?;
+                    return Ok(val);
+                }
+                Err(e) => {
+                    let _ = self.clock_set(false);
+                    return Err(e);
+                }
+            }
+        }
+        res
+    }
+
+    async fn ask_digest_inner(&mut self, w: &Weave, token: &CancellationToken) -> R<Option<String>> {
         let req_id = new_request_id();
         self.append(
             Author::Harness,
@@ -5613,12 +5676,12 @@ mod tests {
     #[tokio::test]
     async fn no_notice_is_opened_when_the_retry_window_ends_first() {
         let (script, seen) = down_then(usize::MAX, Vec::new());
-        // The notice would be due as the window ends; the request fails at the attempt after that.
-        let mut fx = retrying_fx(script, 1, 1).await;
+        // The retry window (1 s) ends before the unavailable notice (2 s) falls due.
+        let mut fx = retrying_fx(script, 2, 1).await;
         let session = fx.create();
         run_with(session, vec![user("go")]).await;
         let rs = fx.sink.records();
-        assert!(seen.lock().unwrap().len() >= 3, "the request retried past the notice time");
+        assert!(seen.lock().unwrap().len() >= 2, "the request retried before the window ended");
         let items = inbox(&rs);
         assert_eq!(items.len(), 1, "{:?}", kinds(&rs));
         assert_eq!((items[0].kind, items[0].blocking), (InboxKind::Parked, true));
@@ -7875,6 +7938,8 @@ mod tests {
             "claim_update",
             "report_blocker",
             "finish",
+            "ask_for",
+            "hand_off",
             "verdict",
             "ledger",
             "agent_stop",
@@ -8186,5 +8251,156 @@ mod tests {
         wait_until(&fx.sink, "stopped", |rs| turn_ends(rs).contains(&TurnEndReason::Stopped)).await;
         assert!(fx.ctx.capabilities.ptys.ids().is_empty());
         assert_eq!(finish_task(tx, task).await, End::Closed);
+    }
+
+    #[tokio::test]
+    async fn idle_operator_reweave_digest_pauses_clock_and_excludes_idle_wait() {
+        fn long() -> Reply {
+            Reply::tool("bash", json!({ "command": BIG }).to_string()).with_text("t".repeat(100_000))
+        }
+        let script = with_digest(vec![long().into(), long().into(), Reply::text("ok").into()], Some("lead A"));
+        let mut fx = Fx::new("chat", false, false, script).await;
+        fx.context =
+            ReweavePolicy { target_tokens: 100_000, floor_tokens: 1_000, keep_recent_steps: 1, stub_tail_lines: 3 };
+        let session = fx.create();
+        let (tx, task) = spawn_run(session);
+        tx.send(user("go")).unwrap();
+        wait_until(&fx.sink, "turn end", |rs| count(rs, "turn_end") == 1).await;
+        assert!(reweave_records(&fx.sink.records()).is_empty());
+
+        tx.send(Input::Reweave).unwrap();
+        wait_until(&fx.sink, "reweave", |rs| count(rs, "reweave") == 1).await;
+        let rs = fx.sink.records();
+        assert!(
+            rs.iter().any(|r| matches!(&r.event, Event::ModelRequest(m) if m.purpose == Purpose::Digest)),
+            "idle operator reweave should have requested a digest"
+        );
+        let pause_ts = rs
+            .iter()
+            .rev()
+            .find_map(|r| match r.event {
+                Event::BudgetClock { running: false } => Some(r.ts_ms),
+                _ => None,
+            })
+            .expect("idle digest must pause clock");
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert_eq!(finish_task(tx, task).await, End::Closed);
+        let after_idle = Session::open(fx.deps()).unwrap().st.clock.unwrap();
+        assert_eq!(after_idle.running_from, None, "clock must be paused after idle reweave");
+        assert!(now_ms().saturating_sub(pause_ts) >= 100, "idle window should have elapsed");
+        assert_eq!(
+            after_idle.elapsed(now_ms()),
+            after_idle.elapsed(pause_ts),
+            "idle time after digest must not drain budget"
+        );
+
+        // Also check cancellation during an idle digest leaves the clock paused.
+        let cancel_script = Script::new(move |body, _| {
+            let m = body["messages"].as_array().unwrap();
+            if m.last().and_then(|l| l["content"].as_str()).is_some_and(|c| c == texts::DIGEST_PROMPT) {
+                return Action::Stall { ms: 600_000 };
+            }
+            let tools = m.iter().filter(|x| x["role"] == "tool").count();
+            if tools < 2 {
+                long().into()
+            } else {
+                Reply::text("ok").into()
+            }
+        });
+        let mut fx = Fx::new("chat", false, false, cancel_script).await;
+        fx.context =
+            ReweavePolicy { target_tokens: 100_000, floor_tokens: 1_000, keep_recent_steps: 1, stub_tail_lines: 3 };
+        let session = fx.create();
+        let (tx, task) = spawn_run(session);
+        tx.send(user("go")).unwrap();
+        wait_until(&fx.sink, "turn end", |rs| count(rs, "turn_end") == 1).await;
+        tx.send(Input::Reweave).unwrap();
+        wait_until(&fx.sink, "digest request", |rs| {
+            rs.iter().any(|r| matches!(&r.event, Event::ModelRequest(m) if m.purpose == Purpose::Digest))
+        })
+        .await;
+        fx.control.stop_turn();
+        assert_eq!(finish_task(tx, task).await, End::Closed);
+        let reopened = Session::open(fx.deps()).unwrap();
+        assert_eq!(reopened.st.clock.unwrap().running_from, None, "cancelled idle digest must pause clock");
+    }
+
+    #[tokio::test]
+    async fn drain_arrivals_cancels_turn_when_live_inputs_channel_disconnects_mid_turn() {
+        let mut fx = Fx::new(
+            "chat",
+            false,
+            false,
+            seq(vec![
+                Reply::tool(
+                    "bash",
+                    json!({"command": "touch ready && while [ ! -f go ]; do sleep 0.02; done; echo step1"}).to_string(),
+                )
+                .into(),
+                Reply::text("should not run step 2").into(),
+            ]),
+        )
+        .await;
+        let ws = fx.ctx.workspace.clone();
+        let session = fx.create();
+        let (tx, task) = spawn_run(session);
+        tx.send(user("go")).unwrap();
+        for _ in 0..250 {
+            if ws.join("ready").exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(ws.join("ready").exists(), "step 1 bash never started");
+        // Close the live inputs channel mid-turn without calling stop_turn() or sending Input::Stop.
+        drop(tx);
+        std::fs::write(ws.join("go"), "1").unwrap();
+        let end = tokio::time::timeout(Duration::from_secs(10), task).await.expect("session exited").unwrap();
+        assert_eq!(end, End::Closed);
+        let rs = fx.sink.records();
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Stopped], "{:?}", kinds(&rs));
+        assert_eq!(fx.server.requests().len(), 1, "step 2 must not execute after channel disconnect");
+    }
+
+    #[tokio::test]
+    async fn wrapup_allows_child_hand_off_and_lead_ask_for() {
+        let child_script = seq(vec![
+            bash("echo step1").into(),
+            Reply::tool(
+                "hand_off",
+                json!({"state":"partial progress","leads":["try port 8080"],"ask":"more_steps","why":"ran out of steps"})
+                    .to_string(),
+            )
+            .into(),
+        ]);
+        let mut fx = Fx::new("worker", true, true, child_script).await;
+        let session = fx.create_with(
+            Budget { max_steps: Some(1), max_minutes: None },
+            Some((SessionId::from("s-lead"), "Question: find the bug".into())),
+        );
+        let end = run_with(session, vec![]).await;
+        let End::Settled(settled) = end else { panic!("expected settlement, got {end:?}") };
+        assert_eq!(settled.outcome, ChildOutcome::Returned);
+        assert_eq!(settled.payload["handed_off"]["ask"], "more_steps");
+
+        let lead_script = seq(vec![
+            bash("echo step1").into(),
+            Reply::tool(
+                "ask_for",
+                json!({"kind":"budget","what":"10 more steps","why":"need to finish check","meanwhile":"wait"})
+                    .to_string(),
+            )
+            .into(),
+            Reply::tool("wait", json!({}).to_string()).into(),
+        ]);
+        let mut fx = Fx::new("lead", false, true, lead_script).await;
+        let session = fx.create_with(Budget { max_steps: Some(1), max_minutes: None }, None);
+        run_with(session, vec![user("go")]).await;
+        let rs = fx.sink.records();
+        assert!(
+            results(&rs).iter().any(|r| r.name == "ask_for" && r.status == ToolStatus::Ok),
+            "ask_for must succeed during wrapup: {:?}",
+            results(&rs)
+        );
     }
 }

@@ -1813,6 +1813,29 @@ fn content_length(headers: &[httparse::Header<'_>]) -> Result<Option<u64>, Strin
     Ok(length)
 }
 
+/// Writes `value` into `out`, unfolding obsolete multiline continuations (`\r\n` or `\n`
+/// followed by SP/HTAB, or any embedded `\r`/`\n`) to a single ASCII space (`b' '`).
+fn unfold_header_value(out: &mut Vec<u8>, value: &[u8]) {
+    let mut i = 0;
+    while i < value.len() {
+        match value.get(i).copied() {
+            Some(b'\r' | b'\n') => {
+                while value.get(i).is_some_and(|b| matches!(b, b'\r' | b'\n' | b' ' | b'\t')) {
+                    i += 1;
+                }
+                if i < value.len() {
+                    out.push(b' ');
+                }
+            }
+            Some(b) => {
+                out.push(b);
+                i += 1;
+            }
+            None => break,
+        }
+    }
+}
+
 /// The response head at the start of `buf`, parsed as an HTTP client parses it, for a request that
 /// was `HEAD` or not. `None` while it is incomplete.
 fn response_head(buf: &[u8], head_request: bool) -> Result<Option<RespHead>, String> {
@@ -1852,7 +1875,7 @@ fn response_head(buf: &[u8], head_request: bool) -> Result<Option<RespHead>, Str
     for h in resp.headers.iter().filter(|h| !h.name.eq_ignore_ascii_case(MARKER) && !dropped(h.name)) {
         head.extend_from_slice(h.name.as_bytes());
         head.extend_from_slice(b": ");
-        head.extend_from_slice(h.value);
+        unfold_header_value(&mut head, h.value);
         head.extend_from_slice(b"\r\n");
     }
     if is_final {
@@ -3516,6 +3539,34 @@ mod tests {
         let resp = raw(g.port, req.as_bytes()).await;
         assert_eq!(status(&resp), 502, "{resp}");
         assert!(resp.contains("X-Loom-Proxy: 1\r\n"));
+    }
+
+    #[tokio::test]
+    async fn obsolete_multiline_response_headers_are_unfolded_to_single_spaces() {
+        let reply = "HTTP/1.1 200 OK\r\nX-Crlf: hello\r\n world\r\nX-Lf: alpha\n\tbeta\r\nX-Multi: one\r\n   \t\r\n\t two\r\nContent-Length: 2\r\n\r\nok";
+        let parsed = response_head(reply.as_bytes(), false).unwrap().unwrap();
+        let head_str = std::str::from_utf8(&parsed.head).unwrap();
+        assert!(head_str.contains("X-Crlf: hello world\r\n"), "{head_str:?}");
+        assert!(head_str.contains("X-Lf: alpha beta\r\n"), "{head_str:?}");
+        assert!(head_str.contains("X-Multi: one two\r\n"), "{head_str:?}");
+        for line in head_str.strip_suffix("\r\n\r\n").unwrap().split("\r\n") {
+            assert!(!line.contains('\r') && !line.contains('\n'), "unfolded head kept CR/LF: {line:?}");
+        }
+
+        let (p, _rx) = start().await;
+        let g = p.grant(&SessionId::from("s-fold"), lab()).unwrap();
+        let (port, _server) = http_server(reply).await;
+        let req = format!("GET http://127.0.0.1:{port}/ HTTP/1.1\r\n{}\r\n", auth(&g));
+        let resp = raw(g.port, req.as_bytes()).await;
+        let (code, headers, body) = client_view(&resp);
+        assert_eq!((code, body.as_str()), (200, "ok"), "{resp:?}");
+        assert!(headers.contains(&("x-crlf".to_string(), "hello world".to_string())), "{headers:?}");
+        assert!(headers.contains(&("x-lf".to_string(), "alpha beta".to_string())), "{headers:?}");
+        assert!(headers.contains(&("x-multi".to_string(), "one two".to_string())), "{headers:?}");
+        let head_only = resp.split_once("\r\n\r\n").unwrap().0;
+        for line in head_only.split("\r\n") {
+            assert!(!line.contains('\r') && !line.contains('\n'), "proxy emitted CR/LF inside header line: {line:?}");
+        }
     }
 
     #[tokio::test]

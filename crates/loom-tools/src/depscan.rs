@@ -48,7 +48,9 @@
 use crate::binary::{command_bounded, quote, CommandOutcome};
 use crate::{params, Body, Tool, ToolCtx, ToolOutput};
 use async_trait::async_trait;
+use loom_core::admit::normalize;
 use loom_core::event::{ToolClass, ToolSpec, ToolStatus, META_ALSO_STORED, META_EVIDENCE_GRADE, META_RAW_BLOB};
+use loom_core::{BlobRef, BlobStore};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -57,6 +59,10 @@ use std::path::PathBuf;
 pub const MAX_FINDINGS: usize = 50;
 /// Largest VDR/SBOM file parsed and stored whole; a larger one is left in place and named.
 const MAX_ARTIFACT_BYTES: u64 = 32 * 1024 * 1024;
+/// Maximum number of VDR/SBOM files parsed and stored from one scan's reports directory.
+const MAX_ARTIFACT_FILES: usize = 32;
+/// Maximum cumulative byte size across all VDR/SBOM files parsed and stored from one scan.
+const MAX_ARTIFACTS_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 /// Printed by the wrapper script when no `depscan` is on `PATH`.
 const MISSING_MARKER: &str = "LOOM_DEPSCAN_NOT_INSTALLED";
 /// Default and ceiling for one scan. A first run downloads a multi-GB vulnerability
@@ -115,8 +121,19 @@ impl Finding {
     }
 }
 
+/// Normalize inline display text so rendered findings and metadata never carry ANSI escapes or raw controls.
+fn clean_text(s: &str) -> String {
+    let normalized = normalize(s.as_bytes());
+    if normalized.changed {
+        normalized.text
+    } else {
+        s.to_string()
+    }
+}
+
 fn one_line(s: &str, max: usize) -> String {
-    let joined: String = s
+    let cleaned = clean_text(s);
+    let joined: String = cleaned
         .chars()
         .filter(|c| *c == '\n' || !c.is_control())
         .collect::<String>()
@@ -160,20 +177,22 @@ fn findings_of(vdr: &Value) -> Vec<Finding> {
                 if s.is_some() {
                     score = s;
                 }
-                severity = text(rating, "severity").map(|x| x.trim().to_ascii_uppercase()).filter(|x| !x.is_empty());
+                severity = text(rating, "severity")
+                    .map(|x| clean_text(x.trim()).to_ascii_uppercase())
+                    .filter(|x| !x.is_empty());
             }
         }
         let mut affects = Vec::new();
         let mut fixed = None;
         for a in items(vuln, "affects") {
             if let Some(r) = text(a, "ref").filter(|s| !s.trim().is_empty()) {
-                affects.push(r.trim().to_string());
+                affects.push(clean_text(r.trim()));
             }
             if fixed.is_none() {
                 fixed = items(a, "versions")
                     .find(|ver| text(ver, "status") == Some("unaffected"))
                     .and_then(|ver| text(ver, "version"))
-                    .map(|v| v.trim().to_string())
+                    .map(|v| clean_text(v.trim()))
                     .filter(|v| !v.is_empty());
             }
         }
@@ -185,14 +204,15 @@ fn findings_of(vdr: &Value) -> Vec<Finding> {
             match (text(prop, "name"), text(prop, "value")) {
                 (Some("depscan:prioritized"), Some(v)) => prioritized = v.trim().eq_ignore_ascii_case("true"),
                 (Some("depscan:insights"), Some(v)) => {
-                    insights = v.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join("; ")
+                    insights =
+                        clean_text(v).lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join("; ")
                 }
                 _ => {}
             }
         }
         let reachable = insights.to_ascii_lowercase().contains("reachable");
         out.push(Finding {
-            id: id.trim().to_string(),
+            id: clean_text(id.trim()),
             severity: severity.unwrap_or_else(|| "UNKNOWN".to_string()),
             score,
             affects,
@@ -301,8 +321,10 @@ struct Artifact {
 struct Artifacts {
     vdrs: Vec<Artifact>,
     boms: Vec<Artifact>,
-    /// Names of files over the size limit, which are not read.
+    /// Names of files over the per-file size limit, which are not read.
     oversized: Vec<String>,
+    /// Names of files skipped because aggregate count or cumulative-byte limits were reached.
+    skipped: Vec<String>,
     /// A sentence for each report file that was not read because the session may not read what it is.
     refused: Vec<String>,
 }
@@ -310,20 +332,46 @@ struct Artifacts {
 /// Read the `*.vdr.json` / `*.cdx.json` files of the reports directory. The directory is writable by
 /// the scan (and by any command of the session), so each file is opened as the file tools open one: only
 /// a regular file, and only when `readable` accepts the real path of what was opened. A link to something
-/// the session cannot read is refused and named, never stored. An oversized file is not read; its name is
-/// returned so the caller can keep the directory and say where it is.
+/// the session cannot read is refused and named, never stored. Files exceeding per-file or aggregate
+/// limits are not read; their names are returned so the caller can keep the directory and report them.
 fn read_artifacts(reports: &std::path::Path, readable: crate::files::Readable<'_>) -> Artifacts {
+    read_artifacts_bounded(reports, readable, MAX_ARTIFACT_BYTES, MAX_ARTIFACT_FILES, MAX_ARTIFACTS_TOTAL_BYTES)
+}
+
+fn read_artifacts_bounded(
+    reports: &std::path::Path,
+    readable: crate::files::Readable<'_>,
+    max_file_bytes: u64,
+    max_files: usize,
+    max_total_bytes: u64,
+) -> Artifacts {
     use crate::files::{open_readable, NotOpened};
     use std::io::Read as _;
     let mut found = Artifacts::default();
     let Ok(entries) = std::fs::read_dir(reports) else { return found };
-    let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    let mut paths: Vec<(bool, String, PathBuf)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let path = e.path();
+            let name = path.file_name()?.to_string_lossy().into_owned();
+            let is_vdr = name.ends_with(".vdr.json");
+            let is_bom = !is_vdr && name.ends_with(".cdx.json");
+            (is_vdr || is_bom).then_some((!is_vdr, name, path))
+        })
+        .collect();
+    // Read VDR reports before SBOMs so excess SBOMs cannot crowd out primary VDR findings.
     paths.sort();
-    for path in paths {
-        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let is_vdr = name.ends_with(".vdr.json");
-        let is_bom = !is_vdr && name.ends_with(".cdx.json");
-        if !is_vdr && !is_bom {
+
+    let mut total_bytes = 0u64;
+    for (is_bom, name, path) in paths {
+        let is_vdr = !is_bom;
+        if found.vdrs.len() + found.boms.len() >= max_files {
+            found.skipped.push(name);
+            continue;
+        }
+        let remaining = max_total_bytes.saturating_sub(total_bytes);
+        if remaining == 0 {
+            found.skipped.push(name);
             continue;
         }
         let (file, meta) = match open_readable(&path, readable) {
@@ -341,16 +389,28 @@ fn read_artifacts(reports: &std::path::Path, readable: crate::files::Readable<'_
             }
             Err(NotOpened::Io(_)) => continue,
         };
-        if meta.len() > MAX_ARTIFACT_BYTES {
+        if meta.len() > max_file_bytes {
             found.oversized.push(name);
             continue;
         }
+        if meta.len() > remaining {
+            found.skipped.push(name);
+            continue;
+        }
+        let cap = max_file_bytes.min(remaining);
         // A file that grew after the check is not read whole.
         let mut bytes = Vec::new();
-        match file.take(MAX_ARTIFACT_BYTES + 1).read_to_end(&mut bytes) {
-            Ok(_) if bytes.len() as u64 > MAX_ARTIFACT_BYTES => found.oversized.push(name),
-            Ok(_) if is_vdr => found.vdrs.push(Artifact { name, bytes }),
-            Ok(_) => found.boms.push(Artifact { name, bytes }),
+        match file.take(cap.saturating_add(1)).read_to_end(&mut bytes) {
+            Ok(_) if bytes.len() as u64 > max_file_bytes => found.oversized.push(name),
+            Ok(_) if bytes.len() as u64 > remaining => found.skipped.push(name),
+            Ok(_) => {
+                total_bytes = total_bytes.saturating_add(bytes.len() as u64);
+                if is_vdr {
+                    found.vdrs.push(Artifact { name, bytes });
+                } else {
+                    found.boms.push(Artifact { name, bytes });
+                }
+            }
             Err(_) => found.oversized.push(name),
         }
     }
@@ -404,6 +464,32 @@ fn build_script(
     }
     script.push('\n');
     script
+}
+
+fn format_name_list(names: &[String], max_names: usize) -> String {
+    let shown: Vec<String> = names.iter().take(max_names).map(|n| clean_text(n)).collect();
+    if names.len() > max_names {
+        format!("{}, and {} more", shown.join(", "), names.len() - max_names)
+    } else {
+        shown.join(", ")
+    }
+}
+
+fn skipped_fact(skipped: &[String], reports: &std::path::Path) -> String {
+    format!(
+        "{} report file(s) were skipped under the artifact limit ({} files / {} MiB total) and were left under {}: {}",
+        skipped.len(),
+        MAX_ARTIFACT_FILES,
+        MAX_ARTIFACTS_TOTAL_BYTES / (1024 * 1024),
+        reports.display(),
+        format_name_list(skipped, 16),
+    )
+}
+
+fn put_normalized(blobs: &BlobStore, raw: &[u8]) -> std::io::Result<(BlobRef, bool)> {
+    let normalized = normalize(raw);
+    let stored = blobs.put_bytes(normalized.text.as_bytes())?;
+    Ok((stored, normalized.changed))
 }
 
 async fn run(ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
@@ -486,19 +572,25 @@ async fn run(ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
     let console = String::from_utf8_lossy(&outcome.bytes).into_owned();
 
     // --- Artifacts ------------------------------------------------------------
-    let Artifacts { vdrs, boms, oversized, refused } =
+    let Artifacts { vdrs, boms, oversized, skipped, refused } =
         read_artifacts(&reports, &|real| ctx.sandbox.check_read(real).map(|_| ()));
-    let keep_dir = !oversized.is_empty();
-    let mut parsed: Vec<Value> = Vec::new();
+    let keep_dir = !oversized.is_empty() || !skipped.is_empty();
+    let mut parsed_vdrs = 0usize;
     let mut unparseable = 0usize;
+    let mut vdr_components = 0usize;
+    let mut findings: Vec<Finding> = Vec::new();
     for vdr in &vdrs {
         match serde_json::from_slice::<Value>(&vdr.bytes) {
-            Ok(v) => parsed.push(v),
+            Ok(v) => {
+                parsed_vdrs += 1;
+                vdr_components = vdr_components.saturating_add(component_count(&v));
+                findings.extend(findings_of(&v));
+            }
             Err(_) => unparseable += 1,
         }
     }
 
-    if parsed.is_empty() {
+    if parsed_vdrs == 0 {
         if !keep_dir {
             let _ = std::fs::remove_dir_all(&run_dir);
         }
@@ -517,8 +609,11 @@ async fn run(ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
                     .to_string(),
             );
         }
-        if keep_dir {
+        if !oversized.is_empty() {
             out.more.push(format!("Oversized report files were left under {}", reports.display()));
+        }
+        if !skipped.is_empty() {
+            out.more.push(skipped_fact(&skipped, &reports));
         }
         out.more.extend(refused);
         return out;
@@ -528,47 +623,53 @@ async fn run(ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
     let mut components = 0usize;
     for bom in &boms {
         if let Ok(v) = serde_json::from_slice::<Value>(&bom.bytes) {
-            components += component_count(&v);
+            components = components.saturating_add(component_count(&v));
         }
     }
     if components == 0 {
-        components = parsed.iter().map(component_count).sum();
+        components = vdr_components;
     }
-    let mut findings: Vec<Finding> = parsed.iter().flat_map(findings_of).collect();
-    let artifact_names: Vec<String> =
-        vdrs.iter().map(|a| a.name.clone()).chain(boms.iter().map(|a| a.name.clone())).collect();
-    let (summary, outcome_text) =
-        render(&resolved.display().to_string(), components, std::mem::take(&mut findings), &artifact_names);
+    let artifact_names: Vec<String> = vdrs.iter().chain(boms.iter()).map(|a| clean_text(&a.name)).collect();
+    let (summary, outcome_text) = render(
+        &clean_text(&resolved.display().to_string()),
+        components,
+        std::mem::take(&mut findings),
+        &artifact_names,
+    );
 
     let mut out = ToolOutput::ok(outcome_text, Body::Raw(summary.into_bytes()));
     // The ids of every further blob a fact names, so they count as outputs of the mission.
     let mut also: Vec<String> = Vec::new();
-    // Store the artifacts so they outlive the temp directory and can be cited.
+    // Store the normalized artifacts so they outlive the temp directory and can be cited safely.
     if let Some(first) = vdrs.first() {
-        match ctx.blobs.put_bytes(&first.bytes) {
-            Ok(stored) => {
+        match put_normalized(&ctx.blobs, &first.bytes) {
+            Ok((stored, changed)) => {
                 out = out.with_meta(META_RAW_BLOB, json!(stored.id.as_str()));
-                out = out.with_more(format!("VDR {}: {}", first.name, stored.handle()));
+                let note = if changed { " (normalized)" } else { "" };
+                out = out.with_more(format!("VDR {}: {}{note}", clean_text(&first.name), stored.handle()));
             }
             Err(e) => out = out.with_more(format!("the VDR could not be stored ({e})")),
         }
         for extra in vdrs.iter().skip(1) {
-            if let Ok(stored) = ctx.blobs.put_bytes(&extra.bytes) {
+            if let Ok((stored, changed)) = put_normalized(&ctx.blobs, &extra.bytes) {
                 also.push(stored.id.as_str().to_string());
-                out = out.with_more(format!("VDR {}: {}", extra.name, stored.handle()));
+                let note = if changed { " (normalized)" } else { "" };
+                out = out.with_more(format!("VDR {}: {}{note}", clean_text(&extra.name), stored.handle()));
             }
         }
     }
     for bom in &boms {
-        if let Ok(stored) = ctx.blobs.put_bytes(&bom.bytes) {
+        if let Ok((stored, changed)) = put_normalized(&ctx.blobs, &bom.bytes) {
             also.push(stored.id.as_str().to_string());
-            out = out.with_more(format!("SBOM {}: {}", bom.name, stored.handle()));
+            let note = if changed { " (normalized)" } else { "" };
+            out = out.with_more(format!("SBOM {}: {}{note}", clean_text(&bom.name), stored.handle()));
         }
     }
     if !outcome.bytes.is_empty() {
-        if let Ok(stored) = ctx.blobs.put_bytes(&outcome.bytes) {
+        if let Ok((stored, changed)) = put_normalized(&ctx.blobs, &outcome.bytes) {
             also.push(stored.id.as_str().to_string());
-            out = out.with_more(format!("scanner console: {}", stored.handle()));
+            let note = if changed { " (normalized)" } else { "" };
+            out = out.with_more(format!("scanner console: {}{note}", stored.handle()));
         }
     }
     if !also.is_empty() {
@@ -585,8 +686,11 @@ async fn run(ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
             "report file(s) over {} MiB were not parsed and were left under {}: {}",
             MAX_ARTIFACT_BYTES / (1024 * 1024),
             reports.display(),
-            oversized.join(", ")
+            format_name_list(&oversized, 16)
         ));
+    }
+    if !skipped.is_empty() {
+        out = out.with_more(skipped_fact(&skipped, &reports));
     }
     if !outcome.success() {
         out.status = ToolStatus::Error;
@@ -595,7 +699,7 @@ async fn run(ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
             outcome.ended.outcome()
         ));
     }
-    if oversized.is_empty() {
+    if !keep_dir {
         let _ = std::fs::remove_dir_all(&run_dir);
     }
     out
@@ -914,5 +1018,151 @@ echo "fake depscan ran: $*"
         let r = e.call("dep_scan", json!({})).await;
         assert_eq!(r.status, Status::Error, "{}", r.text);
         assert_eq!(grade(&r), Some("analysis"));
+    }
+
+    #[tokio::test]
+    async fn aggregate_artifact_file_count_and_total_byte_caps_bound_reads() {
+        // Direct unit check on bounded aggregate reading: VDRs precede SBOMs and excess files are skipped unread.
+        let dir = tempfile::tempdir().unwrap();
+        let reports = dir.path();
+        std::fs::write(reports.join("z.vdr.json"), vec![b'a'; 50]).unwrap();
+        std::fs::write(reports.join("a.cdx.json"), vec![b'b'; 50]).unwrap();
+        std::fs::write(reports.join("b.cdx.json"), vec![b'c'; 50]).unwrap();
+        let a = read_artifacts_bounded(reports, &|_| Ok(()), 100, 10, 110);
+        assert_eq!(a.vdrs.len(), 1);
+        assert_eq!(a.vdrs[0].name, "z.vdr.json");
+        assert_eq!(a.boms.len(), 1);
+        assert_eq!(a.boms[0].name, "a.cdx.json");
+        assert_eq!(a.skipped, vec!["b.cdx.json"]);
+
+        // File-count cap end-to-end: 1 VDR + 34 SBOMs (35 total > MAX_ARTIFACT_FILES = 32).
+        let mut e = env();
+        let fixtures = e.ctx.workspace.join("fixtures-count");
+        std::fs::create_dir_all(&fixtures).unwrap();
+        std::fs::write(
+            fixtures.join("00-main.vdr.json"),
+            r#"{"bomFormat":"CycloneDX","vulnerabilities":[{"id":"CVE-2024-9001","ratings":[{"severity":"high","score":7.0}],"affects":[{"ref":"pkg:cargo/x@1.0.0"}]}]}"#,
+        )
+        .unwrap();
+        for i in 1..=34 {
+            std::fs::write(
+                fixtures.join(format!("{i:02}.cdx.json")),
+                r#"{"bomFormat":"CycloneDX","components":[{"bom-ref":"pkg:cargo/x@1.0.0"}]}"#,
+            )
+            .unwrap();
+        }
+        let script = format!(
+            "#!/bin/sh\nreports=\"\"\nprev=\"\"\nfor a in \"$@\"; do\n  if [ \"$prev\" = \"--reports-dir\" ]; then reports=\"$a\"; fi\n  prev=\"$a\"\ndone\ncp '{}'/* \"$reports/\"\n",
+            fixtures.display()
+        );
+        with_fake_depscan(&mut e, &script);
+        let r = e.call("dep_scan", json!({})).await;
+        assert_eq!(r.status, Status::Ok, "{}", r.text);
+        assert!(r.text.contains("skipped under the artifact limit"), "{}", r.text);
+        assert!(r.text.contains("3 report file(s)"), "{}", r.text);
+        for skipped in ["32.cdx.json", "33.cdx.json", "34.cdx.json"] {
+            assert!(r.text.contains(skipped), "missing {skipped} in {}", r.text);
+            assert!(!r.text.contains(&format!("SBOM {skipped}: out:")), "{}", r.text);
+        }
+        let also: Vec<&str> =
+            r.meta.get(META_ALSO_STORED).and_then(Value::as_array).unwrap().iter().filter_map(Value::as_str).collect();
+        // 31 stored SBOMs (with 1 VDR = 32 MAX_ARTIFACT_FILES); console output was empty so not stored.
+        assert_eq!(also.len(), MAX_ARTIFACT_FILES - 1, "{also:?}");
+
+        // Cumulative total-byte cap end-to-end: 3 x 25 MiB VDRs (each < 32 MiB, total 75 MiB > 64 MiB).
+        let mut e = env();
+        let fixtures = e.ctx.workspace.join("fixtures-bytes");
+        std::fs::create_dir_all(&fixtures).unwrap();
+        let pad = " ".repeat(25 * 1024 * 1024);
+        for (name, cve) in
+            [("v1.vdr.json", "CVE-2024-0001"), ("v2.vdr.json", "CVE-2024-0002"), ("v3.vdr.json", "CVE-2024-0003")]
+        {
+            let content = format!(
+                "{pad}{{\"bomFormat\":\"CycloneDX\",\"vulnerabilities\":[{{\"id\":\"{cve}\",\"ratings\":[{{\"severity\":\"low\",\"score\":1.0}}]}}]}}"
+            );
+            std::fs::write(fixtures.join(name), content).unwrap();
+        }
+        let script = format!(
+            "#!/bin/sh\nreports=\"\"\nprev=\"\"\nfor a in \"$@\"; do\n  if [ \"$prev\" = \"--reports-dir\" ]; then reports=\"$a\"; fi\n  prev=\"$a\"\ndone\ncp '{}'/* \"$reports/\"\n",
+            fixtures.display()
+        );
+        with_fake_depscan(&mut e, &script);
+        let r = e.call("dep_scan", json!({})).await;
+        assert_eq!(r.status, Status::Ok, "{}", r.text);
+        let stored = e.stored(&r);
+        assert!(stored.contains("CVE-2024-0001") && stored.contains("CVE-2024-0002"), "{stored}");
+        assert!(!stored.contains("CVE-2024-0003"), "v3 should have been skipped unread: {stored}");
+        assert!(r.text.contains("v3.vdr.json") && r.text.contains("skipped under the artifact limit"), "{}", r.text);
+    }
+
+    #[tokio::test]
+    async fn stored_artifacts_normalize_control_and_ansi_bytes() {
+        let mut e = env();
+        let fixtures = e.ctx.workspace.join("fixtures-norm");
+        std::fs::create_dir_all(&fixtures).unwrap();
+        std::fs::write(
+            fixtures.join("a.vdr.json"),
+            b"{\r\n\"bomFormat\":\"CycloneDX\",\"vulnerabilities\":[{\"id\":\"CVE-2024-7777\x7f\",\"ratings\":[{\"severity\":\"high\",\"score\":8.0}],\"affects\":[{\"ref\":\"pkg:npm/a@1.0.0\"}],\"properties\":[{\"name\":\"depscan:insights\",\"value\":\"\\u001b[31mReachable\\u001b[0m\"}]}]}\r\n",
+        )
+        .unwrap();
+        std::fs::write(fixtures.join("b.vdr.json"), b"not-json \x1b[31mBAD-VDR\x1b[0m\njunk\rKEEP-VDR\x07\n").unwrap();
+        std::fs::write(
+            fixtures.join("sbom.cdx.json"),
+            b"{\"bomFormat\":\"CycloneDX\",\"components\":[{\"bom-ref\":\"pkg:npm/padded-package-name-over-100-bytes@1.0.0\"}]}\n\x1b[32mSBOM-OK\x1b[0m\nold\rNEW-SBOM\x00\n",
+        )
+        .unwrap();
+        let script = format!(
+            "#!/bin/sh\nreports=\"\"\nprev=\"\"\nfor a in \"$@\"; do\n  if [ \"$prev\" = \"--reports-dir\" ]; then reports=\"$a\"; fi\n  prev=\"$a\"\ndone\ncp '{}'/* \"$reports/\"\nprintf '\\033[33mconsole-ok\\033[0m\\n'\n",
+            fixtures.display()
+        );
+        with_fake_depscan(&mut e, &script);
+        let r = e.call("dep_scan", json!({})).await;
+        assert_eq!(r.status, Status::Ok, "{}", r.text);
+        assert!(r.text.contains("Reachable") && !r.text.contains('\x1b'), "{}", r.text);
+
+        // No stored blob payload (excluding binary `.idx` line-offset indexes) may hold raw ANSI ESC, NUL, BEL, DEL, or CR bytes.
+        let mut stored_all = Vec::new();
+        let mut dirs = vec![e.dir.path().join("home/blobs")];
+        while let Some(d) = dirs.pop() {
+            for entry in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    dirs.push(p);
+                } else if p.extension().and_then(|ext| ext.to_str()) != Some("idx") {
+                    stored_all.extend(std::fs::read(&p).unwrap_or_default());
+                }
+            }
+        }
+        assert!(!stored_all.is_empty());
+        for forbidden in [0x1bu8, 0x00, 0x07, 0x7f, b'\r'] {
+            assert!(!stored_all.contains(&forbidden), "found unnormalized byte {forbidden:#04x} in blob store");
+        }
+
+        // First VDR stays in META_RAW_BLOB (not overwritten by Body::Raw), normalized, and readable via out_read.
+        let raw_id = r.meta.get(META_RAW_BLOB).and_then(Value::as_str).unwrap();
+        let vdr_read = e.call("out_read", json!({"handle": format!("out:{}", &raw_id[..16])})).await;
+        assert_eq!(vdr_read.status, Status::Ok, "{}", vdr_read.text);
+        assert!(vdr_read.text.contains("CVE-2024-7777\\x7f"), "{}", vdr_read.text);
+
+        let also: Vec<&str> =
+            r.meta.get(META_ALSO_STORED).and_then(Value::as_array).unwrap().iter().filter_map(Value::as_str).collect();
+        assert_eq!(also.len(), 3, "{also:?}");
+        let extra_vdr = e.call("out_read", json!({"handle": format!("out:{}", &also[0][..16])})).await;
+        assert!(extra_vdr.text.contains("BAD-VDR") && extra_vdr.text.contains("KEEP-VDR\\x07"), "{}", extra_vdr.text);
+        assert!(!extra_vdr.text.contains("junk") && !extra_vdr.text.contains('\x1b'), "{}", extra_vdr.text);
+
+        let sbom_read = e.call("out_read", json!({"handle": format!("out:{}", &also[1][..16])})).await;
+        assert!(sbom_read.text.contains("SBOM-OK") && sbom_read.text.contains("NEW-SBOM\\x00"), "{}", sbom_read.text);
+        assert!(!sbom_read.text.contains("old") && !sbom_read.text.contains('\x1b'), "{}", sbom_read.text);
+        let sbom_grep =
+            e.call("out_grep", json!({"handle": format!("out:{}", &also[1][..16]), "pattern": "NEW-SBOM"})).await;
+        assert!(sbom_grep.text.contains("NEW-SBOM\\x00") && !sbom_grep.text.contains('\x1b'), "{}", sbom_grep.text);
+
+        let console_read = e.call("out_read", json!({"handle": format!("out:{}", &also[2][..16])})).await;
+        assert!(
+            console_read.text.contains("console-ok") && !console_read.text.contains('\x1b'),
+            "{}",
+            console_read.text
+        );
     }
 }

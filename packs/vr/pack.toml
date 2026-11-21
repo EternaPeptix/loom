@@ -31,7 +31,7 @@ tools = [
   "bash", "job_wait", "job_kill", "job_list", "read", "write", "edit", "glob", "grep", "out_read", "out_grep", "web_fetch",
   "note", "claim", "claim_update", "evidence", "ledger", "pin", "log_search", "reflect",
   "cve_lookup", "advisory_lookup", "dep_scan",
-  "request_scope", "conclude", "finish", "report_blocker", "wait", "hand_off",
+  "finish", "report_blocker", "wait", "hand_off",
 ]
 
 # The independent check. Checks a proposed scope against the page that authorizes it, and refutes a

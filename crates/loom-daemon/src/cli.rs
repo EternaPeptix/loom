@@ -1087,22 +1087,33 @@ async fn print_records(
     }
 }
 
+fn rest_code(status: &loom_agent::session::Status) -> Option<i32> {
+    match status.phase {
+        Phase::Ended => Some(status.outcome.map(outcome_code).unwrap_or(0)),
+        Phase::Idle => status.last_end.and_then(follow_exit_code),
+        Phase::Running => None,
+    }
+}
+
 /// `tail`: what exists, then what arrives, until the turn that is running (or the next one) ends. A
 /// session at rest — ended, or idle after a turn that ended — has nothing to wait for: its records
 /// are printed and the code is that of its last turn.
 async fn tail_with(c: &Client, a: &TailArgs, cfg: &FollowCfg<'_>, out: &mut dyn Write) -> Result<i32, String> {
     let id = c.resolve(&a.session).await?;
     let status = c.session(&id).await?.info.status;
-    let at_rest_code = match status.phase {
-        Phase::Ended => Some(status.outcome.map(outcome_code).unwrap_or(0)),
-        Phase::Idle => status.last_end.and_then(follow_exit_code),
-        Phase::Running => None,
-    };
+    let at_rest_code = rest_code(&status);
     if a.no_follow || at_rest_code.is_some() {
         print_records(c, &id, a.since, cfg.render, out).await?;
         return Ok(if a.no_follow { 0 } else { at_rest_code.unwrap_or(0) });
     }
     let floor = last_seq(c, &id).await?;
+    // Re-check after computing `floor`: if the running turn finished before `floor` was read,
+    // `floor` already includes its `TurnEnd`/`SessionEnd` and `follow` would wait forever.
+    let status = c.session(&id).await?.info.status;
+    if let Some(code) = rest_code(&status) {
+        print_records(c, &id, a.since, cfg.render, out).await?;
+        return Ok(code);
+    }
     let cfg = FollowCfg { stop_floor: floor, ..*cfg };
     Ok(follow(c, &id, a.since, &cfg, out).await?.code)
 }
@@ -2749,5 +2760,84 @@ mod tests {
         let mut out = Vec::new();
         print_blob(&c, handle, Some((5, None)), &|s: &str| s.to_string(), &mut out).await.unwrap();
         assert_eq!(String::from_utf8(out).unwrap().lines().count(), 3);
+    }
+
+    #[tokio::test]
+    async fn tail_does_not_hang_if_turn_finishes_before_stop_floor() {
+        use axum::extract::Query;
+        use axum::http::header;
+        use axum::response::Response;
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let log = vec![note(0), note(1), turn_end(2, TurnEndReason::Asked)];
+        let sessions_body = json(&vec![info("s-1", 1, false)]);
+        let running_body = detail_with(Phase::Running, None, None);
+        let idle_body = detail_with(Phase::Idle, Some(TurnEndReason::Asked), None);
+
+        let app = axum::Router::new()
+            .route(
+                "/api/sessions",
+                axum::routing::get({
+                    let sessions_body = sessions_body.clone();
+                    move || async move { sessions_body }
+                }),
+            )
+            .route(
+                "/api/sessions/s-1",
+                axum::routing::get({
+                    let calls = calls.clone();
+                    move || async move {
+                        if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                            running_body.clone()
+                        } else {
+                            idle_body.clone()
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/api/sessions/s-1/records",
+                axum::routing::get({
+                    let log = log.clone();
+                    move |Query(q): Query<HashMap<String, String>>| async move {
+                        let after = q.get("after").and_then(|v| v.parse::<Seq>().ok());
+                        let limit = q.get("limit").and_then(|v| v.parse::<usize>().ok()).unwrap_or(500);
+                        let records: Vec<Record> =
+                            log.iter().filter(|r| after.is_none_or(|a| r.seq > a)).take(limit).cloned().collect();
+                        let next_after = (records.len() == limit).then(|| records.last().map(|r| r.seq)).flatten();
+                        json(&crate::wire::RecordsPage { records, next_after })
+                    }
+                }),
+            )
+            .route(
+                "/api/sessions/s-1/stream",
+                axum::routing::get(|| async move {
+                    let pending = futures_util::stream::pending::<Result<axum::body::Bytes, std::io::Error>>();
+                    Response::builder()
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(axum::body::Body::from_stream(pending))
+                        .unwrap()
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let c = Client::new(&format!("http://{addr}"), "tok-123");
+        let render_record = rendered;
+        let cfg = cfg(&render_record);
+        let mut out = Vec::new();
+        let code = tokio::time::timeout(Duration::from_secs(2), tail_with(&c, &tail_args(None, false), &cfg, &mut out))
+            .await
+            .expect("tail_with must not hang")
+            .unwrap();
+        srv.abort();
+        assert_eq!(code, 2);
+        assert_eq!(String::from_utf8(out).unwrap(), "#0\n#1\n#2\n");
     }
 }

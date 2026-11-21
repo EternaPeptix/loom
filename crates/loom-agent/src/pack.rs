@@ -785,14 +785,14 @@ mod tests {
         let p = Packs::load(&dir).unwrap();
         let known = crate::rtools::known_tools();
         let has = |pack: &str, role: &str, tool: &str| p.get(pack).unwrap().roles[role].tools.iter().any(|t| t == tool);
-        for (pack, role) in [("core", "lead"), ("vr", "researcher"), ("vr", "scout")] {
+        for (pack, role) in [("core", "lead"), ("vr", "researcher")] {
             assert!(has(pack, role, "request_scope") && has(pack, role, "conclude"), "{pack}/{role}");
         }
         // A read-only chat asks for scope; it concludes nothing.
         for pack in ["core", "vr"] {
             assert!(has(pack, "chat", "request_scope") && !has(pack, "chat", "conclude"), "{pack}/chat");
         }
-        for (pack, role) in [("core", "worker"), ("core", "verifier"), ("vr", "judge")] {
+        for (pack, role) in [("core", "worker"), ("core", "verifier"), ("vr", "scout"), ("vr", "judge")] {
             assert!(!has(pack, role, "request_scope") && !has(pack, role, "conclude"), "{pack}/{role}");
         }
         assert!(known.iter().any(|t| t == "request_scope") && known.iter().any(|t| t == "conclude"));

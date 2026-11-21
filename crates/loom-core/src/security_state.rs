@@ -742,6 +742,15 @@ impl SecurityState {
             SecurityOp::FactAssert { fact, evidence: e } => {
                 fact.validate()?;
                 evidence(e, true)?;
+                if let Some(&(_, expected)) = causal::BUILTIN_ARITIES.iter().find(|&&(pred, _)| pred == fact.predicate)
+                {
+                    if fact.args.len() != expected {
+                        return Err(format!(
+                            "Predicate `{}` is built-in with arity {expected}; use that arity or choose another predicate name.",
+                            fact.predicate
+                        ));
+                    }
+                }
                 if self
                     .facts
                     .values()
@@ -1493,5 +1502,31 @@ mod tests {
             let json = serde_json::to_string(&e).unwrap();
             assert_eq!(e, serde_json::from_str::<Entry>(&json).unwrap());
         }
+    }
+
+    #[test]
+    fn fact_assert_reserves_builtin_predicate_arities() {
+        let mut l = ledger();
+        for (pred, wrong_args, right_args) in [
+            ("asset", vec!["web"], vec!["as-1", "host", "web"]),
+            ("credential", vec!["u"], vec!["cr-1", "as-1", "u"]),
+            ("foothold", vec!["sh"], vec!["fh-1", "as-1", "u", "sh"]),
+            ("related", vec!["a", "b"], vec!["as-1", "as-2", "reach"]),
+            ("condition", vec!["only-one"], vec!["auth", "x"]),
+        ] {
+            let bad = LedgerOp::Security(SecurityOp::FactAssert {
+                fact: Fact { predicate: pred.into(), args: wrong_args.into_iter().map(str::to_string).collect() },
+                evidence: vec!["e1".into()],
+            });
+            let err = l.validate(&bad, false).unwrap_err();
+            assert!(err.contains("built-in with arity"), "{pred}: {err}");
+
+            let good = SecurityOp::FactAssert {
+                fact: Fact { predicate: pred.into(), args: right_args.into_iter().map(str::to_string).collect() },
+                evidence: vec!["e1".into()],
+            };
+            apply(&mut l, good);
+        }
+        assert!(l.security.projection().complete);
     }
 }

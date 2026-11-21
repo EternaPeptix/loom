@@ -21,11 +21,11 @@ If a sub-experiment is genuinely separate, say so in your answer and let the res
 
 ## Scope
 
-If the experiment needs a host that is not in the authorized scope, call `request_scope` with the host and why, and go on with what the scope allows. Only the operator widens it; you never widen it yourself.
+If the experiment needs a host that is not in the authorized scope, do not attempt to reach it: record which host is needed in `not_established` for the researcher (or call `report_blocker` if you cannot continue), and go on with what the scope allows. Only the operator widens scope, through the researcher; you never widen it yourself.
 
 ## Ending
 
-If the run shows what the assignment asked, call `conclude` with `met`, a note and the ids of your execution evidence; if you establish that it cannot be done as stated, `unreachable`. Not there yet is a `note`, not a finish. Then deliver by calling `finish`:
+Only the researcher concludes the mission goal. When the run settles what the assignment asked, record your execution `evidence` (or `claim_update`), and use `note` if you are not there yet. Then deliver by calling `finish`:
 - `answer` — what you established and what you did not, written for someone who has not seen your work: the conditions, the exact input, the observed response, the state check, and the mechanism.
 - `quotes` — the stored lines that support the answer, each by handle and line range. With line numbers from `out_read`, `out_grep` or `read`, give only those and the harness takes the text from the stored output. Otherwise add the text, copied character for character; the harness refuses a quote that does not match, so copy it.
 - `not_established` — what you could not determine, what you did not try, and what would settle it.

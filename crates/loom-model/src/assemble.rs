@@ -227,6 +227,8 @@ pub struct Assembler {
     done: bool,
     /// Bytes of tool-call names and arguments accumulated (a new call counts `CALL_OVERHEAD`).
     call_bytes: usize,
+    /// Full JSON chunk of the last `{"error": ...}` payload seen, for structured classification.
+    last_error: Option<Value>,
 }
 
 /// What an empty tool-call entry is counted as, so that endless new indices are bounded too.
@@ -281,6 +283,7 @@ impl Assembler {
             return Err(AssembleError::Malformed("the chunk is not a JSON object".into()));
         }
         if let Some(e) = v.get("error") {
+            self.last_error = Some(v.clone());
             return Err(AssembleError::Server(error_message(e)));
         }
         let mut events = Vec::new();
@@ -288,7 +291,7 @@ impl Assembler {
             if let Some(delta) = choice.get("delta") {
                 self.apply_delta(delta, &mut events)?;
             }
-            if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+            if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str).filter(|r| !r.is_empty()) {
                 self.finish = Some(match reason {
                     "tool_calls" | "function_call" => FinishReason::ToolCalls,
                     "length" => FinishReason::Length,
@@ -368,6 +371,10 @@ impl Assembler {
     /// True once `[DONE]` or a `finish_reason` has been seen.
     pub fn is_done(&self) -> bool {
         self.done || self.finish.is_some()
+    }
+
+    pub(crate) fn last_error(&self) -> Option<&Value> {
+        self.last_error.as_ref()
     }
 
     pub fn finish(self) -> Result<Completion, AssembleError> {
@@ -984,5 +991,31 @@ mod tests {
         let c = a.finish().unwrap();
         assert_eq!(c.text, "héllo wörld ✓ 日本語");
         assert_eq!(c.tool_calls[0].arguments, "{\"text\": \"hello\"}");
+    }
+
+    #[test]
+    fn empty_finish_reason_does_not_mark_stream_done() {
+        let mut a = Assembler::new();
+        a.push(&chunk(r#"{"content":"part"}"#, r#""""#)).unwrap();
+        assert!(!a.is_done());
+        assert_eq!(a.finish().unwrap_err(), AssembleError::Incomplete);
+
+        let c =
+            run(&[&chunk(r#"{"content":"part"}"#, r#""""#), &chunk(r#"{"content":" two"}"#, r#""length""#)]).unwrap();
+        assert_eq!(c.text, "part two");
+        assert_eq!(c.finish, FinishReason::Length);
+    }
+
+    #[test]
+    fn error_chunk_preserves_structured_json() {
+        let mut a = Assembler::new();
+        let err = a
+            .push(r#"{"error":{"message":"too big","type":"exceed_context_size_error","n_ctx":4096,"n_prompt_tokens":5000}}"#)
+            .unwrap_err();
+        assert_eq!(err, AssembleError::Server("too big".into()));
+        let raw = a.last_error().expect("stored error chunk");
+        assert_eq!(raw["error"]["type"], "exceed_context_size_error");
+        assert_eq!(raw["error"]["n_ctx"], 4096);
+        assert_eq!(raw["error"]["n_prompt_tokens"], 5000);
     }
 }

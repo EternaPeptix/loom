@@ -706,13 +706,22 @@ impl Tool for AgentFanout {
         }
         let joins = started.iter().map(|id| shared.orch.join(&shared.session, id, &ctx.cancel));
         let results = futures_util::future::join_all(joins).await;
-        if ctx.cancel.is_cancelled() && results.iter().any(Result::is_err) {
+        let cancelled = ctx.cancel.is_cancelled() && results.iter().any(Result::is_err);
+        if cancelled {
             for id in &started {
                 let _ = shared.orch.stop_child(&shared.session, id).await;
             }
-            return ToolOutput::error(format!("Interrupted while waiting for {n} agents; they were stopped."));
+            if results.iter().all(Result::is_err) {
+                return ToolOutput::error(format!("Interrupted while waiting for {n} agents; they were stopped."));
+            }
         }
-        let mut body = format!("{FANOUT_LEGEND}\n\n");
+        let mut body = if cancelled {
+            format!(
+                "Interrupted while waiting for {n} agents; they were stopped. Already settled reports are included below.\n\n{FANOUT_LEGEND}\n\n"
+            )
+        } else {
+            format!("{FANOUT_LEGEND}\n\n")
+        };
         let mut counts = [0usize; 5];
         let order = [
             ChildOutcome::Returned,
@@ -724,7 +733,12 @@ impl Tool for AgentFanout {
         for (i, (id, result)) in started.iter().zip(results).enumerate() {
             let (role, outcome, steps, report) = match result {
                 Ok(s) => (s.role, s.outcome, s.steps, s.report),
-                Err(text) => (String::from("unknown"), ChildOutcome::Failed, 0, text),
+                Err(text) => (
+                    String::from("unknown"),
+                    if cancelled { ChildOutcome::Stopped } else { ChildOutcome::Failed },
+                    0,
+                    text,
+                ),
             };
             if let Some(slot) = order.iter().position(|o| *o == outcome).and_then(|p| counts.get_mut(p)) {
                 *slot += 1;
@@ -747,11 +761,16 @@ impl Tool for AgentFanout {
             .filter(|(_, c)| *c > 0)
             .map(|(o, c)| format!("{c} {}", outcome_word(*o)))
             .collect();
-        let mut out = ToolOutput::ok(format!("{n} agents: {}", parts.join(", ")), Body::Raw(body.into_bytes()));
+        let outcome = if cancelled {
+            format!("Interrupted while waiting for {n} agents; {}", parts.join(", "))
+        } else {
+            format!("{n} agents: {}", parts.join(", "))
+        };
+        let mut out = ToolOutput::ok(outcome, Body::Raw(body.into_bytes()));
         if let Some(fact) = lowered {
             out = out.with_more(fact);
         }
-        if counts.first().copied().unwrap_or(0) == 0 {
+        if cancelled || counts.first().copied().unwrap_or(0) == 0 {
             out.status = ToolStatus::Error;
         }
         out
@@ -944,22 +963,37 @@ impl Tool for Attempt {
         }
         let joins = started.iter().map(|id| shared.orch.join(&shared.session, id, &ctx.cancel));
         let results = futures_util::future::join_all(joins).await;
-        if ctx.cancel.is_cancelled() && results.iter().any(Result::is_err) {
+        let cancelled_join = ctx.cancel.is_cancelled() && results.iter().any(Result::is_err);
+        if cancelled_join {
             for id in &started {
                 let _ = shared.orch.stop_child(&shared.session, id).await;
             }
-            return ToolOutput::error(format!("Interrupted while waiting for {n} attempts; they were stopped."));
+            if results.iter().all(Result::is_err) {
+                return ToolOutput::error(format!("Interrupted while waiting for {n} attempts; they were stopped."));
+            }
         }
         let ids = started.iter().map(SessionId::as_str).collect::<Vec<_>>().join(", ");
-        let mut body = format!("{ATTEMPT_LEGEND}\n\n");
+        let mut body = if cancelled_join {
+            format!(
+                "Interrupted while waiting for {n} attempts; they were stopped. Already settled attempt reports are included below (copies kept at {ids}: `agent_adopt` with `preview: true` shows what each changed).\n\n{ATTEMPT_LEGEND}\n\n"
+            )
+        } else {
+            format!("{ATTEMPT_LEGEND}\n\n")
+        };
         let (mut passed, mut unchecked) = (0usize, 0usize);
         // The complete outputs of the checks: stored here, named only in the text, so the result records them.
         let mut stored: Vec<String> = Vec::new();
+        let mut interrupted_check: Option<usize> = None;
         // One check at a time: several builds or test runs at once would slow each other into the timeout.
         for (i, (id, result)) in started.iter().zip(results).enumerate() {
             let (role, outcome, steps, report) = match result {
                 Ok(s) => (s.role, s.outcome, s.steps, s.report),
-                Err(text) => (String::from("unknown"), ChildOutcome::Failed, 0, text),
+                Err(text) => (
+                    String::from("unknown"),
+                    if cancelled_join { ChildOutcome::Stopped } else { ChildOutcome::Failed },
+                    0,
+                    text,
+                ),
             };
             body.push_str(&format!(
                 "===== attempt {} of {n}: {id} ({role}) \u{2014} {}, {steps} steps =====\n",
@@ -968,16 +1002,18 @@ impl Tool for Attempt {
             ));
             match shared.orch.child_copy(&shared.session, id).await {
                 Ok(Some(copy)) => {
-                    let checked = run_check(ctx, &copy, check, timeout_s).await;
-                    if checked.interrupted {
-                        return ToolOutput::error(format!(
-                            "Interrupted while the check ran in the copy of attempt {}. All {n} attempts have ended and their copies are kept ({ids}): `agent_adopt` with `preview: true` shows what each changed.",
-                            i.saturating_add(1)
-                        ));
+                    if !cancelled_join && interrupted_check.is_none() {
+                        let checked = run_check(ctx, &copy, check, timeout_s).await;
+                        if checked.interrupted {
+                            interrupted_check = Some(i);
+                        }
+                        passed += usize::from(checked.passed);
+                        stored.extend(checked.stored.iter().map(|id| id.as_str().to_string()));
+                        body.push_str(&format!("check: {}\n{}", checked.line, checked.tail));
+                    } else {
+                        unchecked += 1;
+                        body.push_str("check: not run (interrupted before checking)\n");
                     }
-                    passed += usize::from(checked.passed);
-                    stored.extend(checked.stored.iter().map(|id| id.as_str().to_string()));
-                    body.push_str(&format!("check: {}\n{}", checked.line, checked.tail));
                     // After the check: what the check itself wrote counts as part of the copy's state.
                     match changes_of(&copy).await {
                         Ok(changes) if changes.is_empty() => body.push_str("changed: nothing\n"),
@@ -1003,20 +1039,34 @@ impl Tool for Attempt {
             }
             body.push_str(&format!("report:\n{}\n\n", loom_core::tagsafe::quote_lines_starting(&report, "=====")));
         }
-        body.push_str("===== what to do now =====\n");
-        if passed == 0 {
+        let outcome = if cancelled_join {
             body.push_str(&format!(
-                "No attempt passed the check `{check}`. Nothing has changed in your workspace. Read the check output of the attempt that came closest: you can bring its changes over with `agent_adopt` and go on from there, or try again with what these attempts showed.\n"
+                "===== interrupted =====\nInterrupted while waiting for {n} attempts; they were stopped. Settled attempt reports are shown above ({ids}): `agent_adopt` with `preview: true` shows what each changed.\n"
             ));
+            format!("Interrupted while waiting for {n} attempts")
+        } else if let Some(at) = interrupted_check {
+            body.push_str(&format!(
+                "===== interrupted =====\nInterrupted while the check ran in the copy of attempt {}. All {n} attempts have ended and their copies are kept ({ids}): `agent_adopt` with `preview: true` shows what each changed.\n",
+                at.saturating_add(1)
+            ));
+            format!("Interrupted while checking attempt {} of {n}", at.saturating_add(1))
         } else {
-            body.push_str(&format!(
-                "{passed} of {n} attempts passed the check `{check}`. Nothing has changed in your workspace. Choose one attempt by its check result and the files it changed, and bring its changes over with `agent_adopt` and its id. The attempts are alternatives to each other: adopt one, not several. Then run the check in your own workspace.\n"
-            ));
-        }
-        let mut outcome = format!("{n} attempts: {passed} passed the check");
-        if unchecked > 0 {
-            outcome.push_str(&format!(", {unchecked} not checked"));
-        }
+            body.push_str("===== what to do now =====\n");
+            if passed == 0 {
+                body.push_str(&format!(
+                    "No attempt passed the check `{check}`. Nothing has changed in your workspace. Read the check output of the attempt that came closest: you can bring its changes over with `agent_adopt` and go on from there, or try again with what these attempts showed.\n"
+                ));
+            } else {
+                body.push_str(&format!(
+                    "{passed} of {n} attempts passed the check `{check}`. Nothing has changed in your workspace. Choose one attempt by its check result and the files it changed, and bring its changes over with `agent_adopt` and its id. The attempts are alternatives to each other: adopt one, not several. Then run the check in your own workspace.\n"
+                ));
+            }
+            let mut outcome = format!("{n} attempts: {passed} passed the check");
+            if unchecked > 0 {
+                outcome.push_str(&format!(", {unchecked} not checked"));
+            }
+            outcome
+        };
         let mut out = ToolOutput::ok(outcome, Body::Raw(body.into_bytes()));
         if let Some(fact) = lowered {
             out = out.with_more(fact);
@@ -1024,7 +1074,7 @@ impl Tool for Attempt {
         if !stored.is_empty() {
             out = out.with_meta(META_ALSO_STORED, json!(stored));
         }
-        if passed == 0 {
+        if cancelled_join || interrupted_check.is_some() || passed == 0 {
             out.status = ToolStatus::Error;
         }
         out
@@ -2436,5 +2486,57 @@ mod tests {
         let res = r.call("agent_adopt", json!({"agent":"s-kid1"})).await;
         assert_eq!(res.status, ToolStatus::Ok, "{}", res.text);
         assert_eq!(text_of(&ws, "locked/x.txt").as_deref(), Some("new\n"));
+    }
+
+    #[tokio::test]
+    async fn fanout_cancellation_preserves_already_settled_reports() {
+        let r = lead();
+        r.orch.settle("s-kid1", ChildOutcome::Returned, "first child settled finding", Value::Null);
+        r.orch.hang.lock().unwrap().push(SessionId::from("s-kid2"));
+        let (res, ()) = tokio::join!(r.call("agent_fanout", json!({"agents": two()})), cancel_soon(&r));
+        assert_eq!(res.status, ToolStatus::Error);
+        assert!(res.text.contains("Interrupted while waiting for 2 agents; they were stopped."), "{}", res.text);
+        assert!(res.text.contains("===== agent 1 of 2: s-kid1 (worker)"), "{}", res.text);
+        assert!(res.text.contains("first child settled finding"), "{}", res.text);
+    }
+
+    #[tokio::test]
+    async fn attempt_cancellation_preserves_settled_reports_on_join_and_check_interrupt() {
+        // Case 1: partial join cancellation after attempt 1 settled while attempt 2 hangs.
+        let r = lead();
+        r.orch.settle("s-kid1", ChildOutcome::Returned, "settled attempt one report", Value::Null);
+        r.orch.hang.lock().unwrap().push(SessionId::from("s-kid2"));
+        let (res, ()) =
+            tokio::join!(r.call("attempt", json!({"question": "q", "check": "true", "n": 2})), cancel_soon(&r));
+        assert_eq!(res.status, ToolStatus::Error);
+        assert!(res.text.contains("Interrupted while waiting for 2 attempts; they were stopped."), "{}", res.text);
+        assert!(res.text.contains("settled attempt one report"), "{}", res.text);
+
+        // Case 2: both attempts settled, then check 2 is interrupted while running.
+        let r = lead_with_files();
+        copy_for(&r, "s-kid1", |dir| write(dir, "fix.txt", "done\n"));
+        let copy2 = copy_for(&r, "s-kid2", |dir| write(dir, "mark2.txt", "hang\n"));
+        r.orch.settle("s-kid1", ChildOutcome::Returned, "first attempt checkable report", Value::Null);
+        r.orch.settle("s-kid2", ChildOutcome::Returned, "second attempt report", Value::Null);
+        let ready = copy2.dir.join("ready2");
+        let token = r.env.ctx.cancel.clone();
+        let cancel_on_ready = async {
+            for _ in 0..250 {
+                if ready.exists() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(ready.exists(), "second check never started");
+            token.cancel();
+        };
+        let check = "if [ -f mark2.txt ]; then touch ready2 && sleep 60; else echo ran-one; fi";
+        let (res, ()) =
+            tokio::join!(r.call("attempt", json!({"question": "q", "check": check, "n": 2})), cancel_on_ready);
+        assert_eq!(res.status, ToolStatus::Error);
+        assert!(res.text.contains("Interrupted while the check ran in the copy of attempt 2"), "{}", res.text);
+        assert!(res.text.contains("ran-one"), "{}", res.text);
+        assert!(res.text.contains("first attempt checkable report"), "{}", res.text);
+        assert!(res.text.contains("second attempt report"), "{}", res.text);
     }
 }
