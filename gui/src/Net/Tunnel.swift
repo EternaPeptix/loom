@@ -86,14 +86,20 @@ final class Tunnel: @unchecked Sendable {
     private var ssh: Process?
     private var stderrSink: Sink?
     private var closing = false
-    /// The child the last `close()` stopped, until `open()` has seen it exit: its listener may hold the
-    /// port for a moment, and it must not be taken for someone else's.
-    private var exiting: Process?
+    /// All tunnel children stopped by `close()` / `close(only:)` until they have exited: their
+    /// listener may hold the port for a moment, and `closeBlocking()` must ensure every one dies on quit.
+    private var stopping: [ObjectIdentifier: Process] = [:]
+    /// Active one-shot `fetchToken` children so app quit/teardown kills them too.
+    private var tokenProcs: [UUID: Process] = [:]
+    private var _onUnexpectedExit: (@Sendable (String, @escaping @Sendable () -> Bool) -> Void)?
 
     /// Called (on an arbitrary thread) with the reason if the ssh child exits without `close()` having been
     /// asked, and a check the receiver runs again when it acts on the report (after any hop to another
     /// thread): true only while that child is still this tunnel's current one.
-    var onUnexpectedExit: (@Sendable (String, @escaping @Sendable () -> Bool) -> Void)?
+    var onUnexpectedExit: (@Sendable (String, @escaping @Sendable () -> Bool) -> Void)? {
+        get { lock.withLock { _onUnexpectedExit } }
+        set { lock.withLock { _onUnexpectedExit = newValue } }
+    }
 
     static let forwardDeadline: TimeInterval = 10
 
@@ -164,6 +170,10 @@ final class Tunnel: @unchecked Sendable {
         }
         lock.withLock { closing = false; ssh = p; stderrSink = sink }
         do { try p.run() } catch {
+            err.fileHandleForReading.readabilityHandler = nil
+            try? err.fileHandleForReading.close()
+            try? err.fileHandleForWriting.close()
+            sink.end()
             lock.withLock { ssh = nil; stderrSink = nil }
             throw TunnelError.spawnFailed(error.localizedDescription)
         }
@@ -172,18 +182,12 @@ final class Tunnel: @unchecked Sendable {
         let deadline = Date().addingTimeInterval(Tunnel.forwardDeadline)
         var portUp = false
         while true {
-            if Task.isCancelled { close(only: p); throw CancellationError() }
-            if !p.isRunning {
-                await sink.awaitEnd()
-                let msg = sink.text
-                close(only: p)
-                if Tunnel.isBindFailure(msg) { throw TunnelError.portBusy(forward.port) }
-                throw TunnelError.forwardTimedOut(msg.isEmpty ? "ssh exited with status \(p.terminationStatus)" : msg)
-            }
+            try await failIfExited(p, sink: sink, port: forward.port)
             if Tunnel.canConnect(port: forward.port) {
                 portUp = true
                 if await Tunnel.healthz(port: forward.port) { break }
             }
+            try await failIfExited(p, sink: sink, port: forward.port)
             if Date() >= deadline {
                 let msg = sink.text
                 close(only: p)
@@ -213,6 +217,17 @@ final class Tunnel: @unchecked Sendable {
         return Ready(baseURL: forward.baseURL, token: token)
     }
 
+    private func failIfExited(_ p: Process, sink: Sink, port: Int) async throws {
+        if Task.isCancelled { close(only: p); throw CancellationError() }
+        if !p.isRunning {
+            await sink.awaitEnd()
+            let msg = sink.text
+            close(only: p)
+            if Tunnel.isBindFailure(msg) { throw TunnelError.portBusy(port) }
+            throw TunnelError.forwardTimedOut(msg.isEmpty ? "ssh exited with status \(p.terminationStatus)" : msg)
+        }
+    }
+
     /// True while the ssh child of the current tunnel is still running.
     var isRunning: Bool { lock.withLock { ssh?.isRunning ?? false } }
 
@@ -231,6 +246,7 @@ final class Tunnel: @unchecked Sendable {
     private func close(only: Process?) {
         lock.lock()
         if let only, ssh !== only {
+            if only.isRunning { stopping[ObjectIdentifier(only)] = only }
             lock.unlock()
             stop(only)
             return
@@ -239,7 +255,7 @@ final class Tunnel: @unchecked Sendable {
         let p = ssh
         ssh = nil
         stderrSink = nil
-        if let p { exiting = p }
+        if let p { stopping[ObjectIdentifier(p)] = p }
         lock.unlock()
         guard let p else { return }
         stop(p)
@@ -247,54 +263,107 @@ final class Tunnel: @unchecked Sendable {
 
     /// SIGTERM, then SIGKILL after a short grace (off the caller's thread).
     private func stop(_ p: Process) {
+        let key = ObjectIdentifier(p)
         if p.isRunning {
+            lock.withLock { stopping[key] = p }
             p.terminate()
             let pid = p.processIdentifier
             // Escalate off the caller's thread so quit/teardown never blocks on a stuck ssh.
-            DispatchQueue.global().async {
+            DispatchQueue.global().async { [weak self] in
                 for _ in 0..<20 {                     // ~2 s grace
-                    if !p.isRunning { return }
+                    if !p.isRunning {
+                        self?.lock.withLock { _ = self?.stopping.removeValue(forKey: key) }
+                        return
+                    }
                     usleep(100_000)
                 }
-                if p.isRunning { kill(pid, SIGKILL) }
+                if p.isRunning {
+                    kill(pid, SIGKILL)
+                    for _ in 0..<10 {
+                        if !p.isRunning { break }
+                        usleep(20_000)
+                    }
+                }
+                self?.lock.withLock {
+                    if !p.isRunning { _ = self?.stopping.removeValue(forKey: key) }
+                }
             }
+        } else {
+            lock.withLock { _ = stopping.removeValue(forKey: key) }
         }
     }
 
-    /// Synchronous variant for app quit: SIGTERM, brief wait, SIGKILL.
+    /// Synchronous variant for app quit: SIGTERM, brief wait, SIGKILL on all tracked children.
     func closeBlocking() {
-        lock.lock()
-        closing = true
-        let p = ssh
-        ssh = nil
-        lock.unlock()
-        guard let p, p.isRunning else { return }
-        let pid = p.processIdentifier
-        p.terminate()
+        let tracked: [Process] = lock.withLock {
+            closing = true
+            var procs: [ObjectIdentifier: Process] = stopping
+            if let p = ssh {
+                procs[ObjectIdentifier(p)] = p
+                stopping[ObjectIdentifier(p)] = p
+                ssh = nil
+                stderrSink = nil
+            }
+            for p in tokenProcs.values { procs[ObjectIdentifier(p)] = p }
+            return Array(procs.values)
+        }
+        let alive = tracked.filter { $0.isRunning }
+        if alive.isEmpty {
+            lock.withLock {
+                stopping = stopping.filter { $0.value.isRunning }
+                tokenProcs = tokenProcs.filter { $0.value.isRunning }
+            }
+            return
+        }
+        let targets = alive.map { ($0, $0.processIdentifier) }
+        for (p, _) in targets { p.terminate() }
         for _ in 0..<10 {
-            if !p.isRunning { return }
+            if !targets.contains(where: { $0.0.isRunning }) { break }
             usleep(100_000)
         }
-        if p.isRunning { kill(pid, SIGKILL) }
+        var killed = false
+        for (p, pid) in targets where p.isRunning {
+            kill(pid, SIGKILL)
+            killed = true
+        }
+        if killed {
+            for _ in 0..<10 {
+                if !targets.contains(where: { $0.0.isRunning }) { break }
+                usleep(10_000)
+            }
+        }
+        lock.withLock {
+            stopping = stopping.filter { $0.value.isRunning }
+            tokenProcs = tokenProcs.filter { $0.value.isRunning }
+        }
     }
 
-    /// Waits for the child the last `close()` stopped to exit (bounded: `close()` SIGKILLs it after ~2 s),
-    /// so that only a listener that is not loom-desk's own is reported as a busy port.
+    /// Waits for children stopped by `close()` / `close(only:)` to exit (bounded: `stop()` SIGKILLs
+    /// after ~2 s), so that only a listener that is not loom-desk's own is reported as a busy port.
     private func waitForExitingChild() async {
-        guard let p = lock.withLock({ exiting }) else { return }
-        for _ in 0..<60 where p.isRunning && !Task.isCancelled {
+        let pending = lock.withLock { Array(stopping.values) }
+        guard !pending.isEmpty else { return }
+        for _ in 0..<60 {
+            if Task.isCancelled || !pending.contains(where: { $0.isRunning }) { break }
             try? await Task.sleep(nanoseconds: 50_000_000)
         }
-        lock.withLock { if exiting === p && !p.isRunning { exiting = nil } }
+        lock.withLock { stopping = stopping.filter { $0.value.isRunning } }
     }
 
     // MARK: token
 
     private func fetchToken(host: String) async throws -> String {
+        let tokenID = UUID()
         let r = await Tunnel.runCapture("/usr/bin/ssh",
                                         ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"] + Tunnel.noMultiplexing
                                             + ["--", host, "cat ~/.loom/token"],
-                                        timeout: 20)
+                                        timeout: 20) { [weak self] proc in
+            guard let self else { return }
+            self.lock.withLock {
+                if let proc { self.tokenProcs[tokenID] = proc } else { self.tokenProcs.removeValue(forKey: tokenID) }
+            }
+        }
+        if Task.isCancelled { throw CancellationError() }
         guard r.status == 0 else {
             let m = r.stderr.isEmpty ? "ssh exited with status \(r.status)" : r.stderr
             throw TunnelError.badToken(m)
@@ -308,40 +377,105 @@ final class Tunnel: @unchecked Sendable {
 
     struct Captured { var status: Int32; var stdout: String; var stderr: String }
 
-    /// Run a short-lived child, capture its output, kill it after `timeout` seconds.
-    static func runCapture(_ path: String, _ args: [String], timeout: TimeInterval) async -> Captured {
-        await withCheckedContinuation { (cont: CheckedContinuation<Captured, Never>) in
-            DispatchQueue.global().async {
-                let p = Process()
-                p.executableURL = URL(fileURLWithPath: path)
-                p.arguments = args
-                let o = Pipe(), e = Pipe()
-                p.standardOutput = o
-                p.standardError = e
-                p.standardInput = FileHandle.nullDevice
-                do { try p.run() } catch {
-                    cont.resume(returning: Captured(status: -1, stdout: "", stderr: error.localizedDescription))
-                    return
-                }
-                let timer = DispatchSource.makeTimerSource(queue: .global())
-                timer.schedule(deadline: .now() + timeout)
-                timer.setEventHandler { if p.isRunning { p.terminate() } }
-                timer.resume()
-                let group = DispatchGroup()
-                var outData = Data(), errData = Data()
-                group.enter()
-                DispatchQueue.global().async { outData = o.fileHandleForReading.readDataToEndOfFile(); group.leave() }
-                group.enter()
-                DispatchQueue.global().async { errData = e.fileHandleForReading.readDataToEndOfFile(); group.leave() }
-                group.wait()
-                p.waitUntilExit()
-                timer.cancel()
-                cont.resume(returning: Captured(
-                    status: p.terminationStatus,
-                    stdout: String(decoding: outData.prefix(65_536), as: UTF8.self),
-                    stderr: String(decoding: errData.prefix(16_384), as: UTF8.self)
-                        .trimmingCharacters(in: .whitespacesAndNewlines)))
+    private static func terminateWithEscalation(_ p: Process, graceSeconds: Double = 1.0) {
+        guard p.isRunning else { return }
+        let pid = p.processIdentifier
+        p.terminate()
+        DispatchQueue.global().async {
+            let steps = max(1, Int(graceSeconds / 0.1))
+            for _ in 0..<steps {
+                if !p.isRunning { return }
+                usleep(100_000)
             }
+            if p.isRunning { kill(pid, SIGKILL) }
+        }
+    }
+
+    /// Run a short-lived child, capture its output, kill it after `timeout` seconds or on Task cancellation.
+    static func runCapture(_ path: String,
+                           _ args: [String],
+                           timeout: TimeInterval,
+                           onProcess: (@Sendable (Process?) -> Void)? = nil) async -> Captured {
+        if Task.isCancelled {
+            return Captured(status: -1, stdout: "", stderr: "cancelled")
+        }
+        final class Box: @unchecked Sendable {
+            let lock = NSLock()
+            var proc: Process?
+            var cancelled = false
+            var finished = false
+        }
+        final class DataBox: @unchecked Sendable {
+            private let lock = NSLock()
+            private var value = Data()
+            func set(_ d: Data) { lock.withLock { value = d } }
+            func get() -> Data { lock.withLock { value } }
+        }
+        let box = Box()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { (cont: CheckedContinuation<Captured, Never>) in
+                DispatchQueue.global().async {
+                    let earlyCancel: Bool = box.lock.withLock {
+                        if box.cancelled {
+                            box.finished = true
+                            return true
+                        }
+                        return false
+                    }
+                    if earlyCancel {
+                        cont.resume(returning: Captured(status: -1, stdout: "", stderr: "cancelled"))
+                        return
+                    }
+                    let p = Process()
+                    p.executableURL = URL(fileURLWithPath: path)
+                    p.arguments = args
+                    let o = Pipe(), e = Pipe()
+                    p.standardOutput = o
+                    p.standardError = e
+                    p.standardInput = FileHandle.nullDevice
+                    do { try p.run() } catch {
+                        try? o.fileHandleForReading.close(); try? o.fileHandleForWriting.close()
+                        try? e.fileHandleForReading.close(); try? e.fileHandleForWriting.close()
+                        box.lock.withLock { box.finished = true }
+                        cont.resume(returning: Captured(status: -1, stdout: "", stderr: error.localizedDescription))
+                        return
+                    }
+                    let cancelAfterLaunch: Bool = box.lock.withLock {
+                        box.proc = p
+                        return box.cancelled
+                    }
+                    onProcess?(p)
+                    if cancelAfterLaunch {
+                        terminateWithEscalation(p)
+                    }
+                    let timer = DispatchSource.makeTimerSource(queue: .global())
+                    timer.schedule(deadline: .now() + timeout)
+                    timer.setEventHandler { terminateWithEscalation(p) }
+                    timer.resume()
+                    let group = DispatchGroup()
+                    let outBox = DataBox(), errBox = DataBox()
+                    group.enter()
+                    DispatchQueue.global().async { outBox.set(o.fileHandleForReading.readDataToEndOfFile()); group.leave() }
+                    group.enter()
+                    DispatchQueue.global().async { errBox.set(e.fileHandleForReading.readDataToEndOfFile()); group.leave() }
+                    group.wait()
+                    p.waitUntilExit()
+                    timer.cancel()
+                    onProcess?(nil)
+                    box.lock.withLock { box.proc = nil; box.finished = true }
+                    cont.resume(returning: Captured(
+                        status: p.terminationStatus,
+                        stdout: String(decoding: outBox.get().prefix(65_536), as: UTF8.self),
+                        stderr: String(decoding: errBox.get().prefix(16_384), as: UTF8.self)
+                            .trimmingCharacters(in: .whitespacesAndNewlines)))
+                }
+            }
+        } onCancel: {
+            let proc: Process? = box.lock.withLock {
+                box.cancelled = true
+                return box.finished ? nil : box.proc
+            }
+            if let proc { terminateWithEscalation(proc) }
         }
     }
 

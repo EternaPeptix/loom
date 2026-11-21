@@ -1,11 +1,12 @@
 import Foundation
+import Darwin
 import Security
 
 /// A saved way to reach one loom daemon. See gui/DESIGN.md "Connection model".
 /// Secrets (the bearer token) are NOT stored here — they live in the Keychain, keyed by `id`.
-struct Connection: Codable, Identifiable, Equatable {
-    enum Mode: String, Codable { case sshTunnel, direct }
-    enum TokenSource: String, Codable { case fetchOverSsh, manual }
+struct Connection: Codable, Identifiable, Equatable, Sendable {
+    enum Mode: String, Codable, Sendable { case sshTunnel, direct }
+    enum TokenSource: String, Codable, Sendable { case fetchOverSsh, manual }
 
     var id: UUID = UUID()
     var name: String = ""
@@ -39,34 +40,90 @@ enum ConnectionStore {
     }
     static var fileURL: URL { directory.appendingPathComponent("connections.json") }
 
+    private struct Lossy<T: Decodable>: Decodable {
+        let value: T?
+        init(from decoder: Decoder) throws { value = try? T(from: decoder) }
+    }
+
     /// Empty when the file is missing or unreadable. Never throws.
     static func load() -> [Connection] {
-        guard let data = try? Data(contentsOf: fileURL) else { return [] }
-        return (try? JSONDecoder().decode([Connection].self, from: data)) ?? []
+        load(from: fileURL)
     }
 
     /// Writes the list (never any token) with mode 0600 into a 0700 directory. Returns false on failure.
     @discardableResult
     static func save(_ connections: [Connection]) -> Bool {
+        save(connections, to: fileURL)
+    }
+
+    static func load(from url: URL) -> [Connection] {
+        guard let data = try? Data(contentsOf: url) else { return [] }
+        if let exact = try? JSONDecoder().decode([Connection].self, from: data) {
+            return exact
+        }
+        // Preserve corrupt/unparseable JSON before a future save() overwrites the file.
+        let dir = url.deletingLastPathComponent()
+        let backup = dir.appendingPathComponent(url.lastPathComponent + ".corrupt")
+        try? ensurePrivateDirectory(dir)
+        try? writeAtomic0600(data, to: backup)
+        if let boxes = try? JSONDecoder().decode([Lossy<Connection>].self, from: data) {
+            return boxes.compactMap { $0.value }
+        }
+        return []
+    }
+
+    @discardableResult
+    static func save(_ connections: [Connection], to url: URL) -> Bool {
         do {
-            try FileManager.default.createDirectory(
-                at: directory, withIntermediateDirectories: true,
-                attributes: [.posixPermissions: 0o700])
+            try ensurePrivateDirectory(url.deletingLastPathComponent())
             let enc = JSONEncoder()
             enc.outputFormatting = [.prettyPrinted, .sortedKeys]
             let data = try enc.encode(connections)
-            try data.write(to: fileURL, options: .atomic)
-            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
+            try writeAtomic0600(data, to: url)
             return true
         } catch {
             return false
         }
     }
 
+    private static func ensurePrivateDirectory(_ dir: URL) throws {
+        try FileManager.default.createDirectory(
+            at: dir, withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700])
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir.path)
+    }
+
+    private static func writeAtomic0600(_ data: Data, to url: URL) throws {
+        let dir = url.deletingLastPathComponent()
+        let tmp = dir.appendingPathComponent(".\(url.lastPathComponent).\(UUID().uuidString).tmp")
+        var cleanup = true
+        defer { if cleanup { try? FileManager.default.removeItem(at: tmp) } }
+        guard FileManager.default.createFile(
+            atPath: tmp.path, contents: data,
+            attributes: [.posixPermissions: 0o600]) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: tmp.path)
+        if Darwin.rename(tmp.path, url.path) != 0 {
+            let e = Int(errno)
+            throw NSError(domain: NSPOSIXErrorDomain, code: e)
+        }
+        cleanup = false
+    }
+
     private static func query(_ id: UUID) -> [String: Any] {
         [kSecClass as String: kSecClassGenericPassword,
          kSecAttrService as String: keychainService,
          kSecAttrAccount as String: id.uuidString]
+    }
+
+    /// True when a Keychain entry exists for `id` without reading or decrypting the secret payload.
+    static func hasToken(for id: UUID) -> Bool {
+        var q = query(id)
+        q[kSecMatchLimit as String] = kSecMatchLimitOne
+        q[kSecReturnAttributes as String] = true
+        var out: CFTypeRef?
+        return SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess
     }
 
     static func token(for id: UUID) -> String? {
@@ -80,14 +137,18 @@ enum ConnectionStore {
         return s
     }
 
-    /// Stores a valid token (replacing any existing one). Returns false for an invalid token or a
-    /// Keychain failure.
+    /// Stores a valid token (updating in place when present so a failed write never deletes an existing
+    /// token). Returns false for an invalid token or a Keychain failure.
     @discardableResult
     static func setToken(_ token: String, for id: UUID) -> Bool {
         guard isValidToken(token) else { return false }
-        SecItemDelete(query(id) as CFDictionary)
-        var add = query(id)
-        add[kSecValueData as String] = Data(token.utf8)
+        let q = query(id)
+        let data = Data(token.utf8)
+        let status = SecItemUpdate(q as CFDictionary, [kSecValueData as String: data] as CFDictionary)
+        if status == errSecSuccess { return true }
+        guard status == errSecItemNotFound else { return false }
+        var add = q
+        add[kSecValueData as String] = data
         add[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlocked
         return SecItemAdd(add as CFDictionary, nil) == errSecSuccess
     }
@@ -112,11 +173,16 @@ enum ConnectionStore {
     static func baseURLProblem(_ s: String) -> String? {
         var t = s.trimmingCharacters(in: .whitespacesAndNewlines)
         while t.hasSuffix("/") { t.removeLast() }
-        guard let u = URL(string: t), let scheme = u.scheme?.lowercased(),
-              scheme == "http" || scheme == "https", let host = u.host?.lowercased(), !host.isEmpty,
-              u.user == nil, u.password == nil, u.query == nil, u.fragment == nil,
-              u.path.isEmpty else {
+        guard !t.hasSuffix(":"),
+              let u = URL(string: t), let c = URLComponents(string: t),
+              let scheme = u.scheme?.lowercased(), scheme == "http" || scheme == "https",
+              let host = u.host?.lowercased(), !host.isEmpty,
+              u.user == nil, u.password == nil, u.query == nil, u.fragment == nil, u.path.isEmpty,
+              c.user == nil, c.password == nil, c.query == nil, c.fragment == nil, c.path.isEmpty else {
             return "Base URL must look like http://127.0.0.1:7878 or https://host:port (no path, credentials, query or fragment)."
+        }
+        if let port = u.port ?? c.port, !(1...65535).contains(port) {
+            return "Base URL port must be 1–65535."
         }
         if scheme == "http" && !["127.0.0.1", "localhost", "::1", "[::1]"].contains(host) {
             return "http is allowed only for 127.0.0.1, localhost or [::1]; any other host must use https (the token would travel in clear text)."
@@ -151,10 +217,30 @@ enum ConnectionStore {
             chk(baseURLProblem(ok) == nil, "rejected \(ok): \(baseURLProblem(ok) ?? "")")
         }
         for bad in ["http://studio.example.com:7878", "http://10.0.0.5:7878", "http://127.0.0.1.evil.com", "http://localhost.evil.com",
-                    "http://127.0.0.1@evil.com", "ftp://localhost"] {
+                    "http://127.0.0.1@evil.com", "http://@127.0.0.1:7878", "http://127.0.0.1:7878?", "http://127.0.0.1:7878#",
+                    "http://127.0.0.1:0", "http://127.0.0.1:65536", "http://127.0.0.1:99999", "https://studio.example.com:0",
+                    "http://127.0.0.1:", "ftp://localhost"] {
             chk(baseURLProblem(bad) != nil, "accepted \(bad)")
         }
         chk(baseURLProblem("http://10.0.0.5:7878")?.contains("https") == true, "message does not name https")
+
+        // Atomic 0600 persistence & corrupt-JSON backup preservation.
+        let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("loom-conn-check-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tmpDir) }
+        let jsonURL = tmpDir.appendingPathComponent("connections.json")
+        let sample = Connection(name: "studio", mode: .sshTunnel, sshHost: "studio", remotePort: 7878)
+        chk(save([sample], to: jsonURL), "save to temp dir failed")
+        let dirMode = (try? FileManager.default.attributesOfItem(atPath: tmpDir.path)[.posixPermissions] as? NSNumber)?.intValue
+        let fileMode = (try? FileManager.default.attributesOfItem(atPath: jsonURL.path)[.posixPermissions] as? NSNumber)?.intValue
+        chk(dirMode == 0o700, "directory mode not 0700: \(String(describing: dirMode))")
+        chk(fileMode == 0o600, "file mode not 0600: \(String(describing: fileMode))")
+        chk(load(from: jsonURL) == [sample], "round-trip load failed")
+        try? Data("{corrupt".utf8).write(to: jsonURL)
+        chk(load(from: jsonURL).isEmpty, "corrupt json returned items")
+        let backupURL = tmpDir.appendingPathComponent("connections.json.corrupt")
+        chk(FileManager.default.fileExists(atPath: backupURL.path), "corrupt backup not created")
+        let backupMode = (try? FileManager.default.attributesOfItem(atPath: backupURL.path)[.posixPermissions] as? NSNumber)?.intValue
+        chk(backupMode == 0o600, "corrupt backup mode not 0600: \(String(describing: backupMode))")
         return f
     }
     #endif

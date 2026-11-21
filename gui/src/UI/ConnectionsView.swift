@@ -6,10 +6,9 @@ struct ConnectionsView: View {
     @EnvironmentObject var state: AppState
     @State private var editing: Connection? = nil
     @State private var deleting: Connection? = nil
-    @State private var offeredFirstRun = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 12) {
             HStack {
                 Text("Connections").font(.title3)
                 Spacer()
@@ -23,8 +22,16 @@ struct ConnectionsView: View {
                 Text(err).font(.caption).foregroundStyle(.red)
             }
             if state.connections.isEmpty {
-                Text("No connections yet. Add one that points at a loom daemon — directly if it is on this machine, or over SSH if it runs on another.")
-                    .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("No connections yet. Add one that points at a loom daemon — directly if it is on this machine, or over SSH if it runs on another.")
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: 520, alignment: .leading)
+                    Button("Add connection") {
+                        editing = Connection(name: "")
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+                .padding(.top, 8)
             } else {
                 List(state.connections) { c in
                     HStack {
@@ -46,22 +53,23 @@ struct ConnectionsView: View {
         }
         .padding(16)
         .onAppear {
-            // First run: go straight to the add form.
-            if state.connections.isEmpty && !offeredFirstRun {
-                offeredFirstRun = true
+            // First run: open the add form once (persisted on AppState so reopening the window does not re-prompt).
+            if state.connections.isEmpty && !state.offeredFirstRun {
+                state.offeredFirstRun = true
                 editing = Connection(name: "")
             }
         }
         .sheet(item: $editing) { c in
-            ConnectionEditor(original: c, isNew: !state.connections.contains(where: { $0.id == c.id })) { saved, token in
-                state.upsert(saved, token: token)
+            ConnectionEditor(original: c, isNew: !state.connections.contains(where: { $0.id == c.id })) { saved, token, clearToken in
+                state.upsert(saved, token: token, clearToken: clearToken)
                 editing = nil
             } onCancel: { editing = nil }
             .environmentObject(state)
         }
         .confirmationDialog("Delete this connection?", isPresented: Binding(
             get: { deleting != nil }, set: { if !$0 { deleting = nil } }), presenting: deleting) { c in
-            Button("Delete \(c.name)", role: .destructive) { state.remove(c); deleting = nil }
+            let label = c.name.trimmingCharacters(in: .whitespaces).isEmpty ? "(unnamed)" : c.name
+            Button("Delete \(label)", role: .destructive) { state.remove(c); deleting = nil }
             Button("Cancel", role: .cancel) { deleting = nil }
         } message: { _ in
             Text("This also removes its token from the Keychain.")
@@ -83,26 +91,37 @@ struct ConnectionsView: View {
 
 /// The add / edit sheet. The token field is write-only: it is never filled from the Keychain.
 struct ConnectionEditor: View {
+    private enum Field: Hashable { case name }
+
     let original: Connection
     let isNew: Bool
-    let onSave: (Connection, String?) -> Void
+    let onSave: (Connection, String?, Bool) -> Void
     let onCancel: () -> Void
 
     @State private var draft: Connection
     @State private var token = ""
     @State private var portText: String
     @State private var hasStoredToken: Bool
+    @State private var checkedStoredToken: Bool
+    @State private var clearStoredToken = false
+    @State private var showValidation = false
+    @FocusState private var focusedField: Field?
 
     init(original: Connection, isNew: Bool,
-         onSave: @escaping (Connection, String?) -> Void, onCancel: @escaping () -> Void) {
+         onSave: @escaping (Connection, String?, Bool) -> Void, onCancel: @escaping () -> Void) {
         self.original = original; self.isNew = isNew; self.onSave = onSave; self.onCancel = onCancel
         _draft = State(initialValue: original)
         _portText = State(initialValue: String(original.remotePort))
-        _hasStoredToken = State(initialValue: ConnectionStore.token(for: original.id) != nil)
+        let origNeedsToken = original.mode == .direct || original.tokenSource == .manual
+        let checkOnInit = !isNew && origNeedsToken
+        _hasStoredToken = State(initialValue: checkOnInit ? ConnectionStore.hasToken(for: original.id) : false)
+        _checkedStoredToken = State(initialValue: checkOnInit)
     }
 
     private var needsToken: Bool { draft.mode == .direct || draft.tokenSource == .manual }
-    private var port: Int? { Int(portText).flatMap { (1...65535).contains($0) ? $0 : nil } }
+    private var port: Int? {
+        Int(portText.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { (1...65535).contains($0) ? $0 : nil }
+    }
 
     private var problem: String? {
         if draft.name.trimmingCharacters(in: .whitespaces).isEmpty { return "Give the connection a name." }
@@ -117,7 +136,7 @@ struct ConnectionEditor: View {
         }
         if needsToken {
             let t = token.trimmingCharacters(in: .whitespacesAndNewlines)
-            if t.isEmpty && !hasStoredToken { return "Paste the daemon token (64 lowercase hex characters)." }
+            if t.isEmpty && !hasStoredToken && !clearStoredToken { return "Paste the daemon token (64 lowercase hex characters)." }
             if !t.isEmpty && !ConnectionStore.isValidToken(t) { return "The token must be exactly 64 lowercase hex characters." }
         }
         return nil
@@ -128,6 +147,7 @@ struct ConnectionEditor: View {
             Text(isNew ? "Add connection" : "Edit connection").font(.title3)
             Form {
                 TextField("Name", text: $draft.name, prompt: Text("studio"))
+                    .focused($focusedField, equals: .name)
                 Picker("Reach it", selection: $draft.mode) {
                     Text("Over SSH").tag(Connection.Mode.sshTunnel)
                     Text("Direct URL").tag(Connection.Mode.direct)
@@ -140,17 +160,33 @@ struct ConnectionEditor: View {
                         Text("Fetch over SSH (~/.loom/token)").tag(Connection.TokenSource.fetchOverSsh)
                         Text("Enter manually").tag(Connection.TokenSource.manual)
                     }
+                    if draft.tokenSource == .fetchOverSsh {
+                        Text("Uses non-interactive SSH (`BatchMode=yes`) — key or ssh-agent authentication must succeed without prompts.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                 } else {
                     TextField("Base URL", text: $draft.baseURL, prompt: Text("http://127.0.0.1:7878"))
                 }
                 if needsToken {
-                    SecureField("Token", text: $token,
-                                prompt: Text(hasStoredToken ? "stored in Keychain — leave blank to keep" : "64 hex characters"))
+                    HStack {
+                        SecureField("Token", text: $token,
+                                    prompt: Text(hasStoredToken ? "stored in Keychain — leave blank to keep"
+                                                 : clearStoredToken ? "saved token will be cleared on Save" : "64 hex characters"))
+                        if hasStoredToken {
+                            Button("Clear saved token", role: .destructive) {
+                                clearStoredToken = true
+                                hasStoredToken = false
+                                token = ""
+                                showValidation = true
+                            }
+                            .buttonStyle(.borderless)
+                        }
+                    }
                     Text("The daemon writes its token to ~/.loom/token on its host (`loom` reads it there).")
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }
-            if let p = problem {
+            if (showValidation || !isNew), let p = problem {
                 Text(p).font(.caption).foregroundStyle(.red)
             }
             HStack {
@@ -163,7 +199,8 @@ struct ConnectionEditor: View {
                     c.remotePort = port ?? c.remotePort
                     if c.mode == .direct { c.baseURL = ConnectionStore.normalizedBaseURL(c.baseURL) ?? c.baseURL }
                     let t = token.trimmingCharacters(in: .whitespacesAndNewlines)
-                    onSave(c, needsToken && !t.isEmpty ? t : nil)
+                    let newTok = needsToken && !t.isEmpty ? t : nil
+                    onSave(c, newTok, newTok == nil && clearStoredToken)
                 }
                 .keyboardShortcut(.defaultAction)
                 .disabled(problem != nil)
@@ -171,5 +208,15 @@ struct ConnectionEditor: View {
         }
         .padding(24)
         .frame(width: 460)
+        .onAppear { focusedField = .name }
+        .onChange(of: draft) { _, _ in showValidation = true }
+        .onChange(of: portText) { _, _ in showValidation = true }
+        .onChange(of: token) { _, _ in showValidation = true }
+        .onChange(of: needsToken) { _, needs in
+            if needs && !isNew && !checkedStoredToken && !clearStoredToken {
+                checkedStoredToken = true
+                hasStoredToken = ConnectionStore.hasToken(for: original.id)
+            }
+        }
     }
 }

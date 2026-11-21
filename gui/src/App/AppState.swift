@@ -51,7 +51,30 @@ final class AppState: ObservableObject {
     /// shows the link as not connected.
     @Published var daemonUnreachable = false
     @Published var baseURL: String? = nil
-    @Published var focusSession: String? = nil
+    /// Bumped when a notification click or badge tap requests an in-app SPA route via `takeRoute()`.
+    @Published private(set) var routeTick = 0
+
+    /// The bearer token of the live connection. Memory only; never logged or written to JSON.
+    private var token: String?
+    private let tunnel = Tunnel()
+    private let client = DaemonClient()
+    private var connectTask: Task<Void, Never>?
+    private var generation = 0
+    private var restored = false
+    var offeredFirstRun = false
+    /// `<base>/#code=<one-time code>` minted for the web pane of `paneEpoch`. Handed out once: the code is single use.
+    private var pendingEntry: URL?
+    private var pendingRoute: WebPane.Route?
+
+    /// Auto-reconnect: an SSH tunnel dies on sleep or a network change, so reopen it on wake and when the
+    /// network path returns instead of leaving a dead screen with counts and notifications stopped. Set
+    /// false after a manual disconnect or a daemon-identity mismatch, where reconnecting would not help.
+    private var reconnectable = false
+    private var pendingNetworkReconnect = false
+    private var lastReconnectAt = Date.distantPast
+    private let pathMonitor = NWPathMonitor()
+    private var networkSatisfied = true
+    private var watching = false
 
     /// What the web view reports; drives the loading / failure overlay.
     @Published var webState: WebState = .idle {
@@ -67,25 +90,6 @@ final class AppState: ObservableObject {
     @Published var openWindowTick = 0
     /// The last problem saving connections / the Keychain, shown by the editor.
     @Published var storageError: String? = nil
-
-    /// The bearer token of the live connection. Memory only; never logged or written to JSON.
-    private var token: String?
-    private let tunnel = Tunnel()
-    private let client = DaemonClient()
-    private var connectTask: Task<Void, Never>?
-    private var generation = 0
-    private var restored = false
-    /// `<base>/#code=<one-time code>` minted for the web pane of `paneEpoch`. Handed out once: the code is single use.
-    private var pendingEntry: URL?
-
-    /// Auto-reconnect: an SSH tunnel dies on sleep or a network change, so reopen it on wake and when the
-    /// network path returns instead of leaving a dead screen with counts and notifications stopped. Set
-    /// false after a manual disconnect or a daemon-identity mismatch, where reconnecting would not help.
-    private var reconnectable = false
-    private var lastReconnectAt = Date.distantPast
-    private let pathMonitor = NWPathMonitor()
-    private var networkSatisfied = true
-    private var watching = false
 
     private static let lastKey = "loom-desk.lastConnection"
 
@@ -109,14 +113,25 @@ final class AppState: ObservableObject {
 
     // MARK: URLs
 
+    private enum EntryOutcome {
+        case url(URL)
+        case identityMismatch(String)
+    }
+
     /// A fresh entry URL for the live connection: first makes the daemon prove its identity (the token is
     /// not sent to anything that cannot), then asks it for a one-time login code (`POST /api/login-codes`,
     /// bearer token) and builds `<base>/#code=<code>`. The token is never put in a URL. Refuses when
     /// the ssh child of a tunnel connection is gone, so the web view is never pointed at a dead forward.
-    private func makeEntryURL(base: String, token: String) async throws -> URL {
-        if let m = await DaemonClient.verifyIdentity(baseURL: base, token: token).failure {
-            try checkTunnelAlive()
-            throw ConnectError(m)
+    private func makeEntryURL(base: String, token: String) async throws -> EntryOutcome {
+        let idOutcome = await DaemonClient.verifyIdentity(baseURL: base, token: token)
+        try checkTunnelAlive()
+        switch idOutcome {
+        case .proven:
+            break
+        case .mismatch(let m):
+            return .identityMismatch(m)
+        case .unreachable:
+            if let m = idOutcome.failure { throw ConnectError(m) }
         }
         let outcome = await DaemonClient.requestLoginCode(baseURL: base, token: token)
         // Before the outcome: when the request failed because the forward is gone, that is the reason.
@@ -127,12 +142,27 @@ final class AppState: ObservableObject {
         case .failed(let m): throw ConnectError(m)
         }
         guard let url else { throw ConnectError("could not build the web address from the daemon URL") }
-        return url
+        return .url(url)
+    }
+
+    var isConnected: Bool {
+        if case .connected = link { return true }
+        return false
+    }
+
+    var isTunnelAlive: Bool { active?.mode != .sshTunnel || tunnel.isRunning }
+
+    func isCurrentlyActive(_ connection: Connection) -> Bool {
+        guard active?.id == connection.id else { return false }
+        switch link {
+        case .connecting, .connected: return true
+        case .none, .failed: return false
+        }
     }
 
     /// Throws when the active connection is an SSH tunnel whose ssh child is gone.
     private func checkTunnelAlive() throws {
-        if active?.mode == .sshTunnel && !tunnel.isRunning {
+        if !isTunnelAlive {
             let why = tunnel.lastErrorLine
             throw ConnectError("the SSH tunnel closed: \(why.isEmpty ? "ssh is no longer running" : why). Reconnect to open it again.")
         }
@@ -144,14 +174,23 @@ final class AppState: ObservableObject {
         guard let base = baseURL else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(DaemonClient.addressForPasteboard(base: base), forType: .string)
-        status = "address copied"
     }
 
     /// Reload (and Retry) = a new web pane, which asks for a fresh one-time code. Loading another `#code=`
     /// URL into the old view would change only its fragment and run nothing; a new view always loads.
     func reload() {
         guard case .connected = link else { return }
+        pendingEntry = nil
+        webLoadedOnce = false
+        webState = .loading
         paneEpoch += 1
+    }
+
+    /// Navigate the active web pane to the web UI's `#/inbox` route without injecting scripts.
+    func openInbox() {
+        guard case .connected = link else { return }
+        pendingRoute = .inbox
+        routeTick += 1
     }
 
     /// Called once by every newly created web pane (connect, reload, the window built again): asks the
@@ -166,10 +205,15 @@ final class AppState: ObservableObject {
         Task { [weak self] in
             guard let self else { return }
             do {
-                let u = try await self.makeEntryURL(base: base, token: token)
+                let result = try await self.makeEntryURL(base: base, token: token)
                 guard gen == self.generation, epoch == self.paneEpoch else { return }
-                self.pendingEntry = u
-                self.entryTick += 1
+                switch result {
+                case .url(let u):
+                    self.pendingEntry = u
+                    self.entryTick += 1
+                case .identityMismatch(let why):
+                    self.failIdentity(why)
+                }
             } catch {
                 guard gen == self.generation, epoch == self.paneEpoch else { return }
                 self.webState = .failed("\(error)")
@@ -182,13 +226,21 @@ final class AppState: ObservableObject {
     /// (`tunnelDied` reports that). Called from the pane's update: changes nothing published.
     func takeEntryURL() -> URL? {
         defer { pendingEntry = nil }
-        if active?.mode == .sshTunnel && !tunnel.isRunning { return nil }
+        guard isTunnelAlive else { return nil }
         return pendingEntry
+    }
+
+    /// The pending SPA route (notification session focus or inbox jump), consumed once without mutating published state.
+    func takeRoute() -> WebPane.Route? {
+        defer { pendingRoute = nil }
+        guard isTunnelAlive else { return nil }
+        return pendingRoute
     }
 
     // MARK: connect / disconnect
 
     func connect(_ connection: Connection) {
+        let switchingConnection = active?.id != connection.id
         teardown()
         generation += 1
         let gen = generation
@@ -196,6 +248,12 @@ final class AppState: ObservableObject {
         active = connection
         // A tunnel connection is worth reopening by itself after a drop; a direct one has nothing to reopen.
         reconnectable = connection.mode == .sshTunnel
+        pendingNetworkReconnect = false
+        daemonUnreachable = false
+        if switchingConnection {
+            pendingRoute = nil
+            Notifier.withdrawAll()
+        }
         counts = Counts()
         feedStatus = DaemonClient.FeedStatus()
         webState = .idle
@@ -216,7 +274,9 @@ final class AppState: ObservableObject {
                     base = r.baseURL
                     if let fetched = r.token {
                         tok = fetched
-                        _ = ConnectionStore.setToken(fetched, for: connection.id)
+                        if !ConnectionStore.setToken(fetched, for: connection.id) {
+                            self.storageError = "connected, but could not store the fetched token in the Keychain"
+                        }
                     } else {
                         tok = ConnectionStore.token(for: connection.id)
                     }
@@ -258,6 +318,11 @@ final class AppState: ObservableObject {
                 let msg = (error as? ConnectError)?.description ?? (error as? Tunnel.TunnelError)?.description ?? error.localizedDescription
                 self.link = .failed(msg)
                 self.status = "failed"
+                if self.pendingNetworkReconnect && self.reconnectable {
+                    self.pendingNetworkReconnect = false
+                    self.lastReconnectAt = Date()
+                    self.connect(connection)
+                }
             }
         }
     }
@@ -266,6 +331,11 @@ final class AppState: ObservableObject {
         teardown()
         generation += 1
         reconnectable = false   // the operator chose to stop; do not reopen it on wake
+        pendingNetworkReconnect = false
+        active = nil
+        daemonUnreachable = false
+        pendingRoute = nil
+        Notifier.withdrawAll()
         link = .none
         status = "not connected"
         counts = Counts()
@@ -288,6 +358,23 @@ final class AppState: ObservableObject {
         token = nil
         baseURL = nil
         pendingEntry = nil
+    }
+
+    /// The daemon was replaced by something that cannot prove itself: drop the token and fail the link.
+    private func failIdentity(_ why: String) {
+        generation += 1
+        reconnectable = false
+        pendingNetworkReconnect = false
+        client.stop()
+        tunnel.close()
+        token = nil
+        baseURL = nil
+        pendingEntry = nil
+        pendingRoute = nil
+        counts = Counts()
+        daemonUnreachable = false
+        link = .failed(why)
+        status = "daemon not verified"
     }
 
     private func startClient(base: String, token: String, gen: Int) {
@@ -315,17 +402,7 @@ final class AppState: ObservableObject {
                 Task { @MainActor in
                     guard let self, self.generation == gen else { return }
                     if mode.hasPrefix(DaemonClient.identityModePrefix) {
-                        // The daemon was replaced by something that cannot prove itself: stop using the token.
-                        self.generation += 1
-                        self.reconnectable = false   // a different daemon now answers; reconnecting won't help
-                        self.client.stop()
-                        self.tunnel.close()
-                        self.token = nil
-                        self.baseURL = nil
-                        self.pendingEntry = nil
-                        self.counts = Counts()
-                        self.link = .failed(String(mode.dropFirst(DaemonClient.identityModePrefix.count)))
-                        self.status = "daemon not verified"
+                        self.failIdentity(String(mode.dropFirst(DaemonClient.identityModePrefix.count)))
                         return
                     }
                     if mode.hasPrefix(DaemonClient.unreachableModePrefix) {
@@ -333,14 +410,19 @@ final class AppState: ObservableObject {
                         self.status = mode
                         return
                     }
-                    self.daemonUnreachable = false
+                    if self.daemonUnreachable {
+                        self.daemonUnreachable = false
+                        self.status = self.feedStatus.label(at: Date())
+                    }
                 }
             },
             onFeedStatus: { [weak self] feed in
                 Task { @MainActor in
                     guard let self, self.generation == gen else { return }
                     self.feedStatus = feed
-                    self.status = feed.label(at: Date())
+                    if !self.daemonUnreachable {
+                        self.status = feed.label(at: Date())
+                    }
                 }
             })
     }
@@ -364,8 +446,7 @@ final class AppState: ObservableObject {
 
     // MARK: auto-reconnect
 
-    /// Watch for system wake and network-path changes so a dropped tunnel reopens itself. Called once at
-    /// launch (idempotent).
+    /// Watch for system wake, network-path changes, and menu opens. Called once at launch (idempotent).
     func beginWatching() {
         guard !watching else { return }
         watching = true
@@ -375,7 +456,7 @@ final class AppState: ObservableObject {
                 guard let self else { return }
                 let cameBack = up && !self.networkSatisfied
                 self.networkSatisfied = up
-                if cameBack { self.maybeAutoReconnect("network returned") }
+                if cameBack { self.handleNetworkReturned() }
             }
         }
         pathMonitor.start(queue: DispatchQueue(label: "loom-desk.path"))
@@ -384,10 +465,31 @@ final class AppState: ObservableObject {
         ) { [weak self] _ in
             Task { @MainActor in self?.maybeAutoReconnect("woke") }
         }
+        NotificationCenter.default.addObserver(
+            forName: NSMenu.didBeginTrackingNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.refreshNotificationStatus() }
+        }
     }
 
-    /// Reopen a dropped tunnel connection. Event-driven (wake / network return / the drop itself) and
-    /// debounced, never a tight loop; a connect that fails leaves `.failed` and waits for the next event.
+    /// Network path just transitioned from unsatisfied to satisfied: never let the 4 s debounce drop it,
+    /// and if an earlier connect is still in flight, retry once if it fails.
+    private func handleNetworkReturned() {
+        guard reconnectable, let a = active, a.mode == .sshTunnel else { return }
+        switch link {
+        case .failed:
+            pendingNetworkReconnect = false
+            lastReconnectAt = Date()
+            connect(a)
+        case .connecting:
+            pendingNetworkReconnect = true
+        case .none, .connected:
+            break
+        }
+    }
+
+    /// Reopen a dropped tunnel connection. Event-driven (wake / the drop itself) and debounced, never a
+    /// tight loop; a connect that fails leaves `.failed` and waits for the next event.
     private func maybeAutoReconnect(_ reason: String) {
         guard reconnectable, case .failed = link, let a = active, a.mode == .sshTunnel else { return }
         guard Date().timeIntervalSince(lastReconnectAt) > 4 else { return }
@@ -397,14 +499,18 @@ final class AppState: ObservableObject {
 
     // MARK: connections list
 
-    /// Insert or replace, persist, and (optionally) store a manually entered token in the Keychain.
-    func upsert(_ c: Connection, token newToken: String?) {
+    /// Insert or replace, persist, and optionally store or clear a token in the Keychain.
+    func upsert(_ c: Connection, token newToken: String?, clearToken: Bool = false) {
         if let i = connections.firstIndex(where: { $0.id == c.id }) { connections[i] = c } else { connections.append(c) }
         if active?.id == c.id { active = c }
         var problems: [String] = []
         if !ConnectionStore.save(connections) { problems.append("could not write connections.json") }
-        if let t = newToken, !t.isEmpty, !ConnectionStore.setToken(t, for: c.id) {
-            problems.append("could not store the token in the Keychain")
+        if let t = newToken, !t.isEmpty {
+            if !ConnectionStore.setToken(t, for: c.id) {
+                problems.append("could not store the token in the Keychain")
+            }
+        } else if clearToken {
+            ConnectionStore.clearToken(for: c.id)
         }
         storageError = problems.isEmpty ? nil : problems.joined(separator: "; ")
     }
@@ -422,20 +528,32 @@ final class AppState: ObservableObject {
     // MARK: window / notification routing
 
     /// Read the OS notification permission into `notifStatus` (so the menu can reflect it). Called at
-    /// launch and when the app becomes active, since the operator may change it in System Settings.
+    /// launch, when the app becomes active, and when a menu opens.
     func refreshNotificationStatus() {
         guard Bundle.main.bundleURL.pathExtension == "app" else { return }
         UNUserNotificationCenter.current().getNotificationSettings { s in
-            Task { @MainActor in self.notifStatus = s.authorizationStatus }
+            let status = s.authorizationStatus
+            Task { @MainActor in self.notifStatus = status }
         }
     }
 
-    /// Bring the window forward; navigate the pane to `session` when given.
+    /// Bring the window forward; navigate the pane to `session` when given while a link is active/opening.
     func openWindow(focus session: String? = nil) {
         openWindowTick += 1
-        if let session { focusSession = session }
+        if let session {
+            switch link {
+            case .connected, .connecting:
+                pendingRoute = .session(session)
+                routeTick += 1
+            case .none, .failed:
+                break
+            }
+        }
         NSApp.activate(ignoringOtherApps: true)
-        for w in NSApp.windows where w.canBecomeMain { w.makeKeyAndOrderFront(nil) }
+        for w in NSApp.windows where w.canBecomeMain {
+            if w.isMiniaturized { w.deminiaturize(nil) }
+            w.makeKeyAndOrderFront(nil)
+        }
     }
 
     struct ConnectError: Error, CustomStringConvertible {
@@ -448,8 +566,10 @@ final class AppState: ObservableObject {
 enum Notifier {
     private static var available: Bool { Bundle.main.bundleURL.pathExtension == "app" }
 
+    @MainActor
     static func requestAuthorization() {
         guard available else { return }
+        NSApp.activate(ignoringOtherApps: true)
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in
             Task { @MainActor in AppState.shared.refreshNotificationStatus() }
         }
@@ -477,6 +597,13 @@ enum Notifier {
         let center = UNUserNotificationCenter.current()
         center.removeDeliveredNotifications(withIdentifiers: [itemId])
         center.removePendingNotificationRequests(withIdentifiers: [itemId])
+    }
+
+    static func withdrawAll() {
+        guard available else { return }
+        let center = UNUserNotificationCenter.current()
+        center.removeAllDeliveredNotifications()
+        center.removeAllPendingNotificationRequests()
     }
 
     static func cut(_ s: String, _ n: Int) -> String {
