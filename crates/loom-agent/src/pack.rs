@@ -1091,4 +1091,29 @@ mod tests {
             assert!(has(pack, child, "hand_off") && !has(pack, child, "ask_for"), "{pack}/{child}");
         }
     }
+
+    #[test]
+    fn default_shell_and_hidden_tools_validate_and_default_cleanly() {
+        let baseline = Packs::load(mk(GOOD).path()).unwrap();
+        let base_role = baseline.role(Some("mine"), Some("a")).unwrap();
+        assert_eq!(base_role.default_shell, None);
+        assert!(base_role.hidden_tools.is_empty());
+
+        for shell in ["host", "box"] {
+            let text = GOOD.replace(
+                "[roles.a]",
+                &format!("[roles.a]\ndefault_shell = \"{shell}\"\nhidden_tools = [\"step\", \"out_read\"]"),
+            );
+            let packs = Packs::load(mk(&text).path()).unwrap();
+            let role = packs.role(Some("mine"), Some("a")).unwrap();
+            assert_eq!(role.default_shell.as_deref(), Some(shell));
+            assert_eq!(role.hidden_tools, vec!["step".to_string(), "out_read".to_string()]);
+        }
+
+        for bad_shell in ["container", "HOST", ""] {
+            let bad = GOOD.replace("[roles.a]", &format!("[roles.a]\ndefault_shell = \"{bad_shell}\""));
+            let e = err(&bad);
+            assert!(e.contains("default_shell") && e.contains("host or box"), "{bad_shell}: {e}");
+        }
+    }
 }

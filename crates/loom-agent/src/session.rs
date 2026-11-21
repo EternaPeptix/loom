@@ -551,10 +551,11 @@ use loom_core::admit::AdmitPolicy;
 use loom_core::config::{AgentsCfg, Paths};
 use loom_core::estimate::TokenEstimator;
 use loom_core::event::{
-    Author, Budget, ChildCompleted, ChildOutcome, ChildSettled, Event, FinishReason, Forked, InboxItem, InboxKind,
-    ModelRef, ModelRequest, ModelResponse, ModelSwitched, NoteKind, Purpose, ReasoningReplay, Record, Reweave, Seq,
-    SessionOutcome, SessionStart, StoredAction, Termination, Timing, ToolCall, ToolCallRequest, ToolClass, ToolSpec,
-    ToolStatus, Trigger, TurnEndReason, Usage, META_DEFERRED_OBSERVATION, META_EXIT_CODE, META_JOB, META_SIGNAL,
+    Author, Budget, ChildCompleted, ChildOutcome, ChildSettled, Event, EvidenceGrade, FinishReason, Forked, InboxItem,
+    InboxKind, ModelRef, ModelRequest, ModelResponse, ModelSwitched, NoteKind, Purpose, ReasoningReplay, Record,
+    Reweave, Seq, SessionOutcome, SessionStart, StoredAction, Termination, Timing, ToolCall, ToolCallRequest,
+    ToolClass, ToolSpec, ToolStatus, Trigger, TurnEndReason, Usage, META_DEFERRED_OBSERVATION, META_EXIT_CODE,
+    META_JOB, META_SIGNAL,
 };
 use loom_core::ids::{new_item_id, new_request_id, CallId, SessionId};
 use loom_core::ledger::{LedgerOp, LedgerState};
@@ -570,9 +571,9 @@ use loom_model::request::{ChatRequest, ToolChoice};
 use loom_tools::files::FileTracker;
 use loom_tools::jobs::{JobEvent, JobInfo, JobState};
 use loom_tools::proc::Ended;
-use loom_tools::{execute, prepare, refused, Admission, Ran, Registry, ToolCtx};
+use loom_tools::{canonical_tool_alias, execute, prepare, refused, Admission, Ran, Registry, ToolCtx};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -981,6 +982,35 @@ impl CallPolicy {
     }
 }
 
+/// Tools omitted from wire `ToolSpec`s when `agents.compact_tools` is enabled (still runnable if called).
+const COMPACT_HIDDEN_TOOLS: &[&str] = &[
+    "attempt",
+    "agent_adopt",
+    "agent_message",
+    "agent_stop",
+    "decide",
+    "pin",
+    "reflect",
+    "ask_for",
+    "conclude",
+    "out_read",
+    "out_grep",
+    "step",
+];
+
+/// Build the static wire `ToolSpec` list once at session creation so KV prompt cache stays stable.
+fn wire_tools(registry: &Registry, deps: &Deps) -> Vec<ToolSpec> {
+    let hidden = &deps.shared.role.hidden_tools;
+    let compact = deps.agents.compact_tools;
+    registry
+        .specs()
+        .into_iter()
+        .filter(|spec| {
+            !hidden.iter().any(|h| h == &spec.name) && !(compact && COMPACT_HIDDEN_TOOLS.contains(&spec.name.as_str()))
+        })
+        .collect()
+}
+
 /// A step request as the re-weave check needs it.
 #[derive(Clone, Debug, Default)]
 struct Measured {
@@ -1231,7 +1261,7 @@ impl Early {
     }
 
     fn may_start(&self, name: &str) -> bool {
-        self.registry.get(name).is_some_and(|t| t.speculative())
+        self.registry.resolve(name).is_some_and(|(t, _)| t.speculative())
     }
 
     /// Follow the stream: a ready call may start; a new attempt voids what the earlier ones started.
@@ -1272,7 +1302,8 @@ impl Early {
         if self.runs.contains_key(&index) || self.turn.is_cancelled() || running >= MAX_EARLY {
             return;
         }
-        if !matches!(serde_json::from_str::<Value>(arguments), Ok(Value::Object(ref a)) if self.policy.allows(name, &Value::Object(a.clone())))
+        let policy_name = self.registry.resolve(name).and_then(|(_, canon)| canon).unwrap_or(name);
+        if !matches!(serde_json::from_str::<Value>(arguments), Ok(Value::Object(ref a)) if self.policy.allows(policy_name, &Value::Object(a.clone())))
         {
             return;
         }
@@ -1718,7 +1749,7 @@ impl Session {
         let path = deps.paths.session_log(&deps.shared.session);
         let log = SessionLog::create(&path, Durability::Always).map_err(|e| e.to_string())?;
         let mut start = start;
-        start.tools = registry.specs();
+        start.tools = wire_tools(&registry, &deps);
         let mut session = Session::bare(deps, log, Vec::new(), registry);
         session.append(Author::Harness, Event::SessionStart(start)).map_err(|e| e.0)?;
         if let Some((parent, text)) = assignment {
@@ -3262,6 +3293,10 @@ Name them when you start a new mission instead."
                 && shared.role.tools.iter().any(|t| t == "conclude"),
             solvable: shared.role.solvable,
         });
+        if let Some(activity) = hud::recent_activity(self.own()) {
+            text.push_str("\n\n");
+            text.push_str(&activity);
+        }
         if shared.is_child() {
             text.push_str(if shared.role.read_only {
                 "\n\nMission ledger access: read-only. Return observations through your report or verdict."
@@ -3384,6 +3419,9 @@ Name them when you start a new mission instead."
 
     /// A stretch of own steps with no ledger record, file change or child activity gets one note.
     fn check_stall(&mut self) -> R<()> {
+        if !self.deps.agents.idle_ledger_nudge {
+            return Ok(());
+        }
         let n = self.deps.agents.stall_steps;
         if n == 0 || self.st.termination != Some(Termination::Explicit) || self.deps.shared.journal.is_none() {
             return Ok(());
@@ -3643,8 +3681,21 @@ Name them when you start a new mission instead."
             self.note(Author::Harness, NoteKind::Nudge, texts::REASONING_ONLY.to_string())?;
             return Ok(Flow::Next);
         }
+        let termination = self.st.termination.unwrap_or(Termination::Explicit);
+        if self.deps.agents.implicit_finish
+            && termination == Termination::Explicit
+            && running_jobs == 0
+            && running_children == 0
+            && !c.text.trim().is_empty()
+            && names.iter().any(|n| n == "finish")
+            && !names.iter().any(|n| n == "verdict")
+        {
+            if let Some(flow) = self.try_implicit_finish(req_id, c.text.trim(), ledger.as_ref(), w_tools).await? {
+                return Ok(flow);
+            }
+        }
         let verdict = gate::on_yield(&YieldCtx {
-            termination: self.st.termination.unwrap_or(Termination::Explicit),
+            termination,
             is_child: shared.is_child(),
             tools: &names,
             ledger: ledger.as_ref(),
@@ -3671,6 +3722,78 @@ Name them when you start a new mission instead."
                 }
             }
         }
+    }
+
+    async fn try_implicit_finish(
+        &mut self,
+        req_id: &str,
+        answer: &str,
+        ledger: Option<&LedgerState>,
+        w_tools: &[ToolSpec],
+    ) -> R<Option<Flow>> {
+        let mut handles = extract_out_handles(answer);
+        if handles.is_empty() {
+            let goal_concluded = ledger.is_some_and(|l| !gate::goal_unconcluded(l));
+            let candidate = self.recent_exec_output_handle();
+            if !goal_concluded && candidate.is_none() {
+                return Ok(None);
+            }
+            if let Some(handle) = candidate {
+                handles.push(handle);
+            }
+        }
+        let mut quotes = Vec::with_capacity(handles.len());
+        for handle in handles {
+            let end = match loom_tools::outputs::open(&self.deps.ctx, &handle).await {
+                Ok(id) => match self.deps.ctx.blobs.meta(&id) {
+                    Ok(meta) if meta.lines > 0 => meta.lines.min(20),
+                    _ => 20,
+                },
+                Err(_) => 20,
+            };
+            quotes.push(json!({ "handle": handle, "start": 1, "end": end }));
+        }
+        let synthetic = ToolCallRequest {
+            call_id: CallId(format!("implicit_finish_{}", self.st.step)),
+            name: "finish".into(),
+            arguments: json!({ "answer": answer, "quotes": quotes }).to_string(),
+            complete: true,
+        };
+        let early = Early::new(
+            false,
+            self.registry.clone(),
+            self.deps.ctx.clone(),
+            &self.token,
+            HashSet::new(),
+            self.early_counts.clone(),
+        );
+        let calls = self.run_calls(req_id, std::slice::from_ref(&synthetic), w_tools, early).await?;
+        match calls.effect {
+            Some(Effect::EndTurn(reason)) => return Ok(Some(Flow::End(reason))),
+            Some(Effect::Settle(d)) => return Ok(Some(Flow::Settle(d))),
+            None => {}
+        }
+        if calls.cancelled {
+            return self.cancelled().await.map(Some);
+        }
+        if self.nudges < self.deps.agents.max_nudges {
+            self.nudges = self.nudges.saturating_add(1);
+            return Ok(Some(Flow::Next));
+        }
+        Ok(None)
+    }
+
+    fn recent_exec_output_handle(&self) -> Option<String> {
+        self.records.iter().rev().find_map(|r| match &r.event {
+            Event::ToolResult(t)
+                if t.class == ToolClass::Exec
+                    && t.status == ToolStatus::Ok
+                    && EvidenceGrade::of_tool_result(&t.name, t.class, &t.meta) == EvidenceGrade::Run =>
+            {
+                t.output.as_ref().filter(|b| b.lines > 0).map(BlobRef::handle)
+            }
+            _ => None,
+        })
     }
 
     /// Count a reply that made no progress as a nudge. Past `agents.max_nudges` of them in a row the
@@ -3721,8 +3844,10 @@ Name them when you start a new mission instead."
                 out.cancelled = true;
                 break;
             }
-            let tool = self.registry.get(&call.name);
-            let class = tool.as_ref().map(|t| t.spec().class).unwrap_or(ToolClass::State);
+            let resolved = self.registry.resolve(&call.name);
+            let tool = resolved.as_ref().map(|(t, _)| t);
+            let policy_name = resolved.as_ref().and_then(|(_, canon)| *canon).unwrap_or(call.name.as_str());
+            let class = tool.map(|t| t.spec().class).unwrap_or(ToolClass::State);
             let args = serde_json::from_str::<Value>(&call.arguments)
                 .unwrap_or_else(|_| Value::String(call.arguments.clone()));
             self.append(
@@ -3743,10 +3868,14 @@ Name them when you start a new mission instead."
             let started = Instant::now();
             let mut result = if let Some(first) = &ender {
                 refused(&ctx, &call.name, class, texts::not_run_after(first), started)
-            } else if tool.is_none() && w_tools.iter().any(|t| t.name == call.name) {
+            } else if tool.is_none()
+                && w_tools
+                    .iter()
+                    .any(|t| t.name == call.name || canonical_tool_alias(&call.name) == Some(t.name.as_str()))
+            {
                 let message = texts::not_in_assignment(&call.name, &self.deps.shared.role.name, &self.registry.names());
                 refused(&ctx, &call.name, class, message, started)
-            } else if !(CallPolicy { wrapup: self.st.budget_note_step.is_some() }).allows(&call.name, &args) {
+            } else if !(CallPolicy { wrapup: self.st.budget_note_step.is_some() }).allows(policy_name, &args) {
                 refused(&ctx, &call.name, class, texts::wrapup_refused(&call.name), started)
             } else if class == ToolClass::Exec
                 && self.deps.shared.role.max_exec_calls.is_some_and(|cap| self.exec_count() >= u64::from(cap))
@@ -3903,6 +4032,37 @@ Name them when you start a new mission instead."
     }
 }
 
+/// Extract unique `out:<hex>` handles (`out:[0-9a-f]{8,64}`) in order of first appearance.
+fn extract_out_handles(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while let Some(rel) = text.get(i..).and_then(|s| s.find("out:")) {
+        let start = i + rel;
+        let prev_ok = start == 0
+            || text.get(..start).and_then(|s| s.chars().next_back()).is_none_or(|c| !c.is_ascii_alphanumeric());
+        let hex_start = start + 4;
+        let hex_len = bytes
+            .get(hex_start..)
+            .unwrap_or_default()
+            .iter()
+            .take_while(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
+            .count();
+        let hex_end = hex_start + hex_len;
+        let next_ok = text.get(hex_end..).and_then(|s| s.chars().next()).is_none_or(|c| !c.is_ascii_alphanumeric());
+        if prev_ok && (8..=64).contains(&hex_len) && next_ok {
+            if let Some(handle) = text.get(start..hex_end) {
+                if seen.insert(handle.to_string()) {
+                    out.push(handle.to_string());
+                }
+            }
+        }
+        i = hex_end.max(start + 4);
+    }
+    out
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {
@@ -3927,6 +4087,7 @@ mod tests {
         records: Mutex<Vec<Record>>,
         deltas: Mutex<Vec<(String, StreamEvent)>>,
         statuses: Mutex<Vec<Status>>,
+        orch: Mutex<Option<Arc<FakeOrch>>>,
     }
 
     impl Collect {
@@ -3939,7 +4100,21 @@ mod tests {
     }
 
     impl Sink for Collect {
-        fn record(&self, _session: &SessionId, record: &Record) {
+        fn record(&self, session: &SessionId, record: &Record) {
+            if let Event::ToolResult(t) = &record.event {
+                if let Some(out) = &t.output {
+                    if let Some(orch) = self.orch.lock().unwrap().as_ref() {
+                        orch.produced_graded(
+                            out,
+                            session.as_str(),
+                            &t.call_id.0,
+                            &t.name,
+                            t.class,
+                            EvidenceGrade::of_tool_result(&t.name, t.class, &t.meta),
+                        );
+                    }
+                }
+            }
             self.records.lock().unwrap().push(record.clone());
         }
         fn delta(&self, _session: &SessionId, req_id: &str, event: &StreamEvent) {
@@ -3953,7 +4128,7 @@ mod tests {
     struct Fx {
         _dir: tempfile::TempDir,
         server: MockServer,
-        _orch: Arc<FakeOrch>,
+        orch: Arc<FakeOrch>,
         sink: Arc<Collect>,
         control: Arc<Control>,
         shared: Arc<Shared>,
@@ -4007,7 +4182,7 @@ mod tests {
             Fx {
                 _dir: dir,
                 server,
-                _orch: orch,
+                orch,
                 sink: Arc::new(Collect::default()),
                 control: Arc::new(Control::new()),
                 shared,
@@ -4103,6 +4278,10 @@ mod tests {
 
         fn log_path(&self) -> std::path::PathBuf {
             self.paths.session_log(&SessionId::from("s-test"))
+        }
+
+        fn track_producers(&self) {
+            *self.sink.orch.lock().unwrap() = Some(self.orch.clone());
         }
     }
 
@@ -8402,5 +8581,256 @@ mod tests {
             "ask_for must succeed during wrapup: {:?}",
             results(&rs)
         );
+    }
+
+    #[tokio::test]
+    async fn compact_tools_and_hidden_tools_filter_wire_specs_while_keeping_registry_and_aliases() {
+        let mut baseline_fx = Fx::build("lead", false, true, AgentsCfg::default(), seq(vec![])).await;
+        let mut baseline_session = baseline_fx.create();
+        let baseline_wire = baseline_session.woven().weave.tools;
+        let baseline_names: Vec<&str> = baseline_wire.iter().map(|t| t.name.as_str()).collect();
+        assert!(baseline_names.contains(&"out_read"));
+        assert!(baseline_names.contains(&"step"));
+        assert!(baseline_names.contains(&"note"));
+
+        // With compact_tools = true and hidden_tools = ["note"], wire specs shrink statically while
+        // all tools remain registered, callable directly (even when hidden), and resolvable via aliases.
+        let mut role_no_conclude = core_role("lead");
+        role_no_conclude.hidden_tools = vec!["note".into()];
+        role_no_conclude.tools.retain(|t| t != "conclude" && t != "request_scope");
+        let script = seq(vec![
+            Reply::tool("read_file", json!({"path": "Cargo.toml"}).to_string()).into(),
+            Reply::tool("todo_write", json!({"steps": ["check result"]}).to_string()).into(),
+            Reply::tool("step", json!({"id": "p1", "status": "done", "note": "checked"}).to_string()).into(),
+            Reply::tool(
+                "note",
+                json!({"kind": "decision", "text": "hidden tool still runs", "why": "test"}).to_string(),
+            )
+            .into(),
+            Reply::tool("shell", json!({"command": "echo aliased-exec"}).to_string()).into(),
+            finish_call("done").into(),
+        ]);
+        let mut fx = Fx::build_with(
+            role_no_conclude,
+            "lead",
+            false,
+            true,
+            AgentsCfg { compact_tools: true, verify_finish: false, ..AgentsCfg::default() },
+            script,
+        )
+        .await;
+        std::fs::write(fx.ctx.workspace.join("Cargo.toml"), "[package]\nname = \"probe\"\n").unwrap();
+        let mut session = fx.create();
+        let wire = session.woven().weave.tools;
+        assert!(wire.len() < baseline_wire.len(), "wire={} baseline={}", wire.len(), baseline_wire.len());
+        for hidden in ["note", "step", "out_read", "out_grep", "pin", "reflect", "ask_for", "decide"] {
+            assert!(!wire.iter().any(|t| t.name == hidden), "{hidden} should be hidden on wire");
+        }
+        assert!(session.registry.get("step").is_some());
+        assert!(session.registry.get("note").is_some());
+        assert!(session.registry.resolve("read_file").is_some_and(|(t, c)| t.speculative() && c == Some("read")));
+
+        run_with(session, vec![user("go")]).await;
+        let rs = fx.sink.records();
+        // Wire tool schemas sent to the server stay identical across every step for KV cache stability.
+        let reqs = fx.server.requests();
+        assert!(reqs.len() >= 5);
+        for req in &reqs[1..] {
+            assert_eq!(req["tools"], reqs[0]["tools"]);
+        }
+        let res = results(&rs);
+        assert!(res.iter().any(|r| r.name == "read" && r.status == ToolStatus::Ok));
+        assert!(res.iter().any(|r| r.name == "plan" && r.status == ToolStatus::Ok));
+        assert!(res.iter().any(|r| r.name == "step" && r.status == ToolStatus::Ok));
+        assert!(res.iter().any(|r| r.name == "note" && r.status == ToolStatus::Ok));
+        assert!(res.iter().any(|r| r.name == "bash" && r.status == ToolStatus::Ok));
+        // `shell` resolved to `ToolClass::Exec` so `ExecStarted` was logged cleanly.
+        assert_eq!(rs.iter().filter(|r| matches!(r.event, Event::ExecStarted { .. })).count(), 1);
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Finished]);
+    }
+
+    #[tokio::test]
+    async fn implicit_finish_delivers_child_and_lead_through_gate_and_preserves_verifier_rejection() {
+        // 1) Child implicit finish: runs bash, yields prose -> settles Returned via synthetic finish.
+        let child_script = seq(vec![bash("echo 42").into(), Reply::text("The sum is 42.").into()]);
+        let child_agents = AgentsCfg { implicit_finish: true, verify_finish: false, ..AgentsCfg::default() };
+        let mut kid = Fx::build("worker", true, true, child_agents, child_script).await;
+        kid.track_producers();
+        let session = kid.create_with(Budget::default(), Some((SessionId::from("s-lead"), "Compute sum".into())));
+        let End::Settled(settled) = run_with(session, vec![]).await else {
+            panic!("expected child to settle");
+        };
+        assert_eq!(settled.outcome, ChildOutcome::Returned);
+        assert!(settled.report.contains("The sum is 42."), "{}", settled.report);
+        assert!(settled.report.contains("42"), "{}", settled.report);
+        let krs = kid.sink.records();
+        assert!(krs.iter().any(|r| matches!(&r.event, Event::ToolCall(c) if c.call_id.0.starts_with("implicit_finish_") && c.name == "finish")));
+
+        // 2) Lead implicit finish when goal is unconcluded is refused by the gate (Flow::Next), NEVER bypassing it.
+        let unconcluded_script = seq(vec![
+            bash("echo 42").into(),
+            Reply::text("Premature prose answer").into(),
+            Reply::tool(
+                "report_blocker",
+                json!({"class": "impossible", "what": "cannot conclude", "tried": "echo 42", "needs": "operator"})
+                    .to_string(),
+            )
+            .into(),
+        ]);
+        let mut fx = Fx::build(
+            "lead",
+            false,
+            true,
+            AgentsCfg { implicit_finish: true, verify_finish: false, ..AgentsCfg::default() },
+            unconcluded_script,
+        )
+        .await;
+        fx.track_producers();
+        let session = fx.create();
+        run_with(session, vec![user("go")]).await;
+        let rs = fx.sink.records();
+        assert!(results(&rs).iter().any(|r| r.name == "finish" && r.status == ToolStatus::Error));
+        assert_ne!(turn_ends(&rs), vec![TurnEndReason::Finished]);
+
+        // 3) Lead implicit finish goes through the verifier gate; rejection flows back to the model.
+        let turn = std::sync::atomic::AtomicUsize::new(0);
+        let verify_script = Script::new(move |body, _| {
+            let step = turn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let msgs = body["messages"].as_array().unwrap();
+            let tool_msgs: Vec<&str> =
+                msgs.iter().filter(|m| m["role"] == "tool").filter_map(|m| m["content"].as_str()).collect();
+            let extract_handle = |s: &str| {
+                s.split("out:")
+                    .nth(1)
+                    .and_then(|rest| rest.split(|c: char| !c.is_ascii_hexdigit()).next())
+                    .map(|hex| format!("out:{hex}"))
+            };
+            match step {
+                0 => bash("echo 42").into(),
+                1 => Reply::tool("claim", json!({"text": "output is 42"}).to_string()).into(),
+                2 => {
+                    let h = extract_handle(tool_msgs[0]).unwrap();
+                    Reply::tool(
+                        "evidence",
+                        json!({"claim": "c1", "handle": h, "start": 1, "end": 1, "note": "run output"}).to_string(),
+                    )
+                    .into()
+                }
+                3 => Reply::tool(
+                    "claim_update",
+                    json!({"id": "c1", "status": "supported", "note": "verified"}).to_string(),
+                )
+                .into(),
+                4 => Reply::tool(
+                    "conclude",
+                    json!({"status": "met", "note": "echoed 42", "evidence": ["e1"]}).to_string(),
+                )
+                .into(),
+                5 => {
+                    let h = extract_handle(tool_msgs[0]).unwrap();
+                    Reply::text(format!("Delivered from {h}: output is 42.")).into()
+                }
+                6 => bash("echo 42 rechecked").into(),
+                7 => {
+                    let h = extract_handle(tool_msgs.last().unwrap()).unwrap();
+                    Reply::tool(
+                        "evidence",
+                        json!({"claim": "c1", "handle": h, "start": 1, "end": 1, "note": "rechecked"}).to_string(),
+                    )
+                    .into()
+                }
+                8 => Reply::tool(
+                    "conclude",
+                    json!({"status": "met", "note": "rechecked 42", "evidence": ["e2"]}).to_string(),
+                )
+                .into(),
+                _ => Reply::text("Final answer after addressing objection.").into(),
+            }
+        });
+        let mut fx = Fx::build(
+            "lead",
+            false,
+            true,
+            AgentsCfg { implicit_finish: true, verify_finish: true, ..AgentsCfg::default() },
+            verify_script,
+        )
+        .await;
+        fx.track_producers();
+        {
+            let mut settlements = fx.orch.settlements.lock().unwrap();
+            settlements.insert(
+                SessionId::from("s-kid1"),
+                Settlement {
+                    child: SessionId::from("s-kid1"),
+                    role: "verifier".into(),
+                    outcome: ChildOutcome::Returned,
+                    report: "Verdict: not accepted".into(),
+                    full: None,
+                    payload: json!({"accepted": false, "objections": ["Re-run check needed."], "opened": []}),
+                    steps: 1,
+                    usage: Usage::default(),
+                },
+            );
+            settlements.insert(
+                SessionId::from("s-kid2"),
+                Settlement {
+                    child: SessionId::from("s-kid2"),
+                    role: "verifier".into(),
+                    outcome: ChildOutcome::Returned,
+                    report: "Verdict: accepted".into(),
+                    full: None,
+                    payload: json!({"accepted": true, "objections": [], "opened": []}),
+                    steps: 1,
+                    usage: Usage::default(),
+                },
+            );
+        }
+        let session = fx.create();
+        run_with(session, vec![user("go")]).await;
+        let rs = fx.sink.records();
+        let finishes: Vec<_> = results(&rs).into_iter().filter(|r| r.name == "finish").collect();
+        assert_eq!(finishes.len(), 2, "expected rejected then accepted finish: {finishes:?}");
+        assert_eq!(finishes[0].status, ToolStatus::Error);
+        assert!(finishes[0].text.contains("Re-run check needed."));
+        assert_eq!(finishes[1].status, ToolStatus::Ok);
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Finished]);
+
+        // 4) Verifier role (has `verdict`) never triggers implicit_finish even when implicit_finish = true.
+        let v_script = seq(vec![Reply::text("Looks good to me.").into(), Reply::text("Still prose.").into()]);
+        let v_agents = AgentsCfg { implicit_finish: true, max_nudges: 1, verify_finish: false, ..AgentsCfg::default() };
+        let mut v_fx = Fx::build("verifier", true, true, v_agents, v_script).await;
+        let v_session = v_fx.create_with(Budget::default(), Some((SessionId::from("s-lead"), "Verify".into())));
+        let End::Settled(v_end) = run_with(v_session, vec![]).await else { panic!("expected settlement") };
+        assert_eq!(v_end.outcome, ChildOutcome::Failed);
+        assert!(!results(&v_fx.sink.records()).iter().any(|r| r.name == "finish"));
+    }
+
+    #[tokio::test]
+    async fn idle_ledger_nudge_false_suppresses_stall_note_while_true_emits_it() {
+        for enabled in [false, true] {
+            let agents =
+                AgentsCfg { stall_steps: 3, idle_ledger_nudge: enabled, verify_finish: false, ..AgentsCfg::default() };
+            let mut actions: Vec<Action> = (0..5).map(|_| bash("echo hi").into()).collect();
+            actions.push(finish_call("done").into());
+            let mut role = core_role("lead");
+            role.tools.retain(|t| t != "conclude" && t != "request_scope");
+            let mut fx = Fx::build_with(role, "lead", false, true, agents, seq(actions)).await;
+            let session = fx.create();
+            run_with(session, vec![user("go")]).await;
+            let n = notes(&fx.sink.records(), NoteKind::Stall);
+            if enabled {
+                assert_eq!(n, vec![texts::stall(3)]);
+            } else {
+                assert!(n.is_empty(), "expected no stall note when idle_ledger_nudge = false, got {n:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn extract_out_handles_ignores_embedded_words_and_deduplicates() {
+        let found = extract_out_handles(
+            "see out:0123abcd and about:deadbeef and `out:89abcdef01234567`, plus out:0123abcd and short out:1234",
+        );
+        assert_eq!(found, vec!["out:0123abcd".to_string(), "out:89abcdef01234567".to_string()]);
     }
 }
