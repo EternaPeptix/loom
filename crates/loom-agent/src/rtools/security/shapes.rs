@@ -104,12 +104,25 @@
 //! - N6 hypothesis_priority / hypothesis_evidence / hypothesis_verdict:
 //!   - N6a: `id` absent and `hypothesis` or `hypothesis_id` (a string) present → renamed.
 //!     Note: "In L, `{hypothesis|hypothesis_id}` was read as `id`."
-//!   - evidence/verdict: a missing `evidence` or `counterevidence` becomes `[]` (no note).
+//!   - evidence/counterevidence: across operations and wrappers that take them (`asset`, `credential`,
+//!     `foothold`, `relation`, `condition_unlock`, `coverage_set` when `status` is `tested`,
+//!     `crash_record.attempt`, `fact_assert`, `hypothesis_evidence`, `hypothesis_verdict`), an omitted
+//!     `evidence` or `counterevidence` defaults quietly to `[]`.
 //!   - N6b verdict: `status` absent and `verdict` present → renamed. Note: "In L, `verdict` was read
 //!     as `status`."
 //!   - N6c verdict: `status` (string, trimmed, case-insensitive) "confirmed", "verified", "true",
 //!     "accepted", "valid" → "supported"; "disproved", "rejected", "false", "invalid" → "refuted"; a
 //!     JSON boolean true/false the same. Note: "In L, status `{given}` was read as `{status}`."
+//! - N6d `blocked_on` / `condition_unlock`:
+//!   - When `target` is absent in `blocked_on`, if exactly one of `asset`, `endpoint`, `service`,
+//!     `claim`, `dead_end`, `id` is present (or `blocked` is a string while `conditions` is present),
+//!     it is read as `target`. Note: "In L, `{key}` was read as `target`."
+//!   - When `conditions` is absent, unambiguous `condition` (`blocked_on`/`condition_unlock`),
+//!     `unlocked`/`unlocks` (`condition_unlock`), or array/object `blocked` (`blocked_on`) is read as
+//!     `conditions` (wrapping a single object in `[…]`), then checked by R2. A free-text string under
+//!     `reason` or `blocked` when `conditions` is absent is refused by R2 (never relaxed).
+//!   - In `blocked_on`, a single object `conditions` is wrapped in `[…]`, and an extra string `reason`
+//!     alongside `conditions` is dropped with a note.
 //! - N7 asset_upsert locators (after N2; only when `asset.kind` and `asset.locator` are strings;
 //!   the locator is trimmed first):
 //!   - N7a kind host: a locator that is not an IP address, holds no user information, and (i) contains
@@ -128,11 +141,15 @@
 //!     after the URL was not recorded: `{rest}`; record it as a fact if it matters." The same applies
 //!     when the first token is a path (starts with `/` but not `//`), with "the text after the path"
 //!     in the note; N7d then joins that path.
-//!   - N7d kind service/endpoint: the locator starts with `/` but not `//`, `asset.parent` is a
-//!     string that `state.resolve` resolves to a recorded asset whose locator parses as an absolute
-//!     URL with a host → `base.join(locator)`, accepted only when the joined URL keeps the base's
-//!     scheme, host and port. Note: "In L, the path `{path}` was joined to its parent's URL as
-//!     `{url}`." A parent that does not resolve → P + the resolve error + suffix.
+//!   - N7d kind service/endpoint: the locator starts with `/` but not `//`. If `asset.parent` is a
+//!     nonblank string, `state.resolve` resolves it to a recorded asset whose locator parses as an
+//!     absolute URL with a host → `base.join(locator)`, accepted only when the joined URL keeps the
+//!     base's scheme, host and port. Note: "In L, the path `{path}` was joined to its parent's URL as
+//!     `{url}`." A parent that does not resolve → P + the resolve error + suffix. If `asset.parent` is
+//!     absent or blank and `state.assets` contains exactly one asset whose locator parses as an
+//!     absolute URL with a host, that asset is inferred as `parent` (unless the joined locator
+//!     canonicalizes to that asset itself) and joined the same way. Note: "In L, `parent` was inferred
+//!     as `{id}` and the path `{path}` was joined to its URL as `{url}`."
 //!
 //! ### Refusals after normalization
 //!
@@ -506,9 +523,7 @@ fn read_one(
             wrap(&mut m, "relation", &["from", "to", "kind", "cost", "evidence", "expires_ms"], &l, &mut notes);
         }
         "condition_unlock" | "blocked_on" => {
-            if let Some(given) = m.get("conditions").and_then(bad_condition) {
-                return Err(refuse(&p, &condition_refusal(&given, caller)));
-            }
+            normalize_conditions_action(&mut m, action, &l, &p, caller, &mut notes)?;
         }
         "hypothesis_open" => {
             attach = open(&mut m, &l, &p, in_batch, &mut notes)?;
@@ -521,17 +536,13 @@ fn read_one(
         }
         "hypothesis_evidence" | "hypothesis_verdict" => {
             rename_id(&mut m, &l, &mut notes);
-            for key in ["evidence", "counterevidence"] {
-                if !m.contains_key(key) {
-                    m.insert(key.into(), Value::Array(Vec::new()));
-                }
-            }
             if action == "hypothesis_verdict" {
                 verdict(&mut m, &l, &mut notes);
             }
         }
         _ => {}
     }
+    default_omitted_evidence(&mut m, action);
     m.insert("action".into(), Value::String(action.to_string()));
     let op = decode(Value::Object(m), action, loc)?;
     let Some((evidence, counterevidence)) = attach else { return Ok((op, notes)) };
@@ -582,6 +593,163 @@ fn principal(m: &mut Map<String, Value>, key: &str, l: &str, notes: &mut Vec<Str
             return;
         }
     }
+}
+
+fn ensure_array(m: &mut Map<String, Value>, key: &str) {
+    if !m.contains_key(key) {
+        m.insert(key.into(), Value::Array(Vec::new()));
+    }
+}
+
+/// Default omitted `evidence` and `counterevidence` to `[]` across all actions/wrappers that take them.
+fn default_omitted_evidence(m: &mut Map<String, Value>, action: &str) {
+    match action {
+        "asset_upsert" => {
+            if let Some(Value::Object(w)) = m.get_mut("asset") {
+                ensure_array(w, "evidence");
+            }
+        }
+        "credential_add" => {
+            if let Some(Value::Object(w)) = m.get_mut("credential") {
+                ensure_array(w, "evidence");
+            }
+        }
+        "foothold_add" => {
+            if let Some(Value::Object(w)) = m.get_mut("foothold") {
+                ensure_array(w, "evidence");
+            }
+        }
+        "relation_add" => {
+            if let Some(Value::Object(w)) = m.get_mut("relation") {
+                ensure_array(w, "evidence");
+            }
+        }
+        "condition_unlock" | "fact_assert" => ensure_array(m, "evidence"),
+        "coverage_set" => {
+            if let Some(Value::Object(d)) = m.get_mut("disposition") {
+                if d.get("status").and_then(Value::as_str) == Some("tested") {
+                    ensure_array(d, "evidence");
+                }
+            }
+        }
+        "crash_record" => {
+            if let Some(Value::Object(a)) = m.get_mut("attempt") {
+                ensure_array(a, "evidence");
+            }
+        }
+        "hypothesis_evidence" | "hypothesis_verdict" => {
+            ensure_array(m, "evidence");
+            ensure_array(m, "counterevidence");
+        }
+        _ => {}
+    }
+}
+
+/// Adopt `val` as `conditions` when it is an array or single condition object; otherwise check it with R2.
+fn adopt_conditions(
+    m: &mut Map<String, Value>,
+    key: &str,
+    val: Value,
+    l: &str,
+    p: &str,
+    caller: &Caller<'_>,
+    notes: &mut Vec<String>,
+) -> Result<(), String> {
+    match val {
+        Value::Array(_) => {
+            m.insert("conditions".into(), val);
+            notes.push(format!("In {l}, `{key}` was read as `conditions`."));
+        }
+        Value::Object(_) => {
+            m.insert("conditions".into(), Value::Array(vec![val]));
+            notes.push(format!("In {l}, `{key}` was read as `conditions`."));
+        }
+        other => {
+            if let Some(given) = bad_condition(&Value::Array(vec![other])) {
+                return Err(refuse(p, &condition_refusal(&given, caller)));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// N6d and R2 for `condition_unlock` and `blocked_on`.
+fn normalize_conditions_action(
+    m: &mut Map<String, Value>,
+    action: &str,
+    l: &str,
+    p: &str,
+    caller: &Caller<'_>,
+    notes: &mut Vec<String>,
+) -> Result<(), String> {
+    if action == "blocked_on" {
+        if !m.contains_key("target") {
+            let mut candidates: Vec<&str> = ["asset", "endpoint", "service", "claim", "dead_end", "id"]
+                .into_iter()
+                .filter(|k| m.contains_key(*k))
+                .collect();
+            if m.contains_key("conditions") && m.get("blocked").is_some_and(Value::is_string) {
+                candidates.push("blocked");
+            }
+            if candidates.len() == 1 {
+                let key = candidates[0];
+                if let Some(val) = m.remove(key) {
+                    m.insert("target".into(), val);
+                    notes.push(format!("In {l}, `{key}` was read as `target`."));
+                }
+            }
+        }
+        if !m.contains_key("conditions") {
+            let has_cond = m.contains_key("condition");
+            let has_blocked = m.contains_key("blocked");
+            match (has_cond, has_blocked) {
+                (true, false) => {
+                    if let Some(val) = m.remove("condition") {
+                        adopt_conditions(m, "condition", val, l, p, caller, notes)?;
+                    }
+                }
+                (false, true) => {
+                    if let Some(val) = m.remove("blocked") {
+                        adopt_conditions(m, "blocked", val, l, p, caller, notes)?;
+                    }
+                }
+                (false, false) => {
+                    if let Some(reason) = m.get("reason") {
+                        let check = if reason.is_array() { reason.clone() } else { Value::Array(vec![reason.clone()]) };
+                        if let Some(given) = bad_condition(&check) {
+                            return Err(refuse(p, &condition_refusal(&given, caller)));
+                        }
+                    }
+                }
+                (true, true) => {}
+            }
+        }
+    } else if !m.contains_key("conditions") {
+        let candidates: Vec<&str> =
+            ["condition", "unlocked", "unlocks"].into_iter().filter(|k| m.contains_key(*k)).collect();
+        if candidates.len() == 1 {
+            let key = candidates[0];
+            if let Some(val) = m.remove(key) {
+                adopt_conditions(m, key, val, l, p, caller, notes)?;
+            }
+        }
+    }
+    if m.get("conditions").is_some_and(Value::is_object) {
+        if let Some(obj) = m.remove("conditions") {
+            m.insert("conditions".into(), Value::Array(vec![obj]));
+            notes.push(format!("In {l}, `conditions` was wrapped in an array."));
+        }
+    }
+    if let Some(given) = m.get("conditions").and_then(bad_condition) {
+        return Err(refuse(p, &condition_refusal(&given, caller)));
+    }
+    if action == "blocked_on" && m.contains_key("conditions") && m.get("reason").is_some_and(Value::is_string) {
+        m.remove("reason");
+        notes.push(format!(
+            "In {l}, `reason` was not recorded: blocked_on records only `target` and typed `conditions`."
+        ));
+    }
+    Ok(())
 }
 
 /// R2 for the `unlocks` of a credential or foothold.
@@ -857,6 +1025,18 @@ fn has_scheme(s: &str) -> bool {
     }
 }
 
+/// Join `path` to `base` only when `base` has a host and joining preserves scheme, host, and port.
+fn join_same_origin(base: &url::Url, path: &str) -> Option<url::Url> {
+    if !base.has_host() {
+        return None;
+    }
+    let joined = base.join(path).ok()?;
+    (base.scheme() == joined.scheme()
+        && base.host() == joined.host()
+        && base.port_or_known_default() == joined.port_or_known_default())
+    .then_some(joined)
+}
+
 /// N7 and R5/R6 for the locator of an asset_upsert's `asset`.
 fn locator(
     m: &mut Map<String, Value>,
@@ -914,25 +1094,59 @@ fn locator(
                 }
             }
             if loc.starts_with('/') && !loc.starts_with("//") {
-                let parent = asset.get("parent").and_then(Value::as_str);
-                if let Some(parent) = parent {
-                    let id = state.resolve(parent).map_err(|e| refuse(p, &e))?;
-                    let base = state.assets.get(&id).and_then(|a| url::Url::parse(&a.locator).ok());
-                    let joined = base.and_then(|b| b.join(&loc).ok().map(|j| (b, j)));
-                    let same = |b: &url::Url, j: &url::Url| {
-                        b.has_host()
-                            && b.scheme() == j.scheme()
-                            && b.host() == j.host()
-                            && b.port_or_known_default() == j.port_or_known_default()
-                    };
-                    if let Some(j) = joined.filter(|(b, j)| same(b, j)).map(|(_, j)| j) {
-                        notes.push(format!(
-                            "In {l}, the path `{}` was joined to its parent's URL as `{}`.",
-                            cut(&loc, QUOTE),
-                            cut(j.as_str(), QUOTE)
-                        ));
-                        loc = j.to_string();
+                let explicit_parent = match asset.get("parent") {
+                    Some(Value::String(parent)) if !parent.trim().is_empty() => Some(Some(parent.as_str())),
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(_)) => None,
+                    Some(_) => Some(None),
+                };
+                match explicit_parent {
+                    Some(Some(parent)) => {
+                        let id = state.resolve(parent).map_err(|e| refuse(p, &e))?;
+                        let base = state.assets.get(&id).and_then(|a| url::Url::parse(&a.locator).ok());
+                        if let Some(j) = base.as_ref().and_then(|b| join_same_origin(b, &loc)) {
+                            notes.push(format!(
+                                "In {l}, the path `{}` was joined to its parent's URL as `{}`.",
+                                cut(&loc, QUOTE),
+                                cut(j.as_str(), QUOTE)
+                            ));
+                            loc = j.to_string();
+                        }
                     }
+                    None => {
+                        let mut url_assets = state.assets.values().filter_map(|a| {
+                            url::Url::parse(&a.locator).ok().filter(|u| u.has_host()).map(|u| (a.id.clone(), u))
+                        });
+                        if let Some((sole_id, base)) = url_assets.next().filter(|_| url_assets.next().is_none()) {
+                            if let Some(j) = join_same_origin(&base, &loc) {
+                                let kind_enum =
+                                    if kind == "service" { AssetKind::Service } else { AssetKind::Endpoint };
+                                let joined_id = canonical_locator(kind_enum, j.as_str())
+                                    .ok()
+                                    .map(|cl| stable_id("as", &[&format!("{kind_enum:?}"), &cl]));
+                                if joined_id.as_deref() == Some(sole_id.as_str()) {
+                                    asset.remove("parent");
+                                    notes.push(format!(
+                                        "In {l}, the path `{}` was joined to `{}` as `{}`.",
+                                        cut(&loc, QUOTE),
+                                        cut(&sole_id, QUOTE),
+                                        cut(j.as_str(), QUOTE)
+                                    ));
+                                } else {
+                                    asset.insert("parent".into(), Value::String(sole_id.clone()));
+                                    notes.push(format!(
+                                        "In {l}, `parent` was inferred as `{}` and the path `{}` was joined to its \
+                                         URL as `{}`.",
+                                        cut(&sole_id, QUOTE),
+                                        cut(&loc, QUOTE),
+                                        cut(j.as_str(), QUOTE)
+                                    ));
+                                }
+                                loc = j.to_string();
+                            }
+                        }
+                    }
+                    Some(None) => {}
                 }
             }
             if loc.starts_with('/') {
@@ -1549,8 +1763,17 @@ mod tests {
         // A parent that does not resolve names the resolve error.
         let e = err(with_parent("/x", "as-nonexistent"));
         assert_eq!(e, "No security record matches `as-nonexistent`; query the current records before choosing an ID. Nothing was recorded.");
-        // In a batch the refusal carries the position.
-        let e = err(go_in(&state, Standing::Lead, &[], batch(vec![asset("host", "h"), asset("endpoint", "/x")])));
+        // When exactly one URL asset exists and parent is absent, it inherits the sole service parent.
+        let r = ok(go_in(&state, Standing::Lead, &[], batch(vec![asset("host", "h"), asset("endpoint", "/x")])));
+        assert_eq!(element(&r, 1)["asset"]["locator"], "http://10.0.0.5:8080/x");
+        assert_eq!(element(&r, 1)["asset"]["parent"], id);
+        // In a batch with no service parent to inherit, the refusal carries the position.
+        let e = err(go_in(
+            &SecurityState::default(),
+            Standing::Lead,
+            &[],
+            batch(vec![asset("host", "h"), asset("endpoint", "/x")]),
+        ));
         assert!(e.starts_with("Operation 2 of 2 in the batch (asset_upsert): An endpoint locator"), "{e}");
     }
 
@@ -1816,6 +2039,169 @@ mod tests {
             "conditions": [{"kind": "container_running", "value": "x"}]})))
         .contains("`container_running`"));
         assert!(err(lead(json!({"action": "claim_update", "id": "c1"}))).contains("not a security_record action"));
+    }
+
+    #[test]
+    fn omitted_evidence_and_counterevidence_default_to_empty_arrays() {
+        let cases = [
+            json!({"action": "asset_upsert", "asset": {"kind": "host", "locator": "10.0.0.5"}}),
+            json!({"action": "credential_add", "credential": {"asset": "as-1", "principal": "root", "secret_handle": "out:abcdef01"}}),
+            json!({"action": "foothold_add", "foothold": {"asset": "as-1", "principal": "www", "access": "shell"}}),
+            json!({"action": "relation_add", "relation": {"from": "as-1", "to": "as-2", "kind": "reaches", "cost": 1}}),
+            json!({"action": "condition_unlock", "conditions": [{"kind": "cred", "value": "as-1"}]}),
+            json!({"action": "coverage_set", "asset": "as-1", "disposition": {"status": "tested"}}),
+            json!({"action": "crash_record", "signature": {"sanitizer": "asan", "frames": [{"function": "f", "file": "a.c"}], "outcome": "crash"}, "attempt": {"vector": "v", "summary": "s"}}),
+            json!({"action": "fact_assert", "fact": {"predicate": "seen", "args": ["a"]}}),
+            json!({"action": "hypothesis_evidence", "id": "hy-1"}),
+        ];
+        for op in cases {
+            let r = ok(lead(op.clone()));
+            assert!(r.notes.is_empty(), "{op}: {:?}", r.notes);
+        }
+        // Deferred coverage does not get an invalid `evidence` field injected.
+        let r = ok(lead(
+            json!({"action": "coverage_set", "asset": "as-1", "disposition": {"status": "deferred", "reason": "oob"}}),
+        ));
+        assert!(matches!(r.op, SecurityOp::CoverageSet { .. }));
+        // Judge verdict with omitted evidence and counterevidence decodes quietly.
+        let r = ok(go(
+            Standing::Judge,
+            &[],
+            json!({"action": "hypothesis_verdict", "id": "hy-1", "status": "supported", "note": "checked"}),
+        ));
+        assert_eq!(json_of(&r.op)["evidence"], json!([]));
+        assert_eq!(json_of(&r.op)["counterevidence"], json!([]));
+    }
+
+    #[test]
+    fn n7d_sole_service_path_inheritance_infers_parent_only_when_unique() {
+        let (mut state, service_id) = state_with("http://10.0.0.5:8080/app/", AssetKind::Service);
+        // Adding a host does not introduce ambiguity since hosts do not parse as URLs.
+        let host_id = stable_id("as", &["Host", "10.0.0.5"]);
+        state.assets.insert(
+            host_id.clone(),
+            Asset {
+                id: host_id,
+                kind: AssetKind::Host,
+                locator: "10.0.0.5".into(),
+                evidence: vec!["e1".into()],
+                mandatory: true,
+                parent: None,
+                coverage: CoverageDisposition::Untested,
+                n: 2,
+            },
+        );
+        // Absent and blank parents infer the sole service asset.
+        for op in [
+            json!({"action": "asset_upsert", "asset": {"kind": "endpoint", "locator": "/login", "evidence": ["e1"]}}),
+            json!({"action": "asset_upsert", "asset": {"kind": "service", "locator": "GET /api/v1", "evidence": ["e1"], "parent": "  "}}),
+        ] {
+            let r = ok(go_in(&state, Standing::Lead, &[], op));
+            let v = json_of(&r.op);
+            assert_eq!(v["asset"]["parent"], service_id);
+            assert!(v["asset"]["locator"].as_str().unwrap().starts_with("http://10.0.0.5:8080/"));
+            assert!(r.notes.iter().any(|n| n.contains("`parent` was inferred as")), "{:?}", r.notes);
+        }
+        // Joining `/` to the sole service itself does not assign itself as parent.
+        let r = ok(go_in(
+            &state,
+            Standing::Lead,
+            &[],
+            json!({"action": "asset_upsert", "asset": {"kind": "service", "locator": "/app/", "evidence": ["e1"], "parent": ""}}),
+        ));
+        let v = json_of(&r.op);
+        assert_eq!(v["asset"]["locator"], "http://10.0.0.5:8080/app/");
+        assert_eq!(v["asset"]["parent"], Value::Null);
+        // Traversal out of origin still hits R6.
+        let e = err(go_in(
+            &state,
+            Standing::Lead,
+            &[],
+            json!({"action": "asset_upsert", "asset": {"kind": "endpoint", "locator": "/\\evil.test/x", "evidence": ["e1"]}}),
+        ));
+        assert!(e.starts_with("An endpoint locator is one absolute URL"), "{e}");
+        // Two URL assets -> ambiguous, keeps R6 error intact.
+        let second_id = stable_id("as", &["Service", "http://10.0.0.5:9090/"]);
+        state.assets.insert(
+            second_id.clone(),
+            Asset {
+                id: second_id,
+                kind: AssetKind::Service,
+                locator: "http://10.0.0.5:9090/".into(),
+                evidence: vec!["e1".into()],
+                mandatory: true,
+                parent: None,
+                coverage: CoverageDisposition::Untested,
+                n: 3,
+            },
+        );
+        let e = err(go_in(&state, Standing::Lead, &[], asset("endpoint", "/login")));
+        assert!(e.starts_with("An endpoint locator is one absolute URL"), "{e}");
+    }
+
+    #[test]
+    fn blocked_on_and_condition_unlock_synonyms_preserve_r2() {
+        for key in ["asset", "endpoint", "service", "claim", "dead_end", "id"] {
+            let r = ok(lead(json!({
+                "action": "blocked_on",
+                key: "c1",
+                "conditions": [{"kind": "cred", "value": "as-1"}]
+            })));
+            assert_eq!(json_of(&r.op)["target"], "c1");
+            assert_eq!(r.notes, vec![format!("In the operation, `{key}` was read as `target`.")]);
+        }
+        // `blocked` as target when `conditions` is present.
+        let r = ok(lead(json!({
+            "action": "blocked_on",
+            "blocked": "c1",
+            "conditions": [{"kind": "auth", "value": "as-1"}]
+        })));
+        assert_eq!(json_of(&r.op)["target"], "c1");
+        assert_eq!(r.notes, vec!["In the operation, `blocked` was read as `target`."]);
+        // `blocked` as conditions array, and `condition` singular / single object.
+        let r = ok(lead(json!({
+            "action": "blocked_on",
+            "target": "c1",
+            "blocked": [{"kind": "cred", "value": "as-1"}]
+        })));
+        assert_eq!(json_of(&r.op)["conditions"][0]["kind"], "cred");
+        let r = ok(lead(json!({
+            "action": "blocked_on",
+            "target": "c1",
+            "condition": {"kind": "key", "value": "k1"}
+        })));
+        assert_eq!(json_of(&r.op)["conditions"][0]["kind"], "key");
+        let r = ok(lead(json!({
+            "action": "blocked_on",
+            "target": "c1",
+            "conditions": {"kind": "role", "value": "admin"},
+            "reason": "needs admin role"
+        })));
+        assert_eq!(json_of(&r.op)["conditions"][0]["kind"], "role");
+        assert_eq!(r.notes.len(), 2);
+        // `condition_unlock` aliases.
+        let r = ok(lead(json!({
+            "action": "condition_unlock",
+            "unlocked": {"kind": "leak", "value": "libc-base"},
+            "evidence": ["e1"]
+        })));
+        assert_eq!(json_of(&r.op)["conditions"][0]["kind"], "leak");
+        let r = ok(lead(json!({
+            "action": "condition_unlock",
+            "unlocks": [{"kind": "offset", "value": "0x10"}]
+        })));
+        assert_eq!(json_of(&r.op)["evidence"], json!([]));
+        // R2 is never relaxed: prose `reason` or `blocked` when `conditions` is absent still refuses via R2.
+        for op in [
+            json!({"action": "blocked_on", "target": "c1", "reason": "Target returns 502"}),
+            json!({"action": "blocked_on", "target": "c1", "blocked": "Target returns 502"}),
+            json!({"action": "blocked_on", "target": "c1", "blocked": [{"kind": "container_running", "value": "x"}]}),
+            json!({"action": "condition_unlock", "condition": "admin login works", "evidence": ["e1"]}),
+        ] {
+            let e = err(lead(op.clone()));
+            assert!(e.starts_with("A condition is a typed prerequisite"), "{op}: {e}");
+        }
+        assert!(err(lead(json!({"action": "blocked_on", "target": "c1", "reason": "502"}))).contains("report_blocker"));
     }
 
     /// Replays logged operations (a JSON array of {"standing", "tools", "operation"}) named by the
