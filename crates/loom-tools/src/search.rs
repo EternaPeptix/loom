@@ -592,6 +592,7 @@ impl Tool for Grep {
                 params::opt("files_only", "boolean", "Show only the paths of files with matches, with a count each (default false)."),
                 params::opt("hidden", "boolean", "Include hidden files and directories (default false)."),
                 params::opt("no_ignore", "boolean", "Include files that .gitignore excludes (default false)."),
+                params::opt("max", "integer", "Maximum match lines to show.").min(1),
             ],
         )
     }
@@ -601,6 +602,9 @@ impl Tool for Grep {
     }
 
     async fn run(&self, ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
+        if let Some(p) = text(args, "path").filter(|p| p.starts_with("out:")) {
+            return crate::outview::grep_handle(ctx, p, args).await;
+        }
         let pattern = text(args, "pattern").unwrap_or_default().to_string();
         let re = match RegexBuilder::new(&pattern).case_insensitive(flag(args, "ignore_case")).build() {
             Ok(r) => r,
@@ -622,6 +626,12 @@ impl Tool for Grep {
             Err(out) => return *out,
         };
         let requested = args.get("context").and_then(Value::as_u64).unwrap_or(0);
+        let max_results = args
+            .get("max")
+            .and_then(Value::as_u64)
+            .and_then(|n| usize::try_from(n).ok())
+            .map(|m| m.max(1).min(ctx.cfg.search_max_results))
+            .unwrap_or(ctx.cfg.search_max_results);
         let opts = GrepOpts {
             re,
             pattern,
@@ -631,7 +641,7 @@ impl Tool for Grep {
             files_only: flag(args, "files_only"),
             hidden: flag(args, "hidden"),
             no_ignore: flag(args, "no_ignore"),
-            bound: Bound::new(ctx.cfg.search_max_results),
+            bound: Bound::new(max_results),
         };
         match tokio::task::spawn_blocking(move || grep_job(&scan, &opts, HintLimits::STANDARD)).await {
             Ok(out) => out,
@@ -1561,5 +1571,28 @@ mod tests {
             );
         }
         assert!(matches!(read_text(&ws.join("d/f"), MAX_GREP_FILE_BYTES, &e.ctx.sandbox), Read::Text(_)));
+    }
+
+    #[tokio::test]
+    async fn grep_honors_max_cap() {
+        let e = env();
+        put(&e, "a.txt", "hit 1\nhit 2\nhit 3\nhit 4\nhit 5\n");
+        let r = e.call("grep", json!({"pattern": "hit", "max": 2})).await;
+        assert_eq!(r.status, crate::ToolStatus::Ok, "{}", r.text);
+        assert!(r.text.contains("hit 1") && r.text.contains("hit 2"), "{}", r.text);
+        assert!(!r.text.contains("hit 3"), "{}", r.text);
+        assert!(r.text.contains("Showing 2 of 5 matching lines found"), "{}", r.text);
+    }
+
+    #[tokio::test]
+    async fn grep_delegates_out_handle() {
+        let e = env();
+        let stored = e.ctx.blobs.put_bytes(b"hit one\nskip\nhit two\nhit three\n").unwrap();
+        let r = e.call("grep", json!({"pattern": "hit", "path": stored.handle(), "max": 2})).await;
+        assert_eq!(r.status, crate::ToolStatus::Ok, "{}", r.text);
+        assert!(r.text.contains("1: hit one") && r.text.contains("3: hit two"), "{}", r.text);
+        assert!(!r.text.contains("4: hit three"), "{}", r.text);
+        assert!(r.text.contains("2 of 3 matching lines"), "{}", r.text);
+        assert!(r.text.contains("narrow the pattern or read ranges with out_read"), "{}", r.text);
     }
 }

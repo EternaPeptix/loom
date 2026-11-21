@@ -103,6 +103,15 @@ use tokio_util::sync::CancellationToken;
 /// Runs the script in `$0` and then appends its exit status, as a number, to stderr (the exit file).
 const WRAPPER: &str = "/bin/bash -c \"$0\" 2>&1; echo $? >&2";
 
+fn seatbelt_wrapper(sandbox: &crate::sandbox::Sandbox, script: &str) -> String {
+    if sandbox.mode() == loom_core::config::SandboxMode::Seatbelt && script.contains("<<") {
+        if let Some(modern) = crate::sandbox::Sandbox::modern_bash() {
+            return format!("{modern} -c \"$0\" 2>&1; echo $? >&2");
+        }
+    }
+    WRAPPER.to_string()
+}
+
 /// Runs the launcher's program and arguments (`$@`, an inert owner marker is `$0`) and then appends the
 /// exit status, as `WRAPPER` does. The arguments are never parsed by this shell.
 const LAUNCH_WRAPPER: &str = "\"$@\" 2>&1; echo $? >&2";
@@ -714,9 +723,17 @@ fn spawn_with(how: How<'_>, spec: &Spawn) -> io::Result<Running> {
         marker.write_all(owner.as_bytes())?;
         marker.sync_data()?;
     }
+    let extra_tmpdir = match &how {
+        How::Sandboxed(sandbox) if sandbox.mode() == loom_core::config::SandboxMode::Seatbelt => {
+            let _ = std::fs::create_dir_all(sandbox.tmp_dir());
+            (!spec.env.iter().any(|(k, _)| k == "TMPDIR")).then(|| sandbox.tmp_dir().to_path_buf())
+        }
+        _ => None,
+    };
     let (program, args, remote_stop) = match how {
         How::Sandboxed(sandbox) => {
-            let (program, mut args) = sandbox.command(WRAPPER);
+            let wrapper = seatbelt_wrapper(sandbox, &spec.script);
+            let (program, mut args) = sandbox.command(&wrapper);
             args.push(spec.script.clone());
             args.push(owner.clone());
             (program, args, None)
@@ -728,15 +745,11 @@ fn spawn_with(how: How<'_>, spec: &Spawn) -> io::Result<Running> {
         }
     };
     let mut cmd = tokio::process::Command::new(program);
-    cmd.args(args)
-        .env_clear()
-        .envs(&spec.env)
-        .current_dir(&spec.cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(out))
-        .stderr(Stdio::from(exit))
-        .process_group(0)
-        .kill_on_drop(false);
+    cmd.args(args).env_clear().envs(&spec.env).current_dir(&spec.cwd);
+    if let Some(tmpdir) = extra_tmpdir {
+        cmd.env("TMPDIR", tmpdir);
+    }
+    cmd.stdin(Stdio::null()).stdout(Stdio::from(out)).stderr(Stdio::from(exit)).process_group(0).kill_on_drop(false);
     let child = match cmd.spawn() {
         Ok(child) => child,
         Err(error) => {

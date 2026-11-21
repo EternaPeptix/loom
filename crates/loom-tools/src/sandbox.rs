@@ -1766,6 +1766,7 @@ impl Sandbox {
         {
             sbpl(p)?;
         }
+        let _ = std::fs::create_dir_all(&tmp_dir);
         let analysis_dir = tmp_dir.parent().map(|p| p.join("analysis")).unwrap_or_default();
         Ok(Sandbox {
             mode: cfg.mode,
@@ -2135,16 +2136,38 @@ impl Sandbox {
         holders_for(&self.writable, &self.protected, &self.unreadable, &self.credentials, &self.tmp_dir)
     }
 
+    #[cfg(target_os = "macos")]
+    pub(crate) fn modern_bash() -> Option<&'static str> {
+        use std::os::unix::fs::PermissionsExt;
+        for candidate in ["/opt/homebrew/bin/bash", "/usr/local/bin/bash"] {
+            if let Ok(meta) = std::fs::metadata(candidate) {
+                if meta.is_file() && (meta.permissions().mode() & 0o111 != 0) {
+                    return Some(candidate);
+                }
+            }
+        }
+        None
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) fn modern_bash() -> Option<&'static str> {
+        None
+    }
+
     pub fn command(&self, script: &str) -> (String, Vec<String>) {
         if self.mode == SandboxMode::Bubblewrap {
             return linux::command(self, script);
         }
+        let bash = if self.mode == SandboxMode::Seatbelt && script.contains("<<") {
+            Self::modern_bash().unwrap_or("/bin/bash")
+        } else {
+            "/bin/bash"
+        };
         match self.profile() {
-            Some(profile) => (
-                SANDBOX_EXEC.to_string(),
-                vec!["-p".into(), profile, "/bin/bash".into(), "-c".into(), script.to_string()],
-            ),
-            None => ("/bin/bash".to_string(), vec!["-c".into(), script.to_string()]),
+            Some(profile) => {
+                (SANDBOX_EXEC.to_string(), vec!["-p".into(), profile, bash.into(), "-c".into(), script.to_string()])
+            }
+            None => (bash.to_string(), vec!["-c".into(), script.to_string()]),
         }
     }
 
@@ -6486,5 +6509,35 @@ mod tests {
         // Also ensure check_read refuses actor workspace and its `.loom`.
         assert!(replay.check_read(&f.ws).is_err());
         assert!(replay.check_read(&f.ws.join(".loom/oracle-secrets")).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_heredoc_works_in_writable_and_read_only_sandboxes() {
+        let f = fx_prod();
+        let writable = build(&f, &cfg(SandboxMode::Seatbelt), None);
+        // Non-heredoc commands must keep using `/bin/bash` so shape guarantees stay exact.
+        let (_, plain_args) = writable.command("echo hi");
+        assert_eq!(plain_args.get(2).map(String::as_str), Some("/bin/bash"));
+
+        if Sandbox::modern_bash().is_none() {
+            return;
+        }
+        let ro_cfg = SandboxCfg { protected_paths: vec![f.ws.display().to_string()], ..cfg(SandboxMode::Seatbelt) };
+        let read_only = build(&f, &ro_cfg, None);
+        let small = "cat <<'EOF'\nsmall-heredoc-ok\nEOF";
+        let big_body = "x".repeat(96 * 1024);
+        let large = format!("wc -c <<'EOF'\n{big_body}\nEOF");
+
+        for (label, sb) in [("writable", &writable), ("read-only", &read_only)] {
+            let (ok_small, out_small) = run(sb, &f.ws, small);
+            assert!(ok_small, "{label} small: {out_small}");
+            assert_eq!(out_small.trim(), "small-heredoc-ok", "{label}");
+
+            let (ok_large, out_large) = run(sb, &f.ws, &large);
+            assert!(ok_large, "{label} large: {out_large}");
+            let count: usize = out_large.trim().parse().unwrap_or(0);
+            assert_eq!(count, 96 * 1024 + 1, "{label}: {out_large}");
+        }
     }
 }

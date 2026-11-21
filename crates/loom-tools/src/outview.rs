@@ -94,6 +94,112 @@ fn shorten_lines(excerpt: &str) -> String {
     out
 }
 
+/// Read lines of a stored output by handle (reused by `out_read` and `read` on `out:` paths).
+pub async fn read_handle(ctx: &ToolCtx, handle: &str, args: &Map<String, Value>) -> ToolOutput {
+    let id = match outputs::open(ctx, handle).await {
+        Ok(id) => id,
+        Err(e) => return ToolOutput::error(e.sentence(handle)),
+    };
+    let total = match ctx.blobs.meta(&id) {
+        Ok(m) => m.lines,
+        Err(e) => {
+            return ToolOutput::error(format!(
+                "The output `{handle}` could not be read ({e}). Check the handle and try again."
+            ))
+        }
+    };
+    let (first, last) = match view::window(uint(args, "start"), uint(args, "end"), total, ctx.cfg.read_max_lines) {
+        Ok(Some(w)) => w,
+        Ok(None) => return ToolOutput::ok("ok", Body::View { of: id, text: "(no output)".into(), shown: Vec::new() }),
+        Err(e) => return ToolOutput::error(e),
+    };
+    let numbered = match view::numbered(&ctx.blobs, &id, first, last, MAX_LINE_CHARS, ctx.view_chars) {
+        Ok(r) => r,
+        Err(e) => return ToolOutput::error(format!("The output `{handle}` could not be read ({e}). Try again.")),
+    };
+    let shown_last = numbered.last;
+    let mut out = ToolOutput::ok("ok", Body::View { of: id, text: numbered.text, shown: vec![(first, shown_last)] })
+        .with_more(view::range_fact(first, shown_last, total));
+    if shown_last < last {
+        out = out.with_more(view::ended_fact(shown_last));
+    }
+    if numbered.shortened > 0 {
+        out = out.with_more(format!("{} long lines shortened", numbered.shortened));
+    }
+    out
+}
+
+/// Search a stored output by handle for a regular expression (reused by `out_grep` and `grep` on `out:` paths).
+pub async fn grep_handle(ctx: &ToolCtx, handle: &str, args: &Map<String, Value>) -> ToolOutput {
+    let id = match outputs::open(ctx, handle).await {
+        Ok(id) => id,
+        Err(e) => return ToolOutput::error(e.sentence(handle)),
+    };
+    let pattern = string(args, "pattern");
+    let ignore_case = args.get("ignore_case").and_then(Value::as_bool).unwrap_or(false);
+    let full = if ignore_case { format!("(?i){pattern}") } else { pattern.to_string() };
+    let re = match Regex::new(&full) {
+        Ok(re) => re,
+        Err(e) => {
+            return ToolOutput::error(format!(
+                "The pattern `{pattern}` is not a valid regular expression: {e}\nFix it (Rust/RE2 syntax; escape literal special characters with a backslash) and call `out_grep` again."
+            ))
+        }
+    };
+    let context = uint(args, "context").unwrap_or(DEFAULT_CONTEXT).min(MAX_CONTEXT);
+    let max_matches = uint(args, "max")
+        .and_then(|n| usize::try_from(n).ok())
+        .map(|n| n.max(1).min(ctx.cfg.search_max_results))
+        .unwrap_or(ctx.cfg.search_max_results);
+    let total_lines = match ctx.blobs.meta(&id) {
+        Ok(m) => m.lines,
+        Err(e) => {
+            return ToolOutput::error(format!(
+                "The output `{handle}` could not be read ({e}). Check the handle and try again."
+            ))
+        }
+    };
+    let found = match ctx.blobs.grep(&id, &re, context as usize, max_matches) {
+        Ok(r) => r,
+        Err(e) => return ToolOutput::error(format!("The output `{handle}` could not be searched ({e}). Try again.")),
+    };
+    if found.matches.is_empty() {
+        return ToolOutput::ok("no match", Body::View { of: id, text: "(no line matches)".into(), shown: Vec::new() });
+    }
+    let ranges: Vec<(u64, u64)> = found
+        .matches
+        .iter()
+        .map(|m| (m.line.saturating_sub(context).max(1), m.line.saturating_add(context).min(total_lines.max(m.line))))
+        .collect();
+    let groups: Vec<String> = found.matches.iter().map(|m| shorten_lines(&m.excerpt)).collect();
+    // Groups are added in order while the body, separators included, stays within the view size; the
+    // first is always added.
+    let mut included = 0usize;
+    let mut used = 0usize;
+    for g in &groups {
+        let need = g.chars().count().saturating_add(if included > 0 { GROUP_SEP.chars().count() } else { 0 });
+        if included > 0 && used.saturating_add(need) > ctx.view_chars {
+            break;
+        }
+        used = used.saturating_add(need);
+        included += 1;
+    }
+    let text = groups.iter().take(included).cloned().collect::<Vec<_>>().join(GROUP_SEP);
+    let shown_ranges = merge(ranges.into_iter().take(included).collect());
+    let shown_count = included as u64;
+    let left_out = groups.len().saturating_sub(included);
+    let mut out = ToolOutput::ok("ok", Body::View { of: id, text, shown: shown_ranges })
+        .with_more(format!("{shown_count} of {} matching lines", found.total_matches));
+    if left_out > 0 {
+        out = out.with_more(format!(
+            "{left_out} more matches not shown to stay within the size one result may show: narrow the pattern, lower context, or read ranges with out_read"
+        ));
+    } else if found.total_matches > shown_count {
+        out = out.with_more("narrow the pattern or read ranges with out_read");
+    }
+    out
+}
+
 #[async_trait]
 impl Tool for OutRead {
     fn spec(&self) -> ToolSpec {
@@ -114,41 +220,7 @@ impl Tool for OutRead {
     }
 
     async fn run(&self, ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
-        let handle = string(args, "handle");
-        let id = match outputs::open(ctx, handle).await {
-            Ok(id) => id,
-            Err(e) => return ToolOutput::error(e.sentence(handle)),
-        };
-        let total = match ctx.blobs.meta(&id) {
-            Ok(m) => m.lines,
-            Err(e) => {
-                return ToolOutput::error(format!(
-                    "The output `{handle}` could not be read ({e}). Check the handle and try again."
-                ))
-            }
-        };
-        let (first, last) = match view::window(uint(args, "start"), uint(args, "end"), total, ctx.cfg.read_max_lines) {
-            Ok(Some(w)) => w,
-            Ok(None) => {
-                return ToolOutput::ok("ok", Body::View { of: id, text: "(no output)".into(), shown: Vec::new() })
-            }
-            Err(e) => return ToolOutput::error(e),
-        };
-        let numbered = match view::numbered(&ctx.blobs, &id, first, last, MAX_LINE_CHARS, ctx.view_chars) {
-            Ok(r) => r,
-            Err(e) => return ToolOutput::error(format!("The output `{handle}` could not be read ({e}). Try again.")),
-        };
-        let shown_last = numbered.last;
-        let mut out =
-            ToolOutput::ok("ok", Body::View { of: id, text: numbered.text, shown: vec![(first, shown_last)] })
-                .with_more(view::range_fact(first, shown_last, total));
-        if shown_last < last {
-            out = out.with_more(view::ended_fact(shown_last));
-        }
-        if numbered.shortened > 0 {
-            out = out.with_more(format!("{} long lines shortened", numbered.shortened));
-        }
-        out
+        read_handle(ctx, string(args, "handle"), args).await
     }
 }
 
@@ -164,6 +236,7 @@ impl Tool for OutGrep {
                 params::req("pattern", "string", "Regular expression (Rust/RE2 syntax), matched against single lines."),
                 params::opt("context", "integer", "Lines of context before and after each match (default 2).").min(0),
                 params::opt("ignore_case", "boolean", "Match case-insensitively (default false)."),
+                params::opt("max", "integer", "Maximum match lines to show.").min(1),
             ],
         )
     }
@@ -173,77 +246,7 @@ impl Tool for OutGrep {
     }
 
     async fn run(&self, ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
-        let handle = string(args, "handle");
-        let id = match outputs::open(ctx, handle).await {
-            Ok(id) => id,
-            Err(e) => return ToolOutput::error(e.sentence(handle)),
-        };
-        let pattern = string(args, "pattern");
-        let ignore_case = args.get("ignore_case").and_then(Value::as_bool).unwrap_or(false);
-        let full = if ignore_case { format!("(?i){pattern}") } else { pattern.to_string() };
-        let re = match Regex::new(&full) {
-            Ok(re) => re,
-            Err(e) => {
-                return ToolOutput::error(format!(
-                    "The pattern `{pattern}` is not a valid regular expression: {e}\nFix it (Rust/RE2 syntax; escape literal special characters with a backslash) and call `out_grep` again."
-                ))
-            }
-        };
-        let context = uint(args, "context").unwrap_or(DEFAULT_CONTEXT).min(MAX_CONTEXT);
-        let total_lines = match ctx.blobs.meta(&id) {
-            Ok(m) => m.lines,
-            Err(e) => {
-                return ToolOutput::error(format!(
-                    "The output `{handle}` could not be read ({e}). Check the handle and try again."
-                ))
-            }
-        };
-        let found = match ctx.blobs.grep(&id, &re, context as usize, ctx.cfg.search_max_results) {
-            Ok(r) => r,
-            Err(e) => {
-                return ToolOutput::error(format!("The output `{handle}` could not be searched ({e}). Try again."))
-            }
-        };
-        if found.matches.is_empty() {
-            return ToolOutput::ok(
-                "no match",
-                Body::View { of: id, text: "(no line matches)".into(), shown: Vec::new() },
-            );
-        }
-        let ranges: Vec<(u64, u64)> = found
-            .matches
-            .iter()
-            .map(|m| {
-                (m.line.saturating_sub(context).max(1), m.line.saturating_add(context).min(total_lines.max(m.line)))
-            })
-            .collect();
-        let groups: Vec<String> = found.matches.iter().map(|m| shorten_lines(&m.excerpt)).collect();
-        // Groups are added in order while the body, separators included, stays within the view size; the
-        // first is always added.
-        let mut included = 0usize;
-        let mut used = 0usize;
-        for g in &groups {
-            let need = g.chars().count().saturating_add(if included > 0 { GROUP_SEP.chars().count() } else { 0 });
-            if included > 0 && used.saturating_add(need) > ctx.view_chars {
-                break;
-            }
-            used = used.saturating_add(need);
-            included += 1;
-        }
-        let text = groups.iter().take(included).cloned().collect::<Vec<_>>().join(GROUP_SEP);
-        let shown_ranges = merge(ranges.into_iter().take(included).collect());
-        let shown_count = included as u64;
-        let left_out = groups.len().saturating_sub(included);
-        let mut out = ToolOutput::ok("ok", Body::View { of: id, text, shown: shown_ranges })
-            .with_more(format!("{shown_count} of {} matching lines", found.total_matches));
-        if left_out > 0 {
-            out = out.with_more(format!(
-                "{left_out} more matches not shown to stay within the size one result may show: narrow the pattern, lower context, or read ranges with out_read"
-            ));
-        } else if found.total_matches > shown_count {
-            out = out.with_more("narrow the pattern or read ranges with out_read");
-        }
-        out
+        grep_handle(ctx, string(args, "handle"), args).await
     }
 }
 
@@ -450,5 +453,17 @@ mod tests {
         assert!(r.text.contains("1 more matches not shown to stay within the size one result may show"), "{}", r.text);
         assert!(!r.text.contains("90: line 90"), "{}", r.text);
         assert_eq!(shown(&r), json!([[10, 10], [50, 50]]));
+    }
+
+    #[tokio::test]
+    async fn out_grep_honors_max_cap() {
+        let e = env();
+        let h = put(&e, "match 1\nmatch 2\nmatch 3\nmatch 4\nmatch 5\n");
+        let r = e.call("out_grep", json!({"handle": h, "pattern": "match", "context": 0, "max": 2})).await;
+        assert_eq!(r.status, crate::ToolStatus::Ok, "{}", r.text);
+        assert!(r.text.contains("1: match 1") && r.text.contains("2: match 2"), "{}", r.text);
+        assert!(!r.text.contains("3: match 3"), "{}", r.text);
+        assert!(r.text.contains("2 of 5 matching lines"), "{}", r.text);
+        assert!(r.text.contains("narrow the pattern or read ranges with out_read"), "{}", r.text);
     }
 }
