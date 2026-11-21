@@ -278,8 +278,8 @@ pub fn suite() -> Vec<Scenario> {
             name: "malformed_calls",
             plays: "begins with an argument the tool does not have, a tool that does not exist and a call cut short",
             lead: &[
-                Call("bash", r#"{"cmd": "cat numbers.txt"}"#),
-                Call("shell", r#"{"command": "cat numbers.txt"}"#),
+                Call("bash", r#"{"bogus": "cat numbers.txt"}"#),
+                Call("no_such_tool", r#"{"command": "cat numbers.txt"}"#),
                 Cut,
                 Run,
                 Claim,
@@ -800,7 +800,9 @@ mod tests {
         let o = played_named("gives_up").await;
         assert_eq!((o.end, o.solved, o.sessions), (TurnEndReason::Parked, false, 1));
         // One look, then four replies without a call: three nudged, the fourth parked.
-        assert_eq!(o.lead, card(5, None, 1, 0, (0, 0), 0, (0, 0), 0));
+        let mut expected = card(5, None, 1, 0, (0, 0), 0, (0, 0), 0);
+        expected.text_only_nudges = 3;
+        assert_eq!(o.lead, expected);
         assert_eq!(o.lead.verifier_accept_rate(), None);
         assert_eq!(o.mission, o.lead);
     }
@@ -818,7 +820,9 @@ mod tests {
         let o = played(&scenario).await;
         // The work was done, and nothing was delivered: solved by the outside check, not finished.
         assert_eq!((o.end, o.solved, o.sessions), (TurnEndReason::Parked, true, 1));
-        assert_eq!(o.lead, card(5, None, 1, 0, (0, 0), 0, (0, 0), 0));
+        let mut expected = card(5, None, 1, 0, (0, 0), 0, (0, 0), 0);
+        expected.text_only_nudges = 3;
+        assert_eq!(o.lead, expected);
     }
 
     /// Set in the child process that plays `concludes_on_a_scan`.

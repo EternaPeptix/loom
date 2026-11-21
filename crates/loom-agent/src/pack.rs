@@ -117,6 +117,10 @@ pub struct RoleDef {
     pub flag_regex: Option<String>,
     /// Copied from the pack's `solvable` key at load: the operator built this mission to be solved.
     pub solvable: bool,
+    /// Optional default shell routing for `bash` ("host" or "box").
+    pub default_shell: Option<String>,
+    /// Optional per-role tool names omitted from wire tool specs (still runnable if called).
+    pub hidden_tools: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -206,6 +210,9 @@ struct RawRole {
     #[serde(default)]
     require_distinct_verifier_profile: bool,
     flag_regex: Option<String>,
+    default_shell: Option<String>,
+    #[serde(default)]
+    hidden_tools: Vec<String>,
 }
 
 fn valid_name(s: &str) -> bool {
@@ -386,6 +393,11 @@ fn parse_pack(
         if r.max_steps == Some(0) {
             return Err(format!("{at}: max_steps must be at least one; omit it to inherit the dispatch budget"));
         }
+        if let Some(shell) = &r.default_shell {
+            if !matches!(shell.as_str(), "host" | "box") {
+                return Err(format!("{at}: `default_shell` = \"{shell}\" is invalid; use host or box"));
+            }
+        }
         let verifier = resolve_verifier(&at, rname == "verifier", r, &raw.roles, &role_list)?;
         roles.insert(
             rname.clone(),
@@ -410,6 +422,8 @@ fn parse_pack(
                 require_distinct_verifier_profile: r.require_distinct_verifier_profile,
                 flag_regex: r.flag_regex.clone(),
                 solvable: raw.solvable,
+                default_shell: r.default_shell.clone(),
+                hidden_tools: r.hidden_tools.clone(),
             },
         );
     }

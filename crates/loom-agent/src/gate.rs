@@ -77,13 +77,13 @@
 //! - `end` past the last line is refused, not clamped: `quote {i}: {handle} has {total} lines, so end
 //!   {end} is past its end. A quote without its text is exactly the lines you name; give a range within
 //!   1-{total}.`
-//! - more than `observe::REF_QUOTE_MAX_LINES` (20) lines: `quote {i}: lines {start}-{end} are {n} lines; a
-//!   quote without its text takes at most 20. Name only the lines that show the point, or give several
+//! - more than `observe::REF_QUOTE_MAX_LINES` (40) lines: `quote {i}: lines {start}-{end} are {n} lines; a
+//!   quote without its text takes at most 40. Name only the lines that show the point, or give several
 //!   quotes.` (a range costs nothing to widen, and a quote is the lines that show a point);
 //! - `observe::lines_as_quote(lines, start)` is `None`: `quote {i}: lines {start}-{end} of {handle} are
 //!   blank. Name the lines that carry the text.`
-//! - its text has more than `observe::REF_QUOTE_MAX_CHARS` (2000) characters: `quote {i}: lines
-//!   {start}-{end} of {handle} have {n} characters; a quote without its text takes at most 2000. Name
+//! - its text has more than `observe::REF_QUOTE_MAX_CHARS` (4000) characters: `quote {i}: lines
+//!   {start}-{end} of {handle} have {n} characters; a quote without its text takes at most 4000. Name
 //!   fewer lines, or give the text of the part that shows the point, copied exactly.`
 //!
 //! Otherwise it is verified with that text and the numbers of its first and last line (blank lines at
@@ -1118,25 +1118,25 @@ To keep working, call a tool. To deliver your result, call finish; if the assign
         assert!(e.contains("start 9 is past its end"), "{e}");
         let e = check_quotes(&ctx, &[q("out:0123456789abcdef", 1, 1, "")]).await.err().unwrap_or_default();
         assert!(e.contains("no output of this mission has the handle"), "{e}");
-        // At most 20 lines.
-        let many: String = (1..=30).map(|n| format!("line {n}\n")).collect();
+        // At most 40 lines.
+        let many: String = (1..=50).map(|n| format!("line {n}\n")).collect();
         let (_d, ctx, h) = store_with(&many);
-        assert_eq!(check_quotes(&ctx, &[q(&h, 5, 24, "")]).await.map(|v| (v[0].start, v[0].end)), Ok((5, 24)));
-        let e = check_quotes(&ctx, &[q(&h, 5, 25, "")]).await.err().unwrap_or_default();
+        assert_eq!(check_quotes(&ctx, &[q(&h, 5, 44, "")]).await.map(|v| (v[0].start, v[0].end)), Ok((5, 44)));
+        let e = check_quotes(&ctx, &[q(&h, 5, 45, "")]).await.err().unwrap_or_default();
         assert_eq!(
             e,
-            "quote 1: lines 5-25 are 21 lines; a quote without its text takes at most 20. Name only the lines that show the point, or give several quotes."
+            "quote 1: lines 5-45 are 41 lines; a quote without its text takes at most 40. Name only the lines that show the point, or give several quotes."
         );
         // Blank lines carry nothing.
         let (_d, ctx, h) = store_with("a\n\n  \nb\n");
         let e = check_quotes(&ctx, &[q(&h, 2, 3, "")]).await.err().unwrap_or_default();
         assert_eq!(e, format!("quote 1: lines 2-3 of {h} are blank. Name the lines that carry the text."));
-        // At most 2000 characters: a long line is quoted by the part that matters.
-        let (_d, ctx, h) = store_with(&format!("short\n{}\n", "x".repeat(2_001)));
+        // At most 4000 characters: a long line is quoted by the part that matters.
+        let (_d, ctx, h) = store_with(&format!("short\n{}\n", "x".repeat(4_001)));
         let e = check_quotes(&ctx, &[q(&h, 2, 2, "")]).await.err().unwrap_or_default();
         assert_eq!(
             e,
-            format!("quote 1: lines 2-2 of {h} have 2001 characters; a quote without its text takes at most 2000. Name fewer lines, or give the text of the part that shows the point, copied exactly.")
+            format!("quote 1: lines 2-2 of {h} have 4001 characters; a quote without its text takes at most 4000. Name fewer lines, or give the text of the part that shows the point, copied exactly.")
         );
         assert!(check_quotes(&ctx, &[q(&h, 1, 1, "")]).await.is_ok());
     }
