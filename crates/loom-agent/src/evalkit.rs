@@ -767,8 +767,12 @@ mod tests {
         assert_eq!((o.end, o.solved, o.sessions), (TurnEndReason::Finished, true, 2));
         // Refused once for the goal not concluded and once for the open claim; neither is a quote's
         // fault, and neither reached a verifier: one was started, for the finish that was delivered.
-        assert_eq!(o.lead, card(8, Some(8), 8, 0, (3, 2), 0, (1, 0), 0));
-        assert_eq!(o.mission, card(10, Some(8), 10, 0, (3, 2), 0, (1, 0), 0));
+        let mut expected_lead = card(8, Some(8), 8, 0, (3, 2), 0, (1, 0), 0);
+        expected_lead.ceremony_refusals = 2;
+        assert_eq!(o.lead, expected_lead);
+        let mut expected_mission = card(10, Some(8), 10, 0, (3, 2), 0, (1, 0), 0);
+        expected_mission.ceremony_refusals = 2;
+        assert_eq!(o.mission, expected_mission);
     }
 
     #[tokio::test]
@@ -899,8 +903,12 @@ mod tests {
         let o = run(&scan_scenario(), dir.path()).await.unwrap();
         assert_eq!((o.end, o.solved, o.sessions), (TurnEndReason::Finished, true, 2));
         // scan, claim, evidence, claim_update, conclude (refused), finish (held), run, evidence, conclude, finish.
-        assert_eq!(o.lead, card(10, Some(10), 10, 0, (2, 1), 0, (1, 0), 0));
-        assert_eq!(o.mission, card(12, Some(10), 12, 0, (2, 1), 0, (1, 0), 0));
+        let mut expected_lead = card(10, Some(10), 10, 0, (2, 1), 0, (1, 0), 0);
+        expected_lead.ceremony_refusals = 1;
+        assert_eq!(o.lead, expected_lead);
+        let mut expected_mission = card(12, Some(10), 12, 0, (2, 1), 0, (1, 0), 0);
+        expected_mission.ceremony_refusals = 1;
+        assert_eq!(o.mission, expected_mission);
         let refusal = refused_conclusion(&dir.path().join("home")).expect("no refused conclude in the logs");
         assert!(refusal.contains("analysis is not a run"), "{refusal}");
         assert!(refusal.contains("e1 analysis by dep_scan"), "{refusal}");

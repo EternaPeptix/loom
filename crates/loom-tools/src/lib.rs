@@ -74,7 +74,9 @@ use futures_util::FutureExt;
 use loom_core::admit::{admit, envelope_plain, normalize, AdmitPolicy, Facts};
 use loom_core::config::ToolsCfg;
 use loom_core::estimate::TokenEstimator;
-use loom_core::event::{ToolClass, ToolResult, ToolSpec, ToolStatus, META_OF_BLOB, META_RAW_BLOB, META_SHOWN};
+use loom_core::event::{
+    ToolClass, ToolResult, ToolSpec, ToolStatus, META_OF_BLOB, META_RAW_BLOB, META_REPAIRED, META_SHOWN,
+};
 use loom_core::{BlobId, BlobStore, CallId, SessionId};
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
@@ -367,7 +369,7 @@ impl Prepared {
             )),
         };
         if !checked.notes.is_empty() {
-            output.meta.insert("repaired".into(), json!(true));
+            output.meta.insert(META_REPAIRED.into(), json!(true));
             output.more.extend(checked.notes);
         }
         Ran { spec, output, took: started.elapsed() }
