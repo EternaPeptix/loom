@@ -107,6 +107,8 @@
 //!   refused because analysis is not a run, so the `finish` after it is held by the goal pre-gate. A harness
 //!   that took a scan for a run (`dep_scan` is an `Exec` tool) would let this model finish on the scan with
 //!   `sum.txt` never written.
+//! - `repaired_aliases`: begins with common training aliases (`bash` with `cmd`, `shell` with `command`)
+//!   that are transparently repaired without costing extra malformed steps before finishing normally.
 //!
 //! ## `table(outcomes)`
 //! The outcomes as text, one row each under a header line, columns separated by two spaces and as wide
@@ -358,6 +360,23 @@ pub fn suite() -> Vec<Scenario> {
                 Run,
                 Evidence(ByLines),
                 Conclude("e2"),
+                Finish(ByLines),
+            ],
+            ..base
+        },
+        Scenario {
+            name: "repaired_aliases",
+            plays: "calls bash with `cmd` and `shell` with `command` before finishing normally",
+            lead: &[
+                Call("bash", r#"{"cmd": "cat numbers.txt"}"#),
+                Call(
+                    "shell",
+                    r#"{"command": "s=0; while read n; do s=$((s+n)); done < numbers.txt; echo $s > sum.txt; echo sum.txt now holds $(cat sum.txt)"}"#,
+                ),
+                Claim,
+                Evidence(ByLines),
+                Support,
+                Conclude("e1"),
                 Finish(ByLines),
             ],
             ..base
@@ -760,6 +779,18 @@ mod tests {
         assert_eq!(o.lead, card(9, Some(9), 9, 3, (1, 0), 0, (1, 0), 0));
         assert_eq!(o.lead.malformed_call_rate(), Some(3.0 / 9.0));
         assert_eq!(o.mission, card(11, Some(9), 11, 3, (1, 0), 0, (1, 0), 0));
+    }
+
+    #[tokio::test]
+    async fn zero_training_aliases_are_repaired_without_cost() {
+        let o = played_named("repaired_aliases").await;
+        assert_eq!((o.end, o.solved, o.sessions), (TurnEndReason::Finished, true, 2));
+        assert!(o.lead.repaired_calls >= 2, "{:?}", o.lead);
+        assert_eq!(o.lead.malformed_calls, 0);
+        assert!(o.lead.finished);
+        let mut expected = card(7, Some(7), 7, 0, (1, 0), 0, (1, 0), 0);
+        expected.repaired_calls = 2;
+        assert_eq!(o.lead, expected);
     }
 
     #[tokio::test]

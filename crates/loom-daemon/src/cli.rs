@@ -61,8 +61,9 @@
 //! - `inbox`: `render::inbox_list`. `answer <item> <text…>`: `client.answer`; `answered {item}`.
 //! - `ledger <session|mission>`: the ledger's `markdown`, then one line for each of `LedgerView::notices`
 //!   (entries written by a newer loom that are not shown, an ignored torn tail, entries past the head record).
-//! - `score <session|mission> [--json]`: `client.score` of the mission, as `render::score_table`; with
-//!   `--json` the `ScoreView` itself, indented, for a script that compares runs.
+//! - `score <session|mission> [--json]`: `client.score` of the mission, as `render::score_table`
+//!   followed by `Harness tax: <summary>`; with `--json` the `ScoreView` itself, indented, for a
+//!   script that compares runs.
 //! - `window <session>`: `render::window_table`. `net <session> [-n <limit>]`: `render::net_table`, then
 //!   `render::granted_hosts_line` from the mission's ledger (left out when the ledger cannot be read).
 //! - `out <handle> [--lines <a>:<b>]`: the stored output's lines (all of it, paged 5 000 lines at a
@@ -635,6 +636,15 @@ fn block(text: &str) -> Result<(), String> {
     } else {
         outln(text)
     }
+}
+
+fn format_score_text(view: &loom_agent::runtime::ScoreView, style: &Style) -> String {
+    let mut text = render::score_table(view, style);
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(&format!("Harness tax: {}\n", view.total.harness_tax_summary()));
+    text
 }
 
 fn terminal_width() -> usize {
@@ -1316,7 +1326,7 @@ async fn dispatch(command: Command) -> Result<i32, String> {
             let text = if a.json {
                 serde_json::to_string_pretty(&view).map_err(|e| format!("The score could not be written: {e}"))?
             } else {
-                render::score_table(&view, &style())
+                format_score_text(&view, &style())
             };
             block(&text).map(|()| 0)
         }
@@ -2839,5 +2849,35 @@ mod tests {
         srv.abort();
         assert_eq!(code, 2);
         assert_eq!(String::from_utf8(out).unwrap(), "#0\n#1\n#2\n");
+    }
+
+    #[test]
+    fn score_text_appends_harness_tax_summary_after_score_table() {
+        use loom_agent::runtime::{ScoreView, SessionScore};
+        use loom_core::scorecard::Scorecard;
+        let card = Scorecard {
+            steps: 5,
+            calls: 4,
+            malformed_calls: 1,
+            text_only_nudges: 1,
+            repaired_calls: 2,
+            ceremony_refusals: 1,
+            ..Scorecard::default()
+        };
+        let view = ScoreView {
+            mission: MissionId::from("m-1"),
+            sessions: vec![SessionScore {
+                session: SessionId::from("s-1"),
+                role: "lead".into(),
+                parent: None,
+                card: card.clone(),
+            }],
+            total: card.clone(),
+        };
+        let style = Style { color: false, width: 100 };
+        let rendered = format_score_text(&view, &style);
+        let table = render::score_table(&view, &style);
+        assert_eq!(rendered, format!("{table}Harness tax: {}\n", card.harness_tax_summary()));
+        assert!(rendered.ends_with(&format!("Harness tax: {}\n", card.harness_tax_summary())));
     }
 }
