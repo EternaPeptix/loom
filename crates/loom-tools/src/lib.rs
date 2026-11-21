@@ -62,6 +62,7 @@ pub mod outview;
 pub mod params;
 pub mod proc;
 pub mod pty;
+pub mod rootbox;
 pub mod sandbox;
 pub mod schema;
 pub mod search;

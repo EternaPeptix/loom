@@ -8166,6 +8166,15 @@ mod tests {
     }
 
     #[test]
+    fn rootbox_exec_is_refused_in_wrap_up_and_the_class_counts_as_exec() {
+        let policy = CallPolicy { wrapup: true };
+        assert!(!policy.allows("rootbox_exec", &json!({"command": "id"})), "closed in wrap-up");
+        assert!(CallPolicy::default().allows("rootbox_exec", &json!({})), "open otherwise");
+        let registry = crate::rtools::testkit::rootbox_registry();
+        assert_eq!(registry.get("rootbox_exec").map(|t| t.spec().class), Some(ToolClass::Exec));
+    }
+
+    #[test]
     fn durable_clock_excludes_waits_renewals_and_restart_downtime() {
         let mut state = State { started_ms: 1000, ..State::default() };
         let apply = |s: &mut State, ms, event| {

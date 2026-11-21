@@ -48,6 +48,8 @@ pub struct FakeOrch {
     pub copies: Mutex<HashMap<SessionId, Result<ChildCopy, String>>>,
     /// What `box_access` answers; unset means no box is configured.
     pub boxed: Mutex<Option<Result<Arc<loom_tools::boxctl::MissionBox>, String>>>,
+    /// What `rootbox_access` answers; unset means no root box is configured.
+    pub rootbox: Mutex<Option<Result<Arc<loom_tools::rootbox::RootBox>, String>>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -210,6 +212,13 @@ impl Orchestrator for FakeOrch {
         lock(&self.producers).get(blob).cloned()
     }
 
+    async fn rootbox_access(&self, _session: &SessionId) -> Result<Arc<loom_tools::rootbox::RootBox>, String> {
+        match lock(&self.rootbox).clone() {
+            Some(answer) => answer,
+            None => Err(super::rootbox::NO_ROOTBOX.to_string()),
+        }
+    }
+
     async fn box_access(&self, _session: &SessionId) -> Result<Arc<loom_tools::boxctl::MissionBox>, String> {
         match lock(&self.boxed).clone() {
             Some(answer) => answer,
@@ -359,6 +368,17 @@ impl Rig {
 /// The registry of a role that has the three box tools (and the job tools that follow their jobs).
 pub fn box_registry() -> Registry {
     box_rig().registry
+}
+
+/// A session `s-test` whose role is the core worker with `rootbox_exec` added; no root box is configured.
+pub fn rootbox_rig() -> Rig {
+    let mut role = core_role("worker");
+    role.tools = ["rootbox_exec", "job_wait", "job_kill", "out_read"].iter().map(|s| s.to_string()).collect();
+    rig_with(role, false, false, AgentsCfg::default())
+}
+
+pub fn rootbox_registry() -> Registry {
+    rootbox_rig().registry
 }
 
 /// A session `s-test` whose role is the core worker with the box tools added; its box is not configured.
