@@ -506,7 +506,7 @@ For browser checks without a model or real daemon:
 node tools/ui-preview.mjs
 ```
 
-Open the printed loopback URL, `/#code=fixture`: the fixture answers `POST /api/web-sessions` for
+Open the printed loopback URL, `/#code=facefeedfacefeed`: the fixture answers `POST /api/web-sessions` for
 that code, so the page signs in as it would from `loom open` (alternatively set the `sessionStorage`
 secret `fixture-secret` and open `/#/s/s-audit`). The fixture contains three workspaces
 (`/fixture/loom`, `/fixture/indexer`, `/fixture/docs`) and three model profiles with different
