@@ -549,10 +549,10 @@ pub const MIN_PARTIAL_QUOTE_CHARS: usize = 8;
 pub const QUOTE_RECORD_CHARS: usize = 300;
 
 /// Most lines a quote given by its line numbers alone may span.
-pub const REF_QUOTE_MAX_LINES: u64 = 20;
+pub const REF_QUOTE_MAX_LINES: u64 = 40;
 
 /// Most characters a quote given by its line numbers alone may record.
-pub const REF_QUOTE_MAX_CHARS: usize = 2_000;
+pub const REF_QUOTE_MAX_CHARS: usize = 4_000;
 
 /// What a quote given by its line numbers alone records (see the contract, *Quote by lines*): the lines
 /// of `haystack`, a range of a stored output whose first line has the number `first_line`, each without
@@ -583,19 +583,20 @@ pub enum QuoteError {
     InsideToken { line: u64 },
 }
 
-/// Walk the occurrences of `text` in `hay` front to back, overlapping ones included, and accept the first
-/// that is a valid quote: the numbers the quote gave its lines (`numbers`, one entry per line of `text`)
-/// are the numbers of the lines it is on, and it spans whole lines or is long enough and on token
-/// boundaries. Returns the bytes of `hay` it occupies. `first_line` is the number of the first line of
-/// `hay`. One pass: the line count is carried from one occurrence to the next, so the lines of `hay` are
-/// counted once however many occurrences are passed over.
-fn scan_quote(
+/// Walk the occurrences of `text` in `hay` front to back, overlapping ones included, collecting up to
+/// `max_matches` spans that are valid quotes: the numbers the quote gave its lines (`numbers`, one entry
+/// per line of `text`) are the numbers of the lines it is on, and it spans whole lines or is long enough
+/// and on token boundaries. `first_line` is the number of the first line of `hay`. One pass: the line
+/// count is carried from one occurrence to the next, so the lines of `hay` are counted once however many
+/// occurrences are passed over.
+fn scan_quote_spans(
     hay: &str,
     text: &str,
     numbers: Option<&[Option<u64>]>,
     first_line: u64,
-) -> Result<std::ops::Range<usize>, QuoteError> {
-    if text.is_empty() {
+    max_matches: usize,
+) -> Result<Vec<std::ops::Range<usize>>, QuoteError> {
+    if text.is_empty() || max_matches == 0 {
         return Err(QuoteError::NotFound);
     }
     let long_enough = text.chars().filter(|c| !c.is_whitespace()).count() >= MIN_PARTIAL_QUOTE_CHARS;
@@ -604,6 +605,7 @@ fn scan_quote(
     let mut inside: Option<u64> = None;
     let first_alnum = text.chars().next().is_some_and(char::is_alphanumeric);
     let last_alnum = text.chars().next_back().is_some_and(char::is_alphanumeric);
+    let mut matches = Vec::new();
     // `line` is the number of the line that byte `counted` of `hay` is on.
     let (mut line, mut counted) = (first_line, 0usize);
     let mut from = 0usize;
@@ -626,7 +628,11 @@ fn scan_quote(
         let after = hay.get(off.saturating_add(text.len())..);
         let ends_line = after.is_some_and(|after| after.is_empty() || after.starts_with('\n'));
         if starts_line && ends_line {
-            return Ok(off..off.saturating_add(text.len()));
+            matches.push(off..off.saturating_add(text.len()));
+            if matches.len() >= max_matches {
+                return Ok(matches);
+            }
+            continue;
         }
         if !long_enough {
             short = true;
@@ -638,9 +644,16 @@ fn scan_quote(
         let inside_token = (first_alnum && before.is_some_and(char::is_alphanumeric))
             || (last_alnum && next.is_some_and(char::is_alphanumeric));
         if !inside_token {
-            return Ok(off..off.saturating_add(text.len()));
+            matches.push(off..off.saturating_add(text.len()));
+            if matches.len() >= max_matches {
+                return Ok(matches);
+            }
+            continue;
         }
         inside = inside.or(Some(line));
+    }
+    if !matches.is_empty() {
+        return Ok(matches);
     }
     if short {
         return Err(QuoteError::TooShort);
@@ -649,6 +662,15 @@ fn scan_quote(
         return Err(QuoteError::InsideToken { line });
     }
     Err(wrong.unwrap_or(QuoteError::NotFound))
+}
+
+fn scan_quote(
+    hay: &str,
+    text: &str,
+    numbers: Option<&[Option<u64>]>,
+    first_line: u64,
+) -> Result<std::ops::Range<usize>, QuoteError> {
+    scan_quote_spans(hay, text, numbers, first_line, 1)?.into_iter().next().ok_or(QuoteError::NotFound)
 }
 
 /// What is recorded for the occurrence at bytes `at` of `hay`, and the number of the line it starts with
@@ -726,6 +748,46 @@ pub fn check_quote_at(haystack: &str, quote: &str, first_line: u64) -> Result<(S
 /// [`check_quote`] for a haystack that starts at line 1, when only the answer matters.
 pub fn quote_matches(haystack: &str, quote: &str) -> bool {
     check_quote(haystack, quote, 1).is_ok()
+}
+
+fn unique_recorded(hay: &str, matches: &[std::ops::Range<usize>]) -> Option<(u64, u64, String)> {
+    let [at] = matches else { return None };
+    let (text, start) = recorded(hay, at, 1);
+    let newlines = hay.get(at.clone()).map_or(0, |s| s.matches('\n').count()) as u64;
+    Some((start, start.saturating_add(newlines), text))
+}
+
+/// Search all lines of `haystack` (`1..=total_lines`) using the exact [`check_quote`] matching,
+/// token-boundary, minimum-length, and prefix-stripping rules.
+///
+/// Returns `Ok(Some((actual_start, actual_end, recorded_text)))` when `quote` matches cleanly at
+/// exactly one span, `Ok(None)` when 0 or at least 2 clean spans match (or on `NotFound` /
+/// `WrongLine`), and propagates `InsideToken` / `TooShort` when no valid span matches.
+pub fn find_unique_quote(haystack: &str, quote: &str) -> Result<Option<(u64, u64, String)>, QuoteError> {
+    if quote.trim().is_empty() {
+        return Ok(None);
+    }
+    let hay = prepare_haystack(haystack);
+    let lines = quote_lines(quote);
+    let literal = lines.join("\n");
+    let literal_error = match scan_quote_spans(&hay, &literal, None, 1, 2) {
+        Ok(matches) => return Ok(unique_recorded(&hay, &matches)),
+        Err(QuoteError::NotFound) => None,
+        Err(e) => Some(e),
+    };
+    let numbered = match strip_prefixes(&lines) {
+        Some((stripped, numbers)) => {
+            let text = stripped.join("\n");
+            scan_quote_spans(&hay, &text, Some(numbers.as_slice()), 1, 2)
+        }
+        None => Err(QuoteError::NotFound),
+    };
+    match (numbered, literal_error) {
+        (Ok(matches), _) => Ok(unique_recorded(&hay, &matches)),
+        (Err(_), Some(e @ (QuoteError::InsideToken { .. } | QuoteError::TooShort))) => Err(e),
+        (Err(e @ (QuoteError::InsideToken { .. } | QuoteError::TooShort)), None) => Err(e),
+        (Err(_), _) => Ok(None),
+    }
 }
 
 fn common_prefix_chars(a: &str, b: &str) -> usize {
@@ -1371,5 +1433,69 @@ mod tests {
         // Nothing but blank lines is no quote.
         assert_eq!(lines_as_quote("\n  \n\t\n", 3), None);
         assert_eq!(lines_as_quote("", 1), None);
+    }
+
+    #[test]
+    fn ref_quote_limits_are_40_lines_and_4000_chars() {
+        assert_eq!(REF_QUOTE_MAX_LINES, 40);
+        assert_eq!(REF_QUOTE_MAX_CHARS, 4_000);
+    }
+
+    #[test]
+    fn find_unique_quote_matches_uniquely_or_reports_ambiguity_and_errors() {
+        let hay = concat!(
+            "alpha line one\n",
+            "beta line two\n",
+            "gamma: 10 failed; 0 ignored\n",
+            "delta line four\n",
+            "epsilon shared pattern here\n",
+            "zeta shared pattern here\n",
+            "eta short\n",
+            "theta: 0 failed; 0 ignored\n",
+        );
+
+        // Unique whole-line and multi-line matches.
+        assert_eq!(find_unique_quote(hay, "beta line two"), Ok(Some((2, 2, "beta line two".into()))));
+        assert_eq!(
+            find_unique_quote(hay, "beta line two\ngamma: 10 failed; 0 ignored"),
+            Ok(Some((2, 3, "beta line two\ngamma: 10 failed; 0 ignored".into())))
+        );
+
+        // Unique fragment on token boundaries records its whole line.
+        assert_eq!(find_unique_quote(hay, "line four"), Ok(Some((4, 4, "delta line four".into()))));
+
+        // Multi-match returns Ok(None).
+        assert_eq!(find_unique_quote(hay, "shared pattern"), Ok(None));
+
+        // NotFound and empty/blank return Ok(None).
+        assert_eq!(find_unique_quote(hay, "nonexistent text"), Ok(None));
+        assert_eq!(find_unique_quote(hay, "   \n "), Ok(None));
+
+        // InsideToken is strictly enforced when 0 valid spans match: `0 failed` must NEVER match inside `10 failed`.
+        let inside_only = "test result: FAILED. 5 passed; 10 failed; 0 ignored\n";
+        assert_eq!(find_unique_quote(inside_only, "0 failed; 0 ignored"), Err(QuoteError::InsideToken { line: 1 }));
+        // When one occurrence is inside a token (line 3: `10 failed`) and one is on a boundary (line 8: `0 failed`),
+        // only the valid span counts, yielding a unique match at line 8.
+        assert_eq!(
+            find_unique_quote(hay, "0 failed; 0 ignored"),
+            Ok(Some((8, 8, "theta: 0 failed; 0 ignored".into())))
+        );
+
+        // TooShort propagates when 0 valid spans match.
+        assert_eq!(find_unique_quote(hay, "short"), Err(QuoteError::TooShort));
+
+        // Line-number-prefix stripping disambiguates repeated text and requires the right line number.
+        assert_eq!(
+            find_unique_quote(hay, "5: epsilon shared pattern here\n6: zeta shared pattern here"),
+            Ok(Some((5, 6, "epsilon shared pattern here\nzeta shared pattern here".into())))
+        );
+        assert_eq!(
+            find_unique_quote(hay, "6\tzeta shared pattern here"),
+            Ok(Some((6, 6, "zeta shared pattern here".into())))
+        );
+        // Wrong line number produces 0 valid spans -> Ok(None).
+        assert_eq!(find_unique_quote(hay, "1: delta line four"), Ok(None));
+        // Numbered InsideToken propagates InsideToken.
+        assert_eq!(find_unique_quote(hay, "3: 0 failed; 0 ignored"), Err(QuoteError::InsideToken { line: 3 }));
     }
 }

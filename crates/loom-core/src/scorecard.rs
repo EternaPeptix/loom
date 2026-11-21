@@ -60,7 +60,8 @@
 //! log without the meta keys; `add`; `cells` for a full card, an empty one and an unrecorded one.
 
 use crate::event::{
-    Event, EvictAction, Purpose, Record, ToolStatus, META_REFUSAL, META_VERIFIED, REFUSAL_QUOTE, REFUSAL_VERIFIER,
+    Event, EvictAction, NoteKind, Purpose, Record, ToolStatus, META_REFUSAL, META_REPAIRED, META_VERIFIED,
+    REFUSAL_CEREMONY, REFUSAL_QUOTE, REFUSAL_VERIFIER,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -85,6 +86,15 @@ pub struct Scorecard {
     /// `ask_for` calls that were accepted: the operator asked for budget, a tool, a hint or direction.
     #[serde(default)]
     pub asks: u64,
+    /// Stop-gate nudges caused by a reply with no tool calls or an empty reply.
+    #[serde(default)]
+    pub text_only_nudges: u64,
+    /// Tool calls whose arguments were repaired or normalized by the harness (`META_REPAIRED`).
+    #[serde(default)]
+    pub repaired_calls: u64,
+    /// Tool calls refused by a harness ceremony or shape check (`REFUSAL_CEREMONY`).
+    #[serde(default)]
+    pub ceremony_refusals: u64,
     pub unrecorded: bool,
 }
 
@@ -103,6 +113,35 @@ impl Scorecard {
         ratio(self.verifier_accepts, self.verifier_accepts.saturating_add(self.verifier_rejections))
     }
 
+    /// Calls and turns lost to harness tax: malformed calls, quote refusals, ceremony refusals, and
+    /// text-only nudges.
+    pub fn harness_tax_calls(&self) -> u64 {
+        self.malformed_calls
+            .saturating_add(self.quote_refusals)
+            .saturating_add(self.ceremony_refusals)
+            .saturating_add(self.text_only_nudges)
+    }
+
+    fn harness_tax_denominator(&self) -> u64 {
+        self.calls.saturating_add(self.text_only_nudges)
+    }
+
+    /// Harness tax per tool-call attempt (including text-only nudged turns); `None` when neither calls
+    /// nor text-only nudges occurred.
+    pub fn harness_tax_rate(&self) -> Option<f64> {
+        ratio(self.harness_tax_calls(), self.harness_tax_denominator())
+    }
+
+    /// Human-readable summary of harness tax and repaired calls in `"{n} ({pct}%) tax, {repaired} repaired"`
+    /// style (`"{n} (-) tax, {repaired} repaired"` when there are no calls or nudges).
+    pub fn harness_tax_summary(&self) -> String {
+        let tax = self.harness_tax_calls();
+        match percent(tax, self.harness_tax_denominator()) {
+            Some(pct) => format!("{tax} ({pct}%) tax, {} repaired", self.repaired_calls),
+            None => format!("{tax} (-) tax, {} repaired", self.repaired_calls),
+        }
+    }
+
     /// Add the work of another session of the same mission (a worker, a verifier) to this one's.
     pub fn add(&mut self, other: &Scorecard) {
         self.steps = self.steps.saturating_add(other.steps);
@@ -116,6 +155,9 @@ impl Scorecard {
         self.fresh_starts = self.fresh_starts.saturating_add(other.fresh_starts);
         self.hand_offs = self.hand_offs.saturating_add(other.hand_offs);
         self.asks = self.asks.saturating_add(other.asks);
+        self.text_only_nudges = self.text_only_nudges.saturating_add(other.text_only_nudges);
+        self.repaired_calls = self.repaired_calls.saturating_add(other.repaired_calls);
+        self.ceremony_refusals = self.ceremony_refusals.saturating_add(other.ceremony_refusals);
         self.unrecorded |= other.unrecorded;
     }
 
@@ -181,9 +223,14 @@ pub fn score(records: &[Record]) -> Scorecard {
                 if t.status == ToolStatus::Invalid {
                     card.malformed_calls = card.malformed_calls.saturating_add(1);
                 }
+                if t.meta.get(META_REPAIRED).and_then(Value::as_bool) == Some(true) {
+                    card.repaired_calls = card.repaired_calls.saturating_add(1);
+                }
                 let refusal = t.meta.get(META_REFUSAL).and_then(Value::as_str);
                 if refusal == Some(REFUSAL_QUOTE) {
                     card.quote_refusals = card.quote_refusals.saturating_add(1);
+                } else if refusal == Some(REFUSAL_CEREMONY) {
+                    card.ceremony_refusals = card.ceremony_refusals.saturating_add(1);
                 }
                 // The two exits that are not a finish: counted when the tool took them.
                 if t.status == ToolStatus::Ok {
@@ -213,6 +260,12 @@ pub fn score(records: &[Record]) -> Scorecard {
                     card.finished = true;
                     card.steps_to_finish = Some(card.steps);
                 }
+            }
+            Event::HarnessNote { note: NoteKind::Nudge, text }
+                if text.starts_with("Your reply ended without a tool call")
+                    || text.starts_with("Your reply was empty") =>
+            {
+                card.text_only_nudges = card.text_only_nudges.saturating_add(1);
             }
             Event::Reweave(w) if w.evictions.iter().any(|e| e.action == EvictAction::Remove) => {
                 card.fresh_starts = card.fresh_starts.saturating_add(1);
@@ -361,6 +414,9 @@ mod tests {
                 fresh_starts: 1,
                 hand_offs: 0,
                 asks: 0,
+                text_only_nudges: 0,
+                repaired_calls: 0,
+                ceremony_refusals: 0,
                 unrecorded: false,
             }
         );
@@ -497,6 +553,9 @@ mod tests {
             fresh_starts: 1,
             hand_offs: 2,
             asks: 3,
+            text_only_nudges: 1,
+            repaired_calls: 2,
+            ceremony_refusals: 1,
             unrecorded: false,
         };
         assert_eq!(card.cells(), ["12", "11", "16", "2 (13%)", "2 of 3", "4", "1 of 2", "1", "2", "3"]);
@@ -514,5 +573,61 @@ mod tests {
             (rate(1, 3), rate(2, 3), rate(1, 200), rate(3, 3)),
             ("1 (33%)".into(), "2 (67%)".into(), "1 (1%)".into(), "3 (100%)".into())
         );
+    }
+
+    #[test]
+    fn harness_tax_fields_rate_addition_and_summary() {
+        // Text-only and empty reply nudges count; other nudges/notes do not.
+        let mut events = vec![
+            Event::HarnessNote {
+                note: NoteKind::Nudge,
+                text: "Your reply ended without a tool call, so nothing was delivered.".into(),
+            },
+            Event::HarnessNote {
+                note: NoteKind::Nudge,
+                text: "Your reply was empty, so nothing was delivered.".into(),
+            },
+            Event::HarnessNote { note: NoteKind::Nudge, text: "The call `bash` could not run: bad JSON.".into() },
+            Event::HarnessNote { note: NoteKind::Info, text: "Your reply was empty".into() },
+        ];
+        // Repaired tool calls and ceremony refusals.
+        events.extend(step("bash", ToolStatus::Ok, json!({ META_REPAIRED: true })));
+        events.extend(step("bash", ToolStatus::Ok, json!({ META_REPAIRED: false })));
+        events.extend(step("security_record", ToolStatus::Error, json!({ META_REFUSAL: REFUSAL_CEREMONY })));
+        events.extend(step("evidence", ToolStatus::Error, json!({ META_REFUSAL: REFUSAL_QUOTE })));
+        events.extend(step("bash", ToolStatus::Invalid, json!({})));
+        let card = score(&numbered(events));
+        assert_eq!(card.text_only_nudges, 2);
+        assert_eq!(card.repaired_calls, 1);
+        assert_eq!(card.ceremony_refusals, 1);
+        assert_eq!(card.quote_refusals, 1);
+        assert_eq!(card.malformed_calls, 1);
+        assert_eq!(card.calls, 5);
+        // 1 malformed + 1 quote + 1 ceremony + 2 text-only nudges = 5 out of (5 calls + 2 nudges) = 5/7 (~71%).
+        assert_eq!(card.harness_tax_calls(), 5);
+        assert!((card.harness_tax_rate().unwrap() - (5.0 / 7.0)).abs() < 1e-12);
+        assert_eq!(card.harness_tax_summary(), "5 (71%) tax, 1 repaired");
+
+        // Adding sums the 3 new fields cleanly.
+        let mut combined = card.clone();
+        combined.add(&card);
+        assert_eq!((combined.text_only_nudges, combined.repaired_calls, combined.ceremony_refusals), (4, 2, 2));
+        assert_eq!(combined.harness_tax_calls(), 10);
+        assert_eq!(combined.harness_tax_summary(), "10 (71%) tax, 2 repaired");
+
+        // Empty card has no rate and reads `-` for percentage.
+        let empty = Scorecard::default();
+        assert_eq!(empty.harness_tax_calls(), 0);
+        assert_eq!(empty.harness_tax_rate(), None);
+        assert_eq!(empty.harness_tax_summary(), "0 (-) tax, 0 repaired");
+
+        // Deserializing older JSON without the new fields defaults them to 0.
+        let legacy: Scorecard = serde_json::from_value(json!({
+            "steps": 2, "finished": true, "steps_to_finish": 2, "calls": 2, "malformed_calls": 0,
+            "finish_calls": 1, "finish_refusals": 0, "quote_refusals": 0, "verifier_accepts": 0,
+            "verifier_rejections": 0, "fresh_starts": 0, "unrecorded": false
+        }))
+        .unwrap();
+        assert_eq!((legacy.text_only_nudges, legacy.repaired_calls, legacy.ceremony_refusals), (0, 0, 0));
     }
 }
