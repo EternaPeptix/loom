@@ -270,14 +270,17 @@ use crate::pack::RoleDef;
 use crate::texts;
 use async_trait::async_trait;
 use loom_core::event::{
-    Author, Brief, Budget, ChildOutcome, Event, InboxItem, InboxKind, NoteKind, SpawnMode, Termination, ToolClass,
-    ToolSpec, ToolStatus, TurnEndReason, META_OF_BLOB, META_REFUSAL, META_VERIFIED, REFUSAL_QUOTE, REFUSAL_VERIFIER,
+    Author, Brief, Budget, ChildOutcome, Event, EvidenceGrade, InboxItem, InboxKind, NoteKind, SpawnMode, Termination,
+    ToolClass, ToolSpec, ToolStatus, TurnEndReason, META_OF_BLOB, META_REFUSAL, META_VERIFIED, REFUSAL_CEREMONY,
+    REFUSAL_QUOTE, REFUSAL_VERIFIER,
 };
 use loom_core::ids::new_item_id;
-use loom_core::ledger::{ClaimStatus, Evidence, EvidenceKind, GoalMetStatus, LedgerOp, LedgerState, ObligationKind};
+use loom_core::ledger::{
+    ClaimStatus, Evidence, EvidenceInput, EvidenceKind, GoalMetStatus, LedgerOp, LedgerState, ObligationKind,
+};
 use loom_core::log::read_records;
 use loom_core::observe::QUOTE_RECORD_CHARS;
-use loom_core::{BlobId, BlobRef, SessionId};
+use loom_core::{BlobId, BlobRef, BlobStore, SessionId};
 use loom_tools::jobs::JobState;
 use loom_tools::outputs;
 use loom_tools::params::{opt, req, spec};
@@ -294,6 +297,46 @@ pub struct HandOff(pub Arc<Shared>);
 pub struct ReportBlocker(pub Arc<Shared>);
 pub struct Wait(pub Arc<Shared>);
 pub struct Conclude(pub Arc<Shared>);
+
+async fn is_valid_oracle_blob(
+    shared: &Shared,
+    ctx: &ToolCtx,
+    producer: &super::Producer,
+    blob: &BlobId,
+    verifier: &str,
+    digest: &str,
+) -> Result<bool, String> {
+    if producer.tool != "oracle_check"
+        || producer.class != ToolClass::Exec
+        || producer.session == shared.session
+        || shared.orch.child_role(&shared.session, &producer.session).await.as_deref() != Some(verifier)
+    {
+        return Ok(false);
+    }
+    let Ok(meta) = ctx.blobs.meta(blob) else {
+        return Ok(false);
+    };
+    if meta.bytes > 8 * 1024 * 1024 {
+        return Ok(false);
+    }
+    let Ok(bytes) = ctx.blobs.read_all(blob) else {
+        return Ok(false);
+    };
+    if bytes.len() > 8 * 1024 * 1024 {
+        return Ok(false);
+    }
+    let Ok(receipt) = serde_json::from_slice::<Value>(&bytes) else {
+        return Ok(false);
+    };
+    if receipt.get("passed").and_then(Value::as_bool) == Some(true)
+        && receipt.get("contract_sha256").and_then(Value::as_str) == Some(digest)
+    {
+        // Producer lookups may have waited. A contract changed during this check must not be
+        // accepted based only on the digest read before those awaits.
+        return Ok(loom_tools::oracle::contract_digest(ctx)? == digest);
+    }
+    Ok(false)
+}
 
 /// A successful security conclusion cites an actual oracle output from this lead's independently
 /// spawned, named verifier role. Printed JSON and another mission's receipts cannot satisfy it.
@@ -327,38 +370,11 @@ async fn check_mechanical_oracle(
         let Some(producer) = shared.orch.producer(mission, blob).await else {
             continue;
         };
-        if producer.tool != "oracle_check"
-            || producer.class != ToolClass::Exec
-            || producer.session == shared.session
-            || producer.session != e.input.session
-            || producer.call_id != e.input.call_id
-            || shared.orch.child_role(&shared.session, &producer.session).await.as_deref() != Some(verifier)
-        {
+        if producer.session != e.input.session || producer.call_id != e.input.call_id {
             continue;
         }
-        let Ok(meta) = ctx.blobs.meta(blob) else {
-            continue;
-        };
-        if meta.bytes > 8 * 1024 * 1024 {
-            continue;
-        }
-        let Ok(bytes) = ctx.blobs.read_all(blob) else {
-            continue;
-        };
-        if bytes.len() > 8 * 1024 * 1024 {
-            continue;
-        }
-        let Ok(receipt) = serde_json::from_slice::<Value>(&bytes) else {
-            continue;
-        };
-        if receipt.get("passed").and_then(Value::as_bool) == Some(true)
-            && receipt.get("contract_sha256").and_then(Value::as_str) == Some(digest.as_str())
-        {
-            // Producer lookups may have waited. A contract changed during this check must not be
-            // accepted based only on the digest read before those awaits.
-            if loom_tools::oracle::contract_digest(ctx)? == digest {
-                return Ok(());
-            }
+        if is_valid_oracle_blob(shared, ctx, &producer, blob, verifier, &digest).await? {
+            return Ok(());
         }
     }
     Err(format!("The goal is not mechanically established. Have an independent `{verifier}` child run oracle_check against the current operator contract, attach its passing output as attested mission evidence, and cite that evidence ID. A banner, model-authored JSON, self-verification, another role's receipt, or a receipt for an older contract does not count."))
@@ -388,11 +404,11 @@ pub fn quote_items() -> Value {
         "type": "object",
         "properties": {
             "handle": { "type": "string", "description": "The stored output, for example out:7f3a9c1e." },
-            "start": { "type": "integer", "description": "First line of the quote in that output." },
-            "end": { "type": "integer", "description": "Last line of the quote in that output." },
-            "text": { "type": "string", "description": "Leave out to quote lines start-end whole, as stored (at most 20 lines; needs exact line numbers). Or the text copied exactly from within those lines; the range may then be wider than the text." }
+            "start": { "type": "integer", "description": "First line of the quote in that output (optional when `text` is unique)." },
+            "end": { "type": "integer", "description": "Last line of the quote in that output (optional when `text` is unique)." },
+            "text": { "type": "string", "description": "Leave out to quote lines start-end whole, as stored (at most 40 lines; needs exact start/end). Or the text copied exactly from the output." }
         },
-        "required": ["handle", "start", "end"],
+        "required": ["handle"],
         "additionalProperties": false
     })
 }
@@ -429,6 +445,19 @@ pub fn finish_brief(
     not_established: Option<&str>,
     evidence: &[String],
 ) -> Brief {
+    finish_brief_with_blobs(ledger, answer, quotes, not_established, evidence, None)
+}
+
+/// Build the verifier's finish brief, optionally expanding short stored blobs (`<= 25` lines and
+/// `<= 1500` chars) inline alongside their `out:<hex>` handles.
+pub fn finish_brief_with_blobs(
+    ledger: &LedgerState,
+    answer: &str,
+    quotes: &[crate::gate::VerifiedQuote],
+    not_established: Option<&str>,
+    evidence: &[String],
+    blobs: Option<&BlobStore>,
+) -> Brief {
     let goal = ledger.goal.as_deref().unwrap_or("(no goal recorded)");
     let mut parts = vec![format!("Goal (set by the operator):\n{goal}")];
     // A lead that concluded the goal cannot be met is not asked to prove an impossibility: the verifier is
@@ -464,6 +493,28 @@ pub fn finish_brief(
             })
             .collect();
         parts.push(format!("Lines the lead quotes as support:\n{}", lines.join("\n")));
+
+        if let Some(store) = blobs {
+            let mut included = HashSet::new();
+            let mut contexts = Vec::new();
+            for q in quotes {
+                if !included.insert(&q.blob) {
+                    continue;
+                }
+                if let Ok(bytes) = store.read_all(&q.blob) {
+                    let full = String::from_utf8_lossy(&bytes);
+                    let trimmed = full.trim_end_matches('\n');
+                    let line_count = if trimmed.is_empty() { 0 } else { trimmed.lines().count() };
+                    if line_count > 0 && line_count <= 25 && full.chars().count() <= 1500 {
+                        let body = trimmed.lines().map(|l| format!("  | {l}")).collect::<Vec<_>>().join("\n");
+                        contexts.push(format!("Full output of {} ({line_count} lines):\n{body}", handle_of(&q.blob)));
+                    }
+                }
+            }
+            if !contexts.is_empty() {
+                parts.push(contexts.join("\n\n"));
+            }
+        }
     }
 
     let record = |id: &String| ledger.evidence.iter().find(|e| &e.id == id);
@@ -546,7 +597,8 @@ fn strings_of(v: Option<&Value>) -> Vec<String> {
 const QUOTE_SHAPE: &str = "{handle, start, end, text}";
 
 /// Parse the `quotes` argument; an element of another shape is an error naming its position. A quote
-/// without `text` (absent or `null`) is a quote by lines: its text is empty here.
+/// without `text` (absent or `null`) is a quote by lines: its text is empty here. When `text` is
+/// non-empty, `start` and `end` may both be left out (encoded as `0`) to auto-locate unique matches.
 fn parse_quotes(args: &Map<String, Value>) -> Result<Vec<Quote>, String> {
     let Some(list) = args.get("quotes") else { return Ok(Vec::new()) };
     let Some(list) = list.as_array() else {
@@ -560,12 +612,12 @@ fn parse_quotes(args: &Map<String, Value>) -> Result<Vec<Quote>, String> {
                 None | Some(Value::Null) => String::new(),
                 Some(t) => t.as_str()?.to_string(),
             };
-            Some(Quote {
-                handle: o.get("handle")?.as_str()?.to_string(),
-                start: o.get("start")?.as_u64()?,
-                end: o.get("end")?.as_u64()?,
-                text,
-            })
+            let (start, end) = match (o.get("start"), o.get("end")) {
+                (None | Some(Value::Null), None | Some(Value::Null)) if !text.trim().is_empty() => (0, 0),
+                (Some(s), Some(e)) => (s.as_u64()?, e.as_u64()?),
+                _ => return None,
+            };
+            Some(Quote { handle: o.get("handle")?.as_str()?.to_string(), start, end, text })
         });
         match quote {
             Some(q) => out.push(q),
@@ -667,34 +719,238 @@ impl Finish {
             .with_meta(META_VERIFIED, json!(false))
     }
 
+    /// Validate that concluding `unreachable` is allowed for this role and plan state.
+    fn check_unreachable_allowed(s: &Shared, state: &LedgerState) -> Result<(), String> {
+        if s.role.solvable {
+            let has_blocker = s.role.tools.iter().any(|t| t == "report_blocker");
+            let mut text = texts::conclude_unreachable_refused(has_blocker);
+            let directions = frontier::directions(&frontier::frontier(state, loom_core::now_ms()), 8);
+            text.push_str(&texts::open_routes_block(&directions));
+            return Err(text);
+        }
+        let open = state.open_items().plan;
+        if !open.is_empty() {
+            let mut text = String::from(
+                "conclude `unreachable` cannot be recorded yet: the plan still has open steps, so not every route is closed:",
+            );
+            for id in &open {
+                if let Some(p) = state.plan.iter().find(|p| &p.id == id) {
+                    text.push_str(&format!(
+                        "\n- {} ({}): {}",
+                        p.id,
+                        if p.status == loom_core::ledger::StepStatus::Doing { "doing" } else { "todo" },
+                        cut_chars(&p.text, 120)
+                    ));
+                }
+            }
+            text.push_str("\nClose each route with `step`: status done (say what showed it) or dropped (say why); the ledger is what turns 'unreachable' from an impression into a finding. Then call conclude again.");
+            text.push_str(texts::CONCLUDE_OPEN_ROUTES_TAIL);
+            return Err(text);
+        }
+        Ok(())
+    }
+
+    /// Conclude the goal inline during `finish` when `status` was supplied or `compact_tools` is enabled,
+    /// enforcing the exact same execution-evidence, `solvable`, open-plan, `check_security_coverage`,
+    /// reopened-goal, and `require_oracle` checks as `conclude` before touching the ledger.
+    #[allow(clippy::too_many_arguments)]
+    async fn auto_conclude_on_finish(
+        &self,
+        ctx: &ToolCtx,
+        state: &LedgerState,
+        answer: &str,
+        verified: &[VerifiedQuote],
+        quote_producers: &[Option<super::Producer>],
+        evidence: &mut Vec<String>,
+        status: GoalMetStatus,
+    ) -> Result<LedgerState, Box<ToolOutput>> {
+        let s = &self.0;
+        let err_out = |msg: String| Box::new(ToolOutput::error(msg));
+        if s.mission.is_none() {
+            return Err(err_out(super::NO_MISSION.to_string()));
+        }
+        if let Err(e) = check_security_coverage(state) {
+            return Err(err_out(e));
+        }
+        if status == GoalMetStatus::Refuted {
+            if let Err(e) = Self::check_unreachable_allowed(s, state) {
+                return Err(err_out(e));
+            }
+        }
+        let min_n = state.goal_met.as_ref().filter(|g| g.reopened()).map(|g| g.n).unwrap_or(0);
+        let mut existing_has_fresh_run = false;
+        let mut non_run_labels = Vec::new();
+        let mut non_run_grades = Vec::new();
+        for id in evidence.iter() {
+            let Some(ev) = state.evidence.iter().find(|e| &e.id == id && e.input.attested && e.input.supports) else {
+                return Err(err_out(format!(
+                    "Cannot conclude the goal: `{id}` is not attested supporting evidence in this mission."
+                )));
+            };
+            if ev.input.kind == EvidenceKind::Execution && ev.n > min_n {
+                existing_has_fresh_run = true;
+            } else if ev.input.kind != EvidenceKind::Execution {
+                non_run_labels.push(state.evidence_labels(std::slice::from_ref(id)));
+                non_run_grades.push(ev.input.grade_or_kind());
+            }
+        }
+        let mut quote_has_run = false;
+        for (i, prod_opt) in quote_producers.iter().enumerate() {
+            let Some(prod) = prod_opt else { continue };
+            if prod.grade == EvidenceGrade::Run && prod.class == ToolClass::Exec {
+                quote_has_run = true;
+            } else {
+                non_run_grades.push(prod.grade);
+                if let Some(q) = verified.get(i) {
+                    non_run_labels.push(format!("{} ({}: {})", handle_of(&q.blob), prod.grade.as_str(), prod.tool));
+                }
+            }
+        }
+        if !quote_has_run && !existing_has_fresh_run {
+            if min_n > 0 && verified.is_empty() {
+                return Err(err_out(format!(
+                    "The goal is open again after verifier rejection (entry {min_n}). Run the target again and quote the new run in `quotes` (or cite new run `evidence`), then call `finish`."
+                )));
+            }
+            if non_run_labels.is_empty() {
+                return Err(err_out(
+                    "Concluding the goal in `finish` requires at least one verified `quotes` entry from a command run (or an attested run `evidence` id).".to_string(),
+                ));
+            }
+            let mut msg = format!("None of the cited quotes or evidence is a run: {}.", non_run_labels.join(", "));
+            for grade in [EvidenceGrade::Analysis, EvidenceGrade::Read, EvidenceGrade::Reference] {
+                if non_run_grades.contains(&grade) {
+                    match grade {
+                        EvidenceGrade::Analysis => msg.push_str("\nAnalysis output (a dependency scan, a decompilation, cross-references) describes the target without running it: analysis is not a run."),
+                        EvidenceGrade::Read => msg.push_str("\nReading source or a page does not show what the target does when it runs."),
+                        EvidenceGrade::Reference => msg.push_str("\nReference data (a CVE or advisory record) is about the world, not this target: a lookup is not a run."),
+                        EvidenceGrade::Run => {}
+                    }
+                }
+            }
+            msg.push_str(
+                "\nRun the target, quote that run in `quotes` (or record it with `evidence`), and call `finish` again.",
+            );
+            return Err(err_out(msg));
+        }
+        if status == GoalMetStatus::Supported && s.role.require_oracle && state.release.is_none() {
+            if let Err(oracle_err) = check_mechanical_oracle(s, ctx, state, evidence).await {
+                let verifier = s.role.verifier.as_deref().unwrap_or("");
+                let digest = loom_tools::oracle::contract_digest(ctx).map_err(err_out)?;
+                let mut quote_satisfies_oracle = false;
+                if ctx.sandbox.mode() != loom_core::config::SandboxMode::None && !verifier.is_empty() {
+                    for (vq, prod_opt) in verified.iter().zip(quote_producers) {
+                        if let Some(prod) = prod_opt {
+                            if is_valid_oracle_blob(s, ctx, prod, &vq.blob, verifier, &digest).await.map_err(err_out)? {
+                                quote_satisfies_oracle = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if !quote_satisfies_oracle {
+                    return Err(err_out(oracle_err));
+                }
+            }
+        }
+        if !verified.is_empty() {
+            let summary = cut_chars(answer.trim(), 240);
+            let (_, st) = s.ledger_append(false, LedgerOp::ClaimAdd { text: summary.clone() }).map_err(err_out)?;
+            let claim_id =
+                st.claims.last().map(|c| c.id.clone()).ok_or_else(|| {
+                    err_out("The synthetic claim was not recorded; this is a harness fault.".to_string())
+                })?;
+            for (vq, prod_opt) in verified.iter().zip(quote_producers) {
+                let Some(prod) = prod_opt else { continue };
+                let run = prod.grade == EvidenceGrade::Run && prod.class == ToolClass::Exec;
+                let kind = if run { EvidenceKind::Execution } else { EvidenceKind::Static };
+                let ev_input = EvidenceInput {
+                    claim: claim_id.clone(),
+                    kind,
+                    supports: true,
+                    session: prod.session.clone(),
+                    call_id: prod.call_id.clone(),
+                    blob: Some(vq.blob.clone()),
+                    lines: Some((vq.start, vq.end)),
+                    quote: Some(vq.text.clone()),
+                    note: summary.clone(),
+                    attested: true,
+                    tool: Some(prod.tool.clone()),
+                    grade: Some(prod.grade),
+                };
+                let (_, ev_st) = s.ledger_append(false, LedgerOp::EvidenceAdd(ev_input)).map_err(err_out)?;
+                if let Some(eid) = ev_st.evidence.last().map(|e| e.id.clone()) {
+                    evidence.push(eid);
+                }
+            }
+            s.ledger_append(
+                false,
+                LedgerOp::ClaimUpdate {
+                    id: claim_id,
+                    status: ClaimStatus::Supported,
+                    note: "concluded in finish".to_string(),
+                },
+            )
+            .map_err(err_out)?;
+        }
+        let op = LedgerOp::GoalMetSet { status, note: answer.trim().to_string(), evidence: evidence.clone() };
+        let (_, new_state) = s.ledger_append(false, op).map_err(err_out)?;
+        Ok(new_state)
+    }
+
     /// The lead's result goes through the ledger gate and, when required, an independent verifier. When
     /// verification is required, the result is delivered as finished only after the verifier accepted it.
+    #[allow(clippy::too_many_arguments)]
     async fn finish_lead(
         &self,
         ctx: &ToolCtx,
         args: &Map<String, Value>,
         answer: &str,
         verified: &[VerifiedQuote],
+        quote_producers: &[Option<super::Producer>],
         not_established: Option<&str>,
+        requested_status: Option<GoalMetStatus>,
     ) -> ToolOutput {
         let s = &self.0;
         let mut state = match s.ledger() {
             Ok(st) => st,
             Err(e) => return ToolOutput::error(e),
         };
+        let mut evidence = strings_of(args.get("evidence"));
         // The goal-met pre-gate: the ledger, not prose, decides whether a stop is a deliverable. It refuses
         // in this step, before a finish is recorded, a verifier is started or anything reaches the operator.
         // A role without `conclude` cannot make the conclusion the gate waits for, so it is not gated.
         let has = |tool: &str| s.role.tools.iter().any(|t| t == tool);
         if s.role.termination == Termination::Explicit && has("conclude") && gate::goal_unconcluded(&state) {
-            let tools = finish_tools(&s.role);
-            let directions = frontier::directions(&frontier::frontier(&state, loom_core::now_ms()), 8);
-            let mut text = texts::finish_unavailable(&tools, &directions);
-            if let Some(line) = self.maybe_note_stuck(ctx, &state) {
-                text.push_str(&format!("\n\n{line}"));
+            if requested_status.is_some() || s.agents.compact_tools {
+                let target_status = requested_status.unwrap_or(GoalMetStatus::Supported);
+                state = match self
+                    .auto_conclude_on_finish(
+                        ctx,
+                        &state,
+                        answer,
+                        verified,
+                        quote_producers,
+                        &mut evidence,
+                        target_status,
+                    )
+                    .await
+                {
+                    Ok(st) => st,
+                    Err(out) => return *out,
+                };
+            } else {
+                let tools = finish_tools(&s.role);
+                let directions = frontier::directions(&frontier::frontier(&state, loom_core::now_ms()), 8);
+                let mut text = texts::finish_unavailable(&tools, &directions);
+                if let Some(line) = self.maybe_note_stuck(ctx, &state) {
+                    text.push_str(&format!("\n\n{line}"));
+                }
+                s.emit(Author::Harness, Event::HarnessNote { note: NoteKind::Nudge, text: text.clone() });
+                return ToolOutput::error(text)
+                    .with_more("goal not concluded")
+                    .with_meta(META_REFUSAL, json!(REFUSAL_CEREMONY));
             }
-            s.emit(Author::Harness, Event::HarnessNote { note: NoteKind::Nudge, text: text.clone() });
-            return ToolOutput::error(text);
         }
         let released = state.release.is_some();
         if let Err(e) = check_security_coverage(&state) {
@@ -710,9 +966,10 @@ impl Finish {
                     text.push_str(&format!("\n\n{line}"));
                 }
             }
-            return ToolOutput::error(text);
+            return ToolOutput::error(text)
+                .with_more("open ledger items")
+                .with_meta(META_REFUSAL, json!(REFUSAL_CEREMONY));
         }
-        let evidence = strings_of(args.get("evidence"));
         if state.goal_met.as_ref().is_some_and(|g| g.status == GoalMetStatus::Supported) {
             let mut cited = evidence.clone();
             if let Some(goal) = &state.goal_met {
@@ -754,7 +1011,7 @@ impl Finish {
             let req = SpawnReq {
                 role,
                 mode: SpawnMode::Fresh,
-                brief: finish_brief(&state, answer, verified, not_established, &evidence),
+                brief: finish_brief_with_blobs(&state, answer, verified, not_established, &evidence, Some(&ctx.blobs)),
                 budget: Budget {
                     max_steps: Some(s.agents.child_max_steps),
                     max_minutes: Some(s.agents.child_max_minutes),
@@ -1196,20 +1453,26 @@ fn support_text(not_established: Option<&str>, quotes: &[VerifiedQuote]) -> Stri
 }
 
 /// Every stored output this session produced or opened: the `output` and `of_blob` of its tool results.
-fn outputs_seen(log_path: &std::path::Path) -> HashSet<BlobId> {
+fn outputs_seen_ordered(log_path: &std::path::Path) -> (HashSet<BlobId>, Vec<String>) {
     let mut seen = HashSet::new();
-    let Ok(report) = read_records(log_path) else { return seen };
+    let mut handles = Vec::new();
+    let Ok(report) = read_records(log_path) else { return (seen, handles) };
+    let mut push = |id: BlobId| {
+        if seen.insert(id.clone()) {
+            handles.push(handle_of(&id));
+        }
+    };
     for record in report.records {
         if let Event::ToolResult(r) = record.event {
             if let Some(out) = r.output {
-                seen.insert(out.id);
+                push(out.id);
             }
-            if let Some(of) = r.meta.get(META_OF_BLOB).and_then(Value::as_str) {
-                seen.insert(BlobId(of.to_string()));
+            if let Some(of) = r.meta.get(META_OF_BLOB).and_then(Value::as_str).filter(|s| !s.trim().is_empty()) {
+                push(BlobId(of.to_string()));
             }
         }
     }
-    seen
+    (seen, handles)
 }
 
 /// The outputs (`out:…` handles, as written) that this session's assignment names and that are outputs of the
@@ -1246,13 +1509,15 @@ impl Tool for Finish {
     fn spec(&self) -> ToolSpec {
         spec(
             "finish",
-            "Deliver the result and end the work. This is the only way a result is delivered. `answer` is the result, written for someone who has not seen your work. `quotes` are the lines of stored output that support it. Name them by handle and line numbers and the harness takes their text from the stored output: do this when you have the numbers from `out_read`, `out_grep` or `read`. Otherwise add `text`, copied exactly; it is checked against the stored output and refused if it does not match. `not_established` says what you could not determine or did not check. If the harness refuses the call, it says what is still open; deal with that and call finish again.",
+            "Deliver the result and end the work. This is the only way a result is delivered. `answer` is the result, written for someone who has not seen your work. `quotes` are the lines of stored output that support it. Name them by handle and line numbers and the harness takes their text from the stored output: do this when you have the numbers from `out_read`, `out_grep` or `read`. Otherwise add `text`, copied exactly (line numbers optional when unique); it is checked against the stored output and refused if it does not match. Pass `status` (`met` or `unreachable`) to conclude the goal inline when not yet concluded. `not_established` says what you could not determine or did not check. If the harness refuses the call, it says what is still open; deal with that and call finish again.",
             ToolClass::Terminal,
             &[
                 req("answer", "string", "The result: what was done or found, and how it was confirmed."),
                 opt("quotes", "array", "Supporting lines of stored output: by line numbers, or with the text copied exactly.").with("items", quote_items()),
                 opt("not_established", "string", "What you could not determine, and what you did not check."),
                 opt("evidence", "array", "Ids of ledger evidence records (e1, e2) the result rests on.").items("string"),
+                opt("status", "string", "Optional goal conclusion (`met` or `unreachable`) to record automatically before finishing.")
+                    .one_of(&["met", "unreachable"]),
             ],
         )
     }
@@ -1262,6 +1527,16 @@ impl Tool for Finish {
             _ => {
                 return ToolOutput::error(
                     "finish needs an `answer`: the result, written for someone who has not seen your work. Nothing was delivered.",
+                )
+            }
+        };
+        let requested_status = match str_arg(args, "status").map(str::trim).filter(|s| !s.is_empty()) {
+            None => None,
+            Some("met") => Some(GoalMetStatus::Supported),
+            Some("unreachable") => Some(GoalMetStatus::Refuted),
+            Some(_) => {
+                return ToolOutput::error(
+                    "`status` must be `met` (the goal is achieved) or `unreachable` (it cannot be met as stated).",
                 )
             }
         };
@@ -1280,12 +1555,16 @@ impl Tool for Finish {
             }
         };
         // A quote is attested support, so it comes from an observation, as evidence does.
+        let mut quote_producers = Vec::with_capacity(verified.len());
         if let Some(mission) = self.0.mission.as_ref() {
             for (q, v) in quotes.iter().zip(&verified) {
-                if let Err(text) = super::observed_producer(&self.0, mission, &q.handle, &v.blob).await {
-                    return quote_refused(format!("{text}\nNothing was delivered."));
+                match super::observed_producer(&self.0, mission, &q.handle, &v.blob).await {
+                    Ok(p) => quote_producers.push(Some(p)),
+                    Err(text) => return quote_refused(format!("{text}\nNothing was delivered.")),
                 }
             }
+        } else {
+            quote_producers.resize(verified.len(), None);
         }
         let (jobs, agents) = running_work(&self.0, ctx).await;
         if !jobs.is_empty() || !agents.is_empty() {
@@ -1294,7 +1573,16 @@ impl Tool for Finish {
         if self.0.is_child() {
             self.finish_child(ctx, answer, &verified, str_arg(args, "not_established"))
         } else {
-            self.finish_lead(ctx, args, answer, &verified, str_arg(args, "not_established")).await
+            self.finish_lead(
+                ctx,
+                args,
+                answer,
+                &verified,
+                &quote_producers,
+                str_arg(args, "not_established"),
+                requested_status,
+            )
+            .await
         }
     }
 }
@@ -1329,50 +1617,21 @@ impl Tool for Conclude {
                 )
             }
         };
-        if status == GoalMetStatus::Refuted && s.role.solvable {
-            let has_blocker = s.role.tools.iter().any(|t| t == "report_blocker");
-            let mut text = texts::conclude_unreachable_refused(has_blocker);
-            if let Ok(state) = s.ledger() {
-                let directions = frontier::directions(&frontier::frontier(&state, loom_core::now_ms()), 8);
-                text.push_str(&texts::open_routes_block(&directions));
-            }
-            return ToolOutput::error(text);
-        }
         let state = match s.ledger() {
             Ok(st) => st,
             Err(e) => return ToolOutput::error(e),
         };
+        if status == GoalMetStatus::Refuted {
+            if let Err(text) = Finish::check_unreachable_allowed(s, &state) {
+                return ToolOutput::error(text);
+            }
+        }
         if let Err(e) = check_security_coverage(&state) {
             return ToolOutput::error(e);
         }
         if status == GoalMetStatus::Supported {
             if let Err(e) = check_mechanical_oracle(s, ctx, &state, &strings_of(args.get("evidence"))).await {
                 return ToolOutput::error(e);
-            }
-        }
-        if status == GoalMetStatus::Refuted {
-            let state = match s.ledger() {
-                Ok(st) => st,
-                Err(e) => return ToolOutput::error(e),
-            };
-            let open = state.open_items().plan;
-            if !open.is_empty() {
-                let mut text = String::from(
-                    "conclude `unreachable` cannot be recorded yet: the plan still has open steps, so not every route is closed:",
-                );
-                for id in &open {
-                    if let Some(p) = state.plan.iter().find(|p| &p.id == id) {
-                        text.push_str(&format!(
-                            "\n- {} ({}): {}",
-                            p.id,
-                            if p.status == loom_core::ledger::StepStatus::Doing { "doing" } else { "todo" },
-                            cut_chars(&p.text, 120)
-                        ));
-                    }
-                }
-                text.push_str("\nClose each route with `step`: status done (say what showed it) or dropped (say why); the ledger is what turns 'unreachable' from an impression into a finding. Then call conclude again.");
-                text.push_str(texts::CONCLUDE_OPEN_ROUTES_TAIL);
-                return ToolOutput::error(text);
             }
         }
         let note = str_arg(args, "note").unwrap_or("").trim().to_string();
@@ -1405,7 +1664,7 @@ impl Tool for Verdict {
             &[
                 req("accepted", "boolean", "true only if the claim survived your attempts to refute it."),
                 opt("objections", "array", "What is wrong or unproven. Required when accepted is false.").items("string"),
-                req("opened", "array", "Handles (out:…) of the outputs you examined.").items("string"),
+                opt("opened", "array", "Handles (out:…) of the outputs you examined. Optional when outputs were opened or produced in this session.").items("string"),
                 opt("harm_is_mechanism_only", "boolean", "True when only a mechanism was observed and the claimed harm was not established."),
                 opt("target_was_modified", "boolean", "True when the solver modified the target used to establish success."),
                 opt("static_only", "boolean", "True when the claimed execution outcome has only static evidence."),
@@ -1475,7 +1734,17 @@ impl Tool for Verdict {
                 return ToolOutput::error("Every verdict evidence ID must name an attested record in this mission; record the observation first.");
             }
         }
-        let opened = strings_of(args.get("opened"));
+        let (seen, seen_handles) = outputs_seen_ordered(&s.log_path);
+        let mut opened = strings_of(args.get("opened"));
+        if opened.is_empty() {
+            let mut auto = Vec::new();
+            for h in seen_handles {
+                if outputs::open(ctx, &h).await.is_ok() {
+                    auto.push(h);
+                }
+            }
+            opened = auto;
+        }
         if opened.is_empty() {
             return ToolOutput::error(
                 "List in `opened` the outputs you examined (their out:… handles). A verdict that examined nothing is not a verdict.",
@@ -1488,7 +1757,6 @@ impl Tool for Verdict {
             return ToolOutput::error(running_verdict_refusal(&s.role, &jobs));
         }
 
-        let seen = outputs_seen(&s.log_path);
         for handle in &opened {
             let known = outputs::open(ctx, handle).await.ok().is_some_and(|id| seen.contains(&id));
             if !known {
@@ -2000,8 +2268,8 @@ mod tests {
             assert_eq!(delivery.payload["accepted"], false);
             assert!(!delivery.payload["objections"].as_array().unwrap().is_empty());
         }
-        let (r, _, _) = verifier_with_log();
-        let missing = r.call("verdict", json!({"accepted":true,"target_was_modified":true,"opened":[]})).await;
+        let r_empty = rig("verifier", true, false);
+        let missing = r_empty.call("verdict", json!({"accepted":true,"target_was_modified":true,"opened":[]})).await;
         assert_eq!(missing.status, Status::Error);
         assert!(missing.text.contains("examined nothing"));
     }
@@ -2319,12 +2587,12 @@ mod tests {
             "{}",
             d.report
         );
-        // A range that is not the output's is refused as any quote is, and nothing is delivered.
+        // A range past the end auto-clamps `end`, while `start > total_lines` is refused and emits REFUSAL_QUOTE.
         let r = rig("worker", true, true);
         let h = r.output(out, "bash", ToolClass::Exec);
-        let res = r.call("finish", json!({"answer": "done", "quotes": [{"handle": h, "start": 4, "end": 9}]})).await;
+        let res = r.call("finish", json!({"answer": "done", "quotes": [{"handle": h, "start": 6, "end": 9}]})).await;
         assert_eq!(res.status, Status::Error, "{}", res.text);
-        assert!(res.text.contains("end 9 is past its end"), "{}", res.text);
+        assert!(res.text.contains("start 6 is past its end"), "{}", res.text);
         assert!(
             res.text.contains("Nothing was delivered. These are mechanical fixes, not findings about the work"),
             "{}",
@@ -2332,6 +2600,9 @@ mod tests {
         );
         assert_eq!(res.meta.get(META_REFUSAL), Some(&json!(REFUSAL_QUOTE)));
         assert!(effect(&r).is_none());
+        let clamped =
+            r.call("finish", json!({"answer": "done", "quotes": [{"handle": h, "start": 4, "end": 9}]})).await;
+        assert_eq!(clamped.status, Status::Ok, "{}", clamped.text);
         // It is an observation or it is no quote: the producer rule applies to it too.
         let own = r.output("#12 you: All 212 tests pass\n", "log_search", ToolClass::Read);
         let res = r.call("finish", json!({"answer": "done", "quotes": [{"handle": own, "start": 1, "end": 1}]})).await;
@@ -2881,7 +3152,7 @@ mod tests {
         let res = r.call("finish", json!({"answer": "Parser fixed, really."})).await;
         assert_eq!(res.status, Status::Error, "{}", res.text);
         assert!(res.text.contains("finish is not available yet: the goal is not concluded"), "{}", res.text);
-        assert!(!res.meta.contains_key(META_REFUSAL), "the gate is neither a quote nor a verifier");
+        assert_eq!(res.meta.get(META_REFUSAL), Some(&json!(REFUSAL_CEREMONY)), "pre-gate refusal is ceremony");
         assert!(r.shared.take_fresh_start().is_none());
         assert_eq!(spawn_count(&r), 1);
         // The run the rejected result rested on does not conclude the goal a second time.
@@ -3608,7 +3879,10 @@ mod tests {
         assert!(res.text.contains("needs at least one objection"), "{}", res.text);
         let res = r.call("verdict", json!({"accepted": true, "objections": ["x"], "opened": [produced]})).await;
         assert!(res.text.contains("accepted: true cannot come with objections"), "{}", res.text);
-        let res = r.call("verdict", json!({"accepted": true, "opened": []})).await;
+        let empty = rig("verifier", true, false);
+        let res = empty.call("verdict", json!({"accepted": true, "opened": []})).await;
+        assert!(res.text.contains("A verdict that examined nothing is not a verdict."), "{}", res.text);
+        let res = empty.call("verdict", json!({"accepted": true})).await;
         assert!(res.text.contains("A verdict that examined nothing is not a verdict."), "{}", res.text);
         let res = r.call("verdict", json!({"accepted": true, "opened": ["out:deadbeef00"]})).await;
         assert!(
@@ -4327,5 +4601,243 @@ mod tests {
             ctx_text.contains(&format!("Claims recorded as supported:\n- c1: the parser is fixed\n  {line}")),
             "{ctx_text}"
         );
+    }
+
+    #[tokio::test]
+    async fn finish_auto_concludes_with_explicit_status_and_respects_conclude_rules() {
+        // Analysis-only quote + explicit status: "met" is refused before touching the ledger.
+        let r = lead_with_goal();
+        let h_scan =
+            r.output_graded("RUSTSEC-2020-0071 reachable\n", "dep_scan", ToolClass::Exec, EvidenceGrade::Analysis);
+        let bad = r
+            .call(
+                "finish",
+                json!({
+                    "answer": "Found via scan",
+                    "status": "met",
+                    "quotes": [{"handle": h_scan, "text": "RUSTSEC-2020-0071 reachable"}]
+                }),
+            )
+            .await;
+        assert_eq!(bad.status, Status::Error, "{}", bad.text);
+        assert!(bad.text.contains("None of the cited quotes or evidence is a run"), "{}", bad.text);
+        assert!(gate::goal_unconcluded(&r.shared.ledger().unwrap()));
+        assert!(r.shared.ledger().unwrap().claims.is_empty());
+
+        // Solvable pack refuses status: "unreachable" even with a valid Run quote.
+        let mut solvable = core_role("lead");
+        solvable.solvable = true;
+        let r_sol = rig_with(solvable, false, true, Default::default());
+        r_sol.user_op(LedgerOp::GoalSet { text: "solvable goal".into() });
+        let h_sol_run = r_sol.output("cargo test: ok, 4 passed\n", "bash", ToolClass::Exec);
+        let unreach = r_sol
+            .call(
+                "finish",
+                json!({
+                    "answer": "Cannot do it",
+                    "status": "unreachable",
+                    "quotes": [{"handle": h_sol_run, "text": "cargo test: ok, 4 passed"}]
+                }),
+            )
+            .await;
+        assert_eq!(unreach.status, Status::Error, "{}", unreach.text);
+        assert!(unreach.text.contains("the operator set it up as solvable"), "{}", unreach.text);
+        assert!(gate::goal_unconcluded(&r_sol.shared.ledger().unwrap()));
+
+        // Valid Run quote (omitting start/end!) + status: "met" concludes, verifies, and delivers.
+        let h_run = r.output("cargo test: ok, 4 passed\n", "bash", ToolClass::Exec);
+        r.orch.settle("s-kid1", ChildOutcome::Returned, "verified", accepted_payload());
+        let ok = r
+            .call(
+                "finish",
+                json!({
+                    "answer": "All 4 parser tests pass.",
+                    "status": "met",
+                    "quotes": [{"handle": h_run, "text": "cargo test: ok, 4 passed"}]
+                }),
+            )
+            .await;
+        assert_eq!(ok.status, Status::Ok, "{}", ok.text);
+        let st = r.shared.ledger().unwrap();
+        assert_eq!(st.goal_met.as_ref().map(|g| g.status), Some(GoalMetStatus::Supported));
+        assert!(st.open_items().is_empty());
+        assert_eq!(st.evidence.len(), 1);
+        assert_eq!(st.evidence[0].input.kind, EvidenceKind::Execution);
+
+        // Unsolvable pack refuses status: "unreachable" while plan has open steps, then succeeds once closed.
+        let mut unsolvable = core_role("lead");
+        unsolvable.solvable = false;
+        let r_uns = rig_with(unsolvable, false, true, Default::default());
+        r_uns.user_op(LedgerOp::GoalSet { text: "prove impossible".into() });
+        r_uns.model_op(LedgerOp::PlanSet { steps: vec!["try route A".into()] });
+        let h_fail = r_uns.output("route A returned 403\n", "bash", ToolClass::Exec);
+        let ref_open = r_uns
+            .call(
+                "finish",
+                json!({
+                    "answer": "Cannot reach target",
+                    "status": "unreachable",
+                    "quotes": [{"handle": h_fail, "text": "route A returned 403"}]
+                }),
+            )
+            .await;
+        assert_eq!(ref_open.status, Status::Error, "{}", ref_open.text);
+        assert!(ref_open.text.contains("open steps"), "{}", ref_open.text);
+
+        r_uns.model_op(LedgerOp::PlanUpdate {
+            id: "p1".into(),
+            status: loom_core::ledger::StepStatus::Dropped,
+            note: "blocked by 403".into(),
+            evidence: vec![],
+        });
+        r_uns.orch.settle("s-kid1", ChildOutcome::Returned, "verified", accepted_payload());
+        let ref_ok = r_uns
+            .call(
+                "finish",
+                json!({
+                    "answer": "Route A failed with 403",
+                    "status": "unreachable",
+                    "quotes": [{"handle": h_fail, "text": "route A returned 403"}]
+                }),
+            )
+            .await;
+        assert_eq!(ref_ok.status, Status::Ok, "{}", ref_ok.text);
+        assert_eq!(r_uns.shared.ledger().unwrap().goal_met.as_ref().map(|g| g.status), Some(GoalMetStatus::Refuted));
+
+        // Mechanical oracle rule still enforced on require_oracle: true roles.
+        let r_ora = oracle_rig();
+        r_ora.user_op(LedgerOp::GoalSet { text: "capture oracle flag".into() });
+        let digest = oracle_contract(&r_ora);
+        let h_bash = r_ora.output("local run passed\n", "bash", ToolClass::Exec);
+        let no_ora = r_ora
+            .call(
+                "finish",
+                json!({
+                    "answer": "Done without oracle",
+                    "status": "met",
+                    "quotes": [{"handle": h_bash, "text": "local run passed"}]
+                }),
+            )
+            .await;
+        assert_eq!(no_ora.status, Status::Error, "{}", no_ora.text);
+        assert!(no_ora.text.contains("mechanically established"), "{}", no_ora.text);
+        assert!(gate::goal_unconcluded(&r_ora.shared.ledger().unwrap()));
+
+        // Passing oracle_check receipt quote from the named verifier succeeds directly in finish.
+        let body = json!({"passed": true, "contract_sha256": digest}).to_string();
+        let blob = r_ora.env.ctx.blobs.put_bytes(body.as_bytes()).unwrap();
+        r_ora.orch.produced(&blob, "s-ver1", "ora-call", "oracle_check", ToolClass::Exec);
+        r_ora.orch.running_child("s-ver1", "verifier");
+        r_ora.orch.children.lock().unwrap().iter_mut().for_each(|c| c.running = false);
+        let with_ora = r_ora
+            .call(
+                "finish",
+                json!({
+                    "answer": "Oracle passed",
+                    "status": "met",
+                    "quotes": [{"handle": blob.handle(), "start": 1, "end": 1}]
+                }),
+            )
+            .await;
+        assert_eq!(with_ora.status, Status::Ok, "{}", with_ora.text);
+    }
+
+    #[tokio::test]
+    async fn finish_auto_concludes_on_compact_tools_and_tags_ceremony_refusals() {
+        // With compact_tools = false and status omitted: goal_unconcluded refuses with REFUSAL_CEREMONY.
+        let r_std = lead_with_goal();
+        let h_std = r_std.output("ok\n", "bash", ToolClass::Exec);
+        let pre =
+            r_std.call("finish", json!({"answer": "Done", "quotes": [{"handle": h_std, "start": 1, "end": 1}]})).await;
+        assert_eq!(pre.status, Status::Error);
+        assert!(pre.text.contains("goal is not concluded"), "{}", pre.text);
+        assert_eq!(pre.meta.get(META_REFUSAL), Some(&json!(REFUSAL_CEREMONY)));
+
+        // Once concluded, an open claim causes check_finish_lead refusal tagged REFUSAL_CEREMONY.
+        conclude_met(&r_std).await;
+        r_std.model_op(LedgerOp::ClaimAdd { text: "left open".into() });
+        let open_ref = r_std.call("finish", json!({"answer": "Done"})).await;
+        assert_eq!(open_ref.status, Status::Error);
+        assert_eq!(open_ref.meta.get(META_REFUSAL), Some(&json!(REFUSAL_CEREMONY)));
+
+        // With compact_tools = true and status omitted: auto-concludes Supported when run quote is given.
+        let r_compact = lead_with_goal_cfg(loom_core::config::AgentsCfg { compact_tools: true, ..Default::default() });
+        let h_run = r_compact.output("build succeeded\n", "bash", ToolClass::Exec);
+        r_compact.orch.settle("s-kid1", ChildOutcome::Returned, "verified", accepted_payload());
+        let ok = r_compact
+            .call(
+                "finish",
+                json!({"answer": "Fixed and built", "quotes": [{"handle": h_run, "text": "build succeeded"}]}),
+            )
+            .await;
+        assert_eq!(ok.status, Status::Ok, "{}", ok.text);
+        assert_eq!(
+            r_compact.shared.ledger().unwrap().goal_met.as_ref().map(|g| g.status),
+            Some(GoalMetStatus::Supported)
+        );
+    }
+
+    #[tokio::test]
+    async fn finish_brief_includes_short_blob_full_context_and_skips_long_blobs() {
+        let r = lead_with_goal();
+        let short_body = "line 1\nline 2\nline 3\n";
+        let short_blob = r.env.ctx.blobs.put_bytes(short_body.as_bytes()).unwrap();
+        let long_lines: String = (1..=26).map(|i| format!("row {i}\n")).collect();
+        let long_blob = r.env.ctx.blobs.put_bytes(long_lines.as_bytes()).unwrap();
+
+        let state = r.shared.ledger().unwrap();
+        let brief = finish_brief_with_blobs(
+            &state,
+            "summary",
+            &[
+                crate::gate::VerifiedQuote { blob: short_blob.id.clone(), start: 2, end: 2, text: "line 2".into() },
+                crate::gate::VerifiedQuote { blob: long_blob.id.clone(), start: 1, end: 1, text: "row 1".into() },
+            ],
+            None,
+            &[],
+            Some(&r.env.ctx.blobs),
+        );
+        let ctx_text = brief.context.unwrap();
+        assert!(ctx_text.contains(&format!("- {} lines 2-2: line 2", short_blob.handle())), "{ctx_text}");
+        assert!(
+            ctx_text.contains(&format!(
+                "Full output of {} (3 lines):\n  | line 1\n  | line 2\n  | line 3",
+                short_blob.handle()
+            )),
+            "{ctx_text}"
+        );
+        assert!(!ctx_text.contains(&format!("Full output of {}", long_blob.handle())), "{ctx_text}");
+    }
+
+    #[tokio::test]
+    async fn verdict_auto_populates_opened_from_log_and_enforces_assignments() {
+        let (r, produced, viewed) = verifier_with_log();
+        // Omitting `opened` auto-populates from the session log.
+        let res = r.call("verdict", json!({"accepted": true})).await;
+        assert_eq!(res.status, Status::Ok, "{}", res.text);
+        let Some(Effect::Settle(delivery)) = effect(&r) else { panic!("settle expected") };
+        let opened = delivery.payload["opened"].as_array().unwrap();
+        let opened_strs: Vec<&str> = opened.iter().filter_map(Value::as_str).collect();
+        assert!(opened_strs.contains(&produced.as_str()), "{opened_strs:?}");
+        assert!(opened_strs.contains(&viewed.as_str()), "{opened_strs:?}");
+
+        // Passing `opened: []` also auto-populates from non-empty session log.
+        let (r2, _, _) = verifier_with_log();
+        let res2 = r2.call("verdict", json!({"accepted": true, "opened": []})).await;
+        assert_eq!(res2.status, Status::Ok, "{}", res2.text);
+
+        // Assignment naming an output NOT in the verifier's opened log still fails even when `opened` is omitted.
+        let (r3, _, _) = verifier_with_log();
+        let parent_blob = r3.env.ctx.blobs.put_bytes(b"parent evidence\n").unwrap();
+        r3.orch.in_scope(&parent_blob.id);
+        let (mut log, _) = SessionLog::open(&r3.shared.log_path, Durability::Batch).unwrap();
+        log.append(
+            Author::Harness,
+            Event::HarnessNote { note: NoteKind::Assignment, text: format!("Check {}", parent_blob.handle()) },
+        )
+        .unwrap();
+        let missing_assign = r3.call("verdict", json!({"accepted": true})).await;
+        assert_eq!(missing_assign.status, Status::Error);
+        assert!(missing_assign.text.contains("Your assignment names outputs to examine"), "{}", missing_assign.text);
     }
 }

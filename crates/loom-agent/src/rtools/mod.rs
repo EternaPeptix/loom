@@ -576,12 +576,18 @@ pub fn tool(name: &str, shared: &Arc<Shared>) -> Option<Arc<dyn loom_tools::Tool
 }
 
 /// The session's tools, in the order of the role's tool list: built-in tools from
-/// `Registry::builtin()`, runtime tools from [`tool`]. A name that is neither is an error.
+/// `Registry::builtin()`, runtime tools from [`tool`]. When `default_shell == Some("box")`, `bash`
+/// routes to [`boxtools::BoxBash`] instead of the host `bash` tool. A name that is neither is an error.
 pub fn build_registry(shared: &Arc<Shared>) -> Result<Registry, String> {
     let builtin = Registry::builtin();
     let mut registry = Registry::new();
     for name in &shared.role.tools {
-        match builtin.get(name).or_else(|| tool(name, shared)) {
+        let found = if name == "bash" && shared.role.default_shell.as_deref() == Some("box") {
+            Some(Arc::new(boxtools::BoxBash(shared.clone())) as Arc<dyn loom_tools::Tool>)
+        } else {
+            builtin.get(name).or_else(|| tool(name, shared))
+        };
+        match found {
             Some(t) => registry.add(t),
             None => {
                 return Err(format!(

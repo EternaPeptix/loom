@@ -61,6 +61,7 @@ pub use loom_tools::boxctl::BOX_CLOSED;
 const LISTED: usize = 20;
 
 pub struct BoxExec(pub Arc<Shared>);
+pub struct BoxBash(pub Arc<Shared>);
 pub struct BoxGet(pub Arc<Shared>);
 pub struct BoxReset(pub Arc<Shared>);
 
@@ -129,6 +130,19 @@ impl Tool for BoxExec {
             out = out.with_more(notice);
         }
         out
+    }
+}
+
+#[async_trait]
+impl Tool for BoxBash {
+    fn spec(&self) -> ToolSpec {
+        let mut s = BoxExec(self.0.clone()).spec();
+        s.name = "bash".to_string();
+        s
+    }
+
+    async fn run(&self, ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
+        BoxExec(self.0.clone()).run(ctx, args).await
     }
 }
 
@@ -556,5 +570,42 @@ mod tests {
         assert_eq!(container_path("/etc/hosts").unwrap(), "/etc/hosts");
         assert!(container_path("/work/dir/.").is_err(), "no `.` component anywhere");
         assert!(container_path("").is_err() && container_path("/").is_err() && container_path("a\0b").is_err());
+    }
+
+    #[tokio::test]
+    async fn default_shell_box_routes_bash_to_box_bash() {
+        use crate::rtools::testkit::{core_role, rig_with};
+        use loom_core::config::AgentsCfg;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeDocker::new(dir.path());
+        let mut role = core_role("worker");
+        role.default_shell = Some("box".into());
+        let rig = rig_with(role, false, false, AgentsCfg::default());
+        let b = MissionBox::new(fake.host(), "m-test", source(&[]));
+        *rig.orch.boxed.lock().unwrap() = Some(Ok(b));
+
+        assert_eq!(rig.registry.get("bash").unwrap().spec().name, "bash");
+        assert_eq!(rig.registry.get("bash").unwrap().spec().class, ToolClass::Exec);
+        let r = rig.call("bash", json!({"cmd": "echo in-the-box", "timeout_s": 20})).await;
+        assert_eq!(r.status, ToolStatus::Ok, "{}", r.text);
+        assert!(header(&r).starts_with("[bash · exit 0 · in box loom-m-test"), "{}", header(&r));
+        assert!(r.text.contains("in-the-box"), "{}", r.text);
+        assert!(!fake.sub("exec").is_empty());
+
+        // Host default_shell (or None) keeps host bash and never touches the box.
+        let mut host_role = core_role("worker");
+        host_role.default_shell = Some("host".into());
+        let host_rig = rig_with(host_role, false, false, AgentsCfg::default());
+        let r = host_rig.call("bash", json!({"command": "echo on-host"})).await;
+        assert_eq!(r.status, ToolStatus::Ok, "{}", r.text);
+        assert!(!header(&r).contains("in box"), "{}", header(&r));
+
+        // A role without `bash` in `tools` does not get `bash` even when `default_shell = "box"`.
+        let mut no_bash = core_role("worker");
+        no_bash.default_shell = Some("box".into());
+        no_bash.tools.retain(|t| t != "bash");
+        let no_bash_rig = rig_with(no_bash, false, false, AgentsCfg::default());
+        assert!(no_bash_rig.registry.get("bash").is_none());
     }
 }

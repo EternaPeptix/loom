@@ -377,6 +377,76 @@ fn workspace_param() -> Param {
     .default(json!("shared"))
 }
 
+fn role_synonym(requested: &str) -> Option<&'static str> {
+    match requested {
+        "judge" => Some("verifier"),
+        "subagent" | "coder" => Some("worker"),
+        "researcher" => Some("lead"),
+        _ => None,
+    }
+}
+
+/// Resolve a common role synonym against `shared.role.may_spawn` only when the requested role
+/// is absent from `may_spawn` and its synonym is present. Returns the header note if rewritten.
+fn resolve_role_synonym(shared: &Shared, fields: &mut Map<String, Value>) -> Option<String> {
+    let requested = fields.get("role").and_then(Value::as_str)?;
+    if requested.trim().is_empty() {
+        return None;
+    }
+    let may = &shared.role.may_spawn;
+    if may.iter().any(|m| m == requested) {
+        return None;
+    }
+    let syn = role_synonym(requested)?;
+    if may.iter().any(|m| m == syn) {
+        let req_owned = requested.to_string();
+        fields.insert("role".to_string(), Value::String(syn.to_string()));
+        Some(format!("role alias: `{req_owned}` -> `{syn}`"))
+    } else {
+        None
+    }
+}
+
+fn parse_positive_steps(v: &Value) -> Result<u32, String> {
+    let parsed = v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()));
+    parsed
+        .and_then(|n| u32::try_from(n).ok())
+        .filter(|&n| n >= 1)
+        .ok_or_else(|| "`max_steps` must be a positive integer.".to_string())
+}
+
+struct NormalizedFanoutItem {
+    fields: Map<String, Value>,
+    item_steps: Option<u32>,
+    role_note: Option<String>,
+}
+
+/// Normalize one element of `agent_fanout`'s `agents` array (`task`/`prompt` -> `question`,
+/// per-item `max_steps`/`steps`, and role synonyms).
+fn normalize_fanout_item(shared: &Shared, object: &Map<String, Value>) -> Result<NormalizedFanoutItem, String> {
+    let mut fields = object.clone();
+    let missing_question =
+        fields.get("question").is_none_or(|v| v.is_null() || v.as_str().is_some_and(|s| s.trim().is_empty()));
+    if missing_question {
+        for alias in ["task", "prompt"] {
+            if let Some(v) = fields.remove(alias) {
+                if !v.is_null() {
+                    fields.insert("question".to_string(), v);
+                    break;
+                }
+            }
+        }
+    }
+    let raw_max_steps = fields.remove("max_steps").filter(|v| !v.is_null());
+    let raw_steps = fields.remove("steps").filter(|v| !v.is_null());
+    let item_steps = match raw_max_steps.or(raw_steps) {
+        Some(v) => Some(parse_positive_steps(&v)?),
+        None => None,
+    };
+    let role_note = resolve_role_synonym(shared, &mut fields);
+    Ok(NormalizedFanoutItem { fields, item_steps, role_note })
+}
+
 /// Read one assignment object. See the module contract.
 pub fn assignment(shared: &Shared, object: &Map<String, Value>) -> Result<(String, Brief), String> {
     const KEYS: [&str; 10] =
@@ -558,11 +628,12 @@ impl Tool for AgentSpawn {
     }
     async fn run(&self, ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
         let shared = &*self.0;
-        let fields: Map<String, Value> = args
+        let mut fields: Map<String, Value> = args
             .iter()
             .filter(|(k, _)| !matches!(k.as_str(), "mode" | "max_steps" | "max_minutes" | "background" | "workspace"))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
+        let role_note = resolve_role_synonym(shared, &mut fields);
         let (role, brief) = match assignment(shared, &fields) {
             Ok(a) => a,
             Err(e) => return ToolOutput::error(e),
@@ -596,6 +667,9 @@ impl Tool for AgentSpawn {
                     "Agent {id} ({role}) is working. Its report will arrive as a harness message when it ends. Call `wait` when you have nothing else to do until then.{copy}"
                 )),
             );
+            if let Some(note) = role_note {
+                out = out.with_more(note);
+            }
             if let Some(fact) = lowered {
                 out = out.with_more(fact);
             }
@@ -617,6 +691,9 @@ impl Tool for AgentSpawn {
             ToolOutput::ok(format!("agent {id} {}", outcome_word(settlement.outcome)), Body::Raw(body.into_bytes()))
                 .with_more(settlement.role.clone())
                 .with_more(format!("{} steps", settlement.steps));
+        if let Some(note) = role_note {
+            out = out.with_more(note);
+        }
         if let Some(fact) = lowered {
             out = out.with_more(fact);
         }
@@ -630,7 +707,9 @@ impl Tool for AgentSpawn {
 #[async_trait]
 impl Tool for AgentFanout {
     fn spec(&self) -> ToolSpec {
-        let items = loom_tools::params::object(&assignment_params());
+        let mut item_params = assignment_params();
+        item_params.push(opt("max_steps", "integer", "The most model steps this agent may take.").min(1));
+        let items = loom_tools::params::object(&item_params);
         spec(
             "agent_fanout",
             "Give several independent assignments to agents that work at the same time, and get all their reports in one result. Use it when the pieces do not depend on each other. Each element of `agents` is one assignment with the same fields as agent_spawn.",
@@ -659,15 +738,26 @@ impl Tool for AgentFanout {
         }
         let mut parsed = Vec::new();
         let mut errors = Vec::new();
+        let mut role_notes: Vec<String> = Vec::new();
         for (i, item) in items.iter().enumerate() {
             let number = i.saturating_add(1);
             let result = match item.as_object() {
-                Some(object) => assignment(shared, object)
-                    .and_then(|(role, brief)| prerequisite(shared, object).map(|p| (role, brief, p))),
+                Some(object) => normalize_fanout_item(shared, object).and_then(|norm| {
+                    assignment(shared, &norm.fields).and_then(|(role, brief)| {
+                        prerequisite(shared, &norm.fields).map(|p| (role, brief, p, norm.item_steps, norm.role_note))
+                    })
+                }),
                 None => Err(format!("must be an assignment object; received {}.", describe(item))),
             };
             match result {
-                Ok(a) => parsed.push(a),
+                Ok((role, brief, p, item_steps, note)) => {
+                    if let Some(n) = note {
+                        if !role_notes.contains(&n) {
+                            role_notes.push(n);
+                        }
+                    }
+                    parsed.push((role, brief, p, item_steps));
+                }
                 Err(e) => errors.push(format!("agents[{number}]: {e}")),
             }
         }
@@ -688,10 +778,19 @@ impl Tool for AgentFanout {
             Ok(w) => w,
             Err(e) => return ToolOutput::error(e),
         };
-        let (budget, lowered) = budget_for(shared, args);
+        let (base_budget, mut lowered) = budget_for(shared, args);
+        let ceiling_steps = shared.agents.child_max_steps;
+        let ceiling_minutes = shared.agents.child_max_minutes;
         let mut started: Vec<SessionId> = Vec::new();
-        for (role, brief, prerequisite) in parsed {
-            let mut req = request(ctx, role, SpawnMode::Fresh, brief, budget.clone(), true);
+        for (role, brief, prerequisite, item_steps) in parsed {
+            let mut budget = base_budget.clone();
+            if let Some(steps) = item_steps {
+                if steps > ceiling_steps && lowered.is_none() {
+                    lowered = Some(format!("budget lowered to {ceiling_steps} steps / {ceiling_minutes} min"));
+                }
+                budget.max_steps = Some(steps.min(ceiling_steps));
+            }
+            let mut req = request(ctx, role, SpawnMode::Fresh, brief, budget, true);
             req.prerequisite = prerequisite;
             req.workspace = workspace;
             match shared.orch.spawn(&shared.session, req).await {
@@ -767,6 +866,9 @@ impl Tool for AgentFanout {
             format!("{n} agents: {}", parts.join(", "))
         };
         let mut out = ToolOutput::ok(outcome, Body::Raw(body.into_bytes()));
+        for note in role_notes {
+            out = out.with_more(note);
+        }
         if let Some(fact) = lowered {
             out = out.with_more(fact);
         }
@@ -2538,5 +2640,119 @@ mod tests {
         assert!(res.text.contains("ran-one"), "{}", res.text);
         assert!(res.text.contains("first attempt checkable report"), "{}", res.text);
         assert!(res.text.contains("second attempt report"), "{}", res.text);
+    }
+
+    #[tokio::test]
+    async fn fanout_accepts_prompt_aliases_and_per_item_max_steps() {
+        let cfg = AgentsCfg { child_max_steps: 10, child_max_minutes: 5, ..AgentsCfg::default() };
+        let mut role = core_role("lead");
+        role.may_spawn = vec!["worker".into(), "verifier".into()];
+        let r = rig_with(role, false, true, cfg.clone());
+
+        // Calling through `r.call` exercises schema validation and normalization end-to-end.
+        let res = r
+            .call(
+                "agent_fanout",
+                json!({
+                    "max_steps": 8,
+                    "agents": [
+                        {"task": "check module A", "steps": 3},
+                        {"prompt": "check module B", "max_steps": cfg.child_max_steps + 25, "role": "judge"}
+                    ]
+                }),
+            )
+            .await;
+        assert_eq!(res.status, ToolStatus::Ok, "{}", res.text);
+        assert!(
+            res.text
+                .contains(&format!("budget lowered to {} steps / {} min", cfg.child_max_steps, cfg.child_max_minutes)),
+            "{}",
+            res.text
+        );
+        assert!(res.text.contains("role alias: `judge` -> `verifier`"), "{}", res.text);
+        let reqs = spawned(&r);
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[0].brief.question, "check module A");
+        assert_eq!(reqs[0].role, "worker");
+        assert_eq!(reqs[0].budget.max_steps, Some(3));
+        assert_eq!(reqs[1].brief.question, "check module B");
+        assert_eq!(reqs[1].role, "verifier");
+        assert_eq!(reqs[1].budget.max_steps, Some(cfg.child_max_steps));
+
+        // Calling Tool::run directly proves AgentFanout itself handles task/prompt/steps/max_steps.
+        let tool = AgentFanout(r.shared.clone());
+        let direct = tool
+            .run(
+                &r.env.ctx,
+                &obj(json!({
+                    "agents": [
+                        {"task": "direct task", "steps": 2, "role": "coder"},
+                        {"prompt": "direct prompt", "max_steps": 4, "role": "subagent"}
+                    ]
+                })),
+            )
+            .await;
+        assert_eq!(direct.status, ToolStatus::Ok, "{:?}", direct.body);
+        assert!(direct.more.iter().any(|m| m == "role alias: `coder` -> `worker`"), "{:?}", direct.more);
+        assert!(direct.more.iter().any(|m| m == "role alias: `subagent` -> `worker`"), "{:?}", direct.more);
+        let reqs = spawned(&r);
+        assert_eq!(reqs.len(), 4);
+        assert_eq!(reqs[2].brief.question, "direct task");
+        assert_eq!(reqs[2].role, "worker");
+        assert_eq!(reqs[2].budget.max_steps, Some(2));
+        assert_eq!(reqs[3].brief.question, "direct prompt");
+        assert_eq!(reqs[3].role, "worker");
+        assert_eq!(reqs[3].budget.max_steps, Some(4));
+
+        // Non-positive per-item steps fail validation cleanly before spawning anything.
+        let bad = tool
+            .run(
+                &r.env.ctx,
+                &obj(json!({
+                    "agents": [
+                        {"task": "ok", "steps": 2},
+                        {"prompt": "bad", "max_steps": 0}
+                    ]
+                })),
+            )
+            .await;
+        assert_eq!(bad.status, ToolStatus::Error);
+        assert_eq!(spawned(&r).len(), 4);
+    }
+
+    #[tokio::test]
+    async fn role_synonyms_resolve_only_when_needed_and_permitted() {
+        // On a standard lead (may_spawn: worker, verifier): judge->verifier, coder/subagent->worker;
+        // researcher->lead is NOT resolved because lead is not in may_spawn.
+        let r = lead();
+        let res = r.call("agent_spawn", json!({"question": "verify x", "role": "judge"})).await;
+        assert_eq!(res.status, ToolStatus::Ok, "{}", res.text);
+        assert!(res.text.contains("role alias: `judge` -> `verifier`"), "{}", res.text);
+        assert_eq!(spawned(&r)[0].role, "verifier");
+
+        let res = r.call("agent_spawn", json!({"question": "code y", "role": "coder"})).await;
+        assert_eq!(res.status, ToolStatus::Ok, "{}", res.text);
+        assert!(res.text.contains("role alias: `coder` -> `worker`"), "{}", res.text);
+        assert_eq!(spawned(&r)[1].role, "worker");
+
+        let res = r.call("agent_spawn", json!({"question": "research z", "role": "researcher"})).await;
+        assert_eq!(res.status, ToolStatus::Error, "{}", res.text);
+        assert!(res.text.contains("`researcher` is not one of them"), "{}", res.text);
+
+        // When `lead` IS in may_spawn, `researcher` resolves to `lead`.
+        let mut parent = core_role("lead");
+        parent.may_spawn = vec!["lead".into(), "judge".into(), "verifier".into()];
+        let r_custom = rig_with(parent, false, true, AgentsCfg::default());
+
+        let res = r_custom.call("agent_spawn", json!({"question": "dig deep", "role": "researcher"})).await;
+        assert_eq!(res.status, ToolStatus::Ok, "{}", res.text);
+        assert!(res.text.contains("role alias: `researcher` -> `lead`"), "{}", res.text);
+        assert_eq!(spawned(&r_custom)[0].role, "lead");
+
+        // When the requested role itself IS in may_spawn (`judge` here), it must NOT be rewritten.
+        let res = r_custom.call("agent_spawn", json!({"question": "keep exact", "role": "judge"})).await;
+        assert_eq!(res.status, ToolStatus::Ok, "{}", res.text);
+        assert!(!res.text.contains("role alias:"), "{}", res.text);
+        assert_eq!(spawned(&r_custom)[1].role, "judge");
     }
 }
