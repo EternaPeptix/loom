@@ -19,7 +19,7 @@
       <button id="close-left" type="button" class="btn small drawer-btn" aria-label="Close missions">Close</button>
     </header>
     <div class="lnew">
-      <button id="btn-new" type="button" class="btn wide">New mission</button>
+      <button id="btn-new" type="button" class="btn wide new-mission">New mission</button>
       <button id="btn-switch" type="button" class="btn with-keys" aria-haspopup="dialog" aria-keyshortcuts="Control+K Meta+K" title="Switch to a mission or agent">Switch… <kbd id="switch-cap">Ctrl+K</kbd></button>
     </div>
     <div id="disk-warning" class="disk-warning" role="status" hidden></div>
@@ -53,6 +53,11 @@
     <section id="view-empty" class="view empty">
       <h1>Work that stays inspectable.</h1>
       <p>Choose a mission, review what needs you, or start new work.</p>
+      <div class="empty-actions">
+        <button id="empty-new" type="button" class="btn primary">New mission</button>
+        <button id="empty-inbox" type="button" class="btn urgent" hidden>Review inbox <span id="empty-inbox-count" class="count">0</span></button>
+        <button id="empty-missions" type="button" class="btn drawer-only">Browse missions</button>
+      </div>
     </section>
 
     <section id="view-session" class="view session" hidden>
@@ -63,13 +68,14 @@
             <h1 id="s-title" class="stitle"></h1>
           </nav>
           <div class="mission-actions">
-            <button id="b-rename" type="button" class="btn" hidden>Rename</button>
+            <button id="b-rename" type="button" class="btn ghost" hidden>Rename</button>
             <button id="b-stop" type="button" class="btn danger" hidden>Stop</button>
             <button id="b-resume" type="button" class="btn" hidden>Resume</button>
             <button id="b-archive" type="button" class="btn" hidden>Archive</button>
             <button id="b-unarchive" type="button" class="btn" hidden>Unarchive</button>
-            <button id="b-files" type="button" class="btn with-icon" aria-controls="right" title="Browse this session's workspace folder in the inspector." hidden><svg class="icon" viewBox="0 0 14 14" aria-hidden="true"><path d="M1.5 3.5a1 1 0 0 1 1-1h3l1.3 1.5h4.7a1 1 0 0 1 1 1v5.5a1 1 0 0 1-1 1h-9a1 1 0 0 1-1-1Z"/></svg>Files</button>
-            <button id="toggle-inspector" type="button" class="btn with-icon" aria-controls="right" aria-expanded="false"><svg class="icon" viewBox="0 0 14 14" aria-hidden="true"><rect x="1.5" y="2" width="11" height="10" rx="1.5"/><path d="M9 2v10"/></svg>Inspector</button>
+            <span class="actions-sep" aria-hidden="true"></span>
+            <button id="b-files" type="button" class="btn ghost with-icon" aria-controls="right" title="Browse this session's workspace folder in the inspector." hidden><svg class="icon" viewBox="0 0 14 14" aria-hidden="true"><path d="M1.5 3.5a1 1 0 0 1 1-1h3l1.3 1.5h4.7a1 1 0 0 1 1 1v5.5a1 1 0 0 1-1 1h-9a1 1 0 0 1-1-1Z"/></svg>Files</button>
+            <button id="toggle-inspector" type="button" class="btn ghost with-icon" aria-controls="right" aria-expanded="false"><svg class="icon" viewBox="0 0 14 14" aria-hidden="true"><rect x="1.5" y="2" width="11" height="10" rx="1.5"/><path d="M9 2v10"/></svg>Inspector</button>
           </div>
         </div>
         <div id="s-identity" class="identity" role="group" aria-label="Session identity">
@@ -84,6 +90,13 @@
           <p id="s-goal" class="mission-goal"></p>
           <button id="s-goal-toggle" type="button" class="btn link goal-toggle" aria-controls="s-goal" aria-expanded="false" hidden>Show all</button>
         </div>
+        <div id="shead-confirm" class="shead-confirm model-confirm" role="group" aria-labelledby="shead-confirm-text" hidden>
+          <p id="shead-confirm-text" class="model-confirm-text"></p>
+          <span class="model-confirm-actions">
+            <button id="shead-confirm-yes" type="button" class="btn small danger">Stop it</button>
+            <button id="shead-confirm-cancel" type="button" class="btn small">Keep running</button>
+          </span>
+        </div>
       </header>
       <nav id="mission-tabs" class="mission-tabs" role="tablist" aria-label="Mission views">
         <button id="mission-tab-chat" type="button" class="mission-tab" data-view="chat" role="tab" aria-controls="mission-record" aria-selected="true">Chat</button>
@@ -96,7 +109,7 @@
       <div id="mission-evidence" class="mission-panel" role="tabpanel" aria-labelledby="mission-tab-evidence" hidden></div>
       <div id="mission-record" class="mission-record" role="tabpanel" aria-labelledby="mission-tab-chat">
         <div class="record-tools">
-          <span class="dim">Every record of this session, oldest first. Work is folded into groups; nothing is left out.</span>
+          <span class="record-tools-label dim" title="Every record of this session, oldest first. Work is folded into groups; nothing is left out.">Transcript</span>
           <button id="btn-find" type="button" class="btn small with-keys" aria-controls="find-bar" aria-expanded="false" aria-keyshortcuts="/" title="Find in this record">Find <kbd>/</kbd></button>
           <span class="tools-checks">
             <label class="dim"><input id="expand-work" type="checkbox"> Expand all work</label>
@@ -118,6 +131,10 @@
           <span id="find-count" class="find-count dim" role="status" aria-live="polite"></span>
           <span id="find-hint" class="find-count dim"></span>
         </div>
+        <div id="child-blocker" class="child-blocker" role="status" hidden>
+          <span id="child-blocker-text" class="child-blocker-text"></span>
+          <button id="child-blocker-go" type="button" class="btn small urgent">Open agent</button>
+        </div>
         <div id="scroller" class="scroller">
           <div id="earlier" class="earlier" hidden>
             <button id="btn-earlier" type="button" class="btn">Show earlier</button>
@@ -132,7 +149,10 @@
         <p id="s-progress" class="progress-line" hidden></p>
         <div class="composer-card">
           <div class="composer-heading"><span id="composer-recipient" class="dim"></span><span id="send-state" class="dim" role="status" aria-live="polite"></span></div>
-          <p id="agent-note" class="dim pad" hidden>Messages go to the lead session of this mission, not to its agents.</p>
+          <div id="agent-bar" class="agent-bar" hidden>
+            <p id="agent-note" class="agent-note-text dim">Viewing an agent session. Send messages in the lead session.</p>
+            <button id="agent-go-lead" type="button" class="btn small">Go to lead</button>
+          </div>
           <p id="closed-note" class="dim pad" hidden></p>
           <textarea id="msg" rows="1" placeholder="Add direction or context…" aria-label="Message" aria-describedby="composer-recipient composer-help"></textarea>
           <div id="composer-row" class="composer-bar">
@@ -204,7 +224,7 @@
   </main>
 
   <aside id="right" class="col right" aria-label="Mission inspector" inert>
-    <div id="inspector-resize" class="inspector-resize" role="separator" aria-label="Resize inspector" aria-orientation="vertical" aria-valuemin="280" aria-valuemax="560" aria-valuenow="360" tabindex="0"></div>
+    <div id="inspector-resize" class="inspector-resize" role="separator" aria-label="Resize inspector" aria-orientation="vertical" aria-valuemin="280" aria-valuemax="560" aria-valuenow="396" tabindex="0"></div>
     <header class="rhead">
       <nav class="tabs" id="tabs" role="tablist" aria-label="Inspector views">
         <button id="tab-ledger" type="button" class="tab" data-tab="ledger" role="tab" aria-controls="panel" aria-selected="true">Ledger</button>
@@ -214,7 +234,7 @@
         <button id="tab-session" type="button" class="tab" data-tab="session" role="tab" aria-controls="panel" aria-selected="false" tabindex="-1">Session</button>
         <button id="tab-files" type="button" class="tab" data-tab="files" role="tab" aria-controls="panel" aria-selected="false" tabindex="-1">Files</button>
       </nav>
-      <button id="close-right" type="button" class="btn small" aria-label="Close inspector">Close</button>
+      <button id="close-right" type="button" class="btn small ghost" aria-label="Close inspector">Close</button>
     </header>
     <div id="panel" class="panel" role="tabpanel" aria-labelledby="tab-ledger"></div>
   </aside>
@@ -234,6 +254,9 @@
         <button id="picker-home" type="button" class="btn small">Home</button>
         <button id="picker-new" type="button" class="btn small" aria-expanded="false" aria-controls="picker-newrow">New folder…</button>
         <label class="check dim"><input id="picker-hidden" type="checkbox"> Show hidden</label>
+      </div>
+      <div class="picker-filter-row">
+        <input id="picker-filter" type="search" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="Filter folders in this directory" aria-label="Filter folders in this directory">
       </div>
       <div id="picker-newrow" class="picker-newrow" hidden>
         <label for="picker-newname" class="dim">Name of the new folder</label>
