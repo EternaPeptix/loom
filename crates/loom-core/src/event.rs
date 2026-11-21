@@ -34,14 +34,19 @@ pub const META_ALSO_STORED: &str = "also_stored";
 pub const META_JOB: &str = "job";
 /// Output was admitted for a stored action; coverage awaits an actual actor callback.
 pub const META_DEFERRED_OBSERVATION: &str = "deferred_observation";
-/// `ToolResult::meta` key: which check of the harness refused the call, for the two refusals a
-/// scorecard counts by kind: [`REFUSAL_QUOTE`] or [`REFUSAL_VERIFIER`]. Absent on any other result.
+/// `ToolResult::meta` key: which check of the harness refused the call, for the refusals a
+/// scorecard counts by kind: [`REFUSAL_QUOTE`], [`REFUSAL_VERIFIER`], or [`REFUSAL_CEREMONY`].
+/// Absent on any other result.
 pub const META_REFUSAL: &str = "refusal";
 /// [`META_REFUSAL`]: a quote of a `finish` or an `evidence` did not check, so nothing was delivered or
 /// attached.
 pub const REFUSAL_QUOTE: &str = "quote";
 /// [`META_REFUSAL`]: the verifier of a lead's `finish` did not accept the result.
 pub const REFUSAL_VERIFIER: &str = "verifier";
+/// [`META_REFUSAL`]: a harness ceremony or shape check refused the call without running it.
+pub const REFUSAL_CEREMONY: &str = "ceremony";
+/// `ToolResult::meta` key: `true` when the harness repaired or normalized the call's arguments.
+pub const META_REPAIRED: &str = "repaired";
 /// `ToolResult::meta` key on a delivered `finish` (status `Ok`): `true` when an independent verifier
 /// accepted the result, `false` when it was delivered without one. Absent in logs written before the
 /// key existed.

@@ -40,10 +40,12 @@
 //!   `call-{12 random lowercase base32 characters}`.
 //! - `arguments`: the concatenated string, except that an empty or whitespace-only string becomes
 //!   `{}` when the finish reason is not `Length`.
-//! - `complete`: true exactly when `arguments` parses as a JSON object.
-//! - finish reason: if at least one tool call exists and the recorded reason is `Stop`, the result
-//!   is `ToolCalls`. If the reason is `ToolCalls` and no call exists, the result is `Stop`.
-//! - `text` and `reasoning` are returned exactly as received (no trimming).
+//! - `complete`: true when `arguments` parses as a JSON object (including after deterministic repair
+//!   when `finish_reason` is not `Length`/`Error`/`Aborted`).
+//! - finish reason: if at least one tool call exists (including structured calls recovered from `text`)
+//!   and the recorded reason is `Stop`, the result is `ToolCalls`. If the reason is `ToolCalls` and no
+//!   call exists, the result is `Stop`.
+//! - `text` and `reasoning` are returned as received when no leaked calls are extracted from `text`.
 //!
 //! Tests required: parser with every split position of a sample stream (feed it in 1-byte chunks and
 //! in random-sized chunks, same payloads out); CRLF; comments; multi-line data. Assembler: the exact
@@ -267,6 +269,448 @@ fn random_call_id() -> String {
     id
 }
 
+fn strip_outer_code_fence(s: &str) -> &str {
+    let trimmed = s.trim();
+    let Some(after_open) = trimmed.strip_prefix("```") else {
+        return trimmed;
+    };
+    let Some(inner) = after_open.strip_suffix("```") else {
+        return trimmed;
+    };
+    let body = if let Some(nl) = inner.find('\n') {
+        let first = inner.get(..nl).unwrap_or("").trim();
+        if !first.starts_with('{')
+            && !first.starts_with('[')
+            && first.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+        {
+            inner.get(nl + 1..).unwrap_or("")
+        } else {
+            inner
+        }
+    } else {
+        let lead = inner.trim_start();
+        if lead.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("json")) {
+            let after_lang = lead.get(4..).unwrap_or("").trim_start();
+            if after_lang.starts_with('{') || after_lang.starts_with('[') {
+                after_lang
+            } else {
+                inner
+            }
+        } else {
+            inner
+        }
+    };
+    body.trim()
+}
+
+fn strip_leaked_vendor_tokens(s: &str) -> String {
+    const OPEN: &str = "<|open|>";
+    const SEP: &str = "<|sep|>";
+    if !s.contains(OPEN) {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(open_idx) = rest.find(OPEN) {
+        out.push_str(rest.get(..open_idx).unwrap_or(""));
+        let after_open = rest.get(open_idx + OPEN.len()..).unwrap_or("");
+        if let Some(sep_idx) = after_open.find(SEP) {
+            let inside = after_open.get(..sep_idx).unwrap_or("");
+            if !inside.contains(OPEN) && !inside.contains('\n') && !inside.contains('\r') {
+                rest = after_open.get(sep_idx + SEP.len()..).unwrap_or("");
+                continue;
+            }
+        }
+        out.push_str(OPEN);
+        rest = after_open;
+    }
+    out.push_str(rest);
+    out
+}
+
+fn strip_trailing_commas(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_string = false;
+    let mut escape = false;
+    for (idx, ch) in s.char_indices() {
+        if in_string {
+            out.push(ch);
+            if escape {
+                escape = false;
+            } else if ch == '\\' {
+                escape = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        if ch == '"' {
+            in_string = true;
+            out.push(ch);
+        } else if ch == ',' {
+            let rest = s.get(idx + ch.len_utf8()..).unwrap_or("");
+            let next_non_ws = rest.chars().find(|c| !matches!(c, ' ' | '\t' | '\n' | '\r'));
+            if matches!(next_non_ws, Some('}' | ']')) {
+                continue;
+            }
+            out.push(ch);
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// Deterministically repair common non-truncated JSON object defects (outer code fences, leaked
+/// vendor token prefixes, trailing commas). Returns `Some(repaired)` only when the repaired
+/// string strictly parses as a JSON object.
+fn repair_json_object(raw: &str) -> Option<String> {
+    let unfenced = strip_outer_code_fence(raw);
+    let devendored = strip_leaked_vendor_tokens(unfenced);
+    let cleaned = strip_trailing_commas(&devendored);
+    matches!(serde_json::from_str::<Value>(&cleaned), Ok(Value::Object(_))).then_some(cleaned)
+}
+
+fn parse_json_value_or_repaired_object(raw: &str) -> Option<Value> {
+    if let Ok(v) = serde_json::from_str::<Value>(raw) {
+        return Some(v);
+    }
+    let repaired = repair_json_object(raw)?;
+    serde_json::from_str::<Value>(&repaired).ok()
+}
+
+fn extract_call_fields(v: &Value, allow_string_args: bool) -> Option<(String, Value)> {
+    let obj = v.as_object()?;
+    let name = obj.get("name").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty())?;
+    let args_val = obj.get("arguments").or_else(|| obj.get("parameters"))?;
+    let args = match args_val {
+        Value::Object(_) => args_val.clone(),
+        Value::String(s) if allow_string_args => {
+            let parsed = parse_json_value_or_repaired_object(s)?;
+            if !parsed.is_object() {
+                return None;
+            }
+            parsed
+        }
+        _ => return None,
+    };
+    Some((name.to_string(), args))
+}
+
+fn find_tag_end(s: &str) -> Option<(usize, bool)> {
+    let mut quote: Option<char> = None;
+    for (idx, ch) in s.char_indices() {
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            }
+            continue;
+        }
+        if ch == '"' || ch == '\'' {
+            quote = Some(ch);
+        } else if ch == '>' {
+            let self_closing = s.get(..idx).is_some_and(|before| before.trim_end().ends_with('/'));
+            return Some((idx, self_closing));
+        }
+    }
+    None
+}
+
+fn parse_xml_attrs(s: &str) -> Option<Vec<(String, String)>> {
+    let mut attrs = Vec::new();
+    let mut rest = s.trim();
+    while !rest.is_empty() {
+        let eq = rest.find('=')?;
+        let key = rest.get(..eq)?.trim();
+        if key.is_empty() || key.chars().any(char::is_whitespace) {
+            return None;
+        }
+        let after_eq = rest.get(eq + 1..)?.trim_start();
+        let quote = after_eq.chars().next()?;
+        if quote != '"' && quote != '\'' {
+            return None;
+        }
+        let val_start = after_eq.get(quote.len_utf8()..)?;
+        let close = val_start.find(quote)?;
+        let val = val_start.get(..close)?;
+        attrs.push((key.to_string(), val.to_string()));
+        rest = val_start.get(close + quote.len_utf8()..)?.trim_start();
+    }
+    Some(attrs)
+}
+
+fn attr_value<'a>(attrs: &'a [(String, String)], key: &str) -> Option<&'a str> {
+    attrs.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+}
+
+fn parse_param_value(raw: &str, force_string: bool) -> Value {
+    if force_string {
+        return Value::String(raw.to_string());
+    }
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Value::String(String::new());
+    }
+    serde_json::from_str::<Value>(trimmed).unwrap_or_else(|_| Value::String(raw.to_string()))
+}
+
+fn parse_xml_invoke(s: &str, open_prefix: &str, close_prefix: &str) -> Option<(usize, String, Value)> {
+    let open_tag = format!("{open_prefix}invoke");
+    let after_tag = s.strip_prefix(&open_tag)?;
+    let next = after_tag.chars().next()?;
+    if !next.is_whitespace() {
+        return None;
+    }
+    let (end_gt, self_closing) = find_tag_end(after_tag)?;
+    let attr_slice = after_tag.get(..end_gt)?;
+    let attr_slice = if self_closing { attr_slice.trim_end().strip_suffix('/')? } else { attr_slice };
+    let attrs = parse_xml_attrs(attr_slice)?;
+    let name = attr_value(&attrs, "name").map(str::trim).filter(|n| !n.is_empty())?.to_string();
+    let body_start = open_tag.len() + end_gt + 1;
+    if self_closing {
+        return Some((body_start, name, Value::Object(serde_json::Map::new())));
+    }
+    let close_invoke = format!("{close_prefix}invoke>");
+    let rest = s.get(body_start..)?;
+    let close_idx = rest.find(&close_invoke)?;
+    let body = rest.get(..close_idx)?;
+
+    let param_open = format!("{open_prefix}parameter");
+    let param_close = format!("{close_prefix}parameter>");
+    let mut map = serde_json::Map::new();
+    let mut p_rest = body.trim_start();
+    while !p_rest.is_empty() {
+        let after_p = p_rest.strip_prefix(&param_open)?;
+        let p_next = after_p.chars().next()?;
+        if !p_next.is_whitespace() {
+            return None;
+        }
+        let (p_gt, p_self_closing) = find_tag_end(after_p)?;
+        if p_self_closing {
+            let p_attrs = parse_xml_attrs(after_p.get(..p_gt)?.trim_end().strip_suffix('/')?)?;
+            let p_name = attr_value(&p_attrs, "name").map(str::trim).filter(|n| !n.is_empty())?;
+            map.insert(p_name.to_string(), Value::String(String::new()));
+            p_rest = after_p.get(p_gt + 1..)?.trim_start();
+            continue;
+        }
+        let p_attrs = parse_xml_attrs(after_p.get(..p_gt)?)?;
+        let p_name = attr_value(&p_attrs, "name").map(str::trim).filter(|n| !n.is_empty())?;
+        let force_string = attr_value(&p_attrs, "string") == Some("true");
+        let after_p_open = after_p.get(p_gt + 1..)?;
+        let p_end = after_p_open.find(&param_close)?;
+        let raw_val = after_p_open.get(..p_end)?;
+        map.insert(p_name.to_string(), parse_param_value(raw_val, force_string));
+        p_rest = after_p_open.get(p_end + param_close.len()..)?.trim_start();
+    }
+    Some((body_start + close_idx + close_invoke.len(), name, Value::Object(map)))
+}
+
+fn parse_xml_function_calls(s: &str, open_prefix: &str, close_prefix: &str) -> Option<(usize, Vec<(String, Value)>)> {
+    let open_wrap = format!("{open_prefix}function_calls>");
+    let close_wrap = format!("{close_prefix}function_calls>");
+    let after_open = s.strip_prefix(&open_wrap)?;
+    let close_idx = after_open.find(&close_wrap)?;
+    let mut body = after_open.get(..close_idx)?.trim_start();
+    let mut calls = Vec::new();
+    while !body.is_empty() {
+        let (used, name, args) = parse_xml_invoke(body, open_prefix, close_prefix)?;
+        calls.push((name, args));
+        body = body.get(used..)?.trim_start();
+    }
+    if calls.is_empty() {
+        return None;
+    }
+    Some((open_wrap.len() + close_idx + close_wrap.len(), calls))
+}
+
+fn try_parse_tool_call_tag(s: &str) -> Option<(usize, Vec<(String, Value)>)> {
+    let after_tag = s.strip_prefix("<tool_call")?;
+    let (end_gt, self_closing) = find_tag_end(after_tag)?;
+    if self_closing || !after_tag.get(..end_gt)?.trim().is_empty() {
+        return None;
+    }
+    let body_start = "<tool_call".len() + end_gt + 1;
+    let rest = s.get(body_start..)?;
+    let close_idx = rest.find("</tool_call>")?;
+    let body = rest.get(..close_idx)?.trim();
+    if !body.starts_with('{') {
+        return None;
+    }
+    let v = parse_json_value_or_repaired_object(body)?;
+    let (name, args) = extract_call_fields(&v, true)?;
+    Some((body_start + close_idx + "</tool_call>".len(), vec![(name, args)]))
+}
+
+enum FencedStep {
+    NotFence,
+    SkipTo(usize),
+    Matched { end: usize, name: String, args: Value },
+}
+
+fn try_fenced_tool_call(text: &str, line_start: usize) -> FencedStep {
+    let after_start = text.get(line_start..).unwrap_or("");
+    let indent = after_start.bytes().take_while(|b| *b == b' ' || *b == b'\t').count();
+    let Some(after_ticks) = after_start.get(indent..).and_then(|r| r.strip_prefix("```")) else {
+        return FencedStep::NotFence;
+    };
+    let Some(first_nl) = after_ticks.find('\n') else {
+        return FencedStep::NotFence;
+    };
+    let info = after_ticks.get(..first_nl).unwrap_or("").trim();
+    let body_offset = line_start + indent + 3 + first_nl + 1;
+    let mut scan = body_offset;
+    let mut closing: Option<(usize, usize)> = None;
+    while scan <= text.len() {
+        let rest = text.get(scan..).unwrap_or("");
+        let line_len = rest.find('\n').unwrap_or(rest.len());
+        let line = rest.get(..line_len).unwrap_or("").strip_suffix('\r').unwrap_or(rest.get(..line_len).unwrap_or(""));
+        if line.trim() == "```" {
+            closing = Some((scan, scan + line_len));
+            break;
+        }
+        if scan + line_len >= text.len() {
+            break;
+        }
+        scan += line_len + 1;
+    }
+    let Some((close_line_start, close_line_end)) = closing else {
+        return FencedStep::SkipTo(body_offset);
+    };
+    let next_pos =
+        if text.as_bytes().get(close_line_end) == Some(&b'\n') { close_line_end + 1 } else { close_line_end };
+    if !info.is_empty() && !info.eq_ignore_ascii_case("json") {
+        return FencedStep::SkipTo(next_pos);
+    }
+    let body = text.get(body_offset..close_line_start).unwrap_or("").trim();
+    if let Ok(v) = serde_json::from_str::<Value>(body) {
+        if let Some((name, args)) = extract_call_fields(&v, false) {
+            return FencedStep::Matched { end: close_line_end, name, args };
+        }
+    }
+    FencedStep::SkipTo(next_pos)
+}
+
+fn strip_extracted_spans(text: &str, spans: &[(usize, usize)]) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    let mut pending_trim_space = false;
+    for &(s, e) in spans {
+        let line_start = text.get(..s).and_then(|b| b.rfind('\n')).map_or(0, |i| i + 1);
+        let before_on_line = text.get(line_start..s).unwrap_or("");
+        let after = text.get(e..).unwrap_or("");
+        let after_nl = after.find('\n');
+        let rest_of_line = after_nl.map_or(after, |i| after.get(..i).unwrap_or(""));
+        let rest_of_line_no_cr = rest_of_line.strip_suffix('\r').unwrap_or(rest_of_line);
+        let own_lines = line_start >= cursor
+            && before_on_line.bytes().all(|b| b == b' ' || b == b'\t')
+            && rest_of_line_no_cr.bytes().all(|b| b == b' ' || b == b'\t');
+
+        let (rem_start, rem_end) = if own_lines {
+            let end = after_nl.map_or(text.len(), |i| e + i + 1);
+            (line_start, end)
+        } else {
+            (s, e)
+        };
+
+        let chunk = text.get(cursor..rem_start).unwrap_or("");
+        let chunk = if pending_trim_space { chunk.strip_prefix(' ').unwrap_or(chunk) } else { chunk };
+        pending_trim_space = false;
+
+        if out.ends_with("\n\n") {
+            let trimmed = chunk.trim_start_matches('\r').trim_start_matches('\n');
+            out.push_str(trimmed);
+        } else {
+            out.push_str(chunk);
+        }
+        if !own_lines && out.ends_with(' ') {
+            pending_trim_space = true;
+        }
+        cursor = rem_end;
+    }
+    let tail = text.get(cursor..).unwrap_or("");
+    let tail = if pending_trim_space { tail.strip_prefix(' ').unwrap_or(tail) } else { tail };
+    if out.ends_with("\n\n") {
+        out.push_str(tail.trim_start_matches('\r').trim_start_matches('\n'));
+    } else {
+        out.push_str(tail);
+    }
+    out.trim().to_string()
+}
+
+fn extract_leaked_tool_calls(text: &str) -> Option<(Vec<ToolCallRequest>, String)> {
+    let mut extracted: Vec<(String, Value)> = Vec::new();
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut pos = 0usize;
+    while pos < text.len() {
+        let at_line_start = pos == 0 || text.as_bytes().get(pos.saturating_sub(1)) == Some(&b'\n');
+        if at_line_start {
+            match try_fenced_tool_call(text, pos) {
+                FencedStep::Matched { end, name, args } => {
+                    spans.push((pos, end));
+                    extracted.push((name, args));
+                    pos = if text.as_bytes().get(end) == Some(&b'\n') { end + 1 } else { end };
+                    continue;
+                }
+                FencedStep::SkipTo(end) => {
+                    pos = end;
+                    continue;
+                }
+                FencedStep::NotFence => {}
+            }
+        }
+        let rest = text.get(pos..).unwrap_or("");
+        if rest.starts_with('\n') {
+            pos += 1;
+            continue;
+        }
+        let matched = if rest.starts_with("<tool_call") {
+            try_parse_tool_call_tag(rest)
+        } else if rest.starts_with("<｜DSML｜function_calls>") {
+            parse_xml_function_calls(rest, "<｜DSML｜", "</｜DSML｜")
+        } else if rest.starts_with("<|DSML|function_calls>") {
+            parse_xml_function_calls(rest, "<|DSML|", "</|DSML|")
+        } else if rest.starts_with("<｜DSML｜invoke") {
+            parse_xml_invoke(rest, "<｜DSML｜", "</｜DSML｜").map(|(len, n, a)| (len, vec![(n, a)]))
+        } else if rest.starts_with("<|DSML|invoke") {
+            parse_xml_invoke(rest, "<|DSML|", "</|DSML|").map(|(len, n, a)| (len, vec![(n, a)]))
+        } else if rest.starts_with("<function_calls>") {
+            parse_xml_function_calls(rest, "<", "</")
+        } else if rest.starts_with("<invoke") {
+            parse_xml_invoke(rest, "<", "</").map(|(len, n, a)| (len, vec![(n, a)]))
+        } else {
+            None
+        };
+        if let Some((len, calls)) = matched {
+            spans.push((pos, pos + len));
+            extracted.extend(calls);
+            pos += len;
+            continue;
+        }
+        let step = rest.chars().next().map_or(1, char::len_utf8);
+        let after = text.get(pos + step..).unwrap_or("");
+        let Some(rel) = after.find(['<', '\n']) else {
+            break;
+        };
+        let jump = pos + step + rel;
+        pos = if after.as_bytes().get(rel) == Some(&b'\n') { jump + 1 } else { jump };
+    }
+    if extracted.is_empty() {
+        return None;
+    }
+    let tool_calls = extracted
+        .into_iter()
+        .enumerate()
+        .map(|(i, (name, args))| ToolCallRequest {
+            call_id: CallId(format!("rec_{i}")),
+            name,
+            arguments: serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string()),
+            complete: true,
+        })
+        .collect();
+    let cleaned = strip_extracted_spans(text, &spans);
+    Some((tool_calls, cleaned))
+}
+
 impl Assembler {
     pub fn new() -> Assembler {
         Assembler::default()
@@ -395,13 +839,30 @@ impl Assembler {
                 },
             };
             used.insert(id.clone());
-            let arguments = if acc.arguments.trim().is_empty() && recorded != FinishReason::Length {
+            let raw_arguments = if acc.arguments.trim().is_empty() && recorded != FinishReason::Length {
                 "{}".to_string()
             } else {
                 acc.arguments
             };
-            let complete = matches!(serde_json::from_str::<Value>(&arguments), Ok(Value::Object(_)));
+            let (arguments, complete) = match serde_json::from_str::<Value>(&raw_arguments) {
+                Ok(Value::Object(_)) => (raw_arguments, true),
+                Ok(_) => (raw_arguments, false),
+                Err(_) if recorded != FinishReason::Length => match repair_json_object(&raw_arguments) {
+                    Some(repaired) => (repaired, true),
+                    None => (raw_arguments, false),
+                },
+                Err(_) => (raw_arguments, false),
+            };
             tool_calls.push(ToolCallRequest { call_id: CallId(id), name: acc.name, arguments, complete });
+        }
+        let mut text = self.text;
+        if tool_calls.is_empty()
+            && !matches!(recorded, FinishReason::Length | FinishReason::Error | FinishReason::Aborted)
+        {
+            if let Some((recovered, stripped_text)) = extract_leaked_tool_calls(&text) {
+                tool_calls = recovered;
+                text = stripped_text;
+            }
         }
         let finish = match recorded {
             FinishReason::Stop if !tool_calls.is_empty() => FinishReason::ToolCalls,
@@ -409,7 +870,7 @@ impl Assembler {
             other => other,
         };
         Ok(Completion {
-            text: self.text,
+            text,
             reasoning: self.reasoning,
             tool_calls,
             finish,
@@ -1017,5 +1478,202 @@ mod tests {
         assert_eq!(raw["error"]["type"], "exceed_context_size_error");
         assert_eq!(raw["error"]["n_ctx"], 4096);
         assert_eq!(raw["error"]["n_prompt_tokens"], 5000);
+    }
+
+    #[test]
+    fn streamed_json_argument_repair_handles_fences_commas_and_vendor_tokens() {
+        let cases = [
+            ("```json\n{\"command\": \"ls -la\"}\n```", serde_json::json!({"command": "ls -la"})),
+            ("```\n{\"path\": \"src/lib.rs\",}\n```", serde_json::json!({"path": "src/lib.rs"})),
+            (
+                "{\"items\": [1, 2,], \"note\": \"keep, } inside\",}",
+                serde_json::json!({"items": [1, 2], "note": "keep, } inside"}),
+            ),
+            ("{\"command\": <|open|>argument key=\"command\"<|sep|>\"pwd\"}", serde_json::json!({"command": "pwd"})),
+            (
+                "{\"a\": \"<|open|>argument key=\"a\"<|sep|>one\", \"b\": \"<|open|>argument key=\"b\"<|sep|>two\"}",
+                serde_json::json!({"a": "one", "b": "two"}),
+            ),
+            (
+                "```json\n{\"path\": \"<|open|>argument key=\\\"path\\\"<|sep|>a.rs\", \"lines\": [1, 2,],}\n```",
+                serde_json::json!({"path": "a.rs", "lines": [1, 2]}),
+            ),
+        ];
+        for (raw, expected) in cases {
+            let body = format!(
+                r#"[{{"index":0,"id":"A","function":{{"name":"bash","arguments":{}}}}}]"#,
+                Value::String(raw.into())
+            );
+            let c = run(&[&tc_chunk(&body), &chunk("{}", r#""tool_calls""#)]).unwrap();
+            assert!(c.tool_calls[0].complete, "{raw}");
+            assert_eq!(serde_json::from_str::<Value>(&c.tool_calls[0].arguments).unwrap(), expected);
+        }
+
+        // Fenced non-object JSON stays incomplete.
+        let body = format!(
+            r#"[{{"index":0,"id":"A","function":{{"name":"t","arguments":{}}}}}]"#,
+            Value::String("```json\n[1, 2,]\n```".into())
+        );
+        let c = run(&[&tc_chunk(&body), &chunk("{}", r#""tool_calls""#)]).unwrap();
+        assert!(!c.tool_calls[0].complete);
+        assert_eq!(c.tool_calls[0].arguments, "```json\n[1, 2,]\n```");
+
+        // FinishReason::Length must never be repaired.
+        let cut = "```json\n{\"command\": \"ls\",}\n```";
+        let body = format!(
+            r#"[{{"index":0,"id":"A","function":{{"name":"bash","arguments":{}}}}}]"#,
+            Value::String(cut.into())
+        );
+        let c = run(&[&tc_chunk(&body), &chunk("{}", r#""length""#)]).unwrap();
+        assert_eq!(c.finish, FinishReason::Length);
+        assert!(!c.tool_calls[0].complete);
+        assert_eq!(c.tool_calls[0].arguments, cut);
+    }
+
+    fn text_reply(content: &str, finish_reason: &str) -> Completion {
+        let delta = serde_json::json!({ "content": content }).to_string();
+        run(&[&chunk(&delta, "null"), &chunk("{}", finish_reason)]).unwrap()
+    }
+
+    #[test]
+    fn text_leaked_tool_call_tags_are_extracted_and_stripped() {
+        let content = concat!(
+            "Let me inspect both files.\n\n",
+            "<tool_call>\n{\"name\": \"read\", \"arguments\": {\"path\": \"a.rs\",}}\n</tool_call>\n",
+            "<tool_call>{\"name\": \"bash\", \"parameters\": {\"command\": \"pwd\"}}</tool_call>\n",
+        );
+        let c = text_reply(content, r#""stop""#);
+        assert_eq!(c.finish, FinishReason::ToolCalls);
+        assert_eq!(c.text, "Let me inspect both files.");
+        assert_eq!(c.tool_calls.len(), 2);
+        assert_eq!(c.tool_calls[0].call_id.as_str(), "rec_0");
+        assert_eq!(c.tool_calls[0].name, "read");
+        assert_eq!(
+            serde_json::from_str::<Value>(&c.tool_calls[0].arguments).unwrap(),
+            serde_json::json!({"path": "a.rs"})
+        );
+        assert!(c.tool_calls[0].complete);
+        assert_eq!(c.tool_calls[1].call_id.as_str(), "rec_1");
+        assert_eq!(c.tool_calls[1].name, "bash");
+        assert_eq!(
+            serde_json::from_str::<Value>(&c.tool_calls[1].arguments).unwrap(),
+            serde_json::json!({"command": "pwd"})
+        );
+        assert!(c.tool_calls[1].complete);
+    }
+
+    #[test]
+    fn text_leaked_dsml_calls_are_extracted_and_stripped() {
+        let content = concat!(
+            "Running search.\n",
+            "<｜DSML｜function_calls>\n",
+            "<｜DSML｜invoke name=\"read\">\n",
+            "<｜DSML｜parameter name=\"path\" string=\"true\">42</｜DSML｜parameter>\n",
+            "<｜DSML｜parameter name=\"start\" string=\"false\">10</｜DSML｜parameter>\n",
+            "</｜DSML｜invoke>\n",
+            "<｜DSML｜invoke name=\"wait\"></｜DSML｜invoke>\n",
+            "</｜DSML｜function_calls>\n",
+        );
+        let c = text_reply(content, r#""stop""#);
+        assert_eq!(c.finish, FinishReason::ToolCalls);
+        assert_eq!(c.text, "Running search.");
+        assert_eq!(c.tool_calls.len(), 2);
+        assert_eq!(c.tool_calls[0].call_id.as_str(), "rec_0");
+        assert_eq!(c.tool_calls[0].name, "read");
+        assert_eq!(
+            serde_json::from_str::<Value>(&c.tool_calls[0].arguments).unwrap(),
+            serde_json::json!({"path": "42", "start": 10})
+        );
+        assert_eq!(c.tool_calls[1].call_id.as_str(), "rec_1");
+        assert_eq!(c.tool_calls[1].name, "wait");
+        assert_eq!(c.tool_calls[1].arguments, "{}");
+    }
+
+    #[test]
+    fn text_leaked_generic_invoke_calls_are_extracted_and_stripped() {
+        let content = concat!(
+            "<invoke name=\"grep\">\n",
+            "<parameter name=\"pattern\">TODO</parameter>\n",
+            "<parameter name=\"limit\">5</parameter>\n",
+            "<parameter name=\"case_sensitive\">false</parameter>\n",
+            "</invoke>",
+        );
+        let c = text_reply(content, r#""tool_calls""#);
+        assert_eq!(c.finish, FinishReason::ToolCalls);
+        assert_eq!(c.text, "");
+        assert_eq!(c.tool_calls.len(), 1);
+        assert_eq!(c.tool_calls[0].call_id.as_str(), "rec_0");
+        assert_eq!(c.tool_calls[0].name, "grep");
+        assert_eq!(
+            serde_json::from_str::<Value>(&c.tool_calls[0].arguments).unwrap(),
+            serde_json::json!({"pattern": "TODO", "limit": 5, "case_sensitive": false})
+        );
+    }
+
+    #[test]
+    fn text_leaked_standalone_fenced_json_calls_are_extracted_and_stripped() {
+        let content = concat!(
+            "First step:\n\n",
+            "```json\n{\"name\": \"bash\", \"arguments\": {\"command\": \"echo hi\"}}\n```\n\n",
+            "After block.",
+        );
+        let c = text_reply(content, r#""stop""#);
+        assert_eq!(c.finish, FinishReason::ToolCalls);
+        assert_eq!(c.text, "First step:\n\nAfter block.");
+        assert_eq!(c.tool_calls.len(), 1);
+        assert_eq!(c.tool_calls[0].call_id.as_str(), "rec_0");
+        assert_eq!(c.tool_calls[0].name, "bash");
+        assert_eq!(
+            serde_json::from_str::<Value>(&c.tool_calls[0].arguments).unwrap(),
+            serde_json::json!({"command": "echo hi"})
+        );
+
+        // Consecutive fenced blocks where the first is arbitrary JSON and the second is a tool call.
+        let mixed = concat!(
+            "```json\n{\"status\": \"ok\"}\n```\n",
+            "```json\n{\"name\": \"read\", \"parameters\": {\"path\": \"x\"}}\n```",
+        );
+        let c = text_reply(mixed, r#""stop""#);
+        assert_eq!(c.finish, FinishReason::ToolCalls);
+        assert_eq!(c.text, "```json\n{\"status\": \"ok\"}\n```");
+        assert_eq!(c.tool_calls.len(), 1);
+        assert_eq!(c.tool_calls[0].name, "read");
+    }
+
+    #[test]
+    fn normal_prose_arbitrary_json_and_truncated_or_tool_replies_stay_untouched() {
+        let untouched_cases = [
+            "  Normal prose mentioning <invoke> and <tool_call> without valid call syntax. \n",
+            "```json\n{\"status\": \"ok\", \"count\": 2}\n```\n",
+            "```json\n{\"name\": \"alice\", \"role\": \"admin\"}\n```",
+            "```json\n{\"name\": \"\", \"arguments\": {}}\n```",
+            "```json\n{\"name\": \"bash\", \"arguments\": \"not-an-object\"}\n```",
+            "Unfenced {\"name\": \"bash\", \"arguments\": {\"command\": \"ls\"}} in prose.",
+            "```rust\nfn main() {}\n```",
+        ];
+        for text in untouched_cases {
+            let c = text_reply(text, r#""stop""#);
+            assert_eq!(c.finish, FinishReason::Stop, "{text}");
+            assert!(c.tool_calls.is_empty(), "{text}");
+            assert_eq!(c.text, text);
+        }
+
+        // FinishReason::Length skips text extraction.
+        let leaked = "<tool_call>{\"name\": \"bash\", \"arguments\": {\"command\": \"ls\"}}</tool_call>";
+        let c = text_reply(leaked, r#""length""#);
+        assert_eq!(c.finish, FinishReason::Length);
+        assert!(c.tool_calls.is_empty());
+        assert_eq!(c.text, leaked);
+
+        // Existing streamed tool calls prevent text extraction.
+        let delta = serde_json::json!({ "content": leaked }).to_string();
+        let c = run(&[
+            &tc_chunk(r#"[{"index":0,"id":"A","function":{"name":"read","arguments":"{}"}}]"#),
+            &chunk(&delta, r#""tool_calls""#),
+        ])
+        .unwrap();
+        assert_eq!(c.tool_calls.len(), 1);
+        assert_eq!(c.tool_calls[0].call_id.as_str(), "A");
+        assert_eq!(c.text, leaked);
     }
 }
