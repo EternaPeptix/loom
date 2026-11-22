@@ -376,6 +376,9 @@ fn finish(f: Finish<'_>) -> ToolOutput {
         && contains(&output, b"Operation not permitted")
     {
         out = out.with_more(SANDBOX_REMINDER);
+        if contains(&output, b"cannot create temp file for here document: Operation not permitted") {
+            out = out.with_more("heredoc temp file blocked under Seatbelt; use `printf` / `python3 -c` / modern bash");
+        }
     }
     out.body = Body::Raw(output);
     match job {
@@ -384,6 +387,402 @@ fn finish(f: Finish<'_>) -> ToolOutput {
         Some(id) => out.with_meta(META_JOB, json!(id)),
         None => add_ended_meta(out, ended),
     }
+}
+
+/// Tokenizes a single simple shell command, returning `None` if it contains any unquoted shell
+/// metacharacters (`;`, `&`, `|`, `<`, `>`, `$`, `` ` ``, `*`, `?`, `[`, `]`, `(`, `)`, `{`, `}`,
+/// newlines) or unsafe substitutions inside double quotes.
+fn split_simple_command(command: &str) -> Option<Vec<String>> {
+    let trimmed = command.trim();
+    if trimmed.is_empty() || trimmed.contains('\n') || trimmed.contains('\r') {
+        return None;
+    }
+    let mut tokens = Vec::new();
+    let mut cur = String::new();
+    let mut in_token = false;
+    let mut chars = trimmed.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            ' ' | '\t' => {
+                if in_token {
+                    tokens.push(std::mem::take(&mut cur));
+                    in_token = false;
+                }
+            }
+            '\'' => {
+                in_token = true;
+                let mut closed = false;
+                for sc in chars.by_ref() {
+                    if sc == '\'' {
+                        closed = true;
+                        break;
+                    }
+                    cur.push(sc);
+                }
+                if !closed {
+                    return None;
+                }
+            }
+            '"' => {
+                in_token = true;
+                let mut closed = false;
+                while let Some(dc) = chars.next() {
+                    match dc {
+                        '"' => {
+                            closed = true;
+                            break;
+                        }
+                        '\\' => {
+                            let escaped = chars.next()?;
+                            cur.push(escaped);
+                        }
+                        '$' | '`' => return None,
+                        _ => cur.push(dc),
+                    }
+                }
+                if !closed {
+                    return None;
+                }
+            }
+            '\\' => {
+                in_token = true;
+                let escaped = chars.next()?;
+                cur.push(escaped);
+            }
+            ';' | '&' | '|' | '<' | '>' | '`' | '$' | '*' | '?' | '[' | ']' | '(' | ')' | '{' | '}' | '#' => {
+                return None;
+            }
+            _ => {
+                in_token = true;
+                cur.push(c);
+            }
+        }
+    }
+    if in_token {
+        tokens.push(cur);
+    }
+    (!tokens.is_empty()).then_some(tokens)
+}
+
+fn is_digits(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn single_file_after_flags(tokens: &[String]) -> Option<String> {
+    let file = match tokens {
+        [single] if !single.is_empty() && single != "-" => single.clone(),
+        _ => return None,
+    };
+    Some(file)
+}
+
+fn parse_cat_target(args: &[String]) -> Option<String> {
+    let mut i = 0;
+    while let Some(tok) = args.get(i) {
+        if tok == "--" {
+            return single_file_after_flags(args.get(i + 1..)?);
+        }
+        if tok == "-" {
+            return None;
+        }
+        if let Some(long) = tok.strip_prefix("--") {
+            match long {
+                "number" | "number-nonblank" | "squeeze-blank" | "show-ends" | "show-tabs" | "show-nonprinting"
+                | "show-all" => {
+                    i += 1;
+                    continue;
+                }
+                _ => return None,
+            }
+        }
+        if let Some(short) = tok.strip_prefix('-') {
+            if short.is_empty()
+                || !short.chars().all(|c| matches!(c, 'A' | 'b' | 'e' | 'E' | 'n' | 's' | 't' | 'T' | 'u' | 'v'))
+            {
+                return None;
+            }
+            i += 1;
+            continue;
+        }
+        return single_file_after_flags(args.get(i..)?);
+    }
+    None
+}
+
+fn parse_head_tail_target(args: &[String]) -> Option<String> {
+    let mut i = 0;
+    while let Some(tok) = args.get(i) {
+        if tok == "--" {
+            return single_file_after_flags(args.get(i + 1..)?);
+        }
+        if tok == "-" {
+            return None;
+        }
+        if let Some(long) = tok.strip_prefix("--") {
+            match long {
+                "quiet" | "silent" | "verbose" => {
+                    i += 1;
+                    continue;
+                }
+                "lines" | "bytes" => {
+                    i += 2;
+                    args.get(i - 1)?;
+                    continue;
+                }
+                _ if long.starts_with("lines=") || long.starts_with("bytes=") => {
+                    i += 1;
+                    continue;
+                }
+                _ => return None,
+            }
+        }
+        if let Some(short) = tok.strip_prefix('-') {
+            if short.is_empty() {
+                return None;
+            }
+            if is_digits(short) {
+                i += 1;
+                continue;
+            }
+            if let Some(first) = short.chars().next() {
+                if matches!(first, 'n' | 'c' | 'b') {
+                    if short.len() == 1 {
+                        args.get(i + 1)?;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                    continue;
+                }
+            }
+            if short.chars().all(|c| matches!(c, 'q' | 'v' | 'r')) {
+                i += 1;
+                continue;
+            }
+            return None;
+        }
+        return single_file_after_flags(args.get(i..)?);
+    }
+    None
+}
+
+fn parse_nl_target(args: &[String]) -> Option<String> {
+    let mut i = 0;
+    while let Some(tok) = args.get(i) {
+        if tok == "--" {
+            return single_file_after_flags(args.get(i + 1..)?);
+        }
+        if tok == "-" {
+            return None;
+        }
+        if let Some(long) = tok.strip_prefix("--") {
+            if long == "no-renumber" {
+                i += 1;
+                continue;
+            }
+            if let Some((name, _)) = long.split_once('=') {
+                if matches!(
+                    name,
+                    "body-numbering"
+                        | "section-delimiter"
+                        | "footer-numbering"
+                        | "header-numbering"
+                        | "line-increment"
+                        | "join-blank-lines"
+                        | "number-format"
+                        | "number-separator"
+                        | "starting-line-number"
+                        | "number-width"
+                ) {
+                    i += 1;
+                    continue;
+                }
+            }
+            return None;
+        }
+        if let Some(short) = tok.strip_prefix('-') {
+            if short == "p" {
+                i += 1;
+                continue;
+            }
+            if let Some(first) = short.chars().next() {
+                if matches!(first, 'b' | 'd' | 'f' | 'h' | 'i' | 'l' | 'n' | 's' | 'v' | 'w') {
+                    if short.len() == 1 {
+                        args.get(i + 1)?;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                    continue;
+                }
+            }
+            return None;
+        }
+        return single_file_after_flags(args.get(i..)?);
+    }
+    None
+}
+
+fn parse_sed_target(args: &[String]) -> Option<String> {
+    let mut saw_quiet = false;
+    let mut saw_expr = false;
+    let mut i = 0;
+    while let Some(tok) = args.get(i) {
+        if tok == "--" {
+            let rest = args.get(i + 1..)?;
+            if !saw_quiet {
+                return None;
+            }
+            return if saw_expr {
+                single_file_after_flags(rest)
+            } else {
+                match rest {
+                    [_script, file] if !file.is_empty() && file != "-" => Some(file.clone()),
+                    _ => None,
+                }
+            };
+        }
+        if tok == "-" {
+            return None;
+        }
+        if let Some(long) = tok.strip_prefix("--") {
+            match long {
+                "quiet" | "silent" => {
+                    saw_quiet = true;
+                    i += 1;
+                    continue;
+                }
+                "regexp-extended" | "posix" | "unbuffered" => {
+                    i += 1;
+                    continue;
+                }
+                "expression" => {
+                    args.get(i + 1)?;
+                    saw_expr = true;
+                    i += 2;
+                    continue;
+                }
+                _ if long.starts_with("expression=") => {
+                    saw_expr = true;
+                    i += 1;
+                    continue;
+                }
+                _ => return None,
+            }
+        }
+        if let Some(short) = tok.strip_prefix('-') {
+            if short.is_empty() {
+                return None;
+            }
+            let mut chars = short.chars().peekable();
+            let mut took_next = false;
+            while let Some(c) = chars.next() {
+                match c {
+                    'n' => saw_quiet = true,
+                    'E' | 'r' | 'u' => {}
+                    'e' => {
+                        saw_expr = true;
+                        if chars.peek().is_none() {
+                            args.get(i + 1)?;
+                            took_next = true;
+                        }
+                        break;
+                    }
+                    'l' => {
+                        if chars.peek().is_none() {
+                            args.get(i + 1)?;
+                            took_next = true;
+                        }
+                        break;
+                    }
+                    _ => return None,
+                }
+            }
+            i += if took_next { 2 } else { 1 };
+            continue;
+        }
+        if !saw_quiet {
+            return None;
+        }
+        let rest = args.get(i..)?;
+        return if saw_expr {
+            single_file_after_flags(rest)
+        } else {
+            match rest {
+                [_script, file] if !file.is_empty() && file != "-" => Some(file.clone()),
+                _ => None,
+            }
+        };
+    }
+    None
+}
+
+fn extract_simple_read_target(command: &str) -> Option<String> {
+    let tokens = split_simple_command(command)?;
+    let (cmd, rest) = tokens.split_first()?;
+    let target = match cmd.as_str() {
+        "cat" | "/bin/cat" => parse_cat_target(rest),
+        "head" | "/usr/bin/head" => parse_head_tail_target(rest),
+        "tail" | "/usr/bin/tail" => parse_head_tail_target(rest),
+        "nl" | "/usr/bin/nl" => parse_nl_target(rest),
+        "sed" | "/usr/bin/sed" => parse_sed_target(rest),
+        _ => None,
+    }?;
+    // Reject tilde expansion unless ~/ or ~ (keep Path checks simple), reject obviously empty.
+    (!target.is_empty()).then_some(target)
+}
+
+fn maybe_track_read(ctx: &ToolCtx, cwd: &Path, command: &str) {
+    use std::io::Read as _;
+
+    const TRACK_BYTES_CAP: u64 = 2 * 1024 * 1024;
+    let Some(target) = extract_simple_read_target(command) else {
+        return;
+    };
+    let candidate = if target == "~" || target.starts_with("~/") {
+        ctx.sandbox.resolve(&target)
+    } else if Path::new(&target).is_absolute() {
+        std::path::PathBuf::from(&target)
+    } else {
+        cwd.join(&target)
+    };
+    let Ok(checked) = ctx.sandbox.check_read(&candidate) else {
+        return;
+    };
+    let Ok((mut file, meta)) = crate::files::open_readable(&checked, &|real| ctx.sandbox.check_read(real).map(|_| ()))
+    else {
+        return;
+    };
+    if !meta.is_file() {
+        return;
+    }
+    #[cfg(unix)]
+    let Ok(real) = ({
+        use std::os::fd::AsFd as _;
+        crate::files::real_path(file.as_fd())
+    }) else {
+        return;
+    };
+    #[cfg(not(unix))]
+    let Ok(real) = std::fs::canonicalize(&checked) else {
+        return;
+    };
+    if !crate::files::is_or_inside(&real, &ctx.workspace) {
+        return;
+    }
+    let seen = if meta.len() <= TRACK_BYTES_CAP {
+        let mut buf = Vec::new();
+        if file.by_ref().take(TRACK_BYTES_CAP + 1).read_to_end(&mut buf).is_ok()
+            && (buf.len() as u64) <= TRACK_BYTES_CAP
+        {
+            crate::files::Seen::of_bytes(&buf)
+        } else {
+            crate::files::Seen::of_stat(&meta)
+        }
+    } else {
+        crate::files::Seen::of_stat(&meta)
+    };
+    ctx.files.record(&real, seen);
 }
 
 /// What the result of a call says about the watch on the job it leaves behind.
@@ -465,6 +864,7 @@ async fn run_command(ctx: &ToolCtx, args: &Map<String, Value>, launch: Option<&L
         Some(launch) => launch.env.clone(),
         None => command_env(ctx),
     };
+    let track_cwd = launch.is_none().then(|| cwd.clone());
     let spec = Spawn { script: command.to_string(), cwd, env, out_path, exit_path };
     let started = Instant::now();
     let sandboxed = launch.is_none();
@@ -592,6 +992,11 @@ async fn run_command(ctx: &ToolCtx, args: &Map<String, Value>, launch: Option<&L
                 });
             }
             remove_files(&running);
+            if ended == Ended::Exit(0) {
+                if let Some(ref track_cwd) = track_cwd {
+                    maybe_track_read(ctx, track_cwd, command);
+                }
+            }
             finish(Finish {
                 ctx,
                 status,
@@ -1294,5 +1699,132 @@ mod tests {
             assert!(r.text.contains("Operation not permitted") && !r.text.contains("JOB-OUTPUT"), "{}", r.text);
         }
         let _ = e.call("job_kill", json!({"job": id})).await;
+    }
+
+    #[test]
+    fn simple_read_target_parser_accepts_and_rejects_strictly() {
+        use super::extract_simple_read_target;
+
+        assert_eq!(extract_simple_read_target("cat foo.rs"), Some("foo.rs".into()));
+        assert_eq!(extract_simple_read_target("cat -n -- 'a b.txt'"), Some("a b.txt".into()));
+        assert_eq!(extract_simple_read_target("head -n 20 src/lib.rs"), Some("src/lib.rs".into()));
+        assert_eq!(extract_simple_read_target("head -20 src/lib.rs"), Some("src/lib.rs".into()));
+        assert_eq!(extract_simple_read_target("tail -n +5 src/lib.rs"), Some("src/lib.rs".into()));
+        assert_eq!(extract_simple_read_target("nl -ba src/lib.rs"), Some("src/lib.rs".into()));
+        assert_eq!(extract_simple_read_target("sed -n '1,10p' src/lib.rs"), Some("src/lib.rs".into()));
+        assert_eq!(extract_simple_read_target("sed -n -e '1p' src/lib.rs"), Some("src/lib.rs".into()));
+
+        for rejected in [
+            "cat a.rs b.rs",
+            "cat a.rs | grep x",
+            "cat a.rs > b.rs",
+            "cat a.rs; ls",
+            "cat $HOME/a.rs",
+            "cat \"$HOME/a.rs\"",
+            "cat *.rs",
+            "tail -f a.rs",
+            "tail -F a.rs",
+            "tail --follow a.rs",
+            "sed '1p' a.rs",
+            "sed -i '' 's/a/b/' a.rs",
+            "sed -ni 's/a/b/' a.rs",
+            "cat -",
+            "grep foo a.rs",
+        ] {
+            assert_eq!(extract_simple_read_target(rejected), None, "{rejected}");
+        }
+    }
+
+    #[tokio::test]
+    async fn bash_read_tracking_unblocks_subsequent_edit_and_ignores_complex_cmds() {
+        let e = env();
+        for name in ["a.txt", "b.txt", "c.txt", "d.txt", "e.txt", "multi1.txt", "multi2.txt", "pipe.txt"] {
+            std::fs::write(e.ctx.workspace.join(name), "old line\nsecond line\nthird line\n").unwrap();
+        }
+        std::fs::create_dir_all(e.ctx.workspace.join("sub")).unwrap();
+        std::fs::write(e.ctx.workspace.join("sub/nested.txt"), "old line\n").unwrap();
+
+        for (cmd, file) in [
+            ("cat a.txt", "a.txt"),
+            ("head -n 2 b.txt", "b.txt"),
+            ("tail -n 2 c.txt", "c.txt"),
+            ("nl -ba d.txt", "d.txt"),
+            ("sed -n '1,2p' e.txt", "e.txt"),
+        ] {
+            let b = e.call("bash", json!({"command": cmd})).await;
+            assert_eq!(b.status, ToolStatus::Ok, "{cmd}: {}", b.text);
+            let ed = e.call("edit", json!({"path": file, "old": "old line", "new": "new line"})).await;
+            assert_eq!(ed.status, ToolStatus::Ok, "{file} after `{cmd}`: {}", ed.text);
+        }
+
+        // Works with bash `cwd` relative to workspace.
+        let b = e.call("bash", json!({"command": "cat nested.txt", "cwd": "sub"})).await;
+        assert_eq!(b.status, ToolStatus::Ok, "{}", b.text);
+        let ed = e.call("edit", json!({"path": "sub/nested.txt", "old": "old line", "new": "updated"})).await;
+        assert_eq!(ed.status, ToolStatus::Ok, "{}", ed.text);
+
+        // Multi-file and piped commands must NOT record read state.
+        let b1 = e.call("bash", json!({"command": "cat multi1.txt multi2.txt"})).await;
+        assert_eq!(b1.status, ToolStatus::Ok, "{}", b1.text);
+        let ed1 = e.call("edit", json!({"path": "multi1.txt", "old": "old line", "new": "x"})).await;
+        assert_eq!(ed1.status, ToolStatus::Error, "{}", ed1.text);
+        assert!(ed1.text.contains("has not been read"), "{}", ed1.text);
+
+        let b2 = e.call("bash", json!({"command": "cat pipe.txt | head -n 1"})).await;
+        assert_eq!(b2.status, ToolStatus::Ok, "{}", b2.text);
+        let ed2 = e.call("edit", json!({"path": "pipe.txt", "old": "old line", "new": "x"})).await;
+        assert_eq!(ed2.status, ToolStatus::Error, "{}", ed2.text);
+        assert!(ed2.text.contains("has not been read"), "{}", ed2.text);
+    }
+
+    #[test]
+    fn finish_adds_seatbelt_heredoc_note_when_blocked() {
+        let mut e = env();
+        let ws_cfg = SandboxCfg { mode: SandboxMode::Seatbelt, ..SandboxCfg::default() };
+        let tmp = e.ctx.workspace.join(".loom-tmp");
+        let home = e.ctx.workspace.join(".loom-home");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        if let Ok(sb) = crate::sandbox::Sandbox::new(&ws_cfg, &e.ctx.workspace, &tmp, &home, None) {
+            e.ctx.sandbox = std::sync::Arc::new(sb);
+            let ended = Ended::Exit(1);
+            let out = super::finish(super::Finish {
+                ctx: &e.ctx,
+                status: ToolStatus::Error,
+                outcome: ended.outcome(),
+                ended: &ended,
+                output: b"bash: line 1: cannot create temp file for here document: Operation not permitted\n".to_vec(),
+                elapsed: Duration::from_millis(10),
+                facts: Vec::new(),
+                job: None,
+                sandboxed: true,
+            });
+            assert!(out.more.iter().any(|m| m.contains("heredoc temp file blocked under Seatbelt")), "{:?}", out.more);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn bash_heredoc_succeeds_through_tool_under_seatbelt() {
+        if crate::sandbox::Sandbox::modern_bash().is_none() {
+            return;
+        }
+        let mut e = env();
+        let ws_cfg = SandboxCfg {
+            mode: SandboxMode::Seatbelt,
+            protected_paths: vec![e.ctx.workspace.display().to_string()],
+            ..SandboxCfg::default()
+        };
+        let tmp = e.ctx.workspace.join(".loom-tmp");
+        let home = e.ctx.workspace.join(".loom-home");
+        std::fs::create_dir_all(&home).unwrap();
+        // Intentionally remove `tmp` first to ensure pre-creation handles missing dir cleanly.
+        let _ = std::fs::remove_dir_all(&tmp);
+        if let Ok(sb) = crate::sandbox::Sandbox::new(&ws_cfg, &e.ctx.workspace, &tmp, &home, None) {
+            e.ctx.sandbox = std::sync::Arc::new(sb);
+            let r = e.call("bash", json!({"command": "cat <<'EOF'\nvia-bash-tool-heredoc\nEOF"})).await;
+            assert_eq!(r.status, ToolStatus::Ok, "{}", r.text);
+            assert!(r.text.contains("via-bash-tool-heredoc"), "{}", r.text);
+        }
     }
 }

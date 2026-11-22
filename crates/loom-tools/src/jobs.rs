@@ -880,18 +880,11 @@ impl Scanner {
         };
         let part = raw.get(..whole)?;
         let part_end = start.saturating_add(whole as u64);
-        self.scanned = part_end;
-        self.floor = part_end;
-        let (output, normalized) = match crate::view::store_text(blobs, part) {
-            Ok((stored, normalized)) => (Some(stored), normalized),
-            Err(e) => {
-                tracing::warn!("a matching part of the output {} was not stored: {e}", self.path.display());
-                (None, normalize(part))
-            }
-        };
+        let normalized = normalize(part);
         let mut lines = Vec::new();
         let mut matches = 0u64;
-        if !normalized.binary {
+        let stored_text: String;
+        let body_for_blob: &[u8] = if !normalized.binary {
             for (n, line) in normalized.text.split('\n').enumerate() {
                 if self.watch.pattern.is_match(line) {
                     matches += 1;
@@ -900,14 +893,81 @@ impl Scanner {
                     }
                 }
             }
-        }
+            normalized.text.as_bytes()
+        } else {
+            // Context lines or trailing bytes pushed the whole part over `looks_binary`; keep the
+            // confirmed match by evaluating each line individually instead of dropping `Found`.
+            let raw_lines: Vec<&[u8]> = part.split(|b| *b == b'\n').collect();
+            let mut rendered = Vec::with_capacity(raw_lines.len());
+            let mut line_binary = Vec::with_capacity(raw_lines.len());
+            for (n, raw_line) in raw_lines.iter().enumerate() {
+                let line_norm = normalize(raw_line);
+                line_binary.push(line_norm.binary);
+                if !line_norm.binary && self.watch.pattern.is_match(&line_norm.text) {
+                    matches += 1;
+                    if lines.len() < MATCH_LINES_MAX {
+                        lines.push((n as u64 + 1, line_norm.text.clone()));
+                    }
+                }
+                rendered.push(line_norm.text);
+            }
+            if matches == 0 {
+                // Even the confirmed line may have had a stray NUL/control byte that passed in a
+                // larger `find` chunk; fall back to lossless-line sanitization for those lines.
+                for (n, (raw_line, is_bin)) in raw_lines.iter().zip(line_binary).enumerate() {
+                    if !is_bin {
+                        continue;
+                    }
+                    let text = sanitized_line(raw_line);
+                    if self.watch.pattern.is_match(&text) {
+                        matches += 1;
+                        if lines.len() < MATCH_LINES_MAX {
+                            lines.push((n as u64 + 1, text.clone()));
+                        }
+                        if let Some(slot) = rendered.get_mut(n) {
+                            *slot = text;
+                        }
+                    }
+                }
+            }
+            stored_text = rendered.join("\n");
+            stored_text.as_bytes()
+        };
         if matches == 0 {
             return None;
         }
+        self.scanned = part_end;
+        self.floor = part_end;
+        let output = match blobs.put_bytes(body_for_blob) {
+            Ok(stored) => Some(stored),
+            Err(e) => {
+                tracing::warn!("a matching part of the output {} was not stored: {e}", self.path.display());
+                None
+            }
+        };
         self.reports = self.reports.saturating_add(1);
         self.last_report = Some(Instant::now());
         Some(Found { output, from: start, lines, matches, last: self.over() })
     }
+}
+
+/// Sanitize one raw line (without `\n`) the way `admit::normalize` treats text lines, used only as
+/// a fallback when a confirmed `wake_on` match lies in a part whose whole-slice heuristic saw binary.
+fn sanitized_line(raw: &[u8]) -> String {
+    let decoded = String::from_utf8_lossy(raw);
+    let mut l = decoded.trim_end_matches('\r');
+    if let Some(p) = l.rfind('\r') {
+        l = l.get(p + 1..).unwrap_or("");
+    }
+    let mut out = String::with_capacity(l.len());
+    for ch in l.chars() {
+        if (ch < ' ' && ch != '\t') || ch == '\u{7f}' {
+            out.push_str(&format!("\\x{:02x}", ch as u32));
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 /// The byte offset, in `lines`, of the first line that matches once normalised. Normalising keeps
@@ -1310,6 +1370,68 @@ mod tests {
         let JobEvent::Settled { info, .. } = f.event().await else { panic!("Settled must follow") };
         assert_eq!(info.state, JobState::Ended(Ended::Exit(0)));
         f.assert_quiet().await;
+    }
+
+    #[tokio::test]
+    async fn binary_context_or_trailing_bytes_do_not_drop_a_confirmed_watch_match() {
+        let f = fx();
+        let out_path = f.root.join("watch-bin.out");
+        let watch = Watch::new("^FOUND", Duration::ZERO, 5).expect("watch");
+        // Context lines before the match are binary, and trailing bytes after the match are binary too,
+        // so `normalize(part).binary` is true even though the matching line itself is plain ASCII.
+        std::fs::write(&out_path, b"\x00\x00\x00\x00\n").unwrap();
+        let mut scanner = Scanner {
+            watch,
+            path: out_path.clone(),
+            limit: 1 << 20,
+            scanned: 0,
+            floor: 0,
+            pending: None,
+            last_report: None,
+            reports: 0,
+        };
+        // First look skips the binary line (advancing `scanned`, keeping `floor == 0`).
+        assert!(scanner.look(&f.blobs, false).is_none());
+        assert_eq!((scanner.scanned, scanner.floor), (5, 0));
+        // Case 1: binary context from `floor` + matching ASCII line (`normalize(part).binary == true`).
+        std::fs::write(&out_path, b"\x00\x00\x00\x00\nFOUND key=abc\n").unwrap();
+        scanner.scanned = 5;
+        scanner.floor = 0;
+        let found = scanner.look(&f.blobs, true).expect("binary context must not drop match");
+        assert_eq!(found.from, 0);
+        assert_eq!(found.lines, [(2, "FOUND key=abc".to_string())]);
+        assert_eq!(found.matches, 1);
+        let blob = f.stored(found.output.as_ref().expect("stored"));
+        assert!(blob.contains("FOUND key=abc"), "{blob}");
+
+        // Case 2: trailing binary bytes written after `find()` set `pending` (plus a stray NUL on the
+        // matched line itself that passed `find()`'s larger chunk threshold).
+        let out2 = f.root.join("watch-bin2.out");
+        let mut padded = vec![b'a'; 180];
+        padded.push(b'\n');
+        padded.extend_from_slice(b"FOUND\x00key=xyz\n");
+        std::fs::write(&out2, &padded).unwrap();
+        let mut scanner2 = Scanner {
+            watch: Watch::new("^FOUND", Duration::ZERO, 5).expect("watch"),
+            path: out2.clone(),
+            limit: 1 << 20,
+            scanned: 0,
+            floor: 0,
+            pending: None,
+            last_report: None,
+            reports: 0,
+        };
+        // `find()` confirms the match before the trailing binary dump arrives.
+        scanner2.find(false);
+        assert!(scanner2.pending.is_some());
+        {
+            use std::io::Write;
+            let mut file = std::fs::OpenOptions::new().append(true).open(&out2).unwrap();
+            file.write_all(&[0u8; 64]).unwrap();
+        }
+        let found2 = scanner2.look(&f.blobs, true).expect("trailing binary must not drop match");
+        assert_eq!(found2.matches, 1);
+        assert_eq!(found2.lines[0].1, "FOUND\\x00key=xyz");
     }
 
     #[tokio::test]

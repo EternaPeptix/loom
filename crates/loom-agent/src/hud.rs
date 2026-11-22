@@ -103,14 +103,20 @@
 //! the re-read rule; determinism.
 
 use crate::{frontier, texts};
-use loom_core::event::{Budget, Event, Record, ToolClass, ToolStatus, META_PATH};
+use loom_core::event::{
+    Budget, Event, Record, ToolClass, ToolResult, ToolStatus, META_EXIT_CODE, META_PATH, META_SIGNAL,
+};
+use loom_core::ids::CallId;
 use loom_core::ledger::{BriefOpts, LedgerState, ObligationKind};
 use loom_core::observe::{self, StaleKind};
 use loom_core::security_state::{HypothesisStatus, SecurityState};
 use serde_json::Value;
+use std::collections::HashSet;
 
 pub const MAX_ITEMS: usize = 8;
 pub const MAX_LINE: usize = 240;
+const RECENT_FILES_LIMIT: usize = 5;
+const RECENT_COMMANDS_LIMIT: usize = 3;
 
 /// A background job as the block shows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -395,13 +401,17 @@ fn stale_lines(records: &[Record]) -> Vec<String> {
 fn exec_command(records: &[Record], seq: u64) -> String {
     let Some(rec) = records.iter().find(|r| r.seq == seq) else { return String::new() };
     let (call_id, name) = match &rec.event {
-        Event::ToolResult(t) => (&t.call_id, t.name.clone()),
-        Event::ToolCall(c) => (&c.call_id, c.name.clone()),
+        Event::ToolResult(t) => (&t.call_id, t.name.as_str()),
+        Event::ToolCall(c) => (&c.call_id, c.name.as_str()),
         _ => return String::new(),
     };
+    call_command(records, call_id, name)
+}
+
+fn call_command(records: &[Record], call_id: &CallId, fallback: &str) -> String {
     let command = records.iter().find_map(|r| match &r.event {
         Event::ToolCall(c) if &c.call_id == call_id => {
-            c.args.get("command").and_then(Value::as_str).map(str::to_string)
+            c.args.get("command").or_else(|| c.args.get("cmd")).and_then(Value::as_str).map(str::to_string)
         }
         _ => None,
     });
@@ -409,13 +419,72 @@ fn exec_command(records: &[Record], seq: u64) -> String {
         Some(c) => {
             let first = c.lines().next().unwrap_or("").trim();
             if first.is_empty() {
-                name
+                fallback.to_string()
             } else {
                 cut(first, 80)
             }
         }
-        None => name,
+        None => fallback.to_string(),
     }
+}
+
+fn command_outcome(t: &ToolResult) -> String {
+    if let Some(code) = t.meta.get(META_EXIT_CODE).and_then(Value::as_i64) {
+        return format!("exit {code}");
+    }
+    if let Some(sig) = t.meta.get(META_SIGNAL).and_then(Value::as_str) {
+        return format!("signal {sig}");
+    }
+    match t.status {
+        ToolStatus::Ok => "ok",
+        ToolStatus::Error => "error",
+        ToolStatus::Denied => "denied",
+        ToolStatus::Invalid => "invalid",
+        ToolStatus::Timeout => "timeout",
+        ToolStatus::Interrupted => "interrupted",
+    }
+    .to_string()
+}
+
+/// Compact, bounded breadcrumbs of recent workspace file accesses (last <= 5) and command outcomes
+/// (last <= 3) from session records. Returns `None` when nothing has been read, written, or run.
+pub fn recent_activity(records: &[Record]) -> Option<String> {
+    let mut files: Vec<String> = Vec::new();
+    let mut seen_files: HashSet<&str> = HashSet::new();
+    let mut commands: Vec<String> = Vec::new();
+    for rec in records.iter().rev() {
+        let Event::ToolResult(t) = &rec.event else { continue };
+        if files.len() < RECENT_FILES_LIMIT
+            && t.status == ToolStatus::Ok
+            && matches!(t.class, ToolClass::Read | ToolClass::Write)
+        {
+            if let Some(path) = t.meta.get(META_PATH).and_then(Value::as_str).map(str::trim).filter(|p| !p.is_empty()) {
+                if seen_files.insert(path) {
+                    let verb = if t.class == ToolClass::Read { "read" } else { "wrote" };
+                    files.push(format!("- {verb} {path}"));
+                }
+            }
+        }
+        if commands.len() < RECENT_COMMANDS_LIMIT && t.class == ToolClass::Exec {
+            let cmd = call_command(records, &t.call_id, &t.name);
+            let outcome = command_outcome(t);
+            commands.push(format!("- `{cmd}` — {outcome}"));
+        }
+        if files.len() >= RECENT_FILES_LIMIT && commands.len() >= RECENT_COMMANDS_LIMIT {
+            break;
+        }
+    }
+    if files.is_empty() && commands.is_empty() {
+        return None;
+    }
+    files.reverse();
+    commands.reverse();
+    let mut lines = Vec::with_capacity(1 + files.len() + commands.len());
+    lines.push("Recent activity:".to_string());
+    for entry in files.into_iter().chain(commands) {
+        lines.push(one_line(&entry));
+    }
+    Some(lines.join("\n"))
 }
 
 /// `ms` since the Unix epoch as `YYYY-MM-DD HH:MM UTC`.
@@ -1093,5 +1162,69 @@ Waiting on the operator (1):\n- q2: Which branch should this target?",
         assert_eq!(brief_opts(&with), BriefOpts::default());
         assert_eq!(brief_opts(&without), BriefOpts::uncapped());
         assert_eq!(brief_opts(&[]), BriefOpts::uncapped());
+    }
+
+    #[test]
+    fn recent_activity_is_bounded_deduplicated_and_omitted_when_empty() {
+        assert_eq!(recent_activity(EMPTY), None);
+
+        let mut recs = Vec::new();
+        let mut seq = 1u64;
+        // 7 file accesses with a re-write of f0.rs at the end; only the last 5 distinct paths stay.
+        for i in 0..7 {
+            let path = format!("src/f{i}.rs");
+            let id = format!("rf{i}");
+            recs.push(call(seq, &id, "read", json!({"path": path}), ToolClass::Read));
+            seq += 1;
+            recs.push(result(seq, &id, "read", ToolClass::Read, None, false, json!({"path": path})));
+            seq += 1;
+        }
+        // Failed read is ignored; re-write of f0 updates its verb and promotes it to latest.
+        recs.push(rec(
+            seq,
+            Event::ToolResult(ToolResult {
+                call_id: CallId::from("rf_err"),
+                name: "read".into(),
+                status: ToolStatus::Error,
+                text: "missing".into(),
+                output: None,
+                cut: false,
+                class: ToolClass::Read,
+                meta: json!({"path": "src/missing.rs"}).as_object().cloned().unwrap(),
+                duration_ms: 0,
+            }),
+        ));
+        seq += 1;
+        recs.push(call(seq, "wf0", "edit", json!({"path": "src/f0.rs"}), ToolClass::Write));
+        seq += 1;
+        recs.push(result(seq, "wf0", "edit", ToolClass::Write, None, false, json!({"path": "src/f0.rs"})));
+        seq += 1;
+
+        // 4 exec commands; only the last 3 stay.
+        for (i, meta) in [json!({"exit_code": 0}), json!({"exit_code": 2}), json!({"signal": "TERM"}), json!({})]
+            .into_iter()
+            .enumerate()
+        {
+            let id = format!("cmd{i}");
+            let cmd = format!("step_{i} --flag\nignored_second_line");
+            recs.push(call(seq, &id, "bash", json!({"command": cmd}), ToolClass::Exec));
+            seq += 1;
+            recs.push(result(seq, &id, "bash", ToolClass::Exec, None, false, meta));
+            seq += 1;
+        }
+
+        let block = recent_activity(&recs).expect("activity expected");
+        assert_eq!(
+            block,
+            "Recent activity:\n\
+- read src/f3.rs\n\
+- read src/f4.rs\n\
+- read src/f5.rs\n\
+- read src/f6.rs\n\
+- wrote src/f0.rs\n\
+- `step_1 --flag` — exit 2\n\
+- `step_2 --flag` — signal TERM\n\
+- `step_3 --flag` — ok"
+        );
     }
 }

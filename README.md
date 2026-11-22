@@ -28,6 +28,43 @@ It inverts the cloud assumptions:
 
 `docs/DESIGN.md` is the specification; this README is the tour. `docs/RUN.md` is the runbook.
 
+## Screenshots
+
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <img src="docs/screenshots/01-overview.png" alt="Missions grouped by workspace"><br>
+      <sub><b>Missions, grouped by workspace.</b> A pinned <b>Needs you</b> group floats whatever is waiting on you to the top.</sub>
+    </td>
+    <td width="50%" valign="top">
+      <img src="docs/screenshots/02-session-chat.png" alt="A session's chat with tool calls"><br>
+      <sub><b>A session is one conversation.</b> Tool calls fold into work groups you can open; every row has Copy&nbsp;command / Copy&nbsp;output. A chip names the model behind each reply, and a model switch is a visible line.</sub>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <img src="docs/screenshots/03-fleet.png" alt="A mission's fleet of agents"><br>
+      <sub><b>A fleet, by role and state.</b> Lead, dispatcher, solvers, verifiers — each agent's effort is scored: steps, calls, malformed calls, refused finishes, verifier accepts and rejects.</sub>
+    </td>
+    <td width="50%" valign="top">
+      <img src="docs/screenshots/05-context.png" alt="The context card"><br>
+      <sub><b>What is in the model's window, right now.</b> Every segment counted, the cached and read-anew split, and the marks where the prefix would be re-woven.</sub>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <img src="docs/screenshots/04-inbox.png" alt="The inbox"><br>
+      <sub><b>The inbox.</b> Questions, approvals and parked blockers, grouped by mission, each with its ways out — answer, fold the context, or switch the model.</sub>
+    </td>
+    <td width="50%" valign="top" align="center">
+      <img src="docs/screenshots/06-phone.png" alt="The phone layout" width="55%"><br>
+      <sub><b>On a phone.</b> The same record in one scroll; the composer sticks to the bottom and a session's open question lands in view.</sub>
+    </td>
+  </tr>
+</table>
+
+<sub>All shots are from the UI's offline fixture (<code>node tools/ui-preview.mjs</code>): no daemon, model, credentials or real data.</sub>
+
 ## Requirements
 
 - Rust 1.88 or newer (`rust-version` in `Cargo.toml`) to build.
@@ -91,21 +128,32 @@ Each of these is a mechanism, not a line in a prompt.
 - **State that must outlive the window lives in a sealed ledger.** Goal, constraints, plan, decisions,
   dead ends, claims, evidence, obligations and approvals are typed, HMAC-chained records in a journal
   outside the workspace, written at decision time. A claim may only quote lines the harness actually
-  put in front of the model, checked verbatim against the stored bytes. The Markdown you read is a
-  generated view, never parsed back.
+  put in front of the model, checked verbatim against the stored bytes, and each piece of evidence is
+  graded by how it was obtained — a command that ran, a static analysis, a file read, an external lookup —
+  so an analysis (a dependency scan, a decompilation) can never pass itself off as a *run* that concludes a
+  goal or settles a verifier's objection. The Markdown you read is a generated view, never parsed back.
 - **Stopping is an act.** A turn that ends without a tool call goes through a gate: for a working
   role, if the ledger still has open steps, obligations or unverified claims, the harness says exactly
   what is open and continues; "it has been a while" and "context" are not reasons to stop. Work ends
   only through `finish` (mechanically checked, then, for a role that asks for it, attacked by an
   independent verifier), `ask_user`, `report_blocker` or `wait`.
 - **Enforcement sits outside the agent's reach.** Keys, config, harness state and the tool set live
-  outside the sandbox's writable area. Network scope is enforced by a loopback egress proxy plus an OS
-  sandbox that permits no other route, not by reading shell text.
+  outside the sandbox's writable area, and the sandbox hides the whole loom home from reads, so a command
+  cannot reach another session's log, a stored output or a mission journal. The daemon's own API port is
+  refused to commands; Git config, hooks and worktree pointers cannot be planted where commands write; and
+  the daemon runs with a cleared environment, so a proxy or credential exported in the shell that started
+  it never reaches a model request or a command. Network scope is enforced by a loopback egress proxy plus
+  an OS sandbox that permits no other route, not by reading shell text.
 - **Nothing leaves the machine unless you configure it.** No telemetry, no analytics, no fallback
   provider. Model requests go only to the server you named.
 - **Unattended is the default.** The daemon survives its own restarts (it resumes what was running
   from the logs), stops cascade to every child, every child has a budget, and anything waiting on a
   human raises a notification.
+- **A new mission can start from what earlier ones learned.** You name the missions to recall
+  (`loom run --prior <mission>`, repeatable, or the web form); before its first step the new lead is
+  handed each one's goal, your standing rules and answers, where its work stood when its ledger was last
+  written, and its security findings as counts and locators — read from the sealed journals, never
+  replayed from a transcript.
 
 ## Shape
 
@@ -129,7 +177,8 @@ Crates:
 | `loom-daemon` | the HTTP API, the embedded web UI, and the `loom` command |
 
 State lives under `~/.loom/` (override with `LOOM_HOME`), never inside a workspace: the config, the
-API token (`token`), the journal key (`keys/`), one directory per session (its log, a small summary
+API token (`token`), the journal key (`keys/`), model API keys when you use `api_key_file`
+(`keys/models/`), one directory per session (its log, a small summary
 and its job files), the content-addressed blob store, one journal per mission, logs, and any packs you
 install.
 
@@ -160,6 +209,8 @@ evidence tiers, is a pack, not core.
 
 ```
 loom run -w /path/to/workspace "task"     start a lead session in that directory and follow it
+loom run ... --prior <mission>            also recall what one or more earlier missions learned
+loom run ... --create-workspace           make the workspace folder first if it does not exist
 loom chat                                 a turn-by-turn chat session on the terminal
 loom ls                                   sessions, their state and context size
 loom tail <session>                       follow a session's record
@@ -213,11 +264,16 @@ daemon's token; `docs/RUN.md` has the recipe.
 
 ## Seeing it: the web UI and the desktop app
 
-The daemon serves a web UI at `/` (missions grouped by workspace on the left; in the middle a header
-that names the model and session running it, the chat of the live record with its tool calls folded
-into work groups, and a composer with a model seat to switch the session's model; on the right an
-inspector with the ledger, context window with each item's standing, inbox, network decisions). It is static,
-strict-CSP, has no build step, and updates live over SSE. Run `loom open` to open it: the command asks
+The daemon serves a web UI at `/`: missions grouped by workspace on the left, with a pinned *Needs you*
+group first; in the middle each session as one **chat** — the whole record as a conversation, tool calls
+folded into work groups you can open, a chip on every reply naming the model that produced it (a model
+switch is a visible line), and a composer with a model seat that moves the session to another model from
+its next step; on the right an inspector with the mission ledger, a **context card** that shows exactly
+what is in the model's window, by segment and with the fold marks, the inbox and the network decisions.
+An **Agents** tab shows a mission's fleet by role and state with each agent's score; a **Files** tab
+browses the session's workspace, read-only. Copy buttons sit on every reply, code block, tool command or
+output and quoted line, and it reads on a phone: one scroll, a sticky composer and a session-details
+sheet. The page is static, strict-CSP, has no build step, and updates live over SSE. Run `loom open` to open it: the command asks
 the daemon for a one-time login code and opens the page with it. The page needs no cookie; it keeps
 a secret in the tab's session storage and asks you to run `loom open` again when that is gone.
 

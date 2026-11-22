@@ -1608,7 +1608,25 @@ impl MadeWorkspace {
         if self.created.is_empty() {
             return;
         }
-        let _ = std::fs::remove_dir(self.path.join(".loom"));
+        let loom = self.path.join(".loom");
+        // Never remove `.loom` if another entry sits inside `self.path` or `.loom` itself is non-empty
+        // (for instance when a concurrent session already populated files under this workspace).
+        let workspace_only_has_loom = match std::fs::read_dir(&self.path) {
+            Ok(entries) => entries.filter_map(Result::ok).all(|e| e.file_name() == ".loom"),
+            Err(_) => false,
+        };
+        let loom_is_empty = match std::fs::read_dir(&loom) {
+            Ok(mut entries) => entries.next().is_none(),
+            Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+        };
+        if !workspace_only_has_loom || !loom_is_empty {
+            return;
+        }
+        match std::fs::remove_dir(&loom) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return,
+        }
         for dir in self.created.iter().rev() {
             if std::fs::remove_dir(dir).is_err() {
                 break;
@@ -2403,6 +2421,8 @@ struct Inner {
     scan_lock: tokio::sync::Mutex<()>,
     /// Held while sessions are activated (never across an `.await`).
     activation: Mutex<()>,
+    /// Held around workspace creation/undo paired with `known` registration (`workspace_ops` -> `state`).
+    workspace_ops: Mutex<()>,
     shutting: AtomicBool,
     /// The volume of the loom home was low at the last check (see `note_disk`).
     disk_low: AtomicBool,
@@ -3171,8 +3191,9 @@ impl Inner {
     }
 
     /// Wait until no task of `ids` is ending after its inputs were closed (an archive), up to the kill
-    /// grace of its jobs plus [`SHUTDOWN_TASK_WAIT`], as a shutdown waits for its tasks.
-    async fn until_closed(&self, ids: &[SessionId]) {
+    /// grace of its jobs plus [`SHUTDOWN_TASK_WAIT`], as a shutdown waits for its tasks. Returns `true`
+    /// when every task has finished closing, `false` on timeout.
+    async fn until_closed(&self, ids: &[SessionId]) -> bool {
         let wait = Duration::from_secs(self.config.tools.kill_grace_s).saturating_add(SHUTDOWN_TASK_WAIT);
         let begun = tokio::time::Instant::now();
         loop {
@@ -3183,8 +3204,11 @@ impl Inner {
                 };
                 ids.iter().any(closed)
             };
-            if !closing || begun.elapsed() >= wait {
-                return;
+            if !closing {
+                return true;
+            }
+            if begun.elapsed() >= wait {
+                return false;
             }
             tokio::time::sleep(SHUTDOWN_POLL).await;
         }
@@ -4934,11 +4958,26 @@ impl Inner {
                 return;
             }
         };
+        let gate_children: HashSet<SessionId> = {
+            let st = self.st();
+            queued
+                .iter()
+                .filter_map(|(_, ev)| match ev {
+                    Event::ChildSettled(c) if st.known.get(&c.child).is_some_and(|k| k.meta.gate.is_some()) => {
+                        Some(c.child.clone())
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
         for (author, mut event) in queued {
             // A report a `join` of the call took has no result to be shown in: it is shown as one that
-            // arrived by itself.
+            // arrived by itself — except for internal `harness: true` gate verifiers, which must stay
+            // hidden from the lead's weave on resume.
             if let Event::ChildSettled(c) = &mut event {
-                c.inline = false;
+                if !gate_children.contains(&c.child) {
+                    c.inline = false;
+                }
             }
             match log.append(author, event) {
                 Ok(record) => self.on_record(parent, &record),
@@ -5370,6 +5409,7 @@ impl Runtime {
             state: Mutex::new(State::default()),
             scan_lock: tokio::sync::Mutex::new(()),
             activation: Mutex::new(()),
+            workspace_ops: Mutex::new(()),
             shutting: AtomicBool::new(false),
             disk_low: AtomicBool::new(false),
             restoring: AtomicBool::new(true),
@@ -5792,48 +5832,64 @@ impl Runtime {
         let (model, window, from_config) = inner.facts(&profile_name).await?;
         // The earlier missions to recall can refuse the request too, so they are read before the folder is made.
         let (prior_ids, recalled) = self.recall_earlier(&new.prior).await?;
-        let made = plan.make_tracked()?;
-        let workspace = made.path.clone();
-        let created = !made.created.is_empty();
-        let title = match new.title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
-            Some(t) => t.to_string(),
-            None => {
-                let first = new.message.as_deref().and_then(|m| m.lines().map(str::trim).find(|l| !l.is_empty()));
-                match first {
-                    Some(l) => cut_chars(l, 80),
-                    None => "untitled".to_string(),
-                }
-            }
-        };
-        let id = SessionId::generate();
         let explicit = role.termination == Termination::Explicit;
-        let meta = SessionMeta {
-            id: id.clone(),
-            mission: MissionId::generate(),
-            parent: None,
-            workspace: workspace.display().to_string(),
-            copy_of: None,
-            pack: role.pack.clone(),
-            role: role.name.clone(),
-            profile: profile_name.clone(),
-            model,
-            context_window: window,
-            title,
-            created_ms: now_ms(),
-            mode: None,
-            awaited: false,
-            unattended: new.unattended.unwrap_or(explicit),
-            archived: false,
-            gate: None,
-            prior: prior_ids,
-            role_models,
+        let (made, workspace, created, id, meta) = {
+            let _ws_guard = lock(&inner.workspace_ops);
+            let made = plan.make_tracked()?;
+            let workspace = made.path.clone();
+            let created = !made.created.is_empty();
+            let title = match new.title.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+                Some(t) => t.to_string(),
+                None => {
+                    let first = new.message.as_deref().and_then(|m| m.lines().map(str::trim).find(|l| !l.is_empty()));
+                    match first {
+                        Some(l) => cut_chars(l, 80),
+                        None => "untitled".to_string(),
+                    }
+                }
+            };
+            let id = SessionId::generate();
+            let meta = SessionMeta {
+                id: id.clone(),
+                mission: MissionId::generate(),
+                parent: None,
+                workspace: workspace.display().to_string(),
+                copy_of: None,
+                pack: role.pack.clone(),
+                role: role.name.clone(),
+                profile: profile_name.clone(),
+                model,
+                context_window: window,
+                title,
+                created_ms: now_ms(),
+                mode: None,
+                awaited: false,
+                unattended: new.unattended.unwrap_or(explicit),
+                archived: false,
+                gate: None,
+                prior: prior_ids,
+                role_models,
+            };
+            inner.st().known.insert(id.clone(), Known::new(meta.clone(), idle_status()));
+            (made, workspace, created, id, meta)
         };
-        inner.st().known.insert(id.clone(), Known::new(meta.clone(), idle_status()));
-        // A request that fails from here on takes back the folders it made.
+        // A request that fails from here on takes back the folders it made, unless another session
+        // already points at the same workspace or created subtree.
         let forget = |inner: &Inner| {
+            let _ws_guard = lock(&inner.workspace_ops);
             inner.proxy.revoke(&id);
-            inner.st().known.remove(&id);
-            made.undo();
+            let in_use = {
+                let mut st = inner.st();
+                st.known.remove(&id);
+                st.known.values().any(|k| {
+                    let ws = Path::new(&k.meta.workspace);
+                    loom_tools::files::is_or_inside(ws, &workspace)
+                        || made.created.iter().any(|dir| loom_tools::files::is_or_inside(ws, dir))
+                })
+            };
+            if !in_use {
+                made.undo();
+            }
         };
         let (deps, parts) = match inner.build(&meta, explicit) {
             Ok(x) => x,
@@ -6178,6 +6234,7 @@ impl Runtime {
         let mut report = ModelsReload { default_model: cfg.default_model.clone(), ..ModelsReload::default() };
         let mut profiles = BTreeMap::new();
         let mut made_live = Vec::new();
+        let mut resize: Vec<(Arc<Limiter>, u32)> = Vec::new();
         for (name, p) in &cfg.models {
             match old.get(name) {
                 Some(rt) if rt.client.profile() == p => {
@@ -6186,7 +6243,17 @@ impl Runtime {
                 before => {
                     let client = ModelClient::new(name, p.clone(), &self.inner.paths.model_keys_dir())
                         .map_err(|e| e.to_string())?;
-                    profiles.insert(name.clone(), Arc::new(ProfileRt::new(client, p.max_concurrent)));
+                    let limiter = match before {
+                        Some(old_rt) if old_rt.client.profile().base_url == p.base_url => {
+                            resize.push((old_rt.limiter.clone(), p.max_concurrent));
+                            old_rt.limiter.clone()
+                        }
+                        _ => Arc::new(Limiter::new(p.max_concurrent)),
+                    };
+                    profiles.insert(
+                        name.clone(),
+                        Arc::new(ProfileRt { client: Arc::new(client), limiter, discovered: Mutex::new(None) }),
+                    );
                     made_live.push((name.clone(), p.clone()));
                     if before.is_some() {
                         report.changed.push(name.clone());
@@ -6215,6 +6282,9 @@ impl Runtime {
             .extend(made_live.into_iter().map(|(_, p)| p));
         *self.inner.models.write().unwrap_or_else(|p| p.into_inner()) =
             Arc::new(ModelTable { default_model: cfg.default_model.clone(), profiles });
+        for (limiter, capacity) in resize {
+            limiter.set_capacity(capacity);
+        }
         // A new or changed endpoint is infrastructure at once for every connection through the proxy, those of every
         // session's commands included (E1). A loopback endpoint's port is refused by the sandboxes made from now on:
         // those of running sessions keep the ports they were made with until they are made again (`sandbox_cfg_for`).
@@ -6835,9 +6905,13 @@ impl Runtime {
             let mut ids = vec![id.clone()];
             ids.extend(st.known.iter().filter(|(_, k)| k.meta.parent.as_ref() == Some(id)).map(|(c, _)| c.clone()));
             if archived
-                && ids
-                    .iter()
-                    .any(|i| st.known.get(i).is_some_and(|k| k.active.is_some() && k.status.phase == Phase::Running))
+                && ids.iter().any(|i| {
+                    st.known.get(i).is_some_and(|k| {
+                        k.active.is_some()
+                            && (k.status.phase == Phase::Running
+                                || (k.meta.parent.is_some() && k.status.last_end.is_none() && !k.finished()))
+                    })
+                })
             {
                 return Err("Stop the session before archiving it.".to_string());
             }
@@ -6850,8 +6924,9 @@ impl Runtime {
                 let Some(k) = st.known.get_mut(sid) else { continue };
                 k.meta.archived = archived;
                 if let Some(a) = k.active.as_mut().filter(|_| archived) {
-                    // The task keeps its place until it has ended, so that nothing opens the session
-                    // beside it while it settles.
+                    // Cancel any starting/waking turn that has not yet published Phase::Running, and keep
+                    // the task entry until it has settled/ended so nothing re-opens beside it.
+                    a.control.stop_for_close();
                     let (closed, _) = unbounded_channel();
                     closing.push(std::mem::replace(&mut a.inputs, closed));
                 }
@@ -6914,7 +6989,12 @@ impl Runtime {
                 }
             };
             if !copies.is_empty() {
-                self.inner.until_closed(&family).await;
+                if !self.inner.until_closed(&family).await {
+                    return Err(
+                        "The session's workspace copies were not removed because a task did not finish closing in time; stop the session and try again."
+                            .to_string(),
+                    );
+                }
                 let removal = tokio::task::spawn_blocking(move || {
                     for dir in copies {
                         let _ = std::fs::remove_dir_all(&dir);
@@ -6928,7 +7008,7 @@ impl Runtime {
         if !archived {
             // A task an archive closed keeps its place until it has ended, and what is handed to it is
             // lost: those of the family end first.
-            self.inner.until_closed(&family).await;
+            let _ = self.inner.until_closed(&family).await;
             // What the agents settled with while the mission was archived is delivered now, and an
             // agent that had not settled goes on with its lead (or is settled, if it cannot be opened).
             self.inner.restore_children(|p| p == id);
@@ -14719,5 +14799,239 @@ mod tests {
         let err = plan.make_tracked().unwrap_err();
         assert!(err.contains("loom home"), "{err}");
         assert!(!home.join("a").exists(), "what the call made inside the home is removed again");
+    }
+
+    #[tokio::test]
+    async fn archive_refuses_starting_child_stops_waking_turn_and_never_deletes_live_copy() {
+        // (a) Rejects archiving when a child has not ended its first turn yet.
+        let stall = env(Script::new(|_, _| Action::Stall { ms: 600_000 })).await;
+        let parent = stall.rt.create_session(stall.new_session(None)).await.unwrap().meta.id;
+        let _kid = stall
+            .rt
+            .inner
+            .spawn_child(
+                &parent,
+                SpawnReq {
+                    role: "worker".into(),
+                    mode: SpawnMode::Fresh,
+                    brief: Brief { question: "q".into(), ..Brief::default() },
+                    budget: Budget::default(),
+                    call_id: CallId::from("c1"),
+                    title: "starting".into(),
+                    awaited: true,
+                    harness: false,
+                    prerequisite: None,
+                    workspace: Workspace::Shared,
+                },
+            )
+            .await
+            .unwrap();
+        let err = stall.rt.archive(&parent, true).await.unwrap_err();
+        assert!(err.contains("Stop the session before archiving it."), "{err}");
+        stall.rt.shutdown().await;
+
+        // (b) Archiving right after an idle session is sent a waking Input::User suppresses that turn.
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let id = e.rt.create_session(e.new_session(Some("first"))).await.unwrap().meta.id;
+        until("idle after first turn", || {
+            e.rt.session(&id).is_some_and(|s| s.status.phase == Phase::Idle && s.status.last_end.is_some())
+        })
+        .await;
+        assert_eq!(e.server.requests().len(), 1);
+        assert!(e.rt.inner.send_input(&id, Input::User("should not run".into())));
+        e.rt.archive(&id, true).await.unwrap();
+        until("lead closed", || e.rt.session(&id).is_some_and(|s| !s.active)).await;
+        assert_eq!(e.server.requests().len(), 1, "buffered waking user turn must not run after archive");
+        e.rt.shutdown().await;
+
+        // (c) If until_closed times out with Workspace::Copy, archive returns Err and leaves the copy intact.
+        let e = env_with(Script::new(|_, _| finish("ok")), false, |c| c.tools.kill_grace_s = 0).await;
+        let lead = e.rt.create_session(e.new_session(None)).await.unwrap().meta.id;
+        let mission = e.rt.session(&lead).unwrap().meta.mission;
+        let kid = SessionId::from("s-copykid");
+        let copy_dir = e.rt.paths().agent_copy(&mission, &kid);
+        std::fs::create_dir_all(e.rt.paths().session_dir(&kid)).unwrap();
+        std::fs::create_dir_all(&copy_dir).unwrap();
+        std::fs::write(copy_dir.join("work.txt"), "keep").unwrap();
+        let (closed_tx, closed_rx) = unbounded_channel();
+        drop(closed_rx);
+        let pending_task = tokio::spawn(std::future::pending::<()>());
+        let handle = pending_task.abort_handle();
+        {
+            let mut st = e.rt.inner.st();
+            let (shared, jobs, mut meta) = {
+                let lead_known = st.known.get(&lead).unwrap();
+                let a = lead_known.active.as_ref().unwrap();
+                (a.shared.clone(), a.jobs.clone(), lead_known.meta.clone())
+            };
+            meta.id = kid.clone();
+            meta.parent = Some(lead.clone());
+            meta.workspace = copy_dir.display().to_string();
+            meta.copy_of = Some(e.ws.display().to_string());
+            let mut status = idle_status();
+            status.last_end = Some(TurnEndReason::Yielded);
+            let mut k = Known::new(meta, status);
+            k.active = Some(ActiveSession {
+                gen: 99,
+                inputs: closed_tx,
+                control: Arc::new(Control::new()),
+                shared,
+                jobs,
+                task: pending_task,
+            });
+            st.known.insert(kid.clone(), k);
+        }
+        let err = e.rt.archive(&lead, true).await.unwrap_err();
+        assert!(err.contains("did not finish closing"), "{err}");
+        assert!(copy_dir.join("work.txt").is_file(), "live workspace copy must not be deleted on timeout");
+        handle.abort();
+        e.rt.inner.st().known.get_mut(&kid).unwrap().active = None;
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_gate_verifier_retry_keeps_aborted_gate_report_inline() {
+        let e = env(Script::new(|_, _| Action::Stall { ms: 600_000 })).await;
+        let parent = e.rt.create_session(e.new_session(None)).await.unwrap().meta.id;
+        let spawn = |harness: bool, q: &str, call_id: &str| {
+            let rt = e.rt.clone();
+            let p = parent.clone();
+            let question = q.to_string();
+            let cid = CallId::from(call_id);
+            async move {
+                rt.inner
+                    .spawn_child(
+                        &p,
+                        SpawnReq {
+                            role: "worker".into(),
+                            mode: SpawnMode::Fresh,
+                            brief: Brief { question, ..Brief::default() },
+                            budget: Budget::default(),
+                            call_id: cid,
+                            title: "child".into(),
+                            awaited: true,
+                            harness,
+                            prerequisite: None,
+                            workspace: Workspace::Shared,
+                        },
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+        let gate_child = spawn(true, "verify finish", "c-gate").await;
+        let normal_child = spawn(false, "user child", "c-normal").await;
+        let parent_shared = e.rt.inner.st().known.get(&parent).unwrap().active.as_ref().unwrap().shared.clone();
+        parent_shared.emit(
+            Author::Agent(gate_child.clone()),
+            Event::ChildSettled(loom_core::event::ChildSettled {
+                child: gate_child.clone(),
+                outcome: ChildOutcome::Stopped,
+                report: "GATE_INTERNAL_REPORT".into(),
+                full: None,
+                usage: Usage::default(),
+                steps: 1,
+                inline: true,
+            }),
+        );
+        parent_shared.emit(
+            Author::Agent(normal_child.clone()),
+            Event::ChildSettled(loom_core::event::ChildSettled {
+                child: normal_child.clone(),
+                outcome: ChildOutcome::Returned,
+                report: "NORMAL_CHILD_REPORT".into(),
+                full: None,
+                usage: Usage::default(),
+                steps: 1,
+                inline: true,
+            }),
+        );
+        e.rt.inner.write_for_parked(&parent, &parent_shared);
+        let rs = read_records(&e.rt.paths().session_log(&parent)).unwrap().records;
+        let gate_rec = rs.iter().find_map(|r| match &r.event {
+            Event::ChildSettled(c) if c.child == gate_child => Some(c),
+            _ => None,
+        });
+        let normal_rec = rs.iter().find_map(|r| match &r.event {
+            Event::ChildSettled(c) if c.child == normal_child => Some(c),
+            _ => None,
+        });
+        assert!(gate_rec.unwrap().inline, "internal gate verifier must stay inline=true");
+        assert!(!normal_rec.unwrap().inline, "normal child settlement flips to inline=false");
+        let w = loom_core::weave::weave(&rs);
+        let rendered: String = w.messages.iter().map(|m| m.content.as_str()).collect::<Vec<_>>().join("\n");
+        assert!(!rendered.contains("GATE_INTERNAL_REPORT"), "{rendered}");
+        assert!(rendered.contains("NORMAL_CHILD_REPORT"), "{rendered}");
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn reload_models_reuses_limiter_when_base_url_is_unchanged_and_replaces_when_changed() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let file = e.rt.paths().config_file();
+        let before = e.rt.inner.models().get("mock").unwrap().limiter.clone();
+        assert_eq!(before.capacity(), e.config.models["mock"].max_concurrent);
+
+        // Same base_url, different max_concurrent: reuses the exact Arc<Limiter> and updates capacity.
+        let mut cfg = e.config.clone();
+        cfg.models.get_mut("mock").unwrap().max_concurrent = 3;
+        std::fs::write(&file, toml::to_string(&cfg).unwrap()).unwrap();
+        let r = e.rt.reload_models().await.unwrap();
+        assert_eq!(r.changed, vec!["mock".to_string()]);
+        let same_url = e.rt.inner.models().get("mock").unwrap().limiter.clone();
+        assert!(Arc::ptr_eq(&before, &same_url), "same-URL reload must reuse existing Limiter");
+        assert_eq!(same_url.capacity(), 3);
+
+        // Failed later reload must not mutate capacities on earlier same-URL profiles.
+        let mut bad = cfg.clone();
+        bad.models.get_mut("mock").unwrap().max_concurrent = 9;
+        let mut broken = cfg.models["mock"].clone();
+        broken.api_key_file = Some("missing-key-file".into());
+        bad.models.insert("zzz_broken".into(), broken);
+        std::fs::write(&file, toml::to_string(&bad).unwrap()).unwrap();
+        assert!(e.rt.reload_models().await.is_err());
+        assert_eq!(same_url.capacity(), 3, "failed reload must leave existing Limiter capacity untouched");
+
+        // Changed base_url: constructs a new Limiter.
+        let other = MockServer::start(Script::new(|_, _| finish("ok"))).await.unwrap();
+        cfg.models.get_mut("mock").unwrap().base_url = other.base_url();
+        std::fs::write(&file, toml::to_string(&cfg).unwrap()).unwrap();
+        e.rt.reload_models().await.unwrap();
+        let diff_url = e.rt.inner.models().get("mock").unwrap().limiter.clone();
+        assert!(!Arc::ptr_eq(&same_url, &diff_url), "changed base_url should get its own Limiter");
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_create_session_undo_preserves_populated_and_sibling_workspace() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        // (a) MadeWorkspace::undo preserves `.loom` when workspace or `.loom` already holds files.
+        let ws_a = e.dir.path().join("undo-guard/ws");
+        let plan = plan_workspace(e.rt.paths(), &ws_a, true).unwrap();
+        let made = plan.make_tracked().unwrap();
+        std::fs::write(made.path.join("sibling.txt"), "keep").unwrap();
+        made.undo();
+        assert!(made.path.join(".loom").is_dir(), "undo must not delete .loom while workspace has entries");
+        std::fs::remove_file(made.path.join("sibling.txt")).unwrap();
+        std::fs::write(made.path.join(".loom").join("secret"), "keep").unwrap();
+        made.undo();
+        assert!(made.path.join(".loom").join("secret").is_file(), "undo must not fail-open on non-empty .loom");
+        std::fs::remove_file(made.path.join(".loom").join("secret")).unwrap();
+        made.undo();
+        assert!(!e.dir.path().join("undo-guard").exists());
+
+        // (b) Concurrent create_session targeting the same nonexistent path preserves its workspace and `.loom`.
+        let ws_shared = e.dir.path().join("concurrent/shared-ws");
+        let mut r1 = e.new_session(None);
+        r1.workspace = ws_shared.clone();
+        r1.create_workspace = true;
+        let mut r2 = e.new_session(None);
+        r2.workspace = ws_shared.clone();
+        r2.create_workspace = true;
+        let (a, b) = tokio::join!(e.rt.create_session_receipt(r1), e.rt.create_session_receipt(r2));
+        a.unwrap();
+        b.unwrap();
+        assert!(ws_shared.join(".loom").is_dir());
+        e.rt.shutdown().await;
     }
 }

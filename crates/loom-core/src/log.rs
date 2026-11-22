@@ -133,10 +133,36 @@ pub struct StoredRecord {
     pub line: Option<String>,
 }
 
+/// Open log file handle that releases its `flock` explicitly on drop when owned.
+///
+/// Relying on closing the fd alone leaves the advisory lock held across any
+/// concurrently forked child's inherited file descriptor until that child execs or exits.
+#[derive(Debug)]
+struct LockedFile {
+    file: File,
+    locked: bool,
+}
+
+impl std::ops::Deref for LockedFile {
+    type Target = File;
+
+    fn deref(&self) -> &Self::Target {
+        &self.file
+    }
+}
+
+impl Drop for LockedFile {
+    fn drop(&mut self) {
+        if self.locked {
+            let _ = fs2::FileExt::unlock(&self.file);
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct SessionLog {
     path: PathBuf,
-    file: File,
+    file: LockedFile,
     next_seq: Seq,
     last_hash: String,
     durability: Durability,
@@ -373,6 +399,7 @@ impl SessionLog {
             Err(e) => return Err(io_err(path)(e)),
         };
         lock_log(&file, path)?;
+        let file = LockedFile { file, locked: true };
         // The new name must survive a crash, or the first records would be written to a file that is gone.
         let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
         File::open(dir).and_then(|d| d.sync_all()).map_err(io_err(dir))?;
@@ -404,6 +431,7 @@ impl SessionLog {
         if lock {
             lock_log(&file, path)?;
         }
+        let file = LockedFile { file, locked: lock };
         let (scanner, records, cause) = scan_file(path)?;
         if scanner.opaque > 0 || scanner.schema > SCHEMA {
             return Err(LogError::Newer(path.to_path_buf()));
@@ -444,7 +472,7 @@ impl SessionLog {
         let mut line = serde_json::to_vec(&record)?;
         let hash = sha256_hex(&line);
         line.push(b'\n');
-        let written = self.file.write_all(&line).and_then(|()| match self.durability {
+        let written = self.file.file.write_all(&line).and_then(|()| match self.durability {
             Durability::Always => self.file.sync_data(),
             Durability::Batch => Ok(()),
         });
@@ -487,7 +515,7 @@ impl SessionLog {
         };
         let src = File::open(src_path).map_err(io_err(src_path))?;
         let mut reader = BufReader::new(src);
-        let mut out = BufWriter::new(&child.file);
+        let mut out = BufWriter::new(&child.file.file);
         let mut buf = Vec::new();
         let mut records = Vec::new();
         let mut copied: u64 = 0;
@@ -1506,5 +1534,17 @@ mod tests {
         let report = read_records(&path).unwrap();
         assert_eq!(report.records.len(), 2);
         assert_eq!(report.records[0].event, Event::UserMessage { text: big });
+    }
+
+    #[test]
+    fn drop_unlocks_even_when_a_duplicated_fd_outlives_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, log) = new_log(&dir);
+        // Simulate a concurrently-forked child inheriting the open file description before exec().
+        let dup = log.file.file.try_clone().unwrap();
+        drop(log);
+        let (reopened, _) = SessionLog::open(&path, Durability::Batch).unwrap();
+        drop(reopened);
+        drop(dup);
     }
 }

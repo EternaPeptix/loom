@@ -75,7 +75,9 @@ use futures_util::FutureExt;
 use loom_core::admit::{admit, envelope_plain, normalize, AdmitPolicy, Facts};
 use loom_core::config::ToolsCfg;
 use loom_core::estimate::TokenEstimator;
-use loom_core::event::{ToolClass, ToolResult, ToolSpec, ToolStatus, META_OF_BLOB, META_RAW_BLOB, META_SHOWN};
+use loom_core::event::{
+    ToolClass, ToolResult, ToolSpec, ToolStatus, META_OF_BLOB, META_RAW_BLOB, META_REPAIRED, META_SHOWN,
+};
 use loom_core::{BlobId, BlobStore, CallId, SessionId};
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
@@ -255,12 +257,38 @@ impl Registry {
         self.tools.iter().find(|t| t.spec().name == name).cloned()
     }
 
+    /// Resolve a tool call name, falling back to [`canonical_tool_alias`] ONLY when that canonical
+    /// tool is registered in `self`. Returns `(tool, Some(canonical))` when resolved via alias.
+    pub fn resolve(&self, name: &str) -> Option<(Arc<dyn Tool>, Option<&'static str>)> {
+        if let Some(tool) = self.get(name) {
+            return Some((tool, None));
+        }
+        let canon = canonical_tool_alias(name)?;
+        self.get(canon).map(|tool| (tool, Some(canon)))
+    }
+
     pub fn specs(&self) -> Vec<ToolSpec> {
         self.tools.iter().map(|t| t.spec()).collect()
     }
 
     pub fn names(&self) -> Vec<String> {
         self.tools.iter().map(|t| t.spec().name).collect()
+    }
+}
+
+/// Map common model training tool-name aliases to Loom's canonical tool name.
+/// Callers must still verify the canonical tool exists in [`Registry`] before running it.
+pub fn canonical_tool_alias(name: &str) -> Option<&'static str> {
+    match name {
+        "read_file" | "view_file" | "open_file" => Some("read"),
+        "write_file" | "create_file" => Some("write"),
+        "edit_file" | "str_replace" | "str_replace_editor" | "replace_in_file" | "apply_patch" => Some("edit"),
+        "shell" | "run_command" | "execute_command" | "exec" | "terminal" => Some("bash"),
+        "search_files" | "ripgrep" | "rg" | "grep_search" => Some("grep"),
+        "find_files" | "list_files" | "list_dir" => Some("glob"),
+        "todo_write" | "update_plan" => Some("plan"),
+        "task" | "subagent" | "spawn_agent" => Some("agent_spawn"),
+        _ => None,
     }
 }
 
@@ -308,13 +336,18 @@ pub struct Ran {
 /// the refused call, exactly as `execute` returns it.
 pub fn prepare(registry: &Registry, ctx: &ToolCtx, name: &str, arguments: &str) -> Result<Prepared, Box<ToolResult>> {
     let started = Instant::now();
-    let Some(tool) = registry.get(name) else {
+    let Some((tool, alias)) = registry.resolve(name) else {
         let message = unknown_tool_message(name, &registry.names());
         return Err(Box::new(refused(ctx, name, ToolClass::State, message, started)));
     };
     let spec = tool.spec();
     match check_arguments(&spec, arguments) {
-        Ok(checked) => Ok(Prepared { tool, spec, checked, started }),
+        Ok(mut checked) => {
+            if let Some(canon) = alias {
+                checked.notes.insert(0, format!("tool alias: called `{name}`, ran `{canon}`"));
+            }
+            Ok(Prepared { tool, spec, checked, started })
+        }
         Err(msg) => Err(Box::new(refused(ctx, name, spec.class, msg, started))),
     }
 }
@@ -336,8 +369,9 @@ impl Prepared {
                 spec.name
             )),
         };
-        for note in checked.notes {
-            output.more.push(note);
+        if !checked.notes.is_empty() {
+            output.meta.insert(META_REPAIRED.into(), json!(true));
+            output.more.extend(checked.notes);
         }
         Ran { spec, output, took: started.elapsed() }
     }
@@ -355,7 +389,7 @@ impl Ran {
 /// complete refusal message for the model. Public so that runtime-owned tools share the same path.
 pub fn check_arguments(spec: &ToolSpec, arguments: &str) -> Result<schema::Checked, String> {
     let name = &spec.name;
-    let parsed: Value = match serde_json::from_str(if arguments.trim().is_empty() { "{}" } else { arguments }) {
+    let mut parsed: Value = match serde_json::from_str(if arguments.trim().is_empty() { "{}" } else { arguments }) {
         Ok(v) => v,
         Err(e) => {
             return Err(format!(
@@ -364,7 +398,9 @@ pub fn check_arguments(spec: &ToolSpec, arguments: &str) -> Result<schema::Check
             ));
         }
     };
-    schema::check(&spec.parameters, &parsed).map_err(|problems| {
+    let mut notes = schema::normalize_for_tool(name, &mut parsed);
+    notes.extend(schema::prepare_for_spec(&spec.parameters, &mut parsed));
+    let mut checked = schema::check(&spec.parameters, &parsed).map_err(|problems| {
         let mut msg = String::from("The arguments do not fit this tool:\n");
         for p in &problems {
             msg.push_str("- ");
@@ -376,7 +412,12 @@ pub fn check_arguments(spec: &ToolSpec, arguments: &str) -> Result<schema::Check
             schema::describe(&spec.parameters)
         ));
         msg
-    })
+    })?;
+    if !notes.is_empty() {
+        notes.extend(checked.notes);
+        checked.notes = notes;
+    }
+    Ok(checked)
 }
 
 /// Turn a tool's output into the record. Public so that runtime-owned tools share the same path.
@@ -818,5 +859,71 @@ mod tests {
         let r = finalize(&e.ctx, &spec_of(&e, "bash"), out, &admission, Instant::now());
         assert_eq!(body_of(&r.text), text);
         assert!(r.output.is_none() && !r.cut);
+    }
+
+    #[test]
+    fn canonical_tool_alias_table() {
+        for (alias, canon) in [
+            ("read_file", "read"),
+            ("view_file", "read"),
+            ("open_file", "read"),
+            ("write_file", "write"),
+            ("create_file", "write"),
+            ("edit_file", "edit"),
+            ("str_replace", "edit"),
+            ("str_replace_editor", "edit"),
+            ("replace_in_file", "edit"),
+            ("apply_patch", "edit"),
+            ("shell", "bash"),
+            ("run_command", "bash"),
+            ("execute_command", "bash"),
+            ("exec", "bash"),
+            ("terminal", "bash"),
+            ("search_files", "grep"),
+            ("ripgrep", "grep"),
+            ("rg", "grep"),
+            ("grep_search", "grep"),
+            ("find_files", "glob"),
+            ("list_files", "glob"),
+            ("list_dir", "glob"),
+            ("todo_write", "plan"),
+            ("update_plan", "plan"),
+            ("task", "agent_spawn"),
+            ("subagent", "agent_spawn"),
+            ("spawn_agent", "agent_spawn"),
+        ] {
+            assert_eq!(canonical_tool_alias(alias), Some(canon), "{alias}");
+        }
+        assert_eq!(canonical_tool_alias("read"), None);
+        assert_eq!(canonical_tool_alias("unknown_tool"), None);
+    }
+
+    #[tokio::test]
+    async fn tool_alias_and_normalization_mark_repaired_and_respect_registry() {
+        let e = testutil::env();
+        std::fs::write(e.ctx.workspace.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+
+        // Registered canonical target via alias runs canonical tool and marks repaired.
+        let r = e.call("read_file", json!({"file_path": "a.txt", "offset": 2, "limit": 1})).await;
+        assert_eq!(r.status, ToolStatus::Ok, "{}", r.text);
+        assert_eq!(r.meta.get("repaired"), Some(&json!(true)));
+        assert!(r.text.contains("tool alias: called `read_file`, ran `read`"), "{}", r.text);
+        assert!(r.text.contains("2\ttwo") && !r.text.contains("3\tthree"), "{}", r.text);
+
+        // Clean canonical call sets no repaired meta.
+        let clean = e.call("read", json!({"path": "a.txt", "start": 1, "end": 1})).await;
+        assert_eq!(clean.status, ToolStatus::Ok, "{}", clean.text);
+        assert!(clean.meta.get("repaired").is_none(), "{:?}", clean.meta);
+
+        // Unregistered canonical target is never granted through alias; keeps unknown_tool_message.
+        let registered: Vec<String> = e.registry.specs().into_iter().map(|s| s.name).collect();
+        let unregistered = e.call("todo_write", json!({"action": "list"})).await;
+        assert_eq!(unregistered.status, ToolStatus::Invalid);
+        assert!(unregistered.meta.get("repaired").is_none());
+        assert_eq!(body_of(&unregistered.text), unknown_tool_message("todo_write", &registered));
+
+        let unknown = e.call("reed", json!({})).await;
+        assert_eq!(unknown.status, ToolStatus::Invalid);
+        assert_eq!(body_of(&unknown.text), unknown_tool_message("reed", &registered));
     }
 }

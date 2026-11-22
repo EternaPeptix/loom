@@ -2421,6 +2421,7 @@ mod tests {
             hand_offs: 0,
             asks: 1,
             unrecorded: false,
+            ..Scorecard::default()
         };
         let verifier = Scorecard { steps: 2, calls: 2, ..Scorecard::default() };
         let scored = |id: &str, role: &str, parent: Option<&str>, card: &Scorecard| SessionScore {

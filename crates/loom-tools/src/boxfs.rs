@@ -307,7 +307,8 @@ impl Walk<'_> {
         names.sort();
         for name in names {
             let lossy = name.to_string_lossy();
-            if lossy.eq_ignore_ascii_case(".git") || (rel.as_os_str().is_empty() && lossy == ".loom") {
+            if lossy.eq_ignore_ascii_case(".git") || (rel.as_os_str().is_empty() && lossy.eq_ignore_ascii_case(".loom"))
+            {
                 continue;
             }
             let Ok(st) = stat_at(fd, &name) else { continue };
@@ -699,6 +700,21 @@ pub fn extract(sandbox: &Sandbox, dest: &Path, tar: &[u8], lim: GetLimits) -> Re
         return Err(refuse("It holds a file with the name of the directory itself.".to_string()));
     }
     // Pass two: where each file goes, and that the place really is inside `dest`.
+    let stop_at = [sandbox.workspace(), sandbox.tmp_dir()].into_iter().find(|r| dest.starts_with(r));
+    for a in dest.ancestors() {
+        if stop_at.is_some_and(|r| a == r) {
+            break;
+        }
+        if cfg!(target_os = "macos") && a != dest && matches!(a.to_str(), Some("/var" | "/tmp" | "/etc")) {
+            continue;
+        }
+        if std::fs::symlink_metadata(a).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(refuse(format!(
+                "{} is a symbolic link, and a fetch does not write through links. Remove it or fetch to another path.",
+                a.display()
+            )));
+        }
+    }
     let dest_real = nearest_existing(dest).and_then(|a| std::fs::canonicalize(a).ok().map(|r| (a.to_path_buf(), r)));
     let mut targets: Vec<(PathBuf, &Entry)> = Vec::new();
     for (rest, e) in &plan {
@@ -879,6 +895,10 @@ mod tests {
         std::fs::create_dir_all(f.ws.join("vendor/.git")).unwrap();
         std::fs::write(f.ws.join("vendor/.git/config"), "GITCONF2").unwrap();
         std::fs::write(f.ws.join("vendor/code.c"), "int main;").unwrap();
+        // Uppercase `.LOOM` on case-insensitive filesystems (macOS APFS) aliases `.loom` and must be skipped too.
+        // On case-insensitive FS `.loom` already exists so writing `.LOOM` touches the same dir; on Linux a separate `.LOOM` dir is also skipped.
+        let _ = std::fs::create_dir_all(f.ws.join(".LOOM"));
+        let _ = std::fs::write(f.ws.join(".LOOM/secret"), "CASEORACLE");
         // A link to an unreadable file, a link to a directory, and a link that dangles.
         std::os::unix::fs::symlink(cred.join("token"), f.ws.join("innocent.txt")).unwrap();
         std::os::unix::fs::symlink(&cred, f.ws.join("linkdir")).unwrap();
@@ -888,7 +908,7 @@ mod tests {
         let names = names_in(&push.tar);
         assert_eq!(names, ["ok.txt", "vendor/code.c"], "{names:?}");
         let all = String::from_utf8_lossy(&push.tar);
-        for secret in ["TOPSECRET", "STATE", "ORACLE", "GITCONF"] {
+        for secret in ["TOPSECRET", "STATE", "ORACLE", "CASEORACLE", "GITCONF"] {
             assert!(!all.contains(secret), "{secret} was sent");
         }
     }
@@ -1028,6 +1048,18 @@ mod tests {
         assert_eq!(names_in(&second.tar), ["b.txt"]);
     }
 
+    #[test]
+    fn i6_a_push_skips_case_variant_dot_loom() {
+        let f = fix();
+        std::fs::remove_dir_all(f.ws.join(".loom")).unwrap();
+        std::fs::create_dir_all(f.ws.join(".LOOM")).unwrap();
+        std::fs::write(f.ws.join(".LOOM/secret"), "TOPSECRET").unwrap();
+        std::fs::write(f.ws.join("ok.txt"), "fine").unwrap();
+        let push = build_push(&f.sb, &f.ws, &Manifest::new(), LIM).unwrap();
+        assert_eq!(names_in(&push.tar), ["ok.txt"]);
+        assert!(!String::from_utf8_lossy(&push.tar).contains("TOPSECRET"));
+    }
+
     fn dest_of(f: &Fix, rel: &str) -> PathBuf {
         f.ws.join(rel)
     }
@@ -1124,6 +1156,21 @@ mod tests {
         let err = extract(&f.sb, &dest_of(&f, "lnk"), &t, GET).unwrap_err();
         assert!(err.contains("symbolic link"), "{err}");
         assert!(!outside_dir.join("target").exists());
+        // The destination directory itself (or an existing ancestor component of `dest`) is a link.
+        std::fs::create_dir_all(f.ws.join("real/existing")).unwrap();
+        std::os::unix::fs::symlink(f.ws.join("real"), f.ws.join("dest_link")).unwrap();
+        let dir_tar = raw_tar(&[("o", b'5', "", b""), ("o/a.txt", b'0', "", b"via_link")]);
+        for bad_dest in [f.ws.join("dest_link"), f.ws.join("dest_link/sub"), f.ws.join("dest_link/existing/sub")] {
+            let err = extract(&f.sb, &bad_dest, &dir_tar, GET).unwrap_err();
+            assert!(
+                err.contains("symbolic link") && err.contains("Nothing was written"),
+                "{}: {err}",
+                bad_dest.display()
+            );
+        }
+        assert!(!f.ws.join("real/a.txt").exists());
+        assert!(!f.ws.join("real/sub").exists());
+        assert!(!f.ws.join("real/existing/sub").exists());
     }
 
     #[test]

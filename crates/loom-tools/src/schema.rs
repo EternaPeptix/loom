@@ -53,6 +53,290 @@ pub struct Checked {
 
 /// Largest magnitude below which every integer is exactly representable as an `f64`.
 const EXACT_F64_INT: f64 = 9_007_199_254_740_992.0;
+/// Maximum `idle_timeout_s` accepted by `bash` (`Bash::spec()`).
+const BASH_IDLE_TIMEOUT_MAX_S: i64 = 300;
+
+/// Strip vendor token delimiters (such as `<|open|>argument key="..."<|sep|>42`) when a string
+/// wraps a trailing numeric literal with `<|...|>` delimiters. Returns `None` if no `<|...|>`
+/// delimiters exist.
+fn strip_vendor_number_delimiter(s: &str) -> Option<&str> {
+    if !(s.contains("<|") && s.contains("|>")) {
+        return None;
+    }
+    let mut cur = s.trim();
+    while cur.ends_with("|>") {
+        let Some(open) = cur.rfind("<|") else { break };
+        if cur.get(open..).is_some_and(|tail| tail.match_indices("|>").count() == 1) {
+            cur = cur.get(..open).unwrap_or("").trim_end();
+        } else {
+            break;
+        }
+    }
+    if let Some((_, tail)) = cur.rsplit_once("|>") {
+        Some(tail.trim())
+    } else {
+        Some(cur.trim())
+    }
+}
+
+fn parse_i64_like(v: &Value) -> Option<i64> {
+    match v {
+        Value::Number(n) => n.as_i64().or_else(|| {
+            n.as_f64().filter(|f| f.is_finite() && f.fract() == 0.0 && f.abs() < EXACT_F64_INT).map(|f| f as i64)
+        }),
+        Value::String(s) => {
+            let candidate = strip_vendor_number_delimiter(s).unwrap_or(s.as_str());
+            candidate.parse::<i64>().ok().or_else(|| {
+                candidate
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|f| f.is_finite() && f.fract() == 0.0 && f.abs() < EXACT_F64_INT)
+                    .map(|f| f as i64)
+            })
+        }
+        _ => None,
+    }
+}
+
+fn parse_f64_like(v: &Value) -> Option<f64> {
+    match v {
+        Value::Number(n) => n.as_f64().filter(|f| f.is_finite()),
+        Value::String(s) => {
+            let candidate = strip_vendor_number_delimiter(s).unwrap_or(s.as_str());
+            candidate.parse::<f64>().ok().filter(|f| f.is_finite())
+        }
+        _ => None,
+    }
+}
+
+fn ms_to_ceil_secs(v: &Value) -> Option<u64> {
+    match v {
+        Value::Number(n) => {
+            if let Some(u) = n.as_u64() {
+                return Some(u.div_ceil(1000).max(1));
+            }
+            if let Some(i) = n.as_i64() {
+                return (i >= 0).then(|| (i as u64).div_ceil(1000).max(1));
+            }
+            let f = n.as_f64().filter(|f| f.is_finite() && *f >= 0.0)?;
+            let secs = (f / 1000.0).ceil();
+            (secs <= u64::MAX as f64).then(|| (secs as u64).max(1))
+        }
+        Value::String(s) => {
+            let candidate = strip_vendor_number_delimiter(s).unwrap_or(s.as_str());
+            if let Ok(u) = candidate.parse::<u64>() {
+                return Some(u.div_ceil(1000).max(1));
+            }
+            let f = candidate.parse::<f64>().ok().filter(|f| f.is_finite() && *f >= 0.0)?;
+            let secs = (f / 1000.0).ceil();
+            (secs <= u64::MAX as f64).then(|| (secs as u64).max(1))
+        }
+        _ => None,
+    }
+}
+
+fn is_absent_or_null(map: &Map<String, Value>, key: &str) -> bool {
+    !map.get(key).is_some_and(|v| !v.is_null())
+}
+
+fn alias_key(map: &mut Map<String, Value>, canon: &str, aliases: &[&str], notes: &mut Vec<String>) {
+    if !is_absent_or_null(map, canon) {
+        return;
+    }
+    let chosen = aliases
+        .iter()
+        .copied()
+        .find(|a| map.get(*a).is_some_and(|v| !v.is_null()))
+        .or_else(|| aliases.iter().copied().find(|a| map.contains_key(*a)));
+    let Some(alias) = chosen else { return };
+    if let Some(val) = map.remove(alias) {
+        map.insert(canon.to_string(), val);
+        notes.push(format!("argument alias: `{alias}` -> `{canon}`"));
+    }
+}
+
+fn clamp_max_value(
+    map: &mut Map<String, Value>,
+    key: &str,
+    max_val: &Value,
+    is_integer: bool,
+    notes: &mut Vec<String>,
+) {
+    let Some(cur) = map.get(key) else { return };
+    let Some(max_f) = max_val.as_f64().filter(|f| f.is_finite()) else { return };
+    if is_integer {
+        if let Some(max_i) = max_val.as_i64() {
+            if let Some(n) = parse_i64_like(cur) {
+                if n > max_i {
+                    map.insert(key.to_string(), Value::from(max_i));
+                    notes.push(format!("argument `{key}`: clamped {n} down to maximum {max_i}"));
+                }
+                return;
+            }
+        }
+    }
+    if let Some(f) = parse_f64_like(cur) {
+        if f > max_f {
+            let clamped = if is_integer {
+                max_val.as_i64().map(Value::from).unwrap_or_else(|| max_val.clone())
+            } else {
+                max_val.clone()
+            };
+            map.insert(key.to_string(), clamped);
+            notes.push(format!("argument `{key}`: clamped {f} down to maximum {max_val}"));
+        }
+    }
+}
+
+/// Normalize well-known model parameter habits for `tool` before [`check`] runs.
+/// Only inserts or renames keys when the canonical key is absent or `null`, and returns a repair
+/// sentence for every transformation applied.
+pub fn normalize_for_tool(tool: &str, value: &mut Value) -> Vec<String> {
+    let Some(map) = value.as_object_mut() else {
+        return Vec::new();
+    };
+    let mut notes = Vec::new();
+    match tool {
+        "read" | "write" | "edit" => {
+            alias_key(map, "path", &["file_path", "filepath", "filename"], &mut notes);
+            alias_key(map, "start", &["offset", "start_line", "from_line"], &mut notes);
+            alias_key(map, "end", &["end_line", "to_line"], &mut notes);
+            if is_absent_or_null(map, "end") {
+                if let Some(limit_key) = ["limit", "num_lines"].into_iter().find(|k| map.contains_key(*k)) {
+                    if let Some(limit) = map.get(limit_key).and_then(parse_i64_like).filter(|n| *n >= 1) {
+                        let start = map.get("start").and_then(parse_i64_like).unwrap_or(1).max(1);
+                        let end = start.saturating_add(limit - 1);
+                        map.remove(limit_key);
+                        map.insert("end".to_string(), Value::from(end));
+                        notes.push(format!("argument alias: `{limit_key}` ({limit}) -> `end` ({end})"));
+                    }
+                }
+            }
+            alias_key(map, "old", &["old_string", "old_text", "old_str", "target"], &mut notes);
+            alias_key(map, "new", &["new_string", "new_text", "new_str", "replacement"], &mut notes);
+            alias_key(map, "all", &["replace_all"], &mut notes);
+            alias_key(map, "content", &["contents", "text", "file_text"], &mut notes);
+        }
+        "bash" => {
+            alias_key(map, "command", &["cmd"], &mut notes);
+            alias_key(map, "timeout_s", &["timeout"], &mut notes);
+            if is_absent_or_null(map, "timeout_s") {
+                if let Some(secs) = map.get("timeout_ms").and_then(ms_to_ceil_secs) {
+                    map.remove("timeout_ms");
+                    map.insert("timeout_s".to_string(), Value::from(secs));
+                    notes.push(format!("argument alias: `timeout_ms` -> `timeout_s` ({secs})"));
+                }
+            }
+            if is_absent_or_null(map, "idle_timeout_s") {
+                if let Some(secs) = map.get("idle_timeout_ms").and_then(ms_to_ceil_secs) {
+                    map.remove("idle_timeout_ms");
+                    map.insert("idle_timeout_s".to_string(), Value::from(secs));
+                    notes.push(format!("argument alias: `idle_timeout_ms` -> `idle_timeout_s` ({secs})"));
+                }
+            }
+            clamp_max_value(map, "idle_timeout_s", &Value::from(BASH_IDLE_TIMEOUT_MAX_S), true, &mut notes);
+        }
+        "grep" | "out_grep" => {
+            alias_key(map, "pattern", &["query", "regex"], &mut notes);
+            alias_key(map, "path", &["dir", "directory", "file_path"], &mut notes);
+            alias_key(map, "max", &["max_results", "limit"], &mut notes);
+        }
+        "glob" => {
+            alias_key(map, "path", &["dir", "directory"], &mut notes);
+            alias_key(map, "pattern", &["glob", "query"], &mut notes);
+        }
+        "out_read" => {
+            if map.remove("total_lines").is_some() {
+                notes.push("stripped harmless extra `total_lines` argument".to_string());
+            }
+            alias_key(map, "start", &["offset", "start_line"], &mut notes);
+            alias_key(map, "end", &["end_line", "limit"], &mut notes);
+        }
+        "claim_update" => {
+            alias_key(map, "id", &["claim", "claim_id"], &mut notes);
+        }
+        "claim" => {
+            alias_key(map, "text", &["claim", "statement"], &mut notes);
+        }
+        "finish" => {
+            alias_key(map, "answer", &["summary", "answer_note", "result"], &mut notes);
+        }
+        "agent_spawn" | "agent_fanout" => {
+            alias_key(map, "question", &["task", "prompt"], &mut notes);
+            alias_key(map, "max_steps", &["steps"], &mut notes);
+            if tool == "agent_fanout" {
+                if let Some(Value::Array(items)) = map.get_mut("agents") {
+                    for item in items {
+                        if let Some(item_map) = item.as_object_mut() {
+                            alias_key(item_map, "question", &["task", "prompt"], &mut notes);
+                            alias_key(item_map, "max_steps", &["steps"], &mut notes);
+                        }
+                    }
+                }
+            }
+        }
+        "plan" | "step" => {
+            alias_key(map, "id", &["step_id"], &mut notes);
+        }
+        "security_record" if is_absent_or_null(map, "operation") && !is_absent_or_null(map, "action") => {
+            if map.get("operation").is_some_and(Value::is_null) {
+                map.remove("operation");
+            }
+            let inner = Value::Object(std::mem::take(map));
+            map.insert("operation".to_string(), inner);
+            notes.push("wrapped top-level `action` payload under `operation`".to_string());
+        }
+        _ => {}
+    }
+    notes
+}
+
+/// Schema-aware pre-check normalization: strips vendor token delimiters from integer/number string
+/// fields when trailing numeric values parse cleanly, and clamps `timeout_s` / `idle_timeout_s`
+/// above the schema's `maximum` down to `maximum`.
+pub(crate) fn prepare_for_spec(schema: &Value, value: &mut Value) -> Vec<String> {
+    let Some(map) = value.as_object_mut() else {
+        return Vec::new();
+    };
+    let Some(props) = schema.get("properties").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let mut notes = Vec::new();
+    for (name, prop_spec) in props {
+        let Some(ty) = prop_spec.get("type").and_then(Value::as_str) else { continue };
+        if !matches!(ty, "integer" | "number") {
+            continue;
+        }
+        let Some(Value::String(s)) = map.get(name) else { continue };
+        let Some(stripped) = strip_vendor_number_delimiter(s) else { continue };
+        let original_preview = crate::preview(s, 60);
+        if ty == "integer" {
+            let parsed = stripped.parse::<i64>().ok().or_else(|| {
+                stripped
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|f| f.is_finite() && f.fract() == 0.0 && f.abs() < EXACT_F64_INT)
+                    .map(|f| f as i64)
+            });
+            if let Some(i) = parsed {
+                map.insert(name.clone(), Value::from(i));
+                notes.push(format!("argument `{name}`: stripped vendor delimiter from \"{original_preview}\" -> {i}"));
+            }
+        } else if let Some(num) = stripped.parse::<f64>().ok().filter(|f| f.is_finite()).and_then(Number::from_f64) {
+            notes.push(format!("argument `{name}`: stripped vendor delimiter from \"{original_preview}\" -> {num}"));
+            map.insert(name.clone(), Value::Number(num));
+        }
+    }
+    for key in ["timeout_s", "idle_timeout_s"] {
+        if let Some(prop_spec) = props.get(key) {
+            if let Some(max_val) = prop_spec.get("maximum") {
+                let is_integer = prop_spec.get("type").and_then(Value::as_str) == Some("integer");
+                clamp_max_value(map, key, max_val, is_integer, &mut notes);
+            }
+        }
+    }
+    notes
+}
 
 pub fn check(schema: &Value, value: &Value) -> Result<Checked, Vec<String>> {
     let Some(given) = value.as_object() else {
@@ -584,5 +868,97 @@ mod tests {
         assert_eq!(distance("Path", "path"), 0);
         assert_eq!(distance("héllo", "hello"), 1);
         assert_eq!(distance("flaw", "lawn"), 2);
+    }
+
+    #[test]
+    fn normalize_for_tool_covers_all_tool_aliases_and_preserves_canonical() {
+        let mut r = json!({"file_path": "x.rs", "offset": 10, "limit": 25});
+        let notes = normalize_for_tool("read", &mut r);
+        assert!(!notes.is_empty());
+        assert_eq!(r, json!({"path": "x.rs", "start": 10, "end": 34}));
+
+        // Explicit canonical key wins and stays intact.
+        let mut r2 = json!({"path": "keep.rs", "file_path": "ignored.rs", "start": 1, "limit": 5, "end": 9});
+        let _ = normalize_for_tool("read", &mut r2);
+        assert_eq!(r2["path"], "keep.rs");
+        assert_eq!(r2["end"], 9);
+
+        let mut e = json!({"filepath": "a.rs", "old_str": "a", "new_string": "b", "replace_all": true});
+        assert!(!normalize_for_tool("edit", &mut e).is_empty());
+        assert_eq!(e, json!({"path": "a.rs", "old": "a", "new": "b", "all": true}));
+
+        let mut w = json!({"filename": "w.txt", "file_text": "hi"});
+        assert!(!normalize_for_tool("write", &mut w).is_empty());
+        assert_eq!(w, json!({"path": "w.txt", "content": "hi"}));
+
+        let mut b = json!({"cmd": "echo hi", "timeout_ms": 1500, "idle_timeout_ms": 1});
+        assert!(!normalize_for_tool("bash", &mut b).is_empty());
+        assert_eq!(b["command"], "echo hi");
+        assert_eq!(b["timeout_s"], 2);
+        assert_eq!(b["idle_timeout_s"], 1);
+
+        let mut g = json!({"query": "foo", "dir": "src", "max_results": 20});
+        assert!(!normalize_for_tool("grep", &mut g).is_empty());
+        assert_eq!(g, json!({"pattern": "foo", "path": "src", "max": 20}));
+
+        let mut gl = json!({"directory": "src", "glob": "*.rs"});
+        assert!(!normalize_for_tool("glob", &mut gl).is_empty());
+        assert_eq!(gl, json!({"path": "src", "pattern": "*.rs"}));
+
+        let mut or = json!({"handle": "out:1", "total_lines": 500, "offset": 5, "limit": 25});
+        let or_notes = normalize_for_tool("out_read", &mut or);
+        assert!(or_notes.iter().any(|n| n.contains("total_lines")), "{or_notes:?}");
+        assert_eq!(or, json!({"handle": "out:1", "start": 5, "end": 25}));
+
+        let mut cu = json!({"claim_id": "c1"});
+        assert!(!normalize_for_tool("claim_update", &mut cu).is_empty());
+        assert_eq!(cu, json!({"id": "c1"}));
+
+        let mut cl = json!({"statement": "fact"});
+        assert!(!normalize_for_tool("claim", &mut cl).is_empty());
+        assert_eq!(cl, json!({"text": "fact"}));
+
+        let mut fin = json!({"summary": "done"});
+        assert!(!normalize_for_tool("finish", &mut fin).is_empty());
+        assert_eq!(fin, json!({"answer": "done"}));
+
+        let mut sp = json!({"task": "check auth", "steps": 6});
+        assert!(!normalize_for_tool("agent_spawn", &mut sp).is_empty());
+        assert_eq!(sp, json!({"question": "check auth", "max_steps": 6}));
+
+        let mut fo = json!({"agents": [{"prompt": "scan", "steps": 4}]});
+        assert!(!normalize_for_tool("agent_fanout", &mut fo).is_empty());
+        assert_eq!(fo["agents"][0], json!({"question": "scan", "max_steps": 4}));
+
+        let mut st = json!({"step_id": "s1"});
+        assert!(!normalize_for_tool("step", &mut st).is_empty());
+        assert_eq!(st, json!({"id": "s1"}));
+
+        let mut sec = json!({"action": "asset_upsert", "kind": "endpoint"});
+        assert!(!normalize_for_tool("security_record", &mut sec).is_empty());
+        assert_eq!(sec, json!({"operation": {"action": "asset_upsert", "kind": "endpoint"}}));
+    }
+
+    #[test]
+    fn prepare_for_spec_strips_vendor_delimiters_and_clamps_max() {
+        let s = crate::params::spec(
+            "bash",
+            "run",
+            crate::ToolClass::Write,
+            &[
+                crate::params::req("command", "string", "cmd"),
+                crate::params::opt("timeout_s", "integer", "timeout").min(1).max(600),
+            ],
+        )
+        .parameters;
+        let mut args = json!({
+            "cmd": "echo ok",
+            "timeout_s": "<|open|>argument key=\"timeout_s\"<|sep|>1200"
+        });
+        let mut notes = normalize_for_tool("bash", &mut args);
+        notes.extend(prepare_for_spec(&s, &mut args));
+        let checked = check(&s, &args).unwrap();
+        assert_eq!(checked.args["timeout_s"], 600);
+        assert!(notes.len() >= 2, "{notes:?}");
     }
 }

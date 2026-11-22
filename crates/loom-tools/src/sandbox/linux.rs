@@ -45,6 +45,7 @@ pub(super) fn pin(
     unreadable: &[PathBuf],
     credentials: &[PathBuf],
     git_dirs: &[PathBuf],
+    holders: &[PathBuf],
 ) -> io::Result<Vec<PinnedPath>> {
     use std::os::fd::AsFd;
     use std::os::unix::fs::OpenOptionsExt;
@@ -69,6 +70,24 @@ pub(super) fn pin(
                     path.display()
                 )));
             }
+            continue;
+        }
+        let file =
+            std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path)?;
+        let real = crate::files::real_path(file.as_fd())?;
+        if &real != path {
+            return Err(invalid(format!("Bubblewrap bind source {} changed while its descriptor was opened (now {}). Stop concurrent filesystem changes and retry.", path.display(), real.display())));
+        }
+        out.push(PinnedPath { path: path.clone(), file: Arc::new(file) });
+    }
+    for path in holders {
+        if out.iter().any(|p| &p.path == path) {
+            continue;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(path) else {
+            continue;
+        };
+        if !meta.is_dir() {
             continue;
         }
         let file =
@@ -186,6 +205,14 @@ pub(super) fn prepare(home: &Path) -> io::Result<PathBuf> {
 }
 
 pub(super) fn command(sb: &Sandbox, script: &str) -> (String, Vec<String>) {
+    command_with(sb, script, true)
+}
+
+pub(super) fn pty_command(sb: &Sandbox, script: &str) -> (String, Vec<String>) {
+    command_with(sb, script, false)
+}
+
+fn command_with(sb: &Sandbox, script: &str, new_session: bool) -> (String, Vec<String>) {
     use std::os::fd::AsRawFd;
     // Only harness-authored code executes before confinement; paths and script are positional args.
     let mut launcher = "exec 3<\"$1\" || exit 126; shift; ".to_string();
@@ -208,11 +235,12 @@ pub(super) fn command(sb: &Sandbox, script: &str) -> (String, Vec<String>) {
     for pin in &sb.linux_pins {
         args.push(format!("/proc/{}/fd/{}", std::process::id(), pin.file.as_raw_fd()));
     }
+    args.extend([super::BWRAP.to_string(), "--die-with-parent".to_string()]);
+    if new_session {
+        args.push("--new-session".to_string());
+    }
     args.extend(
         [
-            super::BWRAP,
-            "--die-with-parent",
-            "--new-session",
             "--unshare-all",
             "--unshare-user",
             "--disable-userns",
@@ -248,50 +276,106 @@ pub(super) fn command(sb: &Sandbox, script: &str) -> (String, Vec<String>) {
             args.extend([flag.to_string(), source, path.display().to_string()]);
         }
     };
+    let bound_writable = |path: &Path| path != sb.tmp_dir.as_path() && !sb.protected.iter().any(|p| under(path, p));
     for path in &sb.writable {
-        if !sb.protected.iter().any(|p| under(path, p)) {
+        if bound_writable(path) {
             bind(&mut args, "--bind", path);
         }
     }
+    // Mount writable ancestor holders (`holders()`) as read-write self-bind mountpoints so `rename(2)`
+    // returns EBUSY instead of lifting multi-component protected/unreadable subtrees off their rules.
+    let all_holders = sb.holders();
+    let mut non_tmp_holders: Vec<PathBuf> = all_holders
+        .iter()
+        .filter(|h| {
+            !under(h, &sb.tmp_dir)
+                && !under(h, &sb.loom_home)
+                && !sb.writable.contains(h)
+                && !sb.protected.contains(h)
+                && !sb.git_dirs.contains(h)
+        })
+        .cloned()
+        .collect();
+    non_tmp_holders.sort_by(|a, b| a.components().count().cmp(&b.components().count()).then_with(|| a.cmp(b)));
+    for h in &non_tmp_holders {
+        bind(&mut args, "--bind", h);
+    }
+    // If any writable root or holder contains `loom_home`, re-apply its masking tmpfs after those
+    // writable `--bind`s and before mounting `tmp_dir`, `analysis_dir`, or replay staging inside it.
+    if sb.writable.iter().any(|w| bound_writable(w) && under(&sb.loom_home, w))
+        || non_tmp_holders.iter().any(|h| under(&sb.loom_home, h))
+    {
+        args.extend(["--tmpfs".to_string(), sb.loom_home.display().to_string()]);
+    }
+    let mounted_protected = |path: &Path| -> bool {
+        path != sb.loom_home.as_path() && (!under(path, &sb.loom_home) || (sb.replay && under(path, &sb.workspace)))
+    };
     for path in sb.protected.iter().chain(&sb.git_dirs) {
-        if under(path, &sb.loom_home) && !under(path, &sb.workspace) {
-            continue;
+        if mounted_protected(path) {
+            bind(&mut args, "--ro-bind", path);
         }
-        bind(&mut args, "--ro-bind", path);
     }
-    if !sb.inside_tmp_protected().iter().any(|p| under(&sb.tmp_dir, p)) {
+    let inside_tmp = sb.inside_tmp_protected();
+    let tmp_bound = !inside_tmp.iter().any(|p| under(&sb.tmp_dir, p));
+    if tmp_bound {
         bind(&mut args, "--bind", &sb.tmp_dir);
+        let mut tmp_holders: Vec<PathBuf> = all_holders
+            .iter()
+            .filter(|h| {
+                under(h, &sb.tmp_dir) && *h != &sb.tmp_dir && !sb.protected.contains(h) && !sb.git_dirs.contains(h)
+            })
+            .cloned()
+            .collect();
+        tmp_holders.sort_by(|a, b| a.components().count().cmp(&b.components().count()).then_with(|| a.cmp(b)));
+        for h in &tmp_holders {
+            bind(&mut args, "--bind", h);
+        }
     }
-    for path in sb.inside_tmp_protected() {
-        bind(&mut args, "--ro-bind", &path);
+    for path in &inside_tmp {
+        bind(&mut args, "--ro-bind", path);
     }
     // The harness's staging of binary-analysis inputs: readable, never writable. It may not exist yet (it is
     // made on first use), so a missing one is not an error.
-    if !sb.replay && under(&sb.analysis_dir, &sb.loom_home) {
+    let analysis_mounted = !sb.replay && under(&sb.analysis_dir, &sb.loom_home);
+    if analysis_mounted {
         let dir = sb.analysis_dir.display().to_string();
         args.extend(["--ro-bind-try".to_string(), dir.clone(), dir]);
     }
+    let workspace_state = sb.workspace.join(".loom");
+    let state_is_loom_home = workspace_state == sb.loom_home;
     for path in sb.unreadable.iter().chain(&sb.credentials) {
-        let restored = sb.writable.iter().chain(&sb.git_dirs).any(|root| under(path, root));
+        let restored =
+            sb.writable.iter().any(|root| bound_writable(root) && under(path, root) && !under(path, &sb.loom_home))
+                || sb.protected.iter().chain(&sb.git_dirs).any(|root| mounted_protected(root) && under(path, root))
+                || (tmp_bound && under(path, &sb.tmp_dir))
+                || inside_tmp.iter().any(|root| under(path, root))
+                || (analysis_mounted && under(path, &sb.analysis_dir));
         if !restored && (under(path, &sb.loom_home) || hidden_home.is_some_and(|home| under(path, home))) {
             continue;
         }
-        if under(path, &sb.workspace.join(".loom")) {
+        if under(path, &workspace_state) && (!state_is_loom_home || !restored) {
             continue;
         }
-        if path.is_dir() {
-            args.extend(["--tmpfs".to_string(), path.display().to_string()]);
-        } else if path.exists() {
-            args.extend(["--ro-bind".to_string(), "/dev/null".to_string(), path.display().to_string()]);
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.file_type().is_symlink() => {}
+            Ok(meta) if meta.is_dir() => {
+                let p = path.display().to_string();
+                args.extend(["--tmpfs".to_string(), p.clone(), "--remount-ro".to_string(), p]);
+            }
+            Ok(_) => {
+                args.extend(["--ro-bind".to_string(), "/dev/null".to_string(), path.display().to_string()]);
+            }
+            Err(_) => {}
         }
     }
-    let workspace_state = sb.workspace.join(".loom");
-    args.extend([
-        "--tmpfs".to_string(),
-        workspace_state.display().to_string(),
-        "--remount-ro".to_string(),
-        workspace_state.display().to_string(),
-    ]);
+    if !state_is_loom_home {
+        args.extend([
+            "--tmpfs".to_string(),
+            workspace_state.display().to_string(),
+            "--remount-ro".to_string(),
+            workspace_state.display().to_string(),
+        ]);
+    }
     // Only these top mounts become read-only; the scoped writable workspace/temp bind mounts below
     // them keep their own access modes.
     for path in hidden_home.into_iter().chain(std::iter::once(&sb.loom_home)) {
@@ -349,10 +433,10 @@ mod tests {
         let outside = root.join("outside");
         std::fs::create_dir(&ws).unwrap();
         std::fs::create_dir(&outside).unwrap();
-        assert!(pin(std::slice::from_ref(&ws), &[ws.join("missing-protection")], &[], &[], &[]).is_err());
+        assert!(pin(std::slice::from_ref(&ws), &[ws.join("missing-protection")], &[], &[], &[], &[]).is_err());
         let alias = ws.join("alias");
         std::os::unix::fs::symlink(&outside, &alias).unwrap();
-        assert!(pin(&[alias], &[], &[], &[], &[]).is_err());
+        assert!(pin(&[alias], &[], &[], &[], &[], &[]).is_err());
     }
 
     #[test]
@@ -403,10 +487,14 @@ mod tests {
         let mut sb = Sandbox::new(&cfg, &ws, &tmp, &home, None).unwrap();
         sb.mode = SandboxMode::Bubblewrap;
         sb.linux_filter = Some(home.join("sandbox/filter.bpf"));
-        sb.linux_pins = pin(&sb.writable, &sb.protected, &sb.unreadable, &sb.credentials, &sb.git_dirs).unwrap();
+        sb.linux_pins =
+            pin(&sb.writable, &sb.protected, &sb.unreadable, &sb.credentials, &sb.git_dirs, &sb.holders()).unwrap();
         let (prog, args) = command(&sb, "printf 'literal $()'; true");
         assert_eq!(prog, "/bin/bash");
         assert!(args.iter().any(|x| x == "--unshare-all"));
+        assert!(args.iter().any(|x| x == "--new-session"));
+        let (_, pty_args) = pty_command(&sb, "printf 'literal $()'; true");
+        assert!(!pty_args.iter().any(|x| x == "--new-session"));
         assert!(args.windows(2).any(|w| w == ["--seccomp", "3"]));
         assert!(!args.windows(3).any(|w| w == ["--bind", ws.to_str().unwrap(), ws.to_str().unwrap()]));
         assert!(args
@@ -428,6 +516,87 @@ mod tests {
         let bytes = std::fs::read(path).unwrap();
         assert_eq!(bytes, filter().unwrap());
         assert_eq!(bytes.len() % 8, 0);
+    }
+
+    #[test]
+    fn command_masks_loom_home_in_writable_roots_pins_holders_and_remounts_unreadable_ro() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let home = root.join(".loom");
+        let tmp = home.join("sessions/s1/tmp");
+        let secret_dir = root.join("secret_dir");
+        let locked = root.join("tools/hooks/post-checkout");
+        for p in [&tmp, &secret_dir, locked.parent().unwrap()] {
+            std::fs::create_dir_all(p).unwrap();
+        }
+        std::fs::write(&locked, "#!/bin/sh\n").unwrap();
+        let cfg = SandboxCfg {
+            protect_credentials: false,
+            protected_paths: vec!["tools/hooks/post-checkout".into()],
+            unreadable_paths: vec!["secret_dir".into()],
+            ..SandboxCfg::default()
+        };
+        let mut sb = Sandbox::with_home(&cfg, &root, &tmp, &home, None, None).unwrap();
+        sb.mode = SandboxMode::Bubblewrap;
+        sb.linux_filter = Some(home.join("sandbox/filter.bpf"));
+        sb.linux_pins =
+            pin(&sb.writable, &sb.protected, &sb.unreadable, &sb.credentials, &sb.git_dirs, &sb.holders()).unwrap();
+        let (_, args) = command(&sb, "true");
+        let root_s = root.to_str().unwrap();
+        let home_s = home.to_str().unwrap();
+        let tmp_s = tmp.to_str().unwrap();
+        let secret_s = secret_dir.to_str().unwrap();
+        let tools_s = root.join("tools").to_str().unwrap().to_string();
+        let hooks_s = root.join("tools/hooks").to_str().unwrap().to_string();
+
+        // Must never re-bind live `loom_home` read-only; must re-mask `loom_home` AFTER writable root `--bind`
+        // and BEFORE mounting `tmp_dir`, without clobbering `tmp_dir` afterwards when `ws/.loom == loom_home`.
+        assert!(!args.windows(3).any(|w| w[0] == "--ro-bind" && w[2] == home_s), "{args:?}");
+        let ws_bind = args.windows(3).position(|w| w[0] == "--bind" && w[2] == root_s).unwrap();
+        let home_tmpfs_after =
+            args[ws_bind..].windows(2).position(|w| w == ["--tmpfs", home_s]).map(|i| ws_bind + i).unwrap();
+        let tmp_bind = args.windows(3).position(|w| w[0] == "--bind" && w[2] == tmp_s).unwrap();
+        assert!(tmp_bind > home_tmpfs_after, "{args:?}");
+        assert!(!args[tmp_bind..].windows(2).any(|w| w == ["--tmpfs", home_s]), "{args:?}");
+
+        // Holders of multi-component `protected_paths` must be pinned/self-bound inside writable root.
+        assert!(args.windows(3).any(|w| w[0] == "--bind" && w[1].starts_with("/proc/") && w[2] == tools_s));
+        assert!(args.windows(3).any(|w| w[0] == "--bind" && w[1].starts_with("/proc/") && w[2] == hooks_s));
+
+        // Unreadable directories must be remounted read-only.
+        assert!(args.windows(4).any(|w| w == ["--tmpfs", secret_s, "--remount-ro", secret_s]), "{args:?}");
+    }
+
+    #[test]
+    fn isolated_replay_command_under_home_and_readonly_never_rebinds_actor_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let user_home = root.join("user");
+        let actor_ws = user_home.join("project");
+        let loom_home = user_home.join("loom-state");
+        let tmp = loom_home.join("sessions/s1/tmp");
+        let staging = loom_home.join("oracle-runs/run-1");
+        let (staged_ws, staged_tmp) = (staging.join("workspace"), staging.join("tmp"));
+        for d in [actor_ws.join(".loom/oracle-secrets"), tmp.clone(), staged_ws.clone(), staged_tmp.clone()] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(actor_ws.join("src.txt"), "untrusted").unwrap();
+        std::fs::write(actor_ws.join(".loom/oracle-secrets/k"), "secret").unwrap();
+        let cfg = SandboxCfg {
+            protect_credentials: true,
+            protected_paths: vec![actor_ws.display().to_string()],
+            ..SandboxCfg::default()
+        };
+        let mut actor = Sandbox::with_home(&cfg, &actor_ws, &tmp, &loom_home, None, Some(user_home)).unwrap();
+        actor.mode = SandboxMode::Bubblewrap;
+        actor.linux_filter = Some(loom_home.join("sandbox/filter.bpf"));
+        let replay = actor.isolated_replay(&staged_ws, &staged_tmp).unwrap();
+        let (_, args) = command(&replay, "true");
+        let actor_s = actor_ws.to_str().unwrap();
+        assert!(
+            !args.windows(3).any(|w| (w[0] == "--bind" || w[0] == "--ro-bind") && w[2].starts_with(actor_s)),
+            "replay must never bind actor workspace or its .loom: {args:?}"
+        );
     }
 }
 
@@ -652,5 +821,69 @@ mod native_tests {
         assert!(run(&replay, "cat pinned.py; echo result > \"$TMPDIR/result\"").status.success());
         assert!(tmp.join("result").exists());
         assert!(!run(&replay, "echo changed > pinned.py").status.success());
+    }
+
+    #[test]
+    fn bubblewrap_native_replay_hides_actor_loom_and_readonly_workspace_under_home() {
+        if !required_launcher() {
+            return;
+        }
+        let executable = std::env::current_exe().unwrap();
+        let root = tempfile::tempdir_in(executable.parent().unwrap()).unwrap();
+        let user_home = root.path().join("user-home");
+        let actor_ws = user_home.join("project");
+        let loom_home = user_home.join("loom-state");
+        let tmp = loom_home.join("sessions/judge/tmp");
+        let staged = loom_home.join("oracle-runs/r1");
+        let (staged_ws, staged_tmp) = (staged.join("workspace"), staged.join("tmp"));
+        for p in [actor_ws.join(".loom/oracle-secrets"), tmp.clone(), staged_ws.clone(), staged_tmp.clone()] {
+            std::fs::create_dir_all(p).unwrap();
+        }
+        std::fs::write(actor_ws.join("leak.txt"), "untrusted").unwrap();
+        std::fs::write(actor_ws.join(".loom/oracle-secrets/k"), "secret").unwrap();
+        std::fs::write(staged_ws.join("pinned.txt"), "ok").unwrap();
+        let cfg = SandboxCfg {
+            mode: SandboxMode::Bubblewrap,
+            protect_credentials: true,
+            protected_paths: vec![actor_ws.display().to_string()],
+            ..SandboxCfg::default()
+        };
+        let actor = Sandbox::with_home(&cfg, &actor_ws, &tmp, &loom_home, None, Some(user_home)).unwrap();
+        let replay = actor.isolated_replay(&staged_ws, &staged_tmp).unwrap();
+        assert!(!run(&replay, &format!("test -e '{}'", actor_ws.join("leak.txt").display())).status.success());
+        assert!(!run(&replay, &format!("test -e '{}'", actor_ws.join(".loom/oracle-secrets/k").display()))
+            .status
+            .success());
+        assert!(run(&replay, "cat pinned.txt").status.success());
+    }
+
+    #[test]
+    fn bubblewrap_native_blocks_holder_rename_and_unreadable_dir_writes() {
+        if !required_launcher() {
+            return;
+        }
+        let executable = std::env::current_exe().unwrap();
+        let root = tempfile::tempdir_in(executable.parent().unwrap()).unwrap();
+        let ws = root.path().join("ws");
+        let home = root.path().join("home");
+        let tmp = home.join("sessions/t/tmp");
+        let hooks = ws.join("tools/hooks");
+        let secret_dir = ws.join("secret_dir");
+        for p in [ws.join(".loom"), tmp.clone(), hooks.clone(), secret_dir.clone()] {
+            std::fs::create_dir_all(p).unwrap();
+        }
+        std::fs::write(hooks.join("post-checkout"), "original").unwrap();
+        std::fs::write(secret_dir.join("k"), "secret").unwrap();
+        let cfg = SandboxCfg {
+            mode: SandboxMode::Bubblewrap,
+            protect_credentials: false,
+            protected_paths: vec!["tools/hooks".into()],
+            unreadable_paths: vec!["secret_dir".into()],
+            ..SandboxCfg::default()
+        };
+        let sb = Sandbox::new(&cfg, &ws, &tmp, &home, None).unwrap();
+        assert!(!run(&sb, "mv tools tools.bak").status.success());
+        assert!(!run(&sb, "touch secret_dir/new").status.success());
+        assert!(run(&sb, "echo ok > tools/sibling.txt").status.success());
     }
 }

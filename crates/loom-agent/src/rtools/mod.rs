@@ -447,9 +447,18 @@ impl Shared {
                     .to_string(),
             );
         }
+        let judge_evidence = self.is_child()
+            && self.role.read_only
+            && self.role.tools.iter().any(|t| t == "evidence")
+            && self.role.tools.iter().any(|t| t == "verdict");
         // Security records are authorized by `security_record` itself (an independent read-only judge may
-        // close a hypothesis); every other op is refused to a read-only role.
-        if self.role.read_only && !from_user && !matches!(op, LedgerOp::Security(_)) {
+        // close a hypothesis); a read-only judge explicitly granted both `evidence` and `verdict` may
+        // attach verbatim-attested evidence to an existing claim; every other op is refused to a read-only role.
+        if self.role.read_only
+            && !from_user
+            && !matches!(op, LedgerOp::Security(_))
+            && !(judge_evidence && matches!(&op, LedgerOp::EvidenceAdd(input) if input.attested))
+        {
             return Err("This role has read-only access to the mission ledger. Return observations through its report or verdict.".to_string());
         }
         let summary = LedgerState::summarize(&op);
@@ -462,6 +471,7 @@ impl Shared {
                 | LedgerOp::Reflection { .. }
                 | LedgerOp::ClaimAdd { .. }
                 | LedgerOp::Security(_) => return Ok(()),
+                LedgerOp::EvidenceAdd(input) if judge_evidence && input.attested => return Ok(()),
                 LedgerOp::ClaimUpdate { id, .. } => id,
                 LedgerOp::EvidenceAdd(input) => &input.claim,
                 _ => return Err("A child may record notes and its own claims and evidence. Mission plans, approvals and other shared obligations belong to the lead.".to_string()),
@@ -566,12 +576,18 @@ pub fn tool(name: &str, shared: &Arc<Shared>) -> Option<Arc<dyn loom_tools::Tool
 }
 
 /// The session's tools, in the order of the role's tool list: built-in tools from
-/// `Registry::builtin()`, runtime tools from [`tool`]. A name that is neither is an error.
+/// `Registry::builtin()`, runtime tools from [`tool`]. When `default_shell == Some("box")`, `bash`
+/// routes to [`boxtools::BoxBash`] instead of the host `bash` tool. A name that is neither is an error.
 pub fn build_registry(shared: &Arc<Shared>) -> Result<Registry, String> {
     let builtin = Registry::builtin();
     let mut registry = Registry::new();
     for name in &shared.role.tools {
-        match builtin.get(name).or_else(|| tool(name, shared)) {
+        let found = if name == "bash" && shared.role.default_shell.as_deref() == Some("box") {
+            Some(Arc::new(boxtools::BoxBash(shared.clone())) as Arc<dyn loom_tools::Tool>)
+        } else {
+            builtin.get(name).or_else(|| tool(name, shared))
+        };
+        match found {
             Some(t) => registry.add(t),
             None => {
                 return Err(format!(
@@ -715,5 +731,104 @@ mod tests {
         assert!(unconfirmed.contains("may or may not be recorded") && unconfirmed.contains("entry 3"), "{unconfirmed}");
         assert!(unconfirmed.contains("before repeating the call"), "{unconfirmed}");
         assert!(!unconfirmed.contains("nothing was recorded"), "{unconfirmed}");
+    }
+
+    #[tokio::test]
+    async fn read_only_judge_with_evidence_and_verdict_can_attach_attested_evidence_only() {
+        use crate::pack::Packs;
+        use crate::rtools::testkit::{rig, rig_with};
+        use loom_core::config::AgentsCfg;
+        use loom_core::ledger::{ClaimStatus, EvidenceInput, EvidenceKind};
+        use serde_json::json;
+        use std::path::Path;
+
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs");
+        let packs = Packs::load(&dir).unwrap();
+        for (pack, role_name) in [("redteam", "op_judge"), ("ctf", "flag_judge")] {
+            let role = packs.role(Some(pack), Some(role_name)).unwrap().clone();
+            let r = rig_with(role, true, true, AgentsCfg::default());
+            r.model_op(LedgerOp::ClaimAdd { text: "candidate reaches target".into() });
+            let h = r.output("verified oracle receipt output\n", "oracle_check", ToolClass::Exec);
+            let res = r
+                .call(
+                    "evidence",
+                    json!({
+                        "claim": "c1",
+                        "handle": h,
+                        "start": 1,
+                        "end": 1,
+                        "quote": "verified oracle receipt output",
+                        "note": "oracle passed",
+                    }),
+                )
+                .await;
+            assert_eq!(res.status, loom_core::event::ToolStatus::Ok, "{pack}/{role_name}: {}", res.text);
+            assert_eq!(r.shared.ledger().unwrap().evidence.len(), 1);
+            for op in [
+                LedgerOp::ClaimAdd { text: "new claim".into() },
+                LedgerOp::ClaimUpdate { id: "c1".into(), status: ClaimStatus::Supported, note: String::new() },
+                LedgerOp::Decision { text: "d".into(), reason: "r".into() },
+            ] {
+                assert!(r.shared.ledger_append(false, op).unwrap_err().contains("read-only"));
+            }
+            let unattested = LedgerOp::EvidenceAdd(EvidenceInput {
+                claim: "c1".into(),
+                kind: EvidenceKind::Static,
+                supports: true,
+                session: r.shared.session.clone(),
+                call_id: CallId::from("call-1"),
+                blob: None,
+                lines: None,
+                quote: None,
+                note: "unattested".into(),
+                attested: false,
+                tool: None,
+                grade: None,
+            });
+            assert!(r.shared.ledger_append(false, unattested).unwrap_err().contains("read-only"));
+        }
+
+        // A read-only verifier without `evidence` stays blocked from EvidenceAdd.
+        let verifier_role = packs.role(Some("core"), Some("verifier")).unwrap().clone();
+        let v = rig_with(verifier_role, true, true, AgentsCfg::default());
+        v.model_op(LedgerOp::ClaimAdd { text: "lead claim".into() });
+        let ev = LedgerOp::EvidenceAdd(EvidenceInput {
+            claim: "c1".into(),
+            kind: EvidenceKind::Static,
+            supports: true,
+            session: v.shared.session.clone(),
+            call_id: CallId::from("call-1"),
+            blob: None,
+            lines: None,
+            quote: None,
+            note: "obs".into(),
+            attested: true,
+            tool: None,
+            grade: None,
+        });
+        assert!(v.shared.ledger_append(false, ev).unwrap_err().contains("read-only"));
+
+        // Non-judge children stay restricted to their own claims.
+        let w = rig("worker", true, true);
+        let journal = w.shared.journal.as_ref().unwrap();
+        journal
+            .append(&SessionId::from("s-lead"), false, LedgerOp::ClaimAdd { text: "lead claim".into() }, &|_| Ok(()))
+            .unwrap();
+        let h = w.output("worker observed line\n", "bash", ToolClass::Exec);
+        let res = w
+            .call(
+                "evidence",
+                json!({
+                    "claim": "c1",
+                    "handle": h,
+                    "start": 1,
+                    "end": 1,
+                    "quote": "worker observed line",
+                    "note": "obs",
+                }),
+            )
+            .await;
+        assert_eq!(res.status, loom_core::event::ToolStatus::Error);
+        assert!(res.text.contains("belongs to another session"), "{}", res.text);
     }
 }

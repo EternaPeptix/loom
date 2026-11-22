@@ -489,19 +489,26 @@ impl ModelClient {
             }
 
             let began = *first_failure.get_or_insert_with(Instant::now);
-            if self.pacing.window.is_some_and(|w| began.elapsed() > w) {
-                return Err(ModelError::Unavailable { attempts, last: reason });
-            }
             let mut delay = self.pacing.backoff(attempts);
             if let Some(ra) = retry_after {
                 delay = delay.max(ra.min(MAX_RETRY_AFTER));
             }
+            if self.pacing.window.is_some_and(|w| {
+                let elapsed = began.elapsed();
+                elapsed > w || (w > Duration::ZERO && elapsed.saturating_add(delay) > w)
+            }) {
+                return Err(ModelError::Unavailable { attempts, last: reason });
+            }
             tracing::debug!(model = %self.name, attempt = attempts, ?delay, %reason, "model attempt failed; retrying");
+            let last_reason = reason.clone();
             send(events, StreamEvent::Retrying { attempt: attempts, after_ms: millis(delay), reason });
             tokio::select! {
                 biased;
                 () = cancel.cancelled() => return Err(ModelError::Cancelled { partial: None }),
                 () = tokio::time::sleep(delay) => {}
+            }
+            if self.pacing.window.is_some_and(|w| began.elapsed() > w) {
+                return Err(ModelError::Unavailable { attempts, last: last_reason });
             }
         }
     }
@@ -618,29 +625,15 @@ impl ModelClient {
             if head.len() < HEAD_BYTES {
                 head.extend(chunk.iter().take(HEAD_BYTES - head.len()));
             }
-            let classify = |e: AssembleError| {
-                match e {
-                AssembleError::Malformed(m) => sticky(format!(
-                    "the server sent a stream chunk that is not valid JSON ({m}). Check that base_url points at an OpenAI-compatible /v1 endpoint."
-                )),
-                // A stream over a size limit is malformed too: it counts toward the same bounded retries.
-                AssembleError::Oversize(m) => sticky(format!(
-                    "the server sent a malformed stream: {m}. Check that base_url points at an OpenAI-compatible /v1 endpoint."
-                )),
-                // An overflow reported inside a 200 stream cannot be cured by sending the same request again.
-                AssembleError::Server(m) if has_overflow_phrase(&m) => {
-                    let (limit, requested) = overflow_numbers(&m);
-                    Fail::Fatal(ModelError::ContextOverflow { limit, requested, message: m })
-                }
-                other => retry(other.to_string()),
-            }
-            };
-            for payload in parser.feed(&chunk).map_err(classify)? {
+            for payload in parser.feed(&chunk).map_err(|e| classify_assemble(e, None))? {
                 payloads = payloads.saturating_add(1);
                 if payload.trim() == "[DONE]" {
                     finished = true;
                 }
-                let evs = asm.push(&payload).map_err(classify)?;
+                let evs = match asm.push(&payload) {
+                    Ok(evs) => evs,
+                    Err(e) => return Err(classify_assemble(e, asm.last_error())),
+                };
                 for ev in evs {
                     if ttft.is_none() {
                         ttft = Some(millis(sent.elapsed()));
@@ -715,6 +708,27 @@ impl ModelClient {
             req = req.bearer_auth(k);
         }
         matches!(req.send().await, Ok(r) if r.status().is_success())
+    }
+}
+
+fn classify_assemble(e: AssembleError, error_chunk: Option<&Value>) -> Fail {
+    match e {
+        AssembleError::Malformed(m) => sticky(format!(
+            "the server sent a stream chunk that is not valid JSON ({m}). Check that base_url points at an OpenAI-compatible /v1 endpoint."
+        )),
+        // A stream over a size limit is malformed too: it counts toward the same bounded retries.
+        AssembleError::Oversize(m) => sticky(format!(
+            "the server sent a malformed stream: {m}. Check that base_url points at an OpenAI-compatible /v1 endpoint."
+        )),
+        // An overflow reported inside a 200 stream cannot be cured by sending the same request again.
+        AssembleError::Server(m) => {
+            if let Some((limit, requested)) = read_overflow_chunk(error_chunk, &m) {
+                Fail::Fatal(ModelError::ContextOverflow { limit, requested, message: m })
+            } else {
+                retry(AssembleError::Server(m).to_string())
+            }
+        }
+        other => retry(other.to_string()),
     }
 }
 
@@ -843,7 +857,10 @@ fn number_after(message: &str, markers: &[&str]) -> Option<u64> {
 fn greater_than_pair(message: &str) -> Option<(u64, u64)> {
     message.match_indices('>').find_map(|(at, _)| {
         let before = message.get(..at)?.trim_end();
-        let start = before.rfind(|c: char| !c.is_ascii_digit()).map_or(0, |i| i.saturating_add(1));
+        let start = before
+            .char_indices()
+            .rfind(|(_, c)| !c.is_ascii_digit())
+            .map_or(0, |(i, c)| i.saturating_add(c.len_utf8()));
         let a = leading_number(before.get(start..)?)?;
         let b = leading_number(message.get(at.checked_add(1)?..)?.trim_start())?;
         (a > b).then_some((a, b))
@@ -870,21 +887,16 @@ fn overflow_numbers(message: &str) -> (Option<u64>, Option<u64>) {
     }
 }
 
-/// The body's `error` object (or the body itself when it has `type`/`code` at the top level).
-fn error_object(body: &str) -> Option<Value> {
-    let v = serde_json::from_str::<Value>(body).ok()?;
+/// The `error` object inside a parsed response/chunk (or the value itself when it is an object).
+fn error_object_from(v: &Value) -> Option<&Value> {
     match v.get("error") {
-        Some(e) if e.is_object() => Some(e.clone()),
-        _ => Some(v).filter(Value::is_object),
+        Some(e) if e.is_object() => Some(e),
+        _ => Some(v).filter(|v| v.is_object()),
     }
 }
 
-/// Reads the overflow report in a 400/413/422 body: `Some((limit, requested))` when it is one.
-/// It is one when the message has an overflow phrase or the error object's `type` or `code` is an
-/// overflow code. `n_ctx` / `n_prompt_tokens` of the error object win over numbers in the message.
-fn read_overflow(body: &str, message: &str) -> Option<(Option<u64>, Option<u64>)> {
-    let object = error_object(body);
-    let field = |k: &str| object.as_ref().and_then(|o| o.get(k));
+fn read_overflow_object(object: Option<&Value>, message: &str) -> Option<(Option<u64>, Option<u64>)> {
+    let field = |k: &str| object.and_then(|o| o.get(k));
     let coded = ["type", "code"]
         .iter()
         .any(|k| field(k).and_then(Value::as_str).is_some_and(|c| OVERFLOW_CODES.contains(&c.to_lowercase().as_str())));
@@ -896,6 +908,18 @@ fn read_overflow(body: &str, message: &str) -> Option<(Option<u64>, Option<u64>)
         (None, None) => Some(overflow_numbers(message)),
         (limit, requested) => Some((limit, requested)),
     }
+}
+
+fn read_overflow_chunk(chunk: Option<&Value>, message: &str) -> Option<(Option<u64>, Option<u64>)> {
+    read_overflow_object(chunk.and_then(error_object_from), message)
+}
+
+/// Reads the overflow report in a 400/413/422 body: `Some((limit, requested))` when it is one.
+/// It is one when the message has an overflow phrase or the error object's `type` or `code` is an
+/// overflow code. `n_ctx` / `n_prompt_tokens` of the error object win over numbers in the message.
+fn read_overflow(body: &str, message: &str) -> Option<(Option<u64>, Option<u64>)> {
+    let v = serde_json::from_str::<Value>(body).ok();
+    read_overflow_object(v.as_ref().and_then(error_object_from), message)
 }
 
 fn classify_status(status: u16, body: &str, retry_after: Option<Duration>) -> Fail {
@@ -2129,5 +2153,45 @@ mod tests {
             assert!(within(p.backoff(4), 4.0));
             assert!(within(p.backoff(40), 4.0));
         }
+    }
+
+    #[tokio::test]
+    async fn retry_after_exceeding_window_does_not_sleep_past_window_or_retry() {
+        let s = server(vec![
+            Action::Status { status: 429, body: "slow down".into(), retry_after_s: Some(5) },
+            Reply::text("must not be sent").into(),
+        ])
+        .await;
+        let pacing = Pacing { window: Some(Duration::from_millis(200)), ..fast_pacing() };
+        let began = Instant::now();
+        let err = client_with(profile(&s.base_url()), pacing)
+            .complete(&req("x"), None, &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(began.elapsed() < Duration::from_millis(500), "slept past window: {:?}", began.elapsed());
+        assert!(matches!(err, ModelError::Unavailable { attempts: 1, .. }), "{err:?}");
+        assert_eq!(s.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn coded_overflow_inside_a_200_stream_is_fatal_and_reads_fields() {
+        let sse = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"error\":{\"message\":\"prompt too large\",\"type\":\"exceed_context_size_error\",\"n_ctx\":8192,\"n_prompt_tokens\":9500}}\n\n",
+        );
+        let s = server(vec![
+            Action::Status { status: 200, body: sse.into(), retry_after_s: None },
+            Reply::text("must not retry").into(),
+        ])
+        .await;
+        let err = client(&s.base_url()).complete(&req("x"), None, &CancellationToken::new()).await.unwrap_err();
+        assert!(matches!(err, ModelError::ContextOverflow { limit: Some(8192), requested: Some(9500), .. }), "{err:?}");
+        assert_eq!(s.requests().len(), 1);
+    }
+
+    #[test]
+    fn greater_than_pair_handles_multibyte_utf8_prefix() {
+        assert_eq!(greater_than_pair("输入70000 > 65536"), Some((70000, 65536)));
+        assert_eq!(overflow_numbers("input —700 > 512"), (Some(512), Some(700)));
     }
 }

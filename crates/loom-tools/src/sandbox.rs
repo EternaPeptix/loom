@@ -1502,13 +1502,35 @@ fn under(path: &Path, rule: &Path) -> bool {
     if !cfg!(target_os = "macos") {
         return path.starts_with(rule);
     }
-    // Compared a character at a time: nothing is allocated for names that are valid UTF-8.
+    // Compared a component at a time using APFS volume folding; identical components short-circuit cleanly.
     let same = |a: Component, b: Component| {
         let (a, b) = (a.as_os_str().to_string_lossy(), b.as_os_str().to_string_lossy());
-        a.chars().flat_map(char::to_lowercase).eq(b.chars().flat_map(char::to_lowercase))
+        fold(&a) == fold(&b)
     };
     let mut p = path.components();
     rule.components().all(|r| p.next().is_some_and(|c| c == r || same(c, r)))
+}
+
+fn holders_for(
+    writable: &[PathBuf],
+    protected: &[PathBuf],
+    unreadable: &[PathBuf],
+    credentials: &[PathBuf],
+    tmp_dir: &Path,
+) -> Vec<PathBuf> {
+    let refused = |a: &Path| {
+        a == tmp_dir
+            || unreadable.iter().chain(credentials).any(|p| under(a, p))
+            || protected.iter().any(|p| under(a, p) && (!a.starts_with(tmp_dir) || under(p, tmp_dir)))
+    };
+    let guarded = protected.iter().chain(unreadable).chain(credentials).map(PathBuf::as_path).chain([tmp_dir]);
+    let mut out = std::collections::BTreeSet::new();
+    for a in guarded.flat_map(|p| p.ancestors().skip(1)) {
+        if writable.iter().any(|w| a.starts_with(w)) && !refused(a) {
+            out.insert(a.to_path_buf());
+        }
+    }
+    out.into_iter().collect()
 }
 
 /// Why `mode` cannot work on this host, if it cannot (`exec` is the seatbelt launcher).
@@ -1707,7 +1729,13 @@ impl Sandbox {
             }
         }
         for p in &cfg.protected_paths {
-            push_unique(&mut protected, anchored(p)?);
+            let written = absolute(p)?;
+            push_unique(&mut protected, canon(&written)?);
+            if let Some(w) = lexical(&written) {
+                if cfg.mode != SandboxMode::Bubblewrap || writable.iter().any(|root| under(&w, root)) {
+                    push_unique(&mut protected, w);
+                }
+            }
         }
 
         // A not-readable path is kept as written as well when a link along it makes that differ: removed,
@@ -1794,7 +1822,8 @@ impl Sandbox {
             None
         };
         let linux_pins = if cfg.mode == SandboxMode::Bubblewrap {
-            linux::pin(&writable, &protected, &unreadable, &credentials, &git_dirs)?
+            let holders = holders_for(&writable, &protected, &unreadable, &credentials, &tmp_dir);
+            linux::pin(&writable, &protected, &unreadable, &credentials, &git_dirs, &holders)?
         } else {
             Vec::new()
         };
@@ -1810,6 +1839,7 @@ impl Sandbox {
         {
             sbpl(p)?;
         }
+        let _ = std::fs::create_dir_all(&tmp_dir);
         let analysis_dir = tmp_dir.parent().map(|p| p.join("analysis")).unwrap_or_default();
         Ok(Sandbox {
             mode: cfg.mode,
@@ -1967,6 +1997,10 @@ impl Sandbox {
         replay.workspace = workspace.clone();
         replay.tmp_dir = tmp.clone();
         replay.writable = vec![workspace.clone(), tmp];
+        // Drop protected entries rooted in any untrusted actor origin (such as `actor_workspace/.loom` or, for
+        // `read_only` verifiers, `actor_workspace` itself) so OS mount rules never re-expose them after
+        // `$HOME` masking.
+        replay.protected.retain(|p| !untrusted.iter().any(|u| under(p, u)));
         for path in &untrusted {
             push_unique(&mut replay.unreadable, path.clone());
         }
@@ -1986,12 +2020,14 @@ impl Sandbox {
         );
         replay.git_modules = found.modules;
         if replay.mode == SandboxMode::Bubblewrap {
+            let holders = replay.holders();
             replay.linux_pins = linux::pin(
                 &replay.writable,
                 &replay.protected,
                 &replay.unreadable,
                 &replay.credentials,
                 &replay.git_dirs,
+                &holders,
             )
             .map_err(|e| format!("Replay mounts cannot be pinned: {e}. Inspect the staged directories."))?;
         }
@@ -2236,35 +2272,51 @@ impl Sandbox {
     /// are allowed and no rule of the profile refuses them already): moving one would take what it holds
     /// out from under its rule. Sorted, so that the same policy gives the same profile.
     fn holders(&self) -> Vec<PathBuf> {
-        let refused = |a: &Path| {
-            a == self.tmp_dir.as_path()
-                || self.unreadable.iter().chain(&self.credentials).any(|p| under(a, p))
-                || self
-                    .protected
-                    .iter()
-                    .any(|p| under(a, p) && (!a.starts_with(&self.tmp_dir) || under(p, &self.tmp_dir)))
-        };
-        let guarded = self.protected.iter().chain(&self.unreadable).chain(&self.credentials).chain([&self.tmp_dir]);
-        let mut out = std::collections::BTreeSet::new();
-        for a in guarded.flat_map(|p| p.ancestors().skip(1)) {
-            if self.writable.iter().any(|w| a.starts_with(w)) && !refused(a) {
-                out.insert(a.to_path_buf());
+        holders_for(&self.writable, &self.protected, &self.unreadable, &self.credentials, &self.tmp_dir)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn modern_bash() -> Option<&'static str> {
+        use std::os::unix::fs::PermissionsExt;
+        for candidate in ["/opt/homebrew/bin/bash", "/usr/local/bin/bash"] {
+            if let Ok(meta) = std::fs::metadata(candidate) {
+                if meta.is_file() && (meta.permissions().mode() & 0o111 != 0) {
+                    return Some(candidate);
+                }
             }
         }
-        out.into_iter().collect()
+        None
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) fn modern_bash() -> Option<&'static str> {
+        None
     }
 
     pub fn command(&self, script: &str) -> (String, Vec<String>) {
         if self.mode == SandboxMode::Bubblewrap {
             return linux::command(self, script);
         }
+        let bash = if self.mode == SandboxMode::Seatbelt && script.contains("<<") {
+            Self::modern_bash().unwrap_or("/bin/bash")
+        } else {
+            "/bin/bash"
+        };
         match self.profile() {
-            Some(profile) => (
-                SANDBOX_EXEC.to_string(),
-                vec!["-p".into(), profile, "/bin/bash".into(), "-c".into(), script.to_string()],
-            ),
-            None => ("/bin/bash".to_string(), vec!["-c".into(), script.to_string()]),
+            Some(profile) => {
+                (SANDBOX_EXEC.to_string(), vec!["-p".into(), profile, bash.into(), "-c".into(), script.to_string()])
+            }
+            None => (bash.to_string(), vec!["-c".into(), script.to_string()]),
         }
+    }
+
+    /// Like [`Sandbox::command`], for a session-owned PTY whose `pre_exec` has already started a
+    /// private session and acquired `TIOCSCTTY` on a fresh PTY slave.
+    pub(crate) fn pty_command(&self, script: &str) -> (String, Vec<String>) {
+        if self.mode == SandboxMode::Bubblewrap {
+            return linux::pty_command(self, script);
+        }
+        self.command(script)
     }
 
     fn resolved(&self, path: &Path) -> Result<PathBuf, String> {
@@ -6779,5 +6831,92 @@ PY";
         let none = build(&f, &cfg(SandboxMode::None), None).describe();
         assert!(!none.contains("No Git repository") && !none.contains("codesign"), "{none}");
         assert!(!none.contains("disk images") && !none.contains("WebKit") && !none.contains("defaults"), "{none}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn under_uses_apfs_folding_for_missing_protected_hooks_and_unreadable_paths() {
+        let f = fx();
+        std::fs::create_dir_all(f.ws.join(".git")).expect("git");
+        std::fs::write(f.ws.join(".git/config"), "[core]\n\thooksPath = .husky\n").expect("gitconfig");
+        let c = SandboxCfg {
+            protected_paths: vec!["config/secret.toml".into(), "sharp/ss".into()],
+            unreadable_paths: vec!["hidden/file".into()],
+            ..cfg(SandboxMode::Seatbelt)
+        };
+        let sb = build(&f, &c, None);
+        assert!(sb.check_write(&f.ws.join(".hu\u{17f}ky/post-checkout")).is_err());
+        assert!(sb.check_write(&f.ws.join("con\u{fb01}g/secret.toml")).is_err());
+        assert!(sb.check_write(&f.ws.join("sharp/\u{df}")).is_err());
+        assert!(sb.check_write(&f.ws.join("sharp/\u{1e9e}")).is_err());
+        assert!(sb.check_read(&f.ws.join("hidden/\u{fb01}le")).is_err());
+    }
+
+    #[test]
+    fn protected_paths_keep_lexical_form_against_symlink_replacement() {
+        let f = fx();
+        let target_dir = f.ws.join("real_dir");
+        std::fs::create_dir_all(&target_dir).expect("dir");
+        std::fs::write(target_dir.join("secret"), "keep").expect("secret");
+        symlink(&target_dir, f.ws.join("link")).expect("symlink");
+        let c = SandboxCfg { protected_paths: vec!["link/secret".into()], ..cfg(SandboxMode::Seatbelt) };
+        let sb = build(&f, &c, None);
+        assert!(sb.protected.contains(&f.ws.join("link/secret")));
+        assert!(sb.protected.contains(&target_dir.join("secret")));
+        assert!(sb.check_write(&f.ws.join("link/secret")).is_err());
+        assert!(sb.check_write(&target_dir.join("secret")).is_err());
+    }
+
+    #[test]
+    fn isolated_replay_strips_actor_workspace_and_loom_state_from_protected() {
+        let f = fx_prod();
+        // Simulate a `read_only = true` verifier whose actor workspace lies in `protected_paths`.
+        let c = SandboxCfg {
+            protect_credentials: true,
+            protected_paths: vec![f.ws.display().to_string()],
+            ..cfg(SandboxMode::Seatbelt)
+        };
+        let sb = build_home(&f, &c, &f.root);
+        let private = sb.oracle_staging_root().join("replay-test");
+        let (ws, tmp) = (private.join("workspace"), private.join("tmp"));
+        for d in [&ws, &tmp] {
+            std::fs::create_dir_all(d).expect("mkdir");
+        }
+        let replay = sb.isolated_replay(&ws, &tmp).expect("replay");
+        assert!(replay.protected.iter().all(|p| !under(p, &f.ws)), "{:?}", replay.protected);
+        assert!(replay.protected.contains(&ws.canonicalize().expect("canon")));
+        // Also ensure check_read refuses actor workspace and its `.loom`.
+        assert!(replay.check_read(&f.ws).is_err());
+        assert!(replay.check_read(&f.ws.join(".loom/oracle-secrets")).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_heredoc_works_in_writable_and_read_only_sandboxes() {
+        let f = fx_prod();
+        let writable = build(&f, &cfg(SandboxMode::Seatbelt), None);
+        // Non-heredoc commands must keep using `/bin/bash` so shape guarantees stay exact.
+        let (_, plain_args) = writable.command("echo hi");
+        assert_eq!(plain_args.get(2).map(String::as_str), Some("/bin/bash"));
+
+        if Sandbox::modern_bash().is_none() {
+            return;
+        }
+        let ro_cfg = SandboxCfg { protected_paths: vec![f.ws.display().to_string()], ..cfg(SandboxMode::Seatbelt) };
+        let read_only = build(&f, &ro_cfg, None);
+        let small = "cat <<'EOF'\nsmall-heredoc-ok\nEOF";
+        let big_body = "x".repeat(96 * 1024);
+        let large = format!("wc -c <<'EOF'\n{big_body}\nEOF");
+
+        for (label, sb) in [("writable", &writable), ("read-only", &read_only)] {
+            let (ok_small, out_small) = run(sb, &f.ws, small);
+            assert!(ok_small, "{label} small: {out_small}");
+            assert_eq!(out_small.trim(), "small-heredoc-ok", "{label}");
+
+            let (ok_large, out_large) = run(sb, &f.ws, &large);
+            assert!(ok_large, "{label} large: {out_large}");
+            let count: usize = out_large.trim().parse().unwrap_or(0);
+            assert_eq!(count, 96 * 1024 + 1, "{label}: {out_large}");
+        }
     }
 }

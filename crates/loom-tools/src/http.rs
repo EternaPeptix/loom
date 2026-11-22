@@ -137,8 +137,13 @@ impl Tool for HttpRepeat {
         } else {
             id
         };
-        let matches: Vec<_> = state.requests.iter().filter(|(k, _)| k.as_str() == id || k.starts_with(id)).collect();
-        let mut request = if matches.len() == 1 { matches.first().map(|(_, r)| (*r).clone()) } else { None };
+        let mut request = state.requests.get(id).cloned().or_else(|| {
+            let mut matches = state.requests.iter().filter(|(k, _)| k.starts_with(id));
+            match (matches.next(), matches.next()) {
+                (Some((_, r)), None) => Some(r.clone()),
+                _ => None,
+            }
+        });
         drop(state);
         let Some(mut r) = request.take() else {
             return ToolOutput::error("Request ID is unknown or ambiguous. Use a complete rq ID from this session; restart discards replay state.");
@@ -874,6 +879,65 @@ mod tests {
         assert_eq!(forms[0]["fields"][0]["hidden"], true);
         assert_eq!(forms[0]["fields"][1]["readonly"], true);
         assert_eq!(forms[0]["fields"][2]["disabled"], true);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn http_repeat_prefers_exact_request_id_over_prefix_matches() {
+        use axum::{routing::get, Router};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/first", get(|| async { "first" }))
+            .route("/other", get(|| async { "other" }))
+            .route("/prefixed", get(|| async { "prefixed" }));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let env = crate::testutil::env();
+        let ctx = env.ctx;
+
+        // Create rq1 -> /first and rq2..=rq10 -> /other so both "rq1" and "rq10" exist.
+        let first =
+            HttpSend.run(&ctx, json!({"request":{"url":format!("http://{addr}/first")}}).as_object().unwrap()).await;
+        assert_eq!(first.status, ToolStatus::Ok);
+        let rest = HttpSend
+            .run(&ctx, json!({"request":{"url":format!("http://{addr}/other")},"race_count":9}).as_object().unwrap())
+            .await;
+        assert_eq!(rest.status, ToolStatus::Ok);
+
+        // Exact key "rq1" resolves deterministically even though "rq10" also starts with "rq1".
+        let rep = HttpRepeat.run(&ctx, json!({"request_id":"rq1"}).as_object().unwrap()).await;
+        assert_eq!(rep.status, ToolStatus::Ok);
+        let Body::Raw(bytes) = rep.body else { panic!() };
+        let parsed: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed[0]["exchange"]["body_text"], "first");
+
+        // An ambiguous prefix without an exact match still fails.
+        let ambig = HttpRepeat.run(&ctx, json!({"request_id":"rq"}).as_object().unwrap()).await;
+        assert_eq!(ambig.status, ToolStatus::Error);
+        let Body::Message(msg) = ambig.body else { panic!() };
+        assert!(msg.contains("unknown or ambiguous"), "{msg}");
+
+        // Unique prefix matching still works when there is no exact key match.
+        {
+            let mut st = ctx.capabilities.http.lock().await;
+            st.requests.insert(
+                "unique99".into(),
+                Request {
+                    url: format!("http://{addr}/prefixed"),
+                    method: "GET".into(),
+                    headers: BTreeMap::new(),
+                    body: String::new(),
+                    body_base64: None,
+                    json: None,
+                },
+            );
+        }
+        let uniq = HttpRepeat.run(&ctx, json!({"request_id":"unique9"}).as_object().unwrap()).await;
+        assert_eq!(uniq.status, ToolStatus::Ok);
+        let Body::Raw(bytes) = uniq.body else { panic!() };
+        let parsed: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed[0]["exchange"]["body_text"], "prefixed");
+
         server.abort();
     }
 }

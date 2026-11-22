@@ -94,6 +94,7 @@ use crate::gate::{check_quotes, Quote};
 use crate::{frontier, texts};
 use async_trait::async_trait;
 use loom_core::event::{EvidenceGrade, ToolClass, ToolSpec, META_REFUSAL, REFUSAL_QUOTE};
+use loom_core::ids::MissionId;
 use loom_core::ledger::{ClaimStatus, EvidenceInput, EvidenceKind, LedgerOp, LedgerState, StepStatus};
 use loom_tools::params::{opt, req, spec};
 use loom_tools::{Body, Tool, ToolCtx, ToolOutput};
@@ -142,6 +143,23 @@ pub struct Evidence(pub Arc<Shared>);
 pub struct Ledger(pub Arc<Shared>);
 pub struct Reflect(pub Arc<Shared>);
 
+fn step_text(step: &Value) -> &str {
+    if let Some(s) = step.as_str() {
+        return s.trim();
+    }
+    if let Some(obj) = step.as_object() {
+        for key in ["step", "text", "content"] {
+            if let Some(s) = obj.get(key).and_then(Value::as_str) {
+                let trimmed = s.trim();
+                if !trimmed.is_empty() {
+                    return trimmed;
+                }
+            }
+        }
+    }
+    ""
+}
+
 #[async_trait]
 impl Tool for Plan {
     fn spec(&self) -> ToolSpec {
@@ -149,7 +167,12 @@ impl Tool for Plan {
             "plan",
             "Set the plan for the mission: an ordered list of steps, each one concrete enough to be checked off. This replaces the current plan. Use `step` to update a single step as you go.",
             ToolClass::State,
-            &[req("steps", "array", "The steps, in order. One sentence each.").items("string")],
+            &[req(
+                "steps",
+                "array",
+                "The steps, in order. Plain strings or {step|text|content} objects, one sentence each.",
+            )
+            .with("items", json!({"anyOf": [{"type": "string"}, {"type": "object"}]}))],
         )
     }
     async fn run(&self, _ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
@@ -158,7 +181,7 @@ impl Tool for Plan {
         };
         let mut texts = Vec::new();
         for (i, step) in steps.iter().enumerate() {
-            let text = step.as_str().unwrap_or("").trim();
+            let text = step_text(step);
             if text.is_empty() {
                 return ToolOutput::error(format!(
                     "Step {} of the plan is empty. Give every step a sentence saying what is to be done; nothing was recorded.",
@@ -193,7 +216,7 @@ impl Tool for Step {
     async fn run(&self, _ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
         let (outcome, op) = match (str_arg(args, "id"), str_arg(args, "status"), str_arg(args, "text")) {
             (None, None, Some(text)) => ("step added".to_string(), LedgerOp::PlanAdd { text: text.trim().to_string() }),
-            (Some(id), Some(status), None) => {
+            (Some(id), Some(status), _) => {
                 let Some(parsed) = parse_enum::<StepStatus>(status) else {
                     return ToolOutput::error("`status` must be one of todo, doing, done, dropped.");
                 };
@@ -292,25 +315,155 @@ impl Tool for Claim {
     fn spec(&self) -> ToolSpec {
         spec(
             "claim",
-            "State something you intend to establish as fact: a finding, a root cause, 'the fix works'. The claim stays open until you attach evidence to it with `evidence` and set its status with `claim_update`. Returns the claim's id.",
+            "State something you intend to establish as fact: a finding, a root cause, 'the fix works'. You may attach evidence and set its status in the same call by passing `handle` (with `quote` or `start`/`end`) and optional `status`/`note`; otherwise the claim stays open until you call `evidence` and `claim_update`. Returns the claim's id.",
             ToolClass::State,
-            &[req("text", "string", "The claim, as one checkable statement.")],
+            &[
+                req("text", "string", "The claim, as one checkable statement."),
+                opt("handle", "string", "Optional stored output handle (for example out:7f3a9c1e) to attach as evidence right away."),
+                opt("start", "integer", "First line of the quote in that output.").min(1),
+                opt("end", "integer", "Last line of the quote in that output.").min(1),
+                opt("quote", "string", "Exact text copied from that output (line numbers optional when unique), or leave out to quote lines start-end whole."),
+                opt("status", "string", "Optional status to set immediately after attaching evidence.").one_of(&["supported", "refuted", "withdrawn"]),
+                opt("note", "string", "One sentence explaining what the evidence shows, or why the claim is refuted/withdrawn."),
+            ],
         )
     }
-    async fn run(&self, _ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
+    async fn run(&self, ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
+        let shared = &self.0;
+        let Some(mission) = shared.mission.as_ref() else { return ToolOutput::error(NO_MISSION) };
         let text = str_arg(args, "text").unwrap_or("").to_string();
-        match self.0.ledger_append(false, LedgerOp::ClaimAdd { text }) {
-            Ok((_, state)) => {
-                let (id, text) = state.claims.last().map(|c| (c.id.as_str(), c.text.as_str())).unwrap_or(("", ""));
-                ToolOutput::ok(
-                    format!("claim {id} open"),
-                    Body::Message(format!(
-                        "{id}: {text}\nAttach evidence with `evidence`, then set its status with `claim_update`."
-                    )),
-                )
-            }
-            Err(text) => ToolOutput::error(text),
+        if text.trim().is_empty() {
+            return match shared.ledger_append(false, LedgerOp::ClaimAdd { text }) {
+                Ok(_) => unreachable!("empty claim text must be refused by ledger"),
+                Err(err) => ToolOutput::error(err),
+            };
         }
+
+        let handle = str_arg(args, "handle");
+        let start = args.get("start").and_then(Value::as_u64).unwrap_or(0);
+        let end = args.get("end").and_then(Value::as_u64).unwrap_or(0);
+        let quote = str_arg(args, "quote").unwrap_or("");
+        let note = str_arg(args, "note").unwrap_or("").trim().to_string();
+        let parsed_status = match str_arg(args, "status") {
+            None => None,
+            Some(raw) => {
+                let Some(parsed) = parse_enum::<ClaimStatus>(raw) else {
+                    return ToolOutput::error("`status` must be one of supported, refuted, withdrawn.");
+                };
+                if parsed == ClaimStatus::Supported && handle.is_none() {
+                    return ToolOutput::error(
+                        "Setting status to supported requires `handle` (with `quote` or `start`/`end`) to attach supporting evidence.",
+                    );
+                }
+                if matches!(parsed, ClaimStatus::Refuted | ClaimStatus::Withdrawn) && note.is_empty() {
+                    return ToolOutput::error("Setting status to refuted or withdrawn requires a non-empty `note`.");
+                }
+                Some((parsed, raw.to_string()))
+            }
+        };
+
+        if handle.is_none() && (!quote.trim().is_empty() || start > 0 || end > 0) {
+            return ToolOutput::error("Give `handle` when attaching a quote with `claim`.");
+        }
+
+        // Validate quote and producer BEFORE writing ClaimAdd so a bad handle/quote leaves zero stray claims.
+        let mut obs = if let Some(h) = handle {
+            let supports = !matches!(parsed_status, Some((ClaimStatus::Refuted, _)));
+            let ev_note = if note.is_empty() { text.trim() } else { note.as_str() };
+            match verify_observation(
+                shared,
+                ctx,
+                mission,
+                "",
+                h,
+                start,
+                end,
+                quote,
+                ev_note,
+                supports,
+                "Nothing was recorded.",
+            )
+            .await
+            {
+                Ok(v) => Some((h.to_string(), supports, v)),
+                Err(out) => return *out,
+            }
+        } else {
+            None
+        };
+
+        let (_, mut state) = match shared.ledger_append(false, LedgerOp::ClaimAdd { text }) {
+            Ok(ok) => ok,
+            Err(err) => return ToolOutput::error(err),
+        };
+        let (claim_id, claim_text) = state.claims.last().map(|c| (c.id.clone(), c.text.clone())).unwrap_or_default();
+
+        let mut extra_lines = Vec::new();
+        if let Some((_, supports, ref mut v)) = obs {
+            v.input.claim = claim_id.clone();
+            let ev_input = v.input.clone();
+            let (_, ev_state) = match shared.ledger_append(false, LedgerOp::EvidenceAdd(ev_input)) {
+                Ok(ok) => ok,
+                Err(err) => return ToolOutput::error(err),
+            };
+            state = ev_state;
+            let ev_id = state.evidence.last().map(|e| e.id.as_str()).unwrap_or("");
+            let side = if supports { "supports" } else { "undermines" };
+            extra_lines.push(format!(
+                "{ev_id} ({side}; {}: {} call in {}) attached to {claim_id}.",
+                v.grade.as_str(),
+                v.tool,
+                v.session
+            ));
+            if let Some(line) = texts::evidence_not_a_run(v.grade, &v.tool) {
+                extra_lines.push(line);
+            }
+        }
+
+        if let Some((parsed, status_word)) = parsed_status {
+            let (_, upd_state) = match shared
+                .ledger_append(false, LedgerOp::ClaimUpdate { id: claim_id.clone(), status: parsed, note })
+            {
+                Ok(ok) => ok,
+                Err(err) => return ToolOutput::error(err),
+            };
+            state = upd_state;
+            let mut msg = format!("{claim_id} is {status_word}: {claim_text}");
+            for line in extra_lines {
+                msg.push('\n');
+                msg.push_str(&line);
+            }
+            if parsed == ClaimStatus::Supported {
+                let established = frontier::frontier(&state, 0).established;
+                msg.push('\n');
+                msg.push_str(&texts::result_banked(&claim_id, established.len(), &frontier::id_list(&established)));
+            }
+            if let Some((_, _, v)) = &obs {
+                if let Some(recorded) = &v.recorded {
+                    msg.push('\n');
+                    msg.push_str(recorded);
+                }
+            }
+            return ToolOutput::ok(format!("claim {claim_id} {status_word}"), Body::Message(msg));
+        }
+
+        let mut msg = format!("{claim_id}: {claim_text}");
+        for line in extra_lines {
+            msg.push('\n');
+            msg.push_str(&line);
+        }
+        if obs.is_some() {
+            msg.push_str("\nThe claim is still open — set its status with `claim_update`.");
+            if let Some((_, _, v)) = &obs {
+                if let Some(recorded) = &v.recorded {
+                    msg.push('\n');
+                    msg.push_str(recorded);
+                }
+            }
+        } else {
+            msg.push_str("\nAttach evidence with `evidence`, then set its status with `claim_update`.");
+        }
+        ToolOutput::ok(format!("claim {claim_id} open"), Body::Message(msg))
     }
 }
 
@@ -353,19 +506,94 @@ impl Tool for ClaimUpdate {
     }
 }
 
+struct VerifiedObservation {
+    input: EvidenceInput,
+    grade: EvidenceGrade,
+    tool: String,
+    session: String,
+    recorded: Option<String>,
+}
+
+fn quote_refused(text: String) -> ToolOutput {
+    ToolOutput::error(text).with_meta(META_REFUSAL, json!(REFUSAL_QUOTE))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn verify_observation(
+    shared: &Shared,
+    ctx: &ToolCtx,
+    mission: &MissionId,
+    claim_id: &str,
+    handle: &str,
+    start: u64,
+    end: u64,
+    quote: &str,
+    note: &str,
+    supports: bool,
+    fail_suffix: &str,
+) -> Result<VerifiedObservation, Box<ToolOutput>> {
+    // Without its text the quote is the lines named: the result then shows what was recorded.
+    let by_lines = quote.trim().is_empty();
+    if start == 0 && end == 0 && by_lines {
+        return Err(Box::new(quote_refused(format!(
+            "Give `quote`, or both `start` and `end` line numbers.\n{fail_suffix}"
+        ))));
+    }
+    let q = Quote { handle: handle.to_string(), start, end, text: quote.to_string() };
+    let verified = match check_quotes(ctx, &[q]).await {
+        Ok(v) => v,
+        Err(text) => return Err(Box::new(quote_refused(format!("{text}\n{fail_suffix}")))),
+    };
+    let Some(v) = verified.into_iter().next() else {
+        return Err(Box::new(ToolOutput::error(
+            "The quote could not be checked, so nothing was attached. Check `handle`, `start` and `end`.",
+        )));
+    };
+    // Only observations are evidence.
+    let producer = match observed_producer(shared, mission, handle, &v.blob).await {
+        Ok(p) => p,
+        Err(text) => return Err(Box::new(quote_refused(text))),
+    };
+    // Only a run is execution evidence; an Exec tool whose output is analysis (dep_scan) is not one.
+    let run = producer.grade == EvidenceGrade::Run && producer.class == ToolClass::Exec;
+    let kind = if run { EvidenceKind::Execution } else { EvidenceKind::Static };
+    let recorded = by_lines.then(|| recorded_lines(handle, v.start, v.end, &v.text));
+    let input = EvidenceInput {
+        claim: claim_id.to_string(),
+        kind,
+        supports,
+        session: producer.session.clone(),
+        call_id: producer.call_id.clone(),
+        blob: Some(v.blob),
+        lines: Some((v.start, v.end)),
+        quote: Some(v.text),
+        note: note.to_string(),
+        attested: true,
+        tool: Some(producer.tool.clone()),
+        grade: Some(producer.grade),
+    };
+    Ok(VerifiedObservation {
+        input,
+        grade: producer.grade,
+        tool: producer.tool,
+        session: producer.session.to_string(),
+        recorded,
+    })
+}
+
 #[async_trait]
 impl Tool for Evidence {
     fn spec(&self) -> ToolSpec {
         spec(
             "evidence",
-            "Attach evidence to a claim: lines of the stored output of a command you ran or a file you read. Two ways. By line numbers: give `handle`, `start` and `end` and leave `quote` out; the harness takes those lines from the stored output (at most 20) and shows you what it recorded. Do this when you have the numbers from `out_read`, `out_grep` or `read`. By text: also give `quote`, copied exactly; the harness looks for it within the lines you name (the range may be wider than the text) and refuses it if it does not occur. Quote whole lines, or at least 8 non-space characters of a line; line numbers copied along with the text must be the output's own. `handle` is the out:… id shown in the header of the result.",
+            "Attach evidence to a claim: lines of the stored output of a command you ran or a file you read. Two ways. By line numbers: give `handle`, `start` and `end` and leave `quote` out; the harness takes those lines from the stored output (at most 40) and shows you what it recorded. Do this when you have the numbers from `out_read`, `out_grep` or `read`. By text: give `quote`, copied exactly (`start` and `end` are optional when unique in the output; if given, the harness checks within that range or auto-locates unique text); quote whole lines, or at least 8 non-space characters of a line. `handle` is the out:… id shown in the header of the result.",
             ToolClass::State,
             &[
                 req("claim", "string", "The claim this bears on, for example c1."),
                 req("handle", "string", "The stored output the quote is from, for example out:7f3a9c1e."),
-                req("start", "integer", "First line of the quote in that output.").min(1),
-                req("end", "integer", "Last line of the quote in that output.").min(1),
-                opt("quote", "string", "Leave out to quote lines start-end whole, as stored. Or the text, copied exactly from within those lines."),
+                opt("start", "integer", "First line of the quote in that output (optional when `quote` is unique).").min(1),
+                opt("end", "integer", "Last line of the quote in that output (optional when `quote` is unique).").min(1),
+                opt("quote", "string", "Leave out to quote lines start-end whole, as stored. Or the text, copied exactly from the output."),
                 req("note", "string", "One sentence: what this shows about the claim."),
                 opt("supports", "boolean", "false when the quote counts against the claim.").default(json!(true)),
             ],
@@ -381,62 +609,43 @@ impl Tool for Evidence {
         let quote = str_arg(args, "quote").unwrap_or("").to_string();
         let note = str_arg(args, "note").unwrap_or("").trim().to_string();
         let supports = args.get("supports").and_then(Value::as_bool).unwrap_or(true);
-        // Without its text the quote is the lines named: the result then shows what was recorded.
-        let by_lines = quote.trim().is_empty();
 
-        // A refusal over the quote says so in the record: a scorecard counts the steps spent on quotes.
-        let quote_refused = |text: String| ToolOutput::error(text).with_meta(META_REFUSAL, json!(REFUSAL_QUOTE));
-        let q = Quote { handle: handle.clone(), start, end, text: quote };
-        let verified = match check_quotes(ctx, &[q]).await {
-            Ok(v) => v,
-            Err(text) => return quote_refused(format!("{text}\nNothing was attached.")),
-        };
-        let Some(v) = verified.into_iter().next() else {
-            return ToolOutput::error(
-                "The quote could not be checked, so nothing was attached. Check `handle`, `start` and `end`.",
-            );
-        };
-        // Only observations are evidence.
-        let producer = match observed_producer(shared, mission, &handle, &v.blob).await {
-            Ok(p) => p,
-            Err(text) => return quote_refused(text),
-        };
-        // Only a run is execution evidence; an Exec tool whose output is analysis (dep_scan) is not one.
-        let run = producer.grade == EvidenceGrade::Run && producer.class == ToolClass::Exec;
-        let kind = if run { EvidenceKind::Execution } else { EvidenceKind::Static };
-        let recorded = by_lines.then(|| recorded_lines(&handle, v.start, v.end, &v.text));
-        let input = EvidenceInput {
-            claim: claim.clone(),
-            kind,
+        let obs = match verify_observation(
+            shared,
+            ctx,
+            mission,
+            &claim,
+            &handle,
+            start,
+            end,
+            &quote,
+            &note,
             supports,
-            session: producer.session.clone(),
-            call_id: producer.call_id.clone(),
-            blob: Some(v.blob.clone()),
-            lines: Some((v.start, v.end)),
-            quote: Some(v.text),
-            note,
-            attested: true,
-            tool: Some(producer.tool.clone()),
-            grade: Some(producer.grade),
+            "Nothing was attached.",
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(out) => return *out,
         };
-        match shared.ledger_append(false, LedgerOp::EvidenceAdd(input)) {
+        match shared.ledger_append(false, LedgerOp::EvidenceAdd(obs.input)) {
             Ok((_, state)) => {
                 let id = state.evidence.last().map(|e| e.id.as_str()).unwrap_or("");
                 let side = if supports { "supports" } else { "undermines" };
                 let mut text = format!(
                     "{id} ({side}; {}: {} call in {}) attached to {claim}.",
-                    producer.grade.as_str(),
-                    producer.tool,
-                    producer.session
+                    obs.grade.as_str(),
+                    obs.tool,
+                    obs.session
                 );
-                if let Some(line) = texts::evidence_not_a_run(producer.grade, &producer.tool) {
+                if let Some(line) = texts::evidence_not_a_run(obs.grade, &obs.tool) {
                     text.push('\n');
                     text.push_str(&line);
                 }
                 if state.claims.iter().any(|c| c.id == claim && c.status == ClaimStatus::Open) {
                     text.push_str("\nThe claim is still open — set its status with `claim_update`.");
                 }
-                if let Some(recorded) = recorded {
+                if let Some(recorded) = obs.recorded {
                     text.push('\n');
                     text.push_str(&recorded);
                 }
@@ -542,8 +751,9 @@ mod tests {
         let want = "Give `id` and `status` to update a step, or `text` alone to add one.";
         assert!(refused(&rig, "step", json!({})).await.contains(want));
         assert!(refused(&rig, "step", json!({"id": "p1"})).await.contains(want));
+        assert!(refused(&rig, "step", json!({"id": "p1", "text": "x"})).await.contains(want));
         assert!(refused(&rig, "step", json!({"status": "done"})).await.contains(want));
-        assert!(refused(&rig, "step", json!({"id": "p1", "status": "done", "text": "x"})).await.contains(want));
+        assert!(refused(&rig, "step", json!({"status": "done", "text": "x"})).await.contains(want));
 
         // A ledger rule refusal comes through verbatim.
         let rule = rig.shared.ledger_append(
@@ -778,10 +988,10 @@ mod tests {
 
         // Its refusals: the range is taken at its word, and nothing is attached. The record says a quote
         // was the reason, as it does for a quote given with text that does not occur.
-        let t = refused(&rig, "evidence", json!({"claim": "c1", "handle": h, "start": 5, "end": 9, "note": "n"})).await;
-        assert!(t.contains("end 9 is past its end") && t.contains("\nNothing was attached."), "{t}");
+        let t = refused(&rig, "evidence", json!({"claim": "c1", "handle": h, "start": 7, "end": 9, "note": "n"})).await;
+        assert!(t.contains("start 7 is past its end") && t.contains("\nNothing was attached."), "{t}");
         for args in [
-            json!({"claim": "c1", "handle": h, "start": 5, "end": 9, "note": "n"}),
+            json!({"claim": "c1", "handle": h, "start": 7, "end": 9, "note": "n"}),
             json!({"claim": "c1", "handle": h, "start": 1, "end": 6, "quote": "no such text here", "note": "n"}),
         ] {
             let r = rig.call("evidence", args).await;
@@ -1165,5 +1375,169 @@ mod tests {
             assert!(t.contains(NO_MISSION), "{name}: {t}");
         }
         assert!(rig.shared.take_emitted().is_empty());
+    }
+
+    #[tokio::test]
+    async fn plan_accepts_todowrite_objects_and_step_updates_when_text_also_passed() {
+        let rig = rig("lead", false, true);
+        let t = ok(
+            &rig,
+            "plan",
+            json!({
+                "steps": [
+                    "plain first step",
+                    {"step": "  second via step key  "},
+                    {"text": "third via text key"},
+                    {"content": "fourth via content key", "status": "todo"}
+                ]
+            }),
+        )
+        .await;
+        assert!(t.contains("[ ] p1 plain first step"), "{t}");
+        assert!(t.contains("[ ] p2 second via step key"), "{t}");
+        assert!(t.contains("[ ] p3 third via text key"), "{t}");
+        assert!(t.contains("[ ] p4 fourth via content key"), "{t}");
+
+        let bad = refused(&rig, "plan", json!({"steps": ["ok", {"step": "   ", "text": ""}, 42]})).await;
+        assert!(bad.contains("Step 2 of the plan is empty"), "{bad}");
+
+        // Providing id, status, and text together updates id (using note if provided, keeping original step text).
+        let upd = ok(
+            &rig,
+            "step",
+            json!({"id": "p1", "status": "done", "text": "ignored replacement", "note": "finished step 1"}),
+        )
+        .await;
+        assert!(upd.contains("step p1 done"), "{upd}");
+        assert!(upd.contains("[x] p1 plain first step — finished step 1"), "{upd}");
+        assert!(!upd.contains("ignored replacement"), "{upd}");
+    }
+
+    #[tokio::test]
+    async fn claim_can_attach_evidence_and_set_status_atomically() {
+        let rig = rig("lead", false, true);
+        let h_run = rig.output("compiling...\n3 tests passed\n", "bash", ToolClass::Exec);
+        let h_edit = rig.output("--- a/x.rs\n+++ b/x.rs\n", "edit", ToolClass::Write);
+
+        // Bad handle/quote leaves ZERO stray claims in the ledger and emits REFUSAL_QUOTE.
+        let r_bad_quote = rig
+            .call(
+                "claim",
+                json!({
+                    "text": "should not leak",
+                    "handle": h_run,
+                    "quote": "missing text xyz",
+                    "status": "supported"
+                }),
+            )
+            .await;
+        assert_eq!(r_bad_quote.status, ToolStatus::Error);
+        assert_eq!(r_bad_quote.meta.get(loom_core::event::META_REFUSAL), Some(&json!(loom_core::event::REFUSAL_QUOTE)));
+        assert!(rig.shared.ledger().unwrap().claims.is_empty());
+
+        let r_bad_prod = rig
+            .call(
+                "claim",
+                json!({
+                    "text": "diff claim",
+                    "handle": h_edit,
+                    "quote": "+++ b/x.rs",
+                    "status": "supported"
+                }),
+            )
+            .await;
+        assert_eq!(r_bad_prod.status, ToolStatus::Error);
+        assert_eq!(r_bad_prod.meta.get(loom_core::event::META_REFUSAL), Some(&json!(loom_core::event::REFUSAL_QUOTE)));
+        assert!(rig.shared.ledger().unwrap().claims.is_empty());
+
+        // `status: "supported"` without `handle` leaves zero stray claims.
+        let r_no_handle = refused(&rig, "claim", json!({"text": "no evidence", "status": "supported"})).await;
+        assert!(r_no_handle.contains("requires `handle`"), "{r_no_handle}");
+        assert!(rig.shared.ledger().unwrap().claims.is_empty());
+
+        // Valid handle + quote + status: "supported" (even omitting `note` and line numbers) succeeds atomically.
+        let t1 = ok(
+            &rig,
+            "claim",
+            json!({
+                "text": "the test suite passes",
+                "handle": h_run,
+                "quote": "3 tests passed",
+                "status": "supported"
+            }),
+        )
+        .await;
+        assert!(t1.contains("claim c1 supported"), "{t1}");
+        assert!(t1.contains("e1 (supports; run: bash call in"), "{t1}");
+        assert!(t1.contains("Established: c1."), "{t1}");
+
+        // Valid handle + by-lines without status attaches evidence and leaves the claim open.
+        let t2 = ok(
+            &rig,
+            "claim",
+            json!({
+                "text": "build started cleanly",
+                "handle": h_run,
+                "start": 1,
+                "end": 1,
+                "note": "compiler output line"
+            }),
+        )
+        .await;
+        assert!(t2.contains("claim c2 open"), "{t2}");
+        assert!(t2.contains("e2 (supports; run: bash call in"), "{t2}");
+        assert!(t2.contains("still open"), "{t2}");
+        assert!(t2.contains("Recorded from"), "{t2}");
+
+        let state = rig.shared.ledger().unwrap();
+        assert_eq!(state.claims.len(), 2);
+        assert_eq!(state.claims[0].status, loom_core::ledger::ClaimStatus::Supported);
+        assert_eq!(state.claims[1].status, loom_core::ledger::ClaimStatus::Open);
+        assert_eq!(state.evidence.len(), 2);
+        assert_eq!(state.evidence[0].input.claim, "c1");
+        assert_eq!(state.evidence[0].input.lines, Some((2, 2)));
+        assert_eq!(state.evidence[1].input.claim, "c2");
+    }
+
+    #[tokio::test]
+    async fn evidence_accepts_omitted_line_numbers_for_unique_quotes() {
+        let rig = rig("lead", false, true);
+        ok(&rig, "claim", json!({"text": "finds unique and catches ambiguous or missing"})).await;
+        let h = rig.output(
+            "first line alpha\nrepeated match here\nsecond unique beta\nrepeated match here\n",
+            "bash",
+            ToolClass::Exec,
+        );
+
+        // Unique quote without start/end resolves automatically.
+        let t = ok(
+            &rig,
+            "evidence",
+            json!({"claim": "c1", "handle": h, "quote": "second unique beta", "note": "found uniquely"}),
+        )
+        .await;
+        assert!(t.contains("e1 (supports; run: bash call"), "{t}");
+        let state = rig.shared.ledger().unwrap();
+        assert_eq!(state.evidence[0].input.lines, Some((3, 3)));
+
+        // Ambiguous quote without start/end is refused with REFUSAL_QUOTE.
+        let r_amb = rig
+            .call("evidence", json!({"claim": "c1", "handle": h, "quote": "repeated match here", "note": "ambiguous"}))
+            .await;
+        assert_eq!(r_amb.status, ToolStatus::Error);
+        assert_eq!(r_amb.meta.get(loom_core::event::META_REFUSAL), Some(&json!(loom_core::event::REFUSAL_QUOTE)));
+
+        // Missing quote without start/end is refused with REFUSAL_QUOTE.
+        let r_miss = rig
+            .call("evidence", json!({"claim": "c1", "handle": h, "quote": "absent substring", "note": "missing"}))
+            .await;
+        assert_eq!(r_miss.status, ToolStatus::Error);
+        assert_eq!(r_miss.meta.get(loom_core::event::META_REFUSAL), Some(&json!(loom_core::event::REFUSAL_QUOTE)));
+
+        // Omitting both quote and line numbers is cleanly refused with REFUSAL_QUOTE.
+        let r_empty = rig.call("evidence", json!({"claim": "c1", "handle": h, "note": "nothing quoted"})).await;
+        assert_eq!(r_empty.status, ToolStatus::Error);
+        assert_eq!(r_empty.meta.get(loom_core::event::META_REFUSAL), Some(&json!(loom_core::event::REFUSAL_QUOTE)));
+        assert!(r_empty.text.contains("Give `quote`, or both `start` and `end` line numbers."), "{}", r_empty.text);
     }
 }

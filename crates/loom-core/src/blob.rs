@@ -215,6 +215,9 @@ impl BlobStore {
     /// removes it.
     fn remove_if_still_old(&self, id: &str, min_age: Duration) -> bool {
         let blob = self.path_of(id);
+        if !fs::symlink_metadata(&blob).is_ok_and(|meta| is_older(&meta, SystemTime::now(), min_age)) {
+            return false;
+        }
         let claimed = self.root.join("tmp").join(format!("gc-{id}"));
         if fs::rename(&blob, &claimed).is_err() {
             return false;
@@ -1092,8 +1095,13 @@ mod tests {
     fn a_blob_refreshed_after_the_sweep_looked_is_put_back() {
         let (_d, s) = store();
         let b = s.put_bytes(b"busy\n").unwrap();
-        // Young when the claim looks (a store deduplicated onto it after the sweep listed it): put back.
+        // Young when the claim looks (a store deduplicated onto it after the sweep listed it):
+        // left untouched in place without moving it into `tmp/`.
+        let claimed = s.root().join("tmp").join(format!("gc-{}", b.id.0));
+        fs::write(&claimed, b"sentinel").unwrap();
         assert!(!s.remove_if_still_old(&b.id.0, DEFAULT_GC_MIN_AGE));
+        assert_eq!(fs::read(&claimed).unwrap(), b"sentinel");
+        fs::remove_file(&claimed).unwrap();
         assert!(s.path_of(&b.id.0).exists() && s.idx_path(&b.id).exists());
         assert!(tmp_files(&s).is_empty());
         // Old: deleted with its index, nothing left in tmp/.

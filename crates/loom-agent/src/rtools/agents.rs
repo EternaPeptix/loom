@@ -377,6 +377,76 @@ fn workspace_param() -> Param {
     .default(json!("shared"))
 }
 
+fn role_synonym(requested: &str) -> Option<&'static str> {
+    match requested {
+        "judge" => Some("verifier"),
+        "subagent" | "coder" => Some("worker"),
+        "researcher" => Some("lead"),
+        _ => None,
+    }
+}
+
+/// Resolve a common role synonym against `shared.role.may_spawn` only when the requested role
+/// is absent from `may_spawn` and its synonym is present. Returns the header note if rewritten.
+fn resolve_role_synonym(shared: &Shared, fields: &mut Map<String, Value>) -> Option<String> {
+    let requested = fields.get("role").and_then(Value::as_str)?;
+    if requested.trim().is_empty() {
+        return None;
+    }
+    let may = &shared.role.may_spawn;
+    if may.iter().any(|m| m == requested) {
+        return None;
+    }
+    let syn = role_synonym(requested)?;
+    if may.iter().any(|m| m == syn) {
+        let req_owned = requested.to_string();
+        fields.insert("role".to_string(), Value::String(syn.to_string()));
+        Some(format!("role alias: `{req_owned}` -> `{syn}`"))
+    } else {
+        None
+    }
+}
+
+fn parse_positive_steps(v: &Value) -> Result<u32, String> {
+    let parsed = v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()));
+    parsed
+        .and_then(|n| u32::try_from(n).ok())
+        .filter(|&n| n >= 1)
+        .ok_or_else(|| "`max_steps` must be a positive integer.".to_string())
+}
+
+struct NormalizedFanoutItem {
+    fields: Map<String, Value>,
+    item_steps: Option<u32>,
+    role_note: Option<String>,
+}
+
+/// Normalize one element of `agent_fanout`'s `agents` array (`task`/`prompt` -> `question`,
+/// per-item `max_steps`/`steps`, and role synonyms).
+fn normalize_fanout_item(shared: &Shared, object: &Map<String, Value>) -> Result<NormalizedFanoutItem, String> {
+    let mut fields = object.clone();
+    let missing_question =
+        fields.get("question").is_none_or(|v| v.is_null() || v.as_str().is_some_and(|s| s.trim().is_empty()));
+    if missing_question {
+        for alias in ["task", "prompt"] {
+            if let Some(v) = fields.remove(alias) {
+                if !v.is_null() {
+                    fields.insert("question".to_string(), v);
+                    break;
+                }
+            }
+        }
+    }
+    let raw_max_steps = fields.remove("max_steps").filter(|v| !v.is_null());
+    let raw_steps = fields.remove("steps").filter(|v| !v.is_null());
+    let item_steps = match raw_max_steps.or(raw_steps) {
+        Some(v) => Some(parse_positive_steps(&v)?),
+        None => None,
+    };
+    let role_note = resolve_role_synonym(shared, &mut fields);
+    Ok(NormalizedFanoutItem { fields, item_steps, role_note })
+}
+
 /// Read one assignment object. See the module contract.
 pub fn assignment(shared: &Shared, object: &Map<String, Value>) -> Result<(String, Brief), String> {
     const KEYS: [&str; 10] =
@@ -558,11 +628,12 @@ impl Tool for AgentSpawn {
     }
     async fn run(&self, ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
         let shared = &*self.0;
-        let fields: Map<String, Value> = args
+        let mut fields: Map<String, Value> = args
             .iter()
             .filter(|(k, _)| !matches!(k.as_str(), "mode" | "max_steps" | "max_minutes" | "background" | "workspace"))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
+        let role_note = resolve_role_synonym(shared, &mut fields);
         let (role, brief) = match assignment(shared, &fields) {
             Ok(a) => a,
             Err(e) => return ToolOutput::error(e),
@@ -596,6 +667,9 @@ impl Tool for AgentSpawn {
                     "Agent {id} ({role}) is working. Its report will arrive as a harness message when it ends. Call `wait` when you have nothing else to do until then.{copy}"
                 )),
             );
+            if let Some(note) = role_note {
+                out = out.with_more(note);
+            }
             if let Some(fact) = lowered {
                 out = out.with_more(fact);
             }
@@ -617,6 +691,9 @@ impl Tool for AgentSpawn {
             ToolOutput::ok(format!("agent {id} {}", outcome_word(settlement.outcome)), Body::Raw(body.into_bytes()))
                 .with_more(settlement.role.clone())
                 .with_more(format!("{} steps", settlement.steps));
+        if let Some(note) = role_note {
+            out = out.with_more(note);
+        }
         if let Some(fact) = lowered {
             out = out.with_more(fact);
         }
@@ -630,7 +707,9 @@ impl Tool for AgentSpawn {
 #[async_trait]
 impl Tool for AgentFanout {
     fn spec(&self) -> ToolSpec {
-        let items = loom_tools::params::object(&assignment_params());
+        let mut item_params = assignment_params();
+        item_params.push(opt("max_steps", "integer", "The most model steps this agent may take.").min(1));
+        let items = loom_tools::params::object(&item_params);
         spec(
             "agent_fanout",
             "Give several independent assignments to agents that work at the same time, and get all their reports in one result. Use it when the pieces do not depend on each other. Each element of `agents` is one assignment with the same fields as agent_spawn.",
@@ -659,15 +738,26 @@ impl Tool for AgentFanout {
         }
         let mut parsed = Vec::new();
         let mut errors = Vec::new();
+        let mut role_notes: Vec<String> = Vec::new();
         for (i, item) in items.iter().enumerate() {
             let number = i.saturating_add(1);
             let result = match item.as_object() {
-                Some(object) => assignment(shared, object)
-                    .and_then(|(role, brief)| prerequisite(shared, object).map(|p| (role, brief, p))),
+                Some(object) => normalize_fanout_item(shared, object).and_then(|norm| {
+                    assignment(shared, &norm.fields).and_then(|(role, brief)| {
+                        prerequisite(shared, &norm.fields).map(|p| (role, brief, p, norm.item_steps, norm.role_note))
+                    })
+                }),
                 None => Err(format!("must be an assignment object; received {}.", describe(item))),
             };
             match result {
-                Ok(a) => parsed.push(a),
+                Ok((role, brief, p, item_steps, note)) => {
+                    if let Some(n) = note {
+                        if !role_notes.contains(&n) {
+                            role_notes.push(n);
+                        }
+                    }
+                    parsed.push((role, brief, p, item_steps));
+                }
                 Err(e) => errors.push(format!("agents[{number}]: {e}")),
             }
         }
@@ -688,10 +778,19 @@ impl Tool for AgentFanout {
             Ok(w) => w,
             Err(e) => return ToolOutput::error(e),
         };
-        let (budget, lowered) = budget_for(shared, args);
+        let (base_budget, mut lowered) = budget_for(shared, args);
+        let ceiling_steps = shared.agents.child_max_steps;
+        let ceiling_minutes = shared.agents.child_max_minutes;
         let mut started: Vec<SessionId> = Vec::new();
-        for (role, brief, prerequisite) in parsed {
-            let mut req = request(ctx, role, SpawnMode::Fresh, brief, budget.clone(), true);
+        for (role, brief, prerequisite, item_steps) in parsed {
+            let mut budget = base_budget.clone();
+            if let Some(steps) = item_steps {
+                if steps > ceiling_steps && lowered.is_none() {
+                    lowered = Some(format!("budget lowered to {ceiling_steps} steps / {ceiling_minutes} min"));
+                }
+                budget.max_steps = Some(steps.min(ceiling_steps));
+            }
+            let mut req = request(ctx, role, SpawnMode::Fresh, brief, budget, true);
             req.prerequisite = prerequisite;
             req.workspace = workspace;
             match shared.orch.spawn(&shared.session, req).await {
@@ -706,13 +805,22 @@ impl Tool for AgentFanout {
         }
         let joins = started.iter().map(|id| shared.orch.join(&shared.session, id, &ctx.cancel));
         let results = futures_util::future::join_all(joins).await;
-        if ctx.cancel.is_cancelled() && results.iter().any(Result::is_err) {
+        let cancelled = ctx.cancel.is_cancelled() && results.iter().any(Result::is_err);
+        if cancelled {
             for id in &started {
                 let _ = shared.orch.stop_child(&shared.session, id).await;
             }
-            return ToolOutput::error(format!("Interrupted while waiting for {n} agents; they were stopped."));
+            if results.iter().all(Result::is_err) {
+                return ToolOutput::error(format!("Interrupted while waiting for {n} agents; they were stopped."));
+            }
         }
-        let mut body = format!("{FANOUT_LEGEND}\n\n");
+        let mut body = if cancelled {
+            format!(
+                "Interrupted while waiting for {n} agents; they were stopped. Already settled reports are included below.\n\n{FANOUT_LEGEND}\n\n"
+            )
+        } else {
+            format!("{FANOUT_LEGEND}\n\n")
+        };
         let mut counts = [0usize; 5];
         let order = [
             ChildOutcome::Returned,
@@ -724,7 +832,12 @@ impl Tool for AgentFanout {
         for (i, (id, result)) in started.iter().zip(results).enumerate() {
             let (role, outcome, steps, report) = match result {
                 Ok(s) => (s.role, s.outcome, s.steps, s.report),
-                Err(text) => (String::from("unknown"), ChildOutcome::Failed, 0, text),
+                Err(text) => (
+                    String::from("unknown"),
+                    if cancelled { ChildOutcome::Stopped } else { ChildOutcome::Failed },
+                    0,
+                    text,
+                ),
             };
             if let Some(slot) = order.iter().position(|o| *o == outcome).and_then(|p| counts.get_mut(p)) {
                 *slot += 1;
@@ -747,11 +860,19 @@ impl Tool for AgentFanout {
             .filter(|(_, c)| *c > 0)
             .map(|(o, c)| format!("{c} {}", outcome_word(*o)))
             .collect();
-        let mut out = ToolOutput::ok(format!("{n} agents: {}", parts.join(", ")), Body::Raw(body.into_bytes()));
+        let outcome = if cancelled {
+            format!("Interrupted while waiting for {n} agents; {}", parts.join(", "))
+        } else {
+            format!("{n} agents: {}", parts.join(", "))
+        };
+        let mut out = ToolOutput::ok(outcome, Body::Raw(body.into_bytes()));
+        for note in role_notes {
+            out = out.with_more(note);
+        }
         if let Some(fact) = lowered {
             out = out.with_more(fact);
         }
-        if counts.first().copied().unwrap_or(0) == 0 {
+        if cancelled || counts.first().copied().unwrap_or(0) == 0 {
             out.status = ToolStatus::Error;
         }
         out
@@ -944,22 +1065,37 @@ impl Tool for Attempt {
         }
         let joins = started.iter().map(|id| shared.orch.join(&shared.session, id, &ctx.cancel));
         let results = futures_util::future::join_all(joins).await;
-        if ctx.cancel.is_cancelled() && results.iter().any(Result::is_err) {
+        let cancelled_join = ctx.cancel.is_cancelled() && results.iter().any(Result::is_err);
+        if cancelled_join {
             for id in &started {
                 let _ = shared.orch.stop_child(&shared.session, id).await;
             }
-            return ToolOutput::error(format!("Interrupted while waiting for {n} attempts; they were stopped."));
+            if results.iter().all(Result::is_err) {
+                return ToolOutput::error(format!("Interrupted while waiting for {n} attempts; they were stopped."));
+            }
         }
         let ids = started.iter().map(SessionId::as_str).collect::<Vec<_>>().join(", ");
-        let mut body = format!("{ATTEMPT_LEGEND}\n\n");
+        let mut body = if cancelled_join {
+            format!(
+                "Interrupted while waiting for {n} attempts; they were stopped. Already settled attempt reports are included below (copies kept at {ids}: `agent_adopt` with `preview: true` shows what each changed).\n\n{ATTEMPT_LEGEND}\n\n"
+            )
+        } else {
+            format!("{ATTEMPT_LEGEND}\n\n")
+        };
         let (mut passed, mut unchecked) = (0usize, 0usize);
         // The complete outputs of the checks: stored here, named only in the text, so the result records them.
         let mut stored: Vec<String> = Vec::new();
+        let mut interrupted_check: Option<usize> = None;
         // One check at a time: several builds or test runs at once would slow each other into the timeout.
         for (i, (id, result)) in started.iter().zip(results).enumerate() {
             let (role, outcome, steps, report) = match result {
                 Ok(s) => (s.role, s.outcome, s.steps, s.report),
-                Err(text) => (String::from("unknown"), ChildOutcome::Failed, 0, text),
+                Err(text) => (
+                    String::from("unknown"),
+                    if cancelled_join { ChildOutcome::Stopped } else { ChildOutcome::Failed },
+                    0,
+                    text,
+                ),
             };
             body.push_str(&format!(
                 "===== attempt {} of {n}: {id} ({role}) \u{2014} {}, {steps} steps =====\n",
@@ -968,16 +1104,18 @@ impl Tool for Attempt {
             ));
             match shared.orch.child_copy(&shared.session, id).await {
                 Ok(Some(copy)) => {
-                    let checked = run_check(ctx, &copy, check, timeout_s).await;
-                    if checked.interrupted {
-                        return ToolOutput::error(format!(
-                            "Interrupted while the check ran in the copy of attempt {}. All {n} attempts have ended and their copies are kept ({ids}): `agent_adopt` with `preview: true` shows what each changed.",
-                            i.saturating_add(1)
-                        ));
+                    if !cancelled_join && interrupted_check.is_none() {
+                        let checked = run_check(ctx, &copy, check, timeout_s).await;
+                        if checked.interrupted {
+                            interrupted_check = Some(i);
+                        }
+                        passed += usize::from(checked.passed);
+                        stored.extend(checked.stored.iter().map(|id| id.as_str().to_string()));
+                        body.push_str(&format!("check: {}\n{}", checked.line, checked.tail));
+                    } else {
+                        unchecked += 1;
+                        body.push_str("check: not run (interrupted before checking)\n");
                     }
-                    passed += usize::from(checked.passed);
-                    stored.extend(checked.stored.iter().map(|id| id.as_str().to_string()));
-                    body.push_str(&format!("check: {}\n{}", checked.line, checked.tail));
                     // After the check: what the check itself wrote counts as part of the copy's state.
                     match changes_of(&copy).await {
                         Ok(changes) if changes.is_empty() => body.push_str("changed: nothing\n"),
@@ -1003,20 +1141,34 @@ impl Tool for Attempt {
             }
             body.push_str(&format!("report:\n{}\n\n", loom_core::tagsafe::quote_lines_starting(&report, "=====")));
         }
-        body.push_str("===== what to do now =====\n");
-        if passed == 0 {
+        let outcome = if cancelled_join {
             body.push_str(&format!(
-                "No attempt passed the check `{check}`. Nothing has changed in your workspace. Read the check output of the attempt that came closest: you can bring its changes over with `agent_adopt` and go on from there, or try again with what these attempts showed.\n"
+                "===== interrupted =====\nInterrupted while waiting for {n} attempts; they were stopped. Settled attempt reports are shown above ({ids}): `agent_adopt` with `preview: true` shows what each changed.\n"
             ));
+            format!("Interrupted while waiting for {n} attempts")
+        } else if let Some(at) = interrupted_check {
+            body.push_str(&format!(
+                "===== interrupted =====\nInterrupted while the check ran in the copy of attempt {}. All {n} attempts have ended and their copies are kept ({ids}): `agent_adopt` with `preview: true` shows what each changed.\n",
+                at.saturating_add(1)
+            ));
+            format!("Interrupted while checking attempt {} of {n}", at.saturating_add(1))
         } else {
-            body.push_str(&format!(
-                "{passed} of {n} attempts passed the check `{check}`. Nothing has changed in your workspace. Choose one attempt by its check result and the files it changed, and bring its changes over with `agent_adopt` and its id. The attempts are alternatives to each other: adopt one, not several. Then run the check in your own workspace.\n"
-            ));
-        }
-        let mut outcome = format!("{n} attempts: {passed} passed the check");
-        if unchecked > 0 {
-            outcome.push_str(&format!(", {unchecked} not checked"));
-        }
+            body.push_str("===== what to do now =====\n");
+            if passed == 0 {
+                body.push_str(&format!(
+                    "No attempt passed the check `{check}`. Nothing has changed in your workspace. Read the check output of the attempt that came closest: you can bring its changes over with `agent_adopt` and go on from there, or try again with what these attempts showed.\n"
+                ));
+            } else {
+                body.push_str(&format!(
+                    "{passed} of {n} attempts passed the check `{check}`. Nothing has changed in your workspace. Choose one attempt by its check result and the files it changed, and bring its changes over with `agent_adopt` and its id. The attempts are alternatives to each other: adopt one, not several. Then run the check in your own workspace.\n"
+                ));
+            }
+            let mut outcome = format!("{n} attempts: {passed} passed the check");
+            if unchecked > 0 {
+                outcome.push_str(&format!(", {unchecked} not checked"));
+            }
+            outcome
+        };
         let mut out = ToolOutput::ok(outcome, Body::Raw(body.into_bytes()));
         if let Some(fact) = lowered {
             out = out.with_more(fact);
@@ -1024,7 +1176,7 @@ impl Tool for Attempt {
         if !stored.is_empty() {
             out = out.with_meta(META_ALSO_STORED, json!(stored));
         }
-        if passed == 0 {
+        if cancelled_join || interrupted_check.is_some() || passed == 0 {
             out.status = ToolStatus::Error;
         }
         out
@@ -2436,5 +2588,171 @@ mod tests {
         let res = r.call("agent_adopt", json!({"agent":"s-kid1"})).await;
         assert_eq!(res.status, ToolStatus::Ok, "{}", res.text);
         assert_eq!(text_of(&ws, "locked/x.txt").as_deref(), Some("new\n"));
+    }
+
+    #[tokio::test]
+    async fn fanout_cancellation_preserves_already_settled_reports() {
+        let r = lead();
+        r.orch.settle("s-kid1", ChildOutcome::Returned, "first child settled finding", Value::Null);
+        r.orch.hang.lock().unwrap().push(SessionId::from("s-kid2"));
+        let (res, ()) = tokio::join!(r.call("agent_fanout", json!({"agents": two()})), cancel_soon(&r));
+        assert_eq!(res.status, ToolStatus::Error);
+        assert!(res.text.contains("Interrupted while waiting for 2 agents; they were stopped."), "{}", res.text);
+        assert!(res.text.contains("===== agent 1 of 2: s-kid1 (worker)"), "{}", res.text);
+        assert!(res.text.contains("first child settled finding"), "{}", res.text);
+    }
+
+    #[tokio::test]
+    async fn attempt_cancellation_preserves_settled_reports_on_join_and_check_interrupt() {
+        // Case 1: partial join cancellation after attempt 1 settled while attempt 2 hangs.
+        let r = lead();
+        r.orch.settle("s-kid1", ChildOutcome::Returned, "settled attempt one report", Value::Null);
+        r.orch.hang.lock().unwrap().push(SessionId::from("s-kid2"));
+        let (res, ()) =
+            tokio::join!(r.call("attempt", json!({"question": "q", "check": "true", "n": 2})), cancel_soon(&r));
+        assert_eq!(res.status, ToolStatus::Error);
+        assert!(res.text.contains("Interrupted while waiting for 2 attempts; they were stopped."), "{}", res.text);
+        assert!(res.text.contains("settled attempt one report"), "{}", res.text);
+
+        // Case 2: both attempts settled, then check 2 is interrupted while running.
+        let r = lead_with_files();
+        copy_for(&r, "s-kid1", |dir| write(dir, "fix.txt", "done\n"));
+        let copy2 = copy_for(&r, "s-kid2", |dir| write(dir, "mark2.txt", "hang\n"));
+        r.orch.settle("s-kid1", ChildOutcome::Returned, "first attempt checkable report", Value::Null);
+        r.orch.settle("s-kid2", ChildOutcome::Returned, "second attempt report", Value::Null);
+        let ready = copy2.dir.join("ready2");
+        let token = r.env.ctx.cancel.clone();
+        let cancel_on_ready = async {
+            for _ in 0..250 {
+                if ready.exists() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            assert!(ready.exists(), "second check never started");
+            token.cancel();
+        };
+        let check = "if [ -f mark2.txt ]; then touch ready2 && sleep 60; else echo ran-one; fi";
+        let (res, ()) =
+            tokio::join!(r.call("attempt", json!({"question": "q", "check": check, "n": 2})), cancel_on_ready);
+        assert_eq!(res.status, ToolStatus::Error);
+        assert!(res.text.contains("Interrupted while the check ran in the copy of attempt 2"), "{}", res.text);
+        assert!(res.text.contains("ran-one"), "{}", res.text);
+        assert!(res.text.contains("first attempt checkable report"), "{}", res.text);
+        assert!(res.text.contains("second attempt report"), "{}", res.text);
+    }
+
+    #[tokio::test]
+    async fn fanout_accepts_prompt_aliases_and_per_item_max_steps() {
+        let cfg = AgentsCfg { child_max_steps: 10, child_max_minutes: 5, ..AgentsCfg::default() };
+        let mut role = core_role("lead");
+        role.may_spawn = vec!["worker".into(), "verifier".into()];
+        let r = rig_with(role, false, true, cfg.clone());
+
+        // Calling through `r.call` exercises schema validation and normalization end-to-end.
+        let res = r
+            .call(
+                "agent_fanout",
+                json!({
+                    "max_steps": 8,
+                    "agents": [
+                        {"task": "check module A", "steps": 3},
+                        {"prompt": "check module B", "max_steps": cfg.child_max_steps + 25, "role": "judge"}
+                    ]
+                }),
+            )
+            .await;
+        assert_eq!(res.status, ToolStatus::Ok, "{}", res.text);
+        assert!(
+            res.text
+                .contains(&format!("budget lowered to {} steps / {} min", cfg.child_max_steps, cfg.child_max_minutes)),
+            "{}",
+            res.text
+        );
+        assert!(res.text.contains("role alias: `judge` -> `verifier`"), "{}", res.text);
+        let reqs = spawned(&r);
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[0].brief.question, "check module A");
+        assert_eq!(reqs[0].role, "worker");
+        assert_eq!(reqs[0].budget.max_steps, Some(3));
+        assert_eq!(reqs[1].brief.question, "check module B");
+        assert_eq!(reqs[1].role, "verifier");
+        assert_eq!(reqs[1].budget.max_steps, Some(cfg.child_max_steps));
+
+        // Calling Tool::run directly proves AgentFanout itself handles task/prompt/steps/max_steps.
+        let tool = AgentFanout(r.shared.clone());
+        let direct = tool
+            .run(
+                &r.env.ctx,
+                &obj(json!({
+                    "agents": [
+                        {"task": "direct task", "steps": 2, "role": "coder"},
+                        {"prompt": "direct prompt", "max_steps": 4, "role": "subagent"}
+                    ]
+                })),
+            )
+            .await;
+        assert_eq!(direct.status, ToolStatus::Ok, "{:?}", direct.body);
+        assert!(direct.more.iter().any(|m| m == "role alias: `coder` -> `worker`"), "{:?}", direct.more);
+        assert!(direct.more.iter().any(|m| m == "role alias: `subagent` -> `worker`"), "{:?}", direct.more);
+        let reqs = spawned(&r);
+        assert_eq!(reqs.len(), 4);
+        assert_eq!(reqs[2].brief.question, "direct task");
+        assert_eq!(reqs[2].role, "worker");
+        assert_eq!(reqs[2].budget.max_steps, Some(2));
+        assert_eq!(reqs[3].brief.question, "direct prompt");
+        assert_eq!(reqs[3].role, "worker");
+        assert_eq!(reqs[3].budget.max_steps, Some(4));
+
+        // Non-positive per-item steps fail validation cleanly before spawning anything.
+        let bad = tool
+            .run(
+                &r.env.ctx,
+                &obj(json!({
+                    "agents": [
+                        {"task": "ok", "steps": 2},
+                        {"prompt": "bad", "max_steps": 0}
+                    ]
+                })),
+            )
+            .await;
+        assert_eq!(bad.status, ToolStatus::Error);
+        assert_eq!(spawned(&r).len(), 4);
+    }
+
+    #[tokio::test]
+    async fn role_synonyms_resolve_only_when_needed_and_permitted() {
+        // On a standard lead (may_spawn: worker, verifier): judge->verifier, coder/subagent->worker;
+        // researcher->lead is NOT resolved because lead is not in may_spawn.
+        let r = lead();
+        let res = r.call("agent_spawn", json!({"question": "verify x", "role": "judge"})).await;
+        assert_eq!(res.status, ToolStatus::Ok, "{}", res.text);
+        assert!(res.text.contains("role alias: `judge` -> `verifier`"), "{}", res.text);
+        assert_eq!(spawned(&r)[0].role, "verifier");
+
+        let res = r.call("agent_spawn", json!({"question": "code y", "role": "coder"})).await;
+        assert_eq!(res.status, ToolStatus::Ok, "{}", res.text);
+        assert!(res.text.contains("role alias: `coder` -> `worker`"), "{}", res.text);
+        assert_eq!(spawned(&r)[1].role, "worker");
+
+        let res = r.call("agent_spawn", json!({"question": "research z", "role": "researcher"})).await;
+        assert_eq!(res.status, ToolStatus::Error, "{}", res.text);
+        assert!(res.text.contains("`researcher` is not one of them"), "{}", res.text);
+
+        // When `lead` IS in may_spawn, `researcher` resolves to `lead`.
+        let mut parent = core_role("lead");
+        parent.may_spawn = vec!["lead".into(), "judge".into(), "verifier".into()];
+        let r_custom = rig_with(parent, false, true, AgentsCfg::default());
+
+        let res = r_custom.call("agent_spawn", json!({"question": "dig deep", "role": "researcher"})).await;
+        assert_eq!(res.status, ToolStatus::Ok, "{}", res.text);
+        assert!(res.text.contains("role alias: `researcher` -> `lead`"), "{}", res.text);
+        assert_eq!(spawned(&r_custom)[0].role, "lead");
+
+        // When the requested role itself IS in may_spawn (`judge` here), it must NOT be rewritten.
+        let res = r_custom.call("agent_spawn", json!({"question": "keep exact", "role": "judge"})).await;
+        assert_eq!(res.status, ToolStatus::Ok, "{}", res.text);
+        assert!(!res.text.contains("role alias:"), "{}", res.text);
+        assert_eq!(spawned(&r_custom)[1].role, "judge");
     }
 }
