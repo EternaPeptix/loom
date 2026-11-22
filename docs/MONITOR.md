@@ -947,6 +947,10 @@ Holds are temporary and re-evaluated. The header says which state applies.
 - **Decode before matching.** Lifetime counters per mission.
 - **Attempts count.**
 
+As built (merge with #53): a `tool_call` records the name and arguments as the model sent them, and the executor
+repairs both (`write_file` is `write`, `filename` is `path`). The tripwires read the call as sent and the paths and
+content the repair adds, so an accepted spelling cannot hide either.
+
 ### 6.2 Tripwires
 "P" means on the precision list (enforcing from day one); "sh" means shadow until promoted.
 

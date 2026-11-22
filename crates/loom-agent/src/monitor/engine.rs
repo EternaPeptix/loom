@@ -61,6 +61,9 @@
 //!   `harness_test` flag (M4); the S3 of TW-17 beside a gated call (M8); a re-finish in a reopened turn (M9); gzip runs
 //!   (M6); a listener serving flag-shaped content (TW-19, needs the census to read content).
 //!
+//! A call is read as sent and as run: the paths and content that the executor's repair of an aliased tool or
+//! argument name adds (`loom_tools::canonical_tool_alias`, `schema::normalize_for_tool`) count like those sent.
+//!
 //! Tests required (M2): a positive and a negative fixture per tripwire; every matching rule of §6.1 with a fixture (own
 //! TMPDIR stripped, prose ignored, `/.git/config` in a URL to a target not matched, decoded base64 matched); the
 //! relaxed uptier and the reasoning cap order; the idle-egress grace; no hit from a session's own directory.
@@ -381,7 +384,36 @@ impl CallView {
                 v.cmd.push_str(s);
             }
         }
+        v.add_repaired(name, args, &ls);
         v
+    }
+
+    /// A `tool_call` records the name and arguments as the model sent them; the executor runs the alias's tool
+    /// with the repaired arguments. The paths and content those add are read too, and nothing sent is dropped.
+    fn add_repaired(&mut self, name: &str, args: &Value, sent: &[(String, String)]) {
+        let tool = loom_tools::canonical_tool_alias(name).unwrap_or(name);
+        let mut ran = args.clone();
+        if loom_tools::schema::normalize_for_tool(tool, &mut ran).is_empty() {
+            return;
+        }
+        let mut repaired = Vec::new();
+        leaves(&ran, &mut repaired, "", 0);
+        for (k, s) in repaired {
+            let key = k.as_str();
+            if PATH_KEYS.contains(&key) {
+                if !self.paths.contains(&s) {
+                    self.paths.push(s);
+                }
+            } else if CONTENT_KEYS.contains(&key)
+                && !matches!(self.class, ToolClass::Exec)
+                && !sent.iter().any(|(sk, sv)| *sv == s && CONTENT_KEYS.contains(&sk.as_str()))
+            {
+                if !self.content.is_empty() {
+                    self.content.push('\n');
+                }
+                self.content.push_str(&s);
+            }
+        }
     }
 
     /// The text a network or command tripwire reads: the command of an Exec call, the URLs of a fetch.

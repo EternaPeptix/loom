@@ -1291,3 +1291,20 @@ fn credential_tags_are_capped_per_mission_and_survive_a_restore() {
     e.restore_secrets(idx);
     assert!(e.take_new_secrets().is_empty());
 }
+
+#[test]
+fn a_repaired_call_is_read_as_the_executor_runs_it() {
+    let hook = "/work/ws/.git/hooks/pre-commit";
+    for key in ["path", "file_path", "filepath", "filename"] {
+        let mut t = T::new();
+        let h = t.tool("write_file", ToolClass::Write, json!({ (key): hook, "content": "#!/bin/sh" }));
+        assert!(!of(&h, 9).is_empty(), "a hook written through `{key}`");
+    }
+    for key in ["content", "contents", "file_text", "text"] {
+        let v = CallView::of("create_file", ToolClass::Write, &json!({ "path": "a", (key): "body" }));
+        assert_eq!(v.content, "body", "content sent as `{key}`");
+    }
+    // The repaired form only adds: a key the monitor already read is still read after its rename to `new`.
+    let v = CallView::of("str_replace", ToolClass::Write, &json!({ "path": "a", "new_string": "body" }));
+    assert_eq!(v.content, "body");
+}

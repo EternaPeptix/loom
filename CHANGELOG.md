@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Monitor and tolerant tool calls together
+
+- **The monitor reads a repaired call as it runs.** The executor accepts other spellings of tool and argument names
+  (`write_file`, `filename`, `file_text`) and the log keeps what was sent, so the path and content tripwires did not
+  see those calls: a git hook written through `filepath` raised nothing. They now read what the repair adds as well.
+
 ### Exact JSON floats
 
 - **A float parsed from JSON is the exact value that was written** (serde_json `float_roundtrip`). A sealed line of the monitor
