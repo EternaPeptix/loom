@@ -353,7 +353,7 @@ Exit status of `run` and `send`: 0 after `Finished` or `Yielded`; 2 when you are
 | `loom chat [options]` | turn-by-turn `chat` session; `--session <id>` continues one; `/quit` leaves |
 | `loom ls [-a]` | sessions (`-a`: archived too) |
 | `loom tail <session> [--since <seq>] [--no-follow]` | print a session's record and follow it |
-| `loom send <session> [text...] [--file PATH]...` | add a message to a running or idle session (`-d` to return at once); each `--file` is uploaded to the session's workspace and attached, and the text may then be empty |
+| `loom send <session> [text...] [--file PATH]... [--after-turn]` | add a message to a running or idle session (`-d` to return at once; `--after-turn` holds it, while the lead is in a turn, until the turn ends, then it starts the next turn); each `--file` is uploaded to the session's workspace and attached, and the text may then be empty |
 | `loom stop <session>` / `resume <session>` | stop the turn, its jobs and agents / let a stopped session carry on |
 | `loom reweave <session>` | fold old tool output out of the context now |
 | `loom archive <session> [--undo]` | hide a finished session; archiving settles the mission's agents |

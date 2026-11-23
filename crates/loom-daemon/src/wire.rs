@@ -195,6 +195,40 @@ pub struct MessageBody {
     /// Uploads of the session's workspace (`POST /api/uploads`), absolute paths; `docs/UPLOADS.md`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<String>,
+    /// `now` (the default): the lead takes it at its next step, or starts a turn when idle. `after_turn`:
+    /// held until the lead's turn ends, then sent as the start of the next one (the same as `now` while the
+    /// lead is idle). Any other value is a `400`.
+    #[serde(default, skip_serializing_if = "MessageWhen::is_now")]
+    pub when: MessageWhen,
+}
+
+/// When a message is sent (`MessageBody.when`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageWhen {
+    #[default]
+    Now,
+    AfterTurn,
+}
+
+impl MessageWhen {
+    fn is_now(&self) -> bool {
+        *self == MessageWhen::Now
+    }
+}
+
+/// Body of `PUT /api/sessions/{id}/queued/{qid}`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueuedEditBody {
+    pub text: String,
+}
+
+/// Answer of `POST /api/sessions/{id}/messages` (`202`) when the message was queued: `{"queued": {id, text,
+/// attachments, created_ms}}`. A message sent at once is answered `{}`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueuedReceipt {
+    pub queued: loom_agent::session::QueuedMessage,
 }
 
 /// Answer of `POST /api/uploads` (`201`).

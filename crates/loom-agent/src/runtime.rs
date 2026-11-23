@@ -657,7 +657,10 @@ use crate::prior;
 use crate::rtools::{
     self, ChildCopy, ChildInfo, Orchestrator, Producer, Run, Settlement, Shared, SpawnReq, Vote, Workspace,
 };
-use crate::session::{queue_input, Control, Deps, End, Input, Phase, Session, Sink, Status};
+use crate::session::{
+    discard_queued_messages, edit_queued_message, queue_input, queue_user_message, queued_messages,
+    take_queued_message, Control, Deps, End, Input, Phase, QueuedMessage, Session, Sink, Status,
+};
 use crate::texts;
 use async_trait::async_trait;
 use futures_util::FutureExt;
@@ -1278,6 +1281,11 @@ pub enum BusEvent {
     /// missed `missed` events; the subscriber should fetch what it shows again.
     Lagged {
         missed: u64,
+    },
+    /// The messages queued for `session` changed (one was added, edited, removed or sent): read the
+    /// list again (`Runtime::queued`).
+    Queued {
+        session: SessionId,
     },
 }
 
@@ -2221,6 +2229,12 @@ impl Sink for SinkImpl {
                 StreamEvent::ToolCallReady { .. } => return,
             };
             inner.publish(BusEvent::Delta { session: session.clone(), req_id: req_id.to_string(), delta });
+        }
+    }
+
+    fn queued(&self, session: &SessionId) {
+        if let Some(inner) = self.0.upgrade() {
+            inner.publish(BusEvent::Queued { session: session.clone() });
         }
     }
 
@@ -5181,6 +5195,98 @@ impl Runtime {
         Ok(())
     }
 
+    /// Send a message after the lead's current turn ends (`when: "after_turn"`). When the lead is idle this
+    /// is `send_message_with` and the answer is `None`. Otherwise the message is validated as `send_message_with`
+    /// does (so an attachment that is not an upload is refused now), kept on disk in the session's `queued/`
+    /// directory and answered with its [`QueuedMessage`]; the lead records it, in the order queued, as
+    /// `user_message`s when the turn ends and starts the next turn with the first (the rest arrive with it).
+    /// A turn that ends `Stopped` sends none: they stay queued until the operator messages or resumes the
+    /// lead, and survive a daemon restart.
+    pub async fn queue_message(
+        &self,
+        id: &SessionId,
+        text: &str,
+        attachments: &[String],
+    ) -> Result<Option<QueuedMessage>, String> {
+        let meta = self.operable(id, Some("message"))?;
+        let running = self.inner.st().known.get(id).is_some_and(|k| k.status.phase == Phase::Running);
+        if !running {
+            return self.send_message_with(id, text, attachments).await.map(|()| None);
+        }
+        if text.trim().is_empty() && attachments.is_empty() {
+            return Err("Write a message to send.".to_string());
+        }
+        if meta.archived {
+            return Err("This session is archived; unarchive it first.".to_string());
+        }
+        let files = attached_files(Path::new(&meta.workspace), attachments)?;
+        let composed = texts::with_attachments(text, &files);
+        self.inner.activate(id)?;
+        let message = queue_user_message(&self.inner.paths, id, text, attachments, &composed)?;
+        // The turn may have ended since the phase was read: the session looks at its queue again.
+        if !self.inner.send_input(id, Input::DrainQueued) {
+            let _ = take_queued_message(&self.inner.paths, id, &message.id);
+            return Err(format!("Session {} is not accepting input.", id.as_str()));
+        }
+        self.inner.publish(BusEvent::Queued { session: id.clone() });
+        Ok(Some(message))
+    }
+
+    /// The messages queued for the lead `id`, oldest first (`queue_message`).
+    pub fn queued(&self, id: &SessionId) -> Result<Vec<QueuedMessage>, String> {
+        self.operable(id, Some("message"))?;
+        Ok(queued_messages(&self.inner.paths, id))
+    }
+
+    /// Replace the text of queued message `qid`; its attachments stay. `There is no queued message {qid}`
+    /// when it was sent or removed meanwhile.
+    pub async fn edit_queued(&self, id: &SessionId, qid: &str, text: &str) -> Result<QueuedMessage, String> {
+        let meta = self.operable(id, Some("message"))?;
+        let current = queued_messages(&self.inner.paths, id)
+            .into_iter()
+            .find(|m| m.id == qid)
+            .ok_or_else(|| format!("There is no queued message {qid}; it may have just been sent."))?;
+        if text.trim().is_empty() && current.attachments.is_empty() {
+            return Err("Write a message to send.".to_string());
+        }
+        let files = attached_files(Path::new(&meta.workspace), &current.attachments)?;
+        let composed = texts::with_attachments(text, &files);
+        let message = edit_queued_message(&self.inner.paths, id, qid, text, &composed)?;
+        self.inner.publish(BusEvent::Queued { session: id.clone() });
+        Ok(message)
+    }
+
+    /// Remove queued message `qid` without sending it.
+    pub async fn remove_queued(&self, id: &SessionId, qid: &str) -> Result<(), String> {
+        self.operable(id, Some("message"))?;
+        take_queued_message(&self.inner.paths, id, qid)?;
+        self.inner.publish(BusEvent::Queued { session: id.clone() });
+        Ok(())
+    }
+
+    /// Send queued message `qid` now, as a message sent to a running lead is (at its next step; a turn
+    /// when it is idle), and take it off the queue.
+    pub async fn send_queued_now(&self, id: &SessionId, qid: &str) -> Result<(), String> {
+        let meta = self.operable(id, Some("message"))?;
+        if meta.archived {
+            return Err("This session is archived; unarchive it first.".to_string());
+        }
+        let (message, composed) = take_queued_message(&self.inner.paths, id, qid)?;
+        self.inner.publish(BusEvent::Queued { session: id.clone() });
+        let sent = self.inner.activate(id).is_ok() && {
+            self.inner.box_reopen_for(id);
+            self.inner.send_input(id, Input::User(composed.clone()))
+        };
+        if !sent {
+            // Not lost: it goes back on the queue (at the end).
+            let _ = queue_user_message(&self.inner.paths, id, &message.text, &message.attachments, &composed);
+            self.inner.publish(BusEvent::Queued { session: id.clone() });
+            return Err(format!("Session {} is not accepting input.", id.as_str()));
+        }
+        self.inner.resume_cut_children(id);
+        Ok(())
+    }
+
     /// The lead session of `id`'s mission (a child's id leads to its root): the session that owns the
     /// mission's ledger and takes the operator's rules and approvals.
     fn lead_of(&self, id: &SessionId) -> Result<SessionMeta, String> {
@@ -5836,6 +5942,10 @@ impl Runtime {
         // which reaches the lead when the mission is unarchived.
         drop(closing);
         if archived {
+            // Messages queued for after a turn are not sent to an archived session.
+            if discard_queued_messages(&self.inner.paths, id) > 0 {
+                self.inner.publish(BusEvent::Queued { session: id.clone() });
+            }
             // The operator is done with this mission, so its open inbox items stop waiting: they are
             // dropped from the index and stop notifying (the repeat notice ends when the item leaves the
             // index). Archived sessions are not activated at the next start, so the items do not come

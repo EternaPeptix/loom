@@ -64,8 +64,8 @@
 
 use crate::wire::{
     AnswerBody, ApprovalBody, ArchiveBody, CreatedSession, DaemonFile, ErrorBody, GcBody, LinesView, MessageBody,
-    ModelBody, ModelsView, RecordsPage, ReleaseBody, RenameBody, RoleModelBody, RuleBody, ScopeBody, ScopeReceipt,
-    SessionDetail, StatusView, UploadView, WithdrawBody,
+    MessageWhen, ModelBody, ModelsView, RecordsPage, ReleaseBody, RenameBody, RoleModelBody, RuleBody, ScopeBody,
+    ScopeReceipt, SessionDetail, StatusView, UploadView, WithdrawBody,
 };
 use loom_agent::runtime::{
     BusEvent, InboxEntry, LedgerView, MissionInfo, MissionModels, ModelSwitchReceipt, ModelsReload, NetEntry,
@@ -465,9 +465,32 @@ impl Client {
 
     /// [`Client::send`] with uploads attached (`paths` are the `path`s `upload` returned).
     pub async fn send_with_files(&self, id: &SessionId, text: &str, paths: &[String]) -> Result<(), String> {
-        let body = serde_json::to_value(MessageBody { text: text.to_string(), attachments: paths.to_vec() })
-            .map_err(|e| format!("The message cannot be encoded ({e})."))?;
+        let body = serde_json::to_value(MessageBody {
+            text: text.to_string(),
+            attachments: paths.to_vec(),
+            when: Default::default(),
+        })
+        .map_err(|e| format!("The message cannot be encoded ({e})."))?;
         self.call_unit(Method::POST, &format!("/api/sessions/{}/messages", segment(id.as_str())), Some(body)).await
+    }
+
+    /// [`Client::send_with_files`] with `when: "after_turn"`: the message that was held until the lead's turn
+    /// ends, or `None` when the lead was idle and it was sent at once.
+    pub async fn send_after_turn(
+        &self,
+        id: &SessionId,
+        text: &str,
+        paths: &[String],
+    ) -> Result<Option<loom_agent::session::QueuedMessage>, String> {
+        let body = serde_json::to_value(MessageBody {
+            text: text.to_string(),
+            attachments: paths.to_vec(),
+            when: MessageWhen::AfterTurn,
+        })
+        .map_err(|e| format!("The message cannot be encoded ({e})."))?;
+        let path = format!("/api/sessions/{}/messages", segment(id.as_str()));
+        let answer: serde_json::Value = self.call(Method::POST, &path, &[], Some(body)).await?;
+        Ok(answer.get("queued").and_then(|q| serde_json::from_value(q.clone()).ok()))
     }
 
     /// `POST /api/uploads`: store `bytes` as `name` in `workspace`'s uploads folder (`docs/UPLOADS.md`).

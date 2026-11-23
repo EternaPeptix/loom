@@ -619,6 +619,12 @@ turn (turn_start{trigger}):
 turn_end{reason}   yielded | finished | asked | blocked | waiting | stopped | parked | budget_exhausted | error
 ```
 
+**Queued messages.** A user message sent `after_turn` while the lead runs is kept in the session's `queued/`
+directory (not in the log). When the turn ends the session records the queued messages in order as `user_message`s;
+the first starts the next turn and the rest arrive in its first request. They can be listed, edited, removed or sent
+now (as a steering message) until then. A stop leaves them queued until the next resume or message; archiving
+discards them.
+
 **Idle inputs.** A user message is recorded and starts a turn. An inbox answer resolves the item
 (answers to questions and blockers are also recorded in the ledger) and, when not blank, starts a turn
 with the answer as a user message; a blank answer to a non-blocking item is a **dismissal**: it

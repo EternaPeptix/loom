@@ -10,6 +10,14 @@
   fact; a reopened session restores it from the last such result. Older logs stay readable. The tool descriptions
   no longer tell the model to `cd` in every command.
 
+### Queued messages
+
+- `POST /api/sessions/{id}/messages` takes `when: "now" | "after_turn"`. A message sent `after_turn` while the lead
+  is in a turn is kept on disk (`queued/`) and recorded as a `user_message` when the turn ends; the first starts the
+  next turn and the rest arrive with it. `GET /api/sessions/{id}/queued`, `PUT`/`DELETE .../queued/{qid}` and
+  `POST .../queued/{qid}/send` list, edit, remove and send one now; the event streams send `{type:"queued",session}`
+  on every change. A stop keeps the queue; archiving discards it. `loom send --after-turn`.
+
 ### File uploads
 
 - `POST /api/uploads?workspace=&name=` (raw body, at most 32 MiB) stores a file in `<workspace>/.loom/uploads/` (name

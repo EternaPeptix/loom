@@ -613,6 +613,9 @@ pub enum Input {
     /// A `Constraint`, `Approval`, `Withdraw` or `Scope` kept on disk at `file` until it is recorded (see
     /// [`queue_input`]).
     Queued { file: PathBuf, input: Box<Input> },
+    /// Queued messages (see [`queue_user_message`]) were written to disk: when the session is idle, record
+    /// them and start a turn; during a turn it does nothing (they are recorded when the turn ends).
+    DrainQueued,
     /// Use another model from the next request on (the operator switched it, or its profile was
     /// reloaded). Applied between steps like a rule; it starts no turn. Not kept on disk: the runtime
     /// writes the new model to `meta.json` first, and `open` records a switch a restart cut short.
@@ -651,11 +654,35 @@ pub const SWITCH_IDLE: &str = "changed while the session was idle";
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum KeptInput {
-    Constraint { text: String },
-    Approval { text: String, scope: String },
-    Withdraw { id: String, reason: String },
-    Scope { hosts: Vec<String>, note: Option<String> },
-    Release { reason: String },
+    Constraint {
+        text: String,
+    },
+    Approval {
+        text: String,
+        scope: String,
+    },
+    Withdraw {
+        id: String,
+        reason: String,
+    },
+    Scope {
+        hosts: Vec<String>,
+        note: Option<String>,
+    },
+    Release {
+        reason: String,
+    },
+    /// A message the operator queued to be sent when the lead's turn ends ([`queue_user_message`]). Not an
+    /// [`Input`] until then: it is never recorded by `kept_inputs`.
+    User {
+        id: String,
+        text: String,
+        attachments: Vec<String>,
+        created_ms: u64,
+        /// What is recorded: `text` with the attachments block; empty means `text` as it is.
+        #[serde(default)]
+        composed: String,
+    },
 }
 
 impl KeptInput {
@@ -666,6 +693,7 @@ impl KeptInput {
             KeptInput::Withdraw { id, reason } => Input::Withdraw { id, reason },
             KeptInput::Scope { hosts, note } => Input::Scope { hosts, note },
             KeptInput::Release { reason } => Input::Release { reason },
+            KeptInput::User { text, composed, .. } => Input::User(if composed.is_empty() { text } else { composed }),
         }
     }
 }
@@ -697,6 +725,17 @@ pub fn queue_input(paths: &Paths, session: &SessionId, input: Input) -> Result<I
 
 /// Write `kept` durably as the next file of `dir`; file names sort in the order they were written.
 fn write_kept(dir: &Path, kept: &KeptInput) -> std::io::Result<PathBuf> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = dir.join(format!("{:016}-{n:010}.json", now_ms()));
+    write_kept_to(dir, &path, kept).inspect_err(|_| {
+        // The operator is told to send it again, so it must not be recorded later as well.
+        let _ = std::fs::remove_file(&path);
+    })
+}
+
+/// Write `kept` durably at `path` in `dir`, replacing what is there.
+fn write_kept_to(dir: &Path, path: &Path, kept: &KeptInput) -> std::io::Result<PathBuf> {
     fn write_synced(dir: &Path, tmp: &Path, path: &Path, kept: &KeptInput) -> std::io::Result<()> {
         use std::io::Write;
         let mut options = std::fs::OpenOptions::new();
@@ -708,19 +747,171 @@ fn write_kept(dir: &Path, kept: &KeptInput) -> std::io::Result<PathBuf> {
         std::fs::rename(tmp, path)?;
         std::fs::File::open(dir)?.sync_all()
     }
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     loom_core::config::ensure_private_dir(dir)?;
-    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let name = format!("{:016}-{n:010}.json", now_ms());
-    let path = dir.join(&name);
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let tmp = dir.join(format!(".{name}.tmp"));
-    if let Err(e) = write_synced(dir, &tmp, &path, kept) {
-        // The operator is told to send it again, so it must not be recorded later as well.
+    if let Err(e) = write_synced(dir, &tmp, path, kept) {
         let _ = std::fs::remove_file(&tmp);
-        let _ = std::fs::remove_file(&path);
         return Err(e);
     }
-    Ok(path)
+    Ok(path.to_path_buf())
+}
+
+/// A message the operator queued to be sent when the lead's turn ends.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueuedMessage {
+    pub id: String,
+    pub text: String,
+    /// Uploads of the session's workspace, as `Runtime::send_message_with` takes them.
+    pub attachments: Vec<String>,
+    pub created_ms: u64,
+}
+
+impl QueuedMessage {
+    fn of(kept: &KeptInput) -> Option<QueuedMessage> {
+        match kept {
+            KeptInput::User { id, text, attachments, created_ms, .. } => Some(QueuedMessage {
+                id: id.clone(),
+                text: text.clone(),
+                attachments: attachments.clone(),
+                created_ms: *created_ms,
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// Serializes the operator's changes to queued messages with the session taking them.
+static QUEUE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn queue_lock() -> std::sync::MutexGuard<'static, ()> {
+    QUEUE_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+fn no_queued(id: &str) -> String {
+    format!("There is no queued message {id}; it may have just been sent.")
+}
+
+/// The queued user messages of `dir` with their files, oldest first.
+fn queued_files(dir: &Path) -> Vec<(PathBuf, KeptInput)> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .collect();
+    files.sort();
+    files
+        .into_iter()
+        .filter_map(|f| {
+            let kept = std::fs::read(&f).ok().and_then(|b| serde_json::from_slice::<KeptInput>(&b).ok())?;
+            matches!(kept, KeptInput::User { .. }).then_some((f, kept))
+        })
+        .collect()
+}
+
+/// Keep a message for `session` on disk until its lead's turn ends. `composed` is `text` with the
+/// attachments block (`texts::with_attachments`), which is what is recorded. The caller then sends the
+/// session [`Input::DrainQueued`], so that a turn that ended meanwhile still sends it.
+pub fn queue_user_message(
+    paths: &Paths,
+    session: &SessionId,
+    text: &str,
+    attachments: &[String],
+    composed: &str,
+) -> Result<QueuedMessage, String> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let created_ms = now_ms();
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let message = QueuedMessage {
+        id: format!("q{created_ms}-{n}"),
+        text: text.to_string(),
+        attachments: attachments.to_vec(),
+        created_ms,
+    };
+    let kept = KeptInput::User {
+        id: message.id.clone(),
+        text: message.text.clone(),
+        attachments: message.attachments.clone(),
+        created_ms,
+        composed: composed.to_string(),
+    };
+    let _guard = queue_lock();
+    write_kept(&queue_dir(paths, session), &kept).map_err(|e| {
+        format!("Could not keep the message for session {} on disk ({e}); send it again.", session.as_str())
+    })?;
+    Ok(message)
+}
+
+/// The messages queued for `session`, oldest first.
+pub fn queued_messages(paths: &Paths, session: &SessionId) -> Vec<QueuedMessage> {
+    let _guard = queue_lock();
+    queued_files(&queue_dir(paths, session)).iter().filter_map(|(_, k)| QueuedMessage::of(k)).collect()
+}
+
+/// Replace the text (and what is recorded for it) of queued message `id`.
+pub fn edit_queued_message(
+    paths: &Paths,
+    session: &SessionId,
+    id: &str,
+    text: &str,
+    composed: &str,
+) -> Result<QueuedMessage, String> {
+    let dir = queue_dir(paths, session);
+    let _guard = queue_lock();
+    for (file, kept) in queued_files(&dir) {
+        let KeptInput::User { id: have, attachments, created_ms, .. } = kept else { continue };
+        if have != id {
+            continue;
+        }
+        let message =
+            QueuedMessage { id: have.clone(), text: text.to_string(), attachments: attachments.clone(), created_ms };
+        let new = KeptInput::User {
+            id: have,
+            text: text.to_string(),
+            attachments,
+            created_ms,
+            composed: composed.to_string(),
+        };
+        write_kept_to(&dir, &file, &new).map_err(|e| format!("Could not keep the edit on disk ({e}); try again."))?;
+        return Ok(message);
+    }
+    Err(no_queued(id))
+}
+
+/// Take queued message `id` off the queue: the message and what is to be recorded for it.
+pub fn take_queued_message(paths: &Paths, session: &SessionId, id: &str) -> Result<(QueuedMessage, String), String> {
+    let _guard = queue_lock();
+    for (file, kept) in queued_files(&queue_dir(paths, session)) {
+        let Some(message) = QueuedMessage::of(&kept) else { continue };
+        if message.id != id {
+            continue;
+        }
+        std::fs::remove_file(&file).map_err(|e| format!("Could not remove the queued message ({e}); try again."))?;
+        let KeptInput::User { text, composed, .. } = kept else { continue };
+        return Ok((message, if composed.is_empty() { text } else { composed }));
+    }
+    Err(no_queued(id))
+}
+
+/// Drop every message queued for `session` (it was archived). Returns how many there were.
+pub fn discard_queued_messages(paths: &Paths, session: &SessionId) -> usize {
+    let _guard = queue_lock();
+    queued_files(&queue_dir(paths, session)).iter().filter(|(f, _)| std::fs::remove_file(f).is_ok()).count()
+}
+
+/// The name a queued message's file takes while the session records it: `{stem}.{seq}.sending`, `seq`
+/// being the seq the message's `user_message` gets.
+fn sending_path(file: &Path, seq: Seq) -> PathBuf {
+    let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let stem = name.split('.').next().unwrap_or_default();
+    file.with_file_name(format!("{stem}.{seq}.sending"))
+}
+
+/// The stem and seq of a name made by [`sending_path`].
+fn sending_parts(file: &Path) -> Option<(String, Seq)> {
+    let name = file.file_name()?.to_str()?.strip_suffix(".sending")?;
+    let (stem, seq) = name.split_once('.')?;
+    Some((stem.to_string(), seq.parse().ok()?))
 }
 
 /// The name a kept input's `file` takes while the session records it: `{stem}.{seq}.taking`, where
@@ -742,6 +933,8 @@ pub trait Sink: Send + Sync {
     fn record(&self, session: &SessionId, record: &Record);
     fn delta(&self, session: &SessionId, req_id: &str, event: &StreamEvent);
     fn status(&self, session: &SessionId, status: &Status);
+    /// The session's queued messages changed (the session recorded some).
+    fn queued(&self, _session: &SessionId) {}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2209,6 +2402,7 @@ Name them when you start a new mission instead."
         }
         self.resolve_stale_notices()?;
         self.publish();
+        self.recover_sending();
         for input in self.kept_inputs() {
             self.arrival(input).await?;
         }
@@ -2249,17 +2443,102 @@ Name them when you start a new mission instead."
             if self.deps.control.is_closed() {
                 return self.close_idle().await;
             }
-            if let Some(trigger) = trigger {
+            let mut next = trigger;
+            while let Some(trigger) = next.take() {
                 if let Some(settled) = self.turn(trigger).await? {
                     return Ok(End::Settled(settled));
                 }
+                // The turn ended: what the operator queued for after it starts the next one. A stop
+                // keeps the queue for the operator's next message or resume.
+                if !self.deps.control.is_closed()
+                    && self.st.last_end != Some(TurnEndReason::Stopped)
+                    && self.flush_queued().await?
+                {
+                    next = Some(Trigger::User);
+                }
+            }
+        }
+    }
+
+    /// Record the queued user messages (see [`queue_user_message`]), oldest first, as `user_message`s.
+    /// Whether any was recorded. Each file is renamed to `{stem}.{seq}.sending` (the seq of its record)
+    /// while it is recorded and deleted after, so that a harness that stops in between records it once
+    /// ([`Session::recover_sending`]).
+    async fn flush_queued(&mut self) -> R<bool> {
+        let dir = queue_dir(&self.deps.paths, &self.deps.shared.session);
+        let mut any = false;
+        loop {
+            let next = {
+                let _guard = queue_lock();
+                match queued_files(&dir).into_iter().next() {
+                    None => None,
+                    Some((file, kept)) => {
+                        let held = sending_path(&file, self.log.next_seq());
+                        match std::fs::rename(&file, &held) {
+                            Ok(()) => Some((held, kept)),
+                            Err(e) => {
+                                tracing::warn!(session = %self.deps.shared.session, "queued message {} not taken: {e}", file.display());
+                                None
+                            }
+                        }
+                    }
+                }
+            };
+            let Some((held, kept)) = next else { break };
+            if let Input::User(text) = kept.into_input() {
+                self.record_input(Input::User(text)).await?;
+            }
+            if let Err(e) = std::fs::remove_file(&held) {
+                tracing::warn!(session = %self.deps.shared.session, "queued message {} not deleted: {e}", held.display());
+            }
+            any = true;
+        }
+        if any {
+            self.deps.sink.queued(&self.deps.shared.session);
+        }
+        Ok(any)
+    }
+
+    /// Settle the queued messages a harness that stopped left being recorded: one whose `user_message`
+    /// reached the log is deleted, any other is queued again.
+    fn recover_sending(&self) {
+        let dir = queue_dir(&self.deps.paths, &self.deps.shared.session);
+        let Ok(entries) = std::fs::read_dir(&dir) else { return };
+        for file in entries.filter_map(|e| e.ok().map(|e| e.path())) {
+            let Some((stem, seq)) = sending_parts(&file) else { continue };
+            let recorded = self
+                .records
+                .binary_search_by_key(&seq, |r| r.seq)
+                .ok()
+                .and_then(|i| self.records.get(i))
+                .is_some_and(|r| r.author == Author::User && matches!(r.event, Event::UserMessage { .. }));
+            let done = if recorded {
+                std::fs::remove_file(&file)
+            } else {
+                std::fs::rename(&file, dir.join(format!("{stem}.json")))
+            };
+            if let Err(e) = done {
+                tracing::warn!(session = %self.deps.shared.session, "queued message {} not settled: {e}", file.display());
             }
         }
     }
 
     async fn idle_input(&mut self, input: Input) -> R<Option<Trigger>> {
         match input {
-            Input::Resume => Ok(Some(Trigger::Resume)),
+            Input::Resume => {
+                // What was queued while the session ran (and kept by a stop) goes first.
+                self.flush_queued().await?;
+                Ok(Some(Trigger::Resume))
+            }
+            Input::DrainQueued => {
+                // A stopped session keeps its queue until the operator messages or resumes it.
+                let stopped = self.st.last_end == Some(TurnEndReason::Stopped);
+                Ok(if !stopped && self.flush_queued().await? { Some(Trigger::User) } else { None })
+            }
+            Input::User(_) => {
+                self.flush_queued().await?;
+                Ok(self.arrival(input).await?.trigger)
+            }
             Input::Reweave => {
                 let token = self.deps.control.begin_turn();
                 let woven = self.woven();
@@ -2327,6 +2606,10 @@ Name them when you start a new mission instead."
                     return None;
                 }
                 let kept = std::fs::read(&file).ok().and_then(|b| serde_json::from_slice::<KeptInput>(&b).ok());
+                // A queued message waits for a turn to end, not for the session to start.
+                if matches!(kept, Some(KeptInput::User { .. })) {
+                    return None;
+                }
                 if kept.is_none() {
                     tracing::warn!(session = %self.deps.shared.session, "unreadable queued input {}", file.display());
                 }
@@ -2476,7 +2759,7 @@ Name them when you start a new mission instead."
                 }
             }
             Input::SwitchModel(sw) => self.switch_model(*sw)?,
-            Input::Resume | Input::Reweave | Input::Stop | Input::Queued { .. } => {}
+            Input::Resume | Input::Reweave | Input::Stop | Input::Queued { .. } | Input::DrainQueued => {}
         }
         Ok(out)
     }
@@ -7067,6 +7350,127 @@ mod tests {
         assert_eq!((ledger.constraints.len(), ledger.approvals.len()), (1, 1));
         assert_eq!(count(&rs, "turn_start"), 0);
         assert_eq!(std::fs::read_dir(&queue).unwrap().count(), 0, "nothing is left on disk");
+        finish_task(tx, task).await;
+    }
+
+    // ---- queued messages ---------------------------------------------------------------------
+
+    fn user_texts(rs: &[Record]) -> Vec<String> {
+        rs.iter()
+            .filter_map(|r| match &r.event {
+                Event::UserMessage { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn queue_msg(paths: &Paths, id: &SessionId, text: &str) -> QueuedMessage {
+        queue_user_message(paths, id, text, &[], text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn queued_messages_wait_for_the_turn_to_end_and_arrive_in_order_in_one_next_turn() {
+        let script = seq(vec![Reply::text("one").with_delay_ms(400).into(), Reply::text("two").into()]);
+        let mut fx = Fx::new("chat", false, false, script).await;
+        drop(fx.create());
+        let id = SessionId::from("s-test");
+        let (tx, task) = spawn_run(Session::open(fx.deps()).unwrap());
+        tx.send(user("go")).unwrap();
+        wait_until(&fx.sink, "the first turn", |rs| count(rs, "turn_start") == 1).await;
+        let a = queue_msg(&fx.paths, &id, "first queued");
+        let b = queue_msg(&fx.paths, &id, "second queued");
+        assert_ne!(a.id, b.id);
+        tx.send(Input::DrainQueued).unwrap();
+        assert_eq!(user_texts(&fx.sink.records()), vec!["go"], "nothing is recorded while the turn runs");
+        wait_until(&fx.sink, "the next turn", |rs| count(rs, "turn_end") == 2).await;
+        let rs = fx.sink.records();
+        assert_eq!(user_texts(&rs), vec!["go", "first queued", "second queued"]);
+        assert_eq!(count(&rs, "turn_start"), 2, "the second message arrives with the first, not in a turn of its own");
+        assert!(queued_messages(&fx.paths, &id).is_empty());
+        assert_eq!(std::fs::read_dir(queue_dir(&fx.paths, &id)).unwrap().count(), 0);
+        finish_task(tx, task).await;
+    }
+
+    #[tokio::test]
+    async fn a_queued_message_sent_to_an_idle_lead_starts_a_turn_like_a_message_sent_now() {
+        let mut fx = Fx::new("chat", false, false, seq(vec![Reply::text("ok").into()])).await;
+        drop(fx.create());
+        let id = SessionId::from("s-test");
+        let (tx, task) = spawn_run(Session::open(fx.deps()).unwrap());
+        queue_msg(&fx.paths, &id, "hello");
+        tx.send(Input::DrainQueued).unwrap();
+        wait_until(&fx.sink, "the turn", |rs| count(rs, "turn_end") == 1).await;
+        assert_eq!(user_texts(&fx.sink.records()), vec!["hello"]);
+        assert!(queued_messages(&fx.paths, &id).is_empty());
+        finish_task(tx, task).await;
+    }
+
+    #[test]
+    fn a_queued_message_is_listed_edited_and_removed_and_an_unknown_id_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::at(dir.path().join("home"));
+        let id = SessionId::from("s-test");
+        let a = queue_user_message(&paths, &id, "a", &["/w/.loom/uploads/x.csv".into()], "a [file]").unwrap();
+        let b = queue_msg(&paths, &id, "b");
+        let c = queue_msg(&paths, &id, "c");
+        let listed = queued_messages(&paths, &id);
+        assert_eq!(listed.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(), ["a", "b", "c"]);
+        assert_eq!(listed[0].attachments, vec!["/w/.loom/uploads/x.csv".to_string()]);
+        // Edit keeps the place, the id and the attachments.
+        let edited = edit_queued_message(&paths, &id, &a.id, "a2", "a2 [file]").unwrap();
+        assert_eq!((edited.id.as_str(), edited.text.as_str()), (a.id.as_str(), "a2"));
+        let listed = queued_messages(&paths, &id);
+        assert_eq!(listed.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(), ["a2", "b", "c"]);
+        assert_eq!(listed[0].attachments.len(), 1);
+        // Remove / send-now take one out and say what it was.
+        let (_, composed) = take_queued_message(&paths, &id, &b.id).unwrap();
+        assert_eq!(composed, "b");
+        assert!(take_queued_message(&paths, &id, &b.id).unwrap_err().starts_with("There is no queued message"));
+        assert!(edit_queued_message(&paths, &id, &b.id, "x", "x").unwrap_err().starts_with("There is no"));
+        assert_eq!(queued_messages(&paths, &id).len(), 2);
+        assert_eq!(discard_queued_messages(&paths, &id), 2);
+        assert!(queued_messages(&paths, &id).is_empty());
+        let _ = c;
+    }
+
+    #[tokio::test]
+    async fn a_stop_keeps_the_queue_and_the_next_resume_or_message_sends_it() {
+        let script = seq(vec![Reply::text("one").with_delay_ms(5000).into(), Reply::text("two").into()]);
+        let mut fx = Fx::new("chat", false, false, script).await;
+        drop(fx.create());
+        let id = SessionId::from("s-test");
+        let (tx, task) = spawn_run(Session::open(fx.deps()).unwrap());
+        tx.send(user("go")).unwrap();
+        wait_until(&fx.sink, "the turn", |rs| count(rs, "turn_start") == 1).await;
+        queue_msg(&fx.paths, &id, "later");
+        tx.send(Input::DrainQueued).unwrap();
+        fx.control.stop_turn();
+        tx.send(Input::Stop).unwrap();
+        wait_until(&fx.sink, "the stop", |rs| turn_ends(rs).contains(&TurnEndReason::Stopped)).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(user_texts(&fx.sink.records()), vec!["go"]);
+        assert_eq!(queued_messages(&fx.paths, &id).len(), 1, "still queued after the stop");
+        tx.send(Input::Resume).unwrap();
+        wait_until(&fx.sink, "the queued message", |rs| user_texts(rs).len() == 2).await;
+        assert!(queued_messages(&fx.paths, &id).is_empty());
+        finish_task(tx, task).await;
+    }
+
+    #[tokio::test]
+    async fn queued_messages_survive_a_restart_and_a_message_sent_now_goes_first() {
+        let mut fx = Fx::new("chat", false, false, seq(vec![Reply::text("ok").into()])).await;
+        drop(fx.create());
+        let id = SessionId::from("s-test");
+        queue_msg(&fx.paths, &id, "from before the restart");
+        // A new harness opens the session: the queue is still there and is not sent by starting.
+        let (tx, task) = spawn_run(Session::open(fx.deps()).unwrap());
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(fx.sink.records().iter().all(|r| !matches!(r.event, Event::UserMessage { .. })));
+        assert_eq!(queued_messages(&fx.paths, &id).len(), 1);
+        tx.send(user("now")).unwrap();
+        wait_until(&fx.sink, "the turn", |rs| count(rs, "turn_end") == 1).await;
+        assert_eq!(user_texts(&fx.sink.records()), vec!["from before the restart", "now"]);
+        assert!(queued_messages(&fx.paths, &id).is_empty());
         finish_task(tx, task).await;
     }
 

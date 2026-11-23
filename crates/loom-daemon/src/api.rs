@@ -45,6 +45,11 @@
 //! | `GET /sessions/{id}/records?after={seq}&limit={n}` | `runtime.stored_records` (`limit` default 500, at most 2000) | `RecordsPage` (`next_after` = last seq of the page when the page is full, else `null`); a record that comes with its stored line (read as `Event::Unknown`) is that line, verbatim |
 //! | `GET /sessions/{id}/stream?after={seq}` | see *Streams* | SSE |
 //! | `POST /sessions/{id}/messages` (`MessageBody`; `attachments` may be left out, and `text` empty when there are some) | `runtime.send_message_with` (`400` with the sentence `texts::not_an_upload` for a path that is not an upload of the workspace) | `202` `{}` |
+//! | `POST /sessions/{id}/messages` with `"when": "after_turn"` (default `"now"`; any other value is `400`) | `runtime.queue_message`: while the lead runs, the message is kept and sent when its turn ends; otherwise as `now` | `202` `{"queued": {id, text, attachments, created_ms}}` when held, `{}` when sent at once |
+//! | `GET /sessions/{id}/queued` | `runtime.queued` (the lead only) | `[{id, text, attachments, created_ms}]`, oldest first |
+//! | `PUT /sessions/{id}/queued/{qid}` (`{text}`) | `runtime.edit_queued` | `200` `{id, text, attachments, created_ms}`; `404` when it is no longer queued |
+//! | `DELETE /sessions/{id}/queued/{qid}` | `runtime.remove_queued` | `200` `{}`; `404` when it is no longer queued |
+//! | `POST /sessions/{id}/queued/{qid}/send` | `runtime.send_queued_now` (as `now`, then removed) | `202` `{}`; `404` when it is no longer queued |
 //! | `POST /uploads?workspace=<abs path>&name=<file name>` (raw body, at most `UPLOAD_MAX_BYTES` = 32 MiB; `Content-Type` is the file's type when it says one) | `upload::store` into `<workspace>/.loom/uploads/` (`docs/UPLOADS.md`); the workspace is judged as `POST /sessions` does (`plan_workspace`, nothing made) | `201` `UploadView`; `400` no or bad `workspace`/`name` (a name with nothing left after cleaning), `404` workspace missing, `409` workspace inside the loom home or not a folder, `413` body over the cap |
 //! | `POST /sessions/{id}/rules` (`RuleBody`) | `runtime.add_rule` (a child's id goes to its lead) | `202` `RuleReceipt` (`queued`: the lead is in a turn and records it at its next step) |
 //! | `POST /sessions/{id}/approvals` (`ApprovalBody`; `scope` may be left out) | `runtime.approve` | `202` `RuleReceipt` |
@@ -100,6 +105,9 @@
 //!   records this build has just written, which it always reads in full.)
 //! - A carriage return in a data line (whitespace between the tokens of a stored line) is sent as a
 //!   space: an SSE line cannot hold one.
+//! - `{"type": "queued", "session": id}` is sent on the events stream and on that session's stream whenever its
+//!   queued messages change (added, edited, removed, sent now, recorded when a turn ends, discarded by an
+//!   archive); read `GET /sessions/{id}/queued` again.
 //! - A subscriber that falls behind (`RecvError::Lagged(n)`) is sent `{"type": "lagged", "missed":
 //!   n}` and the stream goes on. A stream ends when the client goes away or the daemon shuts down.
 //!
@@ -135,8 +143,8 @@ use crate::fsview;
 use crate::ui;
 use crate::wire::{
     AnswerBody, ApprovalBody, ArchiveBody, CreatedSession, DirsView, DiskSpace, ErrorBody, FileLinesView, FilesView,
-    GcBody, LinesView, MessageBody, ModelBody, ModelsView, ReleaseBody, RenameBody, RoleModelBody, RuleBody, ScopeBody,
-    SessionDetail, StatusView, UploadView, WithdrawBody,
+    GcBody, LinesView, MessageBody, MessageWhen, ModelBody, ModelsView, QueuedEditBody, QueuedReceipt, ReleaseBody,
+    RenameBody, RoleModelBody, RuleBody, ScopeBody, SessionDetail, StatusView, UploadView, WithdrawBody,
 };
 use axum::body::{Body, Bytes};
 use axum::extract::rejection::BytesRejection;
@@ -146,7 +154,7 @@ use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use loom_agent::runtime::{BusEvent, NewSession, Runtime, SessionInfo};
 use loom_agent::session::Phase;
@@ -210,6 +218,9 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/sessions/{id}/records", get(records))
         .route("/api/sessions/{id}/stream", get(session_stream))
         .route("/api/sessions/{id}/messages", post(message))
+        .route("/api/sessions/{id}/queued", get(queued_list))
+        .route("/api/sessions/{id}/queued/{qid}", put(queued_edit).delete(queued_remove))
+        .route("/api/sessions/{id}/queued/{qid}/send", post(queued_send))
         .route("/api/sessions/{id}/rules", post(add_rule))
         .route("/api/sessions/{id}/approvals", post(approve))
         .route("/api/sessions/{id}/rules/{rule_id}/withdraw", post(withdraw_rule))
@@ -648,7 +659,35 @@ async fn records(State(s): State<ApiState>, Path(id): Path<String>, q: RawQuery)
 
 async fn message(State(s): State<ApiState>, Path(id): Path<String>, body: Bytes) -> Res<Response> {
     let body: MessageBody = json_body(&body)?;
-    s.runtime.send_message_with(&SessionId::from(id), &body.text, &body.attachments).await.map_err(rt_err)?;
+    let id = SessionId::from(id);
+    if body.when == MessageWhen::AfterTurn {
+        return match s.runtime.queue_message(&id, &body.text, &body.attachments).await.map_err(rt_err)? {
+            Some(queued) => Ok((StatusCode::ACCEPTED, Json(QueuedReceipt { queued })).into_response()),
+            None => Ok(accepted()),
+        };
+    }
+    s.runtime.send_message_with(&id, &body.text, &body.attachments).await.map_err(rt_err)?;
+    Ok(accepted())
+}
+
+async fn queued_list(State(s): State<ApiState>, Path(id): Path<String>) -> Res<Response> {
+    let queued = s.runtime.queued(&SessionId::from(id)).map_err(rt_err)?;
+    Ok(Json(queued).into_response())
+}
+
+async fn queued_edit(State(s): State<ApiState>, Path((id, qid)): Path<(String, String)>, body: Bytes) -> Res<Response> {
+    let body: QueuedEditBody = json_body(&body)?;
+    let queued = s.runtime.edit_queued(&SessionId::from(id), &qid, &body.text).await.map_err(rt_err)?;
+    Ok(Json(queued).into_response())
+}
+
+async fn queued_remove(State(s): State<ApiState>, Path((id, qid)): Path<(String, String)>) -> Res<Response> {
+    s.runtime.remove_queued(&SessionId::from(id), &qid).await.map_err(rt_err)?;
+    Ok(ok_empty())
+}
+
+async fn queued_send(State(s): State<ApiState>, Path((id, qid)): Path<(String, String)>) -> Res<Response> {
+    s.runtime.send_queued_now(&SessionId::from(id), &qid).await.map_err(rt_err)?;
     Ok(accepted())
 }
 
@@ -1175,7 +1214,7 @@ async fn pump_session(
                 }
             }
             BusEvent::Delta { session, req_id, .. } => *session == id && !reqs.completed.contains(req_id),
-            BusEvent::Status { session, .. } => *session == id,
+            BusEvent::Status { session, .. } | BusEvent::Queued { session } => *session == id,
             _ => false,
         };
         if wanted && !push(&tx, &event).await {
@@ -2129,6 +2168,65 @@ mod tests {
             (200, &Value::Null),
             "a choice without a profile clears it"
         );
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn queued_messages_are_listed_edited_removed_sent_now_and_sent_when_the_turn_ends() {
+        let script = Script::new(|_, n| if n == 0 { slow_finish("one", 1500) } else { finish("more") });
+        let e = env(script).await;
+        let id = e.create("first").await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let q = format!("/api/sessions/{id}/queued");
+        let msg = format!("/api/sessions/{id}/messages");
+        let texts = |v: &Value| -> Vec<String> {
+            v.as_array().unwrap().iter().map(|m| m["text"].as_str().unwrap().to_string()).collect()
+        };
+        assert_eq!(e.get(&q).await, (200, json!([])));
+        let (s, b) = e.post_text(&msg, "{\"text\": \"x\", \"when\": \"later\"}").await;
+        assert_eq!(s, 400, "{b}");
+        let (s, a) = e.post(&msg, json!({"text": "a", "when": "after_turn"})).await;
+        assert_eq!(s, 202, "{a}");
+        let aid = a["queued"]["id"].as_str().unwrap().to_string();
+        assert_eq!((a["queued"]["text"].as_str(), a["queued"]["attachments"].clone()), (Some("a"), json!([])));
+        assert!(a["queued"]["created_ms"].as_u64().unwrap() > 0);
+        let (_, b) = e.post(&msg, json!({"text": "b", "when": "after_turn"})).await;
+        let bid = b["queued"]["id"].as_str().unwrap().to_string();
+        let (_, c) = e.post(&msg, json!({"text": "c", "when": "after_turn"})).await;
+        let cid = c["queued"]["id"].as_str().unwrap().to_string();
+        assert_eq!(texts(&e.get(&q).await.1), ["a", "b", "c"]);
+        // Edit keeps the place; remove drops one; both then answer 404.
+        let r = e.rq(Method::PUT, &format!("{q}/{aid}")).json(&json!({"text": "a2"})).send().await.unwrap();
+        let (s, edited) = json_of(r).await;
+        assert_eq!((s, edited["id"].as_str(), edited["text"].as_str()), (200, Some(aid.as_str()), Some("a2")));
+        let r = e.rq(Method::DELETE, &format!("{q}/{bid}")).send().await.unwrap();
+        assert_eq!(json_of(r).await, (200, json!({})));
+        let r = e.rq(Method::DELETE, &format!("{q}/{bid}")).send().await.unwrap();
+        assert_eq!(json_of(r).await.0, 404);
+        let r = e.rq(Method::PUT, &format!("{q}/{bid}")).json(&json!({"text": "z"})).send().await.unwrap();
+        assert_eq!(json_of(r).await.0, 404);
+        let r = e.rq(Method::PUT, &format!("{q}/{aid}")).json(&json!({"text": "z", "x": 1})).send().await.unwrap();
+        assert_eq!(json_of(r).await.0, 400);
+        assert_eq!(texts(&e.get(&q).await.1), ["a2", "c"]);
+        // Send now: steered into the running lead, off the queue.
+        let (s, b) = e.post(&format!("{q}/{cid}/send"), json!({})).await;
+        assert_eq!((s, b), (202, json!({})));
+        assert_eq!(texts(&e.get(&q).await.1), ["a2"]);
+        let (s, _) = e.post(&format!("{q}/{cid}/send"), json!({})).await;
+        assert_eq!(s, 404);
+        // The rest is sent when the turn ends and starts the next one.
+        e.wait_turn_ends(&id, 2).await;
+        assert_eq!(e.get(&q).await, (200, json!([])));
+        let records = e.records(&id).await;
+        let users: Vec<&str> =
+            records.iter().filter(|r| r["kind"] == "user_message").filter_map(|r| r["text"].as_str()).collect();
+        assert!(users.contains(&"a2") && users.contains(&"c"), "{users:?}");
+        // Idle: after_turn is the same as now.
+        let (s, b) = e.post(&msg, json!({"text": "idle", "when": "after_turn"})).await;
+        assert_eq!((s, b), (202, json!({})));
+        e.wait_turn_ends(&id, 3).await;
+        // Unknown session: 404.
+        assert_eq!(e.get("/api/sessions/s-nope/queued").await.0, 404);
         e.rt.shutdown().await;
     }
 

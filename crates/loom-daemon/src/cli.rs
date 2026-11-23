@@ -366,6 +366,10 @@ pub struct SendArgs {
     pub show: ShowOpts,
     #[arg(short, long)]
     pub detach: bool,
+    /// While the lead is in a turn, hold the message until the turn ends instead of giving it to the lead at its
+    /// next step. An idle lead takes it at once, as without the flag
+    #[arg(long)]
+    pub after_turn: bool,
     /// Attach a file (uploaded to the session's workspace first); repeatable. The message may then be empty
     #[arg(long = "file", value_name = "PATH")]
     pub files: Vec<PathBuf>,
@@ -1032,6 +1036,7 @@ async fn follow(
                 BusEvent::Session { .. }
                 | BusEvent::Status { .. }
                 | BusEvent::Net { .. }
+                | BusEvent::Queued { .. }
                 | BusEvent::Settled { .. } => {}
             }
         }
@@ -1163,7 +1168,7 @@ async fn send_with(
     cfg: &FollowCfg<'_>,
     out: &mut dyn Write,
 ) -> Result<FollowEnd, String> {
-    send_with_files(c, id, text, &[], detach, cfg, out).await
+    send_with_files(c, id, text, (&[], false), detach, cfg, out).await
 }
 
 /// [`send_with`] with uploaded `files` attached.
@@ -1171,13 +1176,20 @@ async fn send_with_files(
     c: &Client,
     id: &SessionId,
     text: &str,
-    files: &[String],
+    (files, after_turn): (&[String], bool),
     detach: bool,
     cfg: &FollowCfg<'_>,
     out: &mut dyn Write,
 ) -> Result<FollowEnd, String> {
     let baseline = last_seq(c, id).await?;
-    c.send_with_files(id, text, files).await?;
+    if after_turn {
+        if let Some(queued) = c.send_after_turn(id, text, files).await? {
+            put(out, &format!("queued for {id} ({}); it is sent when the turn ends\n", queued.id))?;
+            return Ok(FollowEnd { code: 0, ended: false });
+        }
+    } else {
+        c.send_with_files(id, text, files).await?;
+    }
     if detach {
         put(out, &format!("sent to {id}\n"))?;
         return Ok(FollowEnd { code: 0, ended: false });
@@ -1268,7 +1280,7 @@ async fn dispatch(command: Command) -> Result<i32, String> {
             let opts = record_opts(&a.show);
             let render_record = |r: &Record| render::record(r, &style, &opts);
             let cfg = terminal_cfg(&render_record, &style, None);
-            Ok(send_with_files(&c, &id, &text, &attached, a.detach, &cfg, &mut StdoutSink).await?.code)
+            Ok(send_with_files(&c, &id, &text, (&attached, a.after_turn), a.detach, &cfg, &mut StdoutSink).await?.code)
         }
         Command::Stop(a) => {
             let c = client_of(&paths)?;
