@@ -32,14 +32,14 @@ record holds exactly what the model reads):
 <text>
 
 Attached files (saved read-only; read them with `read`):
-- /ws/.loom/uploads/report.csv (12.4 KB, text/csv)
-- /ws/.loom/uploads/screen.png (231 KB, image/png)
+- /ws/.loom/uploads/report.csv (12.1 KiB, text/csv)
+- /ws/.loom/uploads/screen.png (226 KiB, image/png)
 ```
 
 A UTF-8 text file of at most 16 KiB is also shown inline, after the list, as
 `` `<path>`: `` followed by a fenced block with an info string from its extension. Images and other binary
 files are listed only. (Image content parts for vision models are not part of this; the model profile
-has no vision flag yet.) Sizes use the UI's units (`12.4 KB`, `3.1 MB`).
+has no vision flag yet.) Sizes use the UI's binary units (`12.1 KiB`, `3.0 MiB`), so the chip and the model's text agree.
 
 The block's first line is fixed text, `Attached files (saved read-only; read them with \`read\`):`, so the
 UI can recognise it: it renders the list as file chips (name, size; click opens the file in the Files

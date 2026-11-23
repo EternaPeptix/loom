@@ -1133,19 +1133,20 @@ pub fn not_an_upload(path: &str) -> String {
     format!("Attach files with POST /api/uploads first; {path} is not an upload of this workspace.")
 }
 
-/// A size in decimal units (1 KB = 1000 bytes): `512 B`, `12.4 KB`, `231 KB`, `3.1 MB`.
+/// A size in binary units, as the web UI writes it (`byteSize` in ui/core.js): `512 B`, `12.1 KiB`,
+/// `226 KiB`, `3.0 MiB`.
 pub fn file_size(n: u64) -> String {
-    if n < 1000 {
+    if n < 1024 {
         return format!("{n} B");
     }
-    let units = ["KB", "MB", "GB", "TB"];
-    let mut x = n as f64 / 1000.0;
+    let units = ["KiB", "MiB", "GiB", "TiB"];
+    let mut x = n as f64 / 1024.0;
     let mut i = 0usize;
-    while x >= 1000.0 && i + 1 < units.len() {
-        x /= 1000.0;
+    while x >= 1024.0 && i + 1 < units.len() {
+        x /= 1024.0;
         i += 1;
     }
-    let unit = units.get(i).copied().unwrap_or("TB");
+    let unit = units.get(i).copied().unwrap_or("TiB");
     if x >= 100.0 {
         format!("{} {unit}", x.round())
     } else {
@@ -1848,8 +1849,8 @@ mod tests {
         assert_eq!(
             with_attachments("Look at these.", &csv_and_png()),
             "Look at these.\n\nAttached files (saved read-only; read them with `read`):\n\
-             - /ws/.loom/uploads/report.csv (12.4 KB, text/csv)\n\
-             - /ws/.loom/uploads/screen.png (231 KB, image/png)\n\n\
+             - /ws/.loom/uploads/report.csv (12.1 KiB, text/csv)\n\
+             - /ws/.loom/uploads/screen.png (226 KiB, image/png)\n\n\
              `/ws/.loom/uploads/report.csv`:\n```csv\na,b\n1,2\n```"
         );
         // No text: the block alone. No files: the text as it is.
@@ -1870,14 +1871,14 @@ mod tests {
     }
 
     #[test]
-    fn sizes_use_decimal_units_and_types_come_from_the_extension_or_the_header() {
+    fn sizes_use_the_ui_binary_units_and_types_come_from_the_extension_or_the_header() {
         assert_eq!(file_size(0), "0 B");
         assert_eq!(file_size(512), "512 B");
-        assert_eq!(file_size(999), "999 B");
-        assert_eq!(file_size(1000), "1.0 KB");
-        assert_eq!(file_size(12_400), "12.4 KB");
-        assert_eq!(file_size(231_000), "231 KB");
-        assert_eq!(file_size(3_100_000), "3.1 MB");
+        assert_eq!(file_size(1023), "1023 B");
+        assert_eq!(file_size(1024), "1.0 KiB");
+        assert_eq!(file_size(12_400), "12.1 KiB");
+        assert_eq!(file_size(231_000), "226 KiB");
+        assert_eq!(file_size(3_145_728), "3.0 MiB");
         assert_eq!(mime_for("a.CSV", None), "text/csv");
         assert_eq!(mime_for("a.png", Some("application/octet-stream")), "image/png");
         assert_eq!(mime_for("a.bin", Some("Image/WebP; q=1")), "image/webp");

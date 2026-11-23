@@ -238,7 +238,7 @@ append("s-fl-net", "inbox_opened", { ts_ms: now - 9 * MIN, ...inbox.find(e => e.
   {
     // Written out here: the seed runs before the workspace trees exist, so attachmentBlock cannot read them yet.
     const csv = "corpus,ms,notes\nsmall,412,warm\nlarge,9120,cold cache\nlarge,8740,warm";
-    const a = { block: "\n\nAttached files (saved read-only; read them with `read`):\n- /fixture/loom/.loom/uploads/report.csv (69 B, text/csv)\n- /fixture/loom/.loom/uploads/screen.png (231.0 KB, image/png)\n\n`/fixture/loom/.loom/uploads/report.csv`:\n```csv\n" + csv + "\n```" };
+    const a = { block: "\n\nAttached files (saved read-only; read them with `read`):\n- /fixture/loom/.loom/uploads/report.csv (69 B, text/csv)\n- /fixture/loom/.loom/uploads/screen.png (226 KiB, image/png)\n\n`/fixture/loom/.loom/uploads/report.csv`:\n```csv\n" + csv + "\n```" };
     append("s-tools", "user_message", { ts_ms: t, text: "These are the numbers and the screenshot from the failing run; compare them with the last build." + a.block }, "user");
     t += 1000;
   }
@@ -535,7 +535,12 @@ function filesLines(id, rel, start, count) {
 // File uploads (docs/UPLOADS.md): stored in memory at <workspace>/.loom/uploads/<name>; the attachment block is the daemon's text.
 const UPLOAD_MAX = 32 * 1024 * 1024;
 const MIME = { csv: "text/csv", txt: "text/plain", md: "text/markdown", json: "application/json", png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", pdf: "application/pdf", rs: "text/x-rust", log: "text/plain" };
-const unitSize = (n) => n < 1000 ? `${n} B` : n < 1e6 ? `${(n / 1000).toFixed(1)} KB` : `${(n / 1e6).toFixed(1)} MB`;
+const unitSize = (n) => { // the daemon's texts::file_size, which matches the UI's byteSize
+  if (n < 1024) return `${n} B`;
+  const u = ["KiB", "MiB", "GiB"]; let x = n / 1024, i = 0;
+  while (x >= 1024 && i < u.length - 1) { x /= 1024; i++; }
+  return `${x >= 100 ? Math.round(x) : x.toFixed(1)} ${u[i]}`;
+};
 function uploadsDir(ws, make) {
   let root = wsRoots.get(ws);
   if (!root) { if (!make) return null; root = dirNode(); wsRoots.set(ws, root); }

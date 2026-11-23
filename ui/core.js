@@ -1659,7 +1659,7 @@ const ATTACH_ITEM = /^- (.+) \(([^()]*?), ([^(),]*)\)$/;
 /**
  * The attachment block the runtime appends to an operator message (docs/UPLOADS.md), taken apart:
  * {text, files:[{path, name, size, mime}], inline}. `text` is what the operator wrote (above the block); `size` is the words
- * the block gives ("12.4 KB"); `inline` is the text after the list (the inline copies), "" when there is none. A text with
+ * the block gives ("12.1 KiB"); `inline` is the text after the list (the inline copies), "" when there is none. A text with
  * no such block comes back whole, with no files.
  */
 export function splitAttachments(text) {

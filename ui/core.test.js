@@ -3586,12 +3586,12 @@ test("mineStep walks the operator's own messages; [ and ] are the keys, never wh
 
 test("splitAttachments takes the runtime's attachment block apart", () => {
   const head = "Attached files (saved read-only; read them with `read`):";
-  const text = `Compare these.\n\n${head}\n- /ws/.loom/uploads/report.csv (12.4 KB, text/csv)\n- /ws/.loom/uploads/my (1).png (231 KB, image/png)\n\n\`/ws/.loom/uploads/report.csv\`:\n\`\`\`csv\na,b\n\`\`\``;
+  const text = `Compare these.\n\n${head}\n- /ws/.loom/uploads/report.csv (12.1 KiB, text/csv)\n- /ws/.loom/uploads/my (1).png (226 KiB, image/png)\n\n\`/ws/.loom/uploads/report.csv\`:\n\`\`\`csv\na,b\n\`\`\``;
   const r = C.splitAttachments(text);
   assert.equal(r.text, "Compare these.");
   assert.deepEqual(r.files, [
-    { path: "/ws/.loom/uploads/report.csv", name: "report.csv", size: "12.4 KB", mime: "text/csv" },
-    { path: "/ws/.loom/uploads/my (1).png", name: "my (1).png", size: "231 KB", mime: "image/png" },
+    { path: "/ws/.loom/uploads/report.csv", name: "report.csv", size: "12.1 KiB", mime: "text/csv" },
+    { path: "/ws/.loom/uploads/my (1).png", name: "my (1).png", size: "226 KiB", mime: "image/png" },
   ]);
   assert.equal(r.inline, "`/ws/.loom/uploads/report.csv`:\n```csv\na,b\n```");
   // Attachments without text, and a list with no inline copies.
