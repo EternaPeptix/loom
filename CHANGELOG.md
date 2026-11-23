@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### The shell directory persists between `bash` calls
+
+- A session has one shell directory (`ToolCtx::shell`, new field): a `bash` call without `cwd` runs where the last
+  call left the shell, so `cd dir` carries over (variables still do not). The result says `cwd now {dir}` and
+  carries the new `ToolResult::meta` key `cwd` (`META_CWD`); a removed directory resets to the workspace with a
+  fact; a reopened session restores it from the last such result. Older logs stay readable. The tool descriptions
+  no longer tell the model to `cd` in every command.
+
 ### File uploads
 
 - `POST /api/uploads?workspace=&name=` (raw body, at most 32 MiB) stores a file in `<workspace>/.loom/uploads/` (name

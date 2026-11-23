@@ -1095,6 +1095,13 @@ the default evidence grade (§7) and staleness. Each module's documentation is t
 - `bash` runs the command with `/bin/bash -c` under the sandbox, in its own process group, stdin
   `/dev/null`, stdout and stderr interleaved into one output file. It is over only when its whole
   process group is empty.
+  - The shell directory persists: a call without `cwd` runs where the last call left the shell (at
+    first the workspace), so `cd dir` carries over; environment variables do not. The script runs
+    behind an `EXIT` trap that writes `pwd -P` to `$LOOM_SHELL_CWD` (a file in the session temp dir);
+    a foreground call that ended by status or signal and finished elsewhere than it started says
+    `cwd now {dir}` and records it as meta `cwd`. A timeout, a job and `background` do not move it;
+    a directory that has been removed resets it to the workspace with a fact; a session reopened from
+    its log restores the last recorded `cwd`. Children and forks start in the workspace.
   - A foreground command still running after `tools.bash_foreground_s` (300) is not killed: it
     becomes a background job, and the result says so with the output so far. With `timeout_s` it is
     stopped instead (status `timeout`). `background: true` starts a job at once.

@@ -3219,6 +3219,7 @@ impl Inner {
                 .admit
                 .for_window(meta.context_window)
                 .view_chars(&loom_core::estimate::TokenEstimator::default()),
+            shell: Arc::new(loom_tools::bash::ShellState::default()),
         };
         // The mission journal is shared by the lead and all its children; a child is always bound to
         // it, so that it has explicit access to the mission state.
