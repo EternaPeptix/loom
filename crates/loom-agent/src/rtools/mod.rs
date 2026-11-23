@@ -454,11 +454,9 @@ impl Shared {
         // Security records are authorized by `security_record` itself (an independent read-only judge may
         // close a hypothesis); a read-only judge explicitly granted both `evidence` and `verdict` may
         // attach verbatim-attested evidence to an existing claim; every other op is refused to a read-only role.
-        if self.role.read_only
-            && !from_user
-            && !matches!(op, LedgerOp::Security(_))
-            && !(judge_evidence && matches!(&op, LedgerOp::EvidenceAdd(input) if input.attested))
-        {
+        let judge_attests = judge_evidence && matches!(&op, LedgerOp::EvidenceAdd(input) if input.attested);
+        let allowed = from_user || matches!(op, LedgerOp::Security(_)) || judge_attests;
+        if self.role.read_only && !allowed {
             return Err("This role has read-only access to the mission ledger. Return observations through its report or verdict.".to_string());
         }
         let summary = LedgerState::summarize(&op);

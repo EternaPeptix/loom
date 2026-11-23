@@ -136,7 +136,7 @@ fn ms_to_ceil_secs(v: &Value) -> Option<u64> {
 }
 
 fn is_absent_or_null(map: &Map<String, Value>, key: &str) -> bool {
-    !map.get(key).is_some_and(|v| !v.is_null())
+    map.get(key).is_none_or(Value::is_null)
 }
 
 fn alias_key(map: &mut Map<String, Value>, canon: &str, aliases: &[&str], notes: &mut Vec<String>) {

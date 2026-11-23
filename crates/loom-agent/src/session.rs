@@ -1007,7 +1007,8 @@ fn wire_tools(registry: &Registry, deps: &Deps) -> Vec<ToolSpec> {
         .specs()
         .into_iter()
         .filter(|spec| {
-            !hidden.iter().any(|h| h == &spec.name) && !(compact && COMPACT_HIDDEN_TOOLS.contains(&spec.name.as_str()))
+            let compacted = compact && COMPACT_HIDDEN_TOOLS.contains(&spec.name.as_str());
+            !compacted && !hidden.iter().any(|h| h == &spec.name)
         })
         .map(|spec| loom_tools::dialect::present(&spec, dialect))
         .collect()

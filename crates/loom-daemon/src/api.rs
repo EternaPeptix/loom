@@ -1073,10 +1073,8 @@ struct ReplayReqs {
 impl ReplayReqs {
     fn note(&mut self, event: &LogEvent) {
         match event {
-            LogEvent::ModelRequest(m) => {
-                if !self.completed.contains(&m.req_id) {
-                    self.pending.insert(m.req_id.clone());
-                }
+            LogEvent::ModelRequest(m) if !self.completed.contains(&m.req_id) => {
+                self.pending.insert(m.req_id.clone());
             }
             LogEvent::ModelResponse(m) => {
                 self.pending.remove(&m.req_id);
