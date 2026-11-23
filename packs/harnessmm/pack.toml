@@ -16,7 +16,7 @@ tools = [
   "agent_spawn", "agent_fanout", "agent_message", "agent_stop", "decide", "verify",
   "finish", "ask_user", "report_blocker", "wait",
 ]
-hidden_tools = ["out_read", "out_grep", "claim_update", "step", "wait", "job_list", "pin", "reflect", "agent_fanout", "agent_message", "agent_stop", "decide"]
+hidden_tools = ["out_read", "out_grep", "claim_update", "step", "wait", "job_list", "pin", "reflect", "agent_fanout", "agent_stop", "decide"]
 
 [roles.worker]
 description = "Carries out one assignment from a lead and returns a result with quoted evidence."

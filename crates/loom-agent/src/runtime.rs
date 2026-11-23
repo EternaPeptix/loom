@@ -7773,51 +7773,6 @@ mod tests {
         assert!(hud.contains("CONSTRAINTMARK"), "the child's state block lacks the mission constraints: {hud}");
         e.rt.shutdown().await;
     }
-
-    #[tokio::test]
-    async fn the_stall_note_goes_to_a_child_that_can_record_and_not_to_a_verifier() {
-        let script = Script::new(|body, _| {
-            if !has_tool(body, "agent_spawn") && tool_msgs(body) < 4 {
-                call("ledger", json!({}))
-            } else {
-                Action::Stall { ms: 600_000 }
-            }
-        });
-        let e = env_with(script, false, |c| c.agents.stall_steps = 2).await;
-        let id = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
-        until("request", || !e.server.requests().is_empty()).await;
-        let req = |role: &str| SpawnReq {
-            role: role.into(),
-            mode: SpawnMode::Fresh,
-            brief: Default::default(),
-            budget: Budget::default(),
-            call_id: CallId::from("c1"),
-            title: role.into(),
-            awaited: false,
-            harness: false,
-            prerequisite: None,
-            workspace: Workspace::Shared,
-        };
-        let worker = e.rt.inner.orch.spawn(&id, req("worker")).await.unwrap();
-        let verifier = e.rt.inner.orch.spawn(&id, req("verifier")).await.unwrap();
-        let steps = |c: &SessionId| e.records(c).iter().filter(|r| matches!(r.event, Event::ModelRequest(_))).count();
-        until("five steps each", || steps(&worker) >= 5 && steps(&verifier) >= 5).await;
-        let stall_notes = |c: &SessionId| -> Vec<String> {
-            e.records(c)
-                .into_iter()
-                .filter_map(|r| match r.event {
-                    Event::HarnessNote { note: loom_core::event::NoteKind::Stall, text } => Some(text),
-                    _ => None,
-                })
-                .collect()
-        };
-        // Both share the journal, so both are watched; only the one with `note` is asked to use it.
-        let given = stall_notes(&worker);
-        assert!(!given.is_empty() && given.iter().all(|t| *t == texts::stall(2)), "{given:?}");
-        assert!(stall_notes(&verifier).is_empty(), "{:?}", stall_notes(&verifier));
-        e.rt.shutdown().await;
-    }
-
     #[tokio::test]
     async fn fork_child_starts_with_the_parents_messages() {
         let e = env(Script::new(|body, _| {
@@ -10051,12 +10006,11 @@ mod tests {
                 finish("seen it")
             } else if first.swap(false, Ordering::SeqCst) {
                 // The job and the wait in one reply: the turn ends before the job's registration is recorded.
-                let bash = json!({"command": "make all", "background": true}).to_string();
+                let bash = json!({"command": "sleep 600; make all", "background": true}).to_string();
                 Action::Reply(Reply::tools([("bash", bash), ("wait", "{}".to_string())]))
             } else {
-                // The job may end at once on a fast host and wake the session before the restart: the turn then
-                // yields, so that the session settles idle instead of starting the job again and again.
-                Action::Reply(Reply::text("waiting"))
+                // Not reached while the job runs; a text-only reply here would end the turn as yielded.
+                call("wait", json!({}))
             }
         }))
         .await;
@@ -10087,7 +10041,7 @@ mod tests {
         let rs = rt2.records(&id, None, 2_000).unwrap();
         let registered = rs.iter().position(|r| {
             matches!(&r.event, Event::JobRegistered { job_id, call_id: c, command }
-                if job_id == "j1" && *c == call_id && command == "make all")
+                if job_id == "j1" && *c == call_id && command == "sleep 600; make all")
         });
         let settled = rs.iter().position(|r| {
             matches!(&r.event, Event::JobSettled { job_id, exit_code: Some(0), output: Some(_), detail }

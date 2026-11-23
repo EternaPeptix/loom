@@ -840,8 +840,26 @@ fn open_to_read(given: &str, path: &Path, readable: Readable<'_>) -> Result<(Fil
     Err(Box::new(refusal))
 }
 
-/// The blocking part of `read`. A file above `limits.whole` is read only by line range, streamed.
+/// The blocking part of `read`: [`read_content`], and the fact that the file changed since this session
+/// last saw it, with the step of that sight.
 fn read_file(
+    ctx: &ToolCtx,
+    given: &str,
+    path: &Path,
+    start: Option<u64>,
+    end: Option<u64>,
+    limits: ReadLimits,
+) -> Worked {
+    let mut worked = read_content(ctx, given, path, start, end, limits);
+    let changed = worked.seen.as_ref().and_then(|now| ctx.files.changed_since(path, now));
+    if let Some(step) = changed {
+        worked.out = worked.out.with_more(format!("changed since your last read (step {step})"));
+    }
+    worked
+}
+
+/// The blocking part of `read`. A file above `limits.whole` is read only by line range, streamed.
+fn read_content(
     ctx: &ToolCtx,
     given: &str,
     path: &Path,
@@ -2267,6 +2285,28 @@ mod tests {
         assert_eq!(shown(&r), json!([[20, 25]]));
         let r = e.call("read", json!({"path": "f.txt", "start": 26})).await;
         assert!(is_err(&r) && r.text.contains("25 lines"), "{}", r.text);
+    }
+
+    #[tokio::test]
+    async fn a_read_says_when_the_file_changed_since_the_last_read() {
+        let e = env_with(ToolsCfg::default(), SandboxCfg { mode: SandboxMode::None, ..SandboxCfg::default() });
+        put(&e, "f.txt", b"one\n");
+        e.ctx.files.set_step(3);
+        let r = e.call("read", json!({"path": "f.txt"})).await;
+        assert!(!r.text.contains("changed since your last read"), "{}", r.text);
+        e.ctx.files.set_step(7);
+        let r = e.call("read", json!({"path": "f.txt"})).await;
+        assert!(!r.text.contains("changed since your last read"), "{}", r.text);
+        put(&e, "f.txt", b"two\n");
+        e.ctx.files.set_step(9);
+        let r = e.call("read", json!({"path": "f.txt"})).await;
+        assert!(
+            r.text.lines().next().unwrap_or_default().contains("changed since your last read (step 7)"),
+            "{}",
+            r.text
+        );
+        let r = e.call("read", json!({"path": "f.txt"})).await;
+        assert!(!r.text.contains("changed since your last read"), "{}", r.text);
     }
 
     #[tokio::test]

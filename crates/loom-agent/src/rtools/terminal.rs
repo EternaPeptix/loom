@@ -458,6 +458,21 @@ pub fn finish_brief_with_blobs(
     evidence: &[String],
     blobs: Option<&BlobStore>,
 ) -> Brief {
+    finish_brief_limited(ledger, answer, quotes, not_established, evidence, blobs, &|_| Vec::new())
+}
+
+/// [`finish_brief_with_blobs`] that also lists, for each output the finish cites (quoted, named as
+/// evidence, or behind a supported claim), what that result did not cover (`limits_of` gives the limits
+/// the session recorded for the output: `cut`, `timeout`, `net denied`, ...).
+pub fn finish_brief_limited(
+    ledger: &LedgerState,
+    answer: &str,
+    quotes: &[crate::gate::VerifiedQuote],
+    not_established: Option<&str>,
+    evidence: &[String],
+    blobs: Option<&BlobStore>,
+    limits_of: &dyn Fn(&BlobId) -> Vec<String>,
+) -> Brief {
     let goal = ledger.goal.as_deref().unwrap_or("(no goal recorded)");
     let mut parts = vec![format!("Goal (set by the operator):\n{goal}")];
     // A lead that concluded the goal cannot be met is not asked to prove an impossibility: the verifier is
@@ -530,6 +545,25 @@ pub fn finish_brief_with_blobs(
     }
     if !supported.is_empty() {
         parts.push(format!("Claims recorded as supported:\n{}", supported.join("\n")));
+    }
+
+    // What each cited output did not cover: a verifier must not take a cut or timed-out run for a whole one.
+    let mut cited: Vec<BlobId> = quotes.iter().map(|q| q.blob.clone()).collect();
+    cited.extend(evidence.iter().filter_map(record).filter_map(|e| e.input.blob.clone()));
+    for c in ledger.claims.iter().filter(|c| c.status == ClaimStatus::Supported) {
+        cited.extend(c.evidence.iter().filter_map(record).filter_map(|e| e.input.blob.clone()));
+    }
+    let mut seen_blobs = HashSet::new();
+    let limited: Vec<String> = cited
+        .iter()
+        .filter(|b| seen_blobs.insert((*b).clone()))
+        .filter_map(|b| {
+            let limits = limits_of(b);
+            (!limits.is_empty()).then(|| format!("- {}: {}", handle_of(b), limits.join(", ")))
+        })
+        .collect();
+    if !limited.is_empty() {
+        parts.push(format!("Cited outputs that did not cover everything (their limits):\n{}", limited.join("\n")));
     }
 
     let question = if unreachable.is_some() {
@@ -722,7 +756,8 @@ impl Finish {
     /// Validate that concluding `unreachable` is allowed for this role and plan state.
     fn check_unreachable_allowed(s: &Shared, state: &LedgerState) -> Result<(), String> {
         if s.role.solvable {
-            let has_blocker = s.role.tools.iter().any(|t| t == "report_blocker");
+            let has_blocker = s.role.tools.iter().any(|t| t == "report_blocker")
+                && !s.role.hidden_tools.iter().any(|t| t == "report_blocker");
             let mut text = texts::conclude_unreachable_refused(has_blocker);
             let directions = frontier::directions(&frontier::frontier(state, loom_core::now_ms()), 8);
             text.push_str(&texts::open_routes_block(&directions));
@@ -1011,7 +1046,15 @@ impl Finish {
             let req = SpawnReq {
                 role,
                 mode: SpawnMode::Fresh,
-                brief: finish_brief_with_blobs(&state, answer, verified, not_established, &evidence, Some(&ctx.blobs)),
+                brief: finish_brief_limited(
+                    &state,
+                    answer,
+                    verified,
+                    not_established,
+                    &evidence,
+                    Some(&ctx.blobs),
+                    &|b| s.output_limits(b),
+                ),
                 budget: Budget {
                     max_steps: Some(s.agents.child_max_steps),
                     max_minutes: Some(s.agents.child_max_minutes),
@@ -1331,9 +1374,10 @@ async fn running_work(s: &Shared, ctx: &ToolCtx) -> (Vec<String>, Vec<String>) {
 
 /// The tools of `role` that the refusals of `finish` name, so only real ones are offered.
 fn finish_tools(role: &RoleDef) -> texts::FinishTools {
-    let has = |name: &str| role.tools.iter().any(|t| t == name);
+    let has = |name: &str| role.tools.iter().any(|t| t == name) && !role.hidden_tools.iter().any(|h| h == name);
     texts::FinishTools {
-        conclude: has("conclude"),
+        // Names `finish` with a status, which the role has whenever `conclude` is in its set, shown or not.
+        conclude: role.tools.iter().any(|t| t == "conclude"),
         block: has("report_blocker"),
         ask_for: has("ask_for") && !role.hidden_tools.iter().any(|h| h == "ask_for"),
         spawn: has("agent_spawn") && !role.may_spawn.is_empty(),
@@ -1344,7 +1388,7 @@ fn finish_tools(role: &RoleDef) -> texts::FinishTools {
 
 /// The refusal of `finish` (or `hand_off`, named by `tool`) while work this session started is still running.
 /// It names only tools the role has, and says what to do about an agent that no tool of the session can end.
-fn running_refusal(tool: &str, role: &RoleDef, jobs: &[String], agents: &[String]) -> String {
+pub(crate) fn running_refusal(tool: &str, role: &RoleDef, jobs: &[String], agents: &[String]) -> String {
     let has = |name: &str| role.tools.iter().any(|t| t == name) && !role.hidden_tools.iter().any(|h| h == name);
     // `job_wait` without `job` is `wait`: a role that has either can wait for work to report.
     let can_wait = has("wait") || has("job_wait");
@@ -1353,19 +1397,27 @@ fn running_refusal(tool: &str, role: &RoleDef, jobs: &[String], agents: &[String
         "{tool} cannot be accepted yet: work started by this session is still running: {}. Nothing was delivered.",
         running.join(", ")
     );
-    let mut ways: Vec<&str> = Vec::new();
+    let mut ways: Vec<String> = Vec::new();
     if can_wait {
         ways.push(if has("wait") {
-            "wait for it to report (`wait`)"
+            "wait for it to report (`wait`)".to_string()
         } else {
-            "wait for it to report (`job_wait` without `job`)"
+            "wait for it to report (`job_wait` without `job`)".to_string()
         });
     }
     if !jobs.is_empty() && has("job_kill") {
-        ways.push("end a job with `job_kill`");
+        ways.push("end a job with `job_kill`".into());
     }
-    if !agents.is_empty() && has("agent_stop") {
-        ways.push("end an agent with `agent_stop`");
+    // `agent_message` with `stop: true` ends an agent; `agent_stop` is its alias, shown to roles that keep it.
+    let stopper = if has("agent_stop") {
+        Some("agent_stop")
+    } else if has("agent_message") {
+        Some("agent_message` with `stop: true")
+    } else {
+        None
+    };
+    if let (false, Some(s)) = (agents.is_empty(), stopper) {
+        ways.push(format!("end an agent with `{s}`"));
     }
     if ways.is_empty() {
         text.push_str(&format!(" Call {tool} again when it has ended."));
@@ -1380,10 +1432,10 @@ fn running_refusal(tool: &str, role: &RoleDef, jobs: &[String], agents: &[String
         ));
     }
     if !agents.is_empty() {
-        if has("agent_stop") {
-            text.push_str(
-                " An agent takes a moment to end after it is stopped: the result of `agent_stop` says whether it has ended.",
-            );
+        if let Some(s) = stopper {
+            text.push_str(&format!(
+                " An agent takes a moment to end after it is stopped: the result of `{s}` says whether it has ended."
+            ));
         } else {
             let tell: Vec<String> =
                 ["ask_user", "report_blocker"].into_iter().filter(|t| has(t)).map(String::from).collect();
@@ -1400,17 +1452,17 @@ fn running_refusal(tool: &str, role: &RoleDef, jobs: &[String], agents: &[String
 
 /// The refusal of `verdict` while a job of the verifier is still running; names only tools the role has.
 fn running_verdict_refusal(role: &RoleDef, jobs: &[String]) -> String {
-    let has = |tool: &str| role.tools.iter().any(|t| t == tool);
+    let has = |tool: &str| role.tools.iter().any(|t| t == tool) && !role.hidden_tools.iter().any(|h| h == tool);
     let mut text = format!(
         "verdict was refused: a job of yours is still running: {}. It would be killed when you finish, and a verdict must rest on a check you have seen end. Nothing was recorded.",
         jobs.join(", ")
     );
-    let mut ways: Vec<&str> = Vec::new();
+    let mut ways: Vec<String> = Vec::new();
     if has("job_wait") {
-        ways.push("wait for it with `job_wait`");
+        ways.push("wait for it with `job_wait`".to_string());
     }
     if has("job_kill") {
-        ways.push("end it with `job_kill` if you do not need its result");
+        ways.push("end it with `job_kill` if you do not need its result".to_string());
     }
     if ways.is_empty() {
         text.push_str(" Call verdict again when it has ended.");
@@ -1906,7 +1958,7 @@ impl Tool for AskFor {
     }
     async fn run(&self, ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
         let s = &self.0;
-        let has = |tool: &str| s.role.tools.iter().any(|t| t == tool);
+        let has = |tool: &str| s.role.tools.iter().any(|t| t == tool) && !s.role.hidden_tools.iter().any(|t| t == tool);
         if s.is_child() {
             return ToolOutput::error(texts::ask_for_in_child(has("hand_off")));
         }
@@ -1977,7 +2029,7 @@ impl Tool for HandOff {
     }
     async fn run(&self, ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
         let s = &self.0;
-        let has = |tool: &str| s.role.tools.iter().any(|t| t == tool);
+        let has = |tool: &str| s.role.tools.iter().any(|t| t == tool) && !s.role.hidden_tools.iter().any(|t| t == tool);
         if !s.is_child() {
             return ToolOutput::error(texts::hand_off_in_root(has("ask_for")));
         }
@@ -3799,8 +3851,9 @@ mod tests {
             "{all}"
         );
         assert!(all.contains("`job_kill` and `finish` can go in the same reply"), "{all}");
-        role.tools
-            .retain(|t| !matches!(t.as_str(), "wait" | "job_wait" | "job_kill" | "agent_stop" | "report_blocker"));
+        role.tools.retain(|t| {
+            !matches!(t.as_str(), "wait" | "job_wait" | "job_kill" | "agent_stop" | "agent_message" | "report_blocker")
+        });
         let bare = running_refusal("finish", &role, &jobs, &agents);
         assert!(bare.contains("Nothing was delivered. Call finish again when it has ended."), "{bare}");
         assert!(!bare.contains("`job_wait`") && !bare.contains("job_kill") && !bare.contains("agent_stop"), "{bare}");
