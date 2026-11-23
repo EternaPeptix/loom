@@ -2498,11 +2498,15 @@ function chipThumb(file, name) {
   img.alt = "";
   img.width = 20;
   img.height = 20;
+  // A file named .png that is not a decodable image keeps the plain file icon, never a broken-image glyph.
+  const wrap = el("span", "chip-thumb-wrap");
+  wrap.append(icon("source"));
+  img.addEventListener("load", () => wrap.replaceChildren(img));
   const fr = new FileReader();
   fr.addEventListener("load", () => { img.src = String(fr.result); });
   fr.readAsDataURL(file);
   img.title = name;
-  return img;
+  return wrap;
 }
 
 function buildBlock(b, ctx = {}) {
