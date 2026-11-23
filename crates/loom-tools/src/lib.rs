@@ -122,6 +122,9 @@ pub struct ToolCtx {
     /// The most characters the text of a view (`read`, `out_read`, `out_grep`, other numbered views)
     /// may hold: `AdmitPolicy::view_chars` of the session's admission when the call was started.
     pub view_chars: usize,
+    /// The session's shell directory: where `bash` runs when it is given no `cwd`. Clones of the context
+    /// share it; a child agent or fork starts with its own, empty one.
+    pub shell: Arc<bash::ShellState>,
 }
 
 /// What a tool hands back.
@@ -846,6 +849,7 @@ pub mod testutil {
             cancel: CancellationToken::new(),
             capabilities: Arc::new(capabilities::SessionTools::default()),
             view_chars: AdmitPolicy::default().view_chars(&TokenEstimator::default()),
+            shell: Arc::new(bash::ShellState::default()),
         };
         TestEnv {
             dir,

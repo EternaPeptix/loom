@@ -30,6 +30,8 @@ pub const META_RAW_BLOB: &str = "raw_blob";
 /// its header, beside `output` and `META_RAW_BLOB` (dep-scan's further reports). They are outputs of the
 /// session's mission like the others (`loom_tools::outputs`).
 pub const META_ALSO_STORED: &str = "also_stored";
+/// `ToolResult::meta` key: absolute directory a `bash` call left the session's shell in (see `loom_tools::bash`).
+pub const META_CWD: &str = "cwd";
 /// `ToolResult::meta` key: id of the background job a call turned into or started.
 pub const META_JOB: &str = "job";
 /// Output was admitted for a stored action; coverage awaits an actual actor callback.

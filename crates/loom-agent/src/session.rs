@@ -1825,6 +1825,7 @@ Name them when you start a new mission instead."
                 .map_err(|e| e.0)?;
             session.append(Author::Harness, Event::TurnEnd { reason: TurnEndReason::Stopped }).map_err(|e| e.0)?;
         }
+        session.restore_shell_dir();
         session.record_left_jobs()?;
         // After the jobs above are registered: an id they were given is not handed out again either.
         let top = session
@@ -1847,6 +1848,18 @@ Name them when you start a new mission instead."
         }
         session.seed_guard().map_err(|e| e.0)?;
         Ok(session)
+    }
+
+    /// The shell directory of a reopened session: the one the last `bash` result that names one left
+    /// the shell in, when it is still a directory.
+    fn restore_shell_dir(&self) {
+        let left = self.own().iter().rev().find_map(|r| match &r.event {
+            Event::ToolResult(t) if t.name == "bash" => t.meta.get(loom_core::event::META_CWD).and_then(|v| v.as_str()),
+            _ => None,
+        });
+        if let Some(dir) = left.map(std::path::PathBuf::from).filter(|d| d.is_absolute() && d.is_dir()) {
+            self.deps.ctx.shell.set(Some(dir));
+        }
     }
 
     /// Prime the prefix guard with the stable messages of the last request in the log, as they render
@@ -6359,6 +6372,42 @@ mod tests {
             duration_ms: 1,
         };
         session.append(Author::Tool, Event::ToolResult(result)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn open_restores_the_shell_directory_from_the_last_bash_result_that_names_one() {
+        let mut fx = Fx::new("chat", false, false, seq(vec![])).await;
+        let mut session = fx.create();
+        let (a, b) = (fx.ctx.workspace.join("a"), fx.ctx.workspace.join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        for (i, dir) in [&a, &b].into_iter().enumerate() {
+            let result = loom_core::event::ToolResult {
+                call_id: CallId::from(format!("c{i}")),
+                name: "bash".into(),
+                status: ToolStatus::Ok,
+                text: "ok".into(),
+                output: None,
+                cut: false,
+                class: ToolClass::Exec,
+                meta: [(loom_core::event::META_CWD.to_string(), json!(dir.display().to_string()))]
+                    .into_iter()
+                    .collect(),
+                duration_ms: 1,
+            };
+            session.append(Author::Tool, Event::ToolResult(result)).unwrap();
+        }
+        drop(session);
+        let deps = fx.deps();
+        assert!(deps.ctx.shell.get().is_none());
+        let reopened = Session::open(deps).unwrap();
+        drop(reopened);
+        assert_eq!(fx.ctx.shell.get(), Some(b.clone()));
+        // A directory that is gone is not restored.
+        fx.ctx.shell.set(None);
+        std::fs::remove_dir_all(&b).unwrap();
+        let _again = Session::open(fx.deps()).unwrap();
+        assert!(fx.ctx.shell.get().is_none());
     }
 
     #[tokio::test]
