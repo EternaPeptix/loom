@@ -83,3 +83,68 @@ maximum is clamped and said.
 The `tool_call` record keeps the arguments exactly as sent; the `tool_result` header carries the repairs.
 The UI reads paths from `path`, `file_path`, `absolute_path` and `target_file`, shows `description` as the
 row label (the command stays visible beside it), and shows a mapped call under the loom tool it ran.
+
+## 4. One tool per job (merges and hidden tools)
+
+A model is shown one tool for each thing it can do. Where two loom tools did the same job, one absorbs the
+other; the absorbed tool is **hidden** (left out of the wire tool list through the role's `hidden_tools`)
+but still runs when called, so old transcripts, resumed sessions and models that remember the name keep
+working. Nothing is deleted. Usage over 21,272 recorded calls decided which name survives: the more trained or
+more used one.
+
+### 4.1 Merges
+
+| Absorbing tool | Absorbs | How |
+|---|---|---|
+| `read` | `out_read` | `path` may be a stored-output handle (`out:` + hex). Done in `dialect::adapt` (§2). |
+| `grep` | `out_grep` | Same, for `grep`. |
+| `claim` | `claim_update` | `claim` takes an optional `id`. With `id`: set that claim's `status` (`supported`, `refuted`, `withdrawn`; `note` as `claim_update` requires it), written as the same ledger op `claim_update` writes. With `id`, any of `text`, `handle`, `start`, `end`, `quote` is refused ("To change what a claim says, record a new claim and withdraw this one."). Neither `id` nor `text` is refused. Without `id`: unchanged. |
+| `plan` | `step` | Each item may also carry `note` (string) and `evidence` (evidence ids), applied when its status becomes done or dropped, with `step`'s rules; with neither, the fallback note of §4.3 applies. **Update by id:** when every item has an `id` of a current-plan step and none has text (`content`, `text`, `step`, `description`), the items update those steps only and every other step is left as it is. Items that mix id-only and text are refused. **Append:** when the given texts begin with all of the current plan's texts in order and add more after them, the existing steps keep their ids (and statuses, unless given) and the new texts are added at the end, as `step` adds them; this is not a new plan. Anything else keeps today's rules (same texts: apply statuses; changed texts: new plan). |
+| `job_wait` | `wait` | `job` becomes optional and `job_wait` gains `reason` (string). Without `job` (absent, null or empty), the call runs `wait` with `reason`: the turn ends until a background job or agent ends, or a `wake_on` line matches. A `timeout_s` without `job` is ignored with a note. A role without `wait` gets a refusal asking for `job`. Done in `dialect::adapt`, like `out_read`. |
+| `finish` | `conclude` | `finish` already takes `status` (`met`, `unreachable`) and records the conclusion before finishing. Every text that asks for `conclude` asks for `finish` with `status` instead. A refusal of `finish` for want of a conclusion says to pass `status`. |
+
+### 4.2 Hidden without a merge
+
+Rare enough that showing them costs more than it helps (0 to 10 calls each in 21,272). They stay runnable,
+and a pack can still show them by not hiding them.
+
+- `job_list`: results already name job ids and states.
+- `pin`, `reflect`, `ask_for`.
+- On the core lead: `agent_fanout` (call `agent_spawn` several times with `background: true`, then
+  `job_wait` without `job`), `attempt`, `agent_adopt`, `agent_message`, `agent_stop`, `decide`.
+
+### 4.3 Which roles hide what
+
+- **Rule for every pack:** a role hides `out_read` if it has `read`, `out_grep` if it has `grep`,
+  `claim_update` if it has `claim`, `step` if it has `plan`, `wait` if it has `job_wait`, `conclude` if it has
+  `finish`, and always `job_list`, `pin`, `reflect`, `ask_for`.
+- **Core and harnessmm lead:** also hide `agent_fanout`, `attempt`, `agent_adopt`, `agent_message`,
+  `agent_stop` and `decide`. The leads and dispatchers of other packs (ctf, redteam, vr) keep their agent tools
+  visible, because those packs list them on purpose.
+- **Result for the core pack.**
+  - Lead, 22 tools: `bash job_wait job_kill read write edit glob grep web_fetch dep_scan plan note claim evidence ledger log_search agent_spawn verify request_scope finish ask_user report_blocker`. It was 38.
+  - Worker, 18 tools: `bash job_wait job_kill read write edit glob grep web_fetch dep_scan note claim evidence ledger log_search finish report_blocker hand_off`. It was 25.
+  - Verifier, 12 tools: `bash job_wait job_kill read glob grep web_fetch dep_scan ledger log_search verdict report_blocker`. It was 15.
+- **The fallback note.** A step marked done or dropped through `plan` without `note` or `evidence` gets the
+  note "marked done in `plan`" or "dropped in `plan`". Models trained on TodoWrite send no notes. Refusing them
+  would teach nothing and stall the plan.
+
+### 4.4 What a model reads never names a hidden tool
+
+This covers tool descriptions, tool results and refusals, harness notes and nudges, role prompts, pack
+`harness.md` and the system prompt. None may name a tool hidden for the role reading it. Shared texts use the
+absorbing form, which works in every role:
+
+| Instead of | Say |
+|---|---|
+| `out_read` | `read` with the `out:` handle as `path` |
+| `out_grep` | `grep` with the `out:` handle as `path` |
+| `claim_update` | `claim` with `id` |
+| `step` | `plan` |
+| `conclude` | `finish` with `status` |
+| `wait` | `job_wait` without `job` |
+| any other hidden tool | drop or rephrase the sentence |
+
+A test enforces this for every role of every built-in pack. For each role it collects the role prompt, the
+pack's `harness.md`, and the presented descriptions of its visible tools, and checks that none of them names
+one of the role's hidden tools in backticks.
