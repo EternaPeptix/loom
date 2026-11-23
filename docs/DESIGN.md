@@ -18,7 +18,7 @@ That inverts the usual cloud trade-offs:
 
 - **Tokens cost nothing; rebuilding the prefix costs latency.** A cached prefix is free, an edited one
   is re-read from the edit point. So the request prefix is append-only except at explicit, logged
-  re-weaves, and nothing is ever trimmed "to save tokens".
+  compactions, and nothing is ever trimmed "to save tokens".
 - **Forking is free.** A child that starts from its parent's exact prefix gets a full cache hit, so
   delegation and voting can start with everything the parent knows.
 - **The model is the weakest component, so it gets the smallest job.** The harness owns process,
@@ -105,7 +105,7 @@ tools/         import-dsh.py: imports DSH sessions as ended, read-only loom sess
 ```
 
 The command line (`loom --help`): `daemon`, `up`, `down`, `status`, `open`, `run`, `chat`, `ls`,
-`tail`, `send`, `stop`, `resume`, `reweave`, `archive`, `rule`, `approve`, `gc`, `inbox`, `answer`,
+`tail`, `send`, `stop`, `resume`, `compact`, `archive`, `rule`, `approve`, `gc`, `inbox`, `answer`,
 `ledger`, `window`, `net`, `out`, `config`, `service` (the module documentation of
 `loom_daemon::cli` is its specification).
 
@@ -224,95 +224,59 @@ open another. Attribute values have `"`, `<` and `>` escaped and line breaks wri
 harness-built report, text the harness did not write is fenced line by line: `>` before each line, or
 `  | ` before each further line of a list item (§9).
 
-**Re-weave.** A `reweave` record changes the projection for everything at or before `upto_seq`: it
-lists evictions (`stub` with replacement text, `drop`, `drop_reasoning`, or `remove`) and carries a brief (the
-ledger snapshot and resume instructions) that is rendered as a `<harness kind="resume">` block
-directly after the last item at or before `upto_seq`. Evictions accumulate across re-weaves (a later
-one wins for the same record); only the latest brief is rendered. The epoch increments. Everything
-after `upto_seq` renders normally. Because the record is in the log, the projection stays a pure
-function of the log. `drop` on a tool result renders `[evicted from view; the call and its result
-remain in the session record]`; on a model response it removes the text and reasoning and keeps the
-calls, so pairing holds. `remove` on a tool result takes the call out of the window together with its
-result: the assistant message no longer lists that call and no `tool` message is rendered for it (the
-calls that stay keep their pairing; a response left with no text and no call renders nothing). Only a
-fresh start plans one (below). Evictions that name a protected item are ignored.
+**Compaction.** The window of a long session is bounded by compaction, not by trimming. When a step's
+request would reach `compact_at` (`[context] compact_at_tokens`; 0 = 40% of the model's window, never above
+400 000), the session asks the model for a note, builds a table of keys for every output, file, agent and job
+the log holds, and appends one `compaction` record. From then on the weave renders, after the system message,
+one `<harness kind="compaction">` item and then only the records after the compaction's `upto_seq`. Nothing is
+deleted: every output stays readable by its key (`read` with `out:<key>`) and `log_search` searches the whole
+log. A compaction replaces the previous one; the epoch increments. Because the record is in the log, the
+projection stays a pure function of the log, and the weave starts at the latest compaction, so its cost does
+not grow with the age of the session.
 
-**Eviction order** (`plan_reweave`), applied until the estimate is at or below the floor, stopping as
-soon as it is:
+The item holds, in order: a head (`Context was compacted at step N (reason)...`); the operator's messages up to
+`upto_seq`, verbatim (the oldest cut to one line each when together they pass 20% of `compact_at`); the ledger
+brief and frontier as they stood; pinned outputs, newest first, verbatim up to 10% of `compact_at`; the key
+table; and the model's note, labelled as written by the model and not verified.
 
-1. replayed reasoning of model responses (the calls and their results stay);
-2. harness notes of kind `nudge`, `stall`, `verdict`, `output_cut`, `budget` and `interrupted`, oldest
-   first (what the harness said about a step long past);
-3. navigation output (`ToolClass::Nav`: listings, searches), oldest first;
-4. file reads and other lookups (`ToolClass::Read`), largest first;
-5. every other unpinned tool output and agent report, largest first;
-6. every other harness note that is not protected (`arrival`, `info`, the messages of other agents),
-   oldest first — its words stay in the log, where `log_search` finds them;
-7. assistant text, only in the second plan the session makes when the first cannot free enough
-   (see below);
-8. never: the system message, user messages, the `forked` record, harness notes of kind
-   `constraint`, `approval` and `assignment`, pinned output, and the protected recent region — the
-   last `keep_recent_steps` model responses (rendered or not) and everything after the first of them.
-   Without the note classes, arrival notes, nudges and verdicts piled up for the life of a long
-   mission and no re-weave could take them out.
+**Reasons.** `size` (the request is at or above `compact_at`; the size is the server's prompt count for the
+latest request of the epoch plus what was added since), `refused` (the server refused the request for what it
+carries or for its size: empty tail, headers-only note request), `stall` (the same step request hit the
+profile's `stall_timeout_s` three times and its prompt is at least `compact_at / 2`), `operator` (`POST
+/api/sessions/{id}/compact`, alias `/reweave`; `loom compact`, alias `loom reweave`; on an idle session it
+compacts without starting a turn) and `fresh_start` (a lead's `finish` its verifier did not accept; empty tail,
+the note request carries the verifier's objections). A compaction never fails the session and is never
+skipped for being small.
 
-**Fresh start** (`plan_fresh_start`). The fold made when a verifier did not accept a lead's finish (§8)
-is another plan: it is not driven by size and protects no recent region (`upto_seq` is the last record,
-so the brief renders after everything). It drops the text and reasoning of every model response,
-removes every tool result the caller names as an attempt (the session names the `finish` and `conclude`
-calls since the last delivered result; a pin does not keep one), stubs every other unpinned result and
-agent report, and drops the harness notes of kind `nudge`, `stall` and `verdict` (what the harness said
-about the attempt). User messages, constraints, approvals, the assignment and pinned output stay.
+**Tail.** `upto_seq` is the seq just before the first record of the recent tail: the last whole steps whose
+estimated size together is at most 15% of `compact_at`, at least the last whole step when that alone is within
+50%, else empty. The tail is empty for `refused`, `fresh_start` and an operator compaction right after a
+refusal (what the server refuses may be the newest output).
 
-A stub is the evicted result's first line (its envelope header: call, outcome, size, handle); for an
-execution, the last `stub_tail_lines` (12) lines follow under `[last N lines as first shown]`; then
-`[evicted from view, not from the record: {lines} lines / {bytes} bytes. Full output: out:… — read it
-again with out_read or out_grep before relying on it.]`; for a view (`read`, `out_read`, `out_grep`),
-which stores nothing of its own, `[evicted from view, not from the record. It showed lines of out:… —
-read them again with out_read or out_grep before relying on it.]`; and when there is neither, `[evicted
-from view, not from the record. Run it again if the result matters.]`. Tool call/result pairs always stay
-paired (a stub is still a `tool` message).
+**The note request.** The window exactly as the last step request sent it (so the server's cache serves it),
+plus one user message (`texts::COMPACT_PROMPT`; for a fresh start also the objections), the same tools,
+`max_tokens` 12 000, recorded as `model_request{purpose: compact}`. For `refused` and `stall` the window is first
+reduced to headers only (each tool result to its first and last line, each agent report to 2 000 characters).
+Keys the note cites are checked: an `out:` handle must belong to a stored output of the session, a ledger id
+must exist. Unknown ones get one retry; still unknown, they are replaced by `[unknown key]` and listed in
+`dropped_keys`. A failed, cancelled or empty note request gives `note: None` and the compaction goes ahead.
 
-**When and how much.** `target_tokens`, `floor_tokens` and `keep_recent_steps` (defaults 400 000,
-180 000 and 60) are absolute numbers per configuration, not shares of the window: the working set is
-sized by latency and quality, and the rest of the window is burst capacity. Before each step request
-the session compares the size of the request it is about to send, as the server counts it, with a
-limit. The size is the `prompt_tokens` the server reported for the latest answered step request of
-the current epoch plus the estimated tokens of what has been added since (before the first answer of
-an epoch, the estimate alone). The limit is `target_tokens`, lowered when the window is known to
-`window − reserve` and to four fifths of the window; `reserve` is `max_output_tokens` plus
-min(4 096, window/4), or min(20 480, window/4) when no reply length is configured or the window cannot
-hold it. The floor is `floor_tokens`, lowered to half the window, and to half the limit when it is not
-below it. A 1M window keeps 400 000 / 180 000, and windows of 81 920 tokens and more keep the full
-reserve. When the server refuses a prompt as too long (`overflow`), the window used is the smaller of
-the known one and the limit stated in the error.
+**The key table** is built by the harness, deterministically, from the log, the ledger and the previous
+compaction's table (`loom-core::compaction`): outputs (the ones the ledger cites, the note cites, the last 40
+calls before the tail and the previous table's rows; at most 400 rows, 800 with cited ones; the rest are counted
+in a "not listed" line), files changed by `edit`/`write` (shell commands are not tracked), agents, and jobs
+still running.
 
-A re-weave that nobody asked for (`target`) happens only when it is worth it: every re-weave starts a
-new epoch and loses the server's cache, so one that frees little would be needed again a step later.
-The plan must bring the size to the midpoint between floor and limit; if it cannot, the session halves
-`keep_recent_steps` (down to 2, and down to 0 for an `overflow`, since one output of the latest step can
-be what overflows) and plans again, then plans once more allowing assistant text to go.
-When even that is not enough, nothing is recorded and the context grows until the window forces an
-`overflow` re-weave. Forced re-weaves (`overflow`, `refused`, and `operator` from `POST …/reweave` or
-`loom reweave`) take what the plan can free. A `refused` re-weave (§10: a provider refusing what the
-request carries, refused twice on the same prefix) protects no recent step and folds everything it
-can whatever the size, and so does an `operator` one made while the current prefix is the one refused:
-what the server refuses may be the newest output, and is not a matter of size; each stub keeps its
-handle. Neither asks for a digest. Re-weaves happen only between steps (or while idle, on
-operator request), never while a tool call is outstanding. The model can `pin` a result it wants
-kept.
+**Old logs.** `reweave` records written before compaction existed still deserialize and render exactly as they
+did (evictions, brief, digest) until the session's first compaction; no new `reweave` record is written, and a
+config's old `[context]` keys (`target_tokens`, `floor_tokens`, `keep_recent_steps`, `stub_tail_lines`) are
+accepted, ignored and warned about at startup (`target_tokens` is read as `compact_at_tokens` when that is
+absent).
 
-**Digest (cache-friendly).** Before a re-weave that evicts assistant text, unless it is for an
-overflow or a refusal (the server has just refused that prefix), the session sends the *existing* stable prefix
-plus one appended instruction asking for a digest. That request is a full cache hit; it is recorded as
-a `model_request` with purpose `digest` (its reply is not a record), capped at 8 000 tokens, and waits
-for a request slot at the session's own priority. A non-empty reply is stored in the `reweave` record
-and rendered in the resume block under `Leads from earlier work (written by the model, not verified —
-re-check before relying on them):`. The digest asks for a map of the work (established, ruled out with its boundary, tried but not
-ruled out, open leads, next), not a retelling. The resume brief adds, for a session with a ledger, the
-frontier block (`Where the work stands:`) and a paragraph saying a failed attempt rules out that attempt, not
-the approach. Without a digest the re-weave goes ahead all the same: the ledger
-brief is the durable state.
+The log can be paged backward: `GET /api/sessions/{id}/records?before=<seq>&limit=n` returns the n records
+before `seq`, oldest first, with `prev_before` (null at the start); `after` and `before` together are a 400.
+Compactions happen only between steps (or while idle, on operator request), never while a tool call is
+outstanding. The model can `pin` a result it wants kept in view.
 
 **HUD (ephemeral tail).** Not part of the weave. Each step request ends with one `user`-role message
 `<harness-state>…</harness-state>` (`loom-agent::hud`) that is never part of the stable prefix, so the
@@ -582,7 +546,7 @@ with its text is checked as before.
 **Views.** `LedgerState::render_markdown()` is the full Markdown view (the `ledger` tool, the API's
 `markdown`, `loom ledger`). A mission whose lead keeps a ledger but has written nothing yet has an
 empty one; for a mission whose lead keeps none the API answers `No ledger: this mission's lead does
-not keep one.` `LedgerState::brief()` is the compact text of the HUD and of the re-weave
+not keep one.` `LedgerState::brief()` is the compact text of the HUD and of the compaction
 brief: goal, constraints and approvals are the operator's words and never cut; every other line is
 cut at 400 characters; it shows the last 12 decisions and the last 20 dead ends, each list starting
 with `(N older not shown: d1–d3; call `ledger` to read them)` when older ones are left out. The HUD is
@@ -607,14 +571,14 @@ The module documentation of `session.rs` is the precise specification of the loo
 
 ```
 idle: wait for an input (user message, inbox answer, agent report, job end, agent message,
-      resume, operator rule / approval / withdrawal, reweave, stop)
+      resume, operator rule / approval / withdrawal, compact, stop)
 turn (turn_start{trigger}):
   step:
     cancellation check
     drain arrivals (anything queued is recorded now; nothing starts a turn)
     budget check → note, then park / settle after 2 more steps
     stall check → note
-    re-weave check (§5)
+    compaction check (§5)
     request = weave(log) + HUD → request slot → stream (lookups may start early, below)
     reply:
       ended with an error                → the turn fails
@@ -761,16 +725,12 @@ only when every check passes and, where verification is required, a verifier acc
     reasoning that led there, replayed at every step) tends to defend that account or to give up again.
     So every rejection also (a) reopens the goal: a concluded goal-met claim goes back to open
     (`GoalReopen`, not after an operator's release), and the ledger accepts a new `conclude` only on
-    execution evidence recorded after the reopening; and (b) folds the lead's window once the reply's
-    calls have their results: one `reweave` with the reason `finish not accepted`, not driven by size
-    and without a digest (a digest would be that account again), which drops the text and reasoning of
-    every response, takes every `finish` and `conclude` call made since the last delivered result out
-    of the window together with its result (`EvictAction::Remove`, §5), stubs the other results and
-    drops the nudge, stall and verdict notes. The next request ends with a brief
-    (`texts::fresh_start_brief`): what the check found, in the verifier's words, how to go on (the goal
-    is unsolved, not decided either way; a route is closed only by a recorded run that shows it fails),
-    the `Where the work stands:` block of the frontier (the one a re-weave brief carries, with the
-    sentence that a failed attempt rules out that attempt, not the approach), and the ledger. The brief and the HUD's finish line never say that a finish was made or rejected.
+    execution evidence recorded after the reopening; and (b) compacts the lead's window once the reply's
+    calls have their results: one `compaction` with the reason `fresh_start`, an empty tail, and a note request that
+    carries what the verifier objected to (`texts::compact_objections`: the rejected result is not listed under
+    Established). The next request starts from the compaction item: the note, the key table (the attempt's outputs
+    are rows in it) and the ledger, where each objection stands as an open obligation. The item never says that a
+    finish was made or rejected beyond the objections.
     Nothing leaves the record: the attempt stays in the log and its outputs in the store, so
     `log_search`, `out_read` and `out_grep` reach them, and the operator sees all of it. With the option
     off the conclusion stands and the rejection stays in view as the result of the call;
@@ -915,7 +875,7 @@ the precise specification.
   was written there. Every line
   taken from an old ledger is quoted with `>`. A journal that fails verification or holds an entry
   written by a newer loom is named unreadable and nothing from it is shown. The note says that the old
-  mission's outputs cannot be opened and its authorizations do not apply, and a re-weave may drop it
+  mission's outputs cannot be opened and its authorizations do not apply, and a compaction may take it out of view
   like any `info` note.
 - **Stop** cascades from a lead to its agents (§8). An archive settles a mission's agents `stopped`;
   unarchiving delivers what they settled with and restores those that had not settled.
@@ -977,7 +937,7 @@ The module documentation of `client.rs`, `assemble.rs` and `request.rs` is the p
   again. Delays are 0.5 s doubling to `retry_max_delay_s` (30) with ±10% jitter; a larger
   `Retry-After` (up to 600 s) wins. Viewers see each retry as a `retrying` delta. A partial attempt
   is never committed, and a cancellation returns promptly with the text streamed so far.
-- **Unavailable notice.** When one model request of a session (a step's or a digest's) is retrying
+- **Unavailable notice.** When one model request of a session (a step's or a note's) is retrying
   and its outage began `agents.unavailable_notice_s` ago (default 300; 0 = never), the session
   opens a non-blocking `blocker` inbox item, notified like every other: the server's
   address, since when it has been unavailable, the last error, and until when the request is retried
@@ -1007,13 +967,13 @@ The module documentation of `client.rs`, `assemble.rs` and `request.rs` is the p
   `exceed_context_size_error` or `context_length_exceeded`, a 422 of the same kind, and an error object
   with such a message inside a 200 stream, is reported with the limit and request size: the error's
   `n_ctx` and `n_prompt_tokens` when present, else the smaller and the larger of the numbers in the message
-  (servers name them in either order). The session then re-weaves (`overflow`, protecting no recent
-  step when it must) and sends again, once per step, and fails the step when nothing can be folded.
+  (servers name them in either order). The session then compacts (`refused`: empty tail, headers-only
+  note request) and sends again, once per step.
 - **Refusals** (400, 413 or 422 that is not an overflow): a provider refusing what the request carries,
   a content filter refusing a scraped page or a payload, for instance, refuses the same window every
   time. The first refusal fails the step (§8) with an item that says so; when the next request on the
-  same prefix (an answer, a resume) is refused again, the session re-weaves (`refused`: every tool
-  output out of view, each stub keeping its handle) and sends once more before parking again, now
+  same prefix (an answer, a resume) is refused again, the session compacts (`refused`: empty tail, every
+  output reachable by its key in the table) and sends once more before parking again, now
   saying that what is refused is still in view or is the request itself, and that the session must
   move to another model or change its settings. One mission was parked 17 times, about 27 hours of
   waiting, by such a loop before this rule.
@@ -1220,7 +1180,7 @@ the default evidence grade (§7) and staleness. Each module's documentation is t
   VDR, the generated SBOM and the scanner console are stored as blobs. dep-scan's
   prioritized/reachable labels are its static analysis, stated as such, not execution evidence: its
   results are graded `analysis` (§7), so a quote of a scan never counts as a run.
-- `pin {handle, reason, unpin?}` keeps a stored output and every view of it in view through re-weaves;
+- `pin {handle, reason, unpin?}` keeps a stored output and every view of it in view through compactions;
   `log_search {pattern, in?, max?}` searches the session's own record.
 
 **Sandbox** (`loom-tools::sandbox`; its module documentation holds the exact seatbelt profile). Mode
@@ -1556,6 +1516,7 @@ POST /api/sessions                            NewSession → 201 SessionInfo + c
                                               `created: true` in the answer says it was (409 otherwise, with the sentence)
 GET  /api/sessions/{id}                       → SessionDetail (SessionInfo + children, oldest first)
 GET  /api/sessions/{id}/records?after=&limit= → {records, next_after}   (limit: default 500, at most 2000)
+GET  /api/sessions/{id}/records?before=&limit= → {records, next_after: null, prev_before}   (oldest first; after+before is a 400)
 GET  /api/sessions/{id}/stream?after=         SSE, below (Last-Event-ID when after is absent)
 POST /api/sessions/{id}/messages              {text} → 202 {}
 POST /api/sessions/{id}/rules                 {text} → 202 RuleReceipt
@@ -1565,9 +1526,9 @@ POST /api/sessions/{id}/scope                 {hosts, note?} → 202 ScopeReceip
 POST /api/sessions/{id}/release               {reason} → 202 RuleReceipt
 POST /api/sessions/{id}/stop                  → 202 {}
 POST /api/sessions/{id}/resume                → 202 {}
-POST /api/sessions/{id}/reweave               → 202 {}
+POST /api/sessions/{id}/compact               → 202 {}   (alias: /reweave)
 POST /api/sessions/{id}/archive               {archived} → 200 {}
-GET  /api/sessions/{id}/window                → WindowView (+ breakdown, measured_now, last_request, fold_at, fold_to)
+GET  /api/sessions/{id}/window                → WindowView (+ breakdown, measured_now, last_request, fold_at = compact_at)
 GET  /api/sessions/{id}/files?path=           → FilesView {root, path, entries: [{name, kind: dir|file|link|other, size, mtime_ms,
                                               hidden, note?, error?}], more}   (read-only, inside the session's workspace)
 GET  /api/sessions/{id}/files/lines?path=&start=&count=
@@ -1676,7 +1637,7 @@ the mission keeps a ledger (without one a rule is a note with no id), and the st
 recorded for a blank one. A withdrawal names a rule id the ledger has in force. `stop` reaches any
 session; `resume` and `archive` roots only; archiving is refused while the mission is running a turn.
 The same actions exist in the CLI (`loom send`, `rule`, `approve`, `rule --withdraw`, `stop`,
-`resume`, `reweave`, `archive`, `answer`) and in the web UI.
+`resume`, `compact`, `archive`, `answer`) and in the web UI.
 
 **Scope and release.** `POST /scope` (`loom scope`) is the only way a session's reachable hosts grow
 while it runs, and only the operator can call it: it goes to the mission's lead like a rule and is
@@ -1856,7 +1817,7 @@ relied on.
   paths that changed on both sides.
 - Merging an agent's copy into a workspace that changed in the same files, and adopting through Git
   (a branch or a patch) rather than by files.
-- Background request priority for digests and titles (`Priority::Background` exists and nothing uses
+- Background request priority for notes and titles (`Priority::Background` exists and nothing uses
   it; titles are not written by a model).
 - A warning when a configured context window is larger than the one the server reports
   (`Discovered::server_window` is computed and not reported).

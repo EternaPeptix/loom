@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+### Compaction replaces re-weave
+
+- A session's window is bounded by compaction (CONTRACTS-COMPACTION Part K). When a request reaches `compact_at`
+  (`[context] compact_at_tokens`, 0 = 40% of the model's window, at most 400 000), when the server refuses a request,
+  when a large request stalls three times, when the operator asks (`POST /api/sessions/{id}/compact`, `loom compact`;
+  `/reweave` and `loom reweave` stay as aliases) or when a lead's finish is not accepted, the model writes a note
+  (`model_request` purpose `compact`, same window and tools as the last step), the harness builds a table of keys for
+  every output, file, agent and job, and a `compaction` record is appended. The next request is the system message,
+  one `<harness kind="compaction">` item (operator messages, ledger, pins, key table, note) and the records after
+  `upto_seq`. Nothing is deleted from the log. A failed note request still compacts, with no note.
+- The weave starts at the latest compaction, so its cost no longer grows with the age of the session.
+- New event `compaction`; `reweave` records of old logs still load and render as they did until the first compaction;
+  no new `reweave` record is written. New purpose `compact` (`digest` stays readable). No more stubs, evictions or
+  digest request for new records.
+- `[context]` keys `target_tokens`, `floor_tokens`, `keep_recent_steps` and `stub_tail_lines` are accepted, ignored and
+  warned about at startup; `target_tokens` is read as `compact_at_tokens` when that is absent.
+- `GET /api/sessions/{id}/records?before=<seq>&limit=n` pages backward and answers `prev_before`; `after` and
+  `before` together are a 400. `WindowView.fold_at` is `compact_at`.
+
 ### The shell directory persists between `bash` calls
 
 - A session has one shell directory (`ToolCtx::shell`, new field): a `bash` call without `cwd` runs where the last

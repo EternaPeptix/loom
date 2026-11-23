@@ -561,8 +561,8 @@ impl Client {
         self.call_unit(Method::POST, &format!("/api/sessions/{}/resume", segment(id.as_str())), None).await
     }
 
-    pub async fn reweave(&self, id: &SessionId) -> Result<(), String> {
-        self.call_unit(Method::POST, &format!("/api/sessions/{}/reweave", segment(id.as_str())), None).await
+    pub async fn compact(&self, id: &SessionId) -> Result<(), String> {
+        self.call_unit(Method::POST, &format!("/api/sessions/{}/compact", segment(id.as_str())), None).await
     }
 
     pub async fn archive(&self, id: &SessionId, archived: bool) -> Result<(), String> {
@@ -610,6 +610,12 @@ impl Client {
         let body = serde_json::to_value(ModelBody { profile: profile.to_string() })
             .map_err(|e| format!("The request cannot be encoded ({e})."))?;
         self.call(Method::POST, &format!("/api/sessions/{}/model", segment(id.as_str())), &[], Some(body)).await
+    }
+
+    /// The `limit` records before `before`, oldest first (`prev_before` pages further back).
+    pub async fn records_before(&self, id: &SessionId, before: Seq, limit: usize) -> Result<RecordsPage, String> {
+        let query = vec![("limit", limit.to_string()), ("before", before.to_string())];
+        self.call(Method::GET, &format!("/api/sessions/{}/records", segment(id.as_str())), &query, None).await
     }
 
     pub async fn records(&self, id: &SessionId, after: Option<Seq>, limit: usize) -> Result<RecordsPage, String> {
@@ -890,7 +896,7 @@ pub(crate) mod testkit {
             let records: Vec<Record> =
                 log.iter().filter(|r| param("after").is_none_or(|a| r.seq > a)).take(limit).cloned().collect();
             let next_after = if records.len() == limit { records.last().map(|r| r.seq) } else { None };
-            return reply(200, json(&RecordsPage { records, next_after }));
+            return reply(200, json(&RecordsPage { records, next_after, prev_before: None }));
         }
         if let (Some(total), true) = (script.blob_total, path.ends_with("/lines")) {
             let start = param("start").unwrap_or(1);
@@ -1045,7 +1051,7 @@ mod tests {
         let ledger = loom_agent::runtime::LedgerView { markdown: "# ledger".into(), ..Default::default() };
         let blob = BlobRef { id: BlobId("ab".into()), bytes: 9, lines: 3 };
         let lines = LinesView { text: "a\nb\n".into(), first: 1, last: 2, total: 3 };
-        let page = RecordsPage { records: vec![], next_after: Some(7) };
+        let page = RecordsPage { records: vec![], next_after: Some(7), prev_before: None };
         let script = Script::default()
             .route("GET", "/api/status", 200, json(&status_view()))
             .route("GET", "/api/sessions", 200, json(&vec![one.clone()]))
@@ -1054,7 +1060,7 @@ mod tests {
             .route("POST", "/api/sessions/s-1/messages", 202, "{}")
             .route("POST", "/api/sessions/s-1/stop", 202, "{}")
             .route("POST", "/api/sessions/s-1/resume", 202, "{}")
-            .route("POST", "/api/sessions/s-1/reweave", 202, "{}")
+            .route("POST", "/api/sessions/s-1/compact", 202, "{}")
             .route("POST", "/api/sessions/s-1/archive", 200, "{}")
             .route("GET", "/api/sessions/s-1/records", 200, json(&page))
             .route("GET", "/api/sessions/s-1/window", 200, json(&window))
@@ -1084,7 +1090,7 @@ mod tests {
         client.send(&sid, "hello").await.unwrap();
         client.stop(&sid).await.unwrap();
         client.resume(&sid).await.unwrap();
-        client.reweave(&sid).await.unwrap();
+        client.compact(&sid).await.unwrap();
         client.archive(&sid, true).await.unwrap();
         assert_eq!(client.records(&sid, Some(3), 500).await.unwrap(), page);
         assert_eq!(client.window(&sid).await.unwrap(), window);
@@ -1108,7 +1114,7 @@ mod tests {
             ("POST", "/api/sessions/s-1/messages"),
             ("POST", "/api/sessions/s-1/stop"),
             ("POST", "/api/sessions/s-1/resume"),
-            ("POST", "/api/sessions/s-1/reweave"),
+            ("POST", "/api/sessions/s-1/compact"),
             ("POST", "/api/sessions/s-1/archive"),
             ("GET", "/api/sessions/s-1/records?limit=500&after=3"),
             ("GET", "/api/sessions/s-1/window"),
@@ -1203,7 +1209,12 @@ mod tests {
     #[tokio::test]
     async fn records_without_after_sends_only_the_limit_and_events_asks_for_deltas() {
         let script = Script::default()
-            .route("GET", "/api/sessions/s-1/records", 200, json(&RecordsPage { records: vec![], next_after: None }))
+            .route(
+                "GET",
+                "/api/sessions/s-1/records",
+                200,
+                json(&RecordsPage { records: vec![], next_after: None, prev_before: None }),
+            )
             .stream(vec![])
             .stream(vec![]);
         let (client, shared) = start(script).await;

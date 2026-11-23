@@ -35,12 +35,12 @@ retry_max_delay_s = 30                  # longest pause between retries
 # temperature = 0.6
 
 [context]
-# Absolute token counts, not shares of the window. floor_tokens must be below target_tokens. A session
-# clamps both to a smaller model window automatically.
-target_tokens = 400000     # plan a re-weave (fold old output out of view) when the prompt exceeds this
-floor_tokens = 180000      # fold down to about this
-keep_recent_steps = 60     # model responses at the end of the log that are never folded
-stub_tail_lines = 12       # trailing lines of a folded command result kept in its stub
+# The window is compacted when a request reaches this many tokens: the model writes a note, the harness adds a
+# table of keys for every output, and everything before the last few steps leaves the window (nothing is
+# deleted). 0 = 40% of the model's context window, never above 400000.
+compact_at_tokens = 0
+# The re-weave keys (target_tokens, floor_tokens, keep_recent_steps, stub_tail_lines) still load, are ignored,
+# and are warned about at start; target_tokens is read as compact_at_tokens when that is 0.
 
 [admit]
 # How much of a tool output the model sees inline. The whole output is always stored and can be paged.

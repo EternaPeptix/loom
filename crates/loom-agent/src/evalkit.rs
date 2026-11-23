@@ -555,6 +555,11 @@ fn script(scenario: &Scenario) -> Script {
     let (lead, worker, verdicts) = (scenario.lead, scenario.worker, scenario.verdicts);
     let (mut lead_at, mut worker_at, mut given) = (0usize, 0usize, 0usize);
     Script::new(move |body, _| {
+        // The note request of a compaction (a fresh start): it is not one of the session's moves.
+        let last = body["messages"].as_array().and_then(|m| m.last()).and_then(|l| l["content"].as_str());
+        if last.is_some_and(|c| c.starts_with(crate::texts::COMPACT_PROMPT)) {
+            return Action::Reply(Reply::text("## Goal\nThe task.\n## Next\nRun the target again."));
+        }
         if has_tool(body, "verdict") {
             return verify(body, verdicts, &mut given);
         }
