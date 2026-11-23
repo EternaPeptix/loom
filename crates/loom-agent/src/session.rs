@@ -236,10 +236,6 @@
 //!    own model response); a session that is not a child instead opens an inbox item (`Parked`,
 //!    blocking, text `texts::turn_failed("The session's budget is used up.")`) and the turn ends
 //!    `BudgetExhausted`.
-//! 4. **Stall** (only for `Termination::Explicit` sessions with a journal; `agents.stall_steps > 0`):
-//!    when the last `stall_steps` own steps contain no `ledger` record, no `tool_result` of class
-//!    `Write` with status `Ok`, and no `child_spawned`/`child_settled`, and no `Stall` note was given
-//!    within those steps, append `harness_note{Stall, texts::stall(stall_steps)}`.
 //! 5. **Re-weave.** `w = weave(all records)` (a `Woven`, which planning uses as it is), computed
 //!    here once and again only after a record that changes it (a `reweave`); points 5 and 6 and the
 //!    digest request all use it. See below. Forced when the flag from point 2 is set.
@@ -540,8 +536,8 @@
 //!   the step fails; none is opened when the window ends first; a reply that streams past the notice
 //!   time and then breaks starts a new outage; a stop resolves it; 0 opens none; a digest request is
 //!   watched too; a notice left open is resolved when `run` starts;
-//! - stall note after `stall_steps` steps of read-only calls, and not again until progress.
 
+use crate::completeness;
 use crate::frontier;
 use crate::gate::{self, Yield, YieldCtx};
 use crate::hud::{self, HudChild, HudInput, HudJob};
@@ -1695,6 +1691,8 @@ pub struct Session {
     /// Replies in a row that made no progress: nudged by the gate, cut off by the output limit with
     /// no complete call, or with only malformed calls.
     nudges: u32,
+    /// The gate's "ended without a tool call" nudge was given in this turn; it is given once.
+    text_nudged: bool,
     phase: Phase,
     st: State,
     published: Option<Status>,
@@ -1941,6 +1939,7 @@ impl Session {
             jobs_open: true,
             token: CancellationToken::new(),
             nudges: 0,
+            text_nudged: false,
             phase,
             st,
             published: None,
@@ -2933,6 +2932,7 @@ Name them when you start a new mission instead."
     async fn turn(&mut self, trigger: Trigger) -> R<Option<Settlement>> {
         self.token = self.deps.control.begin_turn();
         self.nudges = 0;
+        self.text_nudged = false;
         let renewed = renews_budget(trigger, self.st.last_end);
         self.append(Author::Harness, Event::TurnStart { trigger })?;
         self.clock_set(true)?;
@@ -3130,7 +3130,6 @@ Name them when you start a new mission instead."
         if let Some(flow) = self.run_continuation(force).await? {
             return Ok(flow);
         }
-        self.check_stall()?;
         let token = self.token.clone();
         // The weave of this step, rendered again only after a record that changes it.
         let mut woven = self.woven();
@@ -3748,46 +3747,6 @@ Name them when you start a new mission instead."
         }
     }
 
-    /// A stretch of own steps with no ledger record, file change or child activity gets one note.
-    fn check_stall(&mut self) -> R<()> {
-        if !self.deps.agents.idle_ledger_nudge {
-            return Ok(());
-        }
-        let n = self.deps.agents.stall_steps;
-        if n == 0 || self.st.termination != Some(Termination::Explicit) || self.deps.shared.journal.is_none() {
-            return Ok(());
-        }
-        if self.st.step < n {
-            return Ok(());
-        }
-        let first_step = self.st.step.saturating_sub(n).saturating_add(1);
-        let own = self.own();
-        let mut step = 0u32;
-        let mut from = None;
-        for (i, r) in own.iter().enumerate() {
-            if matches!(&r.event, Event::ModelRequest(m) if m.purpose == Purpose::Step)
-                || matches!(&r.event, Event::StoredAction(_))
-            {
-                step = step.saturating_add(1);
-                if step == first_step {
-                    from = Some(i);
-                    break;
-                }
-            }
-        }
-        let Some(from) = from else { return Ok(()) };
-        let quiet = own.get(from..).unwrap_or_default().iter().all(|r| match &r.event {
-            Event::Ledger { .. } | Event::ChildSpawned(_) | Event::ChildSettled(_) => false,
-            Event::ToolResult(t) => !(t.class == ToolClass::Write && t.status == ToolStatus::Ok),
-            Event::HarnessNote { note: NoteKind::Stall, .. } => false,
-            _ => true,
-        });
-        if quiet {
-            self.note(Author::Harness, NoteKind::Stall, texts::stall(n))?;
-        }
-        Ok(())
-    }
-
     // ---- re-weave ------------------------------------------------------------------------------
 
     /// The weave of the records as they are now, with what planning needs. Every weave a step uses
@@ -4026,10 +3985,12 @@ Name them when you start a new mission instead."
                 return Ok(flow);
             }
         }
+        // Wording names only the tools the role is shown (contract T1), not the registry's hidden ones.
+        let shown: Vec<String> = w_tools.iter().map(|t| t.name.clone()).collect();
         let verdict = gate::on_yield(&YieldCtx {
             termination,
             is_child: shared.is_child(),
-            tools: &names,
+            tools: &shown,
             ledger: ledger.as_ref(),
             reply: &c.text,
             nudges: self.nudges,
@@ -4039,7 +4000,12 @@ Name them when you start a new mission instead."
         });
         match verdict {
             Yield::End => Ok(Flow::End(TurnEndReason::Yielded)),
+            Yield::Nudge(_) if self.text_nudged => {
+                // Contract T2: one "ended without a tool call" nudge per turn; the second such reply ends it.
+                Ok(Flow::End(TurnEndReason::Yielded))
+            }
             Yield::Nudge(text) => {
+                self.text_nudged = true;
                 self.note(Author::Harness, NoteKind::Nudge, text)?;
                 self.nudges = self.nudges.saturating_add(1);
                 Ok(Flow::Next)
@@ -4195,9 +4161,11 @@ Name them when you start a new mission instead."
             let mut ctx = self.deps.ctx.clone();
             ctx.call_id = call.call_id.clone();
             ctx.cancel = self.token.clone();
+            ctx.files.set_step(u64::from(self.st.step));
             let policy = self.admit_policy();
             ctx.view_chars = policy.view_chars(&self.estimator);
             let started = Instant::now();
+            let started_ms = now_ms();
             let mut result = if let Some(first) = &ender {
                 refused(&ctx, &call.name, class, texts::not_run_after(first), started)
             } else if tool.is_none()
@@ -4230,6 +4198,18 @@ Name them when you start a new mission instead."
             };
             if deferred {
                 result.meta.insert(META_DEFERRED_OBSERVATION.into(), Value::Bool(true));
+            }
+            // Result completeness (Part N1): the egress proxy's denials during the call, from the
+            // session's `net.jsonl`, which the tool layer cannot see.
+            if completeness::reaches_network(&call.name) {
+                let net = self.deps.paths.session_dir(&self.deps.shared.session).join("net.jsonl");
+                let (k, hosts) = completeness::denied_between(&net, started_ms, now_ms());
+                completeness::mark_net_denied(&mut result, k, &hosts);
+            }
+            // N5: the verifier's request lists the limits of each output the finish cites.
+            if let Some(blob) = &result.output {
+                let limits = loom_tools::limits_of(&result.meta);
+                self.deps.shared.note_output_limits(&blob.id, limits);
             }
             let ok = result.status == ToolStatus::Ok;
             let flag_note = self.deps.shared.role.flag_regex.as_ref().and_then(|pattern| {
@@ -4908,27 +4888,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_session_nudges_then_parks_and_a_good_call_resets_the_count() {
+    async fn explicit_session_nudges_once_and_a_second_text_reply_ends_the_turn() {
         let agents = AgentsCfg { max_nudges: 2, verify_finish: false, ..AgentsCfg::default() };
-        let script = seq(vec![
-            Reply::text("one").into(),
-            Reply::text("two").into(),
-            bash("echo ok").into(),
-            Reply::text("three").into(),
-            Reply::text("four").into(),
-            Reply::text("five").into(),
-        ]);
+        let script = seq(vec![Reply::text("one").into(), Reply::text("two").into(), Reply::text("three").into()]);
         let mut fx = Fx::build("lead", false, true, agents, script).await;
         let session = fx.create();
         run_with(session, vec![user("go")]).await;
         let rs = fx.sink.records();
-        assert_eq!(notes(&rs, NoteKind::Nudge).len(), 4);
-        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Parked]);
-        let items = inbox(&rs);
-        assert_eq!(items.len(), 1);
-        assert_eq!((items[0].kind, items[0].blocking), (InboxKind::Parked, true));
-        assert_eq!(fx.server.requests().len(), 6);
-        assert_eq!(fx.sink.last_status().unwrap().open_inbox, 1);
+        assert_eq!(notes(&rs, NoteKind::Nudge).len(), 1);
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Yielded]);
+        assert_eq!(fx.server.requests().len(), 2);
         assert_no_cache_break(&rs);
     }
 
@@ -8593,26 +8562,6 @@ mod tests {
         assert!(results[1].text.contains("2\t{\"k\""), "{}", results[1].text.chars().take(200).collect::<String>());
     }
 
-    // ---- stall -------------------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn stall_note_after_quiet_steps_and_not_again_until_progress() {
-        let agents = AgentsCfg { stall_steps: 3, verify_finish: false, ..AgentsCfg::default() };
-        let mut actions: Vec<Action> = (0..5).map(|_| bash("echo hi").into()).collect();
-        actions.push(finish_call("done").into());
-        // A lead without `conclude`: its closing `finish` is not refused for an unconcluded goal.
-        let mut role = core_role("lead");
-        role.tools.retain(|t| t != "conclude" && t != "request_scope");
-        let mut fx = Fx::build_with(role, "lead", false, true, agents, seq(actions)).await;
-        let session = fx.create();
-        run_with(session, vec![user("go")]).await;
-        let rs = fx.sink.records();
-        let n = notes(&rs, NoteKind::Stall);
-        assert_eq!(n, vec![texts::stall(3)]);
-        let at = rs.iter().position(|r| matches!(&r.event, Event::HarnessNote { note: NoteKind::Stall, .. })).unwrap();
-        let requests_before = rs[..at].iter().filter(|r| matches!(r.event, Event::ModelRequest(_))).count();
-        assert_eq!(requests_before, 3);
-    }
     #[test]
     fn runtime_wrapup_policy_closes_new_work_but_preserves_cleanup() {
         let policy = CallPolicy { wrapup: true };
@@ -9326,27 +9275,6 @@ mod tests {
         let End::Settled(v_end) = run_with(v_session, vec![]).await else { panic!("expected settlement") };
         assert_eq!(v_end.outcome, ChildOutcome::Failed);
         assert!(!results(&v_fx.sink.records()).iter().any(|r| r.name == "finish"));
-    }
-
-    #[tokio::test]
-    async fn idle_ledger_nudge_false_suppresses_stall_note_while_true_emits_it() {
-        for enabled in [false, true] {
-            let agents =
-                AgentsCfg { stall_steps: 3, idle_ledger_nudge: enabled, verify_finish: false, ..AgentsCfg::default() };
-            let mut actions: Vec<Action> = (0..5).map(|_| bash("echo hi").into()).collect();
-            actions.push(finish_call("done").into());
-            let mut role = core_role("lead");
-            role.tools.retain(|t| t != "conclude" && t != "request_scope");
-            let mut fx = Fx::build_with(role, "lead", false, true, agents, seq(actions)).await;
-            let session = fx.create();
-            run_with(session, vec![user("go")]).await;
-            let n = notes(&fx.sink.records(), NoteKind::Stall);
-            if enabled {
-                assert_eq!(n, vec![texts::stall(3)]);
-            } else {
-                assert!(n.is_empty(), "expected no stall note when idle_ledger_nudge = false, got {n:?}");
-            }
-        }
     }
 
     #[test]

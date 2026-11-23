@@ -519,6 +519,35 @@ fn outcome_word(o: ChildOutcome) -> &'static str {
     }
 }
 
+/// The first line of a report of an agent that did not finish its work (contract N4): `[incomplete: ended
+/// by {budget|operator stop|error} at step {n}]`. `None` for an agent that returned or blocked on purpose.
+fn incomplete_header(outcome: ChildOutcome, steps: u32) -> Option<String> {
+    let cause = match outcome {
+        ChildOutcome::BudgetExhausted => "budget",
+        ChildOutcome::Stopped => "operator stop",
+        ChildOutcome::Failed => "error",
+        ChildOutcome::Returned | ChildOutcome::Blocked => return None,
+    };
+    Some(format!("[incomplete: ended by {cause} at step {steps}]"))
+}
+
+/// `report` under its incomplete header, when the agent's end calls for one.
+fn with_incomplete_header(report: &str, outcome: ChildOutcome, steps: u32) -> String {
+    match incomplete_header(outcome, steps) {
+        Some(h) => format!("{h}\n{report}"),
+        None => report.to_string(),
+    }
+}
+
+/// `out` with the limit `child incomplete` when the agent's end calls for it.
+fn mark_child_incomplete(out: ToolOutput, outcome: ChildOutcome) -> ToolOutput {
+    if incomplete_header(outcome, 0).is_some() {
+        out.with_limit("child incomplete")
+    } else {
+        out
+    }
+}
+
 /// The budget for a spawn: the call's numbers, lowered to the configured ceiling. The second value
 /// is the header fact to show when something was lowered.
 fn budget_for(shared: &Shared, args: &Map<String, Value>) -> (Budget, Option<String>) {
@@ -699,10 +728,13 @@ impl Tool for AgentSpawn {
         };
         let copy = if workspace == Workspace::Copy { copy_report(shared, &id).await } else { None };
         let body = match copy {
-            None => settlement.report.clone(),
+            None => with_incomplete_header(&settlement.report, settlement.outcome, settlement.steps),
             Some(section) => format!(
                 "{COPY_LEGEND}\n\n===== report of agent {id} =====\n{}\n\n===== what agent {id} changed in its copy =====\n{section}\n",
-                loom_core::tagsafe::quote_lines_starting(&settlement.report, "=====")
+                loom_core::tagsafe::quote_lines_starting(
+                    &with_incomplete_header(&settlement.report, settlement.outcome, settlement.steps),
+                    "====="
+                )
             ),
         };
         let mut out =
@@ -718,7 +750,7 @@ impl Tool for AgentSpawn {
         if settlement.outcome != ChildOutcome::Returned {
             out.status = ToolStatus::Error;
         }
-        out
+        mark_child_incomplete(out, settlement.outcome)
     }
 }
 
@@ -847,6 +879,7 @@ impl Tool for AgentFanout {
             ChildOutcome::Stopped,
             ChildOutcome::Failed,
         ];
+        let mut incomplete = false;
         for (i, (id, result)) in started.iter().zip(results).enumerate() {
             let (role, outcome, steps, report) = match result {
                 Ok(s) => (s.role, s.outcome, s.steps, s.report),
@@ -864,8 +897,9 @@ impl Tool for AgentFanout {
                 "===== agent {} of {n}: {id} ({role}) \u{2014} {}, {steps} steps =====\n{}\n\n",
                 i.saturating_add(1),
                 outcome_word(outcome),
-                loom_core::tagsafe::quote_lines_starting(&report, "=====")
+                loom_core::tagsafe::quote_lines_starting(&with_incomplete_header(&report, outcome, steps), "=====")
             ));
+            incomplete |= incomplete_header(outcome, steps).is_some();
             if workspace == Workspace::Copy {
                 if let Some(section) = copy_report(shared, id).await {
                     body.push_str(&format!("===== what agent {id} changed in its copy =====\n{section}\n\n"));
@@ -892,6 +926,9 @@ impl Tool for AgentFanout {
         }
         if cancelled || counts.first().copied().unwrap_or(0) == 0 {
             out.status = ToolStatus::Error;
+        }
+        if incomplete {
+            out = out.with_limit("child incomplete");
         }
         out
     }
@@ -1242,7 +1279,7 @@ impl Tool for AgentAdopt {
         }
         if copy.running {
             return ToolOutput::error(format!(
-                "Agent {id} is still working in its copy. Wait for it to end (`wait`) or stop it (`agent_stop`), then call agent_adopt again; `preview: true` shows what it has changed so far."
+                "Agent {id} is still working in its copy. Wait for it to end or stop it, then call agent_adopt again; `preview: true` shows what it has changed so far."
             ));
         }
         if std::path::Path::new(&copy.manifest.source) != ctx.workspace {
@@ -1317,15 +1354,26 @@ impl Tool for AgentMessage {
     fn spec(&self) -> ToolSpec {
         spec(
             "agent_message",
-            "Send a message to an agent you started with background: true, for example to correct its course or add information. It reads the message at its next step.",
+            "Send a message to an agent you started with background: true, for example to correct its course or add information. It reads the message at its next step. With stop: true it ends the agent instead (a stopped agent delivers no report) and text is not needed.",
             ToolClass::State,
-            &[req("agent", "string", "Exact child ID, an unambiguous prefix, or last."), req("text", "string", "The message.")],
+            &[
+                req("agent", "string", "Exact child ID, an unambiguous prefix, or last."),
+                opt("text", "string", "The message. Required unless stop is true."),
+                opt("stop", "boolean", "true to stop the agent instead of messaging it.").default(json!(false)),
+            ],
         )
     }
-    async fn run(&self, _ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
+    async fn run(&self, ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
         let shared = &*self.0;
+        if args.get("stop").and_then(Value::as_bool).unwrap_or(false) {
+            // Contract T4: `stop: true` behaves as `agent_stop` for this agent.
+            let mut stop = args.clone();
+            stop.remove("stop");
+            stop.remove("text");
+            return AgentStop(self.0.clone()).run(ctx, &stop).await;
+        }
         let (Some(agent), Some(text)) = (str_arg(args, "agent"), str_arg(args, "text")) else {
-            return ToolOutput::error("Give `agent` (the agent's id) and `text` (the message), both as strings.");
+            return ToolOutput::error("Give `agent` (the agent's id) and `text` (the message), both as strings; or `stop: true` to end the agent.");
         };
         let id = match shared.orch.resolve_child(&shared.session, &SessionId::from(agent)).await {
             Ok(id) => id,
@@ -1578,7 +1626,7 @@ impl Tool for Verify {
             Ok(s) => s,
             Err(out) => return *out,
         };
-        let mut report = settlement.report.clone();
+        let mut report = with_incomplete_header(&settlement.report, settlement.outcome, settlement.steps);
         if let Some(id) = claim_id {
             report.push_str(&format!(
                 "\n\nThe verdict is not recorded on {id}; set the claim's status yourself with `claim` and `id`."
@@ -1943,7 +1991,7 @@ mod tests {
     async fn message_delivers_or_relays_refusal() {
         let r = lead();
         let res = r.call("agent_message", json!({"agent":"s-kid1","text":"hello"})).await;
-        assert_eq!(res.status, ToolStatus::Ok);
+        assert_eq!(res.status, ToolStatus::Ok, "{}", res.text);
         assert!(res.text.contains("sent") && res.text.contains("Delivered to s-kid1."), "{}", res.text);
         assert_eq!(r.orch.calls(), vec!["message s-kid1: hello"]);
         *r.orch.refuse.lock().unwrap() = Some("s-kid1 is not running.".into());

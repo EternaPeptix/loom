@@ -66,6 +66,7 @@ use std::io::{self, Read};
 use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::SystemTime;
 
@@ -107,6 +108,9 @@ impl Seen {
 #[derive(Debug, Default)]
 pub struct FileTracker {
     seen: Mutex<HashMap<PathBuf, Seen>>,
+    /// The session step current when each path was last recorded (see [`FileTracker::set_step`]).
+    steps: Mutex<HashMap<PathBuf, u64>>,
+    step: AtomicU64,
 }
 
 /// Why [`open_regular`] or [`open_readable`] did not open a file.
@@ -403,9 +407,33 @@ impl FileTracker {
         self.seen.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Say which session step the calls that follow belong to; records made now carry it.
+    pub fn set_step(&self, step: u64) {
+        self.step.store(step, Ordering::Relaxed);
+    }
+
+    fn steps(&self) -> MutexGuard<'_, HashMap<PathBuf, u64>> {
+        self.steps.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Record what this session has seen of `path`.
     pub fn record(&self, path: &Path, seen: Seen) {
+        let step = self.step.load(Ordering::Relaxed);
+        self.steps().insert(path.to_path_buf(), step);
         self.map().insert(path.to_path_buf(), seen);
+    }
+
+    /// The step at which this session last saw `path`, when what it saw then differs from `now`
+    /// (the file changed in between, by something other than this session's own writes).
+    pub fn changed_since(&self, path: &Path, now: &Seen) -> Option<u64> {
+        let was = self.map().get(path).cloned()?;
+        // A hash and a size-and-time record describe a file differently: they cannot say it changed.
+        let same_kind =
+            matches!((&was.0, &now.0), (Record::Hash(..), Record::Hash(..)) | (Record::Stat(..), Record::Stat(..)));
+        if &was == now || !same_kind {
+            return None;
+        }
+        Some(self.steps().get(path).copied().unwrap_or(0))
     }
 
     /// Record that this session has seen `bytes` as the content of `path`.
@@ -420,6 +448,7 @@ impl FileTracker {
     }
 
     pub fn forget(&self, path: &Path) {
+        self.steps().remove(path);
         self.map().remove(path);
     }
 

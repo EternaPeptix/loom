@@ -12,6 +12,7 @@
 //! - [`runtime`] every session of a loom home: starting, restoring, parents and children, the operator's actions
 //! - [`evalkit`] scripted models played against the runtime, and the scorecard of each run
 
+pub mod completeness;
 pub mod continuation;
 pub mod evalkit;
 pub mod frontier;

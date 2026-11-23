@@ -130,6 +130,36 @@ pub struct ToolCtx {
 /// Reserved `ToolOutput::meta` key that carries a tool's images to `finalize`; never written to a record.
 pub const META_IMAGES: &str = "\u{0}images";
 
+/// Meta `complete`: `false` when the result did not cover everything it was asked about; absent otherwise.
+pub const META_COMPLETE: &str = "complete";
+/// Meta `limits`: the short words (`cut`, `timeout`, `idle stop`, `output limit`, `net denied`,
+/// `unreadable skipped`, `search cap`, `child incomplete`) that say how. A tool may put its own words here;
+/// [`finalize`] adds the ones it can tell from the result and sets `complete`.
+pub const META_LIMITS: &str = "limits";
+/// Meta `net_denied`: how many proxy connections were denied during a `bash`/`box_exec` call.
+pub const META_NET_DENIED: &str = "net_denied";
+
+/// Add `word` to the `limits` of `meta` (once) and mark the result `complete: false`.
+pub fn add_limit(meta: &mut Map<String, Value>, word: &str) {
+    let mut list: Vec<Value> = match meta.remove(META_LIMITS) {
+        Some(Value::Array(a)) => a,
+        _ => Vec::new(),
+    };
+    if !list.iter().any(|v| v.as_str() == Some(word)) {
+        list.push(json!(word));
+    }
+    meta.insert(META_LIMITS.into(), Value::Array(list));
+    meta.insert(META_COMPLETE.into(), json!(false));
+}
+
+/// The limits recorded in a result's meta.
+pub fn limits_of(meta: &Map<String, Value>) -> Vec<String> {
+    match meta.get(META_LIMITS) {
+        Some(Value::Array(a)) => a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// What a tool hands back.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ToolOutput {
@@ -190,6 +220,12 @@ impl ToolOutput {
 
     pub fn with_meta(mut self, key: &str, value: Value) -> ToolOutput {
         self.meta.insert(key.to_string(), value);
+        self
+    }
+
+    /// Say that this result did not cover everything, by one of the words of [`META_LIMITS`].
+    pub fn with_limit(mut self, word: &str) -> ToolOutput {
+        add_limit(&mut self.meta, word);
         self
     }
 
@@ -626,21 +662,40 @@ pub fn finalize(
     started: Instant,
 ) -> ToolResult {
     let ToolOutput { status, outcome, more, body, mut meta } = output;
+    let outcome_text = outcome.clone();
     let mut facts = Facts { tool: spec.name.clone(), outcome, more, notes: None };
     let duration_ms = started.elapsed().as_millis() as u64;
     let images: Vec<loom_core::ImageRef> =
         meta.remove(META_IMAGES).and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
-    let base = |status, text, output, cut, meta| ToolResult {
-        call_id: ctx.call_id.clone(),
-        name: spec.name.clone(),
-        status,
-        text,
-        output,
-        cut,
-        class: spec.class,
-        meta,
-        duration_ms,
-        images: images.clone(),
+    let derived: Vec<&str> = {
+        let mut d = Vec::new();
+        if status == ToolStatus::Timeout {
+            d.push(if outcome_text.contains("no output during idle") { "idle stop" } else { "timeout" });
+        }
+        if outcome_text.starts_with("stopped: output passed") {
+            d.push("output limit");
+        }
+        d
+    };
+    let base = |status, text, output, cut: bool, mut meta: Map<String, Value>| {
+        for word in &derived {
+            add_limit(&mut meta, word);
+        }
+        if cut {
+            add_limit(&mut meta, "cut");
+        }
+        ToolResult {
+            call_id: ctx.call_id.clone(),
+            name: spec.name.clone(),
+            status,
+            text,
+            output,
+            cut,
+            class: spec.class,
+            meta,
+            duration_ms,
+            images: images.clone(),
+        }
     };
     // A view sized for the bound the call ran with is not cut for a lower one that came after it.
     let budget = ctx.view_chars.max(admission.policy.view_chars(admission.estimator));

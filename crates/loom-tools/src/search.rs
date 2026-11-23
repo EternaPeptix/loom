@@ -6,7 +6,9 @@
 //! Walk `path` (default: the workspace; `ctx.sandbox.resolve` + `check_read`; a file is allowed and
 //! is then the only member) with the `ignore` crate: `.gitignore`/`.ignore`/global git excludes are
 //! respected and hidden files skipped, unless `no_ignore` / `hidden` are set; `.git` directories are
-//! always skipped; symlinks are not followed; entries the sandbox makes unreadable are skipped. The
+//! always skipped; symlinks are not followed; entries the sandbox makes unreadable are skipped and counted
+//! (fact `{k} entries unreadable in the sandbox were skipped`, limit `unreadable skipped`; a result cut by the
+//! result bound carries limit `search cap`). The
 //! walk runs on a blocking thread and stops early when `ctx.cancel` fires (result status
 //! `Interrupted`, with what was found so far).
 //!
@@ -341,7 +343,7 @@ fn set_description(hidden: bool, no_ignore: bool) -> String {
 /// Header facts about the walk itself.
 fn walk_facts(found: &Found, more: &mut Vec<String>) {
     if found.unreadable > 0 {
-        more.push(format!("{} entries skipped (not readable under the sandbox)", found.unreadable));
+        more.push(format!("{} entries unreadable in the sandbox were skipped", found.unreadable));
     }
     if found.errors > 0 {
         more.push(format!("{} entries could not be read during the walk", found.errors));
@@ -572,9 +574,18 @@ fn glob_job(scan: &Scan, glob: &PathGlob, pattern: &str, hidden: bool, no_ignore
             }
         }
         let total = hits.len();
+        let capped = sink.shown < total || sink.full;
         let body = sink.finish(total, found.interrupted, "files", GLOB_ADVICE);
-        ToolOutput::ok(format!("{total} files"), Body::Raw(body.into_bytes()))
+        let out = ToolOutput::ok(format!("{total} files"), Body::Raw(body.into_bytes()));
+        if capped {
+            out.with_limit("search cap")
+        } else {
+            out
+        }
     };
+    if found.unreadable > 0 {
+        out = out.with_limit("unreadable skipped");
+    }
     out.more = more;
     with_status(status, out)
 }
@@ -974,9 +985,18 @@ fn grep_job(scan: &Scan, opts: &GrepOpts, hint_limits: HintLimits) -> ToolOutput
         let (total, unit) =
             if opts.files_only { (files_with, "files with matches") } else { (matches, "matching lines") };
         let advice = if opts.files_only { GREP_FILES_ADVICE } else { GREP_ADVICE };
+        let capped = sink.shown < total || sink.full;
         let body = sink.finish(total, interrupted, unit, advice);
-        ToolOutput::ok(format!("{matches} matches in {files_with} files"), Body::Raw(body.into_bytes()))
+        let out = ToolOutput::ok(format!("{matches} matches in {files_with} files"), Body::Raw(body.into_bytes()));
+        if capped {
+            out.with_limit("search cap")
+        } else {
+            out
+        }
     };
+    if found.unreadable > 0 || unreadable > 0 {
+        out = out.with_limit("unreadable skipped");
+    }
     out.more = more;
     with_status(status, out)
 }
@@ -1578,7 +1598,9 @@ mod tests {
         put(&e, "key.txt", "needle\n");
         let r = e.call("grep", json!({"pattern": "needle"})).await;
         assert_eq!(e.stored(&r), "open.txt:1:needle\n");
-        assert!(r.text.contains("2 entries skipped"), "{}", r.text);
+        assert!(r.text.contains("2 entries unreadable in the sandbox were skipped"), "{}", r.text);
+        assert_eq!(r.meta.get("limits"), Some(&json!(["unreadable skipped"])));
+        assert_eq!(r.meta.get("complete"), Some(&json!(false)));
         let r = e.call("glob", json!({"pattern": "**"})).await;
         assert_eq!(lines(&e.stored(&r)), vec!["open.txt"]);
         let r = e.call("grep", json!({"pattern": "needle", "path": "secret"})).await;

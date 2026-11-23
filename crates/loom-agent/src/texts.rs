@@ -157,13 +157,6 @@ pub const REASON_RESTART: &str = "the harness was restarted";
 /// `Interrupted::reason` when the agent that assigned the work stopped it.
 pub const REASON_PARENT: &str = "stopped by the agent that assigned this work";
 
-/// A stretch of steps that recorded nothing and changed nothing.
-pub fn stall(steps: u32) -> String {
-    format!(
-        "The last {steps} steps recorded nothing in the ledger and changed no file. If you have learned something, record it now (`note`, or `claim` with `evidence`). If the current approach is not getting anywhere, record it as a dead end with `note` and take a different one. Record what you ruled out and why, the best next route you can see, and the evidence that would change your conclusion with `note`. If you cannot continue, call `report_blocker`."
-    )
-}
-
 /// The line a successful `claim_update` to `supported` adds: the result is banked. `n` and `ids` describe every
 /// result established in the mission after the write.
 pub fn result_banked(id: &str, n: usize, ids: &str) -> String {
@@ -1800,7 +1793,6 @@ mod tests {
         assert!(!stuck_notice().chars().any(|c| c.is_ascii_digit()));
         assert!(finish_status_line(false, true, false).is_some_and(|l| l.contains("unreachable")));
         assert!(finish_status_line(false, true, true).is_some_and(|l| !l.contains("unreachable")));
-        assert!(stall(30).contains("the evidence that would change your conclusion"));
     }
 
     #[test]
@@ -1808,7 +1800,6 @@ mod tests {
         assert_eq!(sentence(" no route to host "), "no route to host.");
         assert_eq!(sentence("Refused."), "Refused.");
         assert_eq!(sentence(""), "");
-        assert!(stall(30).starts_with("The last 30 steps recorded nothing"));
         assert_eq!(agent_message("stop at 3"), "Message from the agent that assigned this work:\nstop at 3");
     }
 

@@ -297,27 +297,6 @@ pub fn goal_unconcluded_ignoring_release(ledger: &LedgerState) -> bool {
     ledger.goal.is_some() && ledger.goal_met.as_ref().is_none_or(|g| g.status == GoalMetStatus::Open)
 }
 
-/// The nudge paragraph for a lead that stopped while the goal claim is open and no plan step is: with
-/// nothing planned, an idle reply would be a silent way out. `None` in every other case.
-fn idle_goal_paragraph(ctx: &YieldCtx<'_>) -> Option<String> {
-    let ledger = ctx.ledger?;
-    if !has(ctx.tools, "conclude") || !goal_unconcluded(ledger) || !ledger.open_items().plan.is_empty() {
-        return None;
-    }
-    let mut p = String::from(
-        "The goal is not concluded and no plan step is open, so stopping here is not an exit — but this is not a judgment of the mission either: the record does not show one of the two honest outcomes yet. Add a plan step for the next route and take it, or run the target again.",
-    );
-    if has(ctx.tools, "conclude") {
-        p.push_str(
-            " Call conclude once a run shows the goal met, or once you have established that it cannot be met as stated (every route closed, with execution evidence) — a well-evidenced negative conclusion is a reportable outcome, not a failure.",
-        );
-    }
-    if has(ctx.tools, "report_blocker") {
-        p.push_str(" If something only the operator can supply is blocking you, call report_blocker.");
-    }
-    Some(p)
-}
-
 pub fn on_yield(ctx: &YieldCtx<'_>) -> Yield {
     if ctx.termination == Termination::Free {
         return Yield::End;
@@ -346,11 +325,6 @@ pub fn on_yield(ctx: &YieldCtx<'_>) -> Yield {
     let mut paragraphs = vec![first];
     if let Some(block) = open {
         paragraphs.push(block);
-    }
-    if !ctx.is_child {
-        if let Some(p) = idle_goal_paragraph(ctx) {
-            paragraphs.push(p);
-        }
     }
     if ctx.running_jobs + ctx.running_children > 0 {
         let mut what = Vec::new();
@@ -1068,38 +1042,11 @@ To keep working, call a tool. To deliver your result, call finish; if the assign
     }
 
     #[test]
-    fn an_open_goal_claim_with_no_open_step_is_named_at_the_stop_gate() {
+    fn an_open_goal_claim_adds_no_paragraph_to_the_stop_gate() {
         let t = tools(&["finish", "conclude", "report_blocker"]);
         let l = with_goal(false);
         let text = nudge(&ctx(&t, Some(&l), "I am done."));
-        assert!(
-            text.contains("The goal is not concluded and no plan step is open, so stopping here is not an exit — but this is not a judgment of the mission either:"),
-            "{text}"
-        );
-        assert!(text.contains("Call conclude once a run shows the goal met"), "{text}");
-        assert!(text.contains("call report_blocker"), "{text}");
-        // Without report_blocker that sentence is left out; without conclude the session is not gated at all.
-        let no_blocker = tools(&["finish", "conclude"]);
-        let text = nudge(&ctx(&no_blocker, Some(&l), "x"));
-        assert!(
-            text.contains("no plan step is open") && text.contains("Call conclude") && !text.contains("report_blocker"),
-            "{text}"
-        );
-        let bare = tools(&["finish"]);
-        assert!(!nudge(&ctx(&bare, Some(&l), "x")).contains("not an exit"));
-        // An open plan step, a concluded goal, a released mission, no goal and a child: not mentioned.
-        let open = with_goal(true);
-        assert!(!nudge(&ctx(&t, Some(&open), "x")).contains("not an exit"));
-        let mut met = with_goal(false);
-        met.goal_met = met.goal_met.map(|g| loom_core::ledger::GoalMet { status: GoalMetStatus::Supported, ..g });
-        assert!(!nudge(&ctx(&t, Some(&met), "x")).contains("not an exit"));
-        let mut released = with_goal(false);
-        released.release = Some(loom_core::ledger::Release { reason: "stop".into(), n: 3 });
-        assert!(!nudge(&ctx(&t, Some(&released), "x")).contains("not an exit"));
-        assert!(!nudge(&ctx(&t, Some(&LedgerState::default()), "x")).contains("not an exit"));
-        let mut c = ctx(&t, Some(&l), "x");
-        c.is_child = true;
-        assert!(!nudge(&c).contains("not an exit"));
+        assert!(!text.contains("not an exit") && !text.contains("Call conclude"), "{text}");
         // A free-termination session just ends.
         let mut c = ctx(&t, Some(&l), "x");
         c.termination = Termination::Free;

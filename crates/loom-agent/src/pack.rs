@@ -1191,7 +1191,7 @@ mod tests {
         };
         assert_eq!(
             shown("lead"),
-            sorted("bash job_wait job_kill read write edit glob grep web_fetch dep_scan plan note claim evidence ledger log_search agent_spawn verify request_scope finish ask_user report_blocker")
+            sorted("bash job_wait job_kill read write edit glob grep web_fetch dep_scan plan note claim evidence ledger log_search agent_spawn agent_message verify request_scope finish ask_user report_blocker")
         );
         assert_eq!(
             shown("worker"),
@@ -1201,7 +1201,7 @@ mod tests {
             shown("verifier"),
             sorted("bash job_wait job_kill read glob grep web_fetch dep_scan ledger log_search verdict report_blocker")
         );
-        assert_eq!((shown("lead").len(), shown("worker").len(), shown("verifier").len()), (22, 18, 12));
+        assert_eq!((shown("lead").len(), shown("worker").len(), shown("verifier").len()), (23, 18, 12));
         // The chat role follows the generic rule: out_read/out_grep/job_list/pin are hidden, nothing else.
         let chat = packs.role(None, Some("chat")).unwrap();
         for hidden in ["out_read", "out_grep", "job_list", "pin"] {
@@ -1234,6 +1234,73 @@ mod tests {
                 for (what, text) in &texts {
                     for h in &role.hidden_tools {
                         if text.contains(&format!("`{h}`")) {
+                            found.push(format!("{}/{}: the {what} names the hidden tool `{h}`", pack.name, role.name));
+                        }
+                    }
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked >= 20, "only {checked} roles checked");
+        found.dedup();
+        assert!(found.is_empty(), "{}", found.join("\n"));
+    }
+
+    #[test]
+    fn runtime_messages_never_name_a_tool_the_role_is_not_shown() {
+        use crate::gate::{on_yield, Yield, YieldCtx};
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs");
+        let packs = Packs::load(&dir).unwrap();
+        let mut found: Vec<String> = Vec::new();
+        let mut checked = 0;
+        for pack in packs.names().iter().filter_map(|n| packs.get(n)) {
+            for role in pack.roles.values() {
+                let shown: Vec<String> =
+                    role.tools.iter().filter(|t| !role.hidden_tools.contains(t)).cloned().collect();
+                let jobs = vec!["j1".to_string()];
+                let agents = vec!["s-kid1".to_string()];
+                let mut texts = vec![
+                    (
+                        "running refusal (finish)",
+                        crate::rtools::terminal::running_refusal("finish", role, &jobs, &agents),
+                    ),
+                    (
+                        "running refusal (hand_off)",
+                        crate::rtools::terminal::running_refusal("hand_off", role, &jobs, &[]),
+                    ),
+                ];
+                let ledger = loom_core::ledger::LedgerState {
+                    goal: Some("g".into()),
+                    goal_met: Some(loom_core::ledger::GoalMet {
+                        status: loom_core::ledger::GoalMetStatus::Open,
+                        note: String::new(),
+                        evidence: vec![],
+                        n: 0,
+                    }),
+                    ..Default::default()
+                };
+                for (is_child, running) in [(false, 0), (true, 0), (false, 2)] {
+                    let c = YieldCtx {
+                        termination: role.termination,
+                        is_child,
+                        tools: &shown,
+                        ledger: Some(&ledger),
+                        reply: "done",
+                        nudges: 0,
+                        max_nudges: 3,
+                        running_jobs: running,
+                        running_children: running,
+                    };
+                    if let Yield::Nudge(t) | Yield::Park(t) = on_yield(&c) {
+                        texts.push(("stop-gate nudge", t));
+                    }
+                }
+                for (what, text) in &texts {
+                    for h in &role.hidden_tools {
+                        if text.contains(&format!("`{h}`"))
+                            || text.contains(&format!("Call {h}"))
+                            || text.contains(&format!("call {h}"))
+                        {
                             found.push(format!("{}/{}: the {what} names the hidden tool `{h}`", pack.name, role.name));
                         }
                     }

@@ -334,6 +334,8 @@ struct Slots {
     /// Refusals of the lead's `finish` without new execution evidence since the last rejection. In-memory only.
     stuck_refusals: u32,
     fresh_start: Option<FreshStart>,
+    /// The limits (`cut`, `timeout`, ...) of the stored outputs whose results were not complete.
+    output_limits: std::collections::HashMap<BlobId, Vec<String>>,
 }
 
 /// One session's handle for its runtime tools. Created by the runtime, shared by `Arc`.
@@ -391,6 +393,18 @@ impl Shared {
         }
         slots.stuck_refusals = slots.stuck_refusals.saturating_add(1);
         slots.stuck_refusals
+    }
+
+    /// Remember what the result that stored `blob` did not cover (the verifier's brief lists it).
+    pub fn note_output_limits(&self, blob: &BlobId, limits: Vec<String>) {
+        if !limits.is_empty() {
+            self.slots().output_limits.insert(blob.clone(), limits);
+        }
+    }
+
+    /// What the result that stored `blob` did not cover; empty for a complete one.
+    pub fn output_limits(&self, blob: &BlobId) -> Vec<String> {
+        self.slots().output_limits.get(blob).cloned().unwrap_or_default()
     }
 
     pub fn take_emitted(&self) -> Vec<(Author, Event)> {
