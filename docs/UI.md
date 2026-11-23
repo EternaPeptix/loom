@@ -728,7 +728,8 @@ request reads "Approved · hosts granted: …", a refused one "Refused".
   breadcrumbs and a list read one folder at a time, on opening and on **Refresh** only (no polling). Keys as in the picker (in an empty folder focus is on the current crumb, and Backspace, Left and Alt+Up go up from there); a
   filter over the loaded entries; Show hidden (the daemon's `hidden` flag); links, non-files and the root's `.loom` (the
   entry the daemon marks with a `note`) are listed but closed, each with its reason; a folder the daemon cannot list
-  shows the daemon's sentence (409) in the status line. The tab's DOM is built once per session, so a redraw never loses the filter or the focus.
+  shows the daemon's sentence (409) in the status line. The root's `.loom` stays closed, but `.loom/uploads` and what lies
+  under it can be typed as a path, listed and read (`docs/UPLOADS.md`). The tab's DOM is built once per session, so a redraw never loses the filter or the focus.
 - **A file in the viewer** (`GET …/files/lines?path=&start=&count=`): the stored-output dialog in file mode: the relative path,
   size and age in the header, "File in the workspace now — it may have changed since the agent read it", Go to line and Find
   in loaded lines, **Copy path** (the absolute path), no citation marks. A binary file says so and shows no lines; a refusal

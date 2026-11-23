@@ -1105,6 +1105,132 @@ pub fn flag_candidate(handle: &str) -> String {
     format!("Candidate flag pattern appeared in the admitted view of {handle}. This is an unverified candidate: inspect its stored output and validate against the challenge oracle or independent verifier. A regex match alone never establishes success.")
 }
 
+// ---------------------------------------------------------------------------------------------
+// Attachments (docs/UPLOADS.md)
+
+/// The fixed first line of the attachment block; the UI recognises the block by it.
+pub const ATTACH_HEADER: &str = "Attached files (saved read-only; read them with `read`):";
+/// The largest UTF-8 text file whose content is also shown inline in the message.
+pub const ATTACH_INLINE_MAX: u64 = 16 * 1024;
+
+/// One file attached to a message: an upload of the session's workspace, as the model is told of it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttachedFile {
+    /// Absolute path, `<workspace>/.loom/uploads/<name>`.
+    pub path: String,
+    pub bytes: u64,
+    pub mime: String,
+    /// The whole content, for a UTF-8 text file of at most [`ATTACH_INLINE_MAX`] bytes.
+    pub inline: Option<String>,
+}
+
+pub fn not_an_upload(path: &str) -> String {
+    format!("Attach files with POST /api/uploads first; {path} is not an upload of this workspace.")
+}
+
+/// A size in decimal units (1 KB = 1000 bytes): `512 B`, `12.4 KB`, `231 KB`, `3.1 MB`.
+pub fn file_size(n: u64) -> String {
+    if n < 1000 {
+        return format!("{n} B");
+    }
+    let units = ["KB", "MB", "GB", "TB"];
+    let mut x = n as f64 / 1000.0;
+    let mut i = 0usize;
+    while x >= 1000.0 && i + 1 < units.len() {
+        x /= 1000.0;
+        i += 1;
+    }
+    let unit = units.get(i).copied().unwrap_or("TB");
+    if x >= 100.0 {
+        format!("{} {unit}", x.round())
+    } else {
+        format!("{x:.1} {unit}")
+    }
+}
+
+/// The media type of an upload: the `given` Content-Type when it says something (not blank, not
+/// `application/octet-stream`, not a form encoding), else from the extension of `name`, else
+/// `application/octet-stream`.
+pub fn mime_for(name: &str, given: Option<&str>) -> String {
+    if let Some(g) = given {
+        let base = g.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+        let vague = ["", "application/octet-stream", "application/x-www-form-urlencoded", "multipart/form-data"];
+        if base.contains('/') && !vague.contains(&base.as_str()) {
+            return base;
+        }
+    }
+    let ext = extension(name).to_ascii_lowercase();
+    let mime = match ext.as_str() {
+        "txt" | "log" | "text" => "text/plain",
+        "md" | "markdown" => "text/markdown",
+        "csv" => "text/csv",
+        "tsv" => "text/tab-separated-values",
+        "html" | "htm" => "text/html",
+        "css" => "text/css",
+        "xml" => "application/xml",
+        "json" => "application/json",
+        "yaml" | "yml" => "application/yaml",
+        "toml" => "application/toml",
+        "js" | "mjs" => "text/javascript",
+        "pdf" => "application/pdf",
+        "zip" => "application/zip",
+        "gz" | "tgz" => "application/gzip",
+        "tar" => "application/x-tar",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "bmp" => "image/bmp",
+        "rs" => "text/x-rust",
+        "py" => "text/x-python",
+        "c" | "h" => "text/x-c",
+        "sh" => "text/x-shellscript",
+        _ => "application/octet-stream",
+    };
+    mime.to_string()
+}
+
+/// The part of `name` after its last dot (empty for none, or for a name that only starts with a dot).
+fn extension(name: &str) -> &str {
+    match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => ext,
+        _ => "",
+    }
+}
+
+/// `text` followed by the attachment block for `files`; `text` unchanged when there are none. An empty
+/// `text` gives the block alone.
+pub fn with_attachments(text: &str, files: &[AttachedFile]) -> String {
+    if files.is_empty() {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    let body = text.trim_end();
+    if !body.is_empty() {
+        out.push_str(body);
+        out.push_str("\n\n");
+    }
+    out.push_str(ATTACH_HEADER);
+    for f in files {
+        out.push_str(&format!("\n- {} ({}, {})", f.path, file_size(f.bytes), f.mime));
+    }
+    for f in files {
+        let Some(content) = &f.inline else { continue };
+        // A fence longer than any run of backticks in the content.
+        let longest = content.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+        let fence = "`".repeat(longest.max(2).saturating_add(1));
+        let name = f.path.rsplit('/').next().unwrap_or("");
+        let info = extension(name).to_ascii_lowercase();
+        out.push_str(&format!("\n\n`{}`:\n{fence}{info}\n{content}", f.path));
+        if !content.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&fence);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1692,5 +1818,64 @@ mod tests {
         assert_eq!(outcome_word(ChildOutcome::BudgetExhausted), "budget_exhausted");
         assert_eq!(not_in_assignment("write", "verifier", &["read".into(), "grep".into()]),
             "`write` is not available in this assignment (role `verifier`). Nothing was executed. Available here: read, grep.");
+    }
+
+    fn csv_and_png() -> Vec<AttachedFile> {
+        vec![
+            AttachedFile {
+                path: "/ws/.loom/uploads/report.csv".into(),
+                bytes: 12_400,
+                mime: "text/csv".into(),
+                inline: Some("a,b\n1,2\n".into()),
+            },
+            AttachedFile {
+                path: "/ws/.loom/uploads/screen.png".into(),
+                bytes: 231_000,
+                mime: "image/png".into(),
+                inline: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn the_attachment_block_is_exact() {
+        assert_eq!(
+            with_attachments("Look at these.", &csv_and_png()),
+            "Look at these.\n\nAttached files (saved read-only; read them with `read`):\n\
+             - /ws/.loom/uploads/report.csv (12.4 KB, text/csv)\n\
+             - /ws/.loom/uploads/screen.png (231 KB, image/png)\n\n\
+             `/ws/.loom/uploads/report.csv`:\n```csv\na,b\n1,2\n```"
+        );
+        // No text: the block alone. No files: the text as it is.
+        assert!(with_attachments("", &csv_and_png()).starts_with(ATTACH_HEADER));
+        assert_eq!(with_attachments("hi \n", &[]), "hi \n");
+    }
+
+    #[test]
+    fn an_inline_file_without_a_final_newline_or_with_backticks_is_fenced_safely() {
+        let f = AttachedFile {
+            path: "/w/.loom/uploads/n".into(),
+            bytes: 9,
+            mime: "text/plain".into(),
+            inline: Some("x\n```\ny".into()),
+        };
+        let out = with_attachments("t", &[f]);
+        assert!(out.ends_with("`/w/.loom/uploads/n`:\n````\nx\n```\ny\n````"), "{out}");
+    }
+
+    #[test]
+    fn sizes_use_decimal_units_and_types_come_from_the_extension_or_the_header() {
+        assert_eq!(file_size(0), "0 B");
+        assert_eq!(file_size(512), "512 B");
+        assert_eq!(file_size(999), "999 B");
+        assert_eq!(file_size(1000), "1.0 KB");
+        assert_eq!(file_size(12_400), "12.4 KB");
+        assert_eq!(file_size(231_000), "231 KB");
+        assert_eq!(file_size(3_100_000), "3.1 MB");
+        assert_eq!(mime_for("a.CSV", None), "text/csv");
+        assert_eq!(mime_for("a.png", Some("application/octet-stream")), "image/png");
+        assert_eq!(mime_for("a.bin", Some("Image/WebP; q=1")), "image/webp");
+        assert_eq!(mime_for("noext", None), "application/octet-stream");
+        assert_eq!(mime_for(".hidden", None), "application/octet-stream");
     }
 }

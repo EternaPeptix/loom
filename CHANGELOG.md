@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### File uploads
+
+- `POST /api/uploads?workspace=&name=` (raw body, at most 32 MiB) stores a file in `<workspace>/.loom/uploads/` (name
+  cleaned, numbered when taken, written atomically). `MessageBody` and `NewSession` take `attachments`, absolute paths of
+  uploads of the session's workspace; the runtime appends an attachment block (list, and an inline copy of small text
+  files) to the recorded message. The Files routes serve `.loom/uploads` and nothing else under `.loom`; under
+  Bubblewrap `.loom/uploads` is bound read-only inside the hidden `.loom`. `loom send` and `loom run` take
+  `--file PATH` (repeatable). See `docs/UPLOADS.md`.
+
 ### Stored outputs are the mission's own
 
 - `out_read`, `out_grep`, `pin`, `evidence` and `finish` quotes, `security_record` secret handles,

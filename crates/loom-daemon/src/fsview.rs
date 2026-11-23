@@ -17,13 +17,14 @@
 //!   check lists nothing it should not; each entry's `path` is built from that real path.
 //! - [`list_files`]`(root, loom_home, rel)`: the entries of folder `rel` of the canonical workspace `root`, read
 //!   through one descriptor in the same way: the real path of the open folder must lie inside `root`, outside
-//!   `<root>/.loom` and outside the loom home, or the folder is refused and nothing is listed.
+//!   `<root>/.loom` (except `<root>/.loom/uploads` and what is under it, where uploads are kept) and outside the
+//!   loom home, or the folder is refused and nothing is listed.
 //! - [`read_file_lines`]`(root, loom_home, rel, start, count)`: lines of the regular file `rel` of `root`, at most
 //!   32 MiB of it read (a larger file is refused with a sentence saying so), `count` clamped to `1..=5000`. Only
 //!   the requested lines are kept: no per-line index is built, so memory stays at the file's size.
 //! - Path safety for both file functions ([`resolve_in`]): `rel` is relative; an absolute path, a `..` component
 //!   and a NUL are refused; the target is resolved (links followed) and must lie inside `root`; a symlink that
-//!   leads outside is refused, never followed; nothing inside `<root>/.loom` is reachable by any route, by name
+//!   leads outside is refused, never followed; nothing inside `<root>/.loom` except `.loom/uploads` is reachable by any route, by name
 //!   or through a link (the listing shows `.loom` of the root as a closed entry); nothing that resolves into
 //!   `loom_home` (the daemon's token and keys) is reachable either, which matters for a workspace that holds the
 //!   loom home. A file is opened with
@@ -189,12 +190,21 @@ fn clean_rel(rel: &str) -> Result<Vec<&OsStr>, String> {
 }
 
 /// Whether `p` lies inside `<root>/.loom` (the first component under the root, whatever its case: a volume may
-/// not tell `.loom` from `.LOOM`).
+/// not tell `.loom` from `.LOOM`), except `<root>/.loom/uploads` and what is under it (`docs/UPLOADS.md`).
 fn in_harness(root: &Path, p: &Path) -> bool {
-    p.strip_prefix(root)
-        .ok()
-        .and_then(|r| r.components().next())
-        .is_some_and(|c| c.as_os_str().to_string_lossy().eq_ignore_ascii_case(".loom"))
+    let Ok(rel) = p.strip_prefix(root) else { return false };
+    let mut parts = rel.components().map(|c| c.as_os_str().to_string_lossy());
+    parts.next().is_some_and(|c| c.eq_ignore_ascii_case(".loom")) && parts.next().is_none_or(|c| c != UPLOADS_DIR)
+}
+
+/// The folder under `<root>/.loom` that holds uploads.
+const UPLOADS_DIR: &str = "uploads";
+
+/// Whether the cleaned relative path `parts` is `.loom/uploads` or inside it.
+fn in_uploads(parts: &[&OsStr]) -> bool {
+    parts.len() >= 2
+        && parts.first().is_some_and(|p| p.to_string_lossy().eq_ignore_ascii_case(".loom"))
+        && parts.get(1).is_some_and(|p| p.to_string_lossy() == UPLOADS_DIR)
 }
 
 /// The sentence for a target that is, or leads into, the loom home.
@@ -207,7 +217,7 @@ fn home_note(text: &str, loom_home: &Path) -> String {
 pub fn resolve_in(root: &Path, loom_home: &Path, rel: &str) -> Result<(PathBuf, String), String> {
     let parts = clean_rel(rel)?;
     let text = parts.iter().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>().join("/");
-    if parts.first().is_some_and(|p| p.to_string_lossy().eq_ignore_ascii_case(".loom")) {
+    if parts.first().is_some_and(|p| p.to_string_lossy().eq_ignore_ascii_case(".loom")) && !in_uploads(&parts) {
         return Err(format!("{text} is not shown: {HARNESS_NOTE}."));
     }
     let mut joined = root.to_path_buf();
@@ -545,6 +555,31 @@ mod tests {
         );
         assert!(list_files(&root, &lh(&root), "a.txt").unwrap_err().contains("is a file"));
         assert!(list_files(&root, &lh(&root), "nope").unwrap_err().starts_with("There is no"));
+    }
+
+    #[test]
+    fn uploads_under_the_harness_folder_are_listed_and_read_but_nothing_else_of_it() {
+        let (_d, root, _base, _paths) = tree();
+        let up = root.join(".loom/uploads");
+        std::fs::create_dir_all(up.join("sub")).unwrap();
+        std::fs::write(up.join("r.csv"), "a,b\n1,2\n").unwrap();
+        std::fs::write(up.join("sub/x.txt"), "x").unwrap();
+        symlink(root.join(".loom/secret"), up.join("peek")).unwrap();
+        let lh = lh(&root);
+        let v = list_files(&root, &lh, ".loom/uploads").unwrap();
+        let names: Vec<&str> = v.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["sub", "peek", "r.csv"]);
+        assert_eq!(list_files(&root, &lh, ".loom/uploads/sub").unwrap().entries.len(), 1);
+        let f = read_file_lines(&root, &lh, ".loom/uploads/r.csv", None, None).unwrap();
+        assert_eq!((f.text.as_str(), f.total), ("a,b\n1,2\n", 2));
+        // The rest of `.loom` stays closed, and so does a link out of uploads into it.
+        for rel in [".loom", ".loom/secret", ".loom/uploadsx", ".loom/Uploads2/a", ".loom/uploads/peek"] {
+            assert!(list_files(&root, &lh, rel).is_err(), "{rel}");
+            assert!(read_file_lines(&root, &lh, rel, None, None).is_err(), "{rel}");
+        }
+        let root_listing = list_files(&root, &lh, "").unwrap();
+        let loom = root_listing.entries.iter().find(|e| e.name == ".loom").unwrap();
+        assert_eq!(loom.note.as_deref(), Some(HARNESS_NOTE));
     }
 
     #[test]

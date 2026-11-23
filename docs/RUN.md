@@ -349,11 +349,11 @@ Exit status of `run` and `send`: 0 after `Finished` or `Yielded`; 2 when you are
 | `loom daemon` / `up` / `down` | run the daemon in the foreground / in the background / stop it |
 | `loom status` | the daemon, each model server and whether it answered, counts, free disk space |
 | `loom open [--print]` | open the web UI in the browser (`--print` prints the address instead) |
-| `loom run [options] <task...>` | start a session and follow it; `-d` starts it and returns |
+| `loom run [options] [--file PATH]... <task...>` | start a session and follow it; `-d` starts it and returns; `--file` attaches files as `send` does (the workspace must already exist) |
 | `loom chat [options]` | turn-by-turn `chat` session; `--session <id>` continues one; `/quit` leaves |
 | `loom ls [-a]` | sessions (`-a`: archived too) |
 | `loom tail <session> [--since <seq>] [--no-follow]` | print a session's record and follow it |
-| `loom send <session> <text...>` | add a message to a running or idle session (`-d` to return at once) |
+| `loom send <session> [text...] [--file PATH]...` | add a message to a running or idle session (`-d` to return at once); each `--file` is uploaded to the session's workspace and attached, and the text may then be empty |
 | `loom stop <session>` / `resume <session>` | stop the turn, its jobs and agents / let a stopped session carry on |
 | `loom reweave <session>` | fold old tool output out of the context now |
 | `loom archive <session> [--undo]` | hide a finished session; archiving settles the mission's agents |

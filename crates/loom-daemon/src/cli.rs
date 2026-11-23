@@ -38,7 +38,10 @@
 //! - `ls [-a]`: `render::sessions_table` (`-a`: archived too).
 //! - `tail <session> [--since <seq>] [--no-follow] [--reasoning] [--full] [--verbose]`: print the
 //!   session's records and keep following. `--no-follow` prints what exists and stops.
-//! - `send <session> <text…>` (`-` = standard input), then follows unless `--detach`.
+//! - `send <session> <text…> [--file PATH]…` (`-` = standard input), then follows unless `--detach`. Each
+//!   `--file` is read and uploaded (`upload_files`: `client.upload` into the session's workspace, `docs/UPLOADS.md`)
+//!   before the message, which carries the returned paths as attachments; with files the text may be empty.
+//!   `run` takes `--file` the same way (the workspace must exist: it is uploaded to before the session is made).
 //! - `stop <session>`, `resume <session>`, `reweave <session>`, `archive <session> [--undo]`: the
 //!   call, then one line saying what was asked (`stop requested for {id}`).
 //! - `rule <session> <text…>` (`-` = standard input): `client.add_rule`; `rule sent to {lead}`.
@@ -319,6 +322,9 @@ pub struct RunArgs {
     /// Start it and return
     #[arg(short, long)]
     pub detach: bool,
+    /// Attach a file (uploaded to the workspace first, which must exist); repeatable. The task may then be empty
+    #[arg(long = "file", value_name = "PATH")]
+    pub files: Vec<PathBuf>,
     /// The task ("-" or nothing: read standard input)
     pub message: Vec<String>,
 }
@@ -360,6 +366,9 @@ pub struct SendArgs {
     pub show: ShowOpts,
     #[arg(short, long)]
     pub detach: bool,
+    /// Attach a file (uploaded to the session's workspace first); repeatable. The message may then be empty
+    #[arg(long = "file", value_name = "PATH")]
+    pub files: Vec<PathBuf>,
     /// The message ("-" or nothing: read standard input)
     pub text: Vec<String>,
 }
@@ -782,6 +791,7 @@ fn new_session(opts: &StartOpts, message: Option<String>, cwd: &Path, prior: Vec
         prior,
         role_models: opts.agent_models.iter().cloned().collect(),
         create_workspace: opts.create_workspace,
+        attachments: Vec::new(),
     }
 }
 
@@ -1128,6 +1138,22 @@ async fn tail_with(c: &Client, a: &TailArgs, cfg: &FollowCfg<'_>, out: &mut dyn 
     Ok(follow(c, &id, a.since, &cfg, out).await?.code)
 }
 
+/// Read each file and upload it to `workspace`; the stored paths, in order. A file that cannot be read stops
+/// the command before anything is sent.
+async fn upload_files(c: &Client, workspace: &str, files: &[PathBuf]) -> Result<Vec<String>, String> {
+    let mut stored = Vec::with_capacity(files.len());
+    for file in files {
+        let shown = file.display();
+        let bytes = std::fs::read(file).map_err(|e| format!("Cannot read {shown} to attach it ({e})."))?;
+        let name = file.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
+            format!("Cannot attach {shown}: it has no file name. Give a path that ends in the file's name.")
+        })?;
+        let up = c.upload(workspace, name, bytes).await.map_err(|e| format!("Cannot attach {shown}: {e}"))?;
+        stored.push(up.path);
+    }
+    Ok(stored)
+}
+
 /// `send`: the message, then what follows it.
 async fn send_with(
     c: &Client,
@@ -1137,8 +1163,21 @@ async fn send_with(
     cfg: &FollowCfg<'_>,
     out: &mut dyn Write,
 ) -> Result<FollowEnd, String> {
+    send_with_files(c, id, text, &[], detach, cfg, out).await
+}
+
+/// [`send_with`] with uploaded `files` attached.
+async fn send_with_files(
+    c: &Client,
+    id: &SessionId,
+    text: &str,
+    files: &[String],
+    detach: bool,
+    cfg: &FollowCfg<'_>,
+    out: &mut dyn Write,
+) -> Result<FollowEnd, String> {
     let baseline = last_seq(c, id).await?;
-    c.send(id, text).await?;
+    c.send_with_files(id, text, files).await?;
     if detach {
         put(out, &format!("sent to {id}\n"))?;
         return Ok(FollowEnd { code: 0, ended: false });
@@ -1212,14 +1251,24 @@ async fn dispatch(command: Command) -> Result<i32, String> {
             tail_with(&c, &a, &cfg, &mut StdoutSink).await
         }
         Command::Send(a) => {
-            let text = read_message(&a.text, "message")?;
+            let text = if a.files.is_empty() || !a.text.is_empty() {
+                read_message(&a.text, "message")?
+            } else {
+                String::new()
+            };
             let c = client_of(&paths)?;
             let id = c.resolve(&a.session).await?;
+            let attached = if a.files.is_empty() {
+                Vec::new()
+            } else {
+                let workspace = c.session(&id).await?.info.meta.workspace;
+                upload_files(&c, &workspace, &a.files).await?
+            };
             let style = style();
             let opts = record_opts(&a.show);
             let render_record = |r: &Record| render::record(r, &style, &opts);
             let cfg = terminal_cfg(&render_record, &style, None);
-            Ok(send_with(&c, &id, &text, a.detach, &cfg, &mut StdoutSink).await?.code)
+            Ok(send_with_files(&c, &id, &text, &attached, a.detach, &cfg, &mut StdoutSink).await?.code)
         }
         Command::Stop(a) => {
             let c = client_of(&paths)?;
@@ -1502,13 +1551,18 @@ async fn cmd_open(paths: &Paths, a: &OpenArgs) -> Result<i32, String> {
 }
 
 async fn cmd_run(paths: &Paths, a: RunArgs) -> Result<i32, String> {
-    let message = read_message(&a.message, "message")?;
+    let message =
+        if a.files.is_empty() || !a.message.is_empty() { read_message(&a.message, "message")? } else { String::new() };
     let c = client_of(paths)?;
     let cwd =
         std::env::current_dir().map_err(|e| format!("Cannot find the current directory ({e}). Pass --workspace."))?;
     let client = &c;
     let prior = prior_missions(&a.start.prior, |word| async move { client.mission_of(&word).await }).await?;
-    let made = c.create_receipt(&new_session(&a.start, Some(message), &cwd, prior)).await?;
+    let mut new = new_session(&a.start, Some(message).filter(|m| !m.is_empty()), &cwd, prior);
+    if !a.files.is_empty() {
+        new.attachments = upload_files(&c, &new.workspace.to_string_lossy(), &a.files).await?;
+    }
+    let made = c.create_receipt(&new).await?;
     let id = made.info.meta.id;
     if made.created {
         errln(&format!("created workspace {}", made.info.meta.workspace));
@@ -1846,6 +1900,13 @@ mod tests {
         let Command::Send(a) = ok(&["send", "last", "-"]) else { panic!("not send") };
         assert_eq!(a.text, words(&["-"]));
         rejected(&["send"]);
+        let Command::Send(a) = ok(&["send", "s-1", "--file", "a.csv", "--file", "b.png", "look"]) else {
+            panic!("not send")
+        };
+        assert_eq!(a.files, vec![PathBuf::from("a.csv"), PathBuf::from("b.png")]);
+        assert_eq!(a.text, words(&["look"]));
+        let Command::Run(a) = ok(&["run", "--file", "x.txt"]) else { panic!("not run") };
+        assert_eq!((a.files, a.message.is_empty()), (vec![PathBuf::from("x.txt")], true));
     }
 
     #[test]

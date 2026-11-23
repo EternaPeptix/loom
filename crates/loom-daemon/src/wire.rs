@@ -190,7 +190,22 @@ pub struct LinesView {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MessageBody {
+    /// May be empty when `attachments` is not.
     pub text: String,
+    /// Uploads of the session's workspace (`POST /api/uploads`), absolute paths; `docs/UPLOADS.md`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<String>,
+}
+
+/// Answer of `POST /api/uploads` (`201`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UploadView {
+    /// Absolute path of the stored file, `<workspace>/.loom/uploads/<name>`.
+    pub path: String,
+    /// The stored name (sanitised, and numbered when the name was taken).
+    pub name: String,
+    pub bytes: u64,
+    pub mime: String,
 }
 
 /// Body of `POST /api/sessions/{id}/rules`.

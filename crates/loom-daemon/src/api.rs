@@ -44,7 +44,8 @@
 //! | `GET /sessions/{id}` | the session and its children (sessions whose `parent` is it) | `SessionDetail` |
 //! | `GET /sessions/{id}/records?after={seq}&limit={n}` | `runtime.stored_records` (`limit` default 500, at most 2000) | `RecordsPage` (`next_after` = last seq of the page when the page is full, else `null`); a record that comes with its stored line (read as `Event::Unknown`) is that line, verbatim |
 //! | `GET /sessions/{id}/stream?after={seq}` | see *Streams* | SSE |
-//! | `POST /sessions/{id}/messages` (`MessageBody`) | `runtime.send_message` | `202` `{}` |
+//! | `POST /sessions/{id}/messages` (`MessageBody`; `attachments` may be left out, and `text` empty when there are some) | `runtime.send_message_with` (`400` with the sentence `texts::not_an_upload` for a path that is not an upload of the workspace) | `202` `{}` |
+//! | `POST /uploads?workspace=<abs path>&name=<file name>` (raw body, at most `UPLOAD_MAX_BYTES` = 32 MiB; `Content-Type` is the file's type when it says one) | `upload::store` into `<workspace>/.loom/uploads/` (`docs/UPLOADS.md`); the workspace is judged as `POST /sessions` does (`plan_workspace`, nothing made) | `201` `UploadView`; `400` no or bad `workspace`/`name` (a name with nothing left after cleaning), `404` workspace missing, `409` workspace inside the loom home or not a folder, `413` body over the cap |
 //! | `POST /sessions/{id}/rules` (`RuleBody`) | `runtime.add_rule` (a child's id goes to its lead) | `202` `RuleReceipt` (`queued`: the lead is in a turn and records it at its next step) |
 //! | `POST /sessions/{id}/approvals` (`ApprovalBody`; `scope` may be left out) | `runtime.approve` | `202` `RuleReceipt` |
 //! | `POST /sessions/{id}/rules/{rule_id}/withdraw` (`WithdrawBody`; `reason` may be left out) | `runtime.withdraw_rule` (`404` when the mission has no such rule, `409` when it is already withdrawn) | `202` `RuleReceipt` |
@@ -135,11 +136,12 @@ use crate::ui;
 use crate::wire::{
     AnswerBody, ApprovalBody, ArchiveBody, CreatedSession, DirsView, DiskSpace, ErrorBody, FileLinesView, FilesView,
     GcBody, LinesView, MessageBody, ModelBody, ModelsView, ReleaseBody, RenameBody, RoleModelBody, RuleBody, ScopeBody,
-    SessionDetail, StatusView, WithdrawBody,
+    SessionDetail, StatusView, UploadView, WithdrawBody,
 };
 use axum::body::{Body, Bytes};
+use axum::extract::rejection::BytesRejection;
 use axum::extract::rejection::QueryRejection;
-use axum::extract::{Path, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -236,6 +238,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/fs/dirs", get(fs_dirs))
         .route("/api/sessions/{id}/files", get(session_files))
         .route("/api/sessions/{id}/files/lines", get(session_file_lines))
+        .route("/api/uploads", post(upload).layer(DefaultBodyLimit::max(UPLOAD_MAX_BYTES)))
         .route("/api/events", get(events))
         .route("/api/gc", post(gc))
         .route("/api/shutdown", post(shutdown))
@@ -309,6 +312,8 @@ type Res<T> = Result<T, ApiError>;
 fn rt_err(sentence: String) -> ApiError {
     let status = if sentence.starts_with("There is no") || sentence.starts_with("No ") {
         StatusCode::NOT_FOUND
+    } else if sentence.starts_with("Attach files with POST /api/uploads first") {
+        StatusCode::BAD_REQUEST
     } else {
         StatusCode::CONFLICT
     };
@@ -643,8 +648,64 @@ async fn records(State(s): State<ApiState>, Path(id): Path<String>, q: RawQuery)
 
 async fn message(State(s): State<ApiState>, Path(id): Path<String>, body: Bytes) -> Res<Response> {
     let body: MessageBody = json_body(&body)?;
-    s.runtime.send_message(&SessionId::from(id), &body.text).await.map_err(rt_err)?;
+    s.runtime.send_message_with(&SessionId::from(id), &body.text, &body.attachments).await.map_err(rt_err)?;
     Ok(accepted())
+}
+
+/// The most an upload may hold: the Files viewer's read cap.
+const UPLOAD_MAX_BYTES: usize = fsview::READ_CAP as usize;
+
+/// `POST /api/uploads?workspace=&name=`: the raw body becomes `<workspace>/.loom/uploads/<name>`.
+async fn upload(
+    State(s): State<ApiState>,
+    q: RawQuery,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Res<Response> {
+    let q = params(q)?;
+    let Some(workspace) = q.get("workspace").filter(|w| !w.trim().is_empty()) else {
+        return Err(ApiError::bad_query("workspace is required: the absolute path of the workspace folder"));
+    };
+    let Some(name) = q.get("name").filter(|n| !n.trim().is_empty()) else {
+        return Err(ApiError::bad_query("name is required: the file's name"));
+    };
+    if !(workspace.starts_with('/') || workspace.starts_with('~')) {
+        return Err(ApiError::bad_query(format!("workspace must be an absolute path, not \"{workspace}\".")));
+    }
+    let body = body.map_err(|e| {
+        if e.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            ApiError::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "The upload is larger than {} MiB, the most the daemon stores. Send a smaller file.",
+                    UPLOAD_MAX_BYTES >> 20
+                ),
+            )
+        } else {
+            ApiError::bad_body(e.body_text())
+        }
+    })?;
+    let given = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).map(str::to_string);
+    let (paths, workspace, name) = (s.runtime.paths().clone(), workspace.clone(), name.clone());
+    let view: UploadView = blocking(move || {
+        let root = match loom_agent::runtime::plan_workspace(&paths, std::path::Path::new(&workspace), false) {
+            Ok(loom_agent::runtime::WorkspacePlan::Existing(root)) => root,
+            Ok(_) => {
+                return Err(ApiError::new(StatusCode::NOT_FOUND, format!("The workspace {workspace} does not exist.")))
+            }
+            Err(e) if e.contains("does not exist") => return Err(ApiError::new(StatusCode::NOT_FOUND, e)),
+            Err(e) => return Err(ApiError::new(StatusCode::CONFLICT, e)),
+        };
+        crate::upload::store(&root, &name, &body, given.as_deref()).map_err(|e| {
+            if e.contains("file name") {
+                ApiError::bad_query(e)
+            } else {
+                ApiError::new(StatusCode::CONFLICT, e)
+            }
+        })
+    })
+    .await?;
+    Ok((StatusCode::CREATED, Json(view)).into_response())
 }
 
 async fn add_rule(State(s): State<ApiState>, Path(id): Path<String>, body: Bytes) -> Res<Response> {
@@ -2892,6 +2953,155 @@ mod tests {
         }
         let (s, v) = e.post("/api/sessions", json!({"workspace": canon.join("home")})).await;
         assert!(s == 409 && v["error"].as_str().unwrap().contains("inside the loom home"), "{s} {v}");
+        e.rt.shutdown().await;
+    }
+
+    fn pct(s: &str) -> String {
+        s.bytes()
+            .map(|b| {
+                if b.is_ascii_alphanumeric() || b"-_.~/".contains(&b) {
+                    (b as char).to_string()
+                } else {
+                    format!("%{b:02X}")
+                }
+            })
+            .collect()
+    }
+
+    impl Env {
+        async fn upload(
+            &self,
+            workspace: &std::path::Path,
+            name: &str,
+            body: Vec<u8>,
+            ctype: Option<&str>,
+        ) -> (u16, Value) {
+            let url = format!("/api/uploads?workspace={}&name={}", pct(&workspace.to_string_lossy()), pct(name));
+            let mut r = self.rq(Method::POST, &url).body(body);
+            if let Some(c) = ctype {
+                r = r.header("content-type", c);
+            }
+            json_of(r.send().await.unwrap()).await
+        }
+    }
+
+    #[tokio::test]
+    async fn uploads_are_stored_named_safely_numbered_and_judged_like_a_new_session() {
+        let e = env(Script::new(|_, _| finish("done"))).await;
+        let canon = std::fs::canonicalize(e.dir.path()).unwrap();
+        let ws = canon.join("ws");
+        let (s, v) = e.upload(&ws, "report.csv", b"a,b\n1,2\n".to_vec(), None).await;
+        let stored = ws.join(".loom/uploads/report.csv");
+        assert_eq!(
+            (s, v["path"].as_str(), v["name"].as_str(), v["bytes"].as_u64(), v["mime"].as_str()),
+            (201, stored.to_str(), Some("report.csv"), Some(8), Some("text/csv")),
+            "{v}"
+        );
+        assert_eq!(std::fs::read(&stored).unwrap(), b"a,b\n1,2\n");
+        let (s, v) = e.upload(&ws, "report.csv", b"x".to_vec(), Some("application/json")).await;
+        assert_eq!(
+            (s, v["name"].as_str(), v["mime"].as_str()),
+            (201, Some("report-2.csv"), Some("application/json")),
+            "{v}"
+        );
+        let (s, v) = e.upload(&ws, "../../..//.ssh/id\\rsa", b"k".to_vec(), None).await;
+        assert_eq!((s, v["name"].as_str()), (201, Some("_.._..__.ssh_id_rsa")), "{v}");
+        assert!(ws.join(".loom/uploads/_.._..__.ssh_id_rsa").is_file());
+        let (s, v) = e.upload(&ws, "...", b"k".to_vec(), None).await;
+        assert_eq!(s, 400, "{v}");
+        let (s, v) = e.get(&format!("/api/uploads?workspace={}", pct(&ws.to_string_lossy()))).await;
+        assert_eq!(s, 405, "{v}");
+        let r = e.rq(Method::POST, "/api/uploads?name=x").body("x").send().await.unwrap();
+        assert_eq!(r.status().as_u16(), 400, "no workspace");
+        let r = e
+            .rq(Method::POST, &format!("/api/uploads?workspace={}", pct(&ws.to_string_lossy())))
+            .body("x")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 400, "no name");
+        let r = e.rq(Method::POST, "/api/uploads?workspace=rel&name=x").body("x").send().await.unwrap();
+        assert_eq!(r.status().as_u16(), 400, "relative workspace");
+
+        // The cap: exactly the cap is stored, one byte more is 413 and leaves nothing.
+        let cap = UPLOAD_MAX_BYTES;
+        let (s, v) = e.upload(&ws, "big.bin", vec![7u8; cap + 1], None).await;
+        assert_eq!(s, 413, "{v}");
+        assert!(v["error"].as_str().unwrap().contains("32 MiB"), "{v}");
+        assert!(!ws.join(".loom/uploads/big.bin").exists());
+        let (s, v) = e.upload(&ws, "big.bin", vec![7u8; cap], None).await;
+        assert_eq!((s, v["bytes"].as_u64()), (201, Some(cap as u64)), "{v}");
+
+        // Refused workspaces: missing is 404, inside the loom home 409, a file 409.
+        let (s, v) = e.upload(&canon.join("nope"), "x.txt", b"x".to_vec(), None).await;
+        assert_eq!(s, 404, "{v}");
+        assert!(!canon.join("nope").exists());
+        std::fs::create_dir_all(canon.join("home/keys")).unwrap();
+        let (s, v) = e.upload(&canon.join("home/keys"), "x.txt", b"x".to_vec(), None).await;
+        assert!(s == 409 && v["error"].as_str().unwrap().contains("inside the loom home"), "{s} {v}");
+        assert!(!canon.join("home/keys/.loom").exists());
+        std::fs::write(canon.join("plain.txt"), "p").unwrap();
+        let (s, _) = e.upload(&canon.join("plain.txt"), "x.txt", b"x".to_vec(), None).await;
+        assert_eq!(s, 409);
+        let r = e.http.post(e.url("/api/uploads?workspace=/x&name=y")).body("x").send().await.unwrap();
+        assert_eq!(r.status().as_u16(), 401);
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn attachments_ride_a_message_and_a_new_session_and_uploads_are_readable_in_the_files_routes() {
+        let e = env(Script::new(|_, _| finish("done"))).await;
+        let canon = std::fs::canonicalize(e.dir.path()).unwrap();
+        let ws = canon.join("ws");
+        let (_, up) = e.upload(&ws, "report.csv", b"a,b\n1,2\n".to_vec(), None).await;
+        let path = up["path"].as_str().unwrap().to_string();
+        std::fs::write(ws.join("plain.txt"), "p").unwrap();
+        let (s, v) = e.post("/api/sessions", json!({"workspace": ws, "attachments": [path]})).await;
+        assert_eq!(s, 201, "{v}");
+        let id = v["id"].as_str().unwrap().to_string();
+        e.wait_turn_ends(&id, 1).await;
+        let first = e.records(&id).await.into_iter().find(|r| r["kind"] == "user_message").unwrap();
+        let text = first["text"].as_str().unwrap().to_string();
+        assert!(text.starts_with("Attached files (saved read-only; read them with `read`):\n"), "{text}");
+        assert!(text.contains(&format!("- {path} (8 B, text/csv)")), "{text}");
+
+        let (s, _) = e.post(&format!("/api/sessions/{id}/messages"), json!({"text": "", "attachments": [path]})).await;
+        assert_eq!(s, 202);
+        e.wait_turn_ends(&id, 2).await;
+        let (s, v) = e.post(&format!("/api/sessions/{id}/messages"), json!({"text": "hi"})).await;
+        assert_eq!(s, 202, "{v}");
+        let (s, v) = e.post(&format!("/api/sessions/{id}/messages"), json!({"text": ""})).await;
+        assert_eq!((s, v["error"].as_str()), (409, Some("Write a message to send.")), "{v}");
+        let bad = ws.join("plain.txt").to_string_lossy().into_owned();
+        let (s, v) = e.post(&format!("/api/sessions/{id}/messages"), json!({"text": "x", "attachments": [bad]})).await;
+        assert_eq!(
+            (s, v["error"].as_str()),
+            (
+                400,
+                Some(
+                    format!("Attach files with POST /api/uploads first; {bad} is not an upload of this workspace.")
+                        .as_str()
+                )
+            ),
+            "{v}"
+        );
+        let (s, _) = e.post("/api/sessions", json!({"workspace": ws, "attachments": [bad]})).await;
+        assert_eq!(s, 400);
+        let (s, _) = e.post(&format!("/api/sessions/{id}/messages"), json!({"text": "x", "files": []})).await;
+        assert_eq!(s, 400, "unknown fields stay refused");
+
+        // Files routes: the uploads folder, and nothing else under .loom.
+        let files = |q: &str| format!("/api/sessions/{id}/files{q}");
+        let (s, v) = e.get(&files("?path=.loom/uploads")).await;
+        assert_eq!(s, 200, "{v}");
+        assert_eq!(v["entries"][0]["name"], "report.csv");
+        let (s, v) = e.get(&format!("/api/sessions/{id}/files/lines?path=.loom/uploads/report.csv")).await;
+        assert_eq!((s, v["text"].as_str()), (200, Some("a,b\n1,2\n")), "{v}");
+        let (s, v) = e.get(&files("?path=.loom")).await;
+        assert_eq!(s, 409, "{v}");
+        let (_, root) = e.get(&files("")).await;
+        let loom = root["entries"].as_array().unwrap().iter().find(|x| x["name"] == ".loom").unwrap().clone();
+        assert!(loom["note"].is_string(), "{loom}");
         e.rt.shutdown().await;
     }
 

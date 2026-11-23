@@ -22,5 +22,6 @@ pub mod client;
 pub mod fsview;
 pub mod render;
 pub mod serve;
+pub mod upload;
 pub mod ui;
 pub mod wire;
