@@ -90,7 +90,7 @@ async fn guarded_new_instructions_and_standing_rules_invalidate_a_plan() {
         if constraint {
             fx.shared.ledger_append(true, LedgerOp::ConstraintAdd { text: "New operator rule".into() }).unwrap();
         } else {
-            session.append(Author::User, Event::UserMessage { text: "Change direction".into() }).unwrap();
+            session.append(Author::User, Event::UserMessage { text: "Change direction".into(), images: vec![] }).unwrap();
         }
         session.step().await.unwrap();
         assert!(!fx.ctx.workspace.join("must-not-run").exists());

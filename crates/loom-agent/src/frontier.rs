@@ -351,6 +351,7 @@ mod tests {
                 class,
                 meta: Default::default(),
                 duration_ms: 0,
+                images: Vec::new(),
             }),
         )
     }

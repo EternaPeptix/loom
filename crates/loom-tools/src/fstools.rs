@@ -853,6 +853,9 @@ fn read_file(
         Ok(x) => x,
         Err(refusal) => return (*refusal).into(),
     };
+    if let Some(image) = read_image(ctx, given, &file, &meta) {
+        return image;
+    }
     if meta.len() > limits.whole {
         if start.is_none() && end.is_none() {
             return ToolOutput::error(format!(
@@ -870,6 +873,51 @@ fn read_file(
         Err(f) => return fail_output(f, given, "read", &too_large_advice(given)).into(),
     };
     Worked { out: show_whole(ctx, given, &bytes, start, end), seen: Some(Seen::of_bytes(&bytes)) }
+}
+
+/// An image file is attached, not shown as text: its bytes go to the blob store and the result's images.
+/// `None` when the file is not an image (the head does not carry a known magic or header).
+fn read_image(ctx: &ToolCtx, given: &str, file: &File, meta: &Metadata) -> Option<Worked> {
+    use std::io::{Seek, SeekFrom};
+    const HEAD: usize = 64 * 1024;
+    let mut head = Vec::with_capacity(512);
+    let mut f = file;
+    std::io::Read::take(&mut f, HEAD as u64).read_to_end(&mut head).ok()?;
+    // The handle's offset is shared with the caller's reads: put it back whatever the answer is.
+    if !loom_core::image::has_magic(&head) {
+        f.seek(SeekFrom::Start(0)).ok()?;
+        return None;
+    }
+    let max = ctx.cfg.max_image_bytes;
+    let size = meta.len();
+    let (info, bytes) = if size <= max {
+        // The whole file: the header may lie beyond the head (a JPEG with a long EXIF block).
+        f.seek(SeekFrom::Start(0)).ok()?;
+        let all = read_open(file.try_clone().ok()?, size, max, &ctx.cancel).ok()?;
+        (loom_core::image::detect(&all)?, Some(all))
+    } else {
+        (loom_core::image::detect(&head)?, None)
+    };
+    let Some(bytes) = bytes else {
+        let text = loom_core::image::too_large(given, &info, size, max);
+        return Some(ToolOutput::ok("ok", Body::Message(text)).into());
+    };
+    let stored = match ctx.blobs.put_bytes(&bytes) {
+        Ok(b) => b,
+        Err(e) => {
+            return Some(ToolOutput::error(format!("{given} could not be stored for display ({e}). Try again.")).into())
+        }
+    };
+    let image = loom_core::ImageRef {
+        blob: stored.id.as_str().to_string(),
+        mime: info.mime.to_string(),
+        bytes: bytes.len() as u64,
+        width: info.width,
+        height: info.height,
+        name: Some(given.to_string()),
+    };
+    let text = loom_core::image::read_header(given, &info, bytes.len() as u64);
+    Some(ToolOutput::ok("ok", Body::Message(text)).with_images(&[image]).into())
 }
 
 /// What `read` returns for the content of a file that was loaded whole.
@@ -2246,6 +2294,31 @@ mod tests {
         let r = e.call("read", json!({"path": "bin.dat"})).await;
         assert!(r.text.contains("binary data, 7 bytes") && r.text.contains("binary"), "{}", r.text);
         assert_eq!(shown(&r), json!([[1, 1]]));
+    }
+
+    #[tokio::test]
+    async fn read_of_an_image_attaches_it_and_a_large_one_is_only_described() {
+        let e = env();
+        let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        png.extend_from_slice(&[0, 0, 0, 4, 0, 0, 0, 3, 8, 6, 0, 0, 0]);
+        put(&e, "a.png", &png);
+        let r = e.call("read", json!({"path": "a.png"})).await;
+        assert_eq!(r.status, ToolStatus::Ok, "{}", r.text);
+        assert!(r.text.contains("[read \u{b7} image \u{b7} "), "{}", r.text);
+        assert!(r.text.contains("4x3 PNG"), "{}", r.text);
+        assert_eq!(r.images.len(), 1);
+        assert_eq!((r.images[0].mime.as_str(), r.images[0].width, r.images[0].height), ("image/png", 4, 3));
+        assert_eq!(e.ctx.blobs.read_all(&loom_core::BlobId::from(r.images[0].blob.clone())).unwrap(), png);
+
+        let mut big = png.clone();
+        big.resize(6 * 1024 * 1024, 0);
+        put(&e, "big.png", &big);
+        let r = e.call("read", json!({"path": "big.png"})).await;
+        assert!(
+            r.images.is_empty() && r.text.contains("Not attached") && r.text.contains("max_image_bytes"),
+            "{}",
+            r.text
+        );
     }
 
     fn message(o: &ToolOutput) -> String {

@@ -170,6 +170,14 @@ pub struct WindowItem {
     /// For a `harness_note`: which kind of note it is (its `kind` attribute in the request).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<NoteKind>,
+    /// Estimated tokens of the images this item currently sends (`ImageRef::est_tokens`; 0 when it sends none,
+    /// as when it is stubbed). Not part of `chars`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub image_tokens: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -270,6 +278,7 @@ fn item(seq: Seq, kind: &str, role: Role, chars: usize, state: ItemState, shown:
         class: None,
         preview: preview(shown),
         note: None,
+        image_tokens: 0,
     }
 }
 
@@ -382,10 +391,13 @@ fn build_with<'a>(records: &'a [Record], pending: Option<&'a Reweave>) -> (Weave
                 ));
                 elems.push(Elem { group: seq, msg, entry: Some(entries.len() - 1) });
             }
-            Event::UserMessage { text } => {
+            Event::UserMessage { text, images } => {
                 let mut msg = Message::user(text.clone());
                 msg.origin = vec![seq];
-                entries.push((item(seq, "user_message", Role::User, text.len(), ItemState::Live, text), Aux::none()));
+                msg.images = images.clone();
+                let mut it = item(seq, "user_message", Role::User, text.len(), ItemState::Live, text);
+                it.image_tokens = images.iter().map(crate::image::ImageRef::est_tokens).sum();
+                entries.push((it, Aux::none()));
                 elems.push(Elem { group: seq, msg, entry: Some(entries.len() - 1) });
             }
             Event::HarnessNote { note, text } => {
@@ -539,6 +551,10 @@ fn build_with<'a>(records: &'a [Record], pending: Option<&'a Reweave>) -> (Weave
                             let mut msg = Message::tool(c.call_id.to_string(), content);
                             msg.origin = vec![rseq];
                             let mut it = item(rseq, "tool_result", Role::Tool, content.len(), state, content);
+                            if state == ItemState::Live {
+                                msg.images = t.images.clone();
+                                it.image_tokens = t.images.iter().map(crate::image::ImageRef::est_tokens).sum();
+                            }
                             it.pinned = pinned.contains(c.call_id.as_str());
                             it.call_id = Some(c.call_id.clone());
                             it.class = Some(t.class);
@@ -711,13 +727,16 @@ impl<'a> Outputs<'a> {
     /// The stub for item `i` (a tool result or an agent report), when it is shorter than what is shown.
     fn stub_for(&self, w: &Weave, aux: &[Facts], i: usize, stub_tail_lines: u32) -> Option<EvictAction> {
         let (it, a) = (w.items.get(i)?, aux.get(i)?);
+        let mut has_images = false;
         let text = if it.kind == "tool_result" {
             let t = *self.results.get(&a.result?)?;
+            has_images = !t.images.is_empty();
             stub_text(self.calls.get(t.call_id.as_str()).copied(), t, stub_tail_lines)
         } else {
             format!("[agent report evicted from view, not from the record: {} bytes.]", a.payload)
         };
-        (text.len() < a.payload).then_some(EvictAction::Stub { text })
+        // A result with images is folded however short its text: its images are what the stub gives back.
+        (has_images || text.len() < a.payload).then_some(EvictAction::Stub { text })
     }
 }
 
@@ -986,6 +1005,11 @@ fn plan_on(
         if let Some(slot) = msg_chars.get_mut(m) {
             *slot = new;
         }
+        // A stub gives back the tokens of the images its result carried.
+        if matches!(action, EvictAction::Stub { .. }) {
+            let images = w.messages.get(m).map_or(0, |msg| estimator.image_tokens(std::slice::from_ref(msg)));
+            tokens = tokens.saturating_sub(images);
+        }
         // A response upgraded from DropReasoning to Drop moves to the end, where Drop belongs in the order.
         if let Some(p) = planned {
             chosen.remove(p);
@@ -1031,6 +1055,10 @@ pub fn stub_text(call: Option<&ToolCall>, result: &ToolResult, stub_tail_lines: 
         }
     }
     out.push('\n');
+    for image in &result.images {
+        out.push_str(&crate::image::folded(image));
+        out.push('\n');
+    }
     match &result.output {
         Some(b) => out.push_str(&format!(
             "[evicted from view, not from the record: {} lines / {} bytes. Full output: {} — read it again with read or grep before relying on it.]",
@@ -1137,6 +1165,7 @@ mod tests {
                 class: ToolClass::Exec,
                 meta: Default::default(),
                 duration_ms: 2,
+                images: Vec::new(),
             }),
         );
         let w = weave(&l.recs);
@@ -1225,7 +1254,7 @@ mod tests {
         }
 
         fn user(&mut self, t: &str) -> Seq {
-            self.push(Author::User, Event::UserMessage { text: t.into() })
+            self.push(Author::User, Event::UserMessage { text: t.into(), images: vec![] })
         }
 
         fn note(&mut self, kind: NoteKind, t: &str) -> Seq {
@@ -1293,6 +1322,7 @@ mod tests {
                     class,
                     meta: Default::default(),
                     duration_ms: 1,
+                    images: Vec::new(),
                 }),
             )
         }
@@ -1311,6 +1341,7 @@ mod tests {
                     class: ToolClass::Terminal,
                     meta: Default::default(),
                     duration_ms: 1,
+                    images: Vec::new(),
                 }),
             )
         }
@@ -1562,6 +1593,47 @@ mod tests {
                  <harness kind=\"resume\">\nBRIEF <b>\n\n{LEADS_LINE}\nlead: a < b\n</harness>"
             )
         );
+    }
+
+    #[test]
+    fn images_reach_the_messages_and_a_folded_result_gives_its_image_up() {
+        let img = |name: &str| crate::image::ImageRef {
+            blob: "ab".repeat(32),
+            mime: "image/png".into(),
+            bytes: 10,
+            width: 300,
+            height: 300,
+            name: Some(name.into()),
+        };
+        let mut l = Log::with_replay(ReasoningReplay::All);
+        l.push(Author::User, Event::UserMessage { text: "look".into(), images: vec![img("u.png")] });
+        l.resp("", "", &[("c1", "read", "{}")]);
+        l.call("c1", ToolClass::Read);
+        l.push(
+            Author::Tool,
+            Event::ToolResult(ToolResult {
+                call_id: CallId::from("c1"),
+                name: "read".into(),
+                status: ToolStatus::Ok,
+                text: "[read]".into(),
+                output: None,
+                cut: false,
+                class: ToolClass::Read,
+                meta: Default::default(),
+                duration_ms: 1,
+                images: vec![img("/w/t.png")],
+            }),
+        );
+        let w = weave(&l.recs);
+        let with_images: Vec<_> = w.messages.iter().filter(|m| !m.images.is_empty()).map(|m| m.role).collect();
+        assert_eq!(with_images, vec![Role::User, Role::Tool]);
+        let est = TokenEstimator::default();
+        assert_eq!(est.image_tokens(&w.messages), 0, "a model without vision is charged no image tokens");
+        let mut vis = TokenEstimator::default();
+        vis.set_vision(true);
+        assert_eq!(vis.image_tokens(&w.messages), 240);
+        assert!(w.items.iter().any(|i| i.kind == "tool_result" && i.image_tokens == 120));
+        assert!(w.items.iter().any(|i| i.kind == "user_message" && i.image_tokens == 120));
     }
 
     #[test]

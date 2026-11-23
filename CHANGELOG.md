@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Images
+
+- `user_message` and `tool_result` records can carry `images` (`{blob, mime, bytes, width, height, name}`). Image
+  attachments and `read` of a PNG, JPEG, GIF or WebP file (up to `[tools] max_image_bytes`, 5 MiB) are stored in the
+  blob store and, for a profile with `vision = true`, sent as `image_url` parts (tool images in one user message after
+  the run of tool messages); other models get a sentence naming the image. `GET /api/images/{blob}` serves them;
+  `loom models` and `GET /api/models` list `vision`; the Context breakdown has an "Images" part.
+
 ### File uploads
 
 - `POST /api/uploads?workspace=&name=` (raw body, at most 32 MiB) stores a file in `<workspace>/.loom/uploads/` (name

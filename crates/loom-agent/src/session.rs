@@ -123,6 +123,7 @@
 //!   ledger has no goal yet, `shared.ledger_append(true, GoalSet{text})` and append what it queued
 //!   (`shared.take_emitted()`); a failure is logged with `tracing::warn!` and otherwise ignored.
 //!   Start a turn (`Trigger::User`).
+//! - `Input::UserImages{text, images}`: as `Input::User`, the `user_message` carrying `images`.
 //! - `Input::Answer{item_id, answer}`: if no open inbox item of this session has that id, ignore.
 //!   Otherwise append `inbox_resolved{item_id, answer}`; when the item is a `Question` or `Blocker`
 //!   with a `reference` and the session has a journal, `shared.ledger_append(true,
@@ -567,7 +568,7 @@ use loom_core::{now_ms, BlobRef};
 use loom_model::assemble::{Completion, StreamEvent};
 use loom_model::client::{ModelClient, ModelError};
 use loom_model::limit::{Limiter, Priority};
-use loom_model::request::{ChatRequest, ToolChoice};
+use loom_model::request::{ChatRequest, ImageResolver, ToolChoice};
 use loom_tools::files::FileTracker;
 use loom_tools::jobs::{JobEvent, JobInfo, JobState};
 use loom_tools::proc::Ended;
@@ -587,6 +588,8 @@ use tokio_util::sync::CancellationToken;
 pub enum Input {
     /// The operator wrote to the session.
     User(String),
+    /// The operator wrote to the session and attached images (already in the blob store).
+    UserImages { text: String, images: Vec<loom_core::ImageRef> },
     /// The operator answered one of the session's inbox items.
     Answer { item_id: String, answer: String },
     /// The operator set a standing rule for the mission.
@@ -1717,12 +1720,14 @@ impl Session {
             st.absorb(i, r);
         }
         let phase = if st.ended.is_some() { Phase::Ended } else { Phase::Idle };
+        let mut estimator = TokenEstimator::default();
+        estimator.set_vision(deps.client.profile().vision);
         Session {
             deps,
             log,
             records,
             registry,
-            estimator: TokenEstimator::default(),
+            estimator,
             guard: PrefixGuard::new(),
             inputs: None,
             inputs_seen_open: false,
@@ -1882,6 +1887,7 @@ Name them when you start a new mission instead."
     fn switch_model(&mut self, sw: ModelSwitch) -> R<()> {
         let ModelSwitch { client, limiter, context_window, model, reasoning_replay, reason, settings_changed } = sw;
         self.deps.client = client;
+        self.estimator.set_vision(self.deps.client.profile().vision);
         self.deps.limiter = limiter;
         self.deps.context_window = context_window;
         self.deps.model = model;
@@ -2364,7 +2370,13 @@ Name them when you start a new mission instead."
         let mut out = Arrival::default();
         match input {
             Input::User(text) => {
-                self.append(Author::User, Event::UserMessage { text: text.clone() })?;
+                self.append(Author::User, Event::UserMessage { text: text.clone(), images: vec![] })?;
+                self.record_goal(&text)?;
+                out.trigger = Some(Trigger::User);
+                out.user = true;
+            }
+            Input::UserImages { text, images } => {
+                self.append(Author::User, Event::UserMessage { text: text.clone(), images })?;
                 self.record_goal(&text)?;
                 out.trigger = Some(Trigger::User);
                 out.user = true;
@@ -2391,7 +2403,10 @@ Name them when you start a new mission instead."
                     }
                     return Ok(out);
                 }
-                self.append(Author::User, Event::UserMessage { text: texts::inbox_answer(&item.text, &answer) })?;
+                self.append(
+                    Author::User,
+                    Event::UserMessage { text: texts::inbox_answer(&item.text, &answer), images: vec![] },
+                )?;
                 out.trigger = Some(Trigger::InboxAnswer);
                 out.user = true;
             }
@@ -2831,6 +2846,7 @@ Name them when you start a new mission instead."
             let mut messages = w.messages.clone();
             messages.push(hud_message(&hud_text));
             let sent_chars = messages.iter().map(Message::chars).sum::<usize>().saturating_add(tools_chars(&w.tools));
+            let image_tokens = self.estimator.image_tokens(&messages);
             let est_tokens = self
                 .estimator
                 .tokens_for_messages(&messages)
@@ -2862,6 +2878,7 @@ Name them when you start a new mission instead."
                 max_tokens: self.deps.client.profile().max_output_tokens,
                 seed: None,
                 extra: Map::new(),
+                images: ImageResolver::for_model(self.deps.client.profile().vision, &self.deps.ctx.blobs),
             };
             let result = self.complete_streaming(&request, &req_id, &token).await?;
             let queue_ms = permit.waited_ms;
@@ -2869,7 +2886,7 @@ Name them when you start a new mission instead."
             match result {
                 Ok((c, early)) => {
                     if c.usage.prompt_tokens > 0 {
-                        self.estimator.calibrate(sent_chars, c.usage.prompt_tokens);
+                        self.estimator.calibrate(sent_chars, c.usage.prompt_tokens.saturating_sub(image_tokens));
                     }
                     self.refused_epoch = None;
                     break (req_id, c, queue_ms, request.tools, early, observed);
@@ -3616,6 +3633,7 @@ Name them when you start a new mission instead."
             max_tokens: Some(texts::DIGEST_MAX_TOKENS),
             seed: None,
             extra: Map::new(),
+            images: ImageResolver::for_model(self.deps.client.profile().vision, &self.deps.ctx.blobs),
         };
         // Its events are not shown to viewers: they would read as the step's reply.
         let result = self.complete_watched(&request, token, |_| {}).await?;
@@ -6165,7 +6183,7 @@ mod tests {
     async fn a_log_that_renders_differently_after_a_restart_gets_one_cache_break() {
         let mut fx = Fx::new("chat", false, false, seq(vec![Reply::text("after").into()])).await;
         let mut session = fx.create();
-        session.append(Author::User, Event::UserMessage { text: "hi".into() }).unwrap();
+        session.append(Author::User, Event::UserMessage { text: "hi".into(), images: vec![] }).unwrap();
         session.append(Author::Harness, Event::TurnStart { trigger: Trigger::User }).unwrap();
         let sent = weave(session.records()).messages;
         // What an older build sent for these records hashed differently.
@@ -6215,7 +6233,7 @@ mod tests {
     async fn open_on_a_log_cut_mid_turn_adds_the_restart_records_and_the_next_turn_says_so() {
         let mut fx = Fx::new("chat", false, false, seq(vec![Reply::text("welcome back").into()])).await;
         let mut session = fx.create();
-        session.append(Author::User, Event::UserMessage { text: "hi".into() }).unwrap();
+        session.append(Author::User, Event::UserMessage { text: "hi".into(), images: vec![] }).unwrap();
         session.append(Author::Harness, Event::TurnStart { trigger: Trigger::User }).unwrap();
         drop(session);
         // A torn final line as well.
@@ -6357,6 +6375,7 @@ mod tests {
             class: ToolClass::Exec,
             meta: [(META_JOB.to_string(), json!(id))].into_iter().collect(),
             duration_ms: 1,
+            images: Vec::new(),
         };
         session.append(Author::Tool, Event::ToolResult(result)).unwrap();
     }
@@ -6547,7 +6566,7 @@ mod tests {
     async fn a_turn_that_begins_during_shutdown_is_cut_without_the_restart_note() {
         let mut fx = Fx::new("chat", false, false, seq(vec![Reply::text("welcome back").into()])).await;
         let mut session = fx.create();
-        session.append(Author::User, Event::UserMessage { text: "hi".into() }).unwrap();
+        session.append(Author::User, Event::UserMessage { text: "hi".into(), images: vec![] }).unwrap();
         session.append(Author::Harness, Event::TurnStart { trigger: Trigger::User }).unwrap();
         drop(session);
         let reopened = Session::open(fx.deps()).unwrap();
@@ -6828,7 +6847,7 @@ mod tests {
         let rs = fx.sink.records();
         assert_eq!(count(&rs, "inbox_resolved"), 1);
         assert!(rs.iter().any(
-            |r| matches!(&r.event, Event::UserMessage { text } if *text == texts::inbox_answer("which branch?", "main"))
+            |r| matches!(&r.event, Event::UserMessage { text, .. } if *text == texts::inbox_answer("which branch?", "main"))
         ));
         assert!(rs.iter().any(|r| matches!(&r.event, Event::TurnStart { trigger: Trigger::InboxAnswer })));
         let ledger = fx.shared.ledger().unwrap();
@@ -7197,7 +7216,7 @@ mod tests {
         let mut fx = Fx::new("chat", false, false, seq(vec![Reply::text("first").into()])).await;
         let mut session = fx.create();
         // A long paste, which the server has counted already.
-        session.append(Author::User, Event::UserMessage { text: "u ".repeat(10_000) }).unwrap();
+        session.append(Author::User, Event::UserMessage { text: "u ".repeat(10_000), images: vec![] }).unwrap();
         let w = session.woven().weave;
         let n = w.messages.len();
         let request = ModelRequest {
@@ -7287,7 +7306,7 @@ mod tests {
             };
             Event::ChildSettled(settled)
         };
-        session.append(Author::User, Event::UserMessage { text: "go".into() }).unwrap();
+        session.append(Author::User, Event::UserMessage { text: "go".into(), images: vec![] }).unwrap();
         answered(&mut session, "r-1", "a", 10_000);
         let (kid1, kid2) = (SessionId::from("s-kid-1"), SessionId::from("s-kid-2"));
         session.append(Author::Agent(kid1.clone()), report(&kid1, "first ")).unwrap();
@@ -7449,7 +7468,7 @@ mod tests {
         fx.context =
             ReweavePolicy { target_tokens: 60_000, floor_tokens: 1_000, keep_recent_steps: 1, stub_tail_lines: 3 };
         let mut session = fx.create();
-        session.append(Author::User, Event::UserMessage { text: "go".into() }).unwrap();
+        session.append(Author::User, Event::UserMessage { text: "go".into(), images: vec![] }).unwrap();
         assert!(session.turn(Trigger::User).await.unwrap().is_none());
         let rs = session.records().to_vec();
         let requests =
@@ -7740,7 +7759,7 @@ mod tests {
 
     /// Append the operator's message and run one turn, in place.
     async fn say(session: &mut Session, text: &str) {
-        session.append(Author::User, Event::UserMessage { text: text.into() }).unwrap();
+        session.append(Author::User, Event::UserMessage { text: text.into(), images: vec![] }).unwrap();
         assert!(session.turn(Trigger::User).await.unwrap().is_none());
     }
 

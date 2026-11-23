@@ -383,7 +383,8 @@
 //!   are validated before anything is created and sent with the first message in the same way.
 //! - `send_message(id, text)`: root sessions only (`Messages go to the lead session of a mission;
 //!   {id} is one of its agents.`); empty text refused; ended session refused; activate;
-//!   `Input::User`; then its children that a restart cut are resumed as `resume` does (the lead's
+//!   `Input::User` (`Input::UserImages` when an attachment is an image of at most `max_image_bytes`: it is
+//!   stored in the blob store and named in the `user_message`'s `images`); then its children that a restart cut are resumed as `resume` does (the lead's
 //!   turn starts with `AFTER_RESTART`, which says so).
 //! - `add_rule(id, text)`, `approve(id, text, scope)`, `withdraw_rule(id, rule_id, reason)`: any
 //!   session; the input goes to the lead (root) session of its mission, which owns the ledger.
@@ -1011,7 +1012,7 @@ pub(crate) fn window_breakdown(
     measured_now: Option<u64>,
     estimator: &TokenEstimator,
 ) -> WindowBreakdown {
-    const PARTS: [&str; 12] = [
+    const PARTS: [&str; 13] = [
         "system",
         "tools",
         "rules",
@@ -1023,6 +1024,7 @@ pub(crate) fn window_breakdown(
         "agent_reports",
         "notes",
         "stubs",
+        "images",
         "other",
     ];
     let mut chars = [0u64; PARTS.len()];
@@ -1047,7 +1049,17 @@ pub(crate) fn window_breakdown(
     }
     let chars_of = |key: &str| slot(key).and_then(|i| chars.get(i).copied()).unwrap_or(0);
     let tokens_of = |c: u64| estimator.tokens(usize::try_from(c).unwrap_or(usize::MAX));
-    let raw: Vec<u64> = PARTS.iter().map(|k| tokens_of(chars_of(k))).collect();
+    // Images are sized in tokens by their pixels, not by characters; only a model that takes images counts them.
+    let image_tokens: u64 = if estimator.vision() {
+        items.iter().filter(|i| i.state != loom_core::weave::ItemState::Dropped).map(|i| i.image_tokens).sum()
+    } else {
+        0
+    };
+    if let Some(n) = slot("images").and_then(|i| counts.get_mut(i)) {
+        *n = if estimator.vision() { items.iter().filter(|i| i.image_tokens > 0).count() as u64 } else { 0 };
+    }
+    let raw: Vec<u64> =
+        PARTS.iter().map(|k| if *k == "images" { image_tokens } else { tokens_of(chars_of(k)) }).collect();
     let raw_hud = estimator.tokens(hud_bytes);
     let raw_sum = raw.iter().sum::<u64>().saturating_add(raw_hud);
     // The estimate for the whole, never smaller than its parts.
@@ -1070,6 +1082,7 @@ pub(crate) fn window_breakdown(
                 | "agent_reports"
                 | "notes"
                 | "stubs"
+                | "images"
                 | "other"
         );
         segments.push(WindowSegment {
@@ -1226,6 +1239,9 @@ pub struct ModelHealth {
     pub detail: String,
     pub context_window: Option<u64>,
     pub max_concurrent: u32,
+    /// The profile's `vision`: the model takes images.
+    #[serde(default)]
+    pub vision: bool,
 }
 
 /// A streamed piece of a model reply, in a form the API can send on.
@@ -1582,6 +1598,47 @@ pub fn attached_files(workspace: &Path, paths: &[String]) -> Result<Vec<texts::A
         out.push(texts::AttachedFile { path, bytes, mime: texts::mime_for(name, None), inline });
     }
     Ok(out)
+}
+
+/// The attached files that are images of at most `max` bytes, stored in the blob store, as the message names
+/// them. A file that is not an image, is too large, or cannot be read or stored is left to its path alone.
+fn stored_images(blobs: &BlobStore, files: &[texts::AttachedFile], max: u64) -> Vec<loom_core::ImageRef> {
+    let mut out = Vec::new();
+    for f in files.iter().filter(|f| f.bytes <= max) {
+        let Ok(data) = std::fs::read(&f.path) else { continue };
+        let Some(info) = loom_core::image::detect(&data) else { continue };
+        let Ok(stored) = blobs.put_bytes(&data) else { continue };
+        let name = Path::new(&f.path).file_name().and_then(|n| n.to_str()).map(str::to_string);
+        out.push(loom_core::ImageRef {
+            blob: stored.id.as_str().to_string(),
+            mime: info.mime.to_string(),
+            bytes: data.len() as u64,
+            width: info.width,
+            height: info.height,
+            name,
+        });
+    }
+    out
+}
+
+/// The `images` entry of a record (`{"blob": …, "mime": …}` inside an `images` array) that names `blob`.
+fn find_image(value: &Value, blob: &str) -> Option<loom_core::ImageRef> {
+    match value {
+        Value::Object(map) => {
+            if let Some(Value::Array(list)) = map.get("images") {
+                for entry in list {
+                    if entry.get("blob").and_then(Value::as_str) == Some(blob) {
+                        if let Ok(image) = serde_json::from_value(entry.clone()) {
+                            return Some(image);
+                        }
+                    }
+                }
+            }
+            map.values().find_map(|v| find_image(v, blob))
+        }
+        Value::Array(items) => items.iter().find_map(|v| find_image(v, blob)),
+        _ => None,
+    }
 }
 
 fn no_session(id: &SessionId) -> String {
@@ -2525,6 +2582,7 @@ impl Orchestrator for Orch {
                 max_tokens: Some(texts::VOTE_MAX_TOKENS),
                 seed: Some(seed),
                 extra: serde_json::Map::new(),
+                images: loom_model::ImageResolver::for_model(rt.client.profile().vision, &inner.blobs),
             };
             let client = rt.client.clone();
             let limiter = rt.limiter.clone();
@@ -4904,6 +4962,30 @@ impl Runtime {
         &self.inner.blobs
     }
 
+    /// The image `blob` (a full blob id) when a record of some session names it in an `images` list: what
+    /// `GET /api/images/{blob}` may serve. Reads the logs of the known sessions for lines that contain the id;
+    /// nothing is cached, because the browser caches the answer. `None` for anything else.
+    pub fn image_named(&self, blob: &str) -> Option<loom_core::ImageRef> {
+        if blob.len() != 64 || !blob.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+            return None;
+        }
+        let ids: Vec<SessionId> = self.inner.st().known.keys().cloned().collect();
+        let needle = format!("\"{blob}\"");
+        for id in ids {
+            let Ok(file) = std::fs::File::open(self.inner.paths.session_log(&id)) else { continue };
+            for line in std::io::BufRead::lines(std::io::BufReader::new(file)).map_while(Result::ok) {
+                if !line.contains(&needle) {
+                    continue;
+                }
+                let Ok(value) = serde_json::from_str::<Value>(&line) else { continue };
+                if let Some(image) = find_image(&value, blob) {
+                    return Some(image);
+                }
+            }
+        }
+        None
+    }
+
     /// Port of the egress proxy on 127.0.0.1.
     pub fn proxy_port(&self) -> u16 {
         self.inner.proxy.port()
@@ -5171,7 +5253,13 @@ impl Runtime {
         };
         self.inner.activate(id)?;
         self.inner.box_reopen_for(id);
-        if !self.inner.send_input(id, Input::User(text.to_string())) {
+        let images = stored_images(&self.inner.blobs, &files, self.inner.config.tools.max_image_bytes);
+        let input = if images.is_empty() {
+            Input::User(text.to_string())
+        } else {
+            Input::UserImages { text: text.to_string(), images }
+        };
+        if !self.inner.send_input(id, input) {
             return Err(format!("Session {} is not accepting input.", id.as_str()));
         }
         // The lead works again, so its agents do: after a restart its turn starts with a note
@@ -6236,6 +6324,7 @@ impl Runtime {
                 },
                 context_window: window,
                 max_concurrent: rt.limiter.capacity(),
+                vision: profile.vision,
             });
         }
         out
@@ -6768,6 +6857,7 @@ mod tests {
             class: None,
             preview: String::new(),
             note: None,
+            image_tokens: 0,
         }
     }
 
@@ -6850,13 +6940,14 @@ mod tests {
                 "agent_reports",
                 "notes",
                 "stubs",
+                "images",
                 "other",
                 "framing",
                 "hud"
             ]
         );
         let empty = window_breakdown(&[], (0, 0), 0, 0, 0, None, &est);
-        assert_eq!((empty.total_tokens, empty.segments.len()), (0, 14));
+        assert_eq!((empty.total_tokens, empty.segments.len()), (0, 15));
     }
 
     #[test]
@@ -8627,6 +8718,7 @@ mod tests {
             class: ToolClass::Exec,
             meta: meta.as_object().cloned().unwrap_or_default(),
             duration_ms: 1,
+            images: Vec::new(),
         })
     }
 
@@ -8961,6 +9053,7 @@ mod tests {
             class,
             meta: meta.as_object().cloned().unwrap_or_default(),
             duration_ms: 0,
+            images: Vec::new(),
         })
     }
 
@@ -9092,7 +9185,7 @@ mod tests {
             .collect();
         assert_eq!(triggers, vec![loom_core::event::Trigger::User; 2]);
         let answered =
-            |r: &Record| matches!(&r.event, Event::UserMessage { text } if text.starts_with("[The operator's"));
+            |r: &Record| matches!(&r.event, Event::UserMessage { text, .. } if text.starts_with("[The operator's"));
         assert!(!records.iter().any(answered));
         assert!(e.rt.answer("i-nothing", "x").await.is_err());
         e.rt.shutdown().await;
@@ -10200,6 +10293,7 @@ mod tests {
                 class: loom_core::event::ToolClass::State,
                 meta: Default::default(),
                 duration_ms: 0,
+                images: Vec::new(),
             };
             log.append(Author::Tool, Event::ToolResult(result)).unwrap();
         };
@@ -12668,7 +12762,7 @@ mod tests {
         e.records(id)
             .into_iter()
             .filter_map(|r| match r.event {
-                Event::UserMessage { text } => Some(text),
+                Event::UserMessage { text, .. } => Some(text),
                 _ => None,
             })
             .collect()

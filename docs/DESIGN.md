@@ -1044,6 +1044,33 @@ The module documentation of `client.rs`, `assemble.rs` and `request.rs` is the p
   `loom models set` would. `loom models show` (`GET /api/sessions/{id}/models`) shows the lead's
   model, each role's choice or the pack's, and the agents running with their models.
 
+### Images
+
+A record can name images: `user_message` and `tool_result` carry `images`, a list of `{blob, mime, bytes, width,
+height, name?}` (`loom_core::ImageRef`; `blob` is the full 64-hex blob id; the key is left out when the list is empty,
+so logs of sessions without images are byte-identical to before). PNG, JPEG, GIF and WebP are recognised by magic
+bytes and sized from the header (`loom_core::image`, no dependency). An image attachment of at most
+`[tools] max_image_bytes` (5 MiB) is stored in the blob store and named in the user message besides its line in the
+attachment list; `read` of such a file returns a one-line text and the image in the result's `images` (tools hand
+them back with `ToolOutput::with_images`, carried to `finalize` in a reserved meta key); a larger image is only
+described.
+
+What the model sees depends on the profile's `vision` (default false). With `vision = true` the request builder
+(`ChatRequest::images`, an `ImageResolver` over the blob store) reads each blob at build time and sends it as an
+`image_url` part with a `data:` URL: a user message with images has array `content`; tool messages stay text, and
+the images of the tool results that answer one assistant message follow the run of tool messages in a single
+`user` message (`Images from the tool results above:`, then `[tool call_id: name]` and the part per image), so the
+call/result pairing stays valid. The weave keeps `Message::images` and the placement is done when the body is
+built (`message::render_request`), not in the log or the weave. Without `vision` the messages get a sentence
+(`[image not shown: this model does not take images ...]`) and no parts. An unreadable blob becomes a sentence too.
+
+An image counts `min(2000, max(85, ceil(w*h/750)))` tokens for a vision model (none otherwise, the sentence being
+text), is taken out of the server's prompt count before the characters-per-token ratio is calibrated, and shows
+as the "Images" part of the Context breakdown. A folded tool result gives its images up
+(`[image folded - read {path} again to see it]`); user images are never folded. `GET /api/images/{blob}` serves an
+image blob that some session's log names in an `images` entry (the logs are searched; anything else, tool output
+included, is 404), inline, with its mime type and `Cache-Control: private, max-age=31536000, immutable`.
+
 ## 11. Tools, sandbox, network (`loom-tools`, `loom-net`)
 
 **Tools.** Built in (`Registry::builtin`): `bash`, `job_wait`, `job_kill`, `job_list`, `read`,
