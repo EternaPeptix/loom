@@ -1554,6 +1554,7 @@ function renderHeader() {
   $("msg").disabled = sending;
   const att = attachState("message:" + info.id);
   $("attach-bar").hidden = !a.send;
+  $("attach-btn").hidden = !a.send;
   $("attach-btn").disabled = sending;
   $("send").disabled = sending || pendingReceipt || !S.rec?.initialComplete || (!$("msg").value.trim() && !att.paths.length) || att.busy || att.failed;
   // The button is an icon; its accessible name says the state, and send-state (live) says it in words.
@@ -6114,7 +6115,7 @@ function wire() {
   $("send").addEventListener("click", sendMessage);
   wireAttach(attachCtx.composer, {
     button: "attach-btn", input: "attach-file", drops: ["composer", "scroller"], paste: "msg",
-    canDrop: () => !$("attach-bar").hidden && !$("msg").disabled,
+    canDrop: () => !$("attach-btn").hidden && !$("msg").disabled,
   });
   wireAttach(attachCtx.start, { button: "f-attach", input: "f-file", drops: ["new-form"], paste: "f-message" });
   msg.addEventListener("keydown", (e) => {

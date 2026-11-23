@@ -1292,7 +1292,7 @@ details.reasoning > .copy-row { margin: 4px 0 2px; }
 
   /* ---- the composer: heading, text and Send, then the seat and the caption ---- */
   .composer { padding-top: 6px; padding-bottom: max(6px, env(safe-area-inset-bottom)); }
-  .composer-card { display: grid; grid-template-columns: minmax(0, auto) minmax(0, 1fr) 44px; grid-template-areas: "head head head" "conf conf conf" "attach attach attach" "msg msg send" "seat cap cap" "help help help"; gap: 0 8px; padding: 4px 10px 2px; align-items: center; }
+  .composer-card { display: grid; grid-template-columns: auto minmax(0, auto) minmax(0, 1fr) 44px; grid-template-areas: "head head head head" "conf conf conf conf" "attach attach attach attach" "msg msg msg send" "clip seat cap cap" "help help help help"; gap: 0 8px; padding: 4px 10px 2px; align-items: center; }
   .composer-card.is-agent { display: flex; flex-direction: row; flex-wrap: wrap; align-items: center; gap: 8px 10px; padding: 8px 12px; }
   .composer-card.is-agent #composer-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; width: 100%; margin-left: 0; }
   .composer-card.is-agent .s-caption { margin-left: auto; }
@@ -1303,8 +1303,8 @@ details.reasoning > .copy-row { margin: 4px 0 2px; }
   #composer-row { display: contents; }
   #send { grid-area: send; align-self: end; }
   /* On a phone Stop takes the caption row's end, below Send, at the same 44px size. */
-  #c-stop { grid-row: 5; grid-column: 3; width: 44px; height: 44px; justify-self: end; }
-  .composer-card:has(#c-stop:not([hidden])) .s-caption { grid-column: 2; }
+  #c-stop { grid-row: 5; grid-column: 4; width: 44px; height: 44px; justify-self: end; }
+  .composer-card:has(#c-stop:not([hidden])) .s-caption { grid-column: 3; }
   .seat { grid-area: seat; flex: none; margin: 0; max-width: 34vw; }
   select.model-seat { width: auto; max-width: 34vw; }
   #model-confirm { grid-area: conf; order: 0; }
@@ -1365,6 +1365,10 @@ details.reasoning > .copy-row { margin: 4px 0 2px; }
 /* ---- attachments: the paperclip, the chips, the drop highlight (docs/UPLOADS.md) ---- */
 .attach-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; min-width: 0; }
 .attach-bar[hidden], .attach-chips[hidden] { display: none; }
+/* The chip row shows only while files are attached; the paperclip lives in the bottom bar. */
+.attach-bar:has(#attach-chips[hidden]) { display: none; }
+.attach-btn[hidden] { display: none; }
+#composer-row .attach-btn { order: 0; }
 .attach-btn { display: inline-grid; place-items: center; flex: 0 0 auto; width: 28px; height: 28px; padding: 0; border: 0; border-radius: 50%; background: transparent; color: var(--dim); cursor: pointer; }
 .attach-btn:hover:not(:disabled) { background: var(--hover); color: var(--strong); }
 .attach-btn:disabled { opacity: .5; cursor: default; }
@@ -1390,11 +1394,11 @@ button.attach-open:hover { border-color: var(--accent-line); background: var(--a
 .attach-row .btn { display: inline-flex; align-items: center; gap: 6px; }
 .drop-on { outline: 2px dashed var(--accent-line); outline-offset: -3px; background: var(--accent-tint); }
 .composer-card.drop-on, .form.drop-on { border-radius: var(--r-xl); }
-.thead .tlabel { flex: 0 1 auto; min-width: 0; max-width: 60%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg); }
+.thead .tlabel { flex: 0 0 auto; min-width: 0; max-width: 55%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg); }
 .thead .args.sub { opacity: .75; }
 @media (max-width: 699px) {
-  #attach-bar { grid-area: attach; }
-  #attach-bar:has(#attach-chips[hidden]) { justify-self: start; }
+  #attach-bar { grid-area: attach; padding-top: 4px; }
+  #attach-btn { grid-area: clip; justify-self: start; }
 }
 @media (pointer: coarse) {
   .attach-btn { width: 44px; height: 44px; }
