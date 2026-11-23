@@ -3275,6 +3275,12 @@ impl Inner {
             platform: format!("{} ({})", std::env::consts::OS, std::env::consts::ARCH),
             sandbox: deps.ctx.sandbox.describe(),
             network: network_text(&self.config),
+            // Read now, once: the record below carries them, and the prompt is rendered from this value.
+            project_instructions: if self.config.agents.project_instructions {
+                pack::read_project_instructions(&deps.ctx.workspace)
+            } else {
+                Vec::new()
+            },
         };
         let replay = deps.reasoning_replay;
         Ok(SessionStart {
@@ -3297,6 +3303,7 @@ impl Inner {
             unattended: meta.unattended,
             schema: loom_core::event::SCHEMA,
             title: meta.title.clone(),
+            project_instructions: env.project_instructions,
         })
     }
 
@@ -9531,6 +9538,62 @@ mod tests {
         assert!(!rs.iter().any(|r| matches!(r.event, Event::TurnEnd { reason: TurnEndReason::Finished })));
         assert!(rt2.session(&b).unwrap().active);
         rt2.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn project_instructions_go_into_the_prompt_are_recorded_and_survive_a_restart_unchanged() {
+        let stall = Arc::new(AtomicBool::new(true));
+        let flag = stall.clone();
+        let e = env(Script::new(move |_, _| {
+            if flag.load(Ordering::SeqCst) {
+                Action::Stall { ms: 600_000 }
+            } else {
+                finish("after restart")
+            }
+        }))
+        .await;
+        std::fs::write(e.ws.join("AGENTS.md"), "old agents rules\n").unwrap();
+        std::fs::write(e.ws.join("CLAUDE.md"), "old claude rules\n").unwrap();
+        let id = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
+        until("request", || !e.server.requests().is_empty()).await;
+        let start = match &e.records(&id)[0].event {
+            Event::SessionStart(s) => s.clone(),
+            other => panic!("first record is {other:?}"),
+        };
+        let names: Vec<_> = start.project_instructions.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["AGENTS.md", "CLAUDE.md"]);
+        let section = start.system_prompt.split("# Project instructions").nth(1).unwrap();
+        assert!(section.starts_with("\n\nFrom the workspace's AGENTS.md and CLAUDE.md."), "{section}");
+        assert!(
+            section.contains("## AGENTS.md\n\nold agents rules\n\n## CLAUDE.md\n\nold claude rules\n\n# Environment")
+        );
+        assert!(start.system_prompt.find("# Project instructions") < start.system_prompt.find("# Environment"));
+        e.rt.shutdown().await;
+
+        // The files change; the restarted session still sends what was recorded.
+        std::fs::write(e.ws.join("AGENTS.md"), "new agents rules\n").unwrap();
+        stall.store(false, Ordering::SeqCst);
+        let before = e.server.requests().len();
+        let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
+        until("resumed", || e.server.requests().len() > before).await;
+        let last = e.server.requests().pop().unwrap();
+        assert!(mentions(&last, "old agents rules") && !mentions(&last, "new agents rules"));
+        rt2.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn project_instructions_off_by_config_reads_nothing() {
+        let e = env_with(Script::new(|_, _| finish("ok")), false, |c| c.agents.project_instructions = false).await;
+        std::fs::write(e.ws.join("AGENTS.md"), "rules\n").unwrap();
+        let id = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
+        match &e.records(&id)[0].event {
+            Event::SessionStart(s) => {
+                assert!(s.project_instructions.is_empty());
+                assert!(!s.system_prompt.contains("# Project instructions"));
+            }
+            other => panic!("first record is {other:?}"),
+        }
+        e.rt.shutdown().await;
     }
 
     /// A lead with a sealed ledger of its own that holds the goal `goal`; returns its mission.

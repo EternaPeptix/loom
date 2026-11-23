@@ -184,11 +184,11 @@ What belongs in the ledger, and through which tool:
 
 - `plan` and `step` — the experiments in flight and their state (researcher).
 - `claim` — a statement a result depends on. It stays open until evidence supports or refutes it.
-- `evidence` — the output that shows a claim: a handle and a line range. When you have the line
-  numbers from `out_read`, `out_grep` or `read`, give only those (at most 20 lines): the harness takes
-  the lines from the stored bytes and shows you what it recorded, so nothing is retyped. Otherwise add
-  the quoted lines; the quote is checked against the stored bytes when the record is written. Either
-  way the output's hash is copied into the record, so the citation cannot later point at different
+- `evidence` — the output that shows a claim: a handle and the quoted text, copied from an
+  output you were shown (no line numbers needed; `start` only when the text appears more than once).
+  The harness finds the text in the stored bytes and records its lines; the quote is checked when the
+  record is written. Leaving the quote out and naming `start` and `end` takes those lines as stored (at
+  most 20). Either way the output's hash is copied into the record, so the citation cannot later point at different
   bytes. Quote whole lines, or at least eight non-space characters of one; line numbers copied along
   must be the right ones.
 - `claim_update` — supported, refuted or withdrawn, when the evidence settles it.

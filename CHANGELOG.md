@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Evidence quotes by text; project instructions
+
+- `evidence` and `claim` lead with quoting by text: copy the exact text from an output you were shown; line numbers
+  are not needed. A quote that occurs more than once is refused with every place listed (`line {n}: {line}`, at most
+  10) and `start` picks one. A quote that matches in one place once spacing and line ends are ignored is taken, and
+  the result says which lines.
+- The workspace's `AGENTS.md` and `CLAUDE.md` go into each new session's system prompt (`# Project instructions`),
+  recorded in `session_start.project_instructions`. `[agents] project_instructions = false` turns it off.
+
 ### File uploads
 
 - `POST /api/uploads?workspace=&name=` (raw body, at most 32 MiB) stores a file in `<workspace>/.loom/uploads/` (name

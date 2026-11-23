@@ -4245,6 +4245,7 @@ mod tests {
                 unattended: false,
                 schema: loom_core::event::SCHEMA,
                 title: "test".into(),
+                project_instructions: Vec::new(),
             }
         }
 

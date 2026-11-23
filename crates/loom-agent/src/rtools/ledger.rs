@@ -42,7 +42,12 @@
 //!   the write. Nothing else is recorded; a refutation or withdrawal gets no such line. (`claim` always
 //!   creates an open claim, so it never banks.)
 //! - `evidence`:
-//!   1. `gate::check_quotes(ctx, &[Quote { handle, start, end, text: quote }])` (only an output of the
+//!   1. `gate::check_quotes_noted(ctx, &[Quote { handle, start, end, text: quote }])`: the quote is found by
+//!      its text, with no line numbers needed. More than one place → refused with each listed as
+//!      `line {n}: {line}` (at most 10, each cut at 200 characters) and "Add `start` to say which."; `start`
+//!      alone then names the line the text begins on. No exact match but one place once whitespace runs are
+//!      collapsed and line ends count as a space → taken as the whole lines it lies on, and the result adds
+//!      `matched lines {a}-{b} ignoring spacing.` (only an output of the
 //!      session's mission; another mission's is refused as a handle that names nothing); on `Err(text)`
 //!      → error `{text}\nNothing was attached.` `quote` may be left out (or blank): the quote is then
 //!      by lines, the lines `start`-`end` as the stored output has them (`gate`). This refusal and the
@@ -100,7 +105,7 @@
 //! is not `Run` is never recorded `Execution`; a `read` producer gets no not-a-run line.
 
 use super::{observed_producer, Shared, NO_MISSION};
-use crate::gate::{check_quotes, Quote};
+use crate::gate::{check_quotes_noted, Quote};
 use crate::{frontier, texts};
 use async_trait::async_trait;
 use loom_core::event::{EvidenceGrade, ToolClass, ToolSpec, META_REFUSAL, REFUSAL_QUOTE};
@@ -527,15 +532,15 @@ impl Tool for Claim {
     fn spec(&self) -> ToolSpec {
         spec(
             "claim",
-            "State something you intend to establish as fact (a finding, a root cause, 'the fix works') with `text`; you may attach evidence and set its status in the same call by passing `handle` (with `quote` or `start`/`end`) and optional `status`/`note`, otherwise it stays open until you call `evidence` and then `claim` again. Settle an existing claim with `id` and `status` (`supported` needs evidence attached; `refuted` and `withdrawn` need `note`). Returns the claim's id.",
+            "State something you intend to establish as fact (a finding, a root cause, 'the fix works') with `text`; you may attach evidence and set its status in the same call by passing `handle` (with `quote` or `start`/`end`) and optional `status`/`note`, otherwise it stays open until you call `evidence` and then `claim` again. To attach evidence, copy the exact text from an output you were shown into `quote`; line numbers are not needed. Settle an existing claim with `id` and `status` (`supported` needs evidence attached; `refuted` and `withdrawn` need `note`). Returns the claim's id.",
             ToolClass::State,
             &[
                 opt("text", "string", "The claim, as one checkable statement (a new claim)."),
                 opt("id", "string", "An existing claim to settle, for example c1; give it with `status` and no `text`."),
                 opt("handle", "string", "Optional stored output handle (for example out:7f3a9c1e) to attach as evidence right away."),
-                opt("start", "integer", "First line of the quote in that output.").min(1),
-                opt("end", "integer", "Last line of the quote in that output.").min(1),
-                opt("quote", "string", "Exact text copied from that output (line numbers optional when unique), or leave out to quote lines start-end whole."),
+                opt("start", "integer", "First line of the quote in that output; only when the quote appears more than once (or with `end` and no `quote`).").min(1),
+                opt("end", "integer", "Last line of the quote in that output; only when the quote appears more than once (or with `start` and no `quote`).").min(1),
+                opt("quote", "string", "The exact text, copied from an output you were shown; line numbers are not needed. Leave out to take lines start-end whole, as stored."),
                 opt("status", "string", "Optional status to set immediately after attaching evidence.").one_of(&["supported", "refuted", "withdrawn"]),
                 opt("note", "string", "One sentence explaining what the evidence shows, or why the claim is refuted/withdrawn."),
             ],
@@ -679,6 +684,11 @@ impl Tool for Claim {
                 msg.push_str(&texts::result_banked(&claim_id, established.len(), &frontier::id_list(&established)));
             }
             if let Some((_, _, v)) = &obs {
+                if let Some(spacing) = &v.spacing {
+                    msg.push('\n');
+                    msg.push_str(spacing);
+                    msg.push('.');
+                }
                 if let Some(recorded) = &v.recorded {
                     msg.push('\n');
                     msg.push_str(recorded);
@@ -695,6 +705,11 @@ impl Tool for Claim {
         if obs.is_some() {
             msg.push_str("\nThe claim is still open — set its status with `claim` and `id`.");
             if let Some((_, _, v)) = &obs {
+                if let Some(spacing) = &v.spacing {
+                    msg.push('\n');
+                    msg.push_str(spacing);
+                    msg.push('.');
+                }
                 if let Some(recorded) = &v.recorded {
                     msg.push('\n');
                     msg.push_str(recorded);
@@ -752,6 +767,8 @@ struct VerifiedObservation {
     tool: String,
     session: String,
     recorded: Option<String>,
+    /// Which lines were taken when the quote matched ignoring spacing.
+    spacing: Option<String>,
 }
 
 fn quote_refused(text: String) -> ToolOutput {
@@ -780,11 +797,11 @@ async fn verify_observation(
         ))));
     }
     let q = Quote { handle: handle.to_string(), start, end, text: quote.to_string() };
-    let verified = match check_quotes(ctx, &[q]).await {
+    let verified = match check_quotes_noted(ctx, &[q]).await {
         Ok(v) => v,
         Err(text) => return Err(Box::new(quote_refused(format!("{text}\n{fail_suffix}")))),
     };
-    let Some(v) = verified.into_iter().next() else {
+    let Some((v, spacing)) = verified.into_iter().next() else {
         return Err(Box::new(ToolOutput::error(
             "The quote could not be checked, so nothing was attached. Check `handle`, `start` and `end`.",
         )));
@@ -818,6 +835,7 @@ async fn verify_observation(
         tool: producer.tool,
         session: producer.session.to_string(),
         recorded,
+        spacing,
     })
 }
 
@@ -826,14 +844,14 @@ impl Tool for Evidence {
     fn spec(&self) -> ToolSpec {
         spec(
             "evidence",
-            "Attach evidence to a claim: lines of the stored output of a command you ran or a file you read. Two ways. By line numbers: give `handle`, `start` and `end` and leave `quote` out; the harness takes those lines from the stored output (at most 40) and shows you what it recorded. Do this when you have the numbers from `read` or `grep`. By text: give `quote`, copied exactly (`start` and `end` are optional when unique in the output; if given, the harness checks within that range or auto-locates unique text); quote whole lines, or at least 8 non-space characters of a line. `handle` is the out:… id shown in the header of the result.",
+            "Attach evidence to a claim from the output of a command you ran or a file you read. Copy the exact text from an output you were shown into `quote`; line numbers are not needed. Quote whole lines, or at least 8 non-space characters of a line. The harness finds the text and records the line or lines it is on; differences in spacing are forgiven when the text is found in one place. If the text occurs more than once, the call is refused with every place listed, and you add `start` to say which. `handle` is the out:… id shown in the header of that result. Only when you want whole lines as stored, leave `quote` out and give `handle`, `start` and `end`; the harness takes those lines (at most 40) and shows you what it recorded.",
             ToolClass::State,
             &[
                 req("claim", "string", "The claim this bears on, for example c1."),
                 req("handle", "string", "The stored output the quote is from, for example out:7f3a9c1e."),
-                opt("start", "integer", "First line of the quote in that output (optional when `quote` is unique).").min(1),
-                opt("end", "integer", "Last line of the quote in that output (optional when `quote` is unique).").min(1),
-                opt("quote", "string", "Leave out to quote lines start-end whole, as stored. Or the text, copied exactly from the output."),
+                opt("start", "integer", "First line of the quote in that output; only when the quote appears more than once (or with `end` and no `quote`).").min(1),
+                opt("end", "integer", "Last line of the quote in that output; only when the quote appears more than once (or with `start` and no `quote`).").min(1),
+                opt("quote", "string", "The exact text, copied from an output you were shown; line numbers are not needed. Leave out to take lines start-end whole, as stored."),
                 req("note", "string", "One sentence: what this shows about the claim."),
                 opt("supports", "boolean", "false when the quote counts against the claim.").default(json!(true)),
             ],
@@ -884,6 +902,11 @@ impl Tool for Evidence {
                 }
                 if state.claims.iter().any(|c| c.id == claim && c.status == ClaimStatus::Open) {
                     text.push_str("\nThe claim is still open — set its status with `claim` and `id`.");
+                }
+                if let Some(spacing) = obs.spacing {
+                    text.push('\n');
+                    text.push_str(&spacing);
+                    text.push('.');
                 }
                 if let Some(recorded) = obs.recorded {
                     text.push('\n');
@@ -1884,5 +1907,91 @@ mod tests {
         assert_eq!(r_empty.status, ToolStatus::Error);
         assert_eq!(r_empty.meta.get(loom_core::event::META_REFUSAL), Some(&json!(loom_core::event::REFUSAL_QUOTE)));
         assert!(r_empty.text.contains("Give `quote`, or both `start` and `end` line numbers."), "{}", r_empty.text);
+    }
+
+    #[tokio::test]
+    async fn an_ambiguous_quote_lists_every_place_and_start_picks_one() {
+        let rig = rig("lead", false, true);
+        ok(&rig, "claim", json!({"text": "c"})).await;
+        let long = format!("repeated match here {}", "z".repeat(300));
+        let h = rig.output(
+            &format!("first line alpha\nrepeated match here\nsecond unique beta\nrepeated match here\n{long}\n"),
+            "bash",
+            ToolClass::Exec,
+        );
+        let t =
+            refused(&rig, "evidence", json!({"claim": "c1", "handle": h, "quote": "repeated match here", "note": "n"}))
+                .await;
+        assert!(t.contains("occurs 3 times"), "{t}");
+        assert!(t.contains("\nline 2: repeated match here\n"), "{t}");
+        assert!(t.contains("\nline 4: repeated match here\n"), "{t}");
+        let cut = format!("line 5: repeated match here {}…", "z".repeat(200 - "repeated match here ".len()));
+        assert!(t.contains(&cut), "{t}");
+        assert!(t.contains("Add `start` to say which."), "{t}");
+        assert!(rig.shared.ledger().unwrap().evidence.is_empty());
+        // `start` alone says which; no `end` needed.
+        ok(
+            &rig,
+            "evidence",
+            json!({"claim": "c1", "handle": h, "quote": "repeated match here", "start": 4, "note": "n"}),
+        )
+        .await;
+        assert_eq!(rig.shared.ledger().unwrap().evidence[0].input.lines, Some((4, 4)));
+    }
+
+    #[tokio::test]
+    async fn a_quote_matching_once_ignoring_spacing_is_taken_and_says_which_lines() {
+        let rig = rig("lead", false, true);
+        ok(&rig, "claim", json!({"text": "c"})).await;
+        let h = rig.output(
+            "header\n\n  test a ...   FAILED\n    left: 1,\n    right: 2\nfooter\n",
+            "bash",
+            ToolClass::Exec,
+        );
+        let t = ok(
+            &rig,
+            "evidence",
+            json!({"claim": "c1", "handle": h, "quote": "test a ... FAILED left: 1, right: 2", "note": "n"}),
+        )
+        .await;
+        assert!(t.contains("matched lines 3-5 ignoring spacing."), "{t}");
+        let e = &rig.shared.ledger().unwrap().evidence[0].input;
+        assert_eq!(e.lines, Some((3, 5)));
+        assert_eq!(e.quote.as_deref(), Some("  test a ...   FAILED\n    left: 1,\n    right: 2"));
+        // Ignoring spacing, two places is still ambiguous.
+        let h2 = rig.output("alpha   beta gamma\nalpha beta   gamma\n", "bash", ToolClass::Exec);
+        let t =
+            refused(&rig, "evidence", json!({"claim": "c1", "handle": h2, "quote": "alpha beta gamma", "note": "n"}))
+                .await;
+        assert!(t.contains("line 1:") && t.contains("line 2:") && t.contains("Add `start`"), "{t}");
+    }
+
+    #[tokio::test]
+    async fn a_quote_only_call_on_a_whole_bash_output_records_the_right_lines() {
+        let rig = rig("lead", false, true);
+        ok(&rig, "claim", json!({"text": "c"})).await;
+        let h =
+            rig.output("$ make test\ncompiling\nerror: boom at parse.rs:12\nmore\nFAILED\n", "bash", ToolClass::Exec);
+        let t = ok(
+            &rig,
+            "evidence",
+            json!({"claim": "c1", "handle": h, "quote": "error: boom at parse.rs:12\nmore", "note": "n"}),
+        )
+        .await;
+        assert!(t.contains("run: bash call"), "{t}");
+        let e = &rig.shared.ledger().unwrap().evidence[0].input;
+        assert_eq!(e.lines, Some((3, 4)));
+        assert_eq!(e.quote.as_deref(), Some("error: boom at parse.rs:12\nmore"));
+        assert!(!t.contains("ignoring spacing"), "{t}");
+    }
+
+    #[test]
+    fn evidence_and_claim_lead_with_quoting_by_text() {
+        use loom_tools::Tool as _;
+        let rig = rig("lead", false, true);
+        for spec in [super::Evidence(rig.shared.clone()).spec(), super::Claim(rig.shared.clone()).spec()] {
+            assert!(spec.description.contains("line numbers are not needed"), "{}", spec.description);
+            assert!(!spec.description.contains("out_read"), "{}", spec.description);
+        }
     }
 }

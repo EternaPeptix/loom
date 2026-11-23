@@ -59,13 +59,19 @@
 //! `system_prompt(role, preamble, env)` is, joined by one blank line:
 //! 1. the preamble;
 //! 2. the role prompt;
-//! 3. `# Environment` followed by the lines: `Workspace: {workspace}`, `Platform: {platform}`,
+//! 3. when the session has project instructions: `# Project instructions`, a sentence ("From the workspace's
+//!    {names}. They describe this project; the operator's rules and the mission's constraints come first
+//!    where they differ."), and `## {name}` with the file's text for each of `PromptEnv::project_instructions`
+//!    (`read_project_instructions`: `AGENTS.md`, then `CLAUDE.md` unless its bytes equal the first's; valid
+//!    UTF-8 only; 32 KiB in all, cut with `[cut: {n} more bytes; read {name}]`). The text is the one recorded
+//!    in `session_start`, so a resumed session renders the same bytes however the files have changed;
+//! 4. `# Environment` followed by the lines: `Workspace: {workspace}`, `Platform: {platform}`,
 //!    `Sandbox: {sandbox}`, `Network: {network}` — and nothing that changes from one request to the
 //!    next (no date, no time, no counters), because this text is the head of the cached prefix.
 //!
 //! When the pack sets `solvable = true`, `texts::SOLVABLE_PRIOR` is inserted as its own part between the
 //! role prompt and `# Environment`. It is a fixed text, so it stays inside the cached head. A pack without
-//! the key gets exactly the three parts above, byte for byte. `solvable` is read from `RoleDef::solvable`,
+//! the key gets exactly the parts above, without the project instructions, byte for byte. `solvable` is read from `RoleDef::solvable`,
 //! which the loader copies from the pack onto every role (so tools and the prompt need no pack lookup); it
 //! also makes `conclude` refuse `status: "unreachable"` (see `rtools/terminal.rs`).
 //!
@@ -78,7 +84,7 @@
 //! reads) names only tools that a role of `vr` has.
 
 use crate::texts;
-use loom_core::event::Termination;
+use loom_core::event::{ProjectInstruction, Termination};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::{Component, Path};
@@ -155,6 +161,78 @@ pub struct PromptEnv {
     pub sandbox: String,
     /// One sentence describing the network policy.
     pub network: String,
+    /// The project instruction files read when the session was created (see [`read_project_instructions`]),
+    /// in order. Empty: no section.
+    pub project_instructions: Vec<ProjectInstruction>,
+}
+
+/// The most bytes of project instructions that go into a system prompt, all files together.
+pub const PROJECT_INSTRUCTIONS_MAX_BYTES: usize = 32 * 1024;
+
+/// The project instruction files of a workspace: `AGENTS.md`, then `CLAUDE.md` (left out when its bytes equal
+/// the first's), read from the workspace root. A file that is missing, is not a regular file or is not valid
+/// UTF-8 is left out (a non-UTF-8 one is reported through `tracing`). Together they are cut at
+/// [`PROJECT_INSTRUCTIONS_MAX_BYTES`] (at a character boundary), the cut text ending in
+/// `[cut: {n} more bytes; read {name}]`; a file that comes after the limit is only that marker.
+pub fn read_project_instructions(workspace: &Path) -> Vec<ProjectInstruction> {
+    let mut seen: Vec<Vec<u8>> = Vec::new();
+    let mut out = Vec::new();
+    let mut left = PROJECT_INSTRUCTIONS_MAX_BYTES;
+    for name in ["AGENTS.md", "CLAUDE.md"] {
+        let path = workspace.join(name);
+        if !std::fs::metadata(&path).map(|m| m.is_file()).unwrap_or(false) {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else { continue };
+        if seen.contains(&bytes) {
+            continue;
+        }
+        let Ok(text) = String::from_utf8(bytes.clone()) else {
+            tracing::warn!("{} is not valid UTF-8; it is left out of the project instructions", path.display());
+            continue;
+        };
+        seen.push(bytes);
+        let text = text.trim_end().to_string();
+        if text.is_empty() {
+            continue;
+        }
+        let text = if text.len() <= left {
+            left -= text.len();
+            text
+        } else {
+            let mut at = left;
+            while !text.is_char_boundary(at) {
+                at -= 1;
+            }
+            let more = text.len() - at;
+            left = 0;
+            let kept = text[..at].trim_end();
+            let marker = format!("[cut: {more} more bytes; read {name}]");
+            if kept.is_empty() {
+                marker
+            } else {
+                format!("{kept}\n\n{marker}")
+            }
+        };
+        out.push(ProjectInstruction { name: name.to_string(), text });
+    }
+    out
+}
+
+/// The `# Project instructions` section for `files`, or nothing when there are none.
+fn project_instructions_section(files: &[ProjectInstruction]) -> String {
+    if files.is_empty() {
+        return String::new();
+    }
+    let names: Vec<&str> = files.iter().map(|f| f.name.as_str()).collect();
+    let mut out = format!(
+        "# Project instructions\n\nFrom the workspace's {}. They describe this project; the operator's rules and the mission's constraints come first where they differ.\n\n",
+        names.join(" and ")
+    );
+    for f in files {
+        out.push_str(&format!("## {}\n\n{}\n\n", f.name, f.text.trim_end()));
+    }
+    out
 }
 
 const CORE_TOML: &str = include_str!("../../../packs/core/pack.toml");
@@ -584,6 +662,7 @@ pub fn load_pack(dir: &Path) -> Result<Pack, String> {
 
 pub fn system_prompt(role: &RoleDef, preamble: &str, env: &PromptEnv) -> String {
     let prior = if role.solvable { format!("{}\n\n", texts::SOLVABLE_PRIOR) } else { String::new() };
+    let prior = format!("{prior}{}", project_instructions_section(&env.project_instructions));
     format!(
         "{}\n\n{}\n\n{prior}# Environment\nWorkspace: {}\nPlatform: {}\nSandbox: {}\nNetwork: {}",
         preamble.trim_end(),
@@ -620,7 +699,13 @@ mod tests {
     }
 
     fn env() -> PromptEnv {
-        PromptEnv { workspace: "/w".into(), platform: "linux".into(), sandbox: "sb".into(), network: "net".into() }
+        PromptEnv {
+            workspace: "/w".into(),
+            platform: "linux".into(),
+            sandbox: "sb".into(),
+            network: "net".into(),
+            project_instructions: Vec::new(),
+        }
     }
 
     #[test]
@@ -933,6 +1018,62 @@ mod tests {
             )
         );
         assert_eq!(s, system_prompt(r, pre, &env()));
+
+        // With project instructions: between the role prompt (and prior) and the environment, built from
+        // the given value alone.
+        let mut e = env();
+        e.project_instructions = vec![
+            ProjectInstruction { name: "AGENTS.md".into(), text: "Use tabs.".into() },
+            ProjectInstruction { name: "CLAUDE.md".into(), text: "Run make test.".into() },
+        ];
+        let with = system_prompt(r, pre, &e);
+        assert_eq!(
+            with,
+            format!(
+                "{pre}\n\n{}\n\n# Project instructions\n\nFrom the workspace's AGENTS.md and CLAUDE.md. They describe this project; the operator's rules and the mission's constraints come first where they differ.\n\n## AGENTS.md\n\nUse tabs.\n\n## CLAUDE.md\n\nRun make test.\n\n# Environment\nWorkspace: /w\nPlatform: linux\nSandbox: sb\nNetwork: net",
+                r.prompt
+            )
+        );
+        assert_eq!(with, system_prompt(r, pre, &e));
+    }
+
+    #[test]
+    fn project_instructions_are_read_from_the_workspace_root() {
+        let dir = std::env::temp_dir().join(format!("loom-pi-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(read_project_instructions(&dir).is_empty());
+
+        std::fs::write(dir.join("CLAUDE.md"), "claude rules\n").unwrap();
+        let got = read_project_instructions(&dir);
+        assert_eq!(got.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["CLAUDE.md"]);
+        assert_eq!(got[0].text, "claude rules");
+
+        std::fs::write(dir.join("AGENTS.md"), "agents rules\n").unwrap();
+        let got = read_project_instructions(&dir);
+        assert_eq!(got.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["AGENTS.md", "CLAUDE.md"]);
+
+        // Identical bytes: the second is left out.
+        std::fs::write(dir.join("CLAUDE.md"), "agents rules\n").unwrap();
+        let got = read_project_instructions(&dir);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].name, "AGENTS.md");
+
+        // Not UTF-8: left out.
+        std::fs::write(dir.join("CLAUDE.md"), [0xff, 0xfe, 0x00]).unwrap();
+        assert_eq!(read_project_instructions(&dir).len(), 1);
+
+        // Too long: cut at a character boundary with the marker; the next file is only the marker.
+        std::fs::write(dir.join("AGENTS.md"), "é".repeat(PROJECT_INSTRUCTIONS_MAX_BYTES)).unwrap();
+        std::fs::write(dir.join("CLAUDE.md"), "more").unwrap();
+        let got = read_project_instructions(&dir);
+        assert!(got[0].text.len() <= PROJECT_INSTRUCTIONS_MAX_BYTES + 64);
+        assert!(got[0].text.ends_with(&format!(
+            "[cut: {} more bytes; read AGENTS.md]",
+            2 * PROJECT_INSTRUCTIONS_MAX_BYTES - PROJECT_INSTRUCTIONS_MAX_BYTES
+        )));
+        assert_eq!(got[1].text, "[cut: 4 more bytes; read CLAUDE.md]");
+        let _ = std::fs::remove_dir_all(&dir);
     }
     #[test]
     fn solvable_prior_sits_between_role_prompt_and_environment_only_in_solvable_packs() {
