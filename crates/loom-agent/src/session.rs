@@ -1000,6 +1000,7 @@ const COMPACT_HIDDEN_TOOLS: &[&str] = &[
 
 /// Build the static wire `ToolSpec` list once at session creation so KV prompt cache stays stable.
 fn wire_tools(registry: &Registry, deps: &Deps) -> Vec<ToolSpec> {
+    let dialect = deps.ctx.cfg.dialect;
     let hidden = &deps.shared.role.hidden_tools;
     let compact = deps.agents.compact_tools;
     registry
@@ -1008,6 +1009,7 @@ fn wire_tools(registry: &Registry, deps: &Deps) -> Vec<ToolSpec> {
         .filter(|spec| {
             !hidden.iter().any(|h| h == &spec.name) && !(compact && COMPACT_HIDDEN_TOOLS.contains(&spec.name.as_str()))
         })
+        .map(|spec| loom_tools::dialect::present(&spec, dialect))
         .collect()
 }
 

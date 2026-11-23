@@ -6,6 +6,8 @@
 //! Pack-enabled command guards reject known interactive/unbounded patterns before a spawn. They
 //! are hygiene checks rather than shell containment; arbitrary scripts remain subject to sandbox,
 //! output, cancellation and time limits. Optional idle_timeout_s terminates a silent foreground call.
+//! `description` (optional string) labels the call for whoever reads the transcript (the trained
+//! dialect's `description`); it is accepted and never read here, and has no effect on running.
 //! 1. `cwd`: `ctx.sandbox.resolve`, must be an existing directory (else an error sentence); default
 //!    `ctx.workspace`.
 //! 2. `ctx.jobs.allocate()`, then `proc::spawn` with the script exactly as given, environment
@@ -188,6 +190,7 @@ impl Tool for Bash {
             ToolClass::Exec,
             &[
                 params::req("command", "string", "The command line to run."),
+                params::opt("description", "string", "A few words saying what the command is for. It labels the call; it does not change what runs."),
                 params::opt("timeout_s", "integer", "Stop the command if it has not finished after this many seconds. Leave it out to let the command run as long as it needs.").min(1),
                 params::opt("background", "boolean", "Start the command as a background job and return immediately (default false). Use for servers and long runs; read its output with job_wait."),
                 params::opt("cwd", "string", "Directory to run in (default: the workspace)."),
