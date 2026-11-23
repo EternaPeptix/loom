@@ -82,7 +82,9 @@ maximum is clamped and said.
 
 The `tool_call` record keeps the arguments exactly as sent; the `tool_result` header carries the repairs.
 The UI reads paths from `path`, `file_path`, `absolute_path` and `target_file`, shows `description` as the
-row label (the command stays visible beside it), and shows a mapped call under the loom tool it ran.
+row label (the command stays visible beside it), and shows a mapped call under the loom tool it ran (the
+`tool_result` record names it), with the name it was sent under in the row's tooltip ("Called as `Read`; ran
+`read`"). Search rows show their pattern and where, `web_fetch` its URL, job tools their job.
 
 ## 4. One tool per job (merges and hidden tools)
 

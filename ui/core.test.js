@@ -97,7 +97,8 @@ test("argsLine: bash is its command, file tools their path, the rest compact JSO
   assert.equal(C.argsLine("bash", { command: "ls  -la\n  /tmp" }), "ls -la /tmp");
   assert.equal(C.argsLine("read", { path: "/w/a.rs", offset: 3 }), "/w/a.rs");
   assert.equal(C.argsLine("edit", { path: "/w/b.rs", old: "x" }), "/w/b.rs");
-  assert.equal(C.argsLine("grep", { pattern: "x", path: "." }), '{"pattern":"x","path":"."}');
+  assert.equal(C.argsLine("grep", { pattern: "x", path: "." }), "x in .");
+  assert.equal(C.argsLine("note", { kind: "decision", text: "y" }), '{"kind":"decision","text":"y"}');
   assert.equal(C.argsLine("bash", null), "");
   assert.ok(C.argsLine("bash", { command: "x".repeat(1000) }, 50).length <= 50);
 });
@@ -3624,4 +3625,19 @@ test("tool shapes: absolute_path and target_file are paths; description is the r
   assert.equal(row.argsLine, "cargo test");
   assert.equal(C.toolRow({ kind: "tool", name: "bash", state: "done", argsLine: "ls", args: { command: "ls" }, result: null }).label, "");
   assert.equal(C.toolRow({ kind: "tool", name: "bash", state: "done", argsLine: "ls", args: { command: "ls", description: 7 }, result: null }).label, "");
+});
+
+test("a call sent under another harness's name shows the loom tool that ran, and its path or pattern", () => {
+  const store = C.createRecordStore("s-1");
+  C.applyRecord(store, { seq: 0, ts_ms: 1, author: "model", kind: "tool_call", call_id: "c1", name: "Read", args: { file_path: "/ws/a.rs", offset: 1, limit: 5 }, class: "read" });
+  C.applyRecord(store, { seq: 1, ts_ms: 2, author: "tool", kind: "tool_result", call_id: "c1", name: "read", status: "ok", text: "[read · ok]", class: "read", meta: {}, duration_ms: 3 });
+  const b = store.blocks.find((x) => x.kind === "tool");
+  const row = C.toolRow(b);
+  assert.equal(row.name, "read");
+  assert.equal(row.calledAs, "Read");
+  assert.equal(row.argsLine, "/ws/a.rs");
+  assert.equal(C.argsLine("grep", { pattern: "fn main", path: "src" }), "fn main in src");
+  assert.equal(C.argsLine("web_fetch", { url: "https://example.invalid/x" }), "https://example.invalid/x");
+  assert.equal(C.argsLine("job_wait", { job: "j2" }), "j2");
+  assert.equal(C.toolRow({ ...b, ran: undefined, name: "read" }).calledAs, "");
 });

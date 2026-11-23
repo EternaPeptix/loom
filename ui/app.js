@@ -2560,7 +2560,9 @@ function buildTool(root, b) {
   head.type = "button";
   head.setAttribute("aria-expanded", String(open));
   head.dataset.focusKey = "tool:" + b.id;
-  add(head, icon("chevron"), icon(row.icon), el("span", "name", b.name));
+  const nameEl = el("span", "name", row.name);
+  if (row.calledAs) nameEl.title = `Called as ${row.calledAs}; ran ${row.name}`;
+  add(head, icon("chevron"), icon(row.icon), nameEl);
   // A call that says what it is for (bash's `description`) leads with that; the command stays beside it, dimmer.
   if (row.label) add(head, el("span", "tlabel", row.label));
   const args = el("span", row.label ? "args sub" : "args", row.argsLine);
@@ -2617,7 +2619,7 @@ function buildTool(root, b) {
     if (s.words || s.blob) {
       const note = el("div", "tnote" + (s.cut ? " cutline" : ""));
       add(note, document.createTextNode(s.words ? s.words + " " : ""));
-      if (s.blob) add(note, keyed(btn("open full output", "link", (e) => openViewer(s.blob, `Full output of ${b.name}`, s.total, {}, e.currentTarget)), "full:" + b.id));
+      if (s.blob) add(note, keyed(btn("open full output", "link", (e) => openViewer(s.blob, `Full output of ${b.ran || b.name}`, s.total, {}, e.currentTarget)), "full:" + b.id));
       add(body, note);
     }
   } else if (b.state === "missing") {

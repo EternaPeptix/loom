@@ -141,18 +141,27 @@ export function oneLine(text, max = 160) {
 }
 
 const FILE_TOOLS = new Set(["read", "write", "edit", "multi_edit", "patch", "ls"]);
+const PATH_KEYS = ["path", "file_path", "absolute_path", "target_file", "file"];
+const firstString = (args, keys) => { for (const k of keys) if (typeof args[k] === "string" && args[k]) return args[k]; return ""; };
 
-/** The arguments of a tool call on one line: bash shows its command, file tools their path. */
+/** The arguments of a tool call on one line: bash shows its command, file tools their path, search tools their
+ *  pattern (and where), web_fetch its URL, job tools their job. `name` is the tool that ran (see `tool_result`). */
 export function argsLine(name, args, max = 240) {
   if (args === null || args === undefined) return "";
   if (typeof args === "string") return oneLine(args, max);
   if (typeof args === "object" && !Array.isArray(args)) {
     if (name === "bash" && typeof args.command === "string") return oneLine(args.command, max);
     if (FILE_TOOLS.has(name)) {
-      for (const k of ["path", "file_path", "absolute_path", "target_file", "file"]) {
-        if (typeof args[k] === "string") return oneLine(args[k], max);
-      }
+      const p = firstString(args, PATH_KEYS);
+      if (p) return oneLine(p, max);
     }
+    if (name === "grep" || name === "glob" || name === "out_grep") {
+      const pat = firstString(args, ["pattern", "query", "regex", "glob"]);
+      const where = firstString(args, [...PATH_KEYS, "dir", "directory", "handle"]);
+      if (pat) return oneLine(where ? `${pat} in ${where}` : pat, max);
+    }
+    if (name === "web_fetch" && typeof args.url === "string") return oneLine(args.url, max);
+    if ((name === "job_wait" || name === "job_kill") && typeof args.job === "string") return oneLine(args.job, max);
   }
   let json;
   try {
@@ -1244,6 +1253,12 @@ function step(store, rec) {
         lines: lineCount(rec.text || ""),
         ts: rec.ts_ms,
       };
+      // A call sent under another harness's name (`Read`, `shell`, …) runs as a loom tool; the result names that
+      // tool. The row shows the tool that ran and keeps the sent name for its tooltip (TOOL-SHAPES §3).
+      if (rec.name && b.name && rec.name !== b.name) {
+        b.ran = rec.name;
+        if (b.args && typeof b.args === "object") b.argsLine = argsLine(rec.name, b.args);
+      }
       b.state = "done";
       store.openCalls.delete(b);
       touch(store, b);
@@ -2663,7 +2678,7 @@ const TOOL_OUTCOME_WORDS = {
   interrupted: () => "Cut off; its effects are unknown.",
 };
 
-/** One tool row in a group: {icon, name, label, argsLine, capsule, duration, state, outcome, words, partial}. `capsule` is {text, tone, icon}
+/** One tool row in a group: {icon, name, calledAs, label, argsLine, capsule, duration, state, outcome, words, partial}. `capsule` is {text, tone, icon}
  *  or null (see TOOL_OUTCOME_LOOK); `outcome` is toolOutcome().kind ("running" / "missing" while there is no result), `words` the
  *  sentence for its tooltip, `partial` {words, shown, total, cut} when the model saw only part of the output, else null. */
 export function toolRow(block) {
@@ -2687,7 +2702,8 @@ export function toolRow(block) {
   const duration = r && r.duration_ms ? seconds(r.duration_ms) : "";
   const d = block.args && typeof block.args === "object" && !Array.isArray(block.args) ? block.args.description : null;
   const label = typeof d === "string" && d.trim() ? oneLine(d, 160) : "";
-  return { icon: toolIcon(block), name: block.name, label, argsLine: block.argsLine || "", capsule, duration, state: block.state, outcome, words, partial: partialView(r) };
+  const calledAs = block.ran ? block.name : "";
+  return { icon: toolIcon(block.ran ? { ...block, name: block.ran } : block), name: block.ran || block.name, calledAs, label, argsLine: block.argsLine || "", capsule, duration, state: block.state, outcome, words, partial: partialView(r) };
 }
 
 /** Footer of a reply, quiet: [profile ·] tok/s · seconds · cache N%. Pass `profile` only when the reply's model differs
