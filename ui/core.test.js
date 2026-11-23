@@ -3464,6 +3464,10 @@ test("contextCardModel: rows and bar share their order, zero parts are dropped e
   assert.deepEqual(keys, ["system", "tools", "rules", "resume", "notes", "conversation", "tool_output", "pinned", "agent_reports", "stubs", "framing", "hud"]);
   assert.deepEqual(m.bar.segments.map((s) => s.key), keys);
   assert.equal(m.rows.find((r) => r.key === "tools").label, "Tool definitions · 42");
+  // images the daemon reports have their own row, counted, after the agent reports
+  const pics = C.contextCardModel(cardWindow({ breakdown: { basis: "default_ratio", chars_per_token: 3.3, total_tokens: 6600, segments: [{ key: "system", chars: 1, tokens: 5000 }, { key: "conversation", chars: 1, tokens: 100 }, { key: "images", chars: 0, tokens: 1500, count: 2 }] } }));
+  assert.deepEqual(pics.rows.map((r) => r.key), ["system", "conversation", "images"]);
+  assert.equal(pics.rows.find((r) => r.key === "images").label, "Images · 2");
   assert.equal(m.rows.find((r) => r.key === "system").value, "~4.9k");
   assert.equal(m.rows.reduce((n, r) => n + r.tokens, 0), 151200);
   // an empty conversation still has its row; other zero parts do not

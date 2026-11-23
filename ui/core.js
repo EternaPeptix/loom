@@ -4332,6 +4332,7 @@ export const CTX_PARTS = [
   { key: "tool_output", label: "Tool output", family: "conv", pattern: "hatch", group: "conv", counted: true },
   { key: "pinned", label: "Pinned output", family: "conv", pattern: "dots", group: "conv", counted: true },
   { key: "agent_reports", label: "Agent reports", family: "conv", pattern: "cross", group: "conv", counted: true },
+  { key: "images", label: "Images", family: "conv", pattern: "outline", group: "conv", counted: true, note: "Estimated from each image's size; only a model that takes images is sent them." },
   { key: "stubs", label: "Folded-out stubs", family: "fold", pattern: "dashed", group: "fold", counted: true, note: "The full output stays in the record." },
   { key: "other", label: "Other records", family: "fold", pattern: "light", group: "fold" },
   { key: "framing", label: "Message framing", family: "fold", pattern: "light", group: "fold" },

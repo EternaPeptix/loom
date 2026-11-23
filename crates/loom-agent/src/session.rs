@@ -685,6 +685,9 @@ enum KeptInput {
         /// What is recorded: `text` with the attachments block; empty means `text` as it is.
         #[serde(default)]
         composed: String,
+        /// The attached images stored when it was queued (`Input::UserImages` when not empty).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<loom_core::ImageRef>,
     },
 }
 
@@ -696,7 +699,14 @@ impl KeptInput {
             KeptInput::Withdraw { id, reason } => Input::Withdraw { id, reason },
             KeptInput::Scope { hosts, note } => Input::Scope { hosts, note },
             KeptInput::Release { reason } => Input::Release { reason },
-            KeptInput::User { text, composed, .. } => Input::User(if composed.is_empty() { text } else { composed }),
+            KeptInput::User { text, composed, images, .. } => {
+                let text = if composed.is_empty() { text } else { composed };
+                if images.is_empty() {
+                    Input::User(text)
+                } else {
+                    Input::UserImages { text, images }
+                }
+            }
         }
     }
 }
@@ -813,14 +823,16 @@ fn queued_files(dir: &Path) -> Vec<(PathBuf, KeptInput)> {
 }
 
 /// Keep a message for `session` on disk until its lead's turn ends. `composed` is `text` with the
-/// attachments block (`texts::with_attachments`), which is what is recorded. The caller then sends the
-/// session [`Input::DrainQueued`], so that a turn that ended meanwhile still sends it.
+/// attachments block (`texts::with_attachments`), which is what is recorded, with `images` (the attached
+/// images, already stored as blobs). The caller then sends the session [`Input::DrainQueued`], so that a
+/// turn that ended meanwhile still sends it.
 pub fn queue_user_message(
     paths: &Paths,
     session: &SessionId,
     text: &str,
     attachments: &[String],
     composed: &str,
+    images: &[loom_core::ImageRef],
 ) -> Result<QueuedMessage, String> {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let created_ms = now_ms();
@@ -837,6 +849,7 @@ pub fn queue_user_message(
         attachments: message.attachments.clone(),
         created_ms,
         composed: composed.to_string(),
+        images: images.to_vec(),
     };
     let _guard = queue_lock();
     write_kept(&queue_dir(paths, session), &kept).map_err(|e| {
@@ -862,7 +875,7 @@ pub fn edit_queued_message(
     let dir = queue_dir(paths, session);
     let _guard = queue_lock();
     for (file, kept) in queued_files(&dir) {
-        let KeptInput::User { id: have, attachments, created_ms, .. } = kept else { continue };
+        let KeptInput::User { id: have, attachments, created_ms, images, .. } = kept else { continue };
         if have != id {
             continue;
         }
@@ -874,6 +887,7 @@ pub fn edit_queued_message(
             attachments,
             created_ms,
             composed: composed.to_string(),
+            images,
         };
         write_kept_to(&dir, &file, &new).map_err(|e| format!("Could not keep the edit on disk ({e}); try again."))?;
         return Ok(message);
@@ -881,8 +895,9 @@ pub fn edit_queued_message(
     Err(no_queued(id))
 }
 
-/// Take queued message `id` off the queue: the message and what is to be recorded for it.
-pub fn take_queued_message(paths: &Paths, session: &SessionId, id: &str) -> Result<(QueuedMessage, String), String> {
+/// Take queued message `id` off the queue: the message and the input that records it
+/// (`Input::UserImages` when images were attached).
+pub fn take_queued_message(paths: &Paths, session: &SessionId, id: &str) -> Result<(QueuedMessage, Input), String> {
     let _guard = queue_lock();
     for (file, kept) in queued_files(&queue_dir(paths, session)) {
         let Some(message) = QueuedMessage::of(&kept) else { continue };
@@ -890,8 +905,7 @@ pub fn take_queued_message(paths: &Paths, session: &SessionId, id: &str) -> Resu
             continue;
         }
         std::fs::remove_file(&file).map_err(|e| format!("Could not remove the queued message ({e}); try again."))?;
-        let KeptInput::User { text, composed, .. } = kept else { continue };
-        return Ok((message, if composed.is_empty() { text } else { composed }));
+        return Ok((message, kept.into_input()));
     }
     Err(no_queued(id))
 }
@@ -2491,8 +2505,9 @@ Name them when you start a new mission instead."
                 }
             };
             let Some((held, kept)) = next else { break };
-            if let Input::User(text) = kept.into_input() {
-                self.record_input(Input::User(text)).await?;
+            let input = kept.into_input();
+            if matches!(input, Input::User(_) | Input::UserImages { .. }) {
+                self.record_input(input).await?;
             }
             if let Err(e) = std::fs::remove_file(&held) {
                 tracing::warn!(session = %self.deps.shared.session, "queued message {} not deleted: {e}", held.display());
@@ -6697,6 +6712,7 @@ mod tests {
                     .into_iter()
                     .collect(),
                 duration_ms: 1,
+                images: vec![],
             };
             session.append(Author::Tool, Event::ToolResult(result)).unwrap();
         }
@@ -7378,14 +7394,14 @@ mod tests {
     fn user_texts(rs: &[Record]) -> Vec<String> {
         rs.iter()
             .filter_map(|r| match &r.event {
-                Event::UserMessage { text } => Some(text.clone()),
+                Event::UserMessage { text, .. } => Some(text.clone()),
                 _ => None,
             })
             .collect()
     }
 
     fn queue_msg(paths: &Paths, id: &SessionId, text: &str) -> QueuedMessage {
-        queue_user_message(paths, id, text, &[], text).unwrap()
+        queue_user_message(paths, id, text, &[], text, &[]).unwrap()
     }
 
     #[tokio::test]
@@ -7425,12 +7441,42 @@ mod tests {
         finish_task(tx, task).await;
     }
 
+    #[tokio::test]
+    async fn a_queued_message_keeps_its_images_through_the_queue_and_records_them() {
+        let mut fx = Fx::new("chat", false, false, seq(vec![Reply::text("ok").into()])).await;
+        drop(fx.create());
+        let id = SessionId::from("s-test");
+        let img = loom_core::ImageRef {
+            blob: "ab".repeat(32),
+            mime: "image/png".into(),
+            bytes: 9,
+            width: 4,
+            height: 3,
+            name: Some("shot.png".into()),
+        };
+        queue_user_message(&fx.paths, &id, "look", &[], "look [file]", std::slice::from_ref(&img)).unwrap();
+        let (tx, task) = spawn_run(Session::open(fx.deps()).unwrap());
+        tx.send(Input::DrainQueued).unwrap();
+        wait_until(&fx.sink, "the turn", |rs| count(rs, "turn_end") == 1).await;
+        let recorded: Vec<_> = fx
+            .sink
+            .records()
+            .into_iter()
+            .filter_map(|r| match r.event {
+                Event::UserMessage { text, images } => Some((text, images)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(recorded, vec![("look [file]".to_string(), vec![img])]);
+        finish_task(tx, task).await;
+    }
+
     #[test]
     fn a_queued_message_is_listed_edited_and_removed_and_an_unknown_id_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::at(dir.path().join("home"));
         let id = SessionId::from("s-test");
-        let a = queue_user_message(&paths, &id, "a", &["/w/.loom/uploads/x.csv".into()], "a [file]").unwrap();
+        let a = queue_user_message(&paths, &id, "a", &["/w/.loom/uploads/x.csv".into()], "a [file]", &[]).unwrap();
         let b = queue_msg(&paths, &id, "b");
         let c = queue_msg(&paths, &id, "c");
         let listed = queued_messages(&paths, &id);
@@ -7443,8 +7489,8 @@ mod tests {
         assert_eq!(listed.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(), ["a2", "b", "c"]);
         assert_eq!(listed[0].attachments.len(), 1);
         // Remove / send-now take one out and say what it was.
-        let (_, composed) = take_queued_message(&paths, &id, &b.id).unwrap();
-        assert_eq!(composed, "b");
+        let (_, input) = take_queued_message(&paths, &id, &b.id).unwrap();
+        assert!(matches!(input, Input::User(t) if t == "b"));
         assert!(take_queued_message(&paths, &id, &b.id).unwrap_err().starts_with("There is no queued message"));
         assert!(edit_queued_message(&paths, &id, &b.id, "x", "x").unwrap_err().starts_with("There is no"));
         assert_eq!(queued_messages(&paths, &id).len(), 2);

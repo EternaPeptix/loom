@@ -5317,7 +5317,9 @@ impl Runtime {
         let files = attached_files(Path::new(&meta.workspace), attachments)?;
         let composed = texts::with_attachments(text, &files);
         self.inner.activate(id)?;
-        let message = queue_user_message(&self.inner.paths, id, text, attachments, &composed)?;
+        // Images are stored now, as a message sent at once stores them, so the queued one carries them.
+        let images = stored_images(&self.inner.blobs, &files, self.inner.config.tools.max_image_bytes);
+        let message = queue_user_message(&self.inner.paths, id, text, attachments, &composed, &images)?;
         // The turn may have ended since the phase was read: the session looks at its queue again.
         if !self.inner.send_input(id, Input::DrainQueued) {
             let _ = take_queued_message(&self.inner.paths, id, &message.id);
@@ -5366,15 +5368,20 @@ impl Runtime {
         if meta.archived {
             return Err("This session is archived; unarchive it first.".to_string());
         }
-        let (message, composed) = take_queued_message(&self.inner.paths, id, qid)?;
+        let (message, input) = take_queued_message(&self.inner.paths, id, qid)?;
         self.inner.publish(BusEvent::Queued { session: id.clone() });
+        let (composed, images) = match &input {
+            Input::UserImages { text, images } => (text.clone(), images.clone()),
+            Input::User(text) => (text.clone(), Vec::new()),
+            _ => (message.text.clone(), Vec::new()),
+        };
         let sent = self.inner.activate(id).is_ok() && {
             self.inner.box_reopen_for(id);
-            self.inner.send_input(id, Input::User(composed.clone()))
+            self.inner.send_input(id, input)
         };
         if !sent {
             // Not lost: it goes back on the queue (at the end).
-            let _ = queue_user_message(&self.inner.paths, id, &message.text, &message.attachments, &composed);
+            let _ = queue_user_message(&self.inner.paths, id, &message.text, &message.attachments, &composed, &images);
             self.inner.publish(BusEvent::Queued { session: id.clone() });
             return Err(format!("Session {} is not accepting input.", id.as_str()));
         }
