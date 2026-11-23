@@ -5,8 +5,7 @@
 //! read where unambiguous, each with a note; early role refusals; exact-shape guidance on a refusal),
 //! then resolves security-ID prefixes/aliases, checks actual session capabilities, synthesizes any
 //! inline `out:<handle>` (or `{handle, start?, end?, quote?}`) evidence references into attested
-//! `EvidenceAdd` records after shape/auth/preflight checks pass, then appends one sealed op. The lead opens/prioritizes hypotheses. Only an independent child with `read_only` and `verdict`
-//! may close one, and only its original lead may reprioritize it. The core checks all evidence and
+//! `EvidenceAdd` records after shape/auth/preflight checks pass, then appends one sealed op. The core checks all evidence and
 //! coverage invariants under the journal lock. Batches have the same authorization as individual ops.
 //! A credential's `secret_handle` is opened with `loom_tools::outputs::open` (only an output of the
 //! session's mission): any failure is ``Use an existing stored out: handle for the credential secret; no
@@ -28,41 +27,35 @@
 //! whole state (after a scanner import that ran to tens of thousands of tokens at every write):
 //! - *touched*: for each id-keyed collection of `SecurityState` (`assets`, `credentials`,
 //!   `footholds`, `condition_evidence`, `blocked`, `revisited`, `crashes`, `vector_attempts`,
-//!   `hypotheses`, `relations`, `facts`, `rules`, `aliases`), the keys whose value differs between the
+//!   `relations`, `facts`, `aliases`), the keys whose value differs between the
 //!   state read before the append and the state the append returned, new keys included; of
-//!   `unlocked`, the conditions added; and `died` and `retraction_limitation` when they differ (a
-//!   retraction's conclusions that no longer hold). A write by another session between the two reads
+//!   `unlocked`, the conditions added. A write by another session between the two reads
 //!   shows up too.
 //! - *addressed*: the ids the operation names or creates whatever the state held: the keys of every
 //!   collection of a `SecurityState::default()` to which the (resolved) operation was applied, kept when
 //!   the state after the append has them. An addressed id that was not touched is listed under
 //!   `unchanged` (`{collection: [ids]}`), so a repeated write (an asset already known under its
-//!   canonical locator, a hypothesis already open) still names its id; `unchanged` is omitted when empty.
+//!   canonical locator) still names its id; `unchanged` is omitted when empty.
 //! - `recorded`: `{collection: {id: record}}` of the touched entries (`unlocked`: the list of added
-//!   conditions; `died`: the list; `retraction_limitation`: the text), each in full, when their JSON
+//!   conditions), each in full, when their JSON
 //!   together, pretty-printed as the result is, is at most `RECORDED_CHARS` (8 000) characters;
 //!   otherwise `{collection: {"count": k, "ids": [first 20 ids, each cut to 80 characters]}}` for each
-//!   collection touched (`unlocked` and `died`: the count only). Collections with nothing touched are
+//!   collection touched (`unlocked`: the count only). Collections with nothing touched are
 //!   left out.
 //! - `removed`: `{collection: [ids]}` of keys present before and gone after; omitted when empty.
 //! - `counts`: `{collection: number of entries}` after the write, for each non-empty collection.
 //! - `more`: `The rest of the security state is unchanged by this write; read it with security_query
-//!   (view: state, assets, coverage, revisit, hypotheses or facts).`
+//!   (view: state, assets, coverage, revisit or resolve).`
 //!
 //! Tests: a single upsert returns that asset in full and the counts, not the other assets; a batch
 //! over the size bound returns counts and ids, and stays near the bound with long keys and many
-//! conditions; a repeated hypothesis_open and an upsert of a known asset under another spelling name
-//! the id under `unchanged`; a fact retraction reports `died`; a hypothesis_open returns the new hypothesis id; a
-//! retraction returns the fact it deactivated (a retraction keeps the record, so `removed` stays empty; it
+//! conditions; an upsert of a known asset under another spelling name
+//! the id under `unchanged`; a retraction returns the fact it deactivated (a retraction keeps the record, so `removed` stays empty; it
 //! lists ids a write deletes, tested on the report itself).
 //!
-//! When the read operation was expanded by N4d (a single hypothesis_open carrying evidence) and
-//! the append fails, the error gets the sentence " The evidence given with hypothesis_open was being
-//! attached by a second operation in the same atomic append; nothing was recorded." appended.
-//!
-//! `security_query` returns JSON for state/assets/coverage/revisit/hypotheses/facts/why/what_if/
-//! resolve/path_suggest. Hypothetical changes never write. Rule evaluation reports its bounds and
-//! incomplete closures. Path suggestions are bounded heuristics, not confirmed attack paths.
+//! `security_query` returns JSON for state/assets/coverage/revisit/resolve. The six removed operations
+//! (`hypothesis_open`, `hypothesis_priority`, `hypothesis_evidence`, `hypothesis_verdict`, `rule_install`,
+//! `rule_retract`) are refused with `REMOVED_OP_REFUSAL`; the harness draws no conclusions from the state.
 //!
 //! `security_ingest` reads an existing observed blob (<=2 MiB, <=500 discovered assets), not model
 //! text. Its `handle` is opened with `loom_tools::outputs::open` (a refusal is `Unopened::sentence`), then
@@ -83,7 +76,7 @@ use async_trait::async_trait;
 use loom_core::event::{EvidenceGrade, ToolClass, ToolSpec};
 use loom_core::ledger::{ClaimStatus, Entry, EvidenceInput, EvidenceKind, LedgerOp, LedgerState};
 use loom_core::observe::{MIN_PARTIAL_QUOTE_CHARS, REF_QUOTE_MAX_CHARS, REF_QUOTE_MAX_LINES};
-use loom_core::security_state::{Condition, ConditionKind, CoverageDisposition, Fact, SecurityOp, SecurityState};
+use loom_core::security_state::{Condition, ConditionKind, CoverageDisposition, SecurityOp, SecurityState};
 use loom_core::{BlobId, MissionId};
 use loom_tools::outputs;
 use loom_tools::params::{opt, req, spec};
@@ -109,36 +102,6 @@ fn output(value: &impl Serialize) -> ToolOutput {
             ToolOutput::error("The security state could not be serialized; report this harness fault to the operator.")
         }
     }
-}
-
-fn authorize(shared: &Shared, state: &SecurityState, op: &SecurityOp) -> Result<(), String> {
-    let lead = !shared.is_child();
-    let judge = shared.is_child() && shared.role.read_only && shared.role.tools.iter().any(|t| t == "verdict");
-    match op {
-        SecurityOp::Batch { operations } => {
-            for op in operations {
-                authorize(shared, state, op)?;
-            }
-        }
-        SecurityOp::HypothesisOpen { .. } if !lead => {
-            return Err("Only the mission lead may open a hypothesis; send the proposed hypothesis to the lead.".into())
-        }
-        SecurityOp::HypothesisPriority { id, .. }
-            if !lead || state.hypotheses.get(id).is_some_and(|h| h.owner != shared.session) =>
-        {
-            return Err(
-                "Only the hypothesis's original lead may change its priority; send the proposed change to that lead."
-                    .into(),
-            );
-        }
-        SecurityOp::HypothesisVerdict { id, .. }
-            if !judge || state.hypotheses.get(id).is_some_and(|h| h.owner == shared.session) =>
-        {
-            return Err("A hypothesis verdict requires an independent read-only child with the verdict tool; ask the mission verifier to review it.".into());
-        }
-        _ => {}
-    }
-    Ok(())
 }
 
 fn resolve_op(state: &SecurityState, op: &mut SecurityOp) -> Result<(), String> {
@@ -178,11 +141,7 @@ fn resolve_op(state: &SecurityState, op: &mut SecurityOp) -> Result<(), String> 
             resolve_conditions(state, conditions)?;
         }
         SecurityOp::CoverageSet { asset, .. } => resolve(asset)?,
-        SecurityOp::HypothesisPriority { id, .. }
-        | SecurityOp::HypothesisEvidence { id, .. }
-        | SecurityOp::HypothesisVerdict { id, .. }
-        | SecurityOp::FactRetract { id, .. }
-        | SecurityOp::RuleRetract { id, .. } => resolve(id)?,
+        SecurityOp::FactRetract { id, .. } => resolve(id)?,
         SecurityOp::AliasAdd { target, .. } => resolve(target)?,
         SecurityOp::RelationAdd { relation } => {
             resolve(&mut relation.from)?;
@@ -285,7 +244,7 @@ fn extract_inline_objects(val: &mut Value, prefix: &str, specs: &mut Vec<InlineE
             }
         }
     }
-    for key in ["asset", "credential", "foothold", "relation", "disposition", "attempt", "hypothesis"] {
+    for key in ["asset", "credential", "foothold", "relation", "disposition", "attempt"] {
         if let Some(child) = obj.get_mut(key) {
             extract_inline_objects(child, prefix, specs);
         }
@@ -307,11 +266,6 @@ fn visit_single_op_evidence_mut(op: &mut SecurityOp, mut f: impl FnMut(bool, &mu
         SecurityOp::ConditionUnlock { evidence, .. } => f(false, evidence),
         SecurityOp::CoverageSet { disposition: CoverageDisposition::Tested { evidence }, .. } => f(false, evidence),
         SecurityOp::CrashRecord { attempt, .. } => f(false, &mut attempt.evidence),
-        SecurityOp::HypothesisEvidence { evidence, counterevidence, .. }
-        | SecurityOp::HypothesisVerdict { evidence, counterevidence, .. } => {
-            f(false, evidence);
-            f(true, counterevidence);
-        }
         SecurityOp::RelationAdd { relation } => f(false, &mut relation.evidence),
         SecurityOp::FactAssert { evidence, .. } => f(false, evidence),
         _ => {}
@@ -562,7 +516,6 @@ async fn synthesize_inline_evidence(
     ic: &InlineContext<'_>,
     state: &LedgerState,
     op: &mut SecurityOp,
-    expanded: bool,
     notes: &mut Vec<String>,
 ) -> Result<(), String> {
     if !has_inline_evidence(op) {
@@ -587,7 +540,7 @@ async fn synthesize_inline_evidence(
     };
     let mut raw_items = Vec::new();
     match &mut *op {
-        SecurityOp::Batch { operations } if !expanded => {
+        SecurityOp::Batch { operations } => {
             let n = operations.len();
             for (idx, elem) in operations.iter_mut().enumerate() {
                 let i = idx.saturating_add(1);
@@ -595,13 +548,6 @@ async fn synthesize_inline_evidence(
                 let loc_name = format!("operation {i} of the batch");
                 visit_single_op_evidence_mut(elem, |is_counter, list| {
                     collect_list(elem_index, &loc_name, is_counter, list, &mut raw_items);
-                });
-            }
-        }
-        SecurityOp::Batch { operations } => {
-            for elem in operations.iter_mut() {
-                visit_single_op_evidence_mut(elem, |is_counter, list| {
-                    collect_list(None, "the operation", is_counter, list, &mut raw_items);
                 });
             }
         }
@@ -665,15 +611,7 @@ async fn synthesize_inline_evidence(
     }
     let mut staged_op = op.clone();
     replace_inline_slots(&mut staged_op, &staged_ids);
-    if let Err(e) = staged.validate(&LedgerOp::Security(staged_op), false) {
-        if expanded {
-            return Err(format!(
-                "{e} The evidence given with hypothesis_open was being attached by a second operation in the same \
-                 atomic append; nothing was recorded."
-            ));
-        }
-        return Err(e);
-    }
+    staged.validate(&LedgerOp::Security(staged_op), false)?;
 
     // Commit to the real journal now that all validation checks have passed.
     let claim_id = match target_claim {
@@ -723,7 +661,7 @@ fn replace_inline_slots(op: &mut SecurityOp, ids: &[String]) {
 #[async_trait]
 impl Tool for SecurityRecord {
     fn spec(&self) -> ToolSpec {
-        let caller = shapes::Caller { standing: standing(&self.0), tools: &self.0.role.tools };
+        let caller = shapes::Caller { tools: &self.0.role.tools };
         spec(
             "security_record",
             &shapes::description(&caller),
@@ -740,7 +678,7 @@ impl Tool for SecurityRecord {
             Err(e) => return ToolOutput::error(e),
         };
         let before = state.security.clone();
-        let caller = shapes::Caller { standing: standing(&self.0), tools: &self.0.role.tools };
+        let caller = shapes::Caller { tools: &self.0.role.tools };
         let (mut operation, top_level_note) = match args.get("operation") {
             Some(op) => (op.clone(), None),
             None if args.contains_key("action") => {
@@ -755,14 +693,10 @@ impl Tool for SecurityRecord {
             Ok(read) => read,
             Err(e) => return ToolOutput::error(e),
         };
-        // A single hypothesis_open that carried evidence was read as a two-operation batch (N4d).
-        let expanded = matches!(read.op, SecurityOp::Batch { .. })
-            && operation.get("action").and_then(Value::as_str) != Some("batch");
         let mut notes: Vec<String> = top_level_note.into_iter().collect();
         notes.extend(read.notes);
         let mut op = read.op;
         let prepare = |op: &mut SecurityOp| resolve_op(&state.security, op);
-        let authorized = |op: &SecurityOp| authorize(&self.0, &state.security, op);
         // A batch element that fails is named, the way the core names one that fails validation.
         let prepared = match &mut op {
             SecurityOp::Batch { operations } => {
@@ -770,10 +704,7 @@ impl Tool for SecurityRecord {
                 let mut result = Ok(());
                 for (i, element) in operations.iter_mut().enumerate() {
                     let step = match prepare(element) {
-                        Ok(()) => match resolve_secrets(ctx, element).await {
-                            Ok(()) => authorized(element),
-                            Err(e) => Err(e),
-                        },
+                        Ok(()) => resolve_secrets(ctx, element).await,
                         Err(e) => Err(e),
                     };
                     if let Err(e) = step {
@@ -788,10 +719,7 @@ impl Tool for SecurityRecord {
                 result
             }
             single => match prepare(single) {
-                Ok(()) => match resolve_secrets(ctx, single).await {
-                    Ok(()) => authorized(single),
-                    Err(e) => Err(e),
-                },
+                Ok(()) => resolve_secrets(ctx, single).await,
                 Err(e) => Err(e),
             },
         };
@@ -799,7 +727,7 @@ impl Tool for SecurityRecord {
             return ToolOutput::error(e);
         }
         let inline_ctx = InlineContext { shared: &self.0, mission, ctx, prefix: &prefix, specs: &inline_specs };
-        if let Err(e) = synthesize_inline_evidence(&inline_ctx, &state, &mut op, expanded, &mut notes).await {
+        if let Err(e) = synthesize_inline_evidence(&inline_ctx, &state, &mut op, &mut notes).await {
             return ToolOutput::error(e);
         }
         // Shared::ledger_append serializes all structural validation and writes under the journal lock.
@@ -817,10 +745,6 @@ impl Tool for SecurityRecord {
                 result.extend(touched_report(&before, &state.security, &addressed));
                 output(&result)
             }
-            Err(e) if expanded => ToolOutput::error(format!(
-                "{e} The evidence given with hypothesis_open was being attached by a second operation in the same \
-                 atomic append; nothing was recorded."
-            )),
             Err(e) => ToolOutput::error(e),
         }
     }
@@ -831,7 +755,7 @@ const RECORDED_CHARS: usize = 8_000;
 /// Ids named per collection when the touched records are too many to return in full.
 const RECORDED_IDS: usize = 20;
 /// The id-keyed collections of `SecurityState` whose touched entries a write reports.
-const KEYED: [&str; 13] = [
+const KEYED: [&str; 11] = [
     "assets",
     "credentials",
     "footholds",
@@ -840,10 +764,8 @@ const KEYED: [&str; 13] = [
     "revisited",
     "crashes",
     "vector_attempts",
-    "hypotheses",
     "relations",
     "facts",
-    "rules",
     "aliases",
 ];
 
@@ -910,16 +832,10 @@ fn touched_report(before: &SecurityState, after: &SecurityState, addressed: &Sec
     if !new.is_empty() {
         counts.insert("unlocked".into(), json!(new.len()));
     }
-    for name in ["died", "retraction_limitation"] {
-        let new = after.get(name).filter(|v| !v.is_null() && v.as_array().is_none_or(|a| !a.is_empty()));
-        if let Some(new) = new.filter(|v| before.get(name) != Some(*v)) {
-            touched.insert(name.into(), new.clone());
-        }
-    }
     let recorded: Map<String, Value> = if pretty_chars(&touched) <= RECORDED_CHARS {
         touched
     } else {
-        // Counts and ids; `unlocked`, `died` and the limitation text are named by count or a short cut.
+        // Counts and ids; `unlocked` is named by count.
         let form = |with_ids: bool| -> Map<String, Value> {
             touched
                 .iter()
@@ -962,33 +878,18 @@ fn touched_report(before: &SecurityState, after: &SecurityState, addressed: &Sec
         "more".into(),
         json!(
             "The rest of the security state is unchanged by this write; read it with security_query (view: state, \
-             assets, coverage, revisit, hypotheses or facts)."
+             assets, coverage, revisit or resolve)."
         ),
     );
     report
 }
 
-/// The session's standing for hypotheses: the lead, a read-only child with the verdict tool, or another child.
-fn standing(shared: &Shared) -> shapes::Standing {
-    if !shared.is_child() {
-        shapes::Standing::Lead
-    } else if shared.role.read_only && shared.role.tools.iter().any(|t| t == "verdict") {
-        shapes::Standing::Judge
-    } else {
-        shapes::Standing::Child
-    }
-}
-
 #[async_trait]
 impl Tool for SecurityQuery {
     fn spec(&self) -> ToolSpec {
-        spec("security_query", "Read durable security state. why needs fact; what_if accepts assumed facts and retracted base/rule IDs without changing the journal. path_suggest returns at most three bounded investigation hints over explicit relations, excluding expired edges; it does not establish exploitability or authorize a target. Rule closure complete=false means some conclusions are unknown.", ToolClass::State, &[
-            req("view", "string", "The view.").one_of(&["state","assets","coverage","revisit","hypotheses","facts","why","what_if","resolve","path_suggest"]),
+        spec("security_query", "Read durable security state: the typed records, coverage, routes to revisit, and ID resolution. It is a read; nothing it returns is a conclusion drawn by the harness.", ToolClass::State, &[
+            req("view", "string", "The view.").one_of(&["state","assets","coverage","revisit","resolve"]),
             opt("target", "string", "Exact ID, alias, or unambiguous prefix for resolve."),
-            opt("fact", "object", "Ground {predicate,args} to explain."),
-            opt("assume", "array", "Ground facts for what_if.").items("object"),
-            opt("retract", "array", "Base fact or rule IDs to omit hypothetically.").items("string"),
-            opt("from", "string", "Start asset for path_suggest."), opt("to", "string", "Goal asset for path_suggest."),
             opt("now_ms", "integer", "Expiry evaluation time, default current UTC milliseconds.").min(0),
         ])
     }
@@ -1008,57 +909,10 @@ impl Tool for SecurityQuery {
                 json!({"unlocked_routes":state.newly_unlocked_at(now_ms),"now_ms":now_ms,
                     "blocked":state.blocked,"conditions":state.unlocked})
             }
-            "hypotheses" => return output(&state.hypotheses),
-            "facts" => return output(&state.projection()),
-            "why" => {
-                let fact: Fact = match decode(args.get("fact"), "fact") {
-                    Ok(f) => f,
-                    Err(e) => return ToolOutput::error(e),
-                };
-                let projection = state.projection();
-                json!({"explanation":projection.why(&fact),"complete":projection.complete,"limitation":projection.limitation})
-            }
-            "what_if" => {
-                let assume: Vec<Fact> = match decode(Some(args.get("assume").unwrap_or(&json!([]))), "assume") {
-                    Ok(v) => v,
-                    Err(e) => return ToolOutput::error(e),
-                };
-                if assume.len() > 128 || assume.iter().any(|f| f.validate().is_err()) {
-                    return ToolOutput::error("Give at most 128 valid ground facts for a hypothetical query.");
-                }
-                let mut retract: Vec<String> = match decode(Some(args.get("retract").unwrap_or(&json!([]))), "retract")
-                {
-                    Ok(v) => v,
-                    Err(e) => return ToolOutput::error(e),
-                };
-                if retract.len() > 128 {
-                    return ToolOutput::error("Retract at most 128 IDs in a hypothetical query.");
-                }
-                for id in &mut retract {
-                    match state.resolve(id) {
-                        Ok(v) => *id = v,
-                        Err(e) => return ToolOutput::error(e),
-                    }
-                }
-                return output(&state.what_if(&assume, &retract));
-            }
             "resolve" => match state.resolve(args.get("target").and_then(Value::as_str).unwrap_or("")) {
                 Ok(id) => json!({"id":id}),
                 Err(e) => return ToolOutput::error(e),
             },
-            "path_suggest" => {
-                let from = match state.resolve(args.get("from").and_then(Value::as_str).unwrap_or("")) {
-                    Ok(v) => v,
-                    Err(e) => return ToolOutput::error(e),
-                };
-                let to = match state.resolve(args.get("to").and_then(Value::as_str).unwrap_or("")) {
-                    Ok(v) => v,
-                    Err(e) => return ToolOutput::error(e),
-                };
-                let now_ms = args.get("now_ms").and_then(Value::as_u64).unwrap_or_else(loom_core::now_ms);
-                json!({"paths":state.path_suggest(&from,&to,now_ms),"now_ms":now_ms,
-                    "limitation":"At most three simple paths, eight hops, and 10000 search expansions. Investigation hints; no exploitability claim."})
-            }
             _ => return ToolOutput::error("Choose a supported security_query view from its tool schema."),
         };
         output(&value)
@@ -1141,7 +995,7 @@ mod tests {
     use loom_core::config::AgentsCfg;
     use loom_core::event::ToolStatus as Status;
     use loom_core::ledger::{EvidenceInput, EvidenceKind};
-    use loom_core::security_state::{stable_id, HypothesisStatus};
+    use loom_core::security_state::stable_id;
 
     fn rig(role: &str, child: bool, mission: bool) -> Rig {
         let mut role = core_role(role);
@@ -1202,36 +1056,6 @@ mod tests {
             .await;
         assert_eq!(exact.status, Status::Ok, "{}", exact.text);
         assert!(body_json(&exact.text).get("normalized").is_none());
-        // A hypothesis opened with evidence is two operations in one append.
-        let open = r
-            .call(
-                "security_record",
-                json!({"operation":{"action":"hypothesis_open","hypothesis":{"statement":"candidate","priority":"high",
-                    "evidence":["e1"]}}}),
-            )
-            .await;
-        assert_eq!(open.status, Status::Ok, "{}", open.text);
-        let id = stable_id("hy", &["candidate"]);
-        let state = r.shared.ledger().unwrap().security;
-        assert_eq!(state.hypotheses.get(&id).map(|h| (h.priority, h.evidence.clone())), Some((5, vec!["e1".into()])));
-        // When the second operation fails the whole append fails and the error says so.
-        let failed = r
-            .call(
-                "security_record",
-                json!({"operation":{"action":"hypothesis_open","text":"other","priority":2,"evidence":["e404"]}}),
-            )
-            .await;
-        assert_eq!(failed.status, Status::Error);
-        assert!(failed.text.contains("e404"), "{}", failed.text);
-        assert!(
-            failed.text.contains(
-                " The evidence given with hypothesis_open was being attached by a second operation in the same atomic \
-             append; nothing was recorded."
-            ),
-            "{}",
-            failed.text
-        );
-        assert!(!r.shared.ledger().unwrap().security.hypotheses.contains_key(&stable_id("hy", &["other"])));
         // A failing batch element is named.
         let batch = r
             .call(
@@ -1269,39 +1093,6 @@ mod tests {
         assert!(body.get("state").is_none() && body.get("removed").is_none(), "{body}");
         assert!(body["more"].as_str().unwrap().starts_with("The rest of the security state is unchanged"), "{body}");
         assert!(!res.text.contains("10.0.0.1") && !res.text.contains("10.0.0.2"), "{}", res.text);
-    }
-
-    #[tokio::test]
-    async fn a_batch_over_the_size_bound_returns_counts_and_ids() {
-        let r = rig("lead", false, true);
-        let h = r.output("synthetic evidence", "bash", ToolClass::Exec);
-        evidence(&r, &h);
-        let ops: Vec<Value> = (0..60).map(|i| upsert(&format!("10.1.0.{i}"))).collect();
-        let res = r.call("security_record", json!({"operation":{"action":"batch","ops":ops}})).await;
-        assert_eq!(res.status, Status::Ok, "{}", res.text);
-        let body = body_json(&res.text);
-        assert_eq!(body["recorded"]["assets"]["count"], 60, "{body}");
-        let ids = body["recorded"]["assets"]["ids"].as_array().unwrap();
-        assert_eq!(ids.len(), RECORDED_IDS);
-        assert!(ids.iter().all(|id| r.shared.ledger().unwrap().security.assets.contains_key(id.as_str().unwrap())));
-        assert_eq!(body["counts"]["assets"], 60, "{body}");
-        assert!(res.text.chars().count() < RECORDED_CHARS, "{}", res.text.chars().count());
-    }
-
-    #[tokio::test]
-    async fn a_hypothesis_open_returns_the_new_hypothesis_id() {
-        let r = rig("lead", false, true);
-        let res = r
-            .call(
-                "security_record",
-                json!({"operation":{"action":"hypothesis_open","hypothesis":{"statement":"candidate","priority":"high"}}}),
-            )
-            .await;
-        assert_eq!(res.status, Status::Ok, "{}", res.text);
-        let body = body_json(&res.text);
-        let id = stable_id("hy", &["candidate"]);
-        assert_eq!(body["recorded"]["hypotheses"][&id]["id"], json!(id), "{body}");
-        assert_eq!(body["counts"]["hypotheses"], 1, "{body}");
     }
 
     #[tokio::test]
@@ -1413,104 +1204,6 @@ mod tests {
             "{}",
             nested.text
         );
-        // A child's early refusal inside a batch is named too.
-        let child = rig("worker", true, true);
-        let denied = child
-            .call(
-                "security_record",
-                json!({"operation":{"action":"batch","operations":[
-                    {"action":"alias_add","alias":"web","target":"as-0000"},
-                    {"action":"hypothesis_priority","id":"hy-0000","priority":3}]}}),
-            )
-            .await;
-        assert_eq!(denied.status, Status::Error);
-        assert!(denied.text.contains("Operation 2 of 2 in the batch (hypothesis_priority): Only"), "{}", denied.text);
-    }
-
-    #[tokio::test]
-    async fn the_description_follows_the_session_standing() {
-        let lead = SecurityRecord(rig("lead", false, true).shared.clone()).spec().description;
-        let child = SecurityRecord(rig("worker", true, true).shared.clone()).spec().description;
-        let judge = SecurityRecord(rig("verifier", true, true).shared.clone()).spec().description;
-        assert!(lead.contains("{action:hypothesis_open,") && !lead.contains("status:supported|refuted"));
-        assert!(!child.contains("{action:hypothesis_open,") && child.contains("the mission lead's"));
-        assert!(judge.contains("status:supported|refuted"));
-    }
-
-    #[tokio::test]
-    async fn lead_cannot_self_judge_and_child_cannot_own_priority() {
-        let r = rig("lead", false, true);
-        let open = r
-            .call("security_record", json!({"operation":{"action":"hypothesis_open","text":"candidate","priority":7}}))
-            .await;
-        assert_eq!(open.status, Status::Ok, "{}", open.text);
-        let id = stable_id("hy", &["candidate"]);
-        let verdict=r.call("security_record",json!({"operation":{"action":"hypothesis_verdict","id":id,"status":"supported","note":"self review","evidence":["e1"],"counterevidence":[]}})).await;
-        assert_eq!(verdict.status, Status::Error);
-        assert!(verdict.text.contains("independent"));
-        let child = rig("worker", true, true);
-        let open = child
-            .call("security_record", json!({"operation":{"action":"hypothesis_open","text":"candidate","priority":7}}))
-            .await;
-        assert_eq!(open.status, Status::Error);
-        assert!(child.shared.ledger().unwrap().security.hypotheses.is_empty());
-        let judge = rig("verifier", true, true);
-        let h = judge.output("synthetic evidence", "bash", ToolClass::Exec);
-        evidence(&judge, &h);
-        judge
-            .shared
-            .journal
-            .as_ref()
-            .unwrap()
-            .append(
-                &"s-lead".into(),
-                false,
-                LedgerOp::Security(SecurityOp::HypothesisOpen { text: "candidate".into(), priority: 7 }),
-                &|_| Ok(()),
-            )
-            .unwrap();
-        let verdict=judge.call("security_record",json!({"operation":{"action":"hypothesis_verdict","id":id,"status":"supported","note":"independent observed review","evidence":["e1"],"counterevidence":[]}})).await;
-        assert_eq!(verdict.status, Status::Ok, "{}", verdict.text);
-        assert_eq!(
-            judge.shared.ledger().unwrap().security.hypotheses.get(&id).unwrap().status,
-            HypothesisStatus::Supported
-        );
-        let priority = judge
-            .call("security_record", json!({"operation":{"action":"hypothesis_priority","id":id,"priority":99}}))
-            .await;
-        assert_eq!(priority.status, Status::Error);
-        judge.model_op(LedgerOp::EvidenceAdd(EvidenceInput {
-            claim: "c1".into(),
-            kind: EvidenceKind::Execution,
-            supports: false,
-            session: "s-source".into(),
-            call_id: "call-counter".into(),
-            blob: None,
-            lines: None,
-            quote: None,
-            note: "opposing fixture observation".into(),
-            attested: true,
-            tool: None,
-            grade: None,
-        }));
-        let counter = judge
-            .call(
-                "security_record",
-                json!({"operation":{"action":"hypothesis_evidence","id":id,
-            "evidence":[],"counterevidence":["e2"]}}),
-            )
-            .await;
-        assert_eq!(counter.status, Status::Ok, "{}", counter.text);
-        assert_eq!(judge.shared.ledger().unwrap().security.hypotheses.get(&id).unwrap().status, HypothesisStatus::Open);
-        let ignored = judge
-            .call(
-                "security_record",
-                json!({"operation":{"action":"hypothesis_verdict","id":id,
-            "status":"supported","note":"counterevidence ignored","evidence":["e1"],"counterevidence":[]}}),
-            )
-            .await;
-        assert_eq!(ignored.status, Status::Error);
-        assert!(ignored.text.contains("counterevidence"));
     }
 
     #[tokio::test]
@@ -1532,7 +1225,7 @@ mod tests {
                 "security_record",
                 json!({"operation":{"action":"batch","operations":[
                     {"action":"asset_upsert","asset":{"kind":"host","locator":"new.test","evidence":["e1"]}},
-                    {"action":"fact_assert","fact":{"predicate":"bad","args":["?variable"]},"evidence":["e1"]}
+                    {"action":"fact_assert","fact":{"predicate":"bad","args":["x"]},"evidence":["e404"]}
                 ]}}),
             )
             .await;
@@ -1604,71 +1297,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn queries_do_not_append_and_missionless_tools_refuse() {
-        let r = rig("lead", false, true);
-        let before = r.shared.ledger().unwrap().entries;
-        let res =
-            r.call("security_query", json!({"view":"what_if","assume":[{"predicate":"seen","args":["dummy"]}]})).await;
-        assert_eq!(res.status, Status::Ok, "{}", res.text);
-        assert_eq!(r.shared.ledger().unwrap().entries, before);
-        let r = rig("lead", false, false);
-        for (name, args) in [
-            ("security_query", json!({"view":"state"})),
-            ("security_record", json!({"operation":{"action":"hypothesis_open","text":"x","priority":1}})),
-            ("security_ingest", json!({"format":"ffuf","handle":"out:123456789abc","evidence":["e1"]})),
-        ] {
-            let res = r.call(name, args).await;
-            assert_eq!(res.status, Status::Error);
-            assert!(res.text.contains(super::super::NO_MISSION));
-        }
-    }
-
-    #[tokio::test]
-    async fn a_fact_retraction_reports_the_conclusions_that_died() {
-        let r = rig("lead", false, true);
-        let h = r.output("synthetic evidence", "bash", ToolClass::Exec);
-        evidence(&r, &h);
-        let rule = r
-            .call(
-                "security_record",
-                json!({"operation":{"action":"rule_install","rule":{"name":"v","head":{"predicate":"viable","args":["?x"]},
-                    "body":[{"atom":{"predicate":"seen","args":["?x"]},"negated":false}]}}}),
-            )
-            .await;
-        assert_eq!(rule.status, Status::Ok, "{}", rule.text);
-        let asserted = r
-            .call(
-                "security_record",
-                json!({"operation":{"action":"fact_assert","fact":{"predicate":"seen","args":["dummy"]},"evidence":["e1"]}}),
-            )
-            .await;
-        assert_eq!(asserted.status, Status::Ok, "{}", asserted.text);
-        let id = r.shared.ledger().unwrap().security.facts.keys().next().unwrap().clone();
-        let res =
-            r.call("security_record", json!({"operation":{"action":"fact_retract","id":id,"reason":"mistaken"}})).await;
-        assert_eq!(res.status, Status::Ok, "{}", res.text);
-        assert!(!r.shared.ledger().unwrap().security.died.is_empty());
-        let body = body_json(&res.text);
-        assert!(body["recorded"]["died"].to_string().contains("viable"), "{body}");
-    }
-
-    #[tokio::test]
-    async fn a_repeated_hypothesis_open_names_the_hypothesis_id_as_unchanged() {
-        let r = rig("lead", false, true);
-        let op =
-            json!({"operation":{"action":"hypothesis_open","hypothesis":{"statement":"candidate","priority":"high"}}});
-        let first = r.call("security_record", op.clone()).await;
-        assert_eq!(first.status, Status::Ok, "{}", first.text);
-        let again = r.call("security_record", op).await;
-        assert_eq!(again.status, Status::Ok, "{}", again.text);
-        let id = stable_id("hy", &["candidate"]);
-        let body = body_json(&again.text);
-        assert_eq!(body["unchanged"]["hypotheses"], json!([id]), "{body}");
-        let first = body_json(&first.text);
-        assert!(first.get("unchanged").is_none(), "{first}");
-    }
-
-    #[tokio::test]
     async fn an_upsert_of_a_known_asset_names_its_canonical_id_as_unchanged() {
         let r = rig("lead", false, true);
         let h = r.output("synthetic evidence", "bash", ToolClass::Exec);
@@ -1732,18 +1360,7 @@ mod tests {
     #[tokio::test]
     async fn unwrapped_top_level_action_arguments_are_accepted_with_note() {
         let r = rig("lead", false, true);
-        let (status, body, text) = run_direct(&r, json!({"action": "hypothesis_open", "text": "top-level"})).await;
-        assert_eq!(status, Status::Ok, "{text}");
-        assert_eq!(
-            body["normalized"],
-            json!([
-                "Read top-level arguments as `operation`.",
-                "In the operation, no priority was given, so it is 3 (1 low to 5 high)."
-            ])
-        );
-        let id = stable_id("hy", &["top-level"]);
-        assert!(r.shared.ledger().unwrap().security.hypotheses.contains_key(&id));
-
+        // Combined with N2 flat wrapper and inline out: handle.
         // Combined with N2 flat wrapper and inline out: handle.
         let h = r.output("HTTP/1.1 200 OK\nServer: nginx\n", "bash", ToolClass::Exec);
         let (status, body, text) =
@@ -1825,162 +1442,6 @@ mod tests {
         let cred = ledger.security.credentials.values().next().unwrap();
         assert_eq!(cred.input.evidence, vec!["e3"]);
         assert!(cred.input.secret_handle.starts_with("out:") && cred.input.secret_handle.len() == 68);
-    }
-
-    #[tokio::test]
-    async fn inline_out_handle_enforces_scope_observation_and_batch_atomicity() {
-        let r = rig("lead", false, true);
-        let foreign = r.env.ctx.blobs.put_bytes(b"another mission's secret output\n").unwrap();
-        let before_entries = r.shared.ledger().unwrap().entries;
-
-        // Foreign mission blob gets the exact Unopened::Unknown sentence and records nothing.
-        let res = r
-            .call(
-                "security_record",
-                json!({"operation": {"action": "asset_upsert", "asset": {"kind": "host", "locator": "10.0.0.5", "evidence": [foreign.handle()]}}}),
-            )
-            .await;
-        assert_eq!(res.status, Status::Error);
-        assert!(res.text.contains("No output of this mission has the handle"), "{}", res.text);
-        assert_eq!(r.shared.ledger().unwrap().entries, before_entries);
-
-        // Orphan blob in scope without producer is refused by observed_producer.
-        let orphan = r.env.ctx.blobs.put_bytes(b"orphan output\n").unwrap();
-        r.orch.in_scope(&orphan.id);
-        let res = r
-            .call(
-                "security_record",
-                json!({"operation": {"action": "asset_upsert", "asset": {"kind": "host", "locator": "10.0.0.5", "evidence": [orphan.handle()]}}}),
-            )
-            .await;
-        assert_eq!(res.status, Status::Error);
-        assert!(res.text.contains("was not produced by a tool call of this mission"), "{}", res.text);
-        assert_eq!(r.shared.ledger().unwrap().entries, before_entries);
-
-        // Non-observation producer (`ledger`) is refused by observed_producer.
-        let ledger_out = r.call("ledger", json!({})).await.output.unwrap().handle();
-        let res = r
-            .call(
-                "security_record",
-                json!({"operation": {"action": "asset_upsert", "asset": {"kind": "host", "locator": "10.0.0.5", "evidence": [ledger_out]}}}),
-            )
-            .await;
-        assert_eq!(res.status, Status::Error);
-        assert!(res.text.contains("is the result of `ledger`"), "{}", res.text);
-        assert_eq!(r.shared.ledger().unwrap().entries, before_entries);
-
-        // Batch failure in op 2 (core validation error) must NOT leave stray ClaimAdd or EvidenceAdd from op 1!
-        let good = r.output("observed output\n", "bash", ToolClass::Exec);
-        let res = r
-            .call(
-                "security_record",
-                json!({"operation": {"action": "batch", "operations": [
-                    {"action": "asset_upsert", "asset": {"kind": "host", "locator": "10.0.0.5", "evidence": [good]}},
-                    {"action": "fact_assert", "fact": {"predicate": "bad", "args": ["?unbound"]}, "evidence": [good]}
-                ]}}),
-            )
-            .await;
-        assert_eq!(res.status, Status::Error);
-        assert!(res.text.contains("Operation 2 of 2 in the batch (fact_assert):"), "{}", res.text);
-        let after = r.shared.ledger().unwrap();
-        assert_eq!(after.entries, before_entries);
-        assert!(after.claims.is_empty());
-        assert!(after.evidence.is_empty());
-        assert!(after.security.assets.is_empty());
-    }
-
-    #[tokio::test]
-    async fn inline_out_handle_works_for_hypothesis_open_judge_verdict_and_children() {
-        let lead = rig("lead", false, true);
-        let h_open = lead.output("sqli error near syntax\n", "bash", ToolClass::Exec);
-        let res = lead
-            .call(
-                "security_record",
-                json!({"operation": {"action": "hypothesis_open", "text": "SQLi in /search", "evidence": [h_open]}}),
-            )
-            .await;
-        assert_eq!(res.status, Status::Ok, "{}", res.text);
-        let body = body_json(&res.text);
-        assert!(
-            body["normalized"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|n| n == &json!(format!("In the operation, synthesized evidence e1 from {h_open}."))),
-            "{body}"
-        );
-        let hy_id = stable_id("hy", &["SQLi in /search"]);
-        assert_eq!(lead.shared.ledger().unwrap().security.hypotheses[&hy_id].evidence, vec!["e1"]);
-
-        // Child worker opens its own claim rather than attaching to lead's c1.
-        let child = rig("worker", true, true);
-        child
-            .shared
-            .journal
-            .as_ref()
-            .unwrap()
-            .append(&"s-lead".into(), false, LedgerOp::ClaimAdd { text: "lead claim".into() }, &|_| Ok(()))
-            .unwrap();
-        let h_child = child.output("worker observed file\n", "read", ToolClass::Read);
-        let res = child
-            .call(
-                "security_record",
-                json!({"operation": {"action": "asset_upsert", "asset": {"kind": "host", "locator": "10.0.0.6", "evidence": [h_child]}}}),
-            )
-            .await;
-        assert_eq!(res.status, Status::Ok, "{}", res.text);
-        let child_ledger = child.shared.ledger().unwrap();
-        assert_eq!(child_ledger.claims.len(), 2);
-        assert_eq!(child_ledger.evidence[0].input.claim, "c2");
-
-        // Judge with `evidence` + `verdict` (e.g. op_judge) can synthesize counterevidence on existing claim.
-        let mut judge_role = core_role("verifier");
-        judge_role.tools.extend(["evidence".into(), "security_record".into()]);
-        let judge = rig_with(judge_role, true, true, AgentsCfg::default());
-        judge
-            .shared
-            .journal
-            .as_ref()
-            .unwrap()
-            .append(&"s-lead".into(), false, LedgerOp::ClaimAdd { text: "lead claim".into() }, &|_| Ok(()))
-            .unwrap();
-        judge
-            .shared
-            .journal
-            .as_ref()
-            .unwrap()
-            .append(
-                &"s-lead".into(),
-                false,
-                LedgerOp::Security(SecurityOp::HypothesisOpen { text: "candidate".into(), priority: 3 }),
-                &|_| Ok(()),
-            )
-            .unwrap();
-        let h_judge = judge.output("403 Forbidden from endpoint\n", "bash", ToolClass::Exec);
-        let cand_id = stable_id("hy", &["candidate"]);
-        let res = judge
-            .call(
-                "security_record",
-                json!({"operation": {"action": "hypothesis_verdict", "id": cand_id, "status": "refuted",
-                    "note": "blocked by auth", "counterevidence": [{"handle": h_judge, "quote": "403 Forbidden"}]}}),
-            )
-            .await;
-        assert_eq!(res.status, Status::Ok, "{}", res.text);
-        let j_ledger = judge.shared.ledger().unwrap();
-        assert_eq!(j_ledger.security.hypotheses[&cand_id].status, HypothesisStatus::Refuted);
-        assert!(!j_ledger.evidence[0].input.supports);
-
-        // Read-only verifier WITHOUT `evidence` is refused before writing anything.
-        let ro = rig("verifier", true, true);
-        let h_ro = ro.output("something\n", "bash", ToolClass::Exec);
-        let res = ro
-            .call(
-                "security_record",
-                json!({"operation": {"action": "asset_upsert", "asset": {"kind": "host", "locator": "10.0.0.9", "evidence": [h_ro]}}}),
-            )
-            .await;
-        assert_eq!(res.status, Status::Error);
-        assert!(res.text.contains("read-only"), "{}", res.text);
     }
 
     #[tokio::test]

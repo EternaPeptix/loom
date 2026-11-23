@@ -7,19 +7,17 @@
 //! merely set aside, and what is still open. It gives no percentage of an unknown total and judges only
 //! by ledger evidence, never by prose.
 //!
-//! - `frontier(ledger, now_ms)` is pure. `established`: claims `Supported` (with text), then security
-//!   hypotheses `Supported` (id only), in ledger order. `ruled_out`: claims `Refuted` that carry at least
-//!   one evidence id (a refutation without evidence is not shown), then security hypotheses `Refuted`
-//!   with at least one evidence or counterevidence id (id only). `set_aside`: dead ends, text
+//! - `frontier(ledger, now_ms)` is pure. `established`: claims `Supported` (with text), in ledger order. `ruled_out`: claims `Refuted` that carry at least
+//!   one evidence id (a refutation without evidence is not shown). `set_aside`: dead ends, text
 //!   `{what} — {why}`; set aside by the model, not refuted. `open_leads`: plan steps `Todo`/`Doing`,
-//!   claims `Open`, security hypotheses `Open` (priority descending, then id), routes to revisit
+//!   claims `Open`, routes to revisit
 //!   (`security.newly_unlocked_at(now_ms)`), in that order. `untested`: security assets with coverage
 //!   `Untested`, mandatory ones first, then by id. `surfaces_closed` counts assets that are `Tested` or
 //!   `Deferred`. Security items carry no text: their free-form text can hold secrets.
 //! - `attempts_run(records)` counts admitted execution attempts the way the session's exec budget does:
 //!   one per call id among `exec_started` records and `tool_result` records of class `Exec` whose status
 //!   is neither `Denied` nor `Invalid`. `frontier` leaves `attempts_run` 0; the caller sets it.
-//! - Kinds inside `open_leads` are told apart by id: `hy-…` is a hypothesis, `p{n}` a plan step, `c{n}` a
+//! - Kinds inside `open_leads` are told apart by id: `p{n}` a plan step, `c{n}` a
 //!   claim, anything else a route to revisit.
 //! - `render(f)` gives the block shown in the HUD (see `hud`), or `None` when `f.is_empty()`. Lines, only
 //!   the non-empty ones, in this order:
@@ -28,7 +26,7 @@
 //!   (only when n > 0; `Frontier::reflections` is the ledger's reflection count), `- Attempts run in this
 //!   session: …`. Id lists show at most 8 ids then `, …`. Every line is cut to `hud::MAX_LINE`.
 //! - `directions(f, max)` gives up to `max` one-line open routes, in the priority: untested surfaces,
-//!   open plan steps, open claims, routes to revisit, open hypotheses, set-aside approaches; then
+//!   open plan steps, open claims, routes to revisit, set-aside approaches; then
 //!   `- (+{k} more)` when more remain.
 //!
 //! Tests required: each classification, `no_open_route`, `is_empty`, `attempts_run`, exact `render` text
@@ -37,7 +35,7 @@
 use crate::hud::one_line;
 use loom_core::event::{Event, Record, ToolClass, ToolStatus};
 use loom_core::ledger::{ClaimStatus, LedgerState, StepStatus};
-use loom_core::security_state::{CoverageDisposition, HypothesisStatus};
+use loom_core::security_state::CoverageDisposition;
 use loom_core::CallId;
 use std::collections::HashSet;
 
@@ -53,15 +51,13 @@ pub struct FrontierItem {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Frontier {
-    /// Claims `Supported` (text), then security hypotheses `Supported` (id only). Ledger order.
+    /// Claims `Supported` (text). Ledger order.
     pub established: Vec<FrontierItem>,
-    /// Claims `Refuted` that have at least one evidence id (text), then security hypotheses `Refuted`
-    /// with at least one evidence or counterevidence id (id only).
+    /// Claims `Refuted` that have at least one evidence id (text).
     pub ruled_out: Vec<FrontierItem>,
     /// Ledger dead ends (`x{i}`), text `"{what} — {why}"`. Set aside by the model, NOT refuted.
     pub set_aside: Vec<FrontierItem>,
-    /// Plan steps Todo/Doing (text), claims Open (text), security hypotheses Open (id only, priority
-    /// desc then id), routes to revisit `security.newly_unlocked_at(now_ms)` (id only). In that order.
+    /// Plan steps Todo/Doing (text), claims Open (text), routes to revisit `security.newly_unlocked_at(now_ms)` (id only). In that order.
     pub open_leads: Vec<FrontierItem>,
     /// Security assets whose coverage is `Untested` (id only): mandatory ones first, then by id.
     pub untested: Vec<FrontierItem>,
@@ -87,22 +83,9 @@ pub fn frontier(ledger: &LedgerState, now_ms: u64) -> Frontier {
     for c in ledger.claims.iter().filter(|c| c.status == ClaimStatus::Supported) {
         f.established.push(item(&c.id, &c.text));
     }
-    let mut hyps: Vec<_> = sec.hypotheses.values().collect();
-    hyps.sort_by(|a, b| a.n.cmp(&b.n).then_with(|| a.id.cmp(&b.id)));
-    for h in hyps.iter().filter(|h| h.status == HypothesisStatus::Supported) {
-        f.established.push(item(&h.id, ""));
-    }
-
     for c in ledger.claims.iter().filter(|c| c.status == ClaimStatus::Refuted && !c.evidence.is_empty()) {
         f.ruled_out.push(item(&c.id, &c.text));
     }
-    for h in hyps
-        .iter()
-        .filter(|h| h.status == HypothesisStatus::Refuted && !(h.evidence.is_empty() && h.counterevidence.is_empty()))
-    {
-        f.ruled_out.push(item(&h.id, ""));
-    }
-
     for d in &ledger.dead_ends {
         f.set_aside.push(item(&d.id, &format!("{} — {}", d.what, d.why)));
     }
@@ -112,11 +95,6 @@ pub fn frontier(ledger: &LedgerState, now_ms: u64) -> Frontier {
     }
     for c in ledger.claims.iter().filter(|c| c.status == ClaimStatus::Open) {
         f.open_leads.push(item(&c.id, &c.text));
-    }
-    let mut open: Vec<_> = sec.hypotheses.values().filter(|h| h.status == HypothesisStatus::Open).collect();
-    open.sort_by(|a, b| b.priority.cmp(&a.priority).then_with(|| a.id.cmp(&b.id)));
-    for h in open {
-        f.open_leads.push(item(&h.id, ""));
     }
     for id in sec.newly_unlocked_at(now_ms) {
         f.open_leads.push(item(&id, ""));
@@ -230,7 +208,6 @@ enum Kind {
     Plan,
     Claim,
     Route,
-    Hypothesis,
 }
 
 fn numbered(id: &str, prefix: char) -> bool {
@@ -238,9 +215,7 @@ fn numbered(id: &str, prefix: char) -> bool {
 }
 
 fn kind_of(id: &str) -> Kind {
-    if id.starts_with("hy-") {
-        Kind::Hypothesis
-    } else if numbered(id, 'p') {
+    if numbered(id, 'p') {
         Kind::Plan
     } else if numbered(id, 'c') {
         Kind::Claim
@@ -250,7 +225,7 @@ fn kind_of(id: &str) -> Kind {
 }
 
 /// Up to `max` one-line open routes for "what to try next" lists: untested surfaces, open plan steps, open
-/// claims, routes to revisit, open hypotheses, set-aside approaches; then `- (+{k} more)` if more remain.
+/// claims, routes to revisit, set-aside approaches; then `- (+{k} more)` if more remain.
 pub fn directions(f: &Frontier, max: usize) -> Vec<String> {
     let mut all: Vec<String> = Vec::new();
     for u in &f.untested {
@@ -265,9 +240,6 @@ pub fn directions(f: &Frontier, max: usize) -> Vec<String> {
     }
     for i in leads(Kind::Route) {
         all.push(format!("- route to revisit {}", i.id));
-    }
-    for i in leads(Kind::Hypothesis) {
-        all.push(format!("- open hypothesis {} (security_query for details)", i.id));
     }
     for i in &f.set_aside {
         all.push(format!("- set aside, not refuted, {}: {} — a different attempt can reopen it", i.id, i.text));
@@ -285,8 +257,7 @@ mod tests {
     use super::*;
     use loom_core::event::{Author, ToolResult};
     use loom_core::ledger::{Claim, DeadEnd, PlanStep};
-    use loom_core::security_state::{Asset, AssetKind, BlockedRoute, Condition, ConditionKind, Hypothesis};
-    use loom_core::SessionId;
+    use loom_core::security_state::{Asset, AssetKind, BlockedRoute, Condition, ConditionKind};
 
     fn claim(id: &str, text: &str, status: ClaimStatus, evidence: &[&str]) -> Claim {
         Claim {
@@ -300,21 +271,6 @@ mod tests {
 
     fn step(id: &str, status: StepStatus) -> PlanStep {
         PlanStep { id: id.into(), text: format!("step {id}"), status, note: String::new(), evidence: vec![] }
-    }
-
-    fn hyp(id: &str, status: HypothesisStatus, priority: u8, n: u64, ev: usize, counter: usize) -> Hypothesis {
-        Hypothesis {
-            id: id.into(),
-            text: "SECRET hypothesis".into(),
-            priority,
-            owner: SessionId::from("s-owner"),
-            status,
-            evidence: vec!["e".into(); ev],
-            counterevidence: vec!["e".into(); counter],
-            note: "SECRET note".into(),
-            judge: None,
-            n,
-        }
     }
 
     fn asset(id: &str, mandatory: bool, coverage: CoverageDisposition) -> Asset {
@@ -400,21 +356,9 @@ mod tests {
     }
 
     #[test]
-    fn security_hypotheses_assets_and_routes() {
+    fn security_assets_and_routes() {
         let mut l = LedgerState::default();
         let s = &mut l.security;
-        for h in [
-            hyp("hy-b", HypothesisStatus::Open, 1, 1, 0, 0),
-            hyp("hy-a", HypothesisStatus::Open, 1, 2, 0, 0),
-            hyp("hy-c", HypothesisStatus::Open, 5, 3, 0, 0),
-            hyp("hy-s2", HypothesisStatus::Supported, 1, 5, 1, 0),
-            hyp("hy-s1", HypothesisStatus::Supported, 1, 4, 1, 0),
-            hyp("hy-r1", HypothesisStatus::Refuted, 1, 6, 0, 0),
-            hyp("hy-r2", HypothesisStatus::Refuted, 1, 7, 0, 1),
-            hyp("hy-r3", HypothesisStatus::Refuted, 1, 8, 2, 0),
-        ] {
-            s.hypotheses.insert(h.id.clone(), h);
-        }
         for a in [
             asset("as-3", false, CoverageDisposition::Untested),
             asset("as-2", true, CoverageDisposition::Untested),
@@ -433,16 +377,12 @@ mod tests {
             },
         );
         let f = frontier(&l, 0);
-        assert_eq!(ids(&f.established), ["hy-s1", "hy-s2"]);
-        assert!(f.established.iter().all(|i| i.text.is_empty()));
-        assert_eq!(ids(&f.ruled_out), ["hy-r2", "hy-r3"]);
-        assert_eq!(ids(&f.open_leads), ["hy-c", "hy-a", "hy-b"]);
         assert_eq!(ids(&f.untested), ["as-1", "as-2", "as-3"]);
         assert_eq!((f.surfaces_total, f.surfaces_closed), (5, 2));
 
         l.security.unlocked.insert(Condition { kind: ConditionKind::Auth, value: "v".into() });
         let f = frontier(&l, 0);
-        assert_eq!(ids(&f.open_leads), ["hy-c", "hy-a", "hy-b", "as-9"]);
+        assert_eq!(ids(&f.open_leads), ["as-9"]);
     }
 
     #[test]
@@ -515,8 +455,8 @@ mod tests {
         let one = |f: Frontier| render(&f).unwrap_or_default();
         let head = "Where the work stands:\n";
         assert_eq!(
-            one(Frontier { established: vec![item("hy-1", "")], ..Frontier::default() }),
-            format!("{head}- Established: 1 (hy-1)")
+            one(Frontier { established: vec![item("c1", "")], ..Frontier::default() }),
+            format!("{head}- Established: 1 (c1)")
         );
         assert_eq!(
             one(Frontier { ruled_out: vec![item("c2", "b")], ..Frontier::default() }),
@@ -558,7 +498,7 @@ mod tests {
     #[test]
     fn directions_order_cap_and_remainder() {
         let mut f = full();
-        f.open_leads = vec![item("p1", "read"), item("c4", "claim text"), item("hy-9", ""), item("as-7", "")];
+        f.open_leads = vec![item("p1", "read"), item("c4", "claim text"), item("as-7", "")];
         let all = directions(&f, 20);
         assert_eq!(
             all,
@@ -568,15 +508,14 @@ mod tests {
                 "- open plan step p1: read",
                 "- open claim c4: claim text",
                 "- route to revisit as-7",
-                "- open hypothesis hy-9 (security_query for details)",
                 "- set aside, not refuted, x1: tried mmap — segfaults — a different attempt can reopen it",
             ]
         );
         let cut = directions(&f, 3);
         assert_eq!(cut.len(), 4);
         assert_eq!(cut[2], "- open plan step p1: read");
-        assert_eq!(cut[3], "- (+4 more)");
-        assert_eq!(directions(&f, 7).len(), 7);
+        assert_eq!(cut[3], "- (+3 more)");
+        assert_eq!(directions(&f, 6).len(), 6);
         assert!(directions(&Frontier::default(), 5).is_empty());
         let long = Frontier { open_leads: vec![item("c1", &"x".repeat(500))], ..Frontier::default() };
         assert_eq!(directions(&long, 1)[0].chars().count(), crate::hud::MAX_LINE);
@@ -585,12 +524,10 @@ mod tests {
     #[test]
     fn security_text_never_appears() {
         let mut l = LedgerState::default();
-        l.security.hypotheses.insert("hy-1".into(), hyp("hy-1", HypothesisStatus::Supported, 1, 1, 1, 0));
-        l.security.hypotheses.insert("hy-2".into(), hyp("hy-2", HypothesisStatus::Open, 1, 2, 0, 0));
         l.security.assets.insert("as-1".into(), asset("as-1", true, CoverageDisposition::Untested));
         let f = frontier(&l, 0);
         let text = render(&f).unwrap_or_default();
-        assert!(text.contains("hy-1") && text.contains("hy-2") && text.contains("as-1"), "{text}");
+        assert!(text.contains("as-1"), "{text}");
         assert!(!text.contains("SECRET"), "{text}");
         assert!(!directions(&f, 9).join("\n").contains("SECRET"));
     }
