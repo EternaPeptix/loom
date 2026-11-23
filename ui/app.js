@@ -43,7 +43,7 @@ const S = {
   inboxTouched: new Map(), // item id -> {rev, entry|null}: what inbox records changed, kept over an older snapshot
   sinceSeq: null,
   jumpFrom: null, // the last record seq held when the operator scrolled away from the end (the count behind Jump to latest)
-  ask: null, // an inline confirmation waiting in the inspector: {kind:"fold"} | {kind:"lead", lead, value} | {kind:"role", lead, role, value}
+  ask: null, // an inline confirmation waiting in the inspector: {kind:"compact"} | {kind:"lead", lead, value} | {kind:"role", lead, role, value}
   headAsk: null, // an inline confirmation waiting in the session header: {kind:"stop"|"archive", session}
   section: "chat",
   profiles: null, // GET /api/models for the model seat: {default_model, models: [...]} (null until fetched)
@@ -180,6 +180,32 @@ function setDraft(key, text, origin) {
   for (const input of document.querySelectorAll("[data-draft-key]")) {
     if (input !== origin && input.dataset.draftKey === key) input.value = text;
   }
+}
+
+/** Every `out:<hex>` in the text nodes under `root` becomes a button that opens that stored output. */
+function linkOutKeys(root) {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  const nodes = [];
+  for (let n = walker.nextNode(); n; n = walker.nextNode()) if (n.nodeValue.includes("out:")) nodes.push(n);
+  for (const node of nodes) {
+    const parts = C.splitOutKeys(node.nodeValue);
+    if (!parts.some((p) => p.key)) continue;
+    node.replaceWith(...parts.map((p) => (p.key ? outKeyButton(p.key) : document.createTextNode(p.text))));
+  }
+  return root;
+}
+
+function outKeyButton(key) {
+  const b = btn("out:" + key, "link mono keylink", (e) => openViewer(key, "Output out:" + key, null, {}, e.currentTarget));
+  b.title = "Open the stored output out:" + key;
+  return b;
+}
+
+/** Monospace text whose `out:` keys are buttons. */
+function keyedText(text, cls = "txt out") {
+  const box = el("pre", cls);
+  box.append(...C.splitOutKeys(text).map((p) => (p.key ? outKeyButton(p.key) : document.createTextNode(p.text))));
+  return box;
 }
 
 function prose(text) {
@@ -601,10 +627,50 @@ function openSession(id) {
   if (S.tab !== "ledger") loadTab();
 }
 
+/**
+ * Loads the tail of a long session first: the records after the latest compaction (or the last 1,000), then whatever arrived since by
+ * `after`. Records before them load on "Load earlier records" or when Find asks. A daemon without `before` paging is read from the start.
+ */
+async function loadTail(store) {
+  const page = await api("GET", C.recordsUrl(store.session, null, C.TAIL_LIMIT, C.TAIL_BEFORE));
+  if (S.rec !== store) return;
+  if (!C.pagesBackward(page)) {
+    // An older daemon ignores `before` and answers the first page: apply it and let the forward loop go on.
+    C.applyRecords(store, page.records);
+    for (const record of page.records) noteActivity(store.session, record);
+    store.prevBefore = null;
+    return;
+  }
+  let recs = page.records;
+  let prev = page.prev_before ?? null;
+  for (let more = C.tailNeedsMore(recs, prev); more; more = C.tailNeedsMore(recs, prev)) {
+    const earlier = await api("GET", C.recordsUrl(store.session, null, more.limit, more.before));
+    if (S.rec !== store) return;
+    recs = [...earlier.records, ...recs];
+    prev = earlier.prev_before ?? null;
+  }
+  let prelude = [];
+  if (recs.length && recs[0].seq > 0) {
+    // The session's own first records carry the start facts of the Session tab.
+    const head = await api("GET", C.recordsUrl(store.session, null, 3));
+    if (S.rec !== store) return;
+    prelude = head.records || [];
+  }
+  C.startTailStore(store, recs, prev, prelude);
+  for (const record of recs) noteActivity(store.session, record);
+}
+
 async function loadRecords(store, tries) {
   if (store.loading) return;
   store.loading = true;
   try {
+    if (!store.tailed) {
+      await loadTail(store);
+      if (S.rec !== store) return;
+      store.tailed = true;
+      updateDelivery(store.session);
+      want("blocks", "header", "overview", "list");
+    }
     let after = C.lastSeq(store);
     for (;;) {
       const page = await api("GET", C.recordsUrl(store.session, after, 500));
@@ -639,6 +705,44 @@ async function loadRecords(store, tries) {
   store.loading = false;
   want("header", "overview");
   if (S.rec === store && C.missing(store) && tries < 5) loadRecords(store, tries + 1);
+}
+
+/**
+ * Load the records before the loaded ones: one page, or every page with `all` (Find). The blocks are built again with the earlier ones in
+ * front and the transcript keeps the reader where they were.
+ */
+async function loadEarlier(store, { all = false } = {}) {
+  if (store.earlierLoading) return store.earlierLoading;
+  if (!C.hasEarlier(store)) return;
+  const run = (async () => {
+    $("btn-earlier").disabled = true;
+    $("btn-earlier").textContent = "Loading earlier records…";
+    try {
+      do {
+        const req = C.earlierRequest(store);
+        const page = await api("GET", C.recordsUrl(store.session, null, req.limit, req.before));
+        if (S.rec !== store) return;
+        const scroller = chatScroller();
+        const bottom = scroller.scrollHeight - scroller.scrollTop;
+        const added = C.prependRecords(store, page.records, page.prev_before ?? null);
+        for (const entry of S.r.nodes.values()) entry.node.remove();
+        S.r.nodes.clear();
+        S.r.from = C.earlierFrom(added);
+        S.r.forced.clear();
+        syncChat();
+        if (!S.follow) scroller.scrollTop = scroller.scrollHeight - bottom;
+        want("overview");
+      } while (all && C.hasEarlier(store));
+    } catch (e) {
+      toast("Could not load earlier records: " + e.message);
+    } finally {
+      store.earlierLoading = null;
+      $("btn-earlier").disabled = false;
+      if (S.rec === store) syncChat();
+    }
+  })();
+  store.earlierLoading = run;
+  return run;
 }
 
 /** The open session is being read: its watermark moves to the latest record, so its row is not "new". */
@@ -1606,6 +1710,11 @@ function renderOverview() {
   }
   const entries = missionEntries();
   const model = C.missionOverview(S.rec.records.values(), S.ledger.state, entries, S.sinceSeq);
+  // A long session loads from the end: what the overview reads is the loaded records, and it says so.
+  let partial = panel.querySelector(".overview-partial");
+  if (C.hasEarlier(S.rec)) {
+    if (!partial) { partial = el("p", "dim overview-partial", C.OVERVIEW_PARTIAL_WORDS); panel.querySelector(".overview-main").prepend(partial); }
+  } else if (partial) partial.remove();
   reconcileInbox(panel.querySelector(".overview-decisions"), entries.filter(e => e.item.item_kind !== "finished"), "overview");
   for (const [selector, build] of [[".overview-plan", planSection], [".overview-files", filesSection], [".overview-changes", changesSection], [".overview-rail", railSection]]) {
     const box = panel.querySelector(selector);
@@ -2194,6 +2303,12 @@ function jumpToRecord(seq, { focus = false, highlight = true, done = null } = {}
   S.jumping = true;
   requestAnimationFrame(() => {
     const block = S.rec?.blocks.find(b => b.seq === seq || b.callSeq === seq || b.result?.seq === seq || b.resolved?.seq === seq);
+    if (!block && S.rec && C.hasEarlier(S.rec)) {
+      // The record is before the loaded ones: load them, then go there.
+      S.jumping = false;
+      loadEarlier(S.rec, { all: true }).then(() => jumpToRecord(seq, { focus, highlight, done }));
+      return;
+    }
     if (!block || !S.r) { S.jumping = false; return; }
     S.follow = false;
     while (block.id < S.r.from && S.r.from > 0) showEarlier();
@@ -2617,6 +2732,32 @@ function buildBlock(b, ctx = {}) {
       if (b.blob) add(root, keyed(btn("open output", "link", (e) => openViewer(b.blob.id, "Job output", null, {}, e.currentTarget)), "output:" + b.id));
       break;
     }
+    case "compaction": {
+      root.classList.add("card");
+      const h = el("div", "ch compaction-head");
+      add(h, icon("diamond-outline"), el("strong", "", b.head));
+      add(root, h);
+      if (b.objections) add(root, el("div", "dim compaction-objections", "The verifier objected to: " + b.objections));
+      const note = el("details", "compaction-part compaction-note");
+      add(note, el("summary", "", b.note ? "Note" : "Note (none written)"));
+      remembered(note, b, "note");
+      if (b.note) {
+        add(note, el("div", "dim", C.COMPACT_NOTE_LABEL), add(el("div", "report-prose"), linkOutKeys(prose(b.note))));
+        if (b.droppedKeys.length) {
+          const dropped = el("div", "compaction-dropped");
+          add(dropped, el("div", "dim", C.COMPACT_DROPPED_LABEL));
+          add(dropped, el("code", "", b.droppedKeys.join(" ")));
+          add(note, dropped);
+        }
+      } else add(note, el("div", "dim", C.COMPACT_NO_NOTE));
+      add(root, note);
+      const table = el("details", "compaction-part compaction-table");
+      add(table, el("summary", "", b.table ? `Key table · ${C.count(b.tableKeys.length, "output", "outputs")}` : "Key table (empty)"));
+      remembered(table, b, "table");
+      if (b.table) add(table, keyedText(b.table));
+      add(root, table);
+      break;
+    }
     case "reweave": {
       const d = el("details");
       add(d, el("summary", "", b.summary));
@@ -3024,8 +3165,8 @@ function syncChat() {
     }
     placeInOrder(holder, order);
   });
-  $("earlier").hidden = R.from === 0;
-  $("btn-earlier").textContent = `Show earlier (${C.num(R.from)} more)`;
+  $("earlier").hidden = R.from === 0 && !C.hasEarlier(S.rec);
+  if (!S.rec.earlierLoading) $("btn-earlier").textContent = R.from > 0 ? `Show earlier (${C.num(R.from)} more)` : "Load earlier records";
   tickGroups();
 }
 
@@ -3130,7 +3271,8 @@ function updateJump() {
 function showEarlier() {
   const store = S.rec;
   const R = S.r;
-  if (!store || R.from === 0) return;
+  if (!store) return;
+  if (R.from === 0) { loadEarlier(store); return; }
   const scroller = chatScroller();
   const before = scroller.scrollHeight;
   R.from = C.earlierFrom(R.from);
@@ -3246,7 +3388,7 @@ function waysOut(entry, context) {
   const confirm = el("div", "model-confirm");
   confirm.setAttribute("role", "group");
   confirm.hidden = true;
-  const q = C.foldConfirm(title);
+  const q = C.compactConfirm(title);
   const qid = "fold-q-" + entry.item.item_id;
   const text = el("p", "model-confirm-text", q.text);
   text.id = qid;
@@ -3256,7 +3398,7 @@ function waysOut(entry, context) {
   const failure = el("p", "error");
   failure.setAttribute("role", "alert");
   failure.hidden = true;
-  const fold = btn("Fold the context…", "", () => {
+  const fold = btn("Compact the context…", "", () => {
     confirm.hidden = !confirm.hidden;
     fold.setAttribute("aria-expanded", String(!confirm.hidden));
     receipt.textContent = "";
@@ -3269,10 +3411,10 @@ function waysOut(entry, context) {
     yes.disabled = true;
     failure.hidden = true;
     try {
-      await api("POST", "/api/sessions/" + encodeURIComponent(entry.session) + "/reweave");
+      await api("POST", "/api/sessions/" + encodeURIComponent(entry.session) + "/compact");
       confirm.hidden = true;
       fold.setAttribute("aria-expanded", "false");
-      receipt.textContent = C.FOLD_RECEIPT;
+      receipt.textContent = C.COMPACT_RECEIPT;
       fold.focus();
     } catch (e) {
       fail(failure, e.message);
@@ -3961,9 +4103,9 @@ async function changeModels(work) {
 
 /** The inline question before a Models-tab change; the same words as the model seat, and nothing is sent until the operator answers. */
 function modelAsk(ask) {
-  if (ask.kind === "fold") {
+  if (ask.kind === "compact") {
     const open = S.sessions.byId.get(S.openId);
-    return C.foldConfirm(open && open.title);
+    return C.compactConfirm(open && open.title);
   }
   const models = seatModels();
   if (ask.kind === "lead") {
@@ -4052,7 +4194,7 @@ function renderModels(p, info) {
     }
   };
   const lead = m.lead_model;
-  const ask = S.ask && S.ask.kind !== "fold" && S.ask.lead === m.lead ? S.ask : null;
+  const ask = S.ask && S.ask.kind !== "compact" && S.ask.lead === m.lead ? S.ask : null;
   const q = ask ? modelAsk(ask) : null;
   if (ask && !q) S.ask = null;
   const pending = (kind, role) => q && ask.kind === kind && ask.role === role ? ask.value : null;
@@ -4335,7 +4477,7 @@ function contextCard(w, where, ask) {
     box.append(wrap, labels);
     if (m.bar.scaleNote) box.append(el("p", "ctx-scale", m.bar.scaleNote));
     if (m.fold) box.append(el("p", "ctx-foldline", m.fold.text + (m.fold.past ? " · " + m.fold.past.text : "")));
-    else if (m.parts && w.fold_at) box.append(el("p", "ctx-foldline", `Folds at ${C.tokens(w.fold_at)}, beyond this scale.`));
+    else if (m.parts && (w.compact_at || w.fold_at)) box.append(el("p", "ctx-foldline", w.compact_at ? `Compacts at ${C.tokens(w.compact_at)}, beyond this scale.` : `Folds at ${C.tokens(w.fold_at)}, beyond this scale.`));
     let group = "";
     let list = null;
     for (const r of m.rows) {
@@ -4387,21 +4529,21 @@ function contextCard(w, where, ask) {
   }
   const actions = el("div", "ctx-actions");
   const prefix = where === "sheet" ? "sheet:" : "";
-  const fold = btn("Fold now…", "", () => {
-    if (where === "sheet") { S.sheet.ask = { kind: "fold", focus: true }; want("sheet"); } else { S.ask = { kind: "fold", focus: true }; want("right"); }
+  const fold = btn("Compact now…", "", () => {
+    if (where === "sheet") { S.sheet.ask = { kind: "compact", focus: true }; want("sheet"); } else { S.ask = { kind: "compact", focus: true }; want("right"); }
   });
   fold.dataset.focusKey = prefix + "ask:fold";
-  fold.setAttribute("aria-label", "Fold now");
-  fold.title = "Fold older output out of view now. Asks first.";
+  fold.setAttribute("aria-label", "Compact now");
+  fold.title = "Compact the context now: the model writes a note and everything before the last few steps leaves its view. Asks first.";
   const refresh = btn("Refresh", "", loadWindow);
   refresh.dataset.focusKey = prefix + "ctx-refresh";
   add(actions, fold, refresh);
-  if (ask && ask.kind === "fold") {
-    // Folding is silent until a later record lands, so say it was asked for and pull the view.
+  if (ask && ask.kind === "compact") {
+    // Compacting is silent until a later record lands, so say it was asked for and pull the view.
     actions.append(confirmRow(modelAsk(ask), async () => {
       if (where === "sheet") { S.sheet.ask = null; want("sheet"); requestAnimationFrame(() => focusKey("sheet:ask:fold")); } else askClose("ask:fold");
-      if (await act(api("POST", "/api/sessions/" + encodeURIComponent(S.openId) + "/reweave")) !== undefined) {
-        toast(C.FOLD_RECEIPT);
+      if (await act(api("POST", "/api/sessions/" + encodeURIComponent(S.openId) + "/compact")) !== undefined) {
+        toast(C.COMPACT_RECEIPT);
         loadWindow();
       }
     }, () => { if (where === "sheet") { S.sheet.ask = null; want("sheet"); requestAnimationFrame(() => focusKey("sheet:ask:fold")); } else askClose("ask:fold"); }, prefix));
@@ -5666,7 +5808,8 @@ function renderFind() {
   if (text && S.rec && !S.rec.initialComplete) text += " (the record is still loading)";
   // The live region is written only when its words change, so typing does not repeat itself.
   if (text !== findSaid) { findSaid = text; $("find-count").textContent = text; }
-  const hint = r ? C.findHint(r) : "";
+  const unloaded = S.rec && C.hasEarlier(S.rec) && $("find-q").value.trim() ? C.FIND_EARLIER_WORDS : "";
+  const hint = [r ? C.findHint(r) : "", unloaded].filter(Boolean).join(" ");
   if ($("find-hint").textContent !== hint) $("find-hint").textContent = hint;
   $("find-go").disabled = !hit;
 }
@@ -5684,8 +5827,9 @@ function findRun(jump) {
   if (jump && cur >= 0) jumpToRecord(result.hits[cur].seq, { done: (node) => { FIND.node = node; } });
 }
 
-function findStep(dir) {
+async function findStep(dir) {
   if (!$("find-q").value.trim()) return;
+  if (S.rec && C.hasEarlier(S.rec)) { await loadEarlier(S.rec, { all: true }); if (!S.rec || $("find-bar").hidden) return; }
   findRun(false); // the record may have grown since the last search
   const r = FIND.result;
   if (!r || !r.count) return;
@@ -5713,7 +5857,10 @@ function wireFind() {
     // Typing only counts (after a pause); Enter, Next and Previous go to a match.
     FIND.timer = setTimeout(() => findRun(false), 350);
   });
-  $("find-kind").addEventListener("change", () => findRun(true));
+  $("find-kind").addEventListener("change", async () => {
+    if (S.rec && C.hasEarlier(S.rec) && $("find-q").value.trim()) await loadEarlier(S.rec, { all: true });
+    findRun(true);
+  });
   $("find-bar").addEventListener("keydown", (e) => {
     if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); closeFind(); }
     else if (e.key === "Enter" && e.target === $("find-q")) { e.preventDefault(); clearTimeout(FIND.timer); findStep(e.shiftKey ? -1 : 1); }

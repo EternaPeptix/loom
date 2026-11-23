@@ -345,14 +345,180 @@ export function evictionWords(e) {
 
 export const REWEAVE_NOTE = "Folded items stay in the record above and can be read back by the model.";
 
+// ---- compaction (docs/CONTRACTS-COMPACTION.md Part K and U)
+
+const COMPACT_REASONS = { size: "size", refused: "refused", stall: "stall", operator: "operator", fresh_start: "fresh start" };
+export function compactionReasonWords(reason) {
+  return COMPACT_REASONS[reason] || String(reason || "unknown").replace(/_/g, " ");
+}
+
+/** An `out:` key in text: 8 to 64 hex characters after `out:` (the handle, or a prefix of one). */
+const OUT_KEY = /\bout:([0-9a-f]{8,64})(?![0-9a-zA-Z])/g;
+
+/** Every distinct `out:` key in the texts, in the order first seen, without the `out:` prefix. */
+export function extractOutKeys(...texts) {
+  const seen = new Set();
+  const keys = [];
+  for (const t of texts) {
+    if (typeof t !== "string") continue;
+    for (const m of t.matchAll(OUT_KEY)) if (!seen.has(m[1])) { seen.add(m[1]); keys.push(m[1]); }
+  }
+  return keys;
+}
+
+/** Text cut into [{text}] and [{key, text}] parts, so each `out:` key can be a button. The parts join back to the text. */
+export function splitOutKeys(text) {
+  const s = String(text ?? "");
+  const out = [];
+  let at = 0;
+  for (const m of s.matchAll(OUT_KEY)) {
+    if (m.index > at) out.push({ text: s.slice(at, m.index) });
+    out.push({ key: m[1], text: m[0] });
+    at = m.index + m[0].length;
+  }
+  if (at < s.length) out.push({ text: s.slice(at) });
+  return out;
+}
+
+/** The divider's head line: "Context compacted · step 412 · 305k → 41k tokens · size". */
+export function compactionHead(rec, step) {
+  const bits = ["Context compacted"];
+  if (Number.isInteger(step)) bits.push(`step ${num(step)}`);
+  if (rec.before_tokens > 0 || rec.after_tokens_est > 0) bits.push(`${tokens(rec.before_tokens || 0)} → ${tokens(rec.after_tokens_est || 0)} tokens`);
+  bits.push(compactionReasonWords(rec.reason));
+  return bits.join(" · ");
+}
+
+/**
+ * The card model of a `compaction` record: the head, the note (null when the note request failed), the key table, the keys each cites
+ * (every key a button), the keys the daemon dropped from the note, and for a fresh start what the verifier objected to.
+ */
+export function compactionBlock(rec, step) {
+  const note = typeof rec.note === "string" && rec.note.trim() ? rec.note : null;
+  const table = typeof rec.table === "string" ? rec.table : "";
+  return {
+    kind: "compaction",
+    head: compactionHead(rec, step),
+    epoch: rec.epoch,
+    upto_seq: rec.upto_seq,
+    reason: rec.reason,
+    note,
+    noteKeys: extractOutKeys(note),
+    table,
+    tableKeys: extractOutKeys(table),
+    droppedKeys: Array.isArray(rec.dropped_keys) ? rec.dropped_keys.map(String) : [],
+    objections: typeof rec.objections === "string" && rec.objections.trim() ? rec.objections : null,
+  };
+}
+
+export const COMPACT_NO_NOTE = "No note was written (the note request failed). The key table below is still exact.";
+export const COMPACT_NOTE_LABEL = "Written by the model, not verified: check a key before relying on it.";
+export const COMPACT_DROPPED_LABEL = "Keys the note cited that do not exist in this session; they were removed from it:";
+
+// ---- loading a long session from the end (U4)
+
+export const TAIL_LIMIT = 1000;
+export const TAIL_BEFORE = Number.MAX_SAFE_INTEGER;
+
+/** The latest `compaction` record among `recs`, or null. */
+export function latestCompaction(recs) {
+  let best = null;
+  for (const r of recs || []) if (r && r.kind === "compaction" && (!best || r.seq > best.seq)) best = r;
+  return best;
+}
+
+/**
+ * After a page from the end: the request for the next earlier page when the records after the latest compaction's `upto_seq` are
+ * not all in `recs` yet, else null. Without a compaction in view the last page is all that loads (a log that was never compacted
+ * pages backward on request).
+ */
+export function tailNeedsMore(recs, prevBefore) {
+  if (prevBefore === null || prevBefore === undefined || !recs || !recs.length) return null;
+  const c = latestCompaction(recs);
+  if (!c || !Number.isInteger(c.upto_seq)) return null;
+  return recs[0].seq > c.upto_seq + 1 ? { before: prevBefore, limit: TAIL_LIMIT } : null;
+}
+
+/** True when the page answer comes from a daemon that pages backward (it carries `prev_before`, null or a seq). */
+export function pagesBackward(page) {
+  return !!page && Object.hasOwn(page, "prev_before");
+}
+
+const PRELUDE_KINDS = new Set(["session_start", "forked"]);
+
+/**
+ * The store starts at the first record of the tail: `recs` are the last pages oldest first, `prevBefore` the seq to ask for the
+ * records before them (null when there are none), `prelude` the session's first records (their start facts fill the Session tab).
+ */
+export function startTailStore(store, recs, prevBefore, prelude = []) {
+  const first = recs.length ? recs[0].seq : 0;
+  store.next = first;
+  store.prevBefore = prevBefore === undefined ? null : prevBefore;
+  store.prelude = [];
+  if (first > 0) for (const r of prelude) if (r && PRELUDE_KINDS.has(r.kind) && r.seq < first) applyPrelude(store, r);
+  applyRecords(store, recs);
+  return store;
+}
+
+function applyPrelude(store, rec) {
+  store.prelude.push(rec);
+  step(store, rec);
+  store.records.delete(rec.seq);
+}
+
+/** Whether records before the loaded ones remain on the daemon. */
+export function hasEarlier(store) {
+  return !!store && store.prevBefore !== null && store.prevBefore !== undefined;
+}
+
+/** The next request for earlier records, {before, limit}, or null. */
+export function earlierRequest(store) {
+  return hasEarlier(store) ? { before: store.prevBefore, limit: TAIL_LIMIT } : null;
+}
+
+/**
+ * Put earlier records (oldest first) in front of the store's. The blocks are built again from the first record, in place (the store
+ * object stays); a streaming reply and each block's open/closed state are kept. Returns how many blocks were added in front.
+ */
+export function prependRecords(store, older, prevBefore) {
+  const all = new Map();
+  for (const r of older || []) if (r && Number.isInteger(r.seq)) all.set(r.seq, r);
+  for (const [seq, r] of store.records) all.set(seq, r);
+  const sorted = [...all.values()].sort((a, b) => a.seq - b.seq);
+  const fresh = createRecordStore(store.session);
+  fresh.next = sorted.length ? sorted[0].seq : store.next;
+  fresh.prelude = [];
+  if (fresh.next > 0) for (const r of store.prelude || []) if (r.seq < fresh.next) applyPrelude(fresh, r);
+  applyRecords(fresh, sorted);
+  for (const r of store.ahead.values()) applyRecord(fresh, r);
+  const ui = new Map();
+  for (const b of store.blocks) if (b.ui && Object.keys(b.ui).length && Number.isInteger(b.seq)) ui.set(b.kind + ":" + b.seq, b.ui);
+  for (const b of fresh.blocks) { const u = ui.get(b.kind + ":" + b.seq); if (u) b.ui = u; }
+  const added = fresh.blocks.length - store.blocks.length;
+  const pending = store.pending;
+  const rev = store.pendingRev;
+  Object.assign(store, fresh);
+  store.pending = pending;
+  store.pendingRev = rev + 1;
+  store.prevBefore = prevBefore === undefined ? null : prevBefore;
+  return Math.max(0, added);
+}
+
+/** One line on the Overview of a session whose earlier records are not loaded. */
+export const OVERVIEW_PARTIAL_WORDS = "This summary reads the records loaded so far. Load earlier records in the Chat tab to include the rest.";
+
+/** The words under Find when records before the loaded ones are not searched yet. */
+export const FIND_EARLIER_WORDS = "Earlier records are not loaded. Press Enter to load and search them.";
+
 /** Where blob lines are read from. */
 export function linesUrl(blob, start, end) {
   return `/api/blobs/${encodeURIComponent(blob)}/lines?start=${start}&end=${end}`;
 }
-export function recordsUrl(session, after, limit) {
+export function recordsUrl(session, after, limit, before = null) {
   let u = `/api/sessions/${encodeURIComponent(session)}/records`;
   const q = [];
   if (after !== null && after !== undefined) q.push(`after=${after}`);
+  if (before !== null && before !== undefined) q.push(`before=${before}`);
   if (limit) q.push(`limit=${limit}`);
   return q.length ? `${u}?${q.join("&")}` : u;
 }
@@ -1299,6 +1465,9 @@ function step(store, rec) {
         digest: rec.digest || null,
       });
       break;
+    case "compaction":
+      push(store, { ...base(rec), ...compactionBlock(rec, store.lastStep) });
+      break;
     case "inbox_opened": {
       const item = {};
       for (const f of ITEM_FIELDS) if (rec[f] !== undefined) item[f] = rec[f];
@@ -1360,6 +1529,7 @@ function step(store, rec) {
       clearPending(store);
       break;
     case "model_request":
+      if ((!rec.purpose || rec.purpose === "step") && Number.isInteger(rec.step)) store.lastStep = rec.step;
       push(store, { ...base(rec), kind: "line", sub: "request", detail: true, tone: "dim", text: `request ${rec.req_id}: step ${rec.step}, epoch ${rec.epoch}, about ${tokens(rec.est_tokens)} tokens${rec.purpose && rec.purpose !== "step" ? " (" + rec.purpose + ")" : ""}` });
       break;
     case "session_start":
@@ -2197,7 +2367,7 @@ export function planEvent(ev, ctx) {
       if (r.kind === "inbox_opened" || r.kind === "inbox_resolved") out.push({ fx: "inbox_record", session: ev.session, record: r });
       if (ev.session === ctx.openId) {
         out.push({ fx: "apply_record", record: r });
-        if (r.kind === "turn_end" || r.kind === "reweave") out.push({ fx: "refetch_window" });
+        if (r.kind === "turn_end" || r.kind === "reweave" || r.kind === "compaction") out.push({ fx: "refetch_window" });
       }
       if (r.kind === "ledger" && ctx.ledgerMission && ctx.missionOf(ev.session) === ctx.ledgerMission) {
         out.push({ fx: "refetch_ledger", mission: ctx.ledgerMission });
@@ -3716,6 +3886,7 @@ export function findFields(b, kind = "all") {
     case "child_spawned": return [["text", typeof b.brief === "string" ? b.brief : b.brief && (b.brief.task || b.brief.text || b.brief.goal), b.seq]];
     case "tool": return [["call", `${b.name || ""} ${b.argsLine || ""}`, Number.isInteger(b.callSeq) ? b.callSeq : b.seq], ["result", b.result && b.result.text, b.result && b.result.seq]];
     case "reweave": return [["text", b.summary, b.seq]];
+    case "compaction": return [["text", b.head, b.seq], ["note", b.note, b.seq], ["table", b.table, b.seq]];
     case "line": case "divider": case "end": return [["text", b.text, b.seq]];
     default: return [];
   }
@@ -3834,20 +4005,20 @@ export function progressLine({ plan, step, budget, minutes } = {}) {
 // Pass 2, part 4: ways out, inbox triage
 
 /**
- * foldConfirm(title): the question before folding a session's context, {text, yes, no}. One wording for the Context tab and for the
- * "Ways out" row of a parked or blocker card; `title` is the session's name (omit it for "this session").
+ * compactConfirm(title): the question before compacting a session's context, {text, yes, no}. One wording for the Context tab, the
+ * session sheet and the "Ways out" row of a parked or blocker card; `title` is the session's name (omit it for "this session").
  */
-export function foldConfirm(title) {
+export function compactConfirm(title) {
   const who = title ? `${oneLine(title, 80)}'s context` : "the context of this session";
   return {
-    text: `Fold ${who} now? Older outputs become stubs that keep their out: handles; the next request re-reads the whole prompt once.`,
-    yes: "Fold now",
+    text: `Compact ${who} now? The model writes a note and everything before the last few steps leaves its view; nothing is deleted.`,
+    yes: "Compact now",
     no: "Keep as it is",
   };
 }
 
-/** The receipt line after a fold was asked for. */
-export const FOLD_RECEIPT = "Folding now. The view updates when it is done.";
+/** The receipt line after a compaction was asked for. */
+export const COMPACT_RECEIPT = "Compacting now. The view updates when it is done.";
 
 /**
  * lastRecordedError(blocks): the error sentence of the latest failed request or turn of a session, as the daemon recorded it, or null.
@@ -4326,6 +4497,7 @@ export const CTX_PARTS = [
   { key: "tools", label: "Tool definitions", family: "setup", pattern: "hatch", group: "setup", counted: true },
   { key: "rules", label: "Rules and approvals", family: "setup", pattern: "dots", group: "setup", note: "Yours, verbatim; never folded." },
   { key: "assignment", label: "Assignment from parent", family: "setup", pattern: "outline", group: "setup" },
+  { key: "compaction", label: "Compaction", family: "carry", pattern: "cross", group: "carry", note: "What replaced everything before the last few steps: the head, your messages, the ledger, pins, the key table and the model's note. The note is written by the model and is not verified." },
   { key: "resume", label: "Re-weave brief", family: "carry", pattern: "hatch", group: "carry", note: "Written when older context was folded; may include leads written by the model, not verified." },
   { key: "notes", label: "Harness notes", family: "carry", pattern: "dots", group: "carry", counted: true },
   { key: "conversation", label: "Messages and replies", family: "conv", pattern: "solid", group: "conv", always: true },
@@ -4436,7 +4608,10 @@ export function contextCardModel(w) {
   const byKey = new Map(segs.map((s) => [s.key, s]));
   const rows = [];
   const barParts = [];
+  // A session that has been compacted shows the Compaction part; the re-weave parts stay for sessions that have none.
+  const compacted = Number(byKey.get("compaction") && byKey.get("compaction").tokens) > 0;
   for (const def of parts ? CTX_PARTS : []) {
+    if (compacted && (def.key === "resume" || def.key === "stubs")) continue;
     const seg = byKey.get(def.key);
     const t = seg ? Number(seg.tokens) || 0 : 0;
     if (!(t > 0) && !def.always) continue;
@@ -4445,8 +4620,10 @@ export function contextCardModel(w) {
     rows.push({ key: def.key, label, count: n, value: "~" + tokens(t), tokens: t, share: ctxPercent(t, total), family: def.family, pattern: def.pattern, group: def.group, note: def.note || "" });
     barParts.push({ key: def.key, tokens: t });
   }
-  const foldAt = Number(w && w.fold_at) || 0;
-  const foldTo = Number(w && w.fold_to) || 0;
+  // `compact_at` (the compaction threshold) replaces the fold bounds when the daemon sends it.
+  const compactAt = Number(w && w.compact_at) || 0;
+  const foldAt = compactAt || Number(w && w.fold_at) || 0;
+  const foldTo = compactAt ? 0 : Number(w && w.fold_to) || 0;
   const known = win > 0;
   const scale = known ? win : Math.max(foldAt * 1.25, total * 1.1, 1);
   const layout = segmentLayout(barParts, scale);
@@ -4467,8 +4644,9 @@ export function contextCardModel(w) {
   const inside = (v) => v > 0 && v <= scale;
   const foldInfo = foldAt > 0 && inside(foldAt) ? {
     at: foldAt, to: foldTo, atPct: ctxPercent(foldAt, scale), toPct: foldTo > 0 && inside(foldTo) ? ctxPercent(foldTo, scale) : null,
-    text: foldTo > 0 ? `▼ folds at ${tokens(foldAt)} · ▽ down to ${tokens(foldTo)}` : `▼ folds at ${tokens(foldAt)}`,
-    past: total > foldAt ? { text: "Past the fold mark: older output folds at the next step." } : null,
+    word: compactAt ? "compacts" : "folds",
+    text: foldTo > 0 ? `▼ folds at ${tokens(foldAt)} · ▽ down to ${tokens(foldTo)}` : `▼ ${compactAt ? "compacts" : "folds"} at ${tokens(foldAt)}`,
+    past: total > foldAt ? { text: compactAt ? "Past the compaction mark: the context compacts at the next step." : "Past the fold mark: older output folds at the next step." } : null,
   } : null;
   let cache = null;
   if (last && counted > 0) {

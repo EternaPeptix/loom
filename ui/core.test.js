@@ -2859,11 +2859,11 @@ test("keySheet lists real keys, spells Cmd and Option on a Mac, and offers no ke
   assert.ok(!flat(false).some((r) => /stop|interrupt/i.test(r.text.replace(/never stops anything/, ""))));
 });
 
-test("foldConfirm names the session and says what a fold does", () => {
-  const q = C.foldConfirm("Fix the flaky test");
-  assert.match(q.text, /^Fold Fix the flaky test's context now\? Older outputs become stubs that keep their out: handles; the next request re-reads the whole prompt once\.$/);
-  assert.equal(q.yes, "Fold now");
-  assert.match(C.foldConfirm().text, /^Fold the context of this session now\?/);
+test("compactConfirm names the session and says what a compaction does", () => {
+  const q = C.compactConfirm("Fix the flaky test");
+  assert.equal(q.text, "Compact Fix the flaky test's context now? The model writes a note and everything before the last few steps leaves its view; nothing is deleted.");
+  assert.equal(q.yes, "Compact now");
+  assert.match(C.compactConfirm().text, /^Compact the context of this session now\?/);
 });
 
 test("lastRecordedError reads the failure sentence the daemon records in a parked item or a failed-request answer", () => {
@@ -3749,4 +3749,107 @@ test("queued list words and routes", () => {
   assert.equal(C.queuedUrl("s1", "q/1"), "/api/sessions/s1/queued/q%2F1");
   assert.equal(C.queuedUrl("s1", "q1", "send"), "/api/sessions/s1/queued/q1/send");
   assert.deepEqual(C.SEND_CHOICES.map((c) => c.when), ["now", "after_turn"]);
+});
+
+
+// ---- compaction (docs/CONTRACTS-COMPACTION.md Part U) ----
+
+const K1 = "e134a0f0b4bf46c1", K2 = "cc8752638528652e", K3 = "5a1c3e7d90b2f648";
+const COMPACTION = {
+  epoch: 2, upto_seq: 40, reason: "size", before_tokens: 312000, after_tokens_est: 38000,
+  note: `## State\n- edited (out:${K2}); ran out:${K1}, again out:${K1}; short out:abc is not a key; out:${K3}.`,
+  note_req: "r-9", table: `Outputs\nout:${K1} · bash · ls · exit 0\nout:${K2} · edit · a.rs\nout:${"f".repeat(64)} · bash · x`,
+  keys: [K1, K2], dropped_keys: ["out:0123456789abcdef"], objections: null,
+};
+
+test("compactionHead: step, sizes and the reason in words", () => {
+  assert.equal(C.compactionHead(COMPACTION, 412), "Context compacted · step 412 · 312k → 38k tokens · size");
+  assert.match(C.compactionHead({ ...COMPACTION, reason: "fresh_start" }, 3), /fresh start$/);
+  assert.equal(C.compactionHead({ reason: "operator" }, undefined), "Context compacted · operator");
+});
+
+test("extractOutKeys and splitOutKeys find 8-64 hex keys, once each, in order", () => {
+  assert.deepEqual(C.extractOutKeys(COMPACTION.note, COMPACTION.table), [K2, K1, K3, "f".repeat(64)]);
+  const parts = C.splitOutKeys(`a out:${K1} b`);
+  assert.deepEqual(parts, [{ text: "a " }, { key: K1, text: "out:" + K1 }, { text: " b" }]);
+  assert.deepEqual(C.splitOutKeys("no keys here out:xyz"), [{ text: "no keys here out:xyz" }]);
+  assert.deepEqual(C.splitOutKeys(""), []);
+});
+
+test("compactionBlock: note keys, table keys, dropped keys, objections", () => {
+  const b = C.compactionBlock(COMPACTION, 7);
+  assert.equal(b.kind, "compaction");
+  assert.equal(b.head, "Context compacted · step 7 · 312k → 38k tokens · size");
+  assert.deepEqual(b.noteKeys, [K2, K1, K3]);
+  assert.deepEqual(b.tableKeys, [K1, K2, "f".repeat(64)]);
+  assert.deepEqual(b.droppedKeys, ["out:0123456789abcdef"]);
+  assert.equal(b.objections, null);
+  const fresh = C.compactionBlock({ ...COMPACTION, reason: "fresh_start", note: null, objections: "no run cited", dropped_keys: [] }, 9);
+  assert.equal(fresh.note, null);
+  assert.deepEqual(fresh.noteKeys, []);
+  assert.equal(fresh.objections, "no run cited");
+  assert.equal(C.compactionBlock({ reason: "size" }, 1).table, "");
+});
+
+test("a compaction record becomes a block, is found by Find, and refetches the window", () => {
+  const store = C.createRecordStore("s-c");
+  C.applyRecords(store, [
+    rec("model_request", { req_id: "r", step: 12, epoch: 1, purpose: "step", n_messages: 1, stable_hash: "h", hud: BLOB, est_tokens: 9 }, "harness", 0),
+    rec("compaction", COMPACTION, "harness", 1),
+  ]);
+  const b = store.blocks.find((x) => x.kind === "compaction");
+  assert.ok(b);
+  assert.match(b.head, /step 12/);
+  const hits = C.findInRecord(store.blocks, K2.slice(0, 8), "all", 2).hits;
+  assert.ok(hits.length >= 1, "Find searches the note and the table");
+});
+
+test("paging decisions: a page from the end, then earlier pages until the compaction's upto_seq is in", () => {
+  assert.equal(C.recordsUrl("s-1", null, 1000, C.TAIL_BEFORE), `/api/sessions/s-1/records?before=${C.TAIL_BEFORE}&limit=1000`);
+  assert.equal(C.pagesBackward({ records: [], prev_before: null }), true);
+  assert.equal(C.pagesBackward({ records: [], next_after: null }), false, "an older daemon ignores before");
+  const seqs = (from, to, extra = {}) => { const out = []; for (let i = from; i <= to; i++) out.push({ seq: i, kind: "note", ...(extra[i] || {}) }); return out; };
+  // No compaction in view: the last page is all that loads.
+  assert.equal(C.tailNeedsMore(seqs(500, 1499), 500), null);
+  // A compaction whose upto_seq is inside the page: nothing more.
+  assert.equal(C.tailNeedsMore(seqs(500, 1499, { 900: { kind: "compaction", upto_seq: 800 } }), 500), null);
+  // upto_seq before the page: one more page, from prev_before.
+  assert.deepEqual(C.tailNeedsMore(seqs(500, 1499, { 900: { kind: "compaction", upto_seq: 100 } }), 500), { before: 500, limit: 1000 });
+  // The start of the log has been reached.
+  assert.equal(C.tailNeedsMore(seqs(0, 999, { 900: { kind: "compaction", upto_seq: 0 } }), null), null);
+});
+
+test("a store started from the tail knows its earlier records, prepends them, and keeps what arrives by after", () => {
+  seqCounter = 0;
+  const all = [];
+  for (let i = 0; i < 30; i++) all.push(rec(i % 2 ? "user_message" : "harness_note", i % 2 ? { text: "m" + i } : { note: "n", text: "t" + i }, i % 2 ? "user" : "harness", i));
+  const store = C.createRecordStore("s-t");
+  C.startTailStore(store, all.slice(20), 20, []);
+  assert.equal(C.hasEarlier(store), true);
+  assert.deepEqual(C.earlierRequest(store), { before: 20, limit: C.TAIL_LIMIT });
+  assert.equal(C.lastSeq(store), 29);
+  C.applyRecords(store, [rec("user_message", { text: "new" }, "user", 30)]);
+  assert.equal(C.lastSeq(store), 30);
+  const before = store.blocks.length;
+  const added = C.prependRecords(store, all.slice(0, 20), null);
+  assert.equal(added, store.blocks.length - before);
+  assert.equal(store.blocks.length, 31);
+  assert.equal(C.hasEarlier(store), false);
+  assert.equal(C.earlierRequest(store), null);
+  assert.equal(C.lastSeq(store), 30);
+});
+
+test("CTX_PARTS: a compaction segment replaces the re-weave brief and the stubs, and the threshold says compacts at", () => {
+  const segs = [{ key: "system", tokens: 5000 }, { key: "compaction", tokens: 9000 }, { key: "resume", tokens: 700 }, { key: "stubs", tokens: 300, count: 4 }, { key: "conversation", tokens: 4000 }];
+  const win = { context_window: 262144, compact_at: 104857, breakdown: { basis: "default_ratio", chars_per_token: 3.3, total_tokens: 19000, segments: segs }, measured_now: null };
+  const m = C.contextCardModel(win);
+  const labels = m.rows.map((r) => r.label);
+  assert.ok(labels.includes("Compaction"));
+  assert.ok(!labels.includes("Re-weave brief"));
+  assert.ok(!labels.some((l) => l.startsWith("Folded-out stubs")));
+  assert.match(m.fold.text, /compacts at/);
+  const old = C.contextCardModel({ ...win, compact_at: undefined, fold_at: 210000, breakdown: { ...win.breakdown, segments: segs.filter((x) => x.key !== "compaction") } });
+  const oldLabels = old.rows.map((r) => r.label);
+  assert.ok(oldLabels.includes("Re-weave brief") && oldLabels.some((l) => l.startsWith("Folded-out stubs")));
+  assert.match(old.fold.text, /folds at/);
 });

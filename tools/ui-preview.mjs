@@ -7,7 +7,10 @@
 // running s-notify mission live and opens its "finished" inbox item), and POST /api/sessions/{id}/reweave (202, writes a
 // reweave record). New sessions: m-fleet (13 agents to depth 4, s-fl-*), s-parked (parked on necromicon with a recorded
 // error), s-quiet (running, last record 41 min old), s-notify (running, for /__fixture/end), s-tools (every ToolStatus),
-// s-big (5,000 records for Find).
+// s-big (5,000 records for Find; it loads from the end and pages backward), s-compacted (two compactions: a size one whose note
+// cites keys of its log and one that does not exist, and a fresh start with objections and an empty tail).
+// Records: GET .../records?after=&limit= pages forward (next_after); ?before=&limit= pages backward (prev_before); both is a 400.
+// POST /api/sessions/{id}/compact (and /reweave) appends a `compaction` record and emits it.
 // Workspace folders add (shapes and status codes mirror crates/loom-daemon: refusals are 409, a missing path 404, a bad query 400):
 // GET /api/fs/dirs?path= (fake home /fixture/user; /fixture/home is the loom home and is refused;
 // /fixture/user/many has 2,300 folders; /fixture/user/shared is a link), POST /api/sessions (a missing workspace is refused
@@ -119,9 +122,10 @@ sessions.push(
   session("s-quiet", "Rebuild the search index", { phase: "running", profile: "dsv41", workspace: "/fixture/indexer", step: 27, completion: 33000, prompt: 410000, cached: 380000, age: 2 * 3600000 }),
   session("s-notify", "Nightly dependency sweep", { phase: "running", profile: "qwen", workspace: "/fixture/docs", step: 12, completion: 9000, age: 40 * MIN }),
   session("s-tools", "Tool result shapes", { phase: "idle", last_end: "waiting", profile: "dsv41", workspace: "/fixture/loom", step: 9, completion: 6000, age: 90 * MIN }),
+  session("s-compacted", "Long-running mission (two compactions)", { phase: "idle", last_end: "waiting", profile: "dsv41", workspace: "/fixture/loom", step: 17, completion: 120000, prompt: 61000, cached: 52000, age: 30 * 3600000 }),
   session("s-big", "Long investigation (5,000 records)", { phase: "idle", last_end: "waiting", profile: "dsv41", workspace: "/fixture/loom", step: 1250, completion: 900000, prompt: 300000, cached: 280000, age: 6 * 3600000 }),
 );
-for (const id of ["s-parked", "s-quiet", "s-notify", "s-tools", "s-big", "s-result"]) custom.add(id);
+for (const id of ["s-parked", "s-quiet", "s-notify", "s-tools", "s-big", "s-compacted", "s-result"]) custom.add(id);
 let inbox = [
   { session: "s-audit", mission: "m-audit", title: "Audit harness reliability", opened_ms: now - 240000, item: { item_id: "i-scope", item_kind: "question", text: "Include the desktop app in this audit?", options: ["Include desktop", "Runtime only"], blocking: true, call_id: "question", reference: "q1" } },
   { session: "s-result", mission: "m-s-result", title: "Dependency review", opened_ms: now - 600000, item: { item_id: "i-result", item_kind: "finished", text: "The review is ready to read.", options: [], blocking: false, call_id: "finish" } },
@@ -302,6 +306,64 @@ append("s-fl-net", "inbox_opened", { ts_ms: now - 9 * MIN, ...inbox.find(e => e.
     append(id, "tool_result", { ts_ms: t + 3300, call_id, name: "bash", status: "ok", text: out, ...(cut ? { output: { id: blob, bytes: 128000, lines: 5000 } } : {}), cut, class: "exec", meta: { exit_code: 0 }, duration_ms: 200 }, "tool");
   }
   append(id, "turn_end", { ts_ms: t0 + 10000 + 1250 * 15000, reason: "waiting" }, "harness");
+}
+
+// s-compacted: two compactions. #1 (size) has a note that cites real keys of this log and one key that does not exist (dropped);
+// #2 is a fresh start after the verifier objected, with an empty tail. Keys are the 16-hex prefixes of the stored handles.
+const CK = { test: "e134a0f0b4bf46c1", edit: "cc8752638528652e", grep: "5a1c3e7d90b2f648", log: "9f20d1c4a7b36e85" };
+const ckBlob = (k) => k + "0".repeat(48);
+const COMPACTION_TABLE_1 = [
+  "Outputs — read one with read(path: \"out:<key>\"); search everything with log_search",
+  `out:${CK.test} · bash · python3 public_sequence.py · exit 0 · 7 lines · step 3, 11-22 09:14`,
+  `out:${CK.edit} · edit · crates/loom-agent/src/runtime.rs · edited · +3 −2 · step 5`,
+  `out:${CK.grep} · grep · retry_after · 12 matches · step 6`,
+  "… 1,204 earlier outputs (steps 1–2) are not listed: search them with log_search.",
+  "Files changed by edit/write (shell commands are not tracked)",
+  `crates/loom-agent/src/runtime.rs · +3 −2 · 2 edits · last out:${CK.edit}`,
+  "Agents",
+  "s-fl-web · Solver: web build hooks · web_solver · finished · report out:5a1c3e7d90b2f648",
+  "Jobs still running",
+  "j4 · cargo test --workspace · since step 6",
+].join("\n");
+const COMPACTION_NOTE_1 = [
+  "## Goal", "- Make the retry path report its last error; the operator wants no change to the public API.", "",
+  "## State", `- Edited runtime.rs (out:${CK.edit}); p2 is doing; \`cargo test --workspace\` runs as j4.`, "",
+  "## Established", `- The sequence script exits 0 on the fixed build: out:${CK.test}.`, "",
+  "## Ruled out", `- The retry limit is not the cause: out:${CK.grep} lists every use, none caps below 3.`, "",
+  "## Tried, not settled", "- A cached-length check (see out:0123456789abcdef) [unknown key]", "",
+  "## Next", `- Read the log tail in out:${CK.log}, then finish p2.`,
+].join("\n");
+const COMPACTION_TABLE_2 = [
+  "Outputs — read one with read(path: \"out:<key>\"); search everything with log_search",
+  `out:${CK.log} · bash · tail -n 200 retry.log · exit 0 · 200 lines · step 14, 11-23 08:41`,
+  `out:${CK.edit} · edit · crates/loom-agent/src/runtime.rs · edited · +3 −2 · step 5`,
+  `out:${CK.test} · bash · python3 public_sequence.py · exit 0 · 7 lines · step 3`,
+  "Files changed by edit/write (shell commands are not tracked)",
+  `crates/loom-agent/src/runtime.rs · +3 −2 · 2 edits · last out:${CK.edit}`,
+].join("\n");
+{
+  const id = "s-compacted"; const t0 = now - 30 * 3600000; const H = 3600000;
+  startOf(sessionOf(id), t0, "Make the retry path report its last error, and keep notes.");
+  append(id, "turn_start", { ts_ms: t0 + 2000, trigger: "user" }, "harness");
+  let t = t0 + 10000;
+  const keyed = (k, lines, bytes) => ({ id: ckBlob(k), bytes, lines });
+  t = step(id, t, { command: "git status --short", out: "M crates/loom-agent/src/runtime.rs", exit: 0 });
+  t = step(id, t, { command: "cargo check -p loom-agent", out: "Finished dev profile", exit: 0 });
+  t = step(id, t, { command: "python3 public_sequence.py", out: "1\n2\n3\n4\n5\n6\n7\n[output cut: 7 lines stored]", cut: true, output: keyed(CK.test, 7, 420), exit: 0, meta: { shown: [[1, 7]] } });
+  t = step(id, t, { name: "read", cls: "read", args: { path: "crates/loom-agent/src/runtime.rs", start: 1594, end: 1599 }, out: lines.slice(1593, 1599).join("\n") });
+  t = step(id, t, { name: "edit", cls: "write", args: { path: "crates/loom-agent/src/runtime.rs" }, out: "edited crates/loom-agent/src/runtime.rs +3 −2", cut: true, output: keyed(CK.edit, 12, 900) });
+  t = step(id, t, { name: "grep", cls: "read", args: { pattern: "retry_after" }, out: "runtime.rs:1601: retry_after\n[output cut: 12 matches stored]", cut: true, output: keyed(CK.grep, 12, 1100) });
+  t = step(id, t, { command: "cargo test --workspace", out: "test result: ok", exit: 0 });
+  const upto1 = (logs.get(id) || []).length - 1 - 4; // the last step stays in view
+  append(id, "compaction", { ts_ms: t, epoch: 2, upto_seq: upto1, reason: "size", before_tokens: 312000, after_tokens_est: 38000, note: COMPACTION_NOTE_1, note_req: "fx-note-1", table: COMPACTION_TABLE_1, keys: [CK.test, CK.edit, CK.grep], dropped_keys: ["out:0123456789abcdef"], objections: null }, "harness");
+  t += 20000;
+  t = step(id, t + H, { command: "tail -n 200 retry.log", out: "retry 3 failed: connection reset\n[output cut: 200 lines stored]", cut: true, output: keyed(CK.log, 200, 15000), exit: 0, meta: { shown: [[1, 2]] } });
+  t = step(id, t, { command: "cargo test -p loom-agent retry", out: "test retry::reports_last_error ... FAILED", status: "error", exit: 101 });
+  t = step(id, t, { command: "cargo test -p loom-agent retry", out: "test result: ok", exit: 0 });
+  append(id, "model_response", { ts_ms: t, req_id: "fx-final", text: "The retry path reports its last error now.", reasoning: "", tool_calls: [], finish: "stop", usage: { prompt_tokens: 61000, cached_tokens: 52000, completion_tokens: 20 }, timing: { total_ms: 900 }, attempts: 1 }, "model");
+  append(id, "compaction", { ts_ms: t + 4000, epoch: 3, upto_seq: (logs.get(id) || []).length - 1, reason: "fresh_start", before_tokens: 118000, after_tokens_est: 22000, note: `## Goal\n- Report the last retry error.\n\n## Tried, not settled\n- The finish claimed the fix; the verifier rejected it (out:${CK.log}).\n\n## Next\n- Reproduce the failure with the test before claiming it again.`, note_req: "fx-note-2", table: COMPACTION_TABLE_2, keys: [CK.log, CK.edit, CK.test], dropped_keys: [], objections: "The finish cites no run of the failing test; the log tail in out:" + CK.log + " shows the error still occurs." }, "harness");
+  t = step(id, t + H, { command: "cargo test -p loom-agent retry -- --nocapture", out: "test result: ok. 1 passed", exit: 0 });
+  append(id, "turn_end", { ts_ms: t + 1000, reason: "waiting" }, "harness");
 }
 
 const ledger = { entries: 9, goal: "Find actionable reliability defects and preserve source evidence.", constraints: [{ id: "k1", text: "Read-only review." }], plan: [{ id: "p1", text: "Inspect recovery paths", status: "done", note: "Source finding recorded." }, { id: "p2", text: "Review tool execution", status: "doing" }, { id: "p3", text: "Independently verify findings", status: "todo" }], claims: [{ id: "c1", text: "Recovered reports may omit the answer.", status: "open", evidence: ["e1"], note: "Crash reproduction pending." }, { id: "c2", text: "Process tracking ends when the shell exits.", status: "supported", evidence: ["e2", "e3"] }], evidence: [{ id: "e1", supports: true, kind: "static", attested: true, quote: "full: None,", blob, lines: [1596, 1596], session: "s-audit", call_id: "read1", note: "Source text only." }, { id: "e2", supports: true, kind: "execution", attested: true, quote: "job settled (exit 0) while pid 4127 still running", blob, lines: [212, 214], session: "s-worker", call_id: "bash7" }, { id: "e3", supports: false, kind: "note", attested: false, quote: "a foreground pipeline was tracked to completion", note: "Only observed with a backgrounded child." }], obligations: [{ id: "o1", kind: "agent", text: "Recovery review", outcome: null }], decisions: [], dead_ends: [], questions: [] };
@@ -641,13 +703,15 @@ const PART_COUNT = { tools: 42, rules: 2, assignment: 0, conversation: 96, tool_
 function windowFor(info) {
   const st = (info && info.status) || {};
   const id = info ? info.id : "";
+  const compacted = id === "s-compacted";
   const win = id === "s-notify" ? null : info && info.context_window ? info.context_window : 262144;
   const counted = id !== "s-quiet";
   const total = id === "s-parked" ? 120000 : Math.max(20000, st.prompt_tokens || 148812);
   const ratio = 3.3;
   // The characters are kept in proportion to the size the session has, at about 3.6 characters a token when counted.
   const mult = (total * (counted ? 3.6 : ratio)) / Object.values(PART_CHARS).reduce((a, b) => a + b, 0);
-  const chars = Object.fromEntries(Object.entries(PART_CHARS).map(([k, c]) => [k, Math.round(c * mult)]));
+  const partChars = compacted ? { ...PART_CHARS, resume: 0, stubs: 0, compaction: 41000 } : PART_CHARS;
+  const chars = Object.fromEntries(Object.entries(partChars).map(([k, c]) => [k, Math.round(c * mult)]));
   const raw = Object.fromEntries(Object.entries(chars).map(([k, c]) => [k, Math.ceil(c / ratio)]));
   const hudChars = 2310;
   const rawHud = Math.ceil(hudChars / ratio);
@@ -678,7 +742,7 @@ function windowFor(info) {
     breakdown: { basis: measured ? "scaled_to_measured" : "default_ratio", chars_per_token: measured ? Math.round(ratio / factor * 100) / 100 : ratio, total_tokens: sum, segments },
     measured_now: measured,
     last_request: { req_id: "r-41", step: 41, epoch: 3, n_messages: 120, est_tokens: estTotal, prompt_tokens: lastPrompt, cached_tokens: id === "s-parked" ? 0 : counted ? Math.round(lastPrompt * 0.88) : 0, hud_bytes: hudChars },
-    fold_at: id === "s-parked" ? 100000 : foldAt, fold_to: id === "s-parked" ? 60000 : foldTo,
+    ...(compacted ? { compact_at: Math.min(400000, Math.floor(win * 0.4)) } : { fold_at: id === "s-parked" ? 100000 : foldAt, fold_to: id === "s-parked" ? 60000 : foldTo }),
   };
 }
 
@@ -815,11 +879,16 @@ const server = createServer(async (req, res) => {
         const attached = attachmentBlock(info.workspace, data.attachments);
         if (attached.error) return json(res, { error: attached.error }, 400);
         await wait(2500); append(id, "user_message", { text: String(data.text || "") + attached.block }, "user", true); append(id, "model_request", { req_id: "fixture-delivery", purpose: "step", step: 49 }, "harness", true);
-      } else if (parts[4] === "reweave") {
-        if (info.status.phase === "ended") return json(res, { error: `Session ${id} has ended, so there is nothing to re-weave.` }, 409);
+      } else if (parts[4] === "compact" || parts[4] === "reweave") {
+        if (info.status.phase === "ended") return json(res, { error: `Session ${id} has ended, so there is nothing to compact.` }, 409);
         await wait(400);
         const log = logs.get(id) || [];
-        append(id, "reweave", { epoch: info.status.epoch + 1, upto_seq: Math.max(0, log.length - 1), evictions: [], brief: "Fixture re-weave: older outputs became stubs; the ledger snapshot follows.", digest: null, reason: "operator", before_tokens: info.status.prompt_tokens, after_tokens_est: 30000 }, "harness", true);
+        // The newest stored outputs of this log are what the note and the table cite.
+        const outs = log.filter(r => r.kind === "tool_result" && r.output && r.output.id).slice(-3).reverse();
+        const key = (r) => r.output.id.slice(0, 16);
+        const table = outs.length ? ["Outputs — read one with read(path: \"out:<key>\"); search everything with log_search", ...outs.map(r => `out:${key(r)} · ${r.name} · ${r.output.lines} lines · step ${r.call_id}`)].join("\n") : "";
+        const note = `## Goal\n- Fixture compaction asked by the operator.\n\n## State\n${outs.length ? outs.map(r => `- see out:${key(r)}`).join("\n") : "- nothing stored yet"}\n\n## Next\n- Carry on.`;
+        append(id, "compaction", { epoch: info.status.epoch + 1, upto_seq: Math.max(0, log.length - 1), reason: "operator", before_tokens: info.status.prompt_tokens, after_tokens_est: 30000, note, note_req: "fx-note-op", table, keys: outs.map(key), dropped_keys: [], objections: null }, "harness", true);
         info.status = { ...info.status, epoch: info.status.epoch + 1 };
       } else if (parts[4] === "stop") { await wait(500); info.status = { ...info.status, phase: "idle", last_end: "stopped" }; }
       else if (parts[4] === "resume") info.status = { ...info.status, phase: "running", last_end: null };
@@ -846,7 +915,23 @@ const server = createServer(async (req, res) => {
     if (path === "/api/inbox") return json(res, inbox);
     if (path === "/api/status") return json(res, { version: "fixture", pid: 0, started_ms: now, bind: "127.0.0.1:7878", proxy_port: 0, home: "/fixture/home", sandbox: "seatbelt", network: "allowlist", disk: { free_bytes: 200e9, total_bytes: 500e9 }, models: profiles, sessions_total: sessions.length, sessions_active: sessions.filter(s => s.active).length, sessions_running: sessions.filter(s => s.status.phase === "running").length, inbox_open: inbox.length });
     if (path === "/api/models") return json(res, { default_model: "dsv41", models: profiles });
-    if (path.endsWith("/records")) { const after = Number(url.searchParams.get("after") ?? -1); return json(res, { records: (logs.get(path.split("/")[3]) || []).filter(r => r.seq > after), next_after: null }); }
+    if (path.endsWith("/records")) {
+      // The daemon's paging: `after` pages forward (next_after), `before` pages backward (the last n before seq, oldest first, prev_before).
+      const log = logs.get(path.split("/")[3]) || [];
+      const q = url.searchParams;
+      const limit = q.has("limit") ? Math.max(1, Math.min(5000, Number(q.get("limit")) || 500)) : 1000000;
+      if (q.has("after") && q.has("before")) return json(res, { error: "Give after or before, not both." }, 400);
+      if (q.has("before")) {
+        const before = Number(q.get("before"));
+        const older = log.filter(r => r.seq < before);
+        const page = older.slice(-limit);
+        return json(res, { records: page, prev_before: page.length && page[0].seq > 0 ? page[0].seq : null });
+      }
+      const after = Number(q.get("after") ?? -1);
+      const rest = log.filter(r => r.seq > after);
+      const page = rest.slice(0, limit);
+      return json(res, { records: page, next_after: rest.length > page.length ? page[page.length - 1].seq : null });
+    }
     if (path.endsWith("/ledger")) return json(res, { state: ledgers.get(decodeURIComponent(path.split("/")[3] || "")) || { entries: 0 }, markdown: "" });
     if (path.endsWith("/window")) return json(res, windowFor(sessions.find(x => x.id === decodeURIComponent(path.split("/")[3] || ""))));
     if (path.endsWith("/net")) return json(res, []);
