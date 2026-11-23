@@ -376,6 +376,11 @@
 //!   repeat notice is armed as for a live one.
 //!
 //! ## Operator actions
+//! - `send_message_with(id, text, attachments)`: `send_message` with files attached (`docs/UPLOADS.md`). Each
+//!   path must be a regular file directly in `<workspace>/.loom/uploads/` of the session's workspace, after
+//!   canonicalising and not itself a link (`attached_files`), else `texts::not_an_upload`; the text recorded is
+//!   `texts::with_attachments(text, files)`. Text may be empty when there are attachments. `NewSession.attachments`
+//!   are validated before anything is created and sent with the first message in the same way.
 //! - `send_message(id, text)`: root sessions only (`Messages go to the lead session of a mission;
 //!   {id} is one of its agents.`); empty text refused; ended session refused; activate;
 //!   `Input::User`; then its children that a restart cut are resumed as `resume` does (the lead's
@@ -721,6 +726,10 @@ pub struct NewSession {
     /// Make `workspace` (and the folders above it that are missing) when it does not exist. The receipt of
     /// the creation says `created`; nothing is recorded in the log beyond what a session start records.
     pub create_workspace: bool,
+    /// Uploads of the workspace to attach to the first message (absolute paths from `POST /api/uploads`;
+    /// `docs/UPLOADS.md`). Not written when empty, so a request that names none is accepted by an older daemon.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<String>,
 }
 
 /// `meta.json`: what a session is, fixed when it is created.
@@ -1529,6 +1538,50 @@ pub fn plan_workspace(paths: &Paths, raw: &Path, create: bool) -> Result<Workspa
         ));
     }
     Ok(WorkspacePlan::Create { path, ancestor, protected: vec![paths.home.clone(), copies] })
+}
+
+/// The uploads `paths` names, as the message tells the model of them: each a regular file directly in
+/// `<workspace>/.loom/uploads/` (the real path of both, and the path itself not a link), else
+/// `texts::not_an_upload`. A UTF-8 text file of at most `texts::ATTACH_INLINE_MAX` bytes carries its content.
+pub fn attached_files(workspace: &Path, paths: &[String]) -> Result<Vec<texts::AttachedFile>, String> {
+    use std::io::Read;
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let uploads = std::fs::canonicalize(workspace).ok().map(|w| w.join(".loom").join("uploads"));
+    let mut out = Vec::new();
+    for raw in paths {
+        let refuse = || texts::not_an_upload(raw);
+        let written = Path::new(raw);
+        let is_plain = std::fs::symlink_metadata(written).is_ok_and(|m| m.file_type().is_file());
+        let real = std::fs::canonicalize(written).map_err(|_| refuse())?;
+        let in_uploads = match (&uploads, real.parent()) {
+            (Some(dir), Some(parent)) => {
+                parent == dir.as_path() && std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_dir())
+            }
+            _ => false,
+        };
+        if !written.is_absolute() || !is_plain || !in_uploads {
+            return Err(refuse());
+        }
+        let path = real.to_str().ok_or_else(refuse)?.to_string();
+        let file = std::fs::File::open(&real).map_err(|_| refuse())?;
+        let meta = file.metadata().map_err(|_| refuse())?;
+        if !meta.is_file() {
+            return Err(refuse());
+        }
+        let bytes = meta.len();
+        let inline = if bytes <= texts::ATTACH_INLINE_MAX {
+            let mut data = Vec::new();
+            file.take(texts::ATTACH_INLINE_MAX.saturating_add(1)).read_to_end(&mut data).map_err(|_| refuse())?;
+            String::from_utf8(data).ok().filter(|t| !t.contains('\0') && !t.is_empty())
+        } else {
+            None
+        };
+        let name = real.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        out.push(texts::AttachedFile { path, bytes, mime: texts::mime_for(name, None), inline });
+    }
+    Ok(out)
 }
 
 fn no_session(id: &SessionId) -> String {
@@ -4871,6 +4924,14 @@ impl Runtime {
         inner.check_open()?;
         // Checked before anything else; the folder itself is made only once the rest of the request is accepted.
         let plan = plan_workspace(&inner.paths, &new.workspace, new.create_workspace)?;
+        if !new.attachments.is_empty() {
+            // A workspace that is yet to be made holds no uploads.
+            let root = match &plan {
+                WorkspacePlan::Existing(p) => p.as_path(),
+                WorkspacePlan::Create { path, .. } => path.as_path(),
+            };
+            attached_files(root, &new.attachments)?;
+        }
         let role = inner.packs.role(new.pack.as_deref(), new.role.as_deref())?.clone();
         inner.check_network(&role.pack)?;
         let profile_name = inner.models().resolve(new.model.as_deref().or(role.model.as_deref()))?;
@@ -4994,8 +5055,9 @@ impl Runtime {
         };
         let info = info.ok_or_else(|| no_session(&id))?;
         inner.publish(BusEvent::Session { info: Box::new(info) });
-        if let Some(message) = new.message.as_deref().filter(|m| !m.trim().is_empty()) {
-            self.send_message(&id, message).await?;
+        let message = new.message.as_deref().filter(|m| !m.trim().is_empty());
+        if message.is_some() || !new.attachments.is_empty() {
+            self.send_message_with(&id, message.unwrap_or(""), &new.attachments).await?;
         }
         self.session(&id).map(|info| (info, created)).ok_or_else(|| no_session(&id))
     }
@@ -5087,13 +5149,26 @@ impl Runtime {
     }
 
     pub async fn send_message(&self, id: &SessionId, text: &str) -> Result<(), String> {
+        self.send_message_with(id, text, &[]).await
+    }
+
+    /// [`Runtime::send_message`] with uploads of the session's workspace attached.
+    pub async fn send_message_with(&self, id: &SessionId, text: &str, attachments: &[String]) -> Result<(), String> {
         let meta = self.operable(id, Some("message"))?;
-        if text.trim().is_empty() {
+        if text.trim().is_empty() && attachments.is_empty() {
             return Err("Write a message to send.".to_string());
         }
         if meta.archived {
             return Err("This session is archived; unarchive it first.".to_string());
         }
+        let files = attached_files(Path::new(&meta.workspace), attachments)?;
+        let composed;
+        let text = if files.is_empty() {
+            text
+        } else {
+            composed = texts::with_attachments(text, &files);
+            composed.as_str()
+        };
         self.inner.activate(id)?;
         self.inner.box_reopen_for(id);
         if !self.inner.send_input(id, Input::User(text.to_string())) {
@@ -12578,6 +12653,96 @@ mod tests {
         let bad = NewSession { role: Some("nope".into()), ..make(&later, true) };
         assert!(e.rt.create_session_receipt(bad).await.is_err());
         assert!(!later.exists());
+    }
+
+    fn upload(ws: &Path, name: &str, bytes: &[u8]) -> String {
+        let dir = ws.join(".loom/uploads");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(name), bytes).unwrap();
+        std::fs::canonicalize(dir.join(name)).unwrap().display().to_string()
+    }
+
+    fn user_texts(e: &Env, id: &SessionId) -> Vec<String> {
+        e.records(id)
+            .into_iter()
+            .filter_map(|r| match r.event {
+                Event::UserMessage { text } => Some(text),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_message_with_uploads_records_the_attachment_block_and_refuses_what_is_not_an_upload() {
+        let e = env(Script::new(|_, _| Action::Stall { ms: 600_000 })).await;
+        let info = e.rt.create_session(e.new_session(None)).await.unwrap();
+        let id = info.meta.id.clone();
+        let csv = upload(&e.ws, "report.csv", b"a,b\n1,2\n");
+        let png = upload(&e.ws, "screen.png", &[0x89, b'P', b'N', b'G', 0, 1, 2]);
+
+        // Empty text is allowed with attachments, and refused without.
+        assert_eq!(e.rt.send_message_with(&id, "  ", &[]).await.unwrap_err(), "Write a message to send.");
+        e.rt.send_message_with(&id, "Look.", &[csv.clone(), png.clone()]).await.unwrap();
+        e.rt.send_message_with(&id, "", std::slice::from_ref(&csv)).await.unwrap();
+        until("both messages", || user_texts(&e, &id).len() >= 2).await;
+        let texts = user_texts(&e, &id);
+        assert_eq!(
+            texts[0],
+            format!(
+                "Look.\n\nAttached files (saved read-only; read them with `read`):\n- {csv} (8 B, text/csv)\n\
+                 - {png} (7 B, image/png)\n\n`{csv}`:\n```csv\na,b\n1,2\n```"
+            )
+        );
+        assert!(texts[1].starts_with("Attached files (saved read-only;"), "{}", texts[1]);
+
+        // Not uploads: a file elsewhere in the workspace, one outside, a missing one, a folder, a relative path,
+        // a link to an upload, and a path that climbs out of the folder.
+        std::fs::write(e.ws.join("plain.txt"), "x").unwrap();
+        let outside = e.dir.path().join("outside.txt");
+        std::fs::write(&outside, "x").unwrap();
+        let link = e.ws.join(".loom/uploads/link.csv");
+        std::os::unix::fs::symlink(&csv, &link).unwrap();
+        let dir = e.ws.join(".loom/uploads/sub");
+        std::fs::create_dir_all(&dir).unwrap();
+        let nested = upload(&e.ws, "sub/inner.txt", b"x");
+        let climb = format!("{}/../../plain.txt", e.ws.join(".loom/uploads").display());
+        for bad in [
+            e.ws.join("plain.txt").display().to_string(),
+            outside.display().to_string(),
+            e.ws.join(".loom/uploads/missing").display().to_string(),
+            dir.display().to_string(),
+            "report.csv".to_string(),
+            link.display().to_string(),
+            nested,
+            climb,
+        ] {
+            let err = e.rt.send_message_with(&id, "x", std::slice::from_ref(&bad)).await.unwrap_err();
+            assert_eq!(err, texts::not_an_upload(&bad), "{bad}");
+        }
+        assert_eq!(user_texts(&e, &id).len(), 2, "nothing was recorded for a refused message");
+        tokio::time::timeout(Duration::from_secs(30), e.rt.shutdown()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_new_session_checks_its_attachments_before_anything_is_made_and_sends_them_with_the_message() {
+        let e = env(Script::new(|_, _| Action::Stall { ms: 600_000 })).await;
+        let before = e.rt.sessions(true).len();
+        let bad =
+            NewSession { attachments: vec![e.ws.join("nope").display().to_string()], ..e.new_session(Some("go")) };
+        let err = e.rt.create_session_receipt(bad).await.unwrap_err();
+        assert!(err.starts_with("Attach files with POST /api/uploads first;"), "{err}");
+        assert_eq!(e.rt.sessions(true).len(), before);
+
+        let note = upload(&e.ws, "note.txt", b"hello");
+        let new = NewSession { attachments: vec![note.clone()], ..e.new_session(None) };
+        let (info, _) = e.rt.create_session_receipt(new).await.unwrap();
+        until("the first message", || !user_texts(&e, &info.meta.id).is_empty()).await;
+        let first = user_texts(&e, &info.meta.id).remove(0);
+        assert!(
+            first.starts_with("Attached files (") && first.contains(&format!("- {note} (5 B, text/plain)")),
+            "{first}"
+        );
+        tokio::time::timeout(Duration::from_secs(30), e.rt.shutdown()).await.unwrap();
     }
 
     #[tokio::test]

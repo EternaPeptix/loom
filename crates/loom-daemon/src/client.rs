@@ -65,7 +65,7 @@
 use crate::wire::{
     AnswerBody, ApprovalBody, ArchiveBody, CreatedSession, DaemonFile, ErrorBody, GcBody, LinesView, MessageBody,
     ModelBody, ModelsView, RecordsPage, ReleaseBody, RenameBody, RoleModelBody, RuleBody, ScopeBody, ScopeReceipt,
-    SessionDetail, StatusView, WithdrawBody,
+    SessionDetail, StatusView, UploadView, WithdrawBody,
 };
 use loom_agent::runtime::{
     BusEvent, InboxEntry, LedgerView, MissionInfo, MissionModels, ModelSwitchReceipt, ModelsReload, NetEntry,
@@ -460,9 +460,35 @@ impl Client {
     }
 
     pub async fn send(&self, id: &SessionId, text: &str) -> Result<(), String> {
-        let body = serde_json::to_value(MessageBody { text: text.to_string() })
+        self.send_with_files(id, text, &[]).await
+    }
+
+    /// [`Client::send`] with uploads attached (`paths` are the `path`s `upload` returned).
+    pub async fn send_with_files(&self, id: &SessionId, text: &str, paths: &[String]) -> Result<(), String> {
+        let body = serde_json::to_value(MessageBody { text: text.to_string(), attachments: paths.to_vec() })
             .map_err(|e| format!("The message cannot be encoded ({e})."))?;
         self.call_unit(Method::POST, &format!("/api/sessions/{}/messages", segment(id.as_str())), Some(body)).await
+    }
+
+    /// `POST /api/uploads`: store `bytes` as `name` in `workspace`'s uploads folder (`docs/UPLOADS.md`).
+    pub async fn upload(&self, workspace: &str, name: &str, bytes: Vec<u8>) -> Result<UploadView, String> {
+        self.ensure_proven().await?;
+        let path = "/api/uploads";
+        let url = format!("{}{}", self.base, path);
+        let query = [("workspace", workspace.to_string()), ("name", name.to_string())];
+        let req = self.http.post(url).bearer_auth(&self.token).query(&query).body(bytes);
+        let response = req.send().await.map_err(|e| self.transport_error(&Method::POST, path, e))?;
+        let status = response.status();
+        let raw = response.bytes().await.map_err(|e| self.transport_error(&Method::POST, path, e))?;
+        if status.is_success() {
+            return serde_json::from_slice(&raw).map_err(|e| {
+                format!("The daemon's answer to POST {path} was not understood ({e}); the `loom` command and the daemon may be different versions.")
+            });
+        }
+        match serde_json::from_slice::<ErrorBody>(&raw) {
+            Ok(e) => Err(e.error),
+            Err(_) => Err(format!("The daemon answered {status} to POST {path}.")),
+        }
     }
 
     /// The receipt says which lead the rule went to and whether it is recorded yet (`queued`).

@@ -2644,6 +2644,20 @@ mod tests {
     }
 
     #[test]
+    fn workspace_uploads_are_readable_and_never_writable_but_oracle_secrets_stay_hidden() {
+        let f = fx();
+        let sb = build(&f, &cfg(SandboxMode::Seatbelt), None);
+        let up = f.ws.join(".loom/uploads");
+        std::fs::create_dir_all(&up).unwrap();
+        std::fs::write(up.join("x"), "data").unwrap();
+        assert!(sb.check_read(&up.join("x")).is_ok());
+        assert!(sb.check_read(&up).is_ok());
+        assert!(sb.check_write(&up.join("x")).is_err());
+        assert!(sb.check_write(&up.join("new")).is_err());
+        assert!(sb.check_read(&f.ws.join(".loom/oracle-secrets/key")).is_err());
+    }
+
+    #[test]
     fn protected_path_inside_the_temp_dir_stays_protected() {
         let f = fx();
         // A temp dir that is the workspace itself must not unprotect `.loom`.

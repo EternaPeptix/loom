@@ -6,7 +6,8 @@
 //! session temp rebound writable, and protected children rebound read-only again. Existing Git
 //! metadata directories are read-only as a whole. Creating a new repository inside a writable root
 //! is outside this snapshot-based Git protection; the operator must do that outside the session.
-//! `/tmp`, `/var/tmp` and `/run` are private mounts. Credential/unreadable directories are empty
+//! The workspace `.loom` is hidden by a read-only empty mount, except that an existing `.loom/uploads` folder
+//! is bound read-only inside it (`docs/UPLOADS.md`). `/tmp`, `/var/tmp` and `/run` are private mounts. Credential/unreadable directories are empty
 //! mounts, files are replaced by `/dev/null`. Socket creation and connection syscalls are denied by
 //! seccomp in addition to isolated network namespaces, including filesystem Unix sockets. The filter
 //! is a harness-owned file outside session temp, opened on fd 3 before entering bubblewrap. Only
@@ -369,12 +370,15 @@ fn command_with(sb: &Sandbox, script: &str, new_session: bool) -> (String, Vec<S
         }
     }
     if !state_is_loom_home {
-        args.extend([
-            "--tmpfs".to_string(),
-            workspace_state.display().to_string(),
-            "--remount-ro".to_string(),
-            workspace_state.display().to_string(),
-        ]);
+        args.extend(["--tmpfs".to_string(), workspace_state.display().to_string()]);
+        // Uploads (`docs/UPLOADS.md`) are the one part of the hidden `.loom` the commands may read. The bind goes
+        // before the remount: the tmpfs is read-only afterwards and could no longer take the mount point.
+        let uploads = workspace_state.join("uploads");
+        if std::fs::symlink_metadata(&uploads).is_ok_and(|m| m.is_dir()) {
+            let p = uploads.display().to_string();
+            args.extend(["--ro-bind-try".to_string(), p.clone(), p]);
+        }
+        args.extend(["--remount-ro".to_string(), workspace_state.display().to_string()]);
     }
     // Only these top mounts become read-only; the scoped writable workspace/temp bind mounts below
     // them keep their own access modes.
@@ -504,6 +508,34 @@ mod tests {
             .windows(3)
             .any(|w| w[0] == "--bind" && w[1].starts_with("/proc/") && w[2] == tmp.to_str().unwrap()));
         assert_eq!(args.last().unwrap(), "printf 'literal $()'; true");
+    }
+
+    #[test]
+    fn the_hidden_workspace_state_keeps_uploads_readable_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (ws, tmp, home) = (root.join("ws"), root.join("tmp"), root.join("home"));
+        for p in [&ws, &tmp, &home, &ws.join(".loom/uploads")] {
+            std::fs::create_dir_all(p).unwrap();
+        }
+        let cfg = SandboxCfg { protect_credentials: false, ..SandboxCfg::default() };
+        let mut sb = Sandbox::new(&cfg, &ws, &tmp, &home, None).unwrap();
+        sb.mode = SandboxMode::Bubblewrap;
+        sb.linux_filter = Some(home.join("sandbox/filter.bpf"));
+        sb.linux_pins =
+            pin(&sb.writable, &sb.protected, &sb.unreadable, &sb.credentials, &sb.git_dirs, &sb.holders()).unwrap();
+        let state = ws.join(".loom").display().to_string();
+        let uploads = ws.join(".loom/uploads").display().to_string();
+        let (_, args) = command(&sb, "true");
+        let at = |pat: &[&str]| args.windows(pat.len()).position(|w| w == pat);
+        let hide = at(&["--tmpfs", &state]).expect("state hidden");
+        let bind = at(&["--ro-bind-try", &uploads, &uploads]).expect("uploads bound");
+        let remount = at(&["--remount-ro", &state]).expect("state read-only");
+        assert!(hide < bind && bind < remount, "{args:?}");
+        // Without an uploads folder there is nothing to bind.
+        std::fs::remove_dir(ws.join(".loom/uploads")).unwrap();
+        let (_, args) = command(&sb, "true");
+        assert!(!args.iter().any(|a| a == &uploads), "{args:?}");
     }
 
     #[cfg(target_os = "linux")]
