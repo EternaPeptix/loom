@@ -803,10 +803,9 @@ bounded waiting/stopping and delivery. Probes, writes, new plans/claims and dele
 including speculative starts. A finish requiring fresh execution may still refuse; report the blocker
 and partial result rather than claiming verification. See [runtime controls](RUNTIME-CONTROLS.md).
 
-**Stall.** In a session with a ledger whose role has `note`, `claim` or `evidence`, when the last
-`agents.stall_steps` (30) steps recorded nothing in the ledger, changed no file and started or received
-no agent, a note asks the model to record what it learned or change its approach (at most once in that
-span).
+**Stall.** There is no stall note: it was advice the harness gave on its own (166 times in the
+logs of 2026-11) and a model is left to manage its own pace. `agents.stall_steps` and
+`agents.idle_ledger_nudge` are still accepted in the config, so older configs load, and are ignored.
 
 **Repetition and staleness** (HUD, over the session's own records, `loom_core::observe`): the same tool
 called with the same arguments and the same output at least 3 times (navigation, reads and commands);

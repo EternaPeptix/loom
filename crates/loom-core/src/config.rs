@@ -392,7 +392,7 @@ pub struct AgentsCfg {
     pub child_max_minutes: u32,
     /// Stop-gate nudges without progress before the session is parked for the operator.
     pub max_nudges: u32,
-    /// Steps without a new ledger entry before the harness adds a stall note.
+    /// Accepted so older configs load; ignored (the stall note was removed).
     pub stall_steps: u32,
     /// Run an independent verifier before a lead's `finish` is accepted.
     pub verify_finish: bool,
@@ -419,7 +419,7 @@ pub struct AgentsCfg {
     pub compact_tools: bool,
     /// Allow explicit-termination sessions to treat a plain reply without open ledger items as implicit finish.
     pub implicit_finish: bool,
-    /// Add a nudge paragraph when a lead stops idle with an open goal and no open plan step.
+    /// Accepted so older configs load; ignored (the idle-goal paragraph was removed).
     pub idle_ledger_nudge: bool,
     /// Put the workspace's `AGENTS.md` and `CLAUDE.md` into the system prompt of each new session.
     pub project_instructions: bool,
