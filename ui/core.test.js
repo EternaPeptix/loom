@@ -1812,7 +1812,7 @@ test("workspaceGroups: groups by workspace, newest activity first, Needs you pin
   assert.equal(ask.identity.waiting.text, "Approval waiting 5m");
   assert.equal(ask.identity.waiting.icon, "diamond");
   // no record has been loaded for the others: the age is unknown, never the time since creation
-  assert.equal(groups[2].rows[0].identity.text, "qwen · chat · activity not loaded");
+  assert.equal(groups[2].rows[0].identity.text, "qwen · chat", "an unknown age is left out of the line");
   assert.equal(groups[2].rows[0].identity.age, C.ACTIVITY_UNKNOWN);
   assert.equal(groups[2].rows[0].recordedMs, null);
   assert.equal(groups[2].rows[0].identity.waiting, null);
@@ -2137,7 +2137,9 @@ test("runWords says an open question and a ready result in words, not only by sh
 test("identityLine: the age is a recorded time or an explicit unknown, and a waiting reason has its own line", () => {
   const i = infoOf("s", { profile: "qwen", role: "chat" });
   assert.equal(C.identityLine(i, 1000, null, 61000).text, "qwen · chat · 1m");
-  assert.equal(C.identityLine(i, null, null, 61000).text, "qwen · chat · activity not loaded");
+  assert.equal(C.identityLine(i, null, null, 61000).text, "qwen · chat");
+  assert.equal(C.identityLine(i, null, null, 61000).known, false);
+  assert.equal(C.identityLine(i, null, null, 61000).parts[2], null);
   assert.equal(C.identityLine(i, undefined, null, 61000).age, "activity not loaded");
   const w = C.identityLine(i, 1000, { blocking: { count: 1, kind: "question", since: 1000 } }, 61000);
   assert.equal(w.text, "qwen · chat");
@@ -2448,7 +2450,7 @@ test("scoreRows shapes /score: eight cells per session, the total, and the fine 
   assert.equal(s.bySession.get("kid").text, "1 hand-off");
   assert.equal(s.bySession.get("kid").unrecorded, true);
   assert.equal(s.total.cells.find((c) => c.key === "hand_offs").value, 1);
-  assert.equal(s.label, "Mission total: the result is the lead's, the effort everyone's");
+  assert.equal(s.label, "Mission total, every session");
   assert.equal(s.fineprint, "Run numbers describe effort, not completion.");
   assert.equal(C.scoreRows({ mission: "m", sessions: [{ session: "x", card: {} }], total: {} }).rows[0].text, "no calls recorded");
   for (const bad of [null, {}, { sessions: [] }, { sessions: "x", total: {} }]) assert.equal(C.scoreRows(bad), null);

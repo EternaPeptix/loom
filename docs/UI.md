@@ -58,8 +58,9 @@ line drops the age and the reason is a line of its own below it (for example "Ap
 a question mark in blue) and an available result ("Result ready 10m", an outline diamond in green) are
 said the same way, without the urgent treatment. The age is the time of the latest recorded event the
 page has seen, kept in tab storage beside the watermarks so it survives a reload; for a session whose
-records have not been loaded it reads "activity not loaded". The creation time orders such rows but is
-never shown as an age. The
+records have not been loaded the line leaves the age out ("qwen · lead") and its tooltip says the activity
+is not loaded yet; repeating "not loaded" on every row was noise. The creation time orders such rows but is
+never shown as an age. An agent row in the Agents tab likewise leaves out "last record" until one is known. The
 earlier row summary (what waits and for how long, how the root stands, recorded activity) remains the
 row's tooltip and description, so nothing it said is lost. Blocking requests, nonblocking questions
 and available results have different labels, and only blocking requests use the urgent attention
@@ -373,7 +374,8 @@ The composer's toolbar holds the model seat, `#model-seat`: a select listing the
 open session's current profile. An unreachable profile is labelled "(not reachable)", and a current
 profile that is no longer configured is still listed as "(not configured)". It is disabled, with the
 reason ("This session has ended; its model no longer changes.") as its tooltip and accessible
-description, for an ended session, which the daemon refuses to re-seat; archived sessions can still be
+description, for an ended session, which the daemon refuses to re-seat; on an ended session's closed
+composer it is hidden altogether (the model stays in the header chip). Archived sessions can still be
 re-seated. A switch in flight holds only its own session's seat. Until a session is known to the page the
 seat is disabled and the identity chips are empty rather than showing the previous session.
 

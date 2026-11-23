@@ -71,7 +71,7 @@
             <button id="b-rename" type="button" class="btn ghost" hidden>Rename</button>
             <button id="b-stop" type="button" class="btn danger" hidden>Stop</button>
             <button id="b-resume" type="button" class="btn" hidden>Resume</button>
-            <button id="b-archive" type="button" class="btn" hidden>Archive</button>
+            <button id="b-archive" type="button" class="btn ghost" hidden>Archive</button>
             <button id="b-unarchive" type="button" class="btn" hidden>Unarchive</button>
             <span class="actions-sep" aria-hidden="true"></span>
             <button id="b-files" type="button" class="btn ghost with-icon" aria-controls="right" title="Browse this session's workspace folder in the inspector." hidden><svg class="icon" viewBox="0 0 14 14" aria-hidden="true"><path d="M1.5 3.5a1 1 0 0 1 1-1h3l1.3 1.5h4.7a1 1 0 0 1 1 1v5.5a1 1 0 0 1-1 1h-9a1 1 0 0 1-1-1Z"/></svg>Files</button>
@@ -200,15 +200,20 @@
           </div>
           <p id="f-workspace-note" class="dim field-note" hidden></p>
         </div>
-        <label>Message <textarea id="f-message" rows="6" required></textarea></label>
+        <label>Message <textarea id="f-message" rows="6" required placeholder="What should the lead do, and what does done look like? For example: find why the recovery test is flaky, fix it, and show it passing 20 times in a row." aria-describedby="f-message-note"></textarea></label>
+        <p id="f-message-note" class="dim field-note">⌘Enter starts the mission.</p>
         <div class="form-row">
           <label>Role <select id="f-role"></select></label>
           <label>Model profile <select id="f-model"></select></label>
           <label>Agents' model <select id="f-agent-model"></select></label>
         </div>
-        <label>Title (optional) <input id="f-title" type="text"></label>
-        <label>Recall earlier missions (optional) <input id="f-prior" type="text" placeholder="m-… m-…"></label>
-        <label class="check"><input id="f-unattended" type="checkbox" checked> Resume by itself after a restart</label>
+        <details id="f-more" class="form-more">
+          <summary>More options</summary>
+          <label>Title (optional) <input id="f-title" type="text" placeholder="The first line of the message when empty"></label>
+          <label>Recall earlier missions (optional) <input id="f-prior" type="text" placeholder="Mission ids, for example m-3f2a m-91bc" aria-describedby="f-prior-note" spellcheck="false" autocapitalize="off" autocorrect="off"></label>
+          <p id="f-prior-note" class="dim field-note">The new lead starts with a note of what those missions recorded. Up to 8.</p>
+          <label class="check"><input id="f-unattended" type="checkbox" checked> Resume by itself after a restart</label>
+        </details>
         <p id="f-error" class="error" role="alert" hidden></p>
         <div id="f-create" class="model-confirm create-confirm" role="group" aria-labelledby="f-create-q" hidden>
           <p id="f-create-q" class="model-confirm-text"></p>
@@ -218,7 +223,7 @@
           </span>
         </div>
         <p id="f-receipt" class="dim" role="status" aria-live="polite" hidden></p>
-        <div><button id="f-submit" type="submit" class="btn primary">Start</button></div>
+        <div><button id="f-submit" type="submit" class="btn primary">Start mission</button></div>
       </form>
     </section>
   </main>

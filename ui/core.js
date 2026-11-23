@@ -2485,7 +2485,7 @@ export function groupKeyForSeq(items, seq) {
   return null;
 }
 
-/** The header words of a work group: {text, spoken, duration, tools, exited, failed, denied, invalid, timedOut, interrupted, partial,
+/** The header words of a work group: {text, head, spoken, duration, tools, exited, failed, denied, invalid, timedOut, interrupted, partial,
  *  missing, warnings, running} where text is "Worked for 4m · 12 calls · 2 exited non-zero · 1 denied by policy · 1 without a result ·
  *  running" (each non-ok ToolStatus counted on its own; the running group's duration runs to `now`). `spoken` is the
  *  accessible name: the same without the duration while the group runs, so a ticking clock is not read out every second. */
@@ -2503,8 +2503,11 @@ export function groupLabel(group, now) {
   if (group.missing) rest.push(`${group.missing} without a result`);
   if (group.warnings) rest.push(count(group.warnings, "warning"));
   if (group.running) rest.push("running");
+  // The header's visible words when the outcome counts are drawn as their own marks beside it: no count said twice.
+  const head = [`Worked for ${duration}`, count(group.toolCount, "tool call"), ...(group.missing ? [`${group.missing} without a result`] : []), ...(group.running ? ["running"] : [])];
   return {
     text: [`Worked for ${duration}`, ...rest].join(" · "),
+    head: head.join(" · "),
     spoken: [group.running ? "Work in progress" : `Worked for ${duration}`, ...rest].join(" · "),
     short: [`Worked ${duration}`, count(group.toolCount, "call"), ...(group.running ? ["running"] : [])].join(" · "),
     duration, tools: group.toolCount, failed: group.failed || 0, exited: group.exited || 0, denied: group.denied || 0, invalid: group.invalid || 0,
@@ -2685,16 +2688,18 @@ export function waitingReason(waiting, now) {
 export const ACTIVITY_UNKNOWN = "activity not loaded";
 
 /**
- * The identity line of a row. `activityMs` is the time of the latest RECORD seen (null when none has been loaded: then the
- * line says so, a creation time is never shown as an age). Returns {text, parts, age, waiting}: `parts` is
- * [profile, role, tail] where tail is the age, or ACTIVITY_UNKNOWN; `text` is "profile · role · tail", or just
- * "profile · role" while something waits (the waiting reason `waiting` is then its own line, so the model stays readable).
+ * The identity line of a row. `activityMs` is the time of the latest RECORD seen (null when none has been loaded: a
+ * creation time is never shown as an age). Returns {text, parts, age, waiting, known}: `parts` is [profile, role, tail]
+ * where tail is the age, or null when unknown; `age` is the age or ACTIVITY_UNKNOWN (for a tooltip); `text` is
+ * "profile · role · age", or just "profile · role" while something waits (the waiting reason `waiting` is then its own
+ * line, so the model stays readable) or while the age is unknown (repeating "not loaded" on every row is noise).
  */
 export function identityLine(info, activityMs, waiting, now) {
   const reason = waitingReason(waiting, now);
-  const when = Number.isFinite(activityMs) ? age(now, activityMs) : ACTIVITY_UNKNOWN;
+  const known = Number.isFinite(activityMs);
+  const when = known ? age(now, activityMs) : ACTIVITY_UNKNOWN;
   const head = [info.profile || "?", info.role || "session"];
-  return { text: (reason ? head : [...head, when]).join(" · "), parts: [...head, when], age: when, waiting: reason };
+  return { text: (reason || !known ? head : [...head, when]).join(" · "), parts: [...head, known ? when : null], age: when, waiting: reason, known };
 }
 
 /**
@@ -3369,7 +3374,7 @@ const SCORE_CELLS = [
   ["finish_refusals", "finish refusal", "finish refusals"], ["verifier_accepts", "verifier accept", "verifier accepts"],
   ["verifier_rejections", "verifier reject", "verifier rejects"], ["hand_offs", "hand-off", "hand-offs"], ["asks", "ask", "asks"],
 ];
-export const SCORE_TOTAL_LABEL = "Mission total: the result is the lead's, the effort everyone's";
+export const SCORE_TOTAL_LABEL = "Mission total, every session";
 export const SCORE_FINEPRINT = "Run numbers describe effort, not completion.";
 
 function scoreCard(card) {
@@ -3469,7 +3474,14 @@ export function agentGroups(store, inbox, missionId, opts = {}) {
       spawnSeq: opts.spawns && opts.spawns.has(info.id) ? opts.spawns.get(info.id) : null,
     });
   }
-  return { groups: [...groups.values()].filter((g) => g.rows.length), total: members.length, running, badge: running ? `${running} running` : "" };
+  // `agents` and `agentsRunning` leave the lead out, as the sidebar's "12 agents · 4 running" does; `total` and `running`
+  // count every session of the mission.
+  const agents = members.filter((s) => s.parent).length;
+  const agentsRunning = members.filter((s) => s.parent && s.status && s.status.phase === "running").length;
+  const leadRunning = running - agentsRunning > 0;
+  const summary = agents === 0 ? "No agents yet" + (leadRunning ? " · the lead is running" : "")
+    : count(agents, "agent") + (agentsRunning ? ` · ${agentsRunning} running` : "") + (leadRunning ? " · the lead is running" : "");
+  return { groups: [...groups.values()].filter((g) => g.rows.length), total: members.length, running, agents, agentsRunning, summary, badge: running ? `${running} running` : "" };
 }
 
 // ---- find in the record

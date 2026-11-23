@@ -364,8 +364,11 @@ function persistActivity(session) {
 function identityEl(identity) {
   const line = el("span", "ident");
   const [profile, role, tail] = identity.parts;
-  const rest = identity.waiting ? role : `${role} · ${tail}`;
-  add(line, add(el("span", "ident-line"), el("span", "ident-profile", profile), el("span", "ident-text", " · " + rest)));
+  const rest = identity.waiting || !tail ? role : `${role} · ${tail}`;
+  const head = add(el("span", "ident-line"), el("span", "ident-profile", profile), el("span", "ident-text", " · " + rest));
+  // An unknown age is left out of the line; the tooltip says why there is none.
+  if (!identity.known && !identity.waiting) head.title = "Last activity: not loaded yet (open the mission to load its records)";
+  add(line, head);
   if (identity.waiting) {
     const w = identity.waiting;
     const note = add(el("span", "ident-wait tone-" + (w.tone || "quiet")), icon(w.icon), el("span", "ident-text", w.text));
@@ -1490,8 +1493,10 @@ function renderHeader() {
   const openClaims = (S.ledger.state?.claims || []).filter(claim => claim.status === "open").length;
   $("evidence-count").textContent = `${openClaims} open`;
   $("evidence-count").hidden = openClaims === 0;
-  const running = [...S.sessions.byId.values()].filter(s => s.mission === info.mission && s.status?.phase === "running").length;
+  // Agents only, as the sidebar counts them: the lead's own state is the run chip in the header.
+  const running = [...S.sessions.byId.values()].filter(s => s.mission === info.mission && s.parent && s.status?.phase === "running").length;
   $("agents-count").textContent = `${running} running`;
+  $("agents-count").title = `${C.count(running, "agent")} running (the lead is not counted)`;
   $("agents-count").hidden = running === 0;
   renderProgress(info);
   renderStats();
@@ -1515,7 +1520,10 @@ function renderHeader() {
   $("agent-go-lead").dataset.lead = leadSession ? leadSession.id : "";
   const closed = $("closed-note");
   closed.hidden = !!info.parent || a.send;
-  closed.textContent = info.archived ? "This session is archived; unarchive it to send messages." : "This session has ended.";
+  closed.textContent = info.archived ? "This session is archived; unarchive it to send messages." : "This session has ended. Its record, ledger and files stay as they are.";
+  // An ended session's model no longer changes: the seat would only offer a choice that cannot be made.
+  const seatLabel = $("model-seat").closest(".seat");
+  if (seatLabel) seatLabel.hidden = !a.send && !info.archived && info.status?.phase === "ended";
   // A message is not an answer: say so while a question of this mission waits on the operator.
   const paused = missionEntries().some(entry => entry.item.blocking);
   const lead = C.rootNoun(info) === "lead";
@@ -1967,7 +1975,7 @@ function agentRow(row, active) {
   const text = el("span", "agent-text");
   text.append(el("span", "agent-title", row.title));
   const meta = [row.roleLine, `step ${C.num(row.step)}`];
-  meta.push(row.ageText ? `last record ${row.ageText}` : "last record not loaded");
+  if (row.ageText) meta.push(`last record ${row.ageText}`);
   if (row.generated) meta.push(row.generated);
   text.append(el("span", "dim agent-meta", meta.join(" · ")));
   if (row.crumbs.length) text.append(el("span", "dim agent-meta", "Under " + row.crumbs.join(" › ")));
@@ -2000,14 +2008,24 @@ function renderAgents() {
   const refresh = btn(score && score.loading ? "Refreshing…" : "Refresh scores", "small", () => loadScore(true));
   refresh.dataset.focusKey = "agents-refresh";
   if (score && score.loading) refresh.setAttribute("aria-disabled", "true");
-  frag.append(heading("h2", "Agents", el("span", "dim", `${C.num(model.total)} in this mission${model.running ? " · " + model.badge : ""}`), refresh));
+  frag.append(heading("h2", "Agents", el("span", "dim", model.summary), refresh));
   const note = score && score.error ? el("p", "error", "Scores could not be read: " + score.error)
     : score && score.lastMs && !score.view ? el("p", "dim", "Reading the scores…")
-    : score && score.view ? el("p", "dim", `Scores read ${ago(score.lastMs)}. They refresh when this tab opens, on Refresh, and at most every 2 minutes while an agent runs.`) : null;
+    : null;
   if (note) frag.append(note);
   if (score && score.view) {
     const total = score.view.total;
-    frag.append(add(el("section", "agents-total"), el("h3", "", score.view.label), el("p", "", `${C.num(total.steps)} steps · ${total.text}${total.unrecorded ? " · verifier counts not recorded for some logs" : ""}`), el("p", "dim fineprint", score.view.fineprint)));
+    // A grid of numbers: the steps, then every count that is not zero. The sentence form is the section's label.
+    const grid = el("dl", "score-grid");
+    const cell = (value, label, tone = "") => add(grid, add(el("div", "score-cell" + (tone ? " tone-" + tone : "")), el("dt", "", label), el("dd", "", C.num(value))));
+    cell(total.steps, "steps");
+    for (const c of total.cells) if (c.value > 0) cell(c.value, c.label, /malformed|refusal|reject/.test(c.key) ? "warn" : "");
+    const section = add(el("section", "agents-total"), add(el("h3", "", score.view.label), el("span", "dim score-age", ` · read ${ago(score.lastMs)}`)), grid);
+    section.setAttribute("aria-label", `${score.view.label}: ${C.num(total.steps)} steps · ${total.text}`);
+    section.title = "Scores refresh when this tab opens, on Refresh, and at most every 2 minutes while an agent runs.";
+    if (total.unrecorded) section.append(el("p", "dim fineprint", "Verifier counts were not recorded for some logs."));
+    section.append(el("p", "dim fineprint", score.view.fineprint));
+    frag.append(section);
   }
   if (!model.groups.length) frag.append(el("p", "dim", "No agents in this mission yet."));
   const first = model.groups[0] && model.groups[0].rows[0];
@@ -2241,6 +2259,14 @@ function remembered(details, b, key) {
 }
 
 /** `ctx` carries the chat item a block is shown as: {differs, model}. */
+/** A link to an agent: its title when the page knows it (the id stays the tooltip), else the id. */
+function childLink(id) {
+  const info = S.sessions.byId.get(id);
+  const a = link(info && info.title ? info.title : id, "#/s/" + encodeURIComponent(id));
+  a.title = id;
+  return a;
+}
+
 function buildBlock(b, ctx = {}) {
   const root = el("div", "block " + b.kind + (b.detail ? " detail" : ""));
   b.ui = b.ui || {};
@@ -2270,6 +2296,9 @@ function buildBlock(b, ctx = {}) {
     }
     case "response": {
       const thought = C.thoughtLabel(b);
+      // A step that only called tools has nothing to read but its speed line; inside work it is request detail, shown
+      // with "Show request details" (the tool rows keep their own durations).
+      if (ctx.inGroup && !b.text && !b.reasoning && !(b.cutCalls || []).length && !b.warning) root.classList.add("detail", "step-stats");
       if (b.reasoning) {
         const d = el("details", "reasoning thought");
         const sum = el("summary", "", thought || "Thought");
@@ -2307,7 +2336,10 @@ function buildBlock(b, ctx = {}) {
     case "child_spawned": {
       root.classList.add("card");
       const h = el("div", "ch");
-      add(h, icon("tool-agent"), el("strong", "", `agent started: ${b.role}`), el("span", "dim", b.mode), link(b.child, "#/s/" + encodeURIComponent(b.child)));
+      const modeEl = el("span", "dim", b.mode === "fork" ? "forked" : b.mode);
+      if (b.mode === "fresh") modeEl.title = "Starts from its brief alone, without the lead's conversation.";
+      else if (b.mode === "fork") modeEl.title = "Starts from a copy of the lead's conversation.";
+      add(h, icon("tool-agent"), el("strong", "", `agent started: ${b.role}`), modeEl, childLink(b.child));
       add(root, h, textBox(b.brief.question || "", "txt"));
       break;
     }
@@ -2319,9 +2351,10 @@ function buildBlock(b, ctx = {}) {
       }
       root.classList.add("card");
       const h = el("div", "ch");
-      add(h, icon("tool-agent"), el("strong", "", `agent ${C.outcomeWords(b.outcome)}`), link(b.child, "#/s/" + encodeURIComponent(b.child)), el("span", "dim", `${b.steps} steps`));
+      add(h, icon("tool-agent"), el("strong", "", `agent ${C.outcomeWords(b.outcome)}`), childLink(b.child), el("span", "dim", `${b.steps} steps`));
       add(root, h);
-      add(root, collapsible(b, "report", b.report, 24));
+      // A report is the agent's written reply: shown as formatted text, like a reply, clipped until asked for.
+      add(root, collapsible(b, "report", b.report, 24, { prose: true }));
       if (b.full) add(root, keyed(btn("open full report", "link", (e) => openViewer(b.full.id, "Full report", null, {}, e.currentTarget)), "report:" + b.id));
       break;
     }
@@ -2374,11 +2407,11 @@ function keyed(node, key) {
   return node;
 }
 
-function collapsible(b, key, text, max) {
+function collapsible(b, key, text, max, opts = {}) {
   const wrap = el("div");
   const all = !!b.ui[key];
   const c = C.clip(text, max);
-  add(wrap, textBox(all ? text : c.text, "txt out"));
+  add(wrap, opts.prose ? add(el("div", "report-prose"), prose(all ? text : c.text)) : textBox(all ? text : c.text, "txt out"));
   if (c.clipped) {
     add(wrap, keyed(btn(all ? "show less" : `show all ${C.num(c.total)} lines`, "link", () => {
       b.ui[key] = !all;
@@ -2502,7 +2535,9 @@ function groupHeadText(it) {
   if (!it.toolCount) {
     return `Activity · ${C.count(it.records, "record")}` + (it.warnings ? ` · ${C.count(it.warnings, "warning")}` : "") + (it.running ? " · running" : "");
   }
-  return C.groupLabel(it, Date.now()).text;
+  const words = C.groupLabel(it, Date.now());
+  // The outcome counts and warnings are drawn as labelled marks after the words, so the words leave them out.
+  return words.head;
 }
 
 /** The header's words in both lengths: the sentence, and on a phone the short form ("Worked 2m43s · 8 calls"). Both are hidden from assistive technology; the button's own name is the long sentence. */
@@ -2536,9 +2571,10 @@ function pinOpenGroups() {
 }
 
 // The group's counts, in the order the header words say them: [field, outcome kind, words].
+// The fourth entry is the mark's visible word (left out on a phone, where the mark is its shape and number).
 const GROUP_MARKS = [
-  ["exited", "exit", "exited non-zero"], ["failed", "failed", "failed"], ["denied", "denied", "denied by policy"],
-  ["invalid", "invalid", "invalid"], ["timedOut", "timeout", "timed out"], ["interrupted", "interrupted", "interrupted"],
+  ["exited", "exit", "exited non-zero", "exited"], ["failed", "failed", "failed", "failed"], ["denied", "denied", "denied by policy", "denied"],
+  ["invalid", "invalid", "invalid", "invalid"], ["timedOut", "timeout", "timed out", "timed out"], ["interrupted", "interrupted", "interrupted", "interrupted"],
 ];
 
 /** The frame of a work group: its header button and, while it is open, its body. Members are kept between updates. */
@@ -2573,20 +2609,23 @@ function updateGroup(entry, it, dirty) {
     head.setAttribute("aria-label", groupSpoken(it));
     head.replaceChildren(icon("chevron"), label);
     // Each way a call can end has its own small shape and number, so a refusal is not read as a failure.
-    GROUP_MARKS.forEach(([, kind, noun], i) => {
+    const marks = el("span", "group-marks");
+    marks.setAttribute("aria-hidden", "true");
+    GROUP_MARKS.forEach(([, kind, noun, word], i) => {
       if (!counts[i]) return;
       const look = C.TOOL_OUTCOME_LOOK[kind];
       const mark = el("span", "group-mark tone-" + look.tone);
       mark.title = `${counts[i]} ${noun}`;
-      add(mark, icon(look.icon), el("span", "group-mark-n", String(counts[i])));
-      head.append(mark);
+      add(mark, icon(look.icon), el("span", "group-mark-n", String(counts[i])), el("span", "group-mark-w", word));
+      marks.append(mark);
     });
     if (it.warnings) {
-      const warn = el("span", "group-warn");
+      const warn = el("span", "group-mark group-warn");
       warn.title = C.count(it.warnings, "warning");
-      add(warn, icon("alert"));
-      head.append(warn);
+      add(warn, icon("alert"), el("span", "group-mark-n", String(it.warnings)), el("span", "group-mark-w", it.warnings === 1 ? "warning" : "warnings"));
+      marks.append(warn);
     }
+    if (marks.childElementCount) head.append(marks);
   }
   if (!it.open) {
     if (entry.body) { entry.body.remove(); entry.body = null; entry.members.clear(); entry.earlierRow = null; }
@@ -2610,7 +2649,7 @@ function updateGroup(entry, it, dirty) {
   for (const b of it.shown) {
     let member = entry.members.get(b.id);
     if (!member || dirty.has(b.id)) {
-      const built = buildBlock(b);
+      const built = buildBlock(b, { inGroup: true });
       if (member && member.parentNode === entry.body) member.replaceWith(built);
       member = built;
       entry.members.set(b.id, member);
@@ -5743,6 +5782,11 @@ function wire() {
   });
   $("model-confirm-yes").addEventListener("click", applySeat);
   $("model-confirm-no").addEventListener("click", cancelSeat);
+  if (!MAC) $("f-message-note").textContent = "Ctrl+Enter starts the mission.";
+  // ⌘Enter (Ctrl+Enter elsewhere) starts the mission from the message box; Enter alone adds a line.
+  $("f-message").addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && !e.isComposing) { e.preventDefault(); $("new-form").requestSubmit(); }
+  });
   $("composer").addEventListener("keydown", (e) => { if (e.key === "Escape" && S.seat && !S.seatBusy.has(S.seat.session)) { e.preventDefault(); cancelSeat(); } });
   const msg = $("msg");
   msg.addEventListener("input", () => { if (S.openId) C.setDraft(S.drafts, "message:" + S.openId, msg.value); renderHeader(); });

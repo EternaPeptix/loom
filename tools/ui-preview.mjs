@@ -41,6 +41,25 @@ const profiles = [
   { profile: "necromicon", base_url: "http://10.0.0.9:8000/v1", model: "necromicon", reachable: false, detail: "connection refused: http://10.0.0.9:8000/v1 did not answer; start the server or run `loom models reload` after fixing the profile's base_url.", context_window: 128000, max_concurrent: 1 },
 ];
 const modelRef = p => ({ profile: p.profile, model: p.model, context_window: p.context_window });
+
+// The Models tab's view of a mission (crates/loom-agent MissionModels): the lead's model, the choice per role, live profiles.
+const roleChoices = new Map(); // mission -> {any: string|null, roles: Map<role, string|null>}
+function missionModels(id) {
+  const info = sessions.find(s => s.id === id);
+  if (!info) return null;
+  const lead = info.parent ? sessions.find(s => s.mission === info.mission && !s.parent) || info : info;
+  const ch = roleChoices.get(lead.mission) || { any: null, roles: new Map() };
+  const kids = sessions.filter(s => s.mission === lead.mission && s.parent && s.status.phase !== "ended");
+  const packRoles = lead.pack === "ctf"
+    ? [["dispatcher", "dsv41", [], null], ["web_solver", null, ["qwen", "dsv41"], "dsv41"], ["crypto_solver", "dsv41", [], null], ["binary_solver", "dsv41", [], null], ["worker", null, [], null], ["verifier", "qwen", [], null]]
+    : [["worker", null, [], null], ["verifier", null, [], null]];
+  const roles = packRoles.map(([role, pack_model, alloy_models, escalation_model]) => ({
+    role, verifier: role === "verifier", chosen: ch.roles.get(role) ?? null, pack_model, alloy_models, escalation_model,
+    agents: kids.filter(k => (k.role || "worker") === role).map(k => ({ session: k.id, profile: k.profile, forked: false })),
+  }));
+  return { mission: lead.mission, lead: lead.id, lead_model: { profile: lead.profile, model: lead.model, context_window: lead.context_window },
+    any_role: ch.any, roles, profiles: profiles.map(p => p.profile), default_model: "dsv41" };
+}
 const profileOf = name => profiles.find(p => p.profile === name);
 function session(id, title, { parent = null, phase = "running", last_end = null, outcome = null, workspace = "/fixture/loom", profile = "dsv41", prompt = 86000, cached = 84000, mission = null, role = null, pack = "core", age = 3600000, step = 48, completion = 18000 } = {}) {
   const p = profileOf(profile);
@@ -83,7 +102,7 @@ sessions.push(
   session("s-tools", "Tool result shapes", { phase: "idle", last_end: "waiting", profile: "dsv41", workspace: "/fixture/loom", step: 9, completion: 6000, age: 90 * MIN }),
   session("s-big", "Long investigation (5,000 records)", { phase: "idle", last_end: "waiting", profile: "dsv41", workspace: "/fixture/loom", step: 1250, completion: 900000, prompt: 300000, cached: 280000, age: 6 * 3600000 }),
 );
-for (const id of ["s-parked", "s-quiet", "s-notify", "s-tools", "s-big"]) custom.add(id);
+for (const id of ["s-parked", "s-quiet", "s-notify", "s-tools", "s-big", "s-result"]) custom.add(id);
 let inbox = [
   { session: "s-audit", mission: "m-audit", title: "Audit harness reliability", opened_ms: now - 240000, item: { item_id: "i-scope", item_kind: "question", text: "Include the desktop app in this audit?", options: ["Include desktop", "Runtime only"], blocking: true, call_id: "question", reference: "q1" } },
   { session: "s-result", mission: "m-s-result", title: "Dependency review", opened_ms: now - 600000, item: { item_id: "i-result", item_kind: "finished", text: "The review is ready to read.", options: [], blocking: false, call_id: "finish" } },
@@ -177,6 +196,17 @@ append("s-fl-net", "inbox_opened", { ts_ms: now - 9 * MIN, ...inbox.find(e => e.
   append("s-parked", "harness_note", { ts_ms: now - 55 * MIN, note: "nudge", text: "Nothing is recorded since the last error. Continue the goal or ask the operator." }, "harness");
   append("s-parked", "turn_end", { ts_ms: now - 50 * MIN, reason: "parked" }, "harness");
   append("s-parked", "inbox_opened", { ts_ms: now - 50 * MIN + 1, ...inbox.find(e => e.item.item_id === "i-parked").item }, "harness");
+}
+// s-result: a finished review. Its report is the last reply; the "finished" inbox item points at it.
+{
+  const t0 = now - 25 * MIN;
+  startOf(sessionOf("s-result"), t0, "Review the dependency tree and list anything unmaintained or vulnerable.");
+  const t = step("s-result", t0 + 2 * MIN, { text: "Reading the lockfile.", command: "cargo tree --depth 1", out: "loom v0.1.0\n├── axum v0.8.4\n├── serde v1.0.228\n└── tokio v1.48.0", exit: 0, ms: 2100 });
+  append("s-result", "model_request", { ts_ms: t, req_id: "fx-result-final", step: 48, epoch: 1, purpose: "step", est_tokens: 40000 }, "harness");
+  append("s-result", "model_response", { ts_ms: now - 11 * MIN, req_id: "fx-result-final", text: "## Dependency review\n\nNo direct dependency is unmaintained. Two need attention:\n\n1. **rand 0.10.3** has a patch release (0.10.4) with a fix for `fill_bytes` on short buffers.\n2. **shlex 1.3.0** is a major version behind; 2.0 changes quoting of empty strings.\n\nNo advisory matches the lockfile.", reasoning: "", tool_calls: [], finish: "stop", usage: { prompt_tokens: 40000, cached_tokens: 0, completion_tokens: 160 }, timing: { total_ms: 5200 }, attempts: 1 }, "model");
+  append("s-result", "inbox_opened", { ts_ms: now - 10 * MIN, ...inbox.find(e => e.item.item_id === "i-result").item }, "harness");
+  append("s-result", "turn_end", { ts_ms: now - 10 * MIN + 1, reason: "finished" }, "harness");
+  append("s-result", "session_end", { ts_ms: now - 10 * MIN + 2, outcome: "done", detail: "Finished." }, "harness");
 }
 // s-quiet: running, and its last record is 41 minutes old.
 {
@@ -630,6 +660,13 @@ const server = createServer(async (req, res) => {
       }
       const id = parts[3]; const info = sessions.find(s => s.id === id);
       if (!info) return json(res, { error: "No such fixture session." }, 404);
+      if (parts[4] === "role-model") {
+        const view = missionModels(id);
+        const ch = roleChoices.get(view.mission) || { any: null, roles: new Map() };
+        if (data.role === "*") ch.any = data.profile || null; else ch.roles.set(data.role, data.profile || null);
+        roleChoices.set(view.mission, ch);
+        return json(res, { switched: [], models: missionModels(id) });
+      }
       if (parts[4] === "model") {
         // The daemon refuses to re-seat a finished session (Runtime::switch); so does the fixture.
         if (info.status.phase === "ended") return json(res, { error: `Session ${id} has ended, so its model no longer changes.` }, 409);
@@ -656,6 +693,8 @@ const server = createServer(async (req, res) => {
       else if (parts[4] === "archive") info.archived = data.archived;
       emit({ type: "status", session: id, status: info.status }); return json(res, {}, 202);
     }
+    const modelsMatch = path.match(/^\/api\/sessions\/([^/]+)\/models$/);
+    if (modelsMatch && req.method === "GET") { const v = missionModels(decodeURIComponent(modelsMatch[1])); return v ? json(res, v) : json(res, { error: "No such fixture session." }, 404); }
     if (path === "/api/fs/dirs") { const r = fsListing(url.searchParams.get("path")); return r.error ? json(res, { error: r.error }, r.status) : json(res, r.value); }
     const filesMatch = path.match(/^\/api\/sessions\/([^/]+)\/files(\/lines)?$/);
     if (filesMatch && req.method === "GET") {
