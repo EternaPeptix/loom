@@ -149,7 +149,7 @@ export function argsLine(name, args, max = 240) {
   if (typeof args === "object" && !Array.isArray(args)) {
     if (name === "bash" && typeof args.command === "string") return oneLine(args.command, max);
     if (FILE_TOOLS.has(name)) {
-      for (const k of ["path", "file_path", "file"]) {
+      for (const k of ["path", "file_path", "absolute_path", "target_file", "file"]) {
         if (typeof args[k] === "string") return oneLine(args[k], max);
       }
     }
@@ -1636,7 +1636,37 @@ export function replyCopyText(block) {
 }
 /** "Copy message": an operator or agent message as it was written. */
 export function messageCopyText(block) {
-  return block && block.kind === "user" ? copyText(block.text) : null;
+  return block && block.kind === "user" && typeof block.text === "string" ? copyText(splitAttachments(block.text).text) : null;
+}
+
+const ATTACH_HEAD = "Attached files (saved read-only; read them with `read`):";
+const ATTACH_ITEM = /^- (.+) \(([^()]*?), ([^(),]*)\)$/;
+/**
+ * The attachment block the runtime appends to an operator message (docs/UPLOADS.md), taken apart:
+ * {text, files:[{path, name, size, mime}], inline}. `text` is what the operator wrote (above the block); `size` is the words
+ * the block gives ("12.4 KB"); `inline` is the text after the list (the inline copies), "" when there is none. A text with
+ * no such block comes back whole, with no files.
+ */
+export function splitAttachments(text) {
+  const whole = { text: String(text ?? ""), files: [], inline: "" };
+  const src = whole.text;
+  let from = 0;
+  for (;;) {
+    const at = src.indexOf(ATTACH_HEAD + "\n", from);
+    if (at < 0) return whole;
+    from = at + 1;
+    if (at !== 0 && src[at - 1] !== "\n") continue;
+    const lines = src.slice(at + ATTACH_HEAD.length + 1).split("\n");
+    const files = [];
+    let i = 0;
+    for (; i < lines.length; i++) {
+      const m = ATTACH_ITEM.exec(lines[i]);
+      if (!m) break;
+      files.push({ path: m[1], name: m[1].split("/").filter(Boolean).pop() || m[1], size: m[2], mime: m[3] });
+    }
+    if (!files.length) continue;
+    return { text: src.slice(0, at).replace(/\s+$/, ""), files, inline: lines.slice(i).join("\n").trim() };
+  }
 }
 /** "Copy reasoning": the reasoning of a reply, as recorded. */
 export function reasoningCopyText(block) {
@@ -2633,7 +2663,7 @@ const TOOL_OUTCOME_WORDS = {
   interrupted: () => "Cut off; its effects are unknown.",
 };
 
-/** One tool row in a group: {icon, name, argsLine, capsule, duration, state, outcome, words, partial}. `capsule` is {text, tone, icon}
+/** One tool row in a group: {icon, name, label, argsLine, capsule, duration, state, outcome, words, partial}. `capsule` is {text, tone, icon}
  *  or null (see TOOL_OUTCOME_LOOK); `outcome` is toolOutcome().kind ("running" / "missing" while there is no result), `words` the
  *  sentence for its tooltip, `partial` {words, shown, total, cut} when the model saw only part of the output, else null. */
 export function toolRow(block) {
@@ -2655,7 +2685,9 @@ export function toolRow(block) {
     }
   }
   const duration = r && r.duration_ms ? seconds(r.duration_ms) : "";
-  return { icon: toolIcon(block), name: block.name, argsLine: block.argsLine || "", capsule, duration, state: block.state, outcome, words, partial: partialView(r) };
+  const d = block.args && typeof block.args === "object" && !Array.isArray(block.args) ? block.args.description : null;
+  const label = typeof d === "string" && d.trim() ? oneLine(d, 160) : "";
+  return { icon: toolIcon(block), name: block.name, label, argsLine: block.argsLine || "", capsule, duration, state: block.state, outcome, words, partial: partialView(r) };
 }
 
 /** Footer of a reply, quiet: [profile ·] tok/s · seconds · cache N%. Pass `profile` only when the reply's model differs
@@ -4033,10 +4065,10 @@ export function fileChanges(blocks, workspace = "") {
   return [...rows.values()].sort((a, b) => b.lastSeq - a.lastSeq);
 }
 
-/** The path a tool call names, from its arguments (`path`, `file_path` or `file`), or null. */
+/** The path a tool call names, from its arguments (`path`, `file_path`, `absolute_path`, `target_file` or `file`), or null. */
 export function toolPathArg(args) {
   if (!args || typeof args !== "object" || Array.isArray(args)) return null;
-  for (const k of ["path", "file_path", "file"]) if (typeof args[k] === "string" && args[k].trim()) return args[k];
+  for (const k of ["path", "file_path", "absolute_path", "target_file", "file"]) if (typeof args[k] === "string" && args[k].trim()) return args[k];
   return null;
 }
 

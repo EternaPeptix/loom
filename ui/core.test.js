@@ -3582,3 +3582,46 @@ test("mineStep walks the operator's own messages; [ and ] are the keys, never wh
   assert.equal(C.shortcutFor({ key: "[" }), "mine-prev");
   assert.equal(C.shortcutFor({ key: "]" }, { typing: true }), null);
 });
+
+test("splitAttachments takes the runtime's attachment block apart", () => {
+  const head = "Attached files (saved read-only; read them with `read`):";
+  const text = `Compare these.\n\n${head}\n- /ws/.loom/uploads/report.csv (12.4 KB, text/csv)\n- /ws/.loom/uploads/my (1).png (231 KB, image/png)\n\n\`/ws/.loom/uploads/report.csv\`:\n\`\`\`csv\na,b\n\`\`\``;
+  const r = C.splitAttachments(text);
+  assert.equal(r.text, "Compare these.");
+  assert.deepEqual(r.files, [
+    { path: "/ws/.loom/uploads/report.csv", name: "report.csv", size: "12.4 KB", mime: "text/csv" },
+    { path: "/ws/.loom/uploads/my (1).png", name: "my (1).png", size: "231 KB", mime: "image/png" },
+  ]);
+  assert.equal(r.inline, "`/ws/.loom/uploads/report.csv`:\n```csv\na,b\n```");
+  // Attachments without text, and a list with no inline copies.
+  const bare = C.splitAttachments(`${head}\n- /ws/.loom/uploads/a.bin (3 B, application/octet-stream)`);
+  assert.equal(bare.text, "");
+  assert.equal(bare.files.length, 1);
+  assert.equal(bare.inline, "");
+  // No block, a heading that is not at a line start, or a heading with no list: the text comes back whole.
+  for (const plain of ["hello", `see ${head}\n- /a (1 B, x/y)`, `${head}\nnothing listed`, "", null]) {
+    const r2 = C.splitAttachments(plain);
+    assert.equal(r2.text, String(plain ?? ""));
+    assert.deepEqual(r2.files, []);
+  }
+  // A quoted heading earlier in the text does not hide the real block.
+  assert.equal(C.splitAttachments(`${head}\nnot a list\n\n${head}\n- /a/b.txt (1 B, text/plain)`).files[0].name, "b.txt");
+});
+
+test("Copy message copies only the text above the attachment block", () => {
+  const text = "Look at this.\n\nAttached files (saved read-only; read them with `read`):\n- /ws/.loom/uploads/a.txt (1 B, text/plain)";
+  assert.equal(C.messageCopyText({ kind: "user", text }), "Look at this.");
+  assert.equal(C.messageCopyText({ kind: "user", text: text.replace("Look at this.\n\n", "") }), null);
+});
+
+test("tool shapes: absolute_path and target_file are paths; description is the row label", () => {
+  assert.equal(C.toolPathArg({ absolute_path: "/ws/a.rs" }), "/ws/a.rs");
+  assert.equal(C.toolPathArg({ target_file: "src/b.rs" }), "src/b.rs");
+  assert.equal(C.argsLine("read", { target_file: "src/b.rs" }), "src/b.rs");
+  assert.equal(C.openFileTarget({ name: "read", args: { absolute_path: "/ws/a.rs" } }, "/ws"), "a.rs");
+  const row = C.toolRow({ kind: "tool", name: "bash", state: "done", argsLine: "cargo test", args: { command: "cargo test", description: "Run the tests" }, result: null });
+  assert.equal(row.label, "Run the tests");
+  assert.equal(row.argsLine, "cargo test");
+  assert.equal(C.toolRow({ kind: "tool", name: "bash", state: "done", argsLine: "ls", args: { command: "ls" }, result: null }).label, "");
+  assert.equal(C.toolRow({ kind: "tool", name: "bash", state: "done", argsLine: "ls", args: { command: "ls", description: 7 }, result: null }).label, "");
+});

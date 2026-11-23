@@ -15,6 +15,9 @@
 // GET /api/sessions/{id}/files?path= and .../files/lines?path=&start=&count= over the workspaces /fixture/loom (nested
 // folders, big.log with 20,000 lines, target.bin binary, huge.sql over the 32 MiB cap, outside a link, locked unreadable,
 // pipe not a file, generated with 2,050 entries, .loom closed) and /fixture/indexer.
+// Uploads add: POST /api/uploads?workspace=&name= (201 {path, name, bytes, mime} under <workspace>/.loom/uploads/, 413 over 32 MiB),
+// `attachments` in message and session bodies (the attachment block is appended as the daemon does), and the Files routes serve
+// .loom/uploads and nothing else under .loom. s-tools carries a user message with a CSV and a PNG attached.
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
@@ -228,6 +231,17 @@ append("s-fl-net", "inbox_opened", { ts_ms: now - 9 * MIN, ...inbox.find(e => e.
   startOf(sessionOf("s-tools"), t0, "Try the build, write the config, and read the log.");
   t = step("s-tools", t, { text: "Running the tests.", command: "make test", status: "error", out: "make: *** [test] Error 2", exit: 2 });
   t = step("s-tools", t, { command: "make lint", out: "lint: clean", exit: 0 });
+  t = step("s-tools", t, { command: "cargo test -p loom-agent recovery -- --nocapture 2>&1 | tail -n 40", args: { command: "cargo test -p loom-agent recovery -- --nocapture 2>&1 | tail -n 40", description: "Run the recovery tests" }, out: "test result: ok. 12 passed", exit: 0 });
+  t = step("s-tools", t, { name: "read", cls: "read", args: { absolute_path: "/fixture/loom/README.md" }, out: "# loom", ms: 4 });
+  t = step("s-tools", t, { name: "read", cls: "read", args: { target_file: "notes/empty.txt" }, out: "", ms: 4 });
+  // An operator message with two uploads and one inline copy, as the daemon records it.
+  {
+    // Written out here: the seed runs before the workspace trees exist, so attachmentBlock cannot read them yet.
+    const csv = "corpus,ms,notes\nsmall,412,warm\nlarge,9120,cold cache\nlarge,8740,warm";
+    const a = { block: "\n\nAttached files (saved read-only; read them with `read`):\n- /fixture/loom/.loom/uploads/report.csv (69 B, text/csv)\n- /fixture/loom/.loom/uploads/screen.png (231.0 KB, image/png)\n\n`/fixture/loom/.loom/uploads/report.csv`:\n```csv\n" + csv + "\n```" };
+    append("s-tools", "user_message", { ts_ms: t, text: "These are the numbers and the screenshot from the failing run; compare them with the last build." + a.block }, "user");
+    t += 1000;
+  }
   // Paths for the Files tab's "Open file": inside /fixture/loom (absolute and relative), the binary one, and one that is not there.
   t = step("s-tools", t, { name: "read", cls: "read", args: { path: "/fixture/loom/crates/loom-agent/src/runtime.rs", start: 1, end: 5 }, out: "//! runtime.rs: fixture source\n    // line 2 of runtime.rs", ms: 12 });
   // As the daemon records an edit: its facts line, the unified diff it applied, its end line (crates/loom-core admit.rs).
@@ -366,12 +380,13 @@ const dirNode = (children = {}, extra = {}) => ({ kind: "dir", mtime: now - 3600
 const fileNode = (text, mtime = now - 7200000) => ({ kind: "file", mtime, text });
 const rustText = (name) => Array.from({ length: 140 }, (_, i) => i === 0 ? `//! ${name}: fixture source` : i % 9 === 0 ? `fn step_${i}() -> usize { ${i} }` : `    // line ${i + 1} of ${name}`).join("\n") + "\n";
 const bigLog = Array.from({ length: 20000 }, (_, i) => `2026-11-16T10:${String(Math.floor(i / 600) % 60).padStart(2, "0")}:${String(i % 60).padStart(2, "0")}Z INFO tick ${i + 1}${i === 12344 ? " needle: only in the loaded range" : ""}`).join("\n") + "\n";
+const SEED_CSV = "corpus,ms,notes\nsmall,412,warm\nlarge,9120,cold cache\nlarge,8740,warm\n";
 function loomTree() {
   return dirNode({
     "Cargo.toml": fileNode("[workspace]\nmembers = [\"crates/*\"]\n"),
     "README.md": fileNode("# loom\n\nA fixture workspace.\n\nA <b>line</b> with markup stays inert text.\n", now - 60000),
     ".gitignore": fileNode("target/\n"), ".env": fileNode("FIXTURE=1\n"),
-    ".loom": dirNode({ "oracle.key": fileNode("never listed\n") }, { harness: true }),
+    ".loom": dirNode({ "oracle.key": fileNode("never listed\n"), uploads: dirNode({ "report.csv": fileNode(SEED_CSV), "screen.png": { kind: "file", mtime: now - 3600000, binary: 231 * 1000 } }) }, { harness: true }),
     crates: dirNode({
       "loom-agent": dirNode({ src: dirNode({ "runtime.rs": fileNode(rustText("runtime.rs")), "session.rs": fileNode(rustText("session.rs")), "pack.rs": fileNode(rustText("pack.rs")) }) }),
       "loom-core": dirNode({ src: dirNode({ "ledger.rs": fileNode(rustText("ledger.rs")), "event.rs": fileNode(rustText("event.rs")) }) }),
@@ -471,7 +486,7 @@ function wsResolve(id, rel) {
   const pieces = raw.split("/").filter((p) => p && p !== ".");
   if (pieces.includes("..")) return { status: 409, error: `The path ${raw} uses \`..\`. Paths are relative to the workspace and stay inside it.` };
   const text = pieces.join("/");
-  if (pieces[0] && pieces[0].toLowerCase() === ".loom") return { status: 409, error: `${text} is not shown: harness files are not shown.` };
+  if (pieces[0] && pieces[0].toLowerCase() === ".loom" && !(pieces[0] === ".loom" && pieces[1] === "uploads")) return { status: 409, error: `${text} is not shown: harness files are not shown.` };
   let node = root;
   for (const part of pieces) {
     node = node.kind === "dir" ? (node.children || {})[part] : null;
@@ -516,12 +531,61 @@ function filesLines(id, rel, start, count) {
   const text = first > total ? "" : lines.slice(first - 1, last).join("");
   return { value: { path: r.text, text, first, last, total, total_lines: total, bytes: size, mtime_ms, binary: false } };
 }
+
+// File uploads (docs/UPLOADS.md): stored in memory at <workspace>/.loom/uploads/<name>; the attachment block is the daemon's text.
+const UPLOAD_MAX = 32 * 1024 * 1024;
+const MIME = { csv: "text/csv", txt: "text/plain", md: "text/markdown", json: "application/json", png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", pdf: "application/pdf", rs: "text/x-rust", log: "text/plain" };
+const unitSize = (n) => n < 1000 ? `${n} B` : n < 1e6 ? `${(n / 1000).toFixed(1)} KB` : `${(n / 1e6).toFixed(1)} MB`;
+function uploadsDir(ws, make) {
+  let root = wsRoots.get(ws);
+  if (!root) { if (!make) return null; root = dirNode(); wsRoots.set(ws, root); }
+  root.children[".loom"] = root.children[".loom"] || dirNode({}, { harness: true });
+  const loom = root.children[".loom"];
+  if (!loom.children.uploads) { if (!make) return null; loom.children.uploads = dirNode(); }
+  return loom.children.uploads;
+}
+function storeUpload(ws, rawName, buf, given) {
+  let name = String(rawName).split(/[\\/]/).pop().replace(/[\u0000-\u001f\u007f]/g, "_").replace(/^\.+/, "");
+  name = Buffer.from(name).subarray(0, 120).toString();
+  if (!name) return { status: 400, error: "The upload needs a file name: pass ?name=<file name>." };
+  const dir = uploadsDir(ws, true);
+  const dot = name.lastIndexOf(".");
+  const stem = dot > 0 ? name.slice(0, dot) : name, ext = dot > 0 ? name.slice(dot) : "";
+  let stored = name;
+  for (let n = 2; dir.children[stored]; n++) stored = `${stem}-${n}${ext}`;
+  let text = null;
+  try { text = new TextDecoder("utf-8", { fatal: true }).decode(buf); if (text.includes("\u0000")) text = null; } catch { text = null; }
+  dir.children[stored] = text !== null ? fileNode(text, Date.now()) : { kind: "file", mtime: Date.now(), binary: buf.length };
+  const mime = given && given !== "application/octet-stream" ? given : MIME[ext.slice(1).toLowerCase()] || (text !== null ? "text/plain" : "application/octet-stream");
+  return { status: 201, value: { path: `${ws}/.loom/uploads/${stored}`, name: stored, bytes: buf.length, mime } };
+}
+/** The attachment block the daemon appends to the text, or {error}. */
+function attachmentBlock(ws, paths) {
+  if (paths === undefined || (Array.isArray(paths) && paths.length === 0)) return { block: "" };
+  if (!Array.isArray(paths)) return { error: "attachments must be a list of paths." };
+  const dir = uploadsDir(ws, false);
+  const list = [], inline = [];
+  for (const p of paths) {
+    const prefix = `${ws}/.loom/uploads/`;
+    const name = typeof p === "string" && p.startsWith(prefix) ? p.slice(prefix.length) : "";
+    const node = name && !name.includes("/") && dir ? dir.children[name] : null;
+    if (!node || node.kind !== "file") return { error: `Attach files with POST /api/uploads first; ${p} is not an upload of this workspace.` };
+    const bytes = nodeSize(node);
+    const ext = name.includes(".") ? name.split(".").pop().toLowerCase() : "";
+    const mime = MIME[ext] || (node.binary ? "application/octet-stream" : "text/plain");
+    list.push(`- ${p} (${unitSize(bytes)}, ${mime})`);
+    if (!node.binary && bytes <= 16384) inline.push(`\`${p}\`:\n\`\`\`${ext}\n${node.text.replace(/\n$/, "")}\n\`\`\``);
+  }
+  return { block: "\n\nAttached files (saved read-only; read them with `read`):\n" + list.join("\n") + (inline.length ? "\n\n" + inline.join("\n\n") : "") };
+}
 let createdSessions = 0;
 async function createSession(data) {
   const raw = String(data.workspace || "").trim();
   if (!raw) return { status: 400, error: "A workspace is required." };
   if (data.create_workspace !== undefined && typeof data.create_workspace !== "boolean") return { status: 400, error: "create_workspace must be true or false." };
   const path = cleanPath(expandHome(raw));
+  const attached = attachmentBlock(path, data.attachments);
+  if (attached.error) return { status: 400, error: attached.error };
   if (!path.startsWith("/")) return { status: 409, error: `The workspace ${raw} is a relative path that does not exist. Give an absolute path, or one that starts with ~/.` };
   if (inside(path, LOOM_HOME)) return { status: 409, error: `The workspace ${path} is inside the loom home (${LOOM_HOME}) or its copies folder, which sessions cannot use. Choose a folder elsewhere.` };
   // As the daemon does, the earlier missions to recall are checked before any folder is made.
@@ -541,7 +605,7 @@ async function createSession(data) {
   const info = session(id, String(data.title || "").trim() || String(data.message || "New mission").split("\n")[0].slice(0, 60), { phase: "idle", last_end: "waiting", workspace: path, profile: data.model && profileOf(data.model) ? data.model : "dsv41", mission: "m-" + id, age: 0 });
   sessions.push(info);
   append(id, "session_start", { session: id, mission: info.mission, parent: null, workspace: path, pack: info.pack, role: info.role, termination: "explicit", model: modelRef(profileOf(info.profile)), budget: {}, reasoning_replay: "all", tools: [] }, "harness", false);
-  append(id, "user_message", { text: data.message }, "user");
+  append(id, "user_message", { text: String(data.message || "") + attached.block }, "user");
   emit({ type: "session", info });
   return { status: 201, value: { ...info, created } };
 }
@@ -653,6 +717,19 @@ const server = createServer(async (req, res) => {
       if (data.code !== LOGIN_CODE) return json(res, { error: "That login code is not valid. Run `loom login` for a new one." }, 401);
       return json(res, { secret: "fixture-secret" });
     }
+    if (req.method === "POST" && path === "/api/uploads") {
+      const chunks = []; let size = 0;
+      for await (const chunk of req) { size += chunk.length; if (size <= UPLOAD_MAX) chunks.push(chunk); }
+      const ws = url.searchParams.get("workspace"), name = url.searchParams.get("name");
+      requests.push({ path, workspace: ws, name, bytes: size });
+      if (size > UPLOAD_MAX) return json(res, { error: `That file is ${Math.ceil(size / 1048576)} MiB, more than the 32 MiB an upload may be.` }, 413);
+      if (!ws || !ws.startsWith("/") || !name) return json(res, { error: "Give ?workspace=<absolute path>&name=<file name>." }, 400);
+      if (inside(cleanPath(ws), LOOM_HOME)) return json(res, { error: `The workspace ${ws} is inside the loom home (${LOOM_HOME}), which sessions cannot use. Choose a folder elsewhere.` }, 409);
+      if (fsDirs(cleanPath(ws)) === null) return json(res, { error: `There is no folder ${ws}.` }, 404);
+      await wait(400);
+      const r = storeUpload(cleanPath(ws), name, Buffer.concat(chunks), req.headers["content-type"] || "");
+      return r.error ? json(res, { error: r.error }, r.status) : json(res, r.value, r.status);
+    }
     if (req.method === "POST" && path.startsWith("/api/")) {
       const data = await body(req); requests.push({ path, body: data });
       const parts = path.split("/");
@@ -685,7 +762,9 @@ const server = createServer(async (req, res) => {
         return json(res, { session: id, model: modelRef(target), live });
       }
       if (parts[4] === "messages") {
-        await wait(2500); append(id, "user_message", { text: data.text }, "user", true); append(id, "model_request", { req_id: "fixture-delivery", purpose: "step", step: 49 }, "harness", true);
+        const attached = attachmentBlock(info.workspace, data.attachments);
+        if (attached.error) return json(res, { error: attached.error }, 400);
+        await wait(2500); append(id, "user_message", { text: String(data.text || "") + attached.block }, "user", true); append(id, "model_request", { req_id: "fixture-delivery", purpose: "step", step: 49 }, "harness", true);
       } else if (parts[4] === "reweave") {
         if (info.status.phase === "ended") return json(res, { error: `Session ${id} has ended, so there is nothing to re-weave.` }, 409);
         await wait(400);

@@ -155,6 +155,11 @@
             <button id="agent-go-lead" type="button" class="btn small">Go to lead</button>
           </div>
           <p id="closed-note" class="dim pad" hidden></p>
+          <div id="attach-bar" class="attach-bar">
+            <button id="attach-btn" type="button" class="attach-btn" title="Attach files (or drop or paste them here)" aria-label="Attach files"><svg class="icon" viewBox="0 0 12 12" aria-hidden="true"><path d="M9.8 5.4 6 9.2a2.2 2.2 0 0 1-3.1-3.1l4-4a1.5 1.5 0 0 1 2.1 2.1L5.1 8.1a.8.8 0 0 1-1.1-1.1l3.4-3.4"/></svg></button>
+            <input id="attach-file" type="file" multiple hidden>
+            <ul id="attach-chips" class="attach-chips" aria-label="Attached files" hidden></ul>
+          </div>
           <textarea id="msg" rows="1" placeholder="Add direction or context…" aria-label="Message" aria-describedby="composer-recipient composer-help"></textarea>
           <div id="composer-row" class="composer-bar">
             <p id="composer-help" class="composer-help dim"></p>
@@ -202,8 +207,14 @@
           </div>
           <p id="f-workspace-note" class="dim field-note" hidden></p>
         </div>
+        <ul id="f-attach-chips" class="attach-chips" aria-label="Attached files" hidden></ul>
         <label>Message <textarea id="f-message" rows="6" required placeholder="What should the lead do, and what does done look like? For example: find why the recovery test is flaky, fix it, and show it passing 20 times in a row." aria-describedby="f-message-note"></textarea></label>
-        <p id="f-message-note" class="dim field-note">⌘Enter starts the mission.</p>
+        <div class="attach-row">
+          <button id="f-attach" type="button" class="btn" disabled title="Enter a workspace first: attached files are saved in it."><svg class="icon" viewBox="0 0 12 12" aria-hidden="true"><path d="M9.8 5.4 6 9.2a2.2 2.2 0 0 1-3.1-3.1l4-4a1.5 1.5 0 0 1 2.1 2.1L5.1 8.1a.8.8 0 0 1-1.1-1.1l3.4-3.4"/></svg> Attach files</button>
+          <input id="f-file" type="file" multiple hidden>
+          <p id="f-message-note" class="dim field-note">⌘Enter starts the mission.</p>
+        </div>
+        <p id="f-attach-note" class="dim field-note" role="status" hidden></p>
         <div class="form-row">
           <label>Role <select id="f-role"></select></label>
           <label>Model profile <select id="f-model"></select></label>
@@ -379,6 +390,7 @@
   <svg data-icon="link" class="icon" viewBox="0 0 12 12" aria-hidden="true"><path d="M5 7a2 2 0 0 0 2.8 0l1.6-1.6a2 2 0 0 0-2.8-2.8l-.5.5M7 5a2 2 0 0 0-2.8 0L2.6 6.6a2 2 0 0 0 2.8 2.8l.5-.5"/></svg>
   <svg data-icon="refresh" class="icon" viewBox="0 0 12 12" aria-hidden="true"><path d="M10 6a4 4 0 1 1-1.2-2.8M10 1.8V4H7.8"/></svg>
   <svg data-icon="menu" class="icon" viewBox="0 0 14 14" aria-hidden="true"><path d="M2 3.5h10M2 7h10M2 10.5h10"/></svg>
+  <svg data-icon="paperclip" class="icon" viewBox="0 0 12 12" aria-hidden="true"><path d="M9.8 5.4 6 9.2a2.2 2.2 0 0 1-3.1-3.1l4-4a1.5 1.5 0 0 1 2.1 2.1L5.1 8.1a.8.8 0 0 1-1.1-1.1l3.4-3.4"/></svg>
   <svg data-icon="pin" class="icon" viewBox="0 0 12 12" aria-hidden="true"><path d="M4.4 1.5h3.2l-.4 3 1.5 2H3.3l1.5-2ZM6 6.5v4"/></svg>
 </template>
 <script type="module" src="/app.js"></script>
