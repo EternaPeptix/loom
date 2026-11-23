@@ -1448,6 +1448,8 @@ is an ordinary job, and killing it signals the process group in the container th
 (`proc::RemoteStop`). Not done: a box for an agent that has its own workspace copy; wildcard grants; IPv6;
 a remote stop for a box job adopted after a daemon restart (its record does not keep one).
 
+**Tool shapes.** Models are not fine-tuned for loom, so `read`, `write`, `edit`, `bash`, `grep` and `glob` are shown in Claude Code's argument names (`ToolsCfg.dialect`, default `trained`; `loom` shows loom's own), and calls in the shapes other widely trained harnesses use (Codex `apply_patch`, Cline `replace_in_file`, `str_replace_editor`, Gemini and Cursor names, `TodoWrite`, and so on) are converted to loom's tools before checking, with the repair named in the result. The tables and rules are in `TOOL-SHAPES.md`; the code is `loom-tools/src/dialect.rs`, called from `prepare`.
+
 ## 12. Daemon API (`loom-daemon`)
 
 The module documentation of `api.rs`, `auth.rs`, `serve.rs` and `client.rs` is the precise
