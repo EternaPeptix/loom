@@ -180,7 +180,7 @@ impl Tool for LogSearch {
         for rec in &report.records {
             let seq = rec.seq;
             match &rec.event {
-                Event::UserMessage { text } if scope.messages => {
+                Event::UserMessage { text, .. } if scope.messages => {
                     push_text_matches(&mut lines, &re, text, |l| format!("#{seq} user: {l}"));
                 }
                 Event::HarnessNote { note, text } if scope.messages => {
@@ -276,6 +276,7 @@ mod tests {
             class: ToolClass::Exec,
             meta,
             duration_ms: 1,
+            images: Vec::new(),
         })
     }
 
@@ -305,7 +306,7 @@ mod tests {
         let mut put = |author: Author, event: Event| {
             log.append(author, event).unwrap();
         };
-        put(Author::User, Event::UserMessage { text: "please find the needle\nsecond line".into() });
+        put(Author::User, Event::UserMessage { text: "please find the needle\nsecond line".into(), images: vec![] });
         put(Author::Harness, Event::HarnessNote { note: NoteKind::Nudge, text: "needle still open".into() });
         put(Author::Model, response("I will look for the needle", "secret needle reasoning"));
         put(Author::Model, call("c1", "bash", json!({"command": "grep needle src"})));
@@ -460,7 +461,7 @@ mod tests {
         let rig = rig("lead", false, true);
         let mut log = SessionLog::create(&rig.shared.log_path, Durability::Batch).unwrap();
         let long = format!("start {} end", "é".repeat(500));
-        log.append(Author::User, Event::UserMessage { text: long }).unwrap();
+        log.append(Author::User, Event::UserMessage { text: long, images: vec![] }).unwrap();
         let (_, text) = search(&rig, json!({"pattern": "start"})).await;
         let line = text.lines().nth(1).unwrap();
         assert_eq!(line.chars().count(), 300);

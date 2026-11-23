@@ -1007,6 +1007,7 @@ mod tests {
                 detail: String::new(),
                 context_window: Some(1000),
                 max_concurrent: 4,
+                vision: false,
             }],
             sessions_total: 2,
             sessions_active: 1,

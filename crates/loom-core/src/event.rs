@@ -6,6 +6,7 @@
 
 use crate::blob::BlobRef;
 use crate::ids::{CallId, MissionId, SessionId};
+use crate::image::ImageRef;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -178,6 +179,9 @@ pub enum Event {
     Forked(Forked),
     UserMessage {
         text: String,
+        /// Images the operator attached, stored in the blob store. Skipped when empty.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ImageRef>,
     },
     /// Text from the harness that the model must see and that stays in the window.
     HarnessNote {
@@ -689,6 +693,9 @@ pub struct ToolResult {
     pub meta: Map<String, Value>,
     #[serde(default)]
     pub duration_ms: u64,
+    /// Images the result carries (`read` of an image file). Skipped when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImageRef>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -900,9 +907,56 @@ mod tests {
         Record { seq: 3, ts_ms: 1, author: Author::Harness, prev: "0".repeat(64), event }
     }
 
+    fn image() -> ImageRef {
+        ImageRef {
+            blob: "cd".repeat(32),
+            mime: "image/png".into(),
+            bytes: 9,
+            width: 4,
+            height: 3,
+            name: Some("a.png".into()),
+        }
+    }
+
+    #[test]
+    fn images_ride_a_user_message_and_a_tool_result_and_empty_ones_leave_no_trace() {
+        let plain = serde_json::to_string(&record(Event::UserMessage { text: "hi".into(), images: vec![] })).unwrap();
+        assert!(!plain.contains("images"), "{plain}");
+        // A line written before images existed reads, with none.
+        let back: Record = serde_json::from_str(&plain).unwrap();
+        assert_eq!(back.event, Event::UserMessage { text: "hi".into(), images: vec![] });
+        assert_eq!(serde_json::to_string(&back).unwrap(), plain, "old lines re-serialise byte for byte");
+
+        let r = record(Event::UserMessage { text: "hi".into(), images: vec![image()] });
+        let v: Value = serde_json::to_value(&r).unwrap();
+        assert_eq!(
+            v["images"],
+            json!([{"blob":"cd".repeat(32),"mime":"image/png","bytes":9,"width":4,"height":3,"name":"a.png"}])
+        );
+        assert_eq!(serde_json::from_value::<Record>(v).unwrap(), r);
+
+        let t = ToolResult {
+            call_id: CallId::from("c1"),
+            name: "read".into(),
+            status: ToolStatus::Ok,
+            text: "x".into(),
+            output: None,
+            cut: false,
+            class: ToolClass::Read,
+            meta: Default::default(),
+            duration_ms: 1,
+            images: vec![image()],
+        };
+        let r = record(Event::ToolResult(t.clone()));
+        let s = serde_json::to_string(&r).unwrap();
+        assert_eq!(serde_json::from_str::<Record>(&s).unwrap(), r);
+        let none = serde_json::to_string(&record(Event::ToolResult(ToolResult { images: vec![], ..t }))).unwrap();
+        assert!(!none.contains("images"), "{none}");
+    }
+
     #[test]
     fn record_is_flat_and_tagged() {
-        let r = record(Event::UserMessage { text: "hi".into() });
+        let r = record(Event::UserMessage { text: "hi".into(), images: vec![] });
         let v: Value = serde_json::to_value(&r).unwrap();
         assert_eq!(v["kind"], "user_message");
         assert_eq!(v["text"], "hi");
@@ -983,7 +1037,7 @@ mod tests {
                     title: "t".into(),
                 }),
             ),
-            ("user_message", Event::UserMessage { text: "hi".into() }),
+            ("user_message", Event::UserMessage { text: "hi".into(), images: vec![] }),
             ("harness_note", Event::HarnessNote { note: NoteKind::Nudge, text: "n".into() }),
             ("turn_start", Event::TurnStart { trigger: Trigger::User }),
             (
@@ -1068,6 +1122,7 @@ mod tests {
                     class: ToolClass::Exec,
                     meta: Map::new(),
                     duration_ms: 5,
+                    images: Vec::new(),
                 }),
             ),
             (
@@ -1211,6 +1266,7 @@ mod tests {
             class: ToolClass::Exec,
             meta: Map::new(),
             duration_ms: 5,
+            images: Vec::new(),
         }));
         let s = serde_json::to_string(&r).unwrap();
         assert_eq!(serde_json::from_str::<Record>(&s).unwrap(), r);

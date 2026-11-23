@@ -337,6 +337,7 @@ mod tests {
             class: ToolClass::State,
             meta: meta.as_object().cloned().unwrap_or_else(Map::new),
             duration_ms: 0,
+            images: Vec::new(),
         })
     }
 

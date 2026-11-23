@@ -958,6 +958,7 @@ mod tests {
                 class,
                 meta,
                 duration_ms: 0,
+                images: Vec::new(),
             }),
         )
     }
@@ -1193,6 +1194,7 @@ mod tests {
                     class,
                     meta: serde_json::Map::new(),
                     duration_ms: 0,
+                    images: Vec::new(),
                 }),
             )
         };

@@ -132,6 +132,8 @@ pub struct ModelProfile {
     /// `max_tokens` sent with each request. Absent = not sent (the server's default applies).
     pub max_output_tokens: Option<u64>,
     pub reasoning_replay: ReasoningReplay,
+    /// The model takes images (OpenAI `image_url` content parts). Off: an image is named in the text, not sent.
+    pub vision: bool,
     /// Fields added to every request body verbatim (`reasoning_effort`, `temperature`, `top_p`, …).
     /// Fixed for the life of a session: some templates render them into the request head.
     pub extra_body: Map<String, Value>,
@@ -162,6 +164,7 @@ impl Default for ModelProfile {
             context_window: None,
             max_output_tokens: None,
             reasoning_replay: ReasoningReplay::All,
+            vision: false,
             extra_body: Map::new(),
             max_concurrent: 4,
             stall_timeout_s: 240,
@@ -182,6 +185,8 @@ pub struct ToolsCfg {
     pub read_max_lines: u64,
     /// Most matches `grep`/`glob`/`out_grep` return inline.
     pub search_max_results: usize,
+    /// Largest image file `read` attaches (larger ones are described in text only).
+    pub max_image_bytes: u64,
     pub web_fetch_timeout_s: u64,
     pub web_fetch_max_bytes: u64,
     /// A command whose output grows past this is stopped, and the result says so.
@@ -219,6 +224,7 @@ impl Default for ToolsCfg {
             kill_grace_s: 5,
             read_max_lines: 2_000,
             search_max_results: 200,
+            max_image_bytes: 5 * 1024 * 1024,
             web_fetch_timeout_s: 60,
             web_fetch_max_bytes: 20 * 1024 * 1024,
             max_output_bytes: 64 * 1024 * 1024,

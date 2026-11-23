@@ -5,6 +5,7 @@
 //! - [`event`]   the normative event schema (one [`event::Record`] per log line)
 //! - [`log`]     append-only, hash-chained session log with damage salvage
 //! - [`blob`]    content-addressed store for full tool output, with line paging and search
+//! - [`image`]   images a record names: detection, sizes, the sentences about them
 //! - [`message`] chat messages as sent to the model
 //! - [`weave`]   log → request prefix (deterministic), eviction planning
 //! - [`admit`]   what the model sees of a tool output, with explicit cuts
@@ -22,6 +23,7 @@ pub mod config;
 pub mod estimate;
 pub mod event;
 pub mod ids;
+pub mod image;
 pub mod journal;
 pub mod ledger;
 pub mod log;
@@ -36,6 +38,7 @@ pub mod weave;
 pub use blob::{BlobRef, BlobStore};
 pub use event::{Author, Event, Record, Seq};
 pub use ids::{BlobId, CallId, MissionId, SessionId};
+pub use image::ImageRef;
 pub use message::{Message, Role};
 
 /// Milliseconds since the Unix epoch.

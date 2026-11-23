@@ -127,6 +127,9 @@ pub struct ToolCtx {
     pub shell: Arc<bash::ShellState>,
 }
 
+/// Reserved `ToolOutput::meta` key that carries a tool's images to `finalize`; never written to a record.
+pub const META_IMAGES: &str = "\u{0}images";
+
 /// What a tool hands back.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ToolOutput {
@@ -187,6 +190,15 @@ impl ToolOutput {
 
     pub fn with_meta(mut self, key: &str, value: Value) -> ToolOutput {
         self.meta.insert(key.to_string(), value);
+        self
+    }
+
+    /// Images the result carries (already stored in the blob store). `finalize` moves them out of `meta`
+    /// (the reserved key [`META_IMAGES`]) into `ToolResult::images`, so they never reach the record's meta.
+    pub fn with_images(mut self, images: &[loom_core::ImageRef]) -> ToolOutput {
+        if !images.is_empty() {
+            self.meta.insert(META_IMAGES.to_string(), json!(images));
+        }
         self
     }
 }
@@ -379,6 +391,7 @@ pub fn prepare(registry: &Registry, ctx: &ToolCtx, name: &str, arguments: &str) 
                 class: ToolClass::State,
                 meta: Map::new(),
                 duration_ms: started.elapsed().as_millis() as u64,
+                images: Vec::new(),
             }))
         }
         Adapt::Run(call) => {
@@ -615,6 +628,8 @@ pub fn finalize(
     let ToolOutput { status, outcome, more, body, mut meta } = output;
     let mut facts = Facts { tool: spec.name.clone(), outcome, more, notes: None };
     let duration_ms = started.elapsed().as_millis() as u64;
+    let images: Vec<loom_core::ImageRef> =
+        meta.remove(META_IMAGES).and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
     let base = |status, text, output, cut, meta| ToolResult {
         call_id: ctx.call_id.clone(),
         name: spec.name.clone(),
@@ -625,6 +640,7 @@ pub fn finalize(
         class: spec.class,
         meta,
         duration_ms,
+        images: images.clone(),
     };
     // A view sized for the bound the call ran with is not cut for a lower one that came after it.
     let budget = ctx.view_chars.max(admission.policy.view_chars(admission.estimator));
@@ -731,6 +747,7 @@ pub fn refused(ctx: &ToolCtx, name: &str, class: ToolClass, message: String, sta
         class,
         meta: Map::new(),
         duration_ms: started.elapsed().as_millis() as u64,
+        images: Vec::new(),
     }
 }
 

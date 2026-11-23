@@ -90,7 +90,7 @@
 //!   (`DiskSpace::is_low`), a warning that sessions will fail when the disk fills (bold yellow); one
 //!   line per model (`✓`/`✗`, base URL, model, window, detail when unreachable); the counts.
 //! - `models_table(view, style)`: one line per live profile, `✓`/`✗ {profile}[ (default)] · {model} ·
-//!   {base_url} · window {window} · {max_concurrent} at once[ · {detail}]`; then a line when no
+//!   {base_url} · window {window} · {max_concurrent} at once · vision {yes|no}[ · {detail}]`; then a line when no
 //!   `default_model` is set; `No model profiles are configured.` when there is none.
 //! - `models_reload(report)`: `No profile changed.` or one `added|changed|removed: a, b` line per
 //!   non-empty list; `{n} session(s) moved to the new settings of a changed profile`; `default model:
@@ -389,7 +389,7 @@ pub fn record(rec: &Record, style: &Style, opts: &RecordOpts) -> String {
             out.push(paint(style, BOLD, &head));
             push_block(&mut out, style, None, &f.brief.question, "  ");
         }
-        Event::UserMessage { text } => {
+        Event::UserMessage { text, .. } => {
             out.push(paint(style, CYAN, "▌ you"));
             push_block(&mut out, style, None, text, "");
         }
@@ -895,11 +895,12 @@ pub fn models_table(view: &ModelsView, style: &Style) -> String {
         let default = if m.profile == view.default_model { " (default)" } else { "" };
         let window = m.context_window.map_or_else(|| "unknown".to_string(), tokens);
         let mut text = format!(
-            "{}{default} · {} · {} · window {window} · {} at once",
+            "{}{default} · {} · {} · window {window} · {} at once · vision {}",
             flat(&m.profile),
             flat(&m.model),
             flat(&m.base_url),
-            m.max_concurrent
+            m.max_concurrent,
+            if m.vision { "yes" } else { "no" }
         );
         if !m.reachable && !m.detail.is_empty() {
             text.push_str(&format!(" · {}", flat(&m.detail)));
@@ -1128,6 +1129,7 @@ mod tests {
             class: ToolClass::Exec,
             meta: Map::new(),
             duration_ms: 5,
+            images: Vec::new(),
         })
     }
 
@@ -1213,7 +1215,7 @@ mod tests {
                 allowed_tools: None,
                 title: s.into(),
             }),
-            Event::UserMessage { text: s.into() },
+            Event::UserMessage { text: s.into(), images: vec![] },
             Event::HarnessNote { note: NoteKind::Nudge, text: s.into() },
             Event::TurnStart { trigger: Trigger::User },
             Event::ModelRequest(ModelRequest {
@@ -1462,7 +1464,10 @@ mod tests {
             title: String::new(),
         });
         assert_eq!(render(forked, &MONO), "● agent s-a · worker · forked from s-p\n  why?\n  really\n");
-        assert_eq!(render(Event::UserMessage { text: "hi\nthere".into() }, &MONO), "▌ you\nhi\nthere\n");
+        assert_eq!(
+            render(Event::UserMessage { text: "hi\nthere".into(), images: vec![] }, &MONO),
+            "▌ you\nhi\nthere\n"
+        );
         assert_eq!(
             render(Event::HarnessNote { note: NoteKind::OutputCut, text: "cut".into() }, &MONO),
             "▌ harness · output_cut\ncut\n"
@@ -1590,7 +1595,10 @@ mod tests {
 
     #[test]
     fn colours_wrap_each_line() {
-        assert_eq!(render(Event::UserMessage { text: "x".into() }, &COLOR), "\x1b[36m▌ you\x1b[0m\nx\n");
+        assert_eq!(
+            render(Event::UserMessage { text: "x".into(), images: vec![] }, &COLOR),
+            "\x1b[36m▌ you\x1b[0m\nx\n"
+        );
         assert_eq!(
             render(Event::HarnessNote { note: NoteKind::Info, text: "a\nb".into() }, &COLOR),
             "\x1b[2m▌ harness · info\x1b[0m\n\x1b[2ma\x1b[0m\n\x1b[2mb\x1b[0m\n"
@@ -2069,6 +2077,7 @@ mod tests {
             class: None,
             preview: "first\nline".into(),
             note: None,
+            image_tokens: 0,
         }
     }
 
@@ -2116,6 +2125,7 @@ mod tests {
             detail: if reachable { String::new() } else { "connection refused".into() },
             context_window: if reachable { Some(1_000_000) } else { None },
             max_concurrent: 4,
+            vision: false,
         }
     }
 
@@ -2126,8 +2136,8 @@ mod tests {
         let view = ModelsView { default_model: "local".into(), models: vec![health(true), other] };
         assert_eq!(
             models_table(&view, &MONO),
-            "✓ local (default) · big · http://10.0.0.1:8000/v1 · window 1.00M · 4 at once\n\
-             ✗ other · big · http://10.0.0.1:8000/v1 · window unknown · 4 at once · connection refused\n"
+            "✓ local (default) · big · http://10.0.0.1:8000/v1 · window 1.00M · 4 at once · vision no\n\
+             ✗ other · big · http://10.0.0.1:8000/v1 · window unknown · 4 at once · vision no · connection refus…\n"
         );
         let none = ModelsView { default_model: String::new(), models: vec![health(true)] };
         assert!(models_table(&none, &MONO).ends_with("no default_model: a new session names its model with --model\n"));

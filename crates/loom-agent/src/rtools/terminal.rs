@@ -3864,6 +3864,7 @@ mod tests {
                 class: ToolClass::Exec,
                 meta,
                 duration_ms: 1,
+                images: Vec::new(),
             })
         };
         log.append(Author::Tool, result(Some(produced.clone()), Map::new())).unwrap();

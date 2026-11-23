@@ -14,7 +14,7 @@
 //!    `GET /healthz`, the three static assets and `POST /api/web-sessions`. Otherwise `401`
 //!    `{"error": "Missing or wrong access token. Run `loom open`, or send the token in ~/.loom/token as a Bearer token."}`.
 //!
-//! Every response carries `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`.
+//! Every response carries `Cache-Control: no-store` (except `GET /api/images/{blob}`, which sets its own) and `X-Content-Type-Options: nosniff`.
 //! Errors are `ErrorBody` JSON: a runtime error (`Err(sentence)`) is `404` when the sentence starts
 //! with `There is no` or `No `, otherwise `409`; a body or query that does not parse is `400`
 //! (`{"error": "The request body is not valid: {why}"}`); an unknown path is `404`. No handler
@@ -43,6 +43,7 @@
 //! | `POST /sessions` (`NewSession`; `prior` may be left out; `create_workspace` makes a missing workspace folder) | `runtime.create_session_receipt` (`404` for a `prior` mission that does not exist, `409` for too many) | `201` `CreatedSession` (a `SessionInfo` plus `created`: the folder was made) |
 //! | `GET /sessions/{id}` | the session and its children (sessions whose `parent` is it) | `SessionDetail` |
 //! | `GET /sessions/{id}/records?after={seq}&limit={n}` | `runtime.stored_records` (`limit` default 500, at most 2000) | `RecordsPage` (`next_after` = last seq of the page when the page is full, else `null`); a record that comes with its stored line (read as `Event::Unknown`) is that line, verbatim |
+//! | `GET /images/{blob}` | `runtime.image_named`: the blob (a full id) must be named in the `images` of some session's record | the bytes, `Content-Type` the image's mime, `Content-Disposition: inline`, `Cache-Control: private, max-age=31536000, immutable` (this route only); `404` for any other blob |
 //! | `GET /sessions/{id}/stream?after={seq}` | see *Streams* | SSE |
 //! | `POST /sessions/{id}/messages` (`MessageBody`; `attachments` may be left out, and `text` empty when there are some) | `runtime.send_message_with` (`400` with the sentence `texts::not_an_upload` for a path that is not an upload of the workspace) | `202` `{}` |
 //! | `POST /sessions/{id}/messages` with `"when": "after_turn"` (default `"now"`; any other value is `400`) | `runtime.queue_message`: while the lead runs, the message is kept and sent when its turn ends; otherwise as `now` | `202` `{"queued": {id, text, attachments, created_ms}}` when held, `{}` when sent at once |
@@ -246,6 +247,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/blobs/{handle}", get(blob_meta))
         .route("/api/blobs/{handle}/raw", get(blob_raw))
         .route("/api/blobs/{handle}/lines", get(blob_lines))
+        .route("/api/images/{blob}", get(image))
         .route("/api/fs/dirs", get(fs_dirs))
         .route("/api/sessions/{id}/files", get(session_files))
         .route("/api/sessions/{id}/files/lines", get(session_file_lines))
@@ -464,7 +466,11 @@ fn seal(mut response: Response) -> Response {
         }
     }
     let headers = response.headers_mut();
-    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    // The one route that sets its own policy is the immutable image; everything else is never stored.
+    let immutable = headers.get(header::CACHE_CONTROL).is_some_and(|v| v.as_bytes().starts_with(b"private, max-age="));
+    if !immutable {
+        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
     headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
     response
 }
@@ -920,6 +926,31 @@ async fn blob_raw(State(s): State<ApiState>, Path(handle): Path<String>) -> Res<
     if let Ok(value) = HeaderValue::from_str(&disposition) {
         headers.insert(header::CONTENT_DISPOSITION, value);
     }
+    Ok(response)
+}
+
+/// `GET /api/images/{blob}`: an image blob that a record of some session names in `images`, inline with its mime
+/// type; `404` for any other blob (so the route is no way to read arbitrary tool output).
+async fn image(State(s): State<ApiState>, Path(blob): Path<String>) -> Res<Response> {
+    let rt = s.runtime.clone();
+    let blobs = rt.blobs().clone();
+    let (image, bytes) = blocking(move || {
+        let image = rt
+            .image_named(&blob)
+            .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "There is no image with that id."))?;
+        let bytes = blobs
+            .read_all(&loom_core::BlobId::from(image.blob.clone()))
+            .map_err(|e| ApiError::unreadable_blob(&image.blob, e))?;
+        Ok((image, bytes))
+    })
+    .await?;
+    let mut response = Response::new(Body::from(bytes));
+    let headers = response.headers_mut();
+    if let Ok(v) = HeaderValue::from_str(&image.mime) {
+        headers.insert(header::CONTENT_TYPE, v);
+    }
+    headers.insert(header::CONTENT_DISPOSITION, HeaderValue::from_static("inline"));
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("private, max-age=31536000, immutable"));
     Ok(response)
 }
 
@@ -1889,7 +1920,7 @@ mod tests {
         assert!(w["est_tokens"].as_u64().unwrap() > 0 && !w["items"].as_array().unwrap().is_empty());
         // The additive fields: the parts of the request add up to its total, the fold bounds are given.
         let parts = w["breakdown"]["segments"].as_array().unwrap();
-        assert_eq!(parts.len(), 14);
+        assert_eq!(parts.len(), 15);
         assert_eq!(parts.iter().map(|p| p["tokens"].as_u64().unwrap()).sum::<u64>(), w["breakdown"]["total_tokens"]);
         assert!(w["fold_at"].as_u64().unwrap() > w["fold_to"].as_u64().unwrap());
         assert!(w.get("measured_now").is_some() && w.get("last_request").is_some());
@@ -3144,6 +3175,44 @@ mod tests {
         let r = e.http.post(e.url("/api/uploads?workspace=/x&name=y")).body("x").send().await.unwrap();
         assert_eq!(r.status().as_u16(), 401);
         e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_image_attachment_is_named_in_the_record_and_served_only_when_a_record_names_it() {
+        let e = env(Script::new(|_, _| finish("done"))).await;
+        let canon = std::fs::canonicalize(e.dir.path()).unwrap();
+        let ws = canon.join("ws");
+        let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        png.extend_from_slice(&[0, 0, 0, 3, 0, 0, 0, 2, 8, 6, 0, 0, 0]);
+        let (s, up) = e.upload(&ws, "dot.png", png.clone(), Some("image/png")).await;
+        assert_eq!(s, 201, "{up}");
+        let path = up["path"].as_str().unwrap().to_string();
+        let (s, v) = e.post("/api/sessions", json!({"workspace": ws, "message": "look", "attachments": [path]})).await;
+        assert_eq!(s, 201, "{v}");
+        let id = v["id"].as_str().unwrap().to_string();
+        e.wait_turn_ends(&id, 1).await;
+        let first = e.records(&id).await.into_iter().find(|r| r["kind"] == "user_message").unwrap();
+        let image = first["images"][0].clone();
+        assert_eq!(
+            (image["mime"].as_str(), image["width"].as_u64(), image["height"].as_u64(), image["name"].as_str()),
+            (Some("image/png"), Some(3), Some(2), Some("dot.png")),
+            "{first}"
+        );
+        let blob = image["blob"].as_str().unwrap().to_string();
+
+        let r = e.rq(Method::GET, &format!("/api/images/{blob}")).send().await.unwrap();
+        assert_eq!(r.status(), 200);
+        assert_eq!(r.headers()["content-type"], "image/png");
+        assert_eq!(r.headers()["content-disposition"], "inline");
+        assert_eq!(r.headers()["cache-control"], "private, max-age=31536000, immutable");
+        assert_eq!(r.bytes().await.unwrap().to_vec(), png);
+
+        // A stored blob that no record names (tool output, say), a handle, a short id and junk are all 404.
+        let other = e.rt.blobs().put_bytes(b"secret tool output").unwrap().id.as_str().to_string();
+        for path in [other.as_str(), &blob[..16], "out:abcdef01", "..%2f..%2fetc", &"0".repeat(64)] {
+            let (s, b) = e.get(&format!("/api/images/{path}")).await;
+            assert_eq!(s, 404, "{path}: {b}");
+        }
     }
 
     #[tokio::test]

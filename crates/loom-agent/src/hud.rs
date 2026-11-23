@@ -549,6 +549,7 @@ mod tests {
                 class,
                 meta: meta.as_object().cloned().unwrap_or_default(),
                 duration_ms: 0,
+                images: Vec::new(),
             }),
         )
     }
@@ -1192,6 +1193,7 @@ Waiting on the operator (1):\n- q2: Which branch should this target?",
                 class: ToolClass::Read,
                 meta: json!({"path": "src/missing.rs"}).as_object().cloned().unwrap(),
                 duration_ms: 0,
+                images: Vec::new(),
             }),
         ));
         seq += 1;

@@ -22,6 +22,7 @@ model = "default"                       # example: the id the server serves (a s
 # context_window = 1000000              # discovered from the server's model list when omitted; set it if the server does not report one
 # max_output_tokens = 32768             # max_tokens sent with each request; omitted = the server's default
 reasoning_replay = "all"                # "all" sends reasoning back with its response (cache-safe on templates that keep it); "none" never does
+vision = false                         # true: the model takes images (user attachments, `read` of an image file); false: the text names them
 max_concurrent = 4                      # concurrent requests to this server across all sessions
 stall_timeout_s = 240                   # abort and retry a stream that delivers nothing this long
 retry_window_s = 300                    # keep retrying an unreachable or failing server this long; 0 = until it returns
@@ -55,6 +56,7 @@ bash_foreground_s = 300    # a foreground command still running after this long 
 kill_grace_s = 5           # seconds between TERM and KILL when a command is cancelled
 read_max_lines = 2000      # most lines one read/out_read call returns
 search_max_results = 200   # most entries grep/glob/out_grep list (their text is also capped at 4 MiB)
+max_image_bytes = 5242880       # largest image (5 MiB) read or an attachment puts in front of a vision model
 web_fetch_timeout_s = 60
 web_fetch_max_bytes = 20971520   # 20 MiB
 max_output_bytes = 67108864      # a command whose output passes this (64 MiB) is stopped; the first part is kept
