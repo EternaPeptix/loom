@@ -310,6 +310,15 @@ pub struct ModelSwitched {
     pub reason: String,
 }
 
+/// One project instruction file as it went into a session's system prompt.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectInstruction {
+    /// The file name, `AGENTS.md` or `CLAUDE.md`.
+    pub name: String,
+    /// Its text as the prompt has it (cut at the size limit, with the cut marker).
+    pub text: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SessionStart {
     pub session: SessionId,
@@ -335,6 +344,11 @@ pub struct SessionStart {
     pub unattended: bool,
     #[serde(default)]
     pub title: String,
+    /// The project instruction files (`AGENTS.md`, `CLAUDE.md`) read from the workspace root when the
+    /// session was created, as they went into `system_prompt` (cut, if long). Kept so the prompt is
+    /// never rebuilt from a file that has changed since, and so the UI can list the names.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub project_instructions: Vec<ProjectInstruction>,
     /// Log format version; absent in logs written before the field existed (version 1). A log with
     /// a higher number is read-only for this build.
     #[serde(default = "schema_v1")]
@@ -951,6 +965,7 @@ mod tests {
                     unattended: true,
                     schema: SCHEMA,
                     title: "t".into(),
+                    project_instructions: Vec::new(),
                 }),
             ),
             (

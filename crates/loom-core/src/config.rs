@@ -390,6 +390,8 @@ pub struct AgentsCfg {
     pub implicit_finish: bool,
     /// Add a nudge paragraph when a lead stops idle with an open goal and no open plan step.
     pub idle_ledger_nudge: bool,
+    /// Put the workspace's `AGENTS.md` and `CLAUDE.md` into the system prompt of each new session.
+    pub project_instructions: bool,
 }
 
 impl Default for AgentsCfg {
@@ -410,6 +412,7 @@ impl Default for AgentsCfg {
             compact_tools: false,
             implicit_finish: false,
             idle_ledger_nudge: true,
+            project_instructions: true,
         }
     }
 }
@@ -1188,6 +1191,8 @@ allow = ["*.example.test"]
         assert!(!def.compact_tools);
         assert!(!def.implicit_finish);
         assert!(def.idle_ledger_nudge);
+        assert!(def.project_instructions);
+        assert!(!Config::parse("[agents]\nproject_instructions = false\n").unwrap().agents.project_instructions);
 
         let empty = Config::parse("").unwrap();
         assert_eq!(empty.agents, def);

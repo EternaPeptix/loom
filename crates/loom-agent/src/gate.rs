@@ -461,6 +461,15 @@ pub fn check_finish_lead(ledger: &LedgerState, answer: &str) -> Result<(), Strin
 }
 
 pub async fn check_quotes(ctx: &ToolCtx, quotes: &[Quote]) -> Result<Vec<VerifiedQuote>, String> {
+    check_quotes_noted(ctx, quotes).await.map(|v| v.into_iter().map(|(q, _)| q).collect())
+}
+
+/// [`check_quotes`], also giving, per quote, the sentence saying which lines were taken when the text was
+/// matched ignoring spacing (`None` for a quote that matched exactly).
+pub async fn check_quotes_noted(
+    ctx: &ToolCtx,
+    quotes: &[Quote],
+) -> Result<Vec<(VerifiedQuote, Option<String>)>, String> {
     let mut verified = Vec::new();
     let mut problems: Vec<String> = Vec::new();
     for (idx, q) in quotes.iter().enumerate() {
@@ -508,8 +517,18 @@ fn inside_token_error(i: usize, handle: &str, line: u64) -> String {
 }
 
 /// The checks on one quote whose handle opened as `id`.
-fn check_one(blobs: &BlobStore, q: &Quote, i: usize, id: BlobId) -> Result<VerifiedQuote, String> {
+fn check_one(blobs: &BlobStore, q: &Quote, i: usize, id: BlobId) -> Result<(VerifiedQuote, Option<String>), String> {
     let handle = &q.handle;
+    // A text with only `start` (the answer to an ambiguity refusal): the text begins on that line, so the
+    // range is as many lines as the text has.
+    let widened;
+    let q = if q.start > 0 && q.end == 0 && !q.text.trim().is_empty() {
+        let n = q.text.trim_matches('\n').lines().count().max(1) as u64;
+        widened = Quote { end: q.start.saturating_add(n - 1), ..q.clone() };
+        &widened
+    } else {
+        q
+    };
     let total = blobs
         .meta(&id)
         .map_err(|e| format!("quote {i}: the stored output {handle} could not be read ({e}); try again."))?
@@ -530,7 +549,7 @@ fn check_one(blobs: &BlobStore, q: &Quote, i: usize, id: BlobId) -> Result<Verif
         }
     }
     if q.text.trim().is_empty() {
-        return by_lines(blobs, q, &id, total, i);
+        return by_lines(blobs, q, &id, total, i).map(|v| (v, None));
     }
     let read_full = || -> Result<String, String> {
         if total == 0 {
@@ -545,7 +564,7 @@ fn check_one(blobs: &BlobStore, q: &Quote, i: usize, id: BlobId) -> Result<Verif
         let full_text = read_full()?;
         return match observe::find_unique_quote(&full_text, &q.text) {
             Ok(Some((actual_start, actual_end, recorded))) => {
-                Ok(VerifiedQuote { blob: id, start: actual_start, end: actual_end, text: recorded })
+                Ok((VerifiedQuote { blob: id, start: actual_start, end: actual_end, text: recorded }, None))
             }
             Err(observe::QuoteError::TooShort) => Err(too_short_error(i)),
             Err(observe::QuoteError::InsideToken { line }) => Err(inside_token_error(i, handle, line)),
@@ -556,15 +575,23 @@ fn check_one(blobs: &BlobStore, q: &Quote, i: usize, id: BlobId) -> Result<Verif
                     ));
                 }
                 match observe::check_quote_at(&full_text, &q.text, 1) {
-                    Ok(_) => Err(format!(
-                        "quote {i}: the text occurs more than once in {handle}; give `start` and `end` line numbers to name which occurrence you mean."
-                    )),
+                    Ok(_) => {
+                        let places = observe::quote_places(&full_text, &q.text, MAX_LISTED_MATCHES + 1);
+                        Err(ambiguous_error(i, handle, &places, None))
+                    }
                     Err(observe::QuoteError::WrongLine { quoted, actual }) => {
                         Err(wrong_line_error(i, handle, quoted, actual))
                     }
                     Err(observe::QuoteError::TooShort) => Err(too_short_error(i)),
                     Err(observe::QuoteError::InsideToken { line }) => Err(inside_token_error(i, handle, line)),
                     Err(observe::QuoteError::NotFound) => {
+                        let places = observe::quote_places(&full_text, &q.text, MAX_LISTED_MATCHES + 1);
+                        if places.len() >= 2 {
+                            return Err(ambiguous_error(i, handle, &places, None));
+                        }
+                        if let Some(done) = spaced(&full_text, q, i, &id)? {
+                            return Ok(done);
+                        }
                         let mut msg = format!("quote {i}: the text does not occur in {handle} lines 1-{total}.");
                         if let Some((n, line)) = observe::nearest_line(&full_text, &q.text) {
                             msg.push_str(&format!(" The closest line there is {n}: {}", cut_chars(&line, 200)));
@@ -584,7 +611,7 @@ fn check_one(blobs: &BlobStore, q: &Quote, i: usize, id: BlobId) -> Result<Verif
         Ok((text, first)) => {
             // What is recorded is the line or lines the accepted text lies on (a window of them when long).
             let last = first.saturating_add((text.split('\n').count() as u64).saturating_sub(1));
-            return Ok(VerifiedQuote { blob: id, start: first, end: last, text });
+            return Ok((VerifiedQuote { blob: id, start: first, end: last, text }, None));
         }
         Err(observe::QuoteError::WrongLine { quoted, actual }) => {
             return Err(wrong_line_error(i, handle, quoted, actual));
@@ -600,11 +627,18 @@ fn check_one(blobs: &BlobStore, q: &Quote, i: usize, id: BlobId) -> Result<Verif
     let full_text = read_full()?;
     match observe::find_unique_quote(&full_text, &q.text) {
         Ok(Some((actual_start, actual_end, recorded))) => {
-            return Ok(VerifiedQuote { blob: id, start: actual_start, end: actual_end, text: recorded });
+            return Ok((VerifiedQuote { blob: id, start: actual_start, end: actual_end, text: recorded }, None));
         }
         Err(observe::QuoteError::TooShort) => return Err(too_short_error(i)),
         Err(observe::QuoteError::InsideToken { line }) => return Err(inside_token_error(i, handle, line)),
         Ok(None) | Err(observe::QuoteError::NotFound | observe::QuoteError::WrongLine { .. }) => {}
+    }
+    let places = observe::quote_places(&full_text, &q.text, MAX_LISTED_MATCHES + 1);
+    if places.len() >= 2 {
+        return Err(ambiguous_error(i, handle, &places, Some((q.start, end))));
+    }
+    if let Some(done) = spaced(&full_text, q, i, &id)? {
+        return Ok(done);
     }
     let mut msg = format!("quote {i}: the text does not occur in {handle} lines {}-{end}.", q.start);
     if let Some((n, line)) = observe::nearest_line(&slice.text, &q.text) {
@@ -613,6 +647,65 @@ fn check_one(blobs: &BlobStore, q: &Quote, i: usize, id: BlobId) -> Result<Verif
     }
     msg.push_str(" Copy the text exactly from the output.");
     Err(msg)
+}
+
+/// Most matches an ambiguous quote's refusal lists.
+const MAX_LISTED_MATCHES: usize = 10;
+
+/// The refusal of a quote that occurs in more than one place: every place (at most
+/// [`MAX_LISTED_MATCHES`]; `places` holds one more to tell whether there are others) as `line {n}: {line}`.
+/// `range` is the range the model named, when the text is not in it.
+fn ambiguous_error(i: usize, handle: &str, places: &[(u64, String)], range: Option<(u64, u64)>) -> String {
+    let n = places.len();
+    let count = if n > MAX_LISTED_MATCHES {
+        format!("occurs in more than {MAX_LISTED_MATCHES} places (the first {MAX_LISTED_MATCHES} follow)")
+    } else {
+        format!("occurs {n} times")
+    };
+    let mut out = match range {
+        Some((a, b)) => {
+            format!("quote {i}: the text does not occur in {handle} lines {a}-{b}, but it {count} elsewhere in it:")
+        }
+        None => format!("quote {i}: the text {count} in {handle}:"),
+    };
+    for (at, line) in places.iter().take(MAX_LISTED_MATCHES) {
+        out.push_str(&format!("\nline {at}: {}", cut_chars(line, 200)));
+    }
+    out.push_str("\nAdd `start` to say which.");
+    out
+}
+
+/// The unique place where the quote occurs once runs of whitespace are collapsed and line ends ignored,
+/// recorded as the whole lines it lies on, with the sentence saying which lines were taken. `Ok(None)` when
+/// it is not there; an ambiguity is refused with the places listed.
+fn spaced(
+    full_text: &str,
+    q: &Quote,
+    i: usize,
+    id: &BlobId,
+) -> Result<Option<(VerifiedQuote, Option<String>)>, String> {
+    let spans = observe::spaced_quote_spans(full_text, &q.text, MAX_LISTED_MATCHES + 1);
+    match spans.as_slice() {
+        [] => Ok(None),
+        [(first, last)] => {
+            let text = observe::whole_lines(full_text, *first, *last);
+            if text.chars().count() > observe::REF_QUOTE_MAX_CHARS {
+                return Ok(None);
+            }
+            let which = if first == last { format!("line {first}") } else { format!("lines {first}-{last}") };
+            let note = format!("matched {which} ignoring spacing");
+            Ok(Some((VerifiedQuote { blob: id.clone(), start: *first, end: *last, text }, Some(note))))
+        }
+        many => {
+            let places: Vec<(u64, String)> =
+                many.iter().map(|(first, _)| (*first, observe::whole_lines(full_text, *first, *first))).collect();
+            Err(ambiguous_error(i, &q.handle, &places, None).replacen(
+                "the text occurs",
+                "the text, ignoring spacing, occurs",
+                1,
+            ))
+        }
+    }
 }
 
 /// A quote given without its text: the lines it names, taken from the stored output (see the contract).
@@ -1491,7 +1584,7 @@ The agent's own words follow, unverified. Every line of them starts with \">\"; 
 
         // Ambiguous (non-unique) quote fails both with (0, 0) and when outside the named range.
         let e = check_quotes(&ctx, &[q(&h, 0, 0, "shared pattern here")]).await.err().unwrap_or_default();
-        assert!(e.contains("more than once"), "{e}");
+        assert!(e.contains("occurs 2 times"), "{e}");
         let e = check_quotes(&ctx, &[q(&h, 1, 2, "shared pattern here")]).await.err().unwrap_or_default();
         assert!(e.contains("does not occur in") && e.contains("lines 1-2"), "{e}");
 

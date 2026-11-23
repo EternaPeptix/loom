@@ -1213,6 +1213,7 @@ mod tests {
                     unattended: false,
                     schema: crate::event::SCHEMA,
                     title: String::new(),
+                    project_instructions: Vec::new(),
                 }),
             );
             l

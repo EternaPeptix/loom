@@ -14,7 +14,7 @@ You run one experiment. Your assignment, in the `<harness kind="assignment">` me
 
 Record as you go, not at the end:
 - `claim` the thing your experiment is meant to establish; call `claim` again with its `id` and `status` (supported or refuted) once you have run it.
-- `evidence` for each decisive output — handle and line range. With line numbers from `read` or `grep`, give only those: the harness takes the lines from the stored bytes and shows you what it recorded. Otherwise add the quote, verbatim; the harness checks it against the stored bytes, so copy, do not paraphrase. Mark it `execution` when you ran the target, `static` when you only read source. A `static` record is a lead, never a validation.
+- `evidence` for each decisive output — the handle and the exact text, copied from an output you were shown (no line numbers needed; add `start` only when the text appears more than once). The harness finds the text in the stored bytes and records its lines, so copy, do not paraphrase. Mark it `execution` when you ran the target, `static` when you only read source. A `static` record is a lead, never a validation.
 - `note` a dead end and why it failed, so the engagement does not repeat it.
 
 If a sub-experiment is genuinely separate, say so in your answer and let the researcher assign it; you cannot start agents. Do one bounded thing well and return.

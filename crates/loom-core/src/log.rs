@@ -1438,6 +1438,7 @@ mod tests {
             budget: Budget::default(),
             unattended: false,
             title: String::new(),
+            project_instructions: Vec::new(),
             schema,
         })
     }

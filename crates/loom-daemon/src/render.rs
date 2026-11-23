@@ -1199,6 +1199,7 @@ mod tests {
                 unattended: true,
                 schema: loom_core::event::SCHEMA,
                 title: s.into(),
+                project_instructions: Vec::new(),
             }),
             Event::Forked(Forked {
                 session: sid(),
@@ -1445,6 +1446,7 @@ mod tests {
             unattended: false,
             schema: loom_core::event::SCHEMA,
             title: String::new(),
+            project_instructions: Vec::new(),
         });
         assert_eq!(render(start, &MONO), "● session s-a · lead · mm · /w\n");
         let forked = Event::Forked(Forked {

@@ -790,6 +790,99 @@ pub fn find_unique_quote(haystack: &str, quote: &str) -> Result<Option<(u64, u64
     }
 }
 
+/// Where `quote` sits in `haystack` by the exact matching rules of [`check_quote`] (prefixes, token
+/// boundaries, minimum length), as `(line number, that line)` for up to `max` occurrences, front to
+/// back. Empty when it does not occur. Used to list the candidates of an ambiguous quote.
+pub fn quote_places(haystack: &str, quote: &str, max: usize) -> Vec<(u64, String)> {
+    if quote.trim().is_empty() {
+        return Vec::new();
+    }
+    let hay = prepare_haystack(haystack);
+    let lines = quote_lines(quote);
+    let literal = lines.join("\n");
+    let spans = match scan_quote_spans(&hay, &literal, None, 1, max) {
+        Ok(spans) => spans,
+        Err(_) => match strip_prefixes(&lines) {
+            Some((stripped, numbers)) => {
+                scan_quote_spans(&hay, &stripped.join("\n"), Some(numbers.as_slice()), 1, max).unwrap_or_default()
+            }
+            None => Vec::new(),
+        },
+    };
+    spans
+        .iter()
+        .map(|at| {
+            let before = hay.get(..at.start).unwrap_or_default();
+            let n = before.matches('\n').count();
+            let line = hay.lines().nth(n).unwrap_or_default().to_string();
+            ((n as u64).saturating_add(1), line)
+        })
+        .collect()
+}
+
+/// The places (first line, last line) where `quote` occurs once every run of whitespace, line ends
+/// included, counts as one space on both sides; up to `max`, front to back. A quote of fewer than
+/// [`MIN_PARTIAL_QUOTE_CHARS`] non-space characters, a place that begins or ends inside a longer word, and
+/// a place of more than [`REF_QUOTE_MAX_LINES`] lines are not found. Line numbers count the lines of
+/// `haystack` from 1.
+pub fn spaced_quote_spans(haystack: &str, quote: &str, max: usize) -> Vec<(u64, u64)> {
+    let want = quote.split_whitespace().collect::<Vec<_>>().join(" ");
+    if max == 0 || want.chars().filter(|c| !c.is_whitespace()).count() < MIN_PARTIAL_QUOTE_CHARS {
+        return Vec::new();
+    }
+    let mut norm = String::new();
+    // (byte offset in `norm` where a line's words begin, the line's number)
+    let mut starts: Vec<(usize, u64)> = Vec::new();
+    for (i, line) in haystack.lines().enumerate() {
+        let mut words = line.split_whitespace();
+        let Some(first) = words.next() else { continue };
+        if !norm.is_empty() {
+            norm.push(' ');
+        }
+        starts.push((norm.len(), (i as u64).saturating_add(1)));
+        norm.push_str(first);
+        for w in words {
+            norm.push(' ');
+            norm.push_str(w);
+        }
+    }
+    let line_at = |byte: usize| -> u64 {
+        let k = starts.partition_point(|(s, _)| *s <= byte);
+        k.checked_sub(1).and_then(|k| starts.get(k)).map_or(1, |(_, n)| *n)
+    };
+    let first_alnum = want.chars().next().is_some_and(char::is_alphanumeric);
+    let last_alnum = want.chars().next_back().is_some_and(char::is_alphanumeric);
+    let mut out = Vec::new();
+    let mut from = 0usize;
+    while let Some(off) = norm.get(from..).and_then(|rest| rest.find(&want)).map(|at| from.saturating_add(at)) {
+        from = off.saturating_add(norm.get(off..).and_then(|r| r.chars().next()).map_or(1, char::len_utf8));
+        let end = off.saturating_add(want.len());
+        let before = norm.get(..off).and_then(|b| b.chars().next_back());
+        let after = norm.get(end..).and_then(|a| a.chars().next());
+        if (first_alnum && before.is_some_and(char::is_alphanumeric))
+            || (last_alnum && after.is_some_and(char::is_alphanumeric))
+        {
+            continue;
+        }
+        let (first, last) = (line_at(off), line_at(end.saturating_sub(1)));
+        if last.saturating_sub(first) >= REF_QUOTE_MAX_LINES {
+            continue;
+        }
+        out.push((first, last));
+        if out.len() >= max {
+            break;
+        }
+    }
+    out
+}
+
+/// Lines `first`..=`last` (numbered from 1) of `haystack`, each without trailing whitespace, joined by `\n`.
+pub fn whole_lines(haystack: &str, first: u64, last: u64) -> String {
+    let skip = first.saturating_sub(1) as usize;
+    let take = last.saturating_sub(first).saturating_add(1) as usize;
+    haystack.lines().skip(skip).take(take).map(str::trim_end).collect::<Vec<_>>().join("\n")
+}
+
 fn common_prefix_chars(a: &str, b: &str) -> usize {
     a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count()
 }

@@ -490,7 +490,13 @@ default to empty.
 output by handle, a line range and a note, and either a quote or nothing more (a quote by lines, below).
 The harness:
 
-1. checks the quote against those lines of the stored text, or takes the lines themselves (below);
+1. finds the quote in the stored text by its text, with no line numbers (`start` only picks one place when
+   the text occurs more than once: the call is refused with every place listed as `line {n}: {line}`, at most
+   10, and "Add `start` to say which."). A quote that does not match exactly but matches in exactly one place
+   once runs of whitespace are collapsed and line ends count as one space is taken, as the whole lines it
+   lies on, and the result says "matched lines 12-14 ignoring spacing". A quote with `start` and `end` is
+   still checked against those lines, and with neither quote nor lines the harness takes the lines
+   themselves (below);
 2. finds the producer of the output among the mission's sessions (a session's own records only):
    the tool call whose result stored it; for a `read`, the call that stored the file text its header
    names; for the complete output of a background job, the call that started the job. A view
@@ -1737,8 +1743,11 @@ replaces it. A role that needs a verifier (`verify_finish`, or an explicit `veri
 of the same pack that is `read_only` and has `verdict` and `out_read` or `out_grep`. A pack with
 `requires_restricted_network = true` says in its prompts that the network is restricted, so its sessions
 are refused at creation and at every activation while the network mode is `open`. The system prompt is
-the preamble, the role prompt and an `# Environment` section, joined by blank lines and identical for
-identical inputs.
+the preamble, the role prompt, a `# Project instructions` section when the workspace root has an
+`AGENTS.md` or `CLAUDE.md` (read once when the session is created, 32 KiB at most, recorded in
+`session_start.project_instructions` and rendered from that record, so a resumed session sends the same bytes;
+`[agents] project_instructions = false` turns it off) and an `# Environment` section, joined by blank lines and
+identical for identical inputs.
 
 Two tools belong to roles that may need them. `request_scope {hosts, why}` asks the operator for hosts
 (see section 12); `core` `lead` and `chat` and `vr` `researcher`, `scout` and `chat` have it. `conclude

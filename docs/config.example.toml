@@ -137,6 +137,7 @@ unviewed_min_lines = 20    # outputs with at least this many lines never shown a
 unavailable_notice_s = 300 # a model request still retrying after this long opens a non-blocking inbox item and notifies you (it closes by itself); 0 = never
 copy_max_files = 300000    # a workspace with more files is not copied for an agent that asks for its own copy (workspace = "copy", attempts)
 copy_max_mb = 20480        # nor one with more MiB of file content, where a copy duplicates them; 0 = no limit. Not applied on APFS, where copies are clones that take no space until files change
+project_instructions = true  # put the workspace root's AGENTS.md and CLAUDE.md into each new session's system prompt (32 KiB at most); false = never read them
 
 [notify]
 # command = ["/usr/local/bin/my-notify"]   # program run per notification, given LOOM_KIND, LOOM_SESSION, LOOM_TITLE and LOOM_TEXT in its environment; default: the platform's notifier (macOS only; elsewhere nobody is notified)
