@@ -20,6 +20,7 @@ tools = [
   "agent_spawn", "agent_fanout", "attempt", "agent_adopt", "agent_message", "agent_stop", "decide", "verify",
   "request_scope", "conclude", "finish", "ask_user", "report_blocker", "wait", "ask_for",
 ]
+hidden_tools = ["out_read", "out_grep", "claim_update", "step", "wait", "conclude", "job_list", "pin", "reflect", "ask_for"]
 
 # One experiment per scout: one hypothesis, one input, one observation, the smallest harness that
 # establishes the primitive. Returns executed evidence or a blocker, never a narrative.
@@ -33,6 +34,7 @@ tools = [
   "cve_lookup", "advisory_lookup", "dep_scan",
   "finish", "report_blocker", "wait", "hand_off",
 ]
+hidden_tools = ["out_read", "out_grep", "claim_update", "wait", "job_list", "pin", "reflect"]
 
 # The independent check. Checks a proposed scope against the page that authorizes it, and refutes a
 # finding or a finished engagement. Cannot modify the workspace and never judges its own submission.
@@ -47,6 +49,7 @@ tools = [
   "cve_lookup", "advisory_lookup", "dep_scan",
   "verdict", "report_blocker",
 ]
+hidden_tools = ["out_read", "out_grep", "job_list"]
 
 # Interactive research assistant for working alongside the operator, turn by turn.
 [roles.chat]
@@ -59,3 +62,4 @@ tools = [
   "pin", "log_search",
   "cve_lookup", "cve_search", "advisory_lookup", "dep_scan", "request_scope",
 ]
+hidden_tools = ["out_read", "out_grep", "job_list", "pin"]

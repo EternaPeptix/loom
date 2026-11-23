@@ -1249,7 +1249,9 @@ mod tests {
     fn plain_core_pack(packs: &std::path::Path) {
         let core = packs.join("core");
         std::fs::create_dir_all(core.join("roles")).unwrap();
-        let toml = include_str!("../../../packs/core/pack.toml").replacen("\"request_scope\", \"conclude\", ", "", 1);
+        let toml = include_str!("../../../packs/core/pack.toml")
+            .replacen("\"request_scope\", \"conclude\", ", "", 1)
+            .replace("\"conclude\", ", "");
         assert!(!toml.contains("\"conclude\""), "the lead's tool list changed shape");
         std::fs::write(core.join("pack.toml"), toml).unwrap();
         std::fs::write(core.join("harness.md"), include_str!("../../../packs/core/harness.md")).unwrap();

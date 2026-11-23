@@ -10,6 +10,7 @@ target_concurrency = 2
 prompt = "roles/commander.md"
 termination = "explicit"
 tools = ["read", "out_read", "plan", "step", "claim", "claim_update", "evidence", "security_record", "security_query", "agent_spawn", "agent_fanout", "agent_message", "agent_stop", "verify", "request_scope", "conclude", "finish", "report_blocker"]
+hidden_tools = ["out_read", "claim_update", "step", "conclude"]
 may_spawn = ["recon_operator", "tactical_operator", "lateral_operator", "observer", "op_judge"]
 verify_finish = true
 verifier = "op_judge"
@@ -20,18 +21,21 @@ max_exec_calls = 0
 prompt = "roles/recon_operator.md"
 termination = "explicit"
 tools = ["bash", "read", "write", "out_read", "web_fetch", "http_send", "security_ingest", "security_query", "security_record", "claim", "evidence", "finish", "report_blocker", "request_scope", "job_wait", "job_kill", "codec_calc"]
+hidden_tools = ["out_read"]
 max_steps = 25
 
 [roles.tactical_operator]
 prompt = "roles/tactical_operator.md"
 termination = "explicit"
 tools = ["bash", "read", "write", "out_read", "pty_open", "pty_exec", "pty_close", "http_send", "http_repeat", "security_record", "security_query", "claim", "evidence", "finish", "report_blocker", "request_scope", "job_wait", "job_kill"]
+hidden_tools = ["out_read"]
 max_steps = 30
 
 [roles.lateral_operator]
 prompt = "roles/lateral_operator.md"
 termination = "explicit"
 tools = ["bash", "read", "write", "out_read", "pty_open", "pty_exec", "pty_close", "http_send", "http_repeat", "security_record", "security_query", "claim", "evidence", "finish", "report_blocker", "request_scope", "job_wait", "job_kill"]
+hidden_tools = ["out_read"]
 requires_credential = true
 max_steps = 30
 
@@ -39,6 +43,7 @@ max_steps = 30
 prompt = "roles/observer.md"
 termination = "explicit"
 tools = ["read", "out_read", "log_search", "security_query", "finish", "report_blocker"]
+hidden_tools = ["out_read"]
 read_only = true
 max_steps = 8
 
@@ -46,6 +51,7 @@ max_steps = 8
 prompt = "roles/op_judge.md"
 termination = "explicit"
 tools = ["read", "out_read", "oracle_check", "security_query", "security_record", "evidence", "verdict"]
+hidden_tools = ["out_read"]
 read_only = true
 max_steps = 12
 # model = "independent-judge" # operator-defined profile; also set lead require_distinct_verifier_profile = true when configured.

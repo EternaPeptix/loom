@@ -423,7 +423,7 @@ pub fn check_finish_lead(ledger: &LedgerState, answer: &str) -> Result<(), Strin
         text.push_str("\n\nHow to close them:");
         if !open.plan.is_empty() {
             text.push_str(
-                "\n- Plan steps: call `step` with status done (say in the note what showed it) or dropped (say why).",
+                "\n- Plan steps: call `plan` with status done (say in the note what showed it) or dropped (say why).",
             );
         }
         let objections = ledger.obligations.iter().any(|o| o.outcome.is_none() && o.kind == ObligationKind::Objection);
@@ -437,7 +437,7 @@ pub fn check_finish_lead(ledger: &LedgerState, answer: &str) -> Result<(), Strin
         }
         if !open.claims.is_empty() {
             text.push_str(
-                "\n- Claims: attach evidence with `evidence` and set the status with `claim_update`, or withdraw the claim.",
+                "\n- Claims: attach evidence with `evidence` and set the status with `claim` and `id`, or withdraw the claim.",
             );
         }
         if !open.questions.is_empty() {
@@ -1063,9 +1063,9 @@ To keep working, call a tool. To deliver your result, call finish; if the assign
         assert!(text.contains("obligation o1 (job): cargo test running"));
         assert!(text.contains("claim c3 (no evidence attached): Parser handles nesting"));
         assert!(text.contains("question q1 (waiting for the operator): Which branch?"));
-        assert!(text.contains("call `step` with status done (say in the note what showed it) or dropped (say why)"));
+        assert!(text.contains("call `plan` with status done (say in the note what showed it) or dropped (say why)"));
         assert!(text.contains("wait for the job or agent to report, or stop it"));
-        assert!(text.contains("attach evidence with `evidence` and set the status with `claim_update`, or withdraw"));
+        assert!(text.contains("attach evidence with `evidence` and set the status with `claim` and `id`, or withdraw"));
         assert!(text.contains("`ask_user` ends the turn until they are answered"));
         assert!(!text.contains("The answer is empty"));
     }
@@ -1081,7 +1081,7 @@ To keep working, call a tool. To deliver your result, call finish; if the assign
             evidence: vec![],
         });
         let Err(text) = check_finish_lead(&l, "ok") else { panic!("expected refusal") };
-        assert!(text.contains("`step`"));
+        assert!(text.contains("`plan`"));
         assert!(!text.contains("Obligations:") && !text.contains("Claims:") && !text.contains("Questions:"));
         let clean = LedgerState::default();
         assert_eq!(check_finish_lead(&clean, "fixed it"), Ok(()));

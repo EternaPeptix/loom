@@ -142,7 +142,7 @@ pub async fn grep_handle(ctx: &ToolCtx, handle: &str, args: &Map<String, Value>)
         Ok(re) => re,
         Err(e) => {
             return ToolOutput::error(format!(
-                "The pattern `{pattern}` is not a valid regular expression: {e}\nFix it (Rust/RE2 syntax; escape literal special characters with a backslash) and call `out_grep` again."
+                "The pattern `{pattern}` is not a valid regular expression: {e}\nFix it (Rust/RE2 syntax; escape literal special characters with a backslash) and call `grep` again."
             ))
         }
     };
@@ -192,10 +192,10 @@ pub async fn grep_handle(ctx: &ToolCtx, handle: &str, args: &Map<String, Value>)
         .with_more(format!("{shown_count} of {} matching lines", found.total_matches));
     if left_out > 0 {
         out = out.with_more(format!(
-            "{left_out} more matches not shown to stay within the size one result may show: narrow the pattern, lower context, or read ranges with out_read"
+            "{left_out} more matches not shown to stay within the size one result may show: narrow the pattern, lower context, or read ranges with read"
         ));
     } else if found.total_matches > shown_count {
-        out = out.with_more("narrow the pattern or read ranges with out_read");
+        out = out.with_more("narrow the pattern or read ranges with read");
     }
     out
 }
@@ -399,8 +399,7 @@ mod tests {
         let h = put(&e, &lines(30));
         let r = e.call("out_grep", json!({"handle": h, "pattern": "LINE 1", "ignore_case": true, "context": 0})).await;
         assert!(
-            r.text.contains("3 of 11 matching lines")
-                && r.text.contains("narrow the pattern or read ranges with out_read"),
+            r.text.contains("3 of 11 matching lines") && r.text.contains("narrow the pattern or read ranges with read"),
             "{}",
             r.text
         );
@@ -464,6 +463,6 @@ mod tests {
         assert!(r.text.contains("1: match 1") && r.text.contains("2: match 2"), "{}", r.text);
         assert!(!r.text.contains("3: match 3"), "{}", r.text);
         assert!(r.text.contains("2 of 5 matching lines"), "{}", r.text);
-        assert!(r.text.contains("narrow the pattern or read ranges with out_read"), "{}", r.text);
+        assert!(r.text.contains("narrow the pattern or read ranges with read"), "{}", r.text);
     }
 }

@@ -180,7 +180,7 @@
 //! Result body `Body::Raw(report)`; outcome `verdict: accepted` / `verdict: not accepted` from
 //! `payload.accepted`, or `no verdict ({outcome})` when the payload has none (status `Error`).
 //! When the claim form was used, a last line is appended to the body: `The verdict is not recorded
-//! on {id}; set the claim's status yourself with `claim_update`.`
+//! on {id}; set the claim's status yourself with `claim` and `id`.`
 //!
 //! Tests required (fake `Orchestrator` recording every call and scripted per call; calls made
 //! through `loom_tools::execute`): `assignment` — every rule; `agent_spawn` — awaited result for
@@ -682,7 +682,7 @@ impl Tool for AgentSpawn {
             let mut out = ToolOutput::ok(
                 format!("agent {id} started"),
                 Body::Message(format!(
-                    "Agent {id} ({role}) is working. Its report will arrive as a harness message when it ends. Call `wait` when you have nothing else to do until then.{copy}"
+                    "Agent {id} ({role}) is working. Its report will arrive as a harness message when it ends. Call `job_wait` without `job` when you have nothing else to do until then.{copy}"
                 )),
             );
             if let Some(note) = role_note {
@@ -1581,7 +1581,7 @@ impl Tool for Verify {
         let mut report = settlement.report.clone();
         if let Some(id) = claim_id {
             report.push_str(&format!(
-                "\n\nThe verdict is not recorded on {id}; set the claim's status yourself with `claim_update`."
+                "\n\nThe verdict is not recorded on {id}; set the claim's status yourself with `claim` and `id`."
             ));
         }
         let mut out = match settlement.payload.get("accepted").and_then(Value::as_bool) {
@@ -2098,7 +2098,7 @@ mod tests {
         assert!(res.text.contains("verdict: accepted"), "{}", res.text);
         assert!(
             res.text
-                .contains("The verdict is not recorded on c1; set the claim's status yourself with `claim_update`."),
+                .contains("The verdict is not recorded on c1; set the claim's status yourself with `claim` and `id`."),
             "{}",
             res.text
         );

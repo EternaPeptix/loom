@@ -185,7 +185,7 @@
 //!   `` `{role}` is not a role this session can start. Roles it can start: {list}. ``
 //! - at most `agents.max_children` unsettled children per parent, not counting the finish gate's
 //!   verifiers (as in `children`): otherwise `{n} agents are already running, which is the most
-//!   allowed at once. Wait for one to finish (`wait`) or stop one (`agent_stop`), then start this
+//!   allowed at once. Wait for one to finish (`job_wait` without `job`) or stop one, then start this
 //!   one.`
 //! - the operator's choice for the mission comes first for a fresh child: the parent's
 //!   `role_models` for the role, else its `*` entry (not for a `harness` request, the finish gate's
@@ -3788,7 +3788,7 @@ impl Inner {
                 .count();
             if !req.harness && running >= self.config.agents.max_children as usize {
                 return Err(format!(
-                    "{running} agents are already running, which is the most allowed at once. Wait for one to finish (`wait`) or stop one (`agent_stop`), then start this one."
+                    "{running} agents are already running, which is the most allowed at once. Wait for one to finish (`job_wait` without `job`) or stop one, then start this one."
                 ));
             }
             let mut fork_point = None;
@@ -6614,7 +6614,9 @@ mod tests {
     fn plain_core_pack(packs: &Path) {
         let core = packs.join("core");
         std::fs::create_dir_all(core.join("roles")).unwrap();
-        let toml = include_str!("../../../packs/core/pack.toml").replacen("\"request_scope\", \"conclude\", ", "", 1);
+        let toml = include_str!("../../../packs/core/pack.toml")
+            .replacen("\"request_scope\", \"conclude\", ", "", 1)
+            .replace("\"conclude\", ", "");
         assert!(!toml.contains("\"conclude\""), "the lead's tool list changed shape");
         std::fs::write(core.join("pack.toml"), toml).unwrap();
         std::fs::write(core.join("harness.md"), include_str!("../../../packs/core/harness.md")).unwrap();

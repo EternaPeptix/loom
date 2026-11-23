@@ -16,6 +16,7 @@ tools = [
   "agent_spawn", "agent_fanout", "agent_message", "agent_stop", "decide", "verify",
   "finish", "ask_user", "report_blocker", "wait",
 ]
+hidden_tools = ["out_read", "out_grep", "claim_update", "step", "wait", "job_list", "pin", "reflect", "agent_fanout", "agent_message", "agent_stop", "decide"]
 
 [roles.worker]
 description = "Carries out one assignment from a lead and returns a result with quoted evidence."
@@ -27,6 +28,7 @@ tools = [
   "note", "claim", "claim_update", "evidence", "ledger", "pin", "log_search", "reflect",
   "finish", "report_blocker", "wait",
 ]
+hidden_tools = ["out_read", "out_grep", "claim_update", "wait", "job_list", "pin", "reflect"]
 
 [roles.verifier]
 description = "Independently tries to refute a claim or a finished mission. Cannot modify the workspace."
@@ -38,6 +40,7 @@ tools = [
   "ledger", "log_search",
   "verdict", "report_blocker",
 ]
+hidden_tools = ["out_read", "out_grep", "job_list"]
 
 [roles.chat]
 description = "Interactive assistant: answers and acts turn by turn; a reply without a tool call ends the turn."
@@ -47,3 +50,4 @@ tools = [
   "bash", "job_wait", "job_kill", "job_list", "read", "write", "edit", "glob", "grep", "out_read", "out_grep", "web_fetch",
   "pin", "log_search",
 ]
+hidden_tools = ["out_read", "out_grep", "job_list", "pin"]

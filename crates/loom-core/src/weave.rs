@@ -1003,7 +1003,7 @@ fn plan_on(
 /// Line 1 is the first line of `result.text` (the envelope header written at admission), unchanged.
 /// For `ToolClass::Exec`, the last `stub_tail_lines` lines of `result.text` follow under the line
 /// `[last {n} lines as first shown]`. The final line is:
-/// `[evicted from view, not from the record: {lines} lines / {bytes} bytes. Full output: {handle} — read it again with out_read or out_grep before relying on it.]`
+/// `[evicted from view, not from the record: {lines} lines / {bytes} bytes. Full output: {handle} — read it again with read or grep before relying on it.]`
 /// (`{lines}`/`{bytes}`/`{handle}` from `result.output`). A view (no stored output of its own, and
 /// `meta[META_OF_BLOB]` a non-empty string) ends with `[evicted from view, not from the record. It
 /// showed lines of out:{the first 16 characters of that id} — read them again with out_read or out_grep
@@ -1033,7 +1033,7 @@ pub fn stub_text(call: Option<&ToolCall>, result: &ToolResult, stub_tail_lines: 
     out.push('\n');
     match &result.output {
         Some(b) => out.push_str(&format!(
-            "[evicted from view, not from the record: {} lines / {} bytes. Full output: {} — read it again with out_read or out_grep before relying on it.]",
+            "[evicted from view, not from the record: {} lines / {} bytes. Full output: {} — read it again with read or grep before relying on it.]",
             b.lines,
             b.bytes,
             b.handle()
@@ -1041,7 +1041,7 @@ pub fn stub_text(call: Option<&ToolCall>, result: &ToolResult, stub_tail_lines: 
         None => match result.meta.get(crate::event::META_OF_BLOB).and_then(Value::as_str).filter(|id| !id.is_empty()) {
             // A view stores nothing of its own; its stub names the output it showed.
             Some(id) => out.push_str(&format!(
-                "[evicted from view, not from the record. It showed lines of out:{} — read them again with out_read or out_grep before relying on it.]",
+                "[evicted from view, not from the record. It showed lines of out:{} — read them again with read or grep before relying on it.]",
                 id.chars().take(16).collect::<String>()
             )),
             None => out.push_str("[evicted from view, not from the record. Run it again if the result matters.]"),
@@ -2157,7 +2157,7 @@ mod tests {
         t.meta.insert(crate::event::META_OF_BLOB.into(), serde_json::json!("cd".repeat(32)));
         assert_eq!(
             stub_text(None, &t, 2),
-            "[out_read ok]\n[evicted from view, not from the record. It showed lines of out:cdcdcdcdcdcdcdcd — read them again with out_read or out_grep before relying on it.]"
+            "[out_read ok]\n[evicted from view, not from the record. It showed lines of out:cdcdcdcdcdcdcdcd — read them again with read or grep before relying on it.]"
         );
         // An empty id, or a result with its own output, keeps the old lines.
         t.meta.insert(crate::event::META_OF_BLOB.into(), serde_json::json!(""));
@@ -2523,7 +2523,7 @@ mod tests {
         let exec = stub_text(None, &get(1), 2);
         assert_eq!(
             exec,
-            "[bash ok]\n[last 2 lines as first shown]\nthree\nfour\n[evicted from view, not from the record: 77 lines / 999 bytes. Full output: out:abababababababab — read it again with out_read or out_grep before relying on it.]"
+            "[bash ok]\n[last 2 lines as first shown]\nthree\nfour\n[evicted from view, not from the record: 77 lines / 999 bytes. Full output: out:abababababababab — read it again with read or grep before relying on it.]"
         );
         let read = stub_text(None, &get(2), 2);
         assert!(read.starts_with("[read ok]\n[evicted from view"));

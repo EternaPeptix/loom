@@ -143,7 +143,7 @@ impl Tool for LogSearch {
     fn spec(&self) -> ToolSpec {
         spec(
             "log_search",
-            "Search the complete record of this session for a regular expression: every message, every call you made and every output — including anything that is no longer in view. Matches in tool output come with the out:… handle and line number, which `out_read` opens.",
+            "Search the complete record of this session for a regular expression: every message, every call you made and every output — including anything that is no longer in view. Matches in tool output come with the out:… handle and line number, which `read` opens.",
             ToolClass::Nav,
             &[
                 req("pattern", "string", "A regular expression (Rust regex syntax, case-sensitive; prefix (?i) to ignore case)."),

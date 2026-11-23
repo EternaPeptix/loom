@@ -79,7 +79,7 @@ impl Tool for DepScan {
     fn spec(&self) -> ToolSpec {
         params::spec(
             "dep_scan",
-            "Scan a project's dependencies with OWASP dep-scan: generate a CycloneDX SBOM (via cdxgen) for a directory, or examine an existing CycloneDX SBOM file, and report known-vulnerable components prioritized by dep-scan's own reachability analysis. Returns counts and the top findings; the full VDR and SBOM are stored so you can page them with out_read and quote them as evidence. Requires the `depscan` command installed on the host (it is never installed for you); a first scan downloads its vulnerability database through the session's network proxy, so that may need scope and can take minutes. dep-scan's prioritized/reachable labels are static scanner verdicts, not proof that vulnerable code executes.",
+            "Scan a project's dependencies with OWASP dep-scan: generate a CycloneDX SBOM (via cdxgen) for a directory, or examine an existing CycloneDX SBOM file, and report known-vulnerable components prioritized by dep-scan's own reachability analysis. Returns counts and the top findings; the full VDR and SBOM are stored so you can page them with `read` and quote them as evidence. Requires the `depscan` command installed on the host (it is never installed for you); a first scan downloads its vulnerability database through the session's network proxy, so that may need scope and can take minutes. dep-scan's prioritized/reachable labels are static scanner verdicts, not proof that vulnerable code executes.",
             ToolClass::Exec,
             &[
                 params::opt("path", "string", "Project directory to scan, or one CycloneDX SBOM (.json) file to examine, relative to the workspace (default: the workspace itself)."),

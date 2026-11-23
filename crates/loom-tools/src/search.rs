@@ -1696,6 +1696,6 @@ mod tests {
         assert!(r.text.contains("1: hit one") && r.text.contains("3: hit two"), "{}", r.text);
         assert!(!r.text.contains("4: hit three"), "{}", r.text);
         assert!(r.text.contains("2 of 3 matching lines"), "{}", r.text);
-        assert!(r.text.contains("narrow the pattern or read ranges with out_read"), "{}", r.text);
+        assert!(r.text.contains("narrow the pattern or read ranges with read"), "{}", r.text);
     }
 }
