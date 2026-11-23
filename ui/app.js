@@ -592,6 +592,9 @@ function openSession(id) {
   renderChips(attachCtx.composer);
   want("header", "blocks", "live", "right", "overview");
   loadProfiles();
+  S.queued = { session: null, items: [], error: "", editing: null, editText: "", busy: new Set() };
+  renderQueue();
+  loadQueued();
   loadRecords(S.rec, 0);
   loadNet();
   loadLedger();
@@ -711,6 +714,7 @@ function ctx() {
 
 function handleEvent(ev) {
   S.lastUpdate = Date.now();
+  if (ev.type === "queued") { if (ev.session === S.openId) loadQueued(); return; }
   if (ev.type === "record" && ev.record) noteActivity(ev.session, ev.record);
   for (const f of C.planEvent(ev, ctx())) {
     switch (f.fx) {
@@ -1004,7 +1008,7 @@ function renderStats() {
 function renderCaption(info, stats) {
   const node = $("s-caption");
   if (!info || S.view !== "session") { node.hidden = true; return; }
-  const cap = C.composerCaption({ line: progressLineFor(info), stats: stats || C.sessionStats(info, S.rec ? S.rec.blocks : []) });
+  const cap = C.composerCaption({ line: progressLineFor(info), stats: stats || C.sessionStats(info, S.rec ? S.rec.blocks : []), queued: queuedCount() });
   const text = $("s-caption-text");
   if (text.textContent !== cap.text) text.textContent = cap.text;
   node.setAttribute("aria-label", cap.label);
@@ -1530,7 +1534,7 @@ function renderHeader() {
   // A message is not an answer: say so while a question of this mission waits on the operator.
   const paused = missionEntries().some(entry => entry.item.blocking);
   const lead = C.rootNoun(info) === "lead";
-  const help = C.composerHelp({ coarse: COARSE.matches, paused, running: a.running, lead });
+  const help = C.composerHelp({ coarse: COARSE.matches, paused, running: a.running && lead, lead, mac: MAC });
   $("composer-help").textContent = [help.keys, help.note].filter(Boolean).join(" ");
   $("composer-help").hidden = !a.send;
   $("msg").enterKeyHint = COARSE.matches ? "enter" : "send";
@@ -1562,6 +1566,12 @@ function renderHeader() {
   $("send").setAttribute("aria-label", sendLabel);
   $("send").title = att.busy ? "Waiting for the uploads to finish" : att.failed ? "Remove the attachment that failed to upload first" : sendLabel === "Send" ? (COARSE.matches ? "Send" : "Send (Enter)") : sendLabel;
   $("send").setAttribute("aria-busy", String(sending || !!pendingReceipt));
+  const canQueue = a.send && a.running && lead;
+  $("send-more").hidden = !canQueue;
+  $("send-more").disabled = $("send").disabled;
+  if (!canQueue) closeSendMenu();
+  if (canQueue && !COARSE.matches && sendLabel === "Send" && !att.busy && !att.failed) $("send").title = "Send now (Enter) · Queue for after this turn (" + (MAC ? "⌥Enter" : "Alt+Enter") + ")";
+  renderQueue();
   const question = renderSeat(info);
   $("send-state").textContent = question ? "" : C.sendStateText({ loaded: !!S.rec?.initialComplete, seat: S.seatNote.get(info.id), message });
   updateChildBlocker();
@@ -2389,6 +2399,112 @@ function attachedFiles(b, sp) {
   return box;
 }
 
+
+// ---------------------------------------------------------------------------------------------
+// Images (docs/CONTRACTS-2026-11-23.md D7): thumbnails, the viewer dialog, composer chip thumbnails
+
+const imageCache = new Map(); // blob id -> Promise<data URL>; the bytes come only from /api/images/ and are cached for the page
+const lazyImages = typeof IntersectionObserver === "function"
+  ? new IntersectionObserver((entries) => {
+    for (const e of entries) if (e.isIntersecting) { lazyImages.unobserve(e.target); fillImage(e.target); }
+  }, { rootMargin: "200px" })
+  : null;
+
+/** The image bytes need the bearer header, which an img tag cannot send: fetch them, then show them as a data URL (the CSP allows data:). */
+function imageData(blob) {
+  if (!imageCache.has(blob)) {
+    const p = (async () => {
+      const r = await fetch(C.imageUrl(blob), { credentials: "omit", headers: authHeaders() });
+      if (r.status === 401) { lost(); throw new Error(C.LOST_TOKEN); }
+      if (!r.ok) throw new Error("The image could not be loaded (" + r.status + ").");
+      const data = await r.blob();
+      return await new Promise((resolve, reject) => {
+        const fr = new FileReader();
+        fr.addEventListener("load", () => resolve(String(fr.result)));
+        fr.addEventListener("error", () => reject(new Error("The image could not be read.")));
+        fr.readAsDataURL(data);
+      });
+    })();
+    p.catch(() => imageCache.delete(blob));
+    imageCache.set(blob, p);
+  }
+  return imageCache.get(blob);
+}
+
+function fillImage(img) {
+  imageData(img.dataset.blob).then(
+    (url) => { img.src = url; img.classList.add("loaded"); },
+    (e) => { img.closest(".thumb")?.classList.add("broken"); img.alt = img.alt + " (not loaded: " + e.message + ")"; img.title = e.message; },
+  );
+}
+
+/** One thumbnail button (max 240x240) that opens the viewer. `tool` is the tool name for a tool result's image. */
+function thumb(image, { tool = "", files = [], args = null } = {}) {
+  if (!C.imageUrl(image.blob)) return null;
+  const size = C.thumbSize(image.width, image.height);
+  const alt = C.imageAlt(image, tool);
+  const b = el("button", "thumb");
+  b.type = "button";
+  b.setAttribute("aria-label", "Open image: " + alt + (C.imageFacts(image) ? ", " + C.imageFacts(image) : ""));
+  b.title = alt;
+  const img = el("img");
+  img.alt = alt;
+  img.loading = "lazy";
+  img.decoding = "async";
+  img.width = size.width;
+  img.height = size.height;
+  img.dataset.blob = image.blob;
+  add(b, img);
+  b.addEventListener("click", () => openImage(image, { tool, files, args, opener: b }));
+  if (lazyImages) lazyImages.observe(img); else fillImage(img);
+  return b;
+}
+
+function thumbRow(images, opts) {
+  const list = el("ul", "thumbs");
+  list.setAttribute("aria-label", C.imageCountLabel(images.length));
+  for (const image of images) { const t = thumb(image, opts); if (t) add(list, add(el("li"), t)); }
+  return list.children.length ? list : null;
+}
+
+let imageOpener = null;
+function openImage(image, { tool = "", files = [], args = null, opener = document.activeElement } = {}) {
+  const dialog = $("imgview");
+  imageOpener = opener;
+  const alt = C.imageAlt(image, tool);
+  $("imgview-title").textContent = image.name || alt;
+  $("imgview-info").textContent = C.imageFacts(image);
+  const big = $("imgview-img");
+  big.alt = alt;
+  big.removeAttribute("src");
+  imageData(image.blob).then((url) => { if (imageOpener === opener) big.src = url; }, (e) => { $("imgview-error").textContent = e.message; $("imgview-error").hidden = false; });
+  $("imgview-error").hidden = true;
+  const path = C.imagePath(image, { files, args });
+  const copy = $("imgview-copy");
+  copy.hidden = !path;
+  copy.dataset.path = path || "";
+  $("imgview-path").textContent = path || "";
+  if (!dialog.open) dialog.showModal();
+  $("imgview-close").focus({ preventScroll: true });
+}
+function closeImage() {
+  const dialog = $("imgview");
+  if (dialog.open) dialog.close();
+}
+
+/** A small thumbnail of a local image file for a composer chip, read from the File itself (never from a URL). */
+function chipThumb(file, name) {
+  const img = el("img", "chip-thumb");
+  img.alt = "";
+  img.width = 20;
+  img.height = 20;
+  const fr = new FileReader();
+  fr.addEventListener("load", () => { img.src = String(fr.result); });
+  fr.readAsDataURL(file);
+  img.title = name;
+  return img;
+}
+
 function buildBlock(b, ctx = {}) {
   const root = el("div", "block " + b.kind + (b.detail ? " detail" : ""));
   b.ui = b.ui || {};
@@ -2403,6 +2519,7 @@ function buildBlock(b, ctx = {}) {
         add(root, bubble, copyButton("Copy message", () => C.messageCopyText(b), { what: "Message", source: bubble, key: "copy-msg:" + b.id }));
       }
       if (sp.files.length) add(root, attachedFiles(b, sp));
+      if (b.images && b.images.length) add(root, thumbRow(b.images, { files: sp.files }));
       break;
     }
     case "note": {
@@ -2589,6 +2706,13 @@ function buildTool(root, b) {
     chip.title = stat.words;
     add(head, chip);
   }
+  if (res && res.images && res.images.length) {
+    const n = el("span", "img-count");
+    add(n, icon("image"), document.createTextNode(String(res.images.length)));
+    n.title = C.imageCountLabel(res.images.length);
+    n.setAttribute("aria-label", C.imageCountLabel(res.images.length));
+    add(head, n);
+  }
   if (row.duration) add(head, el("span", "dur", row.duration));
   else if (row.state === "running" && Number.isFinite(b.ts)) {
     // A call still out counts up, so a long build reads as working, not stuck (tickGroups moves it each second).
@@ -2613,6 +2737,7 @@ function buildTool(root, b) {
   }
   if (b.ui.args) add(body, textBox(JSON.stringify(b.args, null, 2), "txt out"));
   if (res) {
+    if (res.images && res.images.length) add(body, thumbRow(res.images, { tool: b.ran || b.name, args: b.args }));
     if (res.text === "") add(body, el("div", "dim", "(no output)"));
     else add(body, collapsible(b, "all", res.text, 24, { styled: true }));
     const s = res.shown;
@@ -4773,7 +4898,7 @@ function renderChips(c) {
   box.hidden = !list.length;
   for (const a of list) {
     const chip = el("li", "attach-chip " + a.state);
-    add(chip, icon(a.state === "failed" ? "alert" : "source"), el("span", "attach-name", a.name));
+    add(chip, a.file && a.state !== "failed" && C.isImageFile(a.file) ? chipThumb(a.file, a.name) : icon(a.state === "failed" ? "alert" : "source"), el("span", "attach-name", a.name));
     if (a.state === "uploading") add(chip, el("span", "attach-size", "Uploading…"));
     else if (a.state === "failed") add(chip, el("span", "attach-error", a.error));
     else add(chip, el("span", "attach-size", C.byteSize(a.size)));
@@ -4787,6 +4912,12 @@ function renderChips(c) {
     add(chip, x);
     if (a.state === "failed") chip.setAttribute("role", "alert");
     add(box, chip);
+    if (a.state !== "failed" && a.file && C.isImageFile(a.file) && c.key() && c.key() !== "new" && visionOff()) {
+      const note = el("li", "attach-note dim", C.NO_VISION_NOTE);
+      add(box, note);
+    } else if (a.state !== "failed" && a.file && C.isImageFile(a.file) && c.key() === "new" && newVisionOff()) {
+      add(box, el("li", "attach-note dim", C.NO_VISION_NOTE));
+    }
   }
   c.changed();
 }
@@ -4799,7 +4930,7 @@ function addFiles(c, files) {
   const list = attachList(key);
   attachments.set(key, list);
   for (const file of files) {
-    const a = { id: ++attachSeq, name: file.name || "pasted-file", size: file.size, state: "uploading", path: "", error: "", ws };
+    const a = { id: ++attachSeq, name: file.name || "pasted-file", size: file.size, state: "uploading", path: "", error: "", ws, file };
     list.push(a);
     uploadOne(c, key, a, file);
   }
@@ -4874,7 +5005,8 @@ function syncNewAttach() {
   } else if (!list.length && ws) note.hidden = true;
 }
 
-async function sendMessage() {
+async function sendMessage(when = S.sendWhen || "now") {
+  S.sendWhen = "now";
   const id = S.openId;
   const key = "message:" + id;
   const text = $("msg").value;
@@ -4897,7 +5029,7 @@ async function sendMessage() {
   S.messageState.set(id, { state: "sending", accepted: false, sentText: text, attached: att.paths.length > 0, afterSeq: C.lastSeq(S.rec) ?? -1, text: "Sending to " + (info.title || id) + "…", at: ++S.stamp });
   renderHeader();
   try {
-    await api("POST", "/api/sessions/" + encodeURIComponent(id) + "/messages", att.paths.length ? { text, attachments: att.paths } : { text });
+    await api("POST", "/api/sessions/" + encodeURIComponent(id) + "/messages", { ...(att.paths.length ? { text, attachments: att.paths } : { text }), ...(queueNow(id, when) ? { when: "after_turn" } : {}) });
     const sent = new Set(att.paths);
     const rest = attachList(key).filter(a => !sent.has(a.path));
     if (rest.length) attachments.set(key, rest); else attachments.delete(key);
@@ -4927,6 +5059,163 @@ function seatModels() {
 async function loadProfiles() {
   try { S.profiles = await api("GET", "/api/models"); } catch { /* /api/status still names the profiles */ }
   if (S.view === "session") want("header");
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// Queued messages (docs/CONTRACTS-2026-11-23.md E5)
+
+S.queued = { session: null, items: [], error: "", editing: null, editText: "", busy: new Set() };
+
+async function loadQueued() {
+  const id = S.openId;
+  if (!id) return;
+  try {
+    const items = C.queuedList(await api("GET", C.queuedUrl(id)));
+    if (S.openId !== id) return;
+    S.queued.session = id;
+    S.queued.items = items;
+    S.queued.error = "";
+    if (S.queued.editing && !items.some(i => i.id === S.queued.editing)) S.queued.editing = null;
+  } catch (e) {
+    if (S.openId !== id) return;
+    // A daemon without the route says nothing: the list stays empty and the composer keeps working.
+    S.queued.session = id;
+    S.queued.items = [];
+    S.queued.error = e.status === 404 ? "" : e.message;
+  }
+  renderQueue();
+  renderCaption(S.sessions.byId.get(id));
+}
+
+function queuedCount() {
+  return S.queued.session === S.openId ? S.queued.items.length : 0;
+}
+
+async function queueAct(item, what) {
+  const id = S.openId;
+  const busy = S.queued.busy;
+  if (busy.has(item.id)) return;
+  busy.add(item.id);
+  S.queued.error = "";
+  try {
+    if (what === "remove") await api("DELETE", C.queuedUrl(id, item.id));
+    else if (what === "send") await api("POST", C.queuedUrl(id, item.id, "send"));
+    else if (what === "save") {
+      await api("PUT", C.queuedUrl(id, item.id), { text: S.queued.editText });
+      S.queued.editing = null;
+    }
+  } catch (e) {
+    // 404: it was just sent or removed elsewhere; the list below is the truth.
+    S.queued.error = e.status === 404 ? "That message is no longer queued; it may have just been sent." : e.message;
+    if (e.status === 404 && S.queued.editing === item.id) S.queued.editing = null;
+  } finally {
+    busy.delete(item.id);
+  }
+  await loadQueued();
+}
+
+function renderQueue() {
+  const box = $("queue-box");
+  const items = S.queued.session === S.openId && S.view === "session" ? S.queued.items : [];
+  const editing = S.queued.editing;
+  // An edit in progress keeps its textarea (and focus) while the list refreshes around it.
+  const keep = editing && box.querySelector("textarea.queue-edit");
+  if (keep && items.some(i => i.id === editing) && !S.queued.error) {
+    return;
+  }
+  const hadFocus = box.contains(document.activeElement) ? document.activeElement.dataset.focusKey : null;
+  box.replaceChildren();
+  box.hidden = !items.length && !S.queued.error;
+  if (!items.length && !S.queued.error) return;
+  const head = el("h2", "queue-head", "Queued for after this turn · " + items.length);
+  head.id = "queue-head";
+  add(box, head);
+  if (S.queued.error) {
+    const err = el("p", "error", S.queued.error);
+    err.setAttribute("role", "alert");
+    add(box, err);
+  }
+  const list = el("ul", "queue-list");
+  list.setAttribute("aria-labelledby", "queue-head");
+  for (const item of items) {
+    const li = el("li", "queue-item");
+    const busy = S.queued.busy.has(item.id);
+    if (S.queued.editing === item.id) {
+      const ta = el("textarea", "queue-edit");
+      ta.value = S.queued.editText;
+      ta.rows = 3;
+      ta.setAttribute("aria-label", "Edit queued message");
+      ta.dataset.focusKey = "q-edit:" + item.id;
+      ta.addEventListener("input", () => { S.queued.editText = ta.value; });
+      ta.addEventListener("keydown", (e) => {
+        if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); S.queued.editing = null; renderQueue(); focusQueue("q-editbtn:" + item.id); }
+      });
+      const save = btn("Save", "small primary", () => queueAct(item, "save"));
+      save.disabled = busy || !S.queued.editText.trim();
+      const cancel = btn("Cancel", "small", () => { S.queued.editing = null; renderQueue(); focusQueue("q-editbtn:" + item.id); });
+      add(li, ta, add(el("div", "queue-actions"), save, cancel));
+    } else {
+      const preview = el("p", "queue-text", C.queuedPreview(item.text) || "(files only)");
+      preview.title = item.text;
+      if (item.attachments.length) add(preview, el("span", "dim", " · " + item.attachments.length + (item.attachments.length === 1 ? " file" : " files")));
+      const edit = btn("Edit", "small", () => { S.queued.editing = item.id; S.queued.editText = item.text; renderQueue(); focusQueue("q-edit:" + item.id); });
+      edit.dataset.focusKey = "q-editbtn:" + item.id;
+      edit.setAttribute("aria-label", "Edit queued message: " + C.queuedPreview(item.text, 40));
+      const now = btn("Send now", "small", () => queueAct(item, "send"));
+      now.dataset.focusKey = "q-send:" + item.id;
+      now.setAttribute("aria-label", "Send now: " + C.queuedPreview(item.text, 40));
+      const rm = btn("Remove", "small", () => queueAct(item, "remove"));
+      rm.dataset.focusKey = "q-rm:" + item.id;
+      rm.setAttribute("aria-label", "Remove queued message: " + C.queuedPreview(item.text, 40));
+      for (const b of [edit, now, rm]) b.disabled = busy;
+      add(li, preview, add(el("div", "queue-actions"), edit, now, rm));
+    }
+    add(list, li);
+  }
+  add(box, list);
+  if (hadFocus) focusQueue(hadFocus);
+}
+function focusQueue(key) {
+  const node = [...$("queue-box").querySelectorAll("[data-focus-key]")].find(n => n.dataset.focusKey === key);
+  if (node) node.focus({ preventScroll: true });
+}
+
+/** Send now (the default) or queue for after the turn: only a running lead can queue. */
+async function sendChoice(when) {
+  S.sendWhen = when;
+  closeSendMenu();
+  await sendMessage();
+}
+function closeSendMenu(refocus = false) {
+  const menu = $("send-menu");
+  if (menu.hidden) return;
+  menu.hidden = true;
+  $("send-more").setAttribute("aria-expanded", "false");
+  if (refocus) $("send-more").focus({ preventScroll: true });
+}
+function openSendMenu() {
+  const menu = $("send-menu");
+  menu.hidden = false;
+  $("send-more").setAttribute("aria-expanded", "true");
+  menu.querySelector("button").focus({ preventScroll: true });
+}
+
+/** Does the open session's model take no images (its profile says vision: false)? Unknown counts as "takes them". */
+function visionOff() {
+  const info = S.sessions.byId.get(S.openId);
+  return !!info && C.modelVision(seatModels(), C.currentModel(S.rec, info)) === false;
+}
+function newVisionOff() {
+  const want = S.newForm && S.newForm.model;
+  const models = seatModels();
+  const profile = want || (S.profiles && S.profiles.default_model) || "";
+  return !!profile && C.modelVision(models, { profile }) === false;
+}
+/** Queue only a running lead's message that was asked to wait; anything else is sent now. */
+function queueNow(id, when) {
+  const info = S.sessions.byId.get(id);
+  return when === "after_turn" && !!info && C.sessionActions(info).running && C.rootNoun(info) === "lead";
 }
 
 /** The select shows the session's profile; another choice waits behind an inline confirmation. */
@@ -6114,16 +6403,40 @@ function wire() {
   $("composer").addEventListener("keydown", (e) => { if (e.key === "Escape" && S.seat && !S.seatBusy.has(S.seat.session)) { e.preventDefault(); cancelSeat(); } });
   const msg = $("msg");
   msg.addEventListener("input", () => { if (S.openId) C.setDraft(S.drafts, "message:" + S.openId, msg.value); renderHeader(); });
-  $("send").addEventListener("click", sendMessage);
+  $("send").addEventListener("click", () => sendMessage("now"));
+  $("send-more").addEventListener("click", () => ($("send-menu").hidden ? openSendMenu() : closeSendMenu(true)));
+  for (const choice of C.SEND_CHOICES) {
+    const item = $("send-menu").querySelector(`[data-when="${choice.when}"]`);
+    item.textContent = choice.label;
+    item.addEventListener("click", () => { closeSendMenu(); sendMessage(choice.when); });
+  }
+  $("send-menu").addEventListener("keydown", (e) => {
+    const items = [...$("send-menu").querySelectorAll("button")];
+    const at = items.indexOf(document.activeElement);
+    if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); closeSendMenu(true); }
+    else if (e.key === "ArrowDown") { e.preventDefault(); items[(at + 1) % items.length].focus(); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); items[(at + items.length - 1) % items.length].focus(); }
+    else if (e.key === "Tab") closeSendMenu();
+  });
+  document.addEventListener("click", (e) => { if (!$("send-menu").hidden && !e.target.closest("#send-group")) closeSendMenu(); });
+  $("imgview-close").addEventListener("click", closeImage);
+  $("imgview-copy").addEventListener("click", async () => {
+    const path = $("imgview-copy").dataset.path;
+    await copyText(path, { label: "Path" });
+  });
+  $("imgview").addEventListener("close", () => { const o = imageOpener; imageOpener = null; if (o && document.contains(o)) o.focus({ preventScroll: true }); $("imgview-img").removeAttribute("src"); });
+  $("imgview").addEventListener("click", (e) => { if (e.target === $("imgview")) closeImage(); });
   wireAttach(attachCtx.composer, {
     button: "attach-btn", input: "attach-file", drops: ["composer", "scroller"], paste: "msg",
     canDrop: () => !$("attach-btn").hidden && !$("msg").disabled,
   });
   wireAttach(attachCtx.start, { button: "f-attach", input: "f-file", drops: ["new-form"], paste: "f-message" });
   msg.addEventListener("keydown", (e) => {
-    if (C.composerAction({ key: e.key, shiftKey: e.shiftKey, isComposing: e.isComposing, text: msg.value || (attachState("message:" + S.openId).paths.length ? "attached" : ""), coarse: COARSE.matches, mod: e.ctrlKey || e.metaKey }) !== "none") {
+    const info = S.sessions.byId.get(S.openId);
+    const act = C.composerAction({ key: e.key, shiftKey: e.shiftKey, isComposing: e.isComposing, text: msg.value || (attachState("message:" + S.openId).paths.length ? "attached" : ""), coarse: COARSE.matches, mod: e.ctrlKey || e.metaKey, alt: e.altKey, running: !!info && C.sessionActions(info).running && C.rootNoun(info) === "lead" });
+    if (act !== "none") {
       e.preventDefault();
-      sendMessage();
+      if (act !== "ignore") sendMessage(act === "queue" ? "after_turn" : "now");
     }
   });
 

@@ -368,6 +368,24 @@ the text above the block.
 Tool rows (`docs/TOOL-SHAPES.md` section 3): `toolPathArg` also reads `absolute_path` and `target_file`. A call whose
 arguments have a string `description` (bash) is labelled with it; the command stays on the row, dimmer, beside the label.
 
+### Images
+
+Records of kind `user_message` and `tool_result` may carry `images: [{blob, mime, bytes, width, height, name?}]` (`imageList` drops anything whose blob is not hex). The bytes come only from `GET /api/images/{blob}` (`imageUrl`), fetched with the bearer header like every other route and shown as data URLs, so the CSP needs `img-src 'self' data:` and nothing else.
+
+- A thumbnail is a button with an `img` of at most 240 by 240 (`thumbSize` scales down, never up), loaded lazily when it nears the viewport. Its alt text is the image's name, else "image from {tool}", else "attached image". A failed load leaves a dashed box and the daemon's sentence in the title.
+- In an operator message the thumbnails sit under the text and the file chips. In a tool row they sit inside the expanded body, above the output; the collapsed head shows a small image icon with the count ("2 images").
+- A click opens the image dialog (same modal pattern as the stored output viewer: focus moves to Close, Escape closes, focus returns to the thumbnail). It shows the full image scaled to fit, the name, "WxH · size · mime", the path and Copy path. The path is the matching attachment file, else the tool's path argument; with neither, Copy path is hidden.
+- Composer and new-mission chips for image files show a 20 px thumbnail read from the local File (never from a URL). When the session's current model has `vision: false` in `GET /api/models`, each image chip is followed by "This model does not take images; it gets the file path." The file is still attached and the path is still sent.
+
+### Queued messages
+
+While the open session's lead is running the composer has two ways to send. Enter sends now, as always. Alt+Enter (Option+Enter on a Mac) queues the message with `when: "after_turn"`; the help line under the box names both keys. The send button has a small menu button beside it ("More ways to send") with "Send now" and "Queue for after this turn"; it is not shown when the lead is not running or when the open session is an agent. On a phone there is no Enter key to rely on, so the menu is the way to queue.
+
+- Queued messages list above the composer, one row each: a one-line preview of the text and Edit, Send now, Remove. The list is the daemon's (`GET /api/sessions/{id}/queued`); the page re-reads it on load and on every `{type:"queued", session}` event, so two tabs agree.
+- Edit swaps the preview for a textarea with Save and Cancel (Escape cancels); Save is `PUT .../queued/{qid}`. Send now is `POST .../queued/{qid}/send`; Remove is `DELETE`. A 404 means it was sent or removed elsewhere: the row goes and the notice says so.
+- The composer caption shows "N queued" first when any are waiting, and the session details label says it too. Stopping a session keeps its queued messages.
+- On a phone (699px and under) the list takes the width of the composer, the preview wraps to two lines, and the buttons are 44 px tall.
+
 ## Drafts, submissions and updates
 
 Drafts are keyed by session ID for messages and item ID for inbox answers. They survive mission/view

@@ -1186,7 +1186,7 @@ function step(store, rec) {
   trackBudget(store, rec);
   switch (rec.kind) {
     case "user_message":
-      push(store, { ...base(rec), kind: "user", text: rec.text || "" });
+      push(store, { ...base(rec), kind: "user", text: rec.text || "", images: imageList(rec.images) });
       break;
     case "harness_note":
       push(store, { ...base(rec), kind: "note", note: rec.note, text: rec.text || "", open: rec.note === "assignment" });
@@ -1252,6 +1252,7 @@ function step(store, rec) {
         shown: shownOfTotal(rec),
         lines: lineCount(rec.text || ""),
         ts: rec.ts_ms,
+        images: imageList(rec.images),
       };
       // A call sent under another harness's name (`Read`, `shell`, …) runs as a loom tool; the result names that
       // tool. The row shows the tool that ran and keeps the sent name for its tooltip (TOOL-SHAPES §3).
@@ -1475,30 +1476,35 @@ export function atEnd(scrollTop, clientHeight, scrollHeight, slack = 48) {
  * What a key press in the composer does. Ctrl/Cmd+Enter (`mod`) sends everywhere. A plain Enter sends with a fine pointer and
  * adds a line with a coarse one (a phone's Return key), where Send is the button.
  */
-export function composerAction({ key, shiftKey, isComposing, text, coarse = false, mod = false }) {
+export function composerAction({ key, shiftKey, isComposing, text, coarse = false, mod = false, alt = false, running = false }) {
   if (key !== "Enter" || isComposing) return "none";
   if (!mod && (shiftKey || coarse)) return "none";
-  return String(text ?? "").trim() ? "send" : "ignore";
+  if (!String(text ?? "").trim()) return "ignore";
+  // Alt+Enter holds the message until the lead's turn ends; with nothing running there is no turn to wait for.
+  return alt && running ? "queue" : "send";
 }
 
 /**
  * The help under the message box: {keys, note}. `keys` names the keys and is empty on a coarse pointer, which has no
- * Enter-to-send to teach; `note` says what a message does and is kept whole.
+ * Enter-to-send to teach; `note` says what a message does and is kept whole. While a turn runs the keys also name the queue key
+ * (`mac` says ⌥ for Alt).
  */
-export function composerHelp({ coarse = false, paused = false, running = false, lead = false } = {}) {
+export function composerHelp({ coarse = false, paused = false, running = false, lead = false, mac = false } = {}) {
   const note = [];
   if (paused) note.push("A message does not answer the open question.");
   if (running) note.push(lead ? "It reaches the lead between steps." : "It is read between steps.");
-  return { keys: coarse ? "" : "Enter sends · Shift+Enter adds a line.", note: note.join(" ") };
+  const keys = running ? `Enter sends now · ${mac ? "⌥Enter" : "Alt+Enter"} queues it for after this turn · Shift+Enter adds a line.` : "Enter sends · Shift+Enter adds a line.";
+  return { keys: coarse ? "" : keys, note: note.join(" ") };
 }
 
 /**
  * The one-line caption on the phone composer: {text, label}. `line` is progressLine() output and `stats` sessionStats(); the
  * text is "Plan 1 of 3 · context 9% · cache 98%" (ellipsized by the page), the label the full sentence for its button.
  */
-export function composerCaption({ line, stats } = {}) {
+export function composerCaption({ line, stats, queued = 0 } = {}) {
   const parts = [];
   const spoken = [];
+  if (queued > 0) { parts.push(queuedLabel(queued)); spoken.push(queuedLabel(queued)); }
   const plan = line && line.parts.find((p) => p.key === "plan");
   if (plan) { parts.push(plan.text.replace(/ done$/, "")); spoken.push(plan.text); }
   const context = stats && stats.context;
@@ -1642,6 +1648,93 @@ export const COPY_FULL_BIG = "This stored output is over 2 MiB, too much to copy
 export function rawUrl(blob) {
   return `/api/blobs/${encodeURIComponent(blob)}/raw`;
 }
+
+// ---- Images (docs/CONTRACTS-2026-11-23.md D7) and queued messages (E5)
+
+/** The images of a record, as the page uses them: only well-formed refs whose blob is a hex id (the route's key). */
+export function imageList(images) {
+  if (!Array.isArray(images)) return [];
+  return images.filter((i) => i && typeof i === "object" && /^[0-9a-f]{8,128}$/i.test(String(i.blob || ""))).map((i) => ({
+    blob: String(i.blob).toLowerCase(), mime: typeof i.mime === "string" ? i.mime : "", bytes: Number(i.bytes) || 0,
+    width: Number(i.width) || 0, height: Number(i.height) || 0, name: typeof i.name === "string" && i.name ? i.name : "",
+  }));
+}
+
+/** Where an image's bytes are read from: the daemon's images route, nowhere else. Null for anything but a hex blob id. */
+export function imageUrl(blob) {
+  return /^[0-9a-f]{8,128}$/i.test(String(blob || "")) ? `/api/images/${String(blob).toLowerCase()}` : null;
+}
+
+/** A thumbnail's size: the image scaled to fit `max` x `max`, never enlarged; unknown sizes give a square placeholder. */
+export function thumbSize(width, height, max = 240) {
+  const w = Number(width), h = Number(height);
+  if (!(w > 0) || !(h > 0)) return { width: max, height: max };
+  const k = Math.min(1, max / w, max / h);
+  return { width: Math.max(1, Math.round(w * k)), height: Math.max(1, Math.round(h * k)) };
+}
+
+/** The words that name an image: its alt text and its facts line. `tool` is the tool of a result's row. */
+export function imageAlt(img, tool) {
+  return img.name || (tool ? `image from ${tool}` : "attached image");
+}
+export function imageFacts(img) {
+  const dims = img.width > 0 && img.height > 0 ? `${img.width}×${img.height}` : "";
+  return [dims, img.bytes > 0 ? byteSize(img.bytes) : "", img.mime].filter(Boolean).join(" · ");
+}
+
+/** The path of an image's file: the attachment list entry of the same name, else the call's path argument; null if unknown. */
+export function imagePath(img, { files = [], args = null } = {}) {
+  const hit = img.name ? files.find((f) => f.name === img.name) : files.length === 1 ? files[0] : null;
+  if (hit) return hit.path;
+  return toolPathArg(args);
+}
+
+/** How the head of a collapsed tool row says it carries images: "1 image" / "2 images". */
+export function imageCountLabel(n) {
+  return `${n} ${n === 1 ? "image" : "images"}`;
+}
+
+const IMAGE_EXT = /\.(png|jpe?g|gif|webp)$/i;
+/** Whether a file the operator attached is an image (by its type, else its name). */
+export function isImageFile(file) {
+  if (!file) return false;
+  if (typeof file.type === "string" && file.type) return /^image\/(png|jpeg|gif|webp)$/.test(file.type);
+  return IMAGE_EXT.test(String(file.name || ""));
+}
+
+/** The vision flag of the session's profile: true, false, or null when the profile list does not say. */
+export function modelVision(models, current) {
+  const m = (Array.isArray(models) ? models : []).find((x) => x && current && x.profile === current.profile);
+  return m && typeof m.vision === "boolean" ? m.vision : null;
+}
+export const NO_VISION_NOTE = "This model does not take images; it gets the file path.";
+
+/** "1 queued" / "3 queued". */
+export function queuedLabel(n) {
+  return `${Number(n) || 0} queued`;
+}
+
+/** A queued message in one line for the list: spaces collapsed, cut at `max` with an ellipsis. */
+export function queuedPreview(text, max = 140) {
+  const one = String(text ?? "").replace(/\s+/g, " ").trim();
+  return one.length > max ? one.slice(0, max - 1).trimEnd() + "…" : one;
+}
+
+/** The queue as the page keeps it: oldest first, only well-formed entries. */
+export function queuedList(items) {
+  return (Array.isArray(items) ? items : []).filter((q) => q && typeof q.id === "string")
+    .map((q) => ({ id: q.id, text: String(q.text ?? ""), attachments: Array.isArray(q.attachments) ? q.attachments : [], created_ms: Number(q.created_ms) || 0 }))
+    .sort((a, b) => a.created_ms - b.created_ms);
+}
+
+/** The route of one queued message (no id: the list); `action` "send" sends it now. */
+export function queuedUrl(session, qid, action) {
+  const base = `/api/sessions/${encodeURIComponent(session)}/queued`;
+  return qid ? `${base}/${encodeURIComponent(qid)}${action ? "/" + action : ""}` : base;
+}
+
+/** What the send button's menu offers while a turn runs. The plain button is the first. */
+export const SEND_CHOICES = [{ when: "now", label: "Send now" }, { when: "after_turn", label: "Queue for after this turn" }];
 
 const copyText = (value) => (typeof value === "string" && value !== "" ? value : null);
 

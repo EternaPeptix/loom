@@ -38,9 +38,25 @@ lines[1596] = "payload: serde_json::Value::Null,"; lines[1597] = "steps,"; lines
 lines[211] = "$ sh -c 'sleep 30 & exit 0'"; lines[212] = "job settled (exit 0) while pid 4127 still running"; lines[213] = "tracked: 0 processes";
 
 // Profiles as the daemon's ModelHealth reports them; "necromicon" is the unreachable one.
+// ---- Images (contract D7) and queued messages (E5). Two small generated PNGs, encoded inline so the fixture has no dependencies.
+const IMG_SCREEN = "11".repeat(32), IMG_ICON = "22".repeat(32);
+const IMAGES = new Map([
+  [IMG_SCREEN, Buffer.from("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", "base64")],
+  [IMG_ICON, Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAHgAAACgCAIAAABIaz/HAAABNUlEQVR42u3bMQkAMAxFwQirkiqpxMiphHrIUAI5yB649fHj5ilf7lW+aX8DNGjQoEGDBg0aNGjQoEGDBg0aNGjQoEGDBg0aNOim0LD+/AUNGjRo0KBBgwYNGjRo0KBBgwYNGjRo0KBBgwYNuis0LBUcNGjQoEGDBg0aNGjQoEGDBg0aNGjQoEGDBg0atJ0hLBUcNGjQoEGDBg0aNGjQoEGDBg0aNGjQoEGDBg0atJ0hLBUcNGjQoEGDBg0aNGjQoEGDBg0aNGjQoEGDBg0atJ0hLBUcNGjQoEGDBg0aNGjQoEGDBg0aNGjQoEGDBg0atJ0hLBUcNGjQoEGDBg0aNGjQoEGDBg0aNGjQoEGDBg0atJ0hLBUcNGjQoEGDBg0aNGjQoEGDBg0aNGjQoEGDBg0a9Ji/D99qVMw+gBMMAAAAAElFTkSuQmCC", "base64")],
+]);
+const SCREEN_REF = { blob: IMG_SCREEN, mime: "image/png", bytes: IMAGES.get(IMG_SCREEN).length, width: 480, height: 300, name: "screen.png" };
+const ICON_REF = { blob: IMG_ICON, mime: "image/png", bytes: IMAGES.get(IMG_ICON).length, width: 120, height: 160 };
+// Queued messages per session, in memory. s-quiet and s-notify (running leads) start with two and one.
+const queued = new Map([
+  ["s-quiet", [{ id: "q1", text: "When the index is rebuilt, run the relevance check against the 200-query set and report the regressions.", attachments: [], created_ms: Date.now() - 4 * 60000 }, { id: "q2", text: "Then archive the old shards.", attachments: [], created_ms: Date.now() - 2 * 60000 }]],
+  ["s-notify", [{ id: "q3", text: "Skip packages we vendor.", attachments: [], created_ms: Date.now() - 60000 }]],
+]);
+let queuedN = 3;
+const queuedOf = id => queued.get(id) || [];
+const emitQueued = id => emit({ type: "queued", session: id });
 const profiles = [
-  { profile: "dsv41", base_url: "https://api.fixture.invalid/dsv41/v1", model: "dsv41", reachable: true, detail: "", context_window: 1000000, max_concurrent: 4 },
-  { profile: "qwen", base_url: "https://api.fixture.invalid/qwen/v1", model: "qwen4-max-preview", reachable: true, detail: "", context_window: 262144, max_concurrent: 2 },
+  { profile: "dsv41", base_url: "https://api.fixture.invalid/dsv41/v1", model: "dsv41", reachable: true, detail: "", context_window: 1000000, max_concurrent: 4, vision: true },
+  { profile: "qwen", base_url: "https://api.fixture.invalid/qwen/v1", model: "qwen4-max-preview", reachable: true, detail: "", context_window: 262144, max_concurrent: 2, vision: false },
   { profile: "necromicon", base_url: "http://10.0.0.9:8000/v1", model: "necromicon", reachable: false, detail: "connection refused: http://10.0.0.9:8000/v1 did not answer; start the server or run `loom models reload` after fixing the profile's base_url.", context_window: 128000, max_concurrent: 1 },
 ];
 const modelRef = p => ({ profile: p.profile, model: p.model, context_window: p.context_window });
@@ -139,13 +155,13 @@ const startOf = (info, ts_ms, text) => {
 const sessionOf = id => sessions.find(s => s.id === id);
 let callN = 0;
 /** One model step (request, response with one call, the call, its result) starting at `t`; returns the next free time. */
-function step(id, t, { text = "", command = "make check", status = "ok", out = "ok", exit = null, ms = 1500, meta = {}, cut = false, output = null, name = "bash", cls = "exec", args = null }) {
+function step(id, t, { images = null, text = "", command = "make check", status = "ok", out = "ok", exit = null, ms = 1500, meta = {}, cut = false, output = null, name = "bash", cls = "exec", args = null }) {
   const n = ++callN; const req_id = `fx-r${n}`; const call_id = `fx-c${n}`;
   const a = args || { command };
   append(id, "model_request", { ts_ms: t, req_id, step: n, epoch: 1, purpose: "step", est_tokens: 80000 }, "harness");
   append(id, "model_response", { ts_ms: t + 800, req_id, text, reasoning: "", tool_calls: [{ call_id, name, arguments: JSON.stringify(a), complete: status !== "invalid" }], finish: "tool_calls", usage: { prompt_tokens: 80000, cached_tokens: 76000, completion_tokens: 50 }, timing: { ttft_ms: 300, total_ms: 800 }, attempts: 1 }, "model");
   append(id, "tool_call", { ts_ms: t + 900, call_id, req_id, name, args: status === "invalid" ? null : a, class: cls }, "model");
-  append(id, "tool_result", { ts_ms: t + 900 + ms, call_id, name, status, text: out, ...(output ? { output } : {}), cut, class: cls, meta: { ...(exit === null ? {} : { exit_code: exit }), ...meta }, duration_ms: ms }, "tool");
+  append(id, "tool_result", { ts_ms: t + 900 + ms, call_id, name, status, text: out, ...(images ? { images } : {}), ...(output ? { output } : {}), cut, class: cls, meta: { ...(exit === null ? {} : { exit_code: exit }), ...meta }, duration_ms: ms }, "tool");
   return t + 1000 + ms;
 }
 
@@ -239,10 +255,11 @@ append("s-fl-net", "inbox_opened", { ts_ms: now - 9 * MIN, ...inbox.find(e => e.
     // Written out here: the seed runs before the workspace trees exist, so attachmentBlock cannot read them yet.
     const csv = "corpus,ms,notes\nsmall,412,warm\nlarge,9120,cold cache\nlarge,8740,warm";
     const a = { block: "\n\nAttached files (saved read-only; read them with `read`):\n- /fixture/loom/.loom/uploads/report.csv (69 B, text/csv)\n- /fixture/loom/.loom/uploads/screen.png (226 KiB, image/png)\n\n`/fixture/loom/.loom/uploads/report.csv`:\n```csv\n" + csv + "\n```" };
-    append("s-tools", "user_message", { ts_ms: t, text: "These are the numbers and the screenshot from the failing run; compare them with the last build." + a.block }, "user");
+    append("s-tools", "user_message", { ts_ms: t, text: "These are the numbers and the screenshot from the failing run; compare them with the last build." + a.block, images: [SCREEN_REF] }, "user");
     t += 1000;
   }
   // Paths for the Files tab's "Open file": inside /fixture/loom (absolute and relative), the binary one, and one that is not there.
+  t = step("s-tools", t, { name: "read", cls: "read", args: { path: "/fixture/loom/.loom/uploads/screen.png" }, out: "[read · image · /fixture/loom/.loom/uploads/screen.png · 480x300 · " + SCREEN_REF.bytes + " B] The image is attached to this result.", images: [{ ...SCREEN_REF, name: "screen.png" }, ICON_REF], ms: 9 });
   t = step("s-tools", t, { name: "read", cls: "read", args: { path: "/fixture/loom/crates/loom-agent/src/runtime.rs", start: 1, end: 5 }, out: "//! runtime.rs: fixture source\n    // line 2 of runtime.rs", ms: 12 });
   // As the daemon records an edit: its facts line, the unified diff it applied, its end line (crates/loom-core admit.rs).
   t = step("s-tools", t, { name: "edit", cls: "write", args: { path: "crates/loom-agent/src/runtime.rs", old: "timeout_ms: 30_000", new: "timeout_ms: 60_000" }, meta: { path: "/fixture/loom/crates/loom-agent/src/runtime.rs" }, ms: 9,
@@ -670,6 +687,29 @@ const server = createServer(async (req, res) => {
     const url = new URL(req.url, "http://localhost");
     const path = url.pathname;
     if (path === "/__fixture/state") return json(res, { requests, inbox, scoreCalls });
+    const imageMatch = path.match(/^\/api\/images\/([0-9a-f]+)$/);
+    if (imageMatch && req.method === "GET") {
+      const bytes = IMAGES.get(imageMatch[1]);
+      if (!bytes) return json(res, { error: "No such image." }, 404);
+      res.writeHead(200, { "content-type": "image/png", "cache-control": "private, max-age=31536000, immutable" });
+      return res.end(bytes);
+    }
+    const queuedMatch = path.match(/^\/api\/sessions\/([^/]+)\/queued(?:\/([^/]+)(\/send)?)?$/);
+    if (queuedMatch) {
+      const sid = decodeURIComponent(queuedMatch[1]); const qid = queuedMatch[2] && decodeURIComponent(queuedMatch[2]);
+      if (!sessions.find(x => x.id === sid)) return json(res, { error: "No such fixture session." }, 404);
+      if (!qid && req.method === "GET") return json(res, queuedOf(sid));
+      const item = qid && queuedOf(sid).find(q => q.id === qid);
+      if (qid && !item) return json(res, { error: `Message ${qid} is no longer queued.` }, 404);
+      if (qid && req.method === "PUT") { item.text = String((await body(req)).text ?? ""); emitQueued(sid); return json(res, item); }
+      if (qid && req.method === "DELETE") { queued.set(sid, queuedOf(sid).filter(q => q !== item)); emitQueued(sid); return json(res, {}, 202); }
+      if (qid && queuedMatch[3] && req.method === "POST") {
+        queued.set(sid, queuedOf(sid).filter(q => q !== item)); emitQueued(sid);
+        append(sid, "user_message", { text: item.text }, "user", true);
+        return json(res, {}, 202);
+      }
+      return json(res, { error: "Not a queued-message route." }, 405);
+    }
     const scoreMatch = path.match(/^\/api\/missions\/([^/]+)\/score$/);
     if (scoreMatch && req.method === "GET") {
       scoreCalls++;
@@ -767,6 +807,11 @@ const server = createServer(async (req, res) => {
         return json(res, { session: id, model: modelRef(target), live });
       }
       if (parts[4] === "messages") {
+        if (data.when === "after_turn") {
+          const item = { id: "q" + (++queuedN), text: String(data.text || ""), attachments: data.attachments || [], created_ms: Date.now() };
+          queued.set(id, [...queuedOf(id), item]); emitQueued(id);
+          return json(res, { queued: item.id }, 202);
+        }
         const attached = attachmentBlock(info.workspace, data.attachments);
         if (attached.error) return json(res, { error: attached.error }, 400);
         await wait(2500); append(id, "user_message", { text: String(data.text || "") + attached.block }, "user", true); append(id, "model_request", { req_id: "fixture-delivery", purpose: "step", step: 49 }, "harness", true);

@@ -148,6 +148,7 @@
       <footer id="composer" class="composer">
         <ol id="s-plan" class="mini-plan" aria-label="Plan" hidden></ol>
         <p id="s-progress" class="progress-line" hidden></p>
+        <section id="queue-box" class="queue-box" aria-label="Queued messages" hidden></section>
         <div class="composer-card">
           <div class="composer-heading"><span id="composer-recipient" class="dim"></span><span id="send-state" class="dim" role="status" aria-live="polite"></span></div>
           <div id="agent-bar" class="agent-bar" hidden>
@@ -172,7 +173,14 @@
               </span>
             </div>
             <button id="c-stop" type="button" class="stop-btn" title="Stop this session (asks first)" aria-label="Stop this session" hidden><svg class="icon" viewBox="0 0 12 12" aria-hidden="true"><rect x="3" y="3" width="6" height="6" rx="1"/></svg></button>
-            <button id="send" type="button" class="send-btn" aria-label="Send" title="Send (Enter)"><svg class="icon" viewBox="0 0 12 12" aria-hidden="true"><path d="M6 10V2.5M2.8 5.6 6 2.4l3.2 3.2"/></svg></button>
+            <span id="send-group" class="send-group">
+              <button id="send" type="button" class="send-btn" aria-label="Send" title="Send (Enter)"><svg class="icon" viewBox="0 0 12 12" aria-hidden="true"><path d="M6 10V2.5M2.8 5.6 6 2.4l3.2 3.2"/></svg></button>
+              <button id="send-more" type="button" class="send-more" aria-label="More ways to send" aria-haspopup="menu" aria-expanded="false" aria-controls="send-menu" title="Send now or queue for after this turn" hidden><svg class="icon" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 7.5 6 4.5l3 3"/></svg></button>
+              <div id="send-menu" class="send-menu" role="menu" aria-label="Send" hidden>
+                <button type="button" role="menuitem" data-when="now">Send now</button>
+                <button type="button" role="menuitem" data-when="after_turn">Queue for after this turn</button>
+              </div>
+            </span>
           </div>
           <button id="s-caption" type="button" class="s-caption" aria-haspopup="dialog" aria-controls="session-sheet" hidden><span id="s-caption-text" class="s-caption-text"></span><svg class="icon" viewBox="0 0 12 12" aria-hidden="true"><path d="M4.5 2.5 8 6 4.5 9.5"/></svg></button>
         </div>
@@ -333,6 +341,18 @@
   <p id="keys-live" class="key-toast" role="status" aria-live="polite"></p>
   <p id="copy-live" class="sr-only" role="status" aria-live="polite"></p>
 
+  <dialog id="imgview" class="viewer imgview" aria-labelledby="imgview-title">
+    <header class="vhead">
+      <h2 id="imgview-title">Image</h2>
+      <span id="imgview-info" class="dim"></span>
+      <span class="spacer"></span>
+      <button id="imgview-copy" type="button" class="btn">Copy path</button>
+      <button id="imgview-close" type="button" class="btn">Close</button>
+    </header>
+    <p id="imgview-path" class="imgview-path dim"></p>
+    <p id="imgview-error" class="error" role="alert" hidden></p>
+    <div class="imgview-body"><img id="imgview-img" alt=""></div>
+  </dialog>
   <dialog id="viewer" class="viewer" aria-labelledby="viewer-title" aria-describedby="viewer-standing">
     <header class="vhead">
       <h2 id="viewer-title">Stored output</h2>
@@ -390,6 +410,7 @@
   <svg data-icon="link" class="icon" viewBox="0 0 12 12" aria-hidden="true"><path d="M5 7a2 2 0 0 0 2.8 0l1.6-1.6a2 2 0 0 0-2.8-2.8l-.5.5M7 5a2 2 0 0 0-2.8 0L2.6 6.6a2 2 0 0 0 2.8 2.8l.5-.5"/></svg>
   <svg data-icon="refresh" class="icon" viewBox="0 0 12 12" aria-hidden="true"><path d="M10 6a4 4 0 1 1-1.2-2.8M10 1.8V4H7.8"/></svg>
   <svg data-icon="menu" class="icon" viewBox="0 0 14 14" aria-hidden="true"><path d="M2 3.5h10M2 7h10M2 10.5h10"/></svg>
+  <svg data-icon="image" class="icon" viewBox="0 0 12 12" aria-hidden="true"><rect x="1.5" y="2" width="9" height="8" rx="1.2"/><circle cx="4.2" cy="4.6" r=".8"/><path d="M1.8 9 5 6.2l2.2 2 1.3-1.2 2 2"/></svg>
   <svg data-icon="paperclip" class="icon" viewBox="0 0 12 12" aria-hidden="true"><path d="M9.8 5.4 6 9.2a2.2 2.2 0 0 1-3.1-3.1l4-4a1.5 1.5 0 0 1 2.1 2.1L5.1 8.1a.8.8 0 0 1-1.1-1.1l3.4-3.4"/></svg>
   <svg data-icon="pin" class="icon" viewBox="0 0 12 12" aria-hidden="true"><path d="M4.4 1.5h3.2l-.4 3 1.5 2H3.3l1.5-2ZM6 6.5v4"/></svg>
 </template>

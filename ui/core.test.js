@@ -3641,3 +3641,108 @@ test("a call sent under another harness's name shows the loom tool that ran, and
   assert.equal(C.argsLine("job_wait", { job: "j2" }), "j2");
   assert.equal(C.toolRow({ ...b, ran: undefined, name: "read" }).calledAs, "");
 });
+
+// ---- images and queued messages (docs/CONTRACTS-2026-11-23.md D7, E5)
+
+test("composerAction: Alt+Enter queues only while a turn runs", () => {
+  const e = { key: "Enter", shiftKey: false, isComposing: false, text: "hi" };
+  assert.equal(C.composerAction({ ...e, alt: true, running: true }), "queue");
+  assert.equal(C.composerAction({ ...e, alt: true, running: false }), "send");
+  assert.equal(C.composerAction({ ...e, running: true }), "send");
+  assert.equal(C.composerAction({ ...e, alt: true, running: true, text: " " }), "ignore");
+  assert.equal(C.composerAction({ ...e, alt: true, running: true, shiftKey: true }), "none");
+  assert.equal(C.composerAction({ ...e, alt: true, running: true, isComposing: true }), "none");
+  assert.equal(C.composerAction({ ...e, alt: true, running: true, coarse: true }), "none");
+});
+
+test("composerHelp names the queue key while running; composerCaption leads with the queue", () => {
+  assert.equal(C.composerHelp({ running: true }).keys, "Enter sends now · Alt+Enter queues it for after this turn · Shift+Enter adds a line.");
+  assert.match(C.composerHelp({ running: true, mac: true }).keys, /⌥Enter queues/);
+  assert.equal(C.composerHelp({ running: true, coarse: true }).keys, "");
+  const c = C.composerCaption({ line: null, stats: { context: "context 9% of 1M", cache: "" }, queued: 2 });
+  assert.equal(c.text, "2 queued · context 9%");
+  assert.equal(c.label, "Session details: 2 queued, context 9% of 1M");
+  assert.equal(C.composerCaption({ line: null, stats: null, queued: 0 }).text, "Session details");
+});
+
+test("thumbSize fits 240 and never enlarges", () => {
+  assert.deepEqual(C.thumbSize(640, 400), { width: 240, height: 150 });
+  assert.deepEqual(C.thumbSize(400, 800), { width: 120, height: 240 });
+  assert.deepEqual(C.thumbSize(100, 50), { width: 100, height: 50 });
+  assert.deepEqual(C.thumbSize(10000, 1), { width: 240, height: 1 });
+  assert.deepEqual(C.thumbSize(0, 0), { width: 240, height: 240 });
+  assert.deepEqual(C.thumbSize(64, 64, 32), { width: 32, height: 32 });
+});
+
+test("imageList and imageUrl keep only hex blob ids and read from /api/images/", () => {
+  const ok = { blob: "AB".repeat(8), mime: "image/png", bytes: 5, width: 3, height: 2, name: "a.png" };
+  assert.deepEqual(C.imageList([ok, { blob: "../x" }, { blob: "https://evil/x.png" }, null, { blob: "" }]), [{ ...ok, blob: "ab".repeat(8) }]);
+  assert.deepEqual(C.imageList(undefined), []);
+  assert.equal(C.imageUrl("ab".repeat(32)), "/api/images/" + "ab".repeat(32));
+  assert.equal(C.imageUrl("../etc/passwd"), null);
+  assert.equal(C.imageUrl("http://x/y"), null);
+  assert.equal(C.imageUrl(undefined), null);
+});
+
+test("image records reach the blocks: user message and tool result", () => {
+  const img = { blob: "cd".repeat(16), mime: "image/png", bytes: 2048, width: 640, height: 400, name: "screen.png" };
+  const store = C.createRecordStore("s-1");
+  C.applyRecords(store, [
+    { seq: 0, ts_ms: 1, kind: "user_message", text: "look", images: [img] },
+    { seq: 1, ts_ms: 2, kind: "user_message", text: "none" },
+    { seq: 2, ts_ms: 3, kind: "tool_call", call_id: "c1", name: "read", args: { path: "/w/screen.png" }, class: "read" },
+    { seq: 3, ts_ms: 4, kind: "tool_result", call_id: "c1", name: "read", status: "ok", text: "[read · image]", class: "read", meta: {}, images: [img] },
+  ]);
+  const users = store.blocks.filter((b) => b.kind === "user");
+  assert.deepEqual(users[0].images, [img]);
+  assert.deepEqual(users[1].images, []);
+  assert.deepEqual(store.blocks.find((b) => b.kind === "tool").result.images, [img]);
+});
+
+test("image words: alt, facts, path, count", () => {
+  const img = { blob: "ab".repeat(8), mime: "image/png", bytes: 231424, width: 640, height: 400, name: "screen.png" };
+  assert.equal(C.imageAlt(img, "read"), "screen.png");
+  assert.equal(C.imageAlt({ ...img, name: "" }, "read"), "image from read");
+  assert.equal(C.imageAlt({ ...img, name: "" }), "attached image");
+  assert.equal(C.imageFacts(img), "640×400 · 226 KiB · image/png");
+  assert.equal(C.imageFacts({ blob: "x", mime: "", bytes: 0, width: 0, height: 0, name: "" }), "");
+  const files = [{ path: "/w/.loom/uploads/screen.png", name: "screen.png" }, { path: "/w/.loom/uploads/b.png", name: "b.png" }];
+  assert.equal(C.imagePath(img, { files }), "/w/.loom/uploads/screen.png");
+  assert.equal(C.imagePath({ ...img, name: "" }, { files, args: { path: "/w/x.png" } }), "/w/x.png");
+  assert.equal(C.imagePath({ ...img, name: "" }, { files: [files[1]] }), "/w/.loom/uploads/b.png");
+  assert.equal(C.imagePath({ ...img, name: "zzz.png" }, { files, args: { file_path: "/w/y.png" } }), "/w/y.png");
+  assert.equal(C.imagePath(img, {}), null);
+  assert.equal(C.imageCountLabel(1), "1 image");
+  assert.equal(C.imageCountLabel(3), "3 images");
+});
+
+test("isImageFile and modelVision", () => {
+  assert.equal(C.isImageFile({ name: "a.PNG", type: "" }), true);
+  assert.equal(C.isImageFile({ name: "a.bin", type: "image/webp" }), true);
+  assert.equal(C.isImageFile({ name: "a.png", type: "application/octet-stream" }), false);
+  assert.equal(C.isImageFile({ name: "a.svg", type: "image/svg+xml" }), false);
+  assert.equal(C.isImageFile({ name: "notes.txt", type: "" }), false);
+  const models = [{ profile: "dsv41", vision: true }, { profile: "qwen", vision: false }, { profile: "old" }];
+  assert.equal(C.modelVision(models, { profile: "dsv41" }), true);
+  assert.equal(C.modelVision(models, { profile: "qwen" }), false);
+  assert.equal(C.modelVision(models, { profile: "old" }), null);
+  assert.equal(C.modelVision(models, null), null);
+  assert.equal(C.modelVision(undefined, { profile: "qwen" }), null);
+});
+
+test("queued list words and routes", () => {
+  assert.equal(C.queuedLabel(0), "0 queued");
+  assert.equal(C.queuedLabel(3), "3 queued");
+  assert.equal(C.queuedPreview("  a\n\n  b   c "), "a b c");
+  const long = C.queuedPreview("x".repeat(300), 20);
+  assert.equal(long.length, 20);
+  assert.ok(long.endsWith("…"));
+  const q = C.queuedList([{ id: "b", text: "2", created_ms: 20 }, { id: "a", text: "1", created_ms: 10, attachments: ["/p"] }, { text: "no id" }, null]);
+  assert.deepEqual(q.map((x) => x.id), ["a", "b"]);
+  assert.deepEqual(q[0].attachments, ["/p"]);
+  assert.deepEqual(q[1].attachments, []);
+  assert.equal(C.queuedUrl("s 1"), "/api/sessions/s%201/queued");
+  assert.equal(C.queuedUrl("s1", "q/1"), "/api/sessions/s1/queued/q%2F1");
+  assert.equal(C.queuedUrl("s1", "q1", "send"), "/api/sessions/s1/queued/q1/send");
+  assert.deepEqual(C.SEND_CHOICES.map((c) => c.when), ["now", "after_turn"]);
+});
