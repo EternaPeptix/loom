@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Hypotheses and the rule engine leave the harness
+
+- `security_record` no longer takes `hypothesis_open`, `hypothesis_priority`, `hypothesis_evidence`,
+  `hypothesis_verdict`, `rule_install` or `rule_retract`; a call is refused with "Hypotheses are not recorded in
+  the security state any more: write the idea as a note (`note` with kind `decision`) or test it and record what
+  the run showed." `security_query` no longer has `hypotheses`, `facts`, `why`, `what_if` or `path_suggest`. The
+  Datalog module, `projection()` and `path_suggest()` are gone with their tests; the HUD, the prior-mission brief
+  and the frontier no longer carry hypotheses or derived facts.
+- Older logs stay readable: the six operations keep their serde variants and change nothing when applied; a
+  snapshot with `hypotheses`, `rules`, `died` or `retraction_limitation` loads and drops them. `SecurityState`
+  lost those fields (nothing is renamed; nothing new is serialized).
+- Repairs instead of refusals: a host given with a scheme, port, path or credentials is recorded as the host;
+  a service or endpoint URL without a scheme gets `https://` for port 443 and `http://` otherwise; `ops` is read
+  as `operations` (also when `action` is missing). Each is said under `normalized`.
+
 ### The shell directory persists between `bash` calls
 
 - A session has one shell directory (`ToolCtx::shell`, new field): a `bash` call without `cwd` runs where the last

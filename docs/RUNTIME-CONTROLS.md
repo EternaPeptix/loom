@@ -49,7 +49,7 @@ streamed local speculative reads and normal dispatch. It allows stored-output in
 `ledger`/mission/security queries, codec calculations, evidence and claim updates, existing plan steps
 closed as done/dropped, notes, closing PTYs, stopping work and terminal tools. `job_wait` must name
 `timeout_s <= 2`. Security ledger cleanup may attach evidence, close coverage or retract existing
-facts/rules; creating assets, hypotheses, credentials, rules or batches is refused. Unknown tools fail
+facts; creating assets, credentials or batches is refused. Unknown tools fail
 closed. Existing finish/evidence requirements remain in force: if fresh execution would be necessary,
 use `report_blocker` with the partial result. Budget exhaustion is reported as unverified, never as
 verified success. Verification children started by a terminal gate retain their independent budgets.

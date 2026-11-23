@@ -908,8 +908,8 @@ the precise specification.
   outputs: its title and the time of its last ledger entry; the operator's goal, rules in force and
   answers to questions, labelled as operator text from an earlier mission; its goal status; where its
   work stood (the frontier evaluated at that last entry's time, not now, with no attempt count and no
-  hypothesis or asset), labelled as written by the model there and not verified; and its security record as
-  counts and asset locators only (no hypothesis id or text, no credential, no identity named, no URL query,
+  asset), labelled as written by the model there and not verified; and its security record as
+  counts and asset locators only (no credential, no identity named, no URL query,
   fragment or password in a locator). The operator's words are shown as written; what the model wrote is
   shown with the query, fragment and userinfo removed from every URL in it, but may still hold whatever
   was written there. Every line
@@ -1828,10 +1828,9 @@ as workspace content.
 
 ## Security workflow extensions
 
-Typed asset/credential/foothold records, coverage, revisit triggers, hypothesis ownership and bounded
-causal projections live in the sealed mission journal; see `docs/SECURITY_STATE.md`. They are
+Typed asset/credential/foothold records, coverage, revisit triggers and facts live in the sealed mission journal; see `docs/SECURITY_STATE.md`. They are
 observations and investigation hints, not network authorization or automatic vulnerability verdicts.
-The HUD renders bounded derived state without copying credentials or untrusted observation prose.
+The HUD renders bounded state without copying credentials or untrusted observation prose.
 
 Roles may opt into structured HTTP/PTY/calculation/binary tools, credential prerequisites and hard
 child step slices. Execution tools retain normal sandboxing, cancellation and output provenance.

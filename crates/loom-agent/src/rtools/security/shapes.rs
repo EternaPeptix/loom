@@ -4,8 +4,8 @@
 //! CONTRACT.
 //!
 //! Why: logged missions showed 42% of `security_record` calls refused, almost all for shape rather
-//! than substance (a host given as `127.0.0.1:19727`, a `hypothesis: {…}` wrapper, `ops` for
-//! `operations`, `priority: "high"`, a free-text blocked_on condition). Each refusal costs a model
+//! than substance (a host given as `127.0.0.1:19727`, `ops` for
+//! `operations`, a free-text blocked_on condition). Each refusal costs a model
 //! step. This module reads a near miss where its meaning is unambiguous, says so in a note, and
 //! otherwise refuses with the exact shape to send. It never weakens what the core checks: evidence
 //! must still exist and be attested, authority is still checked by `authorize` and the core, and
@@ -22,7 +22,7 @@
 //!    own, with location "operation {i} of the batch" (1-based, in the order given). An element that
 //!    is not an object with a string `action` is refused with
 //!    "Operation {i} of {n} in the batch: give an object with `action`. Nothing was recorded."
-//!    Elements are not expanded (N4d applies to a single operation only). A nested batch element is
+//!    A nested batch element is
 //!    passed through unchanged; the core refuses it. The batch itself is decoded from the read
 //!    elements; it stays one atomic append.
 //!    For a single operation the location is "the operation".
@@ -34,18 +34,14 @@
 //!    - Unknown action otherwise → P + "Correct `operation` before retrying: `{action}` is not a
 //!      security_record action; use one of {ACTIONS joined by `, `}." (the action text cut to 80
 //!      characters on a character boundary).
-//!    - R4: `hypothesis_verdict` when `caller.standing != Judge` →
-//!      P + "Only an independent read-only verifier records a hypothesis verdict. Attach your
-//!      evidence with hypothesis_evidence {id, evidence}; the hypothesis stays open until a verifier
-//!      reviews it."
-//!    - `hypothesis_open` when `caller.standing != Lead` (a child, judges included) →
-//!      P + "Only the mission lead may open a hypothesis; send the proposed hypothesis to the lead."
-//!    - `hypothesis_priority` when `caller.standing != Lead` →
-//!      P + "Only the hypothesis's original lead may change its priority; send the proposed change to
-//!      that lead."
+//!    - R4: `hypothesis_open`, `hypothesis_priority`, `hypothesis_evidence`, `hypothesis_verdict`,
+//!      `rule_install` and `rule_retract` (the removed operations, checked first of all, so a batch
+//!      element naming one is refused too) → P + `REMOVED_OP_REFUSAL`: "Hypotheses are not recorded in
+//!      the security state any more: write the idea as a note (`note` with kind `decision`) or test
+//!      it and record what the run showed."
 //! 4. Normalization (N1–N7 below). Every rewrite appends exactly one note, in the order applied. A
 //!    note names its location L ("the operation" or "operation {i} of the batch").
-//! 5. Refusals that need the normalized value (R2, R5, R6, R7), same P and suffix.
+//! 5. Refusals that need the normalized value (R2, R6), same P and suffix.
 //! 6. Decode with serde (the core types keep `deny_unknown_fields`):
 //!    - D1 single operation: "Correct `operation` before retrying: {serde error}. {action} takes
 //!      {shape(action)}. Nothing was recorded."
@@ -74,64 +70,21 @@
 //!     Note: "In L, `evidence` was moved into `{key}`."
 //! - N3 credential/foothold (inside the wrapper): `principal` absent and `username` or `user`
 //!   present → renamed. Note: "In L, `{username|user}` was read as `principal`."
-//! - N4 hypothesis_open:
-//!   - N4a: `hypothesis` is an object and `text` is absent → its keys are copied into the operation
-//!     where the operation lacks them, then `hypothesis` is removed.
-//!     Note: "In L, the fields of `hypothesis` were read as the operation's own."
-//!   - N4b: `text` absent and `hypothesis` (a string) or `statement` present → renamed to `text`.
-//!     Note: "In L, `{hypothesis|statement}` was read as `text`."
-//!   - N4c: `status` present → removed. When it is "open" (any case):
-//!     "In L, `status` was dropped: a new hypothesis is always open." Otherwise:
-//!     "In L, status `{status}` was not recorded: a new hypothesis is open, and only an independent
-//!     read-only verifier records a verdict."
-//!   - N4d: first, when the dropped status (N4c) reads as refuted (the N6c words "refuted",
-//!     "disproved", "rejected", "false", "invalid", or a JSON false) and `evidence` is a nonempty array
-//!     while `counterevidence` is empty or absent, `evidence` is moved into `counterevidence` (the status
-//!     says the evidence counts against the hypothesis; attaching it as support would record the
-//!     opposite). Note, after the N4c note: "In L, the status said the hypothesis is refuted, so its
-//!     `evidence` was attached as counterevidence." Then: `evidence` or `counterevidence` present. For a
-//!     single operation, when either is a
-//!     nonempty array, the operation becomes the batch [hypothesis_open {text, priority},
-//!     hypothesis_evidence {id: stable_id("hy", [text.trim()]), evidence, counterevidence}]
-//!     (missing lists empty). Note: "In L, the evidence was attached by a hypothesis_evidence
-//!     operation recorded in the same atomic append." When both are empty arrays they are removed
-//!     silently. Inside a batch a nonempty one is refused (R8).
-//! - N5 priority (hypothesis_open, hypothesis_priority): an integer 0–255 is kept. A string, trimmed
-//!   and case-insensitive: "low"→1, "medium"/"normal"→3, "high"→5, all ASCII digits with value
-//!   0–255→that number. Note: "In L, priority `{given}` was read as {n}." hypothesis_open without
-//!   `priority` gets 3. Note: "In L, no priority was given, so it is 3 (1 low to 5 high)." Any other
-//!   value is R7.
-//! - N6 hypothesis_priority / hypothesis_evidence / hypothesis_verdict:
-//!   - N6a: `id` absent and `hypothesis` or `hypothesis_id` (a string) present → renamed.
-//!     Note: "In L, `{hypothesis|hypothesis_id}` was read as `id`."
-//!   - evidence/counterevidence: across operations and wrappers that take them (`asset`, `credential`,
-//!     `foothold`, `relation`, `condition_unlock`, `coverage_set` when `status` is `tested`,
-//!     `crash_record.attempt`, `fact_assert`, `hypothesis_evidence`, `hypothesis_verdict`), an omitted
-//!     `evidence` or `counterevidence` defaults quietly to `[]`.
-//!   - N6b verdict: `status` absent and `verdict` present → renamed. Note: "In L, `verdict` was read
-//!     as `status`."
-//!   - N6c verdict: `status` (string, trimmed, case-insensitive) "confirmed", "verified", "true",
-//!     "accepted", "valid" → "supported"; "disproved", "rejected", "false", "invalid" → "refuted"; a
-//!     JSON boolean true/false the same. Note: "In L, status `{given}` was read as `{status}`."
-//! - N6d `blocked_on` / `condition_unlock`:
-//!   - When `target` is absent in `blocked_on`, if exactly one of `asset`, `endpoint`, `service`,
-//!     `claim`, `dead_end`, `id` is present (or `blocked` is a string while `conditions` is present),
-//!     it is read as `target`. Note: "In L, `{key}` was read as `target`."
-//!   - When `conditions` is absent, unambiguous `condition` (`blocked_on`/`condition_unlock`),
-//!     `unlocked`/`unlocks` (`condition_unlock`), or array/object `blocked` (`blocked_on`) is read as
-//!     `conditions` (wrapping a single object in `[…]`), then checked by R2. A free-text string under
-//!     `reason` or `blocked` when `conditions` is absent is refused by R2 (never relaxed).
-//!   - In `blocked_on`, a single object `conditions` is wrapped in `[…]`, and an extra string `reason`
-//!     alongside `conditions` is dropped with a note.
+//! - evidence/counterevidence: across operations and wrappers that take them (`asset`, `credential`,
+//!   `foothold`, `relation`, `condition_unlock`, `coverage_set` when `status` is `tested`,
+//!   `crash_record.attempt`, `fact_assert`), an omitted
+//!   `evidence` or `counterevidence` defaults quietly to `[]`.
+//! - N6 blocked_on / condition_unlock: see `normalize_conditions_action`; a `reason` given
+//!   alongside `conditions` is dropped with a note.
 //! - N7 asset_upsert locators (after N2; only when `asset.kind` and `asset.locator` are strings;
 //!   the locator is trimmed first):
-//!   - N7a kind host: a locator that is not an IP address, holds no user information, and (i) contains
+//!   - N7a kind host: a locator that is not an IP address and (i) contains
 //!     `://` and parses as a URL with a host (a name such as `ftp:21` is not a URL: the URL parser
 //!     would read it as an IPv4 address), or (ii) is `name:port` / `[v6]:port` with a decimal port of at most five
-//!     digits and a name without `/`, `@`, `:` or whitespace → the host (brackets removed), only when
+//!     digits, or otherwise carries a path or user information → the host (brackets removed), only when
 //!     `canonical_locator(Host, host)` accepts it. Note: "In L, the host was recorded as `{host}`
-//!     from `{given}`: a host locator has no scheme, port or path; record the service as kind
-//!     service with an absolute URL."
+//!     from `{given}`: a host locator has no scheme, port, path or credentials; record the
+//!     service as kind service with an absolute URL." A value that holds user information is never quoted.
 //!   - N7b kind service/endpoint: a leading token GET, POST, PUT, PATCH, DELETE, HEAD or OPTIONS
 //!     (any case) followed by whitespace, when the rest starts with `{scheme}://` or with `/` → the
 //!     rest. Note: "In L, the HTTP method `{METHOD}` was dropped from the locator: an endpoint is
@@ -151,6 +104,17 @@
 //!     canonicalizes to that asset itself) and joined the same way. Note: "In L, `parent` was inferred
 //!     as `{id}` and the path `{path}` was joined to its URL as `{url}`."
 //!
+//!   - N7e kind service/endpoint: the locator has no `://`, no whitespace and no `@`, and its part before
+//!     the first `/` is `name:port` with a decimal port, or a bare name or IP (an IPv6 address bare or in
+//!     brackets included) → the locator with `https://` in front when the port is 443 and `http://`
+//!     otherwise (a bare IPv6 address is bracketed: `::1/x` gives `http://[::1]/x`), only when
+//!     `canonical_locator` accepts the result. Note: "In L, `{given}` had no scheme, so it was recorded
+//!     as `{repaired}`: https for port 443 and http otherwise; give tcp:// yourself for a service that
+//!     is not HTTP."
+//! - N8 batch spelling: an object with no `action` and an array under `ops`, `items` or `operations` is
+//!   a batch. Note: "In the operation, no `action` was given; it holds a list of operations, so it was
+//!   read as a batch."
+//!
 //! ### Refusals after normalization
 //!
 //! - R2 a condition (an element of `conditions` in condition_unlock / blocked_on, or of `unlocks`
@@ -160,25 +124,14 @@
 //!   ID>\"}; `{given}` is not one." + (when `caller.tools` has report_blocker) " To report that a
 //!   target is unreachable or the environment is broken, use report_blocker." `{given}` is the
 //!   string itself, or the `kind` value, or the compact JSON of the element.
-//! - R5 kind service/endpoint, the locator has no `://`, no whitespace, no `@`, and its part before
-//!   the first `/` is `name:port` with a decimal port, or a bare name or IP (an IPv6 address bare or in
-//!   brackets included) → P + "Give the scheme as well, for example `http://{locator}` (or
-//!   `tcp://{locator}` for a service that is not HTTP)." A bare IPv6 address is bracketed in
-//!   `{locator}` (`::1/x` gives `[::1]/x`).
 //! - R6 kind service/endpoint, the locator starts with `/` and N7d did not apply (no parent, or a
 //!   parent whose locator is not an absolute URL) → P + "An endpoint locator is one absolute URL,
 //!   such as `http://10.0.0.5:8080/render?name=`; give the full URL, or name its service asset as
 //!   `parent` and give only the path."
-//! - R7 priority not readable by N5 → P + "Give priority as an integer from 1 (low) to 5 (high), or
-//!   low, medium or high."
-//! - R8 hypothesis_open inside a batch with a nonempty evidence or counterevidence list → P +
-//!   "A hypothesis opens without evidence. Put {\"action\": \"hypothesis_evidence\", \"id\":
-//!   \"{id}\", \"evidence\": […]} after it in the batch; `{id}` is the ID of this text." where `{id}`
-//!   is `stable_id("hy", [text.trim()])` (quoted in full, never cut).
 //!
 //! ## `shape(action)` and `ACTIONS`
 //!
-//! `ACTIONS` lists the 19 `SecurityOp` actions in the order of the enum. `shape` returns exactly:
+//! `ACTIONS` lists the 13 `SecurityOp` actions that are still recorded, in the order of the enum. `shape` returns exactly:
 //!
 //! - asset_upsert: `{action:asset_upsert, asset:{kind:host|service|endpoint|file|identity, locator, evidence:[eN], mandatory?:true, parent?:assetID}}; a host locator is a bare name or IP such as 10.0.0.5; a service or endpoint locator is one absolute URL such as http://10.0.0.5:8080/login?next=, without a method or a description`
 //! - coverage_set: `{action:coverage_set, asset:assetID, disposition:{status:tested, evidence:[eN]} or {status:deferred, reason}}`
@@ -188,15 +141,9 @@
 //! - blocked_on: `{action:blocked_on, target:ID, conditions:[condition]}`
 //! - revisit_acknowledge: `{action:revisit_acknowledge, target:ID}`
 //! - crash_record: `{action:crash_record, signature:{sanitizer, frames:[{function, file, line?}], outcome:crash}, attempt:{vector, summary, evidence:[eN]}}; only a real crash has a signature: record a timeout, an out-of-memory exit or a run without a crash as a fact with fact_assert`
-//! - hypothesis_open: `{action:hypothesis_open, text, priority?:1 (low) to 5 (high), default 3}`
-//! - hypothesis_priority: `{action:hypothesis_priority, id:hypothesisID, priority:1 (low) to 5 (high)}`
-//! - hypothesis_evidence: `{action:hypothesis_evidence, id:hypothesisID, evidence:[eN], counterevidence?:[eN]}`
-//! - hypothesis_verdict: `{action:hypothesis_verdict, id:hypothesisID, status:supported|refuted, note, evidence:[eN], counterevidence:[eN]}`
 //! - relation_add: `{action:relation_add, relation:{from:assetID, to:assetID, kind, cost:1-1000 (smaller is easier), evidence:[eN], expires_ms?}}`
 //! - fact_assert: `{action:fact_assert, fact:{predicate, args:[string]}, evidence:[eN]}`
 //! - fact_retract: `{action:fact_retract, id:factID, reason}`
-//! - rule_install: `{action:rule_install, rule:{name, head:{predicate, args:[?x]}, body:[{atom:{predicate, args:[?x]}, negated?:false}]}}`
-//! - rule_retract: `{action:rule_retract, id:ruleID, reason}`
 //! - alias_add: `{action:alias_add, alias, target:ID}`
 //! - batch: `{action:batch, operations:[operation, …]}; atomic: when one operation is invalid nothing is recorded and the error names it`
 //!
@@ -207,20 +154,13 @@
 //! Lines joined by "\n":
 //! 1. "Record typed, evidence-linked security observations in the mission ledger. `operation` is one
 //!    object: an action and its fields."
-//! 2. One line "- {shape(action)}" per action in ACTIONS order, with batch moved to the end, except:
-//!    - Child and Judge (every standing but Lead): hypothesis_open and hypothesis_priority are replaced by
-//!      the single line
-//!      "- hypothesis_open, hypothesis_priority: the mission lead's; send a proposed hypothesis to the
-//!      lead." (at hypothesis_open's position).
-//!    - Lead and Child: hypothesis_verdict is "- hypothesis_verdict: recorded only by an independent
-//!      read-only verifier; attach evidence with hypothesis_evidence and the hypothesis stays open
-//!      until one reviews it."
+//! 2. One line "- {shape(action)}" per action in ACTIONS order, with batch moved to the end.
 //! 3. "A condition is {kind:auth|cred|role|leak|offset|key, value}: a typed prerequisite that a route
 //!    waits on, not a description of a fault." + (when tools has report_blocker) " Report an
 //!    unreachable target or a broken environment with report_blocker."
 //! 4. "Evidence IDs (eN) must already exist and be attested" + (when tools has evidence) ": attach
 //!    the output that shows it with the evidence tool first" + ". Evidence IDs are given exactly; other
-//!    IDs (assets, parents, hypotheses, facts, rules, and the asset in a cred or auth condition) may be
+//!    IDs (assets, parents, facts, and the asset in a cred or auth condition) may be
 //!    the exact ID, an alias, or a unique prefix of at least four characters" + (when tools has
 //!    security_query) "; security_query lists them" + "." (Why: evidence IDs are matched exactly, and a
 //!    cred or auth condition's asset is resolved by `security_record`, see security.rs.)
@@ -234,51 +174,39 @@
 //! ## Tests required
 //!
 //! - Every N rule: input → decoded op + the exact note text (single operation and batch location).
-//! - Every refusal R1, R2 (string, unknown kind; with and without report_blocker in tools), R4 (lead
-//!   and plain child; refused before a shape error would be reported), R5, R6 (no parent; parent that
-//!   is a host), R7, R8, child open/priority; unknown action; non-object element; D1 and D2 texts
+//! - Every refusal R1, R2 (string, unknown kind; with and without report_blocker in tools), R4 (every
+//!   removed action, alone and inside a batch, refused before a shape error would be reported), R6 (no
+//!   parent; parent that is a host); unknown action; non-object element; D1 and D2 texts
 //!   carry the shape.
-//! - N7a refuses to rewrite (and never quotes) `http://user:pass@h/` and `user@h:1`; IPv6 literal
+//! - N7a reduces `http://user:pass@h/` and `user@h:1` to `h` and never quotes the credentials; IPv6 literal
 //!   `::1` and `[::1]:8080`; a name with a port above 99999 is left unchanged.
 //! - N7d: `//evil.test/x` with a parent is not joined; a join keeps scheme, host and port.
 //! - Note and refusal quotes are cut on a character boundary (a multi-byte string over 80 chars).
 //! - N7a: `ftp:21` and `http:8080` give `ftp` and `http`; user information after the first URL (host,
 //!   service and endpoint) is never rewritten or quoted. N7c/N7d: `GET /render?name= (text)` with a
-//!   parent is joined without the text; `/\evil.test/x` with a parent is refused (R6). R5: `::1`.
-//! - `description`: judge shows the verdict shape, lead and child do not; child and judge have the merged
-//!   open/priority line; with tools lacking evidence/report_blocker/security_query none is named.
+//!   parent is joined without the text; `/\evil.test/x` with a parent is refused (R6). N7e: `::1`, `host:443`.
+//! - `description`: with tools lacking evidence/report_blocker/security_query none is named.
 //! - A regression list of synthetic operations, one per failure class seen in logged missions
 //!   (host:port host, URL host, method-prefixed URL, URL + trailing text, scheme-less service,
-//!   relative endpoint, `hypothesis:{statement,status,priority:"high",evidence}`, `ops`/`items`,
-//!   `hypothesis` as id, missing counterevidence, `verdict` + `confirmed`, flat credential with
+//!   relative endpoint, `ops`/`items`/`ops` without an action,
+//!   missing counterevidence, flat credential with
 //!   `username`, evidence outside the wrapper, string conditions, kind `container_running`,
 //!   `claim_update` as an action), each asserting success or its specific refusal. No real
 //!   session data in the repository.
 //! - `#[ignore]` test `replay_logged_operations`: reads the JSON file named by the environment
-//!   variable `LOOM_SECURITY_REPLAY` (an array of `{"standing":"lead"|"child"|"judge",
-//!   "tools":[…], "operation":{…}}`), runs `read` against an empty `SecurityState`, then for every
+//!   variable `LOOM_SECURITY_REPLAY` (an array of `{"tools":[…], "operation":{…}}`), runs `read` against an empty `SecurityState`, then for every
 //!   decoded `AssetUpsert` (top level or in a batch) `AssetInput::id()`; prints counts of: read ok,
 //!   read ok with notes, each refusal kind (by the first 60 characters of the message with digits
 //!   and backticked text masked), and asset locators the core still refuses. Skips when the
 //!   variable is unset.
 
-use loom_core::security_state::{canonical_locator, stable_id, AssetKind, SecurityOp, SecurityState};
-use serde_json::{json, Map, Value};
-
-/// What the session may do with hypotheses. Decides the early refusals and the tool description.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Standing {
-    /// No parent: opens hypotheses and sets their priority.
-    Lead,
-    /// A child that is not a judge.
-    Child,
-    /// A child with `read_only` and the `verdict` tool: may record verdicts.
-    Judge,
-}
+use loom_core::security_state::{
+    canonical_locator, stable_id, AssetKind, SecurityOp, SecurityState, REMOVED_OP_REFUSAL,
+};
+use serde_json::{Map, Value};
 
 /// The session facts the rules depend on.
 pub(super) struct Caller<'a> {
-    pub standing: Standing,
     /// The role's tool names (R1, R2 and the description).
     pub tools: &'a [String],
 }
@@ -290,8 +218,8 @@ pub(super) struct Read {
     pub notes: Vec<String>,
 }
 
-/// Every `SecurityOp` action, in the order of the enum.
-pub(super) const ACTIONS: [&str; 19] = [
+/// Every `SecurityOp` action `security_record` offers, in the order of the enum.
+pub(super) const ACTIONS: [&str; 13] = [
     "batch",
     "asset_upsert",
     "credential_add",
@@ -301,16 +229,20 @@ pub(super) const ACTIONS: [&str; 19] = [
     "revisit_acknowledge",
     "coverage_set",
     "crash_record",
+    "relation_add",
+    "fact_assert",
+    "fact_retract",
+    "alias_add",
+];
+
+/// Actions that older logs hold and that are refused now (hypotheses and the rule engine).
+pub(super) const REMOVED_ACTIONS: [&str; 6] = [
     "hypothesis_open",
     "hypothesis_priority",
     "hypothesis_evidence",
     "hypothesis_verdict",
-    "relation_add",
-    "fact_assert",
-    "fact_retract",
     "rule_install",
     "rule_retract",
-    "alias_add",
 ];
 
 const SUFFIX: &str = " Nothing was recorded.";
@@ -394,6 +326,11 @@ fn decode(value: Value, action: &str, loc: Loc) -> Result<SecurityOp, String> {
 pub(super) fn read(caller: &Caller<'_>, state: &SecurityState, operation: &Value) -> Result<Read, String> {
     let object = operation.as_object();
     let action = object.and_then(|o| o.get("action")).and_then(Value::as_str);
+    // An object with `ops`, `items` or `operations` and no action is a batch.
+    let implied = object.is_some_and(|o| {
+        action.is_none() && ["ops", "items", "operations"].iter().any(|k| o.get(*k).is_some_and(Value::is_array))
+    });
+    let action = if implied { Some("batch") } else { action };
     let (Some(object), Some(action)) = (object, action) else {
         return Err(format!(
             "Correct `operation` before retrying: give an object with `action`, one of {}.{SUFFIX}",
@@ -401,11 +338,22 @@ pub(super) fn read(caller: &Caller<'_>, state: &SecurityState, operation: &Value
         ));
     };
     if action != "batch" {
-        let (op, notes) = read_one(caller, state, object, action, Loc::Single, false)?;
+        let (op, notes) = read_one(caller, state, object, action, Loc::Single)?;
         return Ok(Read { op, notes });
     }
     let mut object = object.clone();
     let mut notes = Vec::new();
+    if implied {
+        object.insert("action".into(), Value::String("batch".into()));
+        notes.push(
+            "In the operation, no `action` was given; it holds a list of operations, so it was read as a batch.".into(),
+        );
+    }
+    // `ops` or `items` stand for `operations` when it is absent, or present but empty.
+    let operations_empty = object.get("operations").and_then(Value::as_array).is_some_and(Vec::is_empty);
+    if operations_empty && object.get("ops").and_then(Value::as_array).is_some_and(|a| !a.is_empty()) {
+        object.remove("operations");
+    }
     if !object.contains_key("operations") {
         let key = match (object.contains_key("ops"), object.contains_key("items")) {
             (true, false) => Some("ops"),
@@ -435,7 +383,7 @@ pub(super) fn read(caller: &Caller<'_>, state: &SecurityState, operation: &Value
             operations.push(decode(item.clone(), action, loc)?);
             continue;
         }
-        let (op, more) = read_one(caller, state, element, action, loc, true)?;
+        let (op, more) = read_one(caller, state, element, action, loc)?;
         operations.push(op);
         notes.extend(more);
     }
@@ -445,17 +393,19 @@ pub(super) fn read(caller: &Caller<'_>, state: &SecurityState, operation: &Value
     Ok(Read { op: SecurityOp::Batch { operations }, notes })
 }
 
-/// Read one operation (steps 3 to 6). Returns the decoded op (a batch when N4d expanded it) and its notes.
+/// Read one operation (steps 3 to 6). Returns the decoded op and its notes.
 fn read_one(
     caller: &Caller<'_>,
     state: &SecurityState,
     object: &Map<String, Value>,
     action: &str,
     loc: Loc,
-    in_batch: bool,
 ) -> Result<(SecurityOp, Vec<String>), String> {
     let p = loc.prefix(action);
     let shown = cut(action, QUOTE);
+    if REMOVED_ACTIONS.contains(&action) {
+        return Err(refuse(&p, REMOVED_OP_REFUSAL));
+    }
     if !ACTIONS.contains(&action) {
         if caller.tools.iter().any(|t| t == action) {
             let message = format!("`{shown}` is a separate tool, not a security_record action; call it directly.");
@@ -469,29 +419,9 @@ fn read_one(
             ),
         ));
     }
-    if action == "hypothesis_verdict" && caller.standing != Standing::Judge {
-        return Err(refuse(
-            &p,
-            "Only an independent read-only verifier records a hypothesis verdict. Attach your evidence with \
-             hypothesis_evidence {id, evidence}; the hypothesis stays open until a verifier reviews it.",
-        ));
-    }
-    if action == "hypothesis_open" && caller.standing != Standing::Lead {
-        return Err(refuse(
-            &p,
-            "Only the mission lead may open a hypothesis; send the proposed hypothesis to the lead.",
-        ));
-    }
-    if action == "hypothesis_priority" && caller.standing != Standing::Lead {
-        return Err(refuse(
-            &p,
-            "Only the hypothesis's original lead may change its priority; send the proposed change to that lead.",
-        ));
-    }
     let l = loc.name();
     let mut m = object.clone();
     let mut notes = Vec::new();
-    let mut attach: Option<(Value, Value)> = None;
     match action {
         "asset_upsert" => {
             wrap(&mut m, "asset", &["kind", "locator", "evidence", "mandatory", "parent"], &l, &mut notes);
@@ -525,35 +455,12 @@ fn read_one(
         "condition_unlock" | "blocked_on" => {
             normalize_conditions_action(&mut m, action, &l, &p, caller, &mut notes)?;
         }
-        "hypothesis_open" => {
-            attach = open(&mut m, &l, &p, in_batch, &mut notes)?;
-        }
-        "hypothesis_priority" => {
-            rename_id(&mut m, &l, &mut notes);
-            if m.contains_key("priority") {
-                set_priority(&mut m, &l, &p, &mut notes)?;
-            }
-        }
-        "hypothesis_evidence" | "hypothesis_verdict" => {
-            rename_id(&mut m, &l, &mut notes);
-            if action == "hypothesis_verdict" {
-                verdict(&mut m, &l, &mut notes);
-            }
-        }
         _ => {}
     }
     default_omitted_evidence(&mut m, action);
     m.insert("action".into(), Value::String(action.to_string()));
     let op = decode(Value::Object(m), action, loc)?;
-    let Some((evidence, counterevidence)) = attach else { return Ok((op, notes)) };
-    let id = match &op {
-        SecurityOp::HypothesisOpen { text, .. } => stable_id("hy", &[text.trim()]),
-        _ => return Ok((op, notes)),
-    };
-    let attached = json!({"action": "hypothesis_evidence", "id": id, "evidence": evidence,
-        "counterevidence": counterevidence});
-    let attached = decode(attached, "hypothesis_evidence", loc)?;
-    Ok((SecurityOp::Batch { operations: vec![op, attached] }, notes))
+    Ok((op, notes))
 }
 
 /// N2: gather a wrapper operation's fields into its wrapper object, and `evidence` into the wrapper.
@@ -636,10 +543,6 @@ fn default_omitted_evidence(m: &mut Map<String, Value>, action: &str) {
             if let Some(Value::Object(a)) = m.get_mut("attempt") {
                 ensure_array(a, "evidence");
             }
-        }
-        "hypothesis_evidence" | "hypothesis_verdict" => {
-            ensure_array(m, "evidence");
-            ensure_array(m, "counterevidence");
         }
         _ => {}
     }
@@ -789,191 +692,6 @@ fn condition_refusal(given: &str, caller: &Caller<'_>) -> String {
     )
 }
 
-/// N4 and N5 for hypothesis_open. Returns the evidence lists to attach by a second operation (N4d).
-fn open(
-    m: &mut Map<String, Value>,
-    l: &str,
-    p: &str,
-    in_batch: bool,
-    notes: &mut Vec<String>,
-) -> Result<Option<(Value, Value)>, String> {
-    if !m.contains_key("text") {
-        if let Some(Value::Object(inner)) = m.get("hypothesis").cloned() {
-            for (k, v) in inner {
-                if !m.contains_key(&k) {
-                    m.insert(k, v);
-                }
-            }
-            m.remove("hypothesis");
-            notes.push(format!("In {l}, the fields of `hypothesis` were read as the operation's own."));
-        }
-    }
-    if !m.contains_key("text") {
-        let key = if m.get("hypothesis").is_some_and(Value::is_string) { Some("hypothesis") } else { None };
-        let key = key.or(if m.contains_key("statement") { Some("statement") } else { None });
-        if let Some((key, value)) = key.and_then(|k| m.remove(k).map(|v| (k, v))) {
-            m.insert("text".into(), value);
-            notes.push(format!("In {l}, `{key}` was read as `text`."));
-        }
-    }
-    let mut refuted = false;
-    if let Some(status) = m.remove("status") {
-        let given = match &status {
-            Value::String(s) => s.clone(),
-            other => other.to_string(),
-        };
-        refuted = verdict_word(&given) == Some("refuted");
-        if given.trim().eq_ignore_ascii_case("open") {
-            notes.push(format!("In {l}, `status` was dropped: a new hypothesis is always open."));
-        } else {
-            notes.push(format!(
-                "In {l}, status `{}` was not recorded: a new hypothesis is open, and only an independent read-only \
-                 verifier records a verdict.",
-                cut(&given, QUOTE)
-            ));
-        }
-    }
-    // N4d: evidence given with the hypothesis.
-    let mut attach = None;
-    let mut refuse_id = None;
-    let lists_ok = ["evidence", "counterevidence"].iter().all(|k| m.get(*k).is_none_or(Value::is_array));
-    let present = m.contains_key("evidence") || m.contains_key("counterevidence");
-    if present && lists_ok {
-        let nonempty = ["evidence", "counterevidence"]
-            .iter()
-            .any(|k| m.get(*k).and_then(Value::as_array).is_some_and(|a| !a.is_empty()));
-        let text = m.get("text").and_then(Value::as_str).map(|t| t.trim().to_string());
-        // A refuted status says the evidence given counts against the hypothesis (N4d).
-        let given_support = m.get("evidence").and_then(Value::as_array).is_some_and(|a| !a.is_empty());
-        let given_counter = m.get("counterevidence").and_then(Value::as_array).is_some_and(|a| !a.is_empty());
-        if refuted && given_support && !given_counter {
-            if let Some(evidence) = m.remove("evidence") {
-                m.insert("counterevidence".into(), evidence);
-                m.insert("evidence".into(), Value::Array(Vec::new()));
-                notes.push(format!(
-                    "In {l}, the status said the hypothesis is refuted, so its `evidence` was attached as \
-                     counterevidence."
-                ));
-            }
-        }
-        match (nonempty, text) {
-            (false, _) => {
-                m.remove("evidence");
-                m.remove("counterevidence");
-            }
-            (true, Some(text)) if in_batch => refuse_id = Some(stable_id("hy", &[text.as_str()])),
-            (true, Some(_)) => {
-                let evidence = m.remove("evidence").unwrap_or_else(|| Value::Array(Vec::new()));
-                let counter = m.remove("counterevidence").unwrap_or_else(|| Value::Array(Vec::new()));
-                attach = Some((evidence, counter));
-                notes.push(format!(
-                    "In {l}, the evidence was attached by a hypothesis_evidence operation recorded in the same \
-                     atomic append."
-                ));
-            }
-            (true, None) => {}
-        }
-    }
-    // N5.
-    let bad_priority = if m.contains_key("priority") {
-        set_priority(m, l, p, notes).err()
-    } else {
-        m.insert("priority".into(), json!(3));
-        notes.push(format!("In {l}, no priority was given, so it is 3 (1 low to 5 high)."));
-        None
-    };
-    if let Some(e) = bad_priority {
-        return Err(e);
-    }
-    if let Some(id) = refuse_id {
-        return Err(refuse(
-            p,
-            &format!(
-                "A hypothesis opens without evidence. Put {{\"action\": \"hypothesis_evidence\", \"id\": \"{id}\", \
-                 \"evidence\": […]}} after it in the batch; `{id}` is the ID of this text."
-            ),
-        ));
-    }
-    Ok(attach)
-}
-
-/// N5 on `m["priority"]`; R7 when it cannot be read.
-fn set_priority(m: &mut Map<String, Value>, l: &str, p: &str, notes: &mut Vec<String>) -> Result<(), String> {
-    let given = m.get("priority").cloned().unwrap_or(Value::Null);
-    let read = match &given {
-        Value::Number(n) => n.as_u64().filter(|v| *v <= 255).map(|v| (v, false)),
-        Value::String(s) => {
-            let t = s.trim().to_ascii_lowercase();
-            match t.as_str() {
-                "low" => Some((1, true)),
-                "medium" | "normal" => Some((3, true)),
-                "high" => Some((5, true)),
-                digits if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) => {
-                    digits.parse::<u8>().ok().map(|v| (u64::from(v), true))
-                }
-                _ => None,
-            }
-        }
-        _ => None,
-    };
-    let Some((value, rewritten)) = read else {
-        return Err(refuse(p, "Give priority as an integer from 1 (low) to 5 (high), or low, medium or high."));
-    };
-    if rewritten {
-        let shown = given.as_str().map(|s| cut(s, QUOTE)).unwrap_or_default();
-        notes.push(format!("In {l}, priority `{shown}` was read as {value}."));
-        m.insert("priority".into(), json!(value));
-    }
-    Ok(())
-}
-
-/// N6a: `hypothesis` or `hypothesis_id` is the hypothesis `id`.
-fn rename_id(m: &mut Map<String, Value>, l: &str, notes: &mut Vec<String>) {
-    if m.contains_key("id") {
-        return;
-    }
-    for name in ["hypothesis", "hypothesis_id"] {
-        if m.get(name).is_some_and(Value::is_string) {
-            if let Some(value) = m.remove(name) {
-                m.insert("id".into(), value);
-                notes.push(format!("In {l}, `{name}` was read as `id`."));
-                return;
-            }
-        }
-    }
-}
-
-/// The verdict a status word means (N6c): "supported" or "refuted".
-fn verdict_word(word: &str) -> Option<&'static str> {
-    match word.trim().to_ascii_lowercase().as_str() {
-        "supported" | "confirmed" | "verified" | "true" | "accepted" | "valid" => Some("supported"),
-        "refuted" | "disproved" | "rejected" | "false" | "invalid" => Some("refuted"),
-        _ => None,
-    }
-}
-
-/// N6b and N6c for hypothesis_verdict.
-fn verdict(m: &mut Map<String, Value>, l: &str, notes: &mut Vec<String>) {
-    if !m.contains_key("status") {
-        if let Some(value) = m.remove("verdict") {
-            m.insert("status".into(), value);
-            notes.push(format!("In {l}, `verdict` was read as `status`."));
-        }
-    }
-    let (given, status) = match m.get("status") {
-        Some(Value::Bool(b)) => (b.to_string(), if *b { "supported" } else { "refuted" }),
-        Some(Value::String(s)) => {
-            let Some(status) = verdict_word(s) else { return };
-            (s.clone(), status)
-        }
-        _ => return,
-    };
-    if given != status {
-        notes.push(format!("In {l}, status `{}` was read as `{status}`.", cut(&given, QUOTE)));
-    }
-    m.insert("status".into(), Value::String(status.to_string()));
-}
-
 /// Whether `s` holds URL user information (`user@` or `user:pass@`) anywhere: in the authority after any `://`,
 /// or in a whitespace-separated token that parses as a URL with a user name or password.
 fn has_userinfo(s: &str) -> bool {
@@ -985,20 +703,6 @@ fn has_userinfo(s: &str) -> bool {
     after_scheme
         || s.split_whitespace()
             .any(|token| url::Url::parse(token).is_ok_and(|u| !u.username().is_empty() || u.password().is_some()))
-}
-
-/// The host of `s` when it is `name:port` or `[v6]:port` with a decimal port of at most five digits.
-fn host_and_port(s: &str) -> Option<String> {
-    let port_ok = |port: &str| !port.is_empty() && port.len() <= 5 && port.bytes().all(|b| b.is_ascii_digit());
-    if let Some(rest) = s.strip_prefix('[') {
-        let (inner, after) = rest.split_once(']')?;
-        let port = after.strip_prefix(':')?;
-        inner.parse::<std::net::Ipv6Addr>().ok()?;
-        return port_ok(port).then(|| inner.to_string());
-    }
-    let (name, port) = s.split_once(':')?;
-    let name_ok = !name.is_empty() && !name.chars().any(|c| c.is_whitespace() || matches!(c, '/' | '@' | ':'));
-    (name_ok && port_ok(port)).then(|| name.to_string())
 }
 
 /// The host of an absolute URL that has one and no user information.
@@ -1055,15 +759,13 @@ fn locator(
     let mut loc = given.clone();
     let before = notes.len();
     match kind.as_str() {
-        "host" if loc.parse::<std::net::IpAddr>().is_err() && !has_userinfo(&loc) => {
-            // A URL is read only with `://`: WHATWG parsing reads `ftp:21` as ftp://0.0.0.21/.
-            let host = if loc.contains("://") { url_host(&loc) } else { None }.or_else(|| host_and_port(&loc));
-            if let Some(host) = host.filter(|h| canonical_locator(AssetKind::Host, h).is_ok()) {
+        "host" if loc.parse::<std::net::IpAddr>().is_err() => {
+            if let Some(host) = reduce_host(&loc).filter(|h| canonical_locator(AssetKind::Host, h).is_ok()) {
                 notes.push(format!(
-                    "In {l}, the host was recorded as `{}` from `{}`: a host locator has no scheme, port or \
-                     path; record the service as kind service with an absolute URL.",
+                    "In {l}, the host was recorded as `{}` from {}: a host locator has no scheme, port, path or \
+                     credentials; record the service as kind service with an absolute URL.",
                     cut(&host, QUOTE),
-                    cut(&given, QUOTE)
+                    shown(&given)
                 ));
                 loc = host;
             }
@@ -1164,16 +866,21 @@ fn locator(
                 .and_then(|h| h.strip_suffix(']'))
                 .is_some_and(|h| h.parse::<std::net::Ipv6Addr>().is_ok());
             if plain && !head.is_empty() && (host_and_port_any(head) || bare_name(head) || v6 || bracketed) {
-                // A bare IPv6 address is bracketed in a URL.
+                // A bare IPv6 address is bracketed in a URL; port 443 reads as https, anything else as http.
                 let tail = loc.get(head.len()..).unwrap_or("");
-                let shown = if v6 { cut(&format!("[{head}]{tail}"), QUOTE) } else { cut(&loc, QUOTE) };
-                return Err(refuse(
-                    p,
-                    &format!(
-                        "Give the scheme as well, for example `http://{shown}` (or `tcp://{shown}` for a service \
-                         that is not HTTP)."
-                    ),
-                ));
+                let authority = if v6 { format!("[{head}]") } else { head.to_string() };
+                let port = authority.rsplit_once(':').filter(|(h, _)| !v6 && !h.ends_with(':')).map(|(_, p)| p);
+                let scheme = if port == Some("443") { "https" } else { "http" };
+                let repaired = format!("{scheme}://{authority}{tail}");
+                if canonical_locator(AssetKind::Service, &repaired).is_ok() {
+                    notes.push(format!(
+                        "In {l}, `{}` had no scheme, so it was recorded as `{}`: https for port 443 and http \
+                         otherwise; give tcp:// yourself for a service that is not HTTP.",
+                        cut(&loc, QUOTE),
+                        cut(&repaired, QUOTE)
+                    ));
+                    loc = repaired;
+                }
             }
         }
         _ => {}
@@ -1182,6 +889,28 @@ fn locator(
         asset.insert("locator".into(), Value::String(loc));
     }
     Ok(())
+}
+
+/// What a note may quote of a given locator: never a value that holds user information.
+fn shown(s: &str) -> String {
+    if s.contains('@') {
+        "a value with credentials, not shown".to_string()
+    } else {
+        format!("`{}`", cut(s, QUOTE))
+    }
+}
+
+/// The host of a host locator that carries a scheme, port, path or credentials; `None` when it has none.
+fn reduce_host(given: &str) -> Option<String> {
+    let token = given.split_whitespace().next()?;
+    let text = if token.contains("://") { token.to_string() } else { format!("tcp://{token}") };
+    let url = url::Url::parse(&text).ok()?;
+    let host = match url.host()? {
+        url::Host::Domain(d) => d.to_string(),
+        url::Host::Ipv4(a) => a.to_string(),
+        url::Host::Ipv6(a) => a.to_string(),
+    };
+    (host != given).then_some(host)
 }
 
 /// `name:port` or `[v6]:port` with any decimal port (R5).
@@ -1209,15 +938,9 @@ pub(super) fn shape(action: &str) -> Option<&'static str> {
         "blocked_on" => "{action:blocked_on, target:ID, conditions:[condition]}",
         "revisit_acknowledge" => "{action:revisit_acknowledge, target:ID}",
         "crash_record" => "{action:crash_record, signature:{sanitizer, frames:[{function, file, line?}], outcome:crash}, attempt:{vector, summary, evidence:[eN]}}; only a real crash has a signature: record a timeout, an out-of-memory exit or a run without a crash as a fact with fact_assert",
-        "hypothesis_open" => "{action:hypothesis_open, text, priority?:1 (low) to 5 (high), default 3}",
-        "hypothesis_priority" => "{action:hypothesis_priority, id:hypothesisID, priority:1 (low) to 5 (high)}",
-        "hypothesis_evidence" => "{action:hypothesis_evidence, id:hypothesisID, evidence:[eN], counterevidence?:[eN]}",
-        "hypothesis_verdict" => "{action:hypothesis_verdict, id:hypothesisID, status:supported|refuted, note, evidence:[eN], counterevidence:[eN]}",
         "relation_add" => "{action:relation_add, relation:{from:assetID, to:assetID, kind, cost:1-1000 (smaller is easier), evidence:[eN], expires_ms?}}",
         "fact_assert" => "{action:fact_assert, fact:{predicate, args:[string]}, evidence:[eN]}",
         "fact_retract" => "{action:fact_retract, id:factID, reason}",
-        "rule_install" => "{action:rule_install, rule:{name, head:{predicate, args:[?x]}, body:[{atom:{predicate, args:[?x]}, negated?:false}]}}",
-        "rule_retract" => "{action:rule_retract, id:ruleID, reason}",
         "alias_add" => "{action:alias_add, alias, target:ID}",
         "batch" => "{action:batch, operations:[operation, …]}; atomic: when one operation is invalid nothing is recorded and the error names it",
         _ => return None,
@@ -1235,19 +958,7 @@ pub(super) fn description(caller: &Caller<'_>) -> String {
     let mut order: Vec<&str> = ACTIONS.iter().copied().filter(|a| *a != "batch").collect();
     order.push("batch");
     for action in order {
-        let line = match (action, caller.standing) {
-            ("hypothesis_open", Standing::Child | Standing::Judge) => {
-                "- hypothesis_open, hypothesis_priority: the mission lead's; send a \
-                 proposed hypothesis to the lead."
-                    .to_string()
-            }
-            ("hypothesis_priority", Standing::Child | Standing::Judge) => continue,
-            ("hypothesis_verdict", Standing::Lead | Standing::Child) => "- hypothesis_verdict: recorded only by an \
-                 independent read-only verifier; attach evidence with hypothesis_evidence and the hypothesis stays \
-                 open until one reviews it."
-                .to_string(),
-            _ => format!("- {}", shape(action).unwrap_or("")),
-        };
+        let line = format!("- {}", shape(action).unwrap_or(""));
         lines.push(line);
     }
     let mut condition =
@@ -1263,7 +974,7 @@ pub(super) fn description(caller: &Caller<'_>) -> String {
         evidence.push_str(": attach the output that shows it with the evidence tool first");
     }
     evidence.push_str(
-        ". Evidence IDs are given exactly; other IDs (assets, parents, hypotheses, facts, rules, and the asset in a \
+        ". Evidence IDs are given exactly; other IDs (assets, parents, facts, and the asset in a \
          cred or auth condition) may be the exact ID, an alias, or a unique prefix of at least four characters",
     );
     if has("security_query") {
@@ -1283,19 +994,20 @@ pub(super) fn description(caller: &Caller<'_>) -> String {
 mod tests {
     use super::*;
     use loom_core::security_state::{Asset, CoverageDisposition};
+    use serde_json::json;
 
     fn names(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| (*s).to_string()).collect()
     }
-    fn go_in(state: &SecurityState, standing: Standing, tools: &[&str], op: Value) -> Result<Read, String> {
+    fn go_in(state: &SecurityState, tools: &[&str], op: Value) -> Result<Read, String> {
         let tools = names(tools);
-        read(&Caller { standing, tools: &tools }, state, &op)
+        read(&Caller { tools: &tools }, state, &op)
     }
-    fn go(standing: Standing, tools: &[&str], op: Value) -> Result<Read, String> {
-        go_in(&SecurityState::default(), standing, tools, op)
+    fn go(tools: &[&str], op: Value) -> Result<Read, String> {
+        go_in(&SecurityState::default(), tools, op)
     }
     fn lead(op: Value) -> Result<Read, String> {
-        go(Standing::Lead, &["report_blocker", "evidence", "security_query"], op)
+        go(&["report_blocker", "evidence", "security_query"], op)
     }
     fn ok(r: Result<Read, String>) -> Read {
         r.unwrap_or_else(|e| panic!("refused: {e}"))
@@ -1356,7 +1068,7 @@ mod tests {
         let mut sorted = ACTIONS.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
-        assert_eq!(sorted.len(), 19);
+        assert_eq!(sorted.len(), 13);
     }
 
     #[test]
@@ -1387,15 +1099,10 @@ mod tests {
     fn batch_elements_are_read_one_by_one_with_their_position() {
         let r = ok(lead(batch(vec![
             asset("host", "10.0.0.5"),
-            json!({"action": "hypothesis_open", "statement": "x is injectable"}),
+            json!({"action": "relation_add", "from": "as-1", "to": "as-2", "kind": "reaches", "cost": 5,
+                "evidence": ["e1"]}),
         ])));
-        assert_eq!(
-            r.notes,
-            vec![
-                "In operation 2 of the batch, `statement` was read as `text`.",
-                "In operation 2 of the batch, no priority was given, so it is 3 (1 low to 5 high)."
-            ]
-        );
+        assert_eq!(r.notes, vec!["In operation 2 of the batch, the relation fields were moved into `relation`."]);
         let e = err(lead(batch(vec![asset("host", "10.0.0.5"), json!("oops")])));
         assert_eq!(e, "Operation 2 of 2 in the batch: give an object with `action`. Nothing was recorded.");
         let e = err(lead(batch(vec![asset("host", "10.0.0.5"), json!({"action": "claim_update"})])));
@@ -1448,187 +1155,6 @@ mod tests {
     }
 
     #[test]
-    fn n4_reads_hypothesis_open_near_misses() {
-        let r = ok(lead(json!({"action": "hypothesis_open", "hypothesis": {"statement": "s", "status": "verified",
-            "priority": "high"}})));
-        assert_eq!(
-            r.notes,
-            vec![
-                "In the operation, the fields of `hypothesis` were read as the operation's own.",
-                "In the operation, `statement` was read as `text`.",
-                "In the operation, status `verified` was not recorded: a new hypothesis is open, and only an \
-                 independent read-only verifier records a verdict.",
-                "In the operation, priority `high` was read as 5."
-            ]
-        );
-        assert_eq!(json_of(&r.op), json!({"action": "hypothesis_open", "text": "s", "priority": 5}));
-        let r = ok(lead(json!({"action": "hypothesis_open", "hypothesis": "s", "status": "Open", "priority": 2})));
-        assert_eq!(
-            r.notes,
-            vec![
-                "In the operation, `hypothesis` was read as `text`.",
-                "In the operation, `status` was dropped: a new hypothesis is always open."
-            ]
-        );
-        let r = ok(lead(json!({"action": "hypothesis_open", "text": "s"})));
-        assert_eq!(r.notes, vec!["In the operation, no priority was given, so it is 3 (1 low to 5 high)."]);
-        assert_eq!(json_of(&r.op)["priority"], 3);
-    }
-
-    #[test]
-    fn n4d_expands_a_single_open_with_evidence_into_one_atomic_batch() {
-        let r = ok(lead(json!({"action": "hypothesis_open", "text": " s ", "priority": 4, "evidence": ["e1"],
-            "counterevidence": []})));
-        assert_eq!(
-            r.notes,
-            vec![
-                "In the operation, the evidence was attached by a hypothesis_evidence operation recorded in the \
-                  same atomic append."
-            ]
-        );
-        let id = stable_id("hy", &["s"]);
-        assert_eq!(element(&r, 0), json!({"action": "hypothesis_open", "text": " s ", "priority": 4}));
-        assert_eq!(
-            element(&r, 1),
-            json!({"action": "hypothesis_evidence", "id": id, "evidence": ["e1"], "counterevidence": []})
-        );
-        // Only counterevidence also expands; empty lists vanish silently.
-        let r = ok(lead(json!({"action": "hypothesis_open", "text": "s", "priority": 4, "counterevidence": ["e2"]})));
-        assert_eq!(element(&r, 1)["evidence"], json!([]));
-        assert_eq!(element(&r, 1)["counterevidence"], json!(["e2"]));
-        let r = ok(lead(json!({"action": "hypothesis_open", "text": "s", "priority": 4, "evidence": [],
-            "counterevidence": []})));
-        assert!(matches!(r.op, SecurityOp::HypothesisOpen { .. }));
-        assert_eq!(r.notes, Vec::<String>::new());
-        // The wrapper form of the logged near miss reads in one go.
-        let r = ok(lead(json!({"hypothesis": {"statement": "s", "status": "verified", "priority": "high",
-            "evidence": ["e1"]}, "action": "hypothesis_open"})));
-        assert_eq!(r.notes.len(), 5, "{:?}", r.notes);
-        assert_eq!(element(&r, 0)["priority"], 5);
-    }
-
-    #[test]
-    fn n4d_reads_evidence_given_with_a_refuted_status_as_counterevidence() {
-        let id = stable_id("hy", &["s"]);
-        for status in [json!("refuted"), json!(" Disproved "), json!(false)] {
-            let r = ok(lead(json!({"action": "hypothesis_open", "hypothesis": {"statement": "s", "status": status,
-                "evidence": ["e5"]}})));
-            assert_eq!(
-                element(&r, 1),
-                json!({"action": "hypothesis_evidence", "id": id, "evidence": [], "counterevidence": ["e5"]})
-            );
-            assert!(
-                r.notes.contains(
-                    &"In the operation, the status said the hypothesis is refuted, so its `evidence` was attached as \
-                      counterevidence."
-                        .to_string()
-                ),
-                "{:?}",
-                r.notes
-            );
-        }
-        // Evidence given on both sides is kept as given, and a supported status moves nothing.
-        let r = ok(lead(json!({"action": "hypothesis_open", "text": "s", "status": "refuted", "evidence": ["e1"],
-            "counterevidence": ["e2"]})));
-        assert_eq!(element(&r, 1)["evidence"], json!(["e1"]));
-        let r = ok(lead(json!({"action": "hypothesis_open", "text": "s", "status": "verified", "evidence": ["e1"]})));
-        assert_eq!(element(&r, 1)["evidence"], json!(["e1"]));
-    }
-
-    #[test]
-    fn r8_refuses_evidence_on_an_open_inside_a_batch() {
-        let id = stable_id("hy", &["s"]);
-        let e = err(lead(batch(vec![
-            asset("host", "10.0.0.5"),
-            json!({"action": "hypothesis_open", "text": " s", "priority": 3, "evidence": ["e1"]}),
-        ])));
-        assert_eq!(
-            e,
-            format!(
-                "Operation 2 of 2 in the batch (hypothesis_open): A hypothesis opens without evidence. Put \
-                 {{\"action\": \"hypothesis_evidence\", \"id\": \"{id}\", \"evidence\": […]}} after it in the batch; \
-                 `{id}` is the ID of this text. Nothing was recorded."
-            )
-        );
-        // Empty lists inside a batch are removed silently.
-        let r = ok(lead(batch(vec![json!({"action": "hypothesis_open", "text": "s", "priority": 3,
-            "evidence": [], "counterevidence": []})])));
-        assert!(r.notes.is_empty());
-    }
-
-    #[test]
-    fn n5_reads_priorities_and_r7_refuses_the_rest() {
-        let prio = |v: Value| lead(json!({"action": "hypothesis_open", "text": "s", "priority": v}));
-        for (given, want) in [
-            (json!("low"), 1),
-            (json!(" Medium "), 3),
-            (json!("normal"), 3),
-            (json!("HIGH"), 5),
-            (json!("4"), 4),
-            (json!("255"), 255),
-        ] {
-            let r = ok(prio(given.clone()));
-            assert_eq!(json_of(&r.op)["priority"], want);
-            let shown = given.as_str().unwrap_or("");
-            assert_eq!(r.notes, vec![format!("In the operation, priority `{shown}` was read as {want}.")]);
-        }
-        for kept in [json!(0), json!(7), json!(255)] {
-            assert!(ok(prio(kept)).notes.is_empty());
-        }
-        for bad in
-            [json!("urgent"), json!("256"), json!(256), json!(-1), json!(2.5), json!(null), json!(true), json!("")]
-        {
-            let e = err(prio(bad.clone()));
-            assert_eq!(
-                e,
-                "Give priority as an integer from 1 (low) to 5 (high), or low, medium or high. Nothing was recorded.",
-                "{bad}"
-            );
-        }
-        let r = ok(lead(json!({"action": "hypothesis_priority", "hypothesis": "hy-1", "priority": "high"})));
-        assert_eq!(
-            r.notes,
-            vec![
-                "In the operation, `hypothesis` was read as `id`.",
-                "In the operation, priority `high` was read as 5."
-            ]
-        );
-        let e = err(lead(json!({"action": "hypothesis_priority", "id": "hy-1", "priority": "soon"})));
-        assert!(e.starts_with("Give priority as an integer"), "{e}");
-    }
-
-    #[test]
-    fn n6_reads_evidence_and_verdict_near_misses() {
-        let judge = |op: Value| go(Standing::Judge, &[], op);
-        let r = ok(judge(json!({"action": "hypothesis_evidence", "hypothesis_id": "hy-1", "evidence": ["e1"]})));
-        assert_eq!(r.notes, vec!["In the operation, `hypothesis_id` was read as `id`."]);
-        assert_eq!(json_of(&r.op)["counterevidence"], json!([]));
-        let r = ok(judge(json!({"action": "hypothesis_verdict", "id": "hy-1", "verdict": "supported", "note": "n"})));
-        assert_eq!(r.notes, vec!["In the operation, `verdict` was read as `status`."]);
-        let r = ok(judge(json!({"action": "hypothesis_verdict", "id": "hy-1", "status": "Confirmed", "note": "n",
-            "evidence": ["e1"]})));
-        assert_eq!(r.notes, vec!["In the operation, status `Confirmed` was read as `supported`."]);
-        for (given, want) in [
-            (json!("verified"), "supported"),
-            (json!("true"), "supported"),
-            (json!("accepted"), "supported"),
-            (json!("valid"), "supported"),
-            (json!("disproved"), "refuted"),
-            (json!("rejected"), "refuted"),
-            (json!("false"), "refuted"),
-            (json!("invalid"), "refuted"),
-            (json!(true), "supported"),
-            (json!(false), "refuted"),
-        ] {
-            let r = ok(judge(json!({"action": "hypothesis_verdict", "id": "hy-1", "status": given, "note": "n"})));
-            assert_eq!(json_of(&r.op)["status"], want);
-            assert_eq!(r.notes.len(), 1, "{given}");
-        }
-        let e = err(judge(json!({"action": "hypothesis_verdict", "id": "hy-1", "status": "maybe", "note": "n"})));
-        assert!(e.contains("unknown variant `maybe`") && e.contains("hypothesis_verdict takes"), "{e}");
-    }
-
-    #[test]
     fn n7a_reduces_a_host_locator_to_the_host() {
         let host = |loc: &str| lead(asset("host", loc));
         for (given, want) in [
@@ -1643,6 +1169,7 @@ mod tests {
             ("http:8080", "http"),
             ("https:443", "https"),
             ("ws:80", "ws"),
+            ("x/y:80", "x"),
         ] {
             let r = ok(host(given));
             assert_eq!(locator_of(&r), want, "{given}");
@@ -1650,27 +1177,28 @@ mod tests {
                 r.notes,
                 vec![format!(
                     "In the operation, the host was recorded as `{want}` from `{}`: a host locator has no scheme, \
-                     port or path; record the service as kind service with an absolute URL.",
+                     port, path or credentials; record the service as kind service with an absolute URL.",
                     given.trim()
                 )]
             );
         }
-        for same in ["::1", "10.0.0.5", "example.test", "db:123456", "db:99999x", "x/y:80"] {
+        for same in ["::1", "10.0.0.5", "example.test", "db:123456", "db:99999x"] {
             let r = ok(host(same));
             assert_eq!(locator_of(&r), same);
             assert!(r.notes.is_empty(), "{same}");
         }
-        // User information is never rewritten and never quoted; the core refuses it.
-        for secret in [
-            "http://user:pass@h/",
-            "user@h:1",
-            "http://:pw@h",
-            "http://10.0.0.5/ http://admin:pw@10.0.0.5/",
-            "http://10.0.0.5/?next=http://admin:pw@x",
+        // Credentials are dropped with the rest and never quoted.
+        for (secret, want) in [
+            ("http://user:pass@h/", "h"),
+            ("user@h:1", "h"),
+            ("http://:pw@h", "h"),
+            ("http://10.0.0.5/ http://admin:pw@10.0.0.5/", "10.0.0.5"),
+            ("http://10.0.0.5/?next=http://admin:pw@x", "10.0.0.5"),
         ] {
             let r = ok(host(secret));
-            assert_eq!(locator_of(&r), secret);
-            assert!(r.notes.is_empty());
+            assert_eq!(locator_of(&r), want, "{secret}");
+            assert_eq!(r.notes.len(), 1);
+            assert!(!r.notes[0].contains("pw") && !r.notes[0].contains("pass") && !r.notes[0].contains("admin"));
         }
     }
 
@@ -1723,7 +1251,6 @@ mod tests {
         let with_parent = |loc: &str, parent: &str| {
             go_in(
                 &state,
-                Standing::Lead,
                 &[],
                 json!({"action": "asset_upsert", "asset": {"kind": "endpoint", "locator": loc, "evidence": ["e1"],
                     "parent": parent}}),
@@ -1764,47 +1291,36 @@ mod tests {
         let e = err(with_parent("/x", "as-nonexistent"));
         assert_eq!(e, "No security record matches `as-nonexistent`; query the current records before choosing an ID. Nothing was recorded.");
         // When exactly one URL asset exists and parent is absent, it inherits the sole service parent.
-        let r = ok(go_in(&state, Standing::Lead, &[], batch(vec![asset("host", "h"), asset("endpoint", "/x")])));
+        let r = ok(go_in(&state, &[], batch(vec![asset("host", "h"), asset("endpoint", "/x")])));
         assert_eq!(element(&r, 1)["asset"]["locator"], "http://10.0.0.5:8080/x");
         assert_eq!(element(&r, 1)["asset"]["parent"], id);
         // In a batch with no service parent to inherit, the refusal carries the position.
-        let e = err(go_in(
-            &SecurityState::default(),
-            Standing::Lead,
-            &[],
-            batch(vec![asset("host", "h"), asset("endpoint", "/x")]),
-        ));
+        let e = err(go_in(&SecurityState::default(), &[], batch(vec![asset("host", "h"), asset("endpoint", "/x")])));
         assert!(e.starts_with("Operation 2 of 2 in the batch (asset_upsert): An endpoint locator"), "{e}");
     }
 
     #[test]
     fn r5_and_r6_refuse_a_locator_the_core_cannot_use() {
-        for (loc, shown) in [
-            ("172.17.0.3:8080", "172.17.0.3:8080"),
-            ("localhost", "localhost"),
-            ("app.test:8080/login", "app.test:8080/login"),
-            ("[::1]:80", "[::1]:80"),
+        for (loc, want) in [
+            ("172.17.0.3:8080", "http://172.17.0.3:8080"),
+            ("localhost", "http://localhost"),
+            ("app.test:8080/login", "http://app.test:8080/login"),
+            ("[::1]:80", "http://[::1]:80"),
+            ("app.test:443", "https://app.test:443"),
         ] {
-            let e = err(lead(asset("service", loc)));
-            assert_eq!(
-                e,
-                format!(
-                    "Give the scheme as well, for example `http://{shown}` (or `tcp://{shown}` for a service that is \
-                     not HTTP). Nothing was recorded."
-                )
-            );
+            let r = ok(lead(asset("service", loc)));
+            assert_eq!(locator_of(&r), want, "{loc}");
+            assert_eq!(r.notes.len(), 1, "{loc}");
+            assert!(r.notes[0].contains("had no scheme"), "{}", r.notes[0]);
         }
-        // A bare IPv6 address needs a scheme, and the suggestion brackets it.
-        for (loc, shown) in [("::1", "[::1]"), ("fe80::1", "[fe80::1]"), ("[::1]", "[::1]"), ("::1/x", "[::1]/x")] {
-            let e = err(lead(asset("endpoint", loc)));
-            assert_eq!(
-                e,
-                format!(
-                    "Give the scheme as well, for example `http://{shown}` (or `tcp://{shown}` for a service that is \
-                     not HTTP). Nothing was recorded."
-                ),
-                "{loc}"
-            );
+        // A bare IPv6 address is bracketed in the repaired URL.
+        for (loc, want) in [
+            ("::1", "http://[::1]"),
+            ("fe80::1", "http://[fe80::1]"),
+            ("[::1]", "http://[::1]"),
+            ("::1/x", "http://[::1]/x"),
+        ] {
+            assert_eq!(locator_of(&ok(lead(asset("endpoint", loc)))), want, "{loc}");
         }
         // Not a bare host: left for the core.
         for loc in ["a b", "x@y:80", "mailto:me", "http://h", "file:///x"] {
@@ -1819,7 +1335,6 @@ mod tests {
         );
         let e = err(go_in(
             &state,
-            Standing::Lead,
             &[],
             json!({"action": "asset_upsert", "asset": {"kind": "endpoint", "locator": "/x", "parent": id}}),
         ));
@@ -1830,7 +1345,7 @@ mod tests {
     fn r2_refuses_conditions_that_are_not_typed() {
         let tools_with = ["report_blocker"];
         let blocked = |conditions: Value, tools: &[&str]| {
-            go(Standing::Lead, tools, json!({"action": "blocked_on", "target": "c1", "conditions": conditions}))
+            go(tools, json!({"action": "blocked_on", "target": "c1", "conditions": conditions}))
         };
         let head =
             "A condition is a typed prerequisite {kind, value} with kind auth, cred, role, leak, offset or key, \
@@ -1845,8 +1360,7 @@ mod tests {
         let e = err(blocked(json!([{"kind": "cred", "value": "x"}, 5]), &[]));
         assert!(e.contains("`5` is not one."), "{e}");
         assert!(blocked(json!([{"kind": "cred", "value": "x"}]), &[]).is_ok());
-        let e =
-            err(go(Standing::Lead, &[], json!({"action": "condition_unlock", "conditions": ["x"], "evidence": []})));
+        let e = err(go(&[], json!({"action": "condition_unlock", "conditions": ["x"], "evidence": []})));
         assert!(e.starts_with(head), "{e}");
         let e = err(lead(json!({"action": "credential_add", "credential": {"asset": "as-1", "principal": "p",
             "secret_handle": "out:abcdef01", "evidence": ["e1"], "unlocks": ["admin"]}})));
@@ -1858,41 +1372,8 @@ mod tests {
     }
 
     #[test]
-    fn early_refusals_come_before_any_shape_check() {
-        let verdict_without_anything = json!({"action": "hypothesis_verdict", "verdict": "confirmed"});
-        for standing in [Standing::Lead, Standing::Child] {
-            let e = err(go(standing, &[], verdict_without_anything.clone()));
-            assert_eq!(
-                e,
-                "Only an independent read-only verifier records a hypothesis verdict. Attach your evidence with \
-                 hypothesis_evidence {id, evidence}; the hypothesis stays open until a verifier reviews it. Nothing \
-                 was recorded."
-            );
-        }
-        assert!(go(Standing::Judge, &[], verdict_without_anything.clone()).is_err());
-        let e = err(lead(batch(vec![verdict_without_anything])));
-        assert!(e.starts_with("Operation 1 of 1 in the batch (hypothesis_verdict): Only an independent"), "{e}");
-        let e = err(go(Standing::Child, &[], json!({"action": "hypothesis_open"})));
-        assert_eq!(
-            e,
-            "Only the mission lead may open a hypothesis; send the proposed hypothesis to the lead. Nothing was recorded."
-        );
-        let e = err(go(Standing::Child, &[], json!({"action": "hypothesis_priority"})));
-        assert_eq!(
-            e,
-            "Only the hypothesis's original lead may change its priority; send the proposed change to that lead. \
-             Nothing was recorded."
-        );
-        for action in ["hypothesis_open", "hypothesis_priority"] {
-            let e = err(go(Standing::Judge, &[], json!({"action": action, "text": "t"})));
-            assert!(e.starts_with("Only the "), "{action}: {e}");
-        }
-        assert!(go(Standing::Lead, &[], json!({"action": "hypothesis_open", "text": "t"})).is_ok());
-    }
-
-    #[test]
     fn r1_names_a_separate_tool_and_unknown_actions_list_the_valid_ones() {
-        let e = err(go(Standing::Lead, &["claim_update", "evidence"], json!({"action": "claim_update", "id": "c1"})));
+        let e = err(go(&["claim_update", "evidence"], json!({"action": "claim_update", "id": "c1"})));
         assert_eq!(
             e,
             "`claim_update` is a separate tool, not a security_record action; call it directly. Nothing was recorded."
@@ -1900,22 +1381,16 @@ mod tests {
         let e = err(lead(json!({"action": "claim_update", "id": "c1"})));
         assert!(e.starts_with("Correct `operation` before retrying: `claim_update` is not a security_record action; use one of batch, asset_upsert,"), "{e}");
         assert!(e.ends_with("alias_add. Nothing was recorded."), "{e}");
-        let e = err(go(Standing::Lead, &[], batch(vec![json!({"action": "evidence"})])));
+        let e = err(go(&[], batch(vec![json!({"action": "evidence"})])));
         assert!(e.starts_with("Operation 1 of 1 in the batch (evidence): Correct `operation`"), "{e}");
-        let e = err(go(Standing::Lead, &["evidence"], batch(vec![json!({"action": "evidence"})])));
+        let e = err(go(&["evidence"], batch(vec![json!({"action": "evidence"})])));
         assert!(e.starts_with("Operation 1 of 1 in the batch (evidence): `evidence` is a separate tool"), "{e}");
     }
 
     #[test]
     fn d1_and_d2_carry_the_shape_and_never_echo_a_string_value() {
-        let e = err(lead(json!({"action": "hypothesis_open", "priority": 3})));
-        assert_eq!(
-            e,
-            format!(
-                "Correct `operation` before retrying: missing field `text`. hypothesis_open takes {}. Nothing was recorded.",
-                shape("hypothesis_open").unwrap()
-            )
-        );
+        let e = err(lead(json!({"action": "relation_add", "relation": {"from": "as-1"}})));
+        assert!(e.contains(&format!("relation_add takes {}", shape("relation_add").unwrap())), "{e}");
         let e = err(lead(json!({"action": "credential_add", "credential": {"asset": "as-1", "principal": "p",
             "secret_handle": "out:abcdef01", "evidence": ["e1"], "unlocks": "hunter2-the-password"}})));
         assert!(!e.contains("hunter2"), "{e}");
@@ -1932,9 +1407,6 @@ mod tests {
         let long: String = "é世".repeat(60);
         assert_eq!(long.chars().count(), 120);
         let cut_text: String = long.chars().take(80).collect();
-        let r = ok(lead(json!({"action": "hypothesis_open", "text": "s", "status": long.clone()})));
-        assert_eq!(r.notes.len(), 2);
-        assert!(r.notes[0].contains(&format!("status `{cut_text}…` was not recorded")), "{}", r.notes[0]);
         let e = err(lead(json!({"action": long.clone()})));
         assert!(e.contains(&format!("`{cut_text}…` is not a security_record action")), "{e}");
         let r = ok(lead(asset("service", &format!("http://h.test/ {long}"))));
@@ -1943,53 +1415,6 @@ mod tests {
         assert!(e.contains(&format!("`{cut_text}…` is not one")), "{e}");
         assert_eq!(cut("abc", 3), "abc");
         assert_eq!(cut("abcd", 3), "abc…");
-    }
-
-    #[test]
-    fn descriptions_depend_only_on_the_caller() {
-        let all = names(&["evidence", "report_blocker", "security_query"]);
-        let d = |standing: Standing, tools: &[String]| description(&Caller { standing, tools });
-        let judge = d(Standing::Judge, &all);
-        let lead_d = d(Standing::Lead, &all);
-        let child = d(Standing::Child, &all);
-        assert!(judge.contains("- {action:hypothesis_verdict, id:hypothesisID, status:supported|refuted"));
-        for text in [&lead_d, &child] {
-            assert!(!text.contains("status:supported|refuted"));
-            assert!(text.contains(
-                "- hypothesis_verdict: recorded only by an independent read-only verifier; attach evidence with \
-                 hypothesis_evidence and the hypothesis stays open until one reviews it."
-            ));
-        }
-        assert!(lead_d.contains("- {action:hypothesis_open,") && lead_d.contains("- {action:hypothesis_priority,"));
-        assert!(!child.contains("{action:hypothesis_open") && !child.contains("{action:hypothesis_priority"));
-        // A judge is a child too: it never sees the lead's hypothesis shapes.
-        assert!(!judge.contains("{action:hypothesis_open") && !judge.contains("{action:hypothesis_priority"));
-        assert!(judge.contains("- hypothesis_open, hypothesis_priority: the mission lead's;"));
-        assert!(!judge.contains("outcome:timeout") && !lead_d.contains("fuzzer_exit71"));
-        assert!(lead_d.contains("outcome:crash}") && lead_d.contains("record a timeout, an out-of-memory exit"));
-        assert!(child.contains(
-            "- hypothesis_open, hypothesis_priority: the mission lead's; send a proposed hypothesis to the lead."
-        ));
-        assert!(lead_d.starts_with("Record typed, evidence-linked security observations in the mission ledger."));
-        assert!(lead_d.contains("Report an unreachable target or a broken environment with report_blocker."));
-        assert!(lead_d.contains(
-            "Evidence IDs (eN) must already exist and be attested: attach the output that shows it with the evidence \
-             tool first. Evidence IDs are given exactly; other IDs (assets, parents, hypotheses, facts, rules, and \
-             the asset in a cred or auth condition) may be the exact ID, an alias, or a unique prefix of at least \
-             four characters; security_query lists them."
-        ));
-        assert!(lead_d.ends_with("These records never authorize network access."));
-        assert_eq!(lead_d, d(Standing::Lead, &all));
-        let bare = d(Standing::Lead, &[]);
-        assert!(
-            !bare.contains("report_blocker") && !bare.contains("security_query") && !bare.contains("evidence tool")
-        );
-        assert!(bare.contains("Evidence IDs (eN) must already exist and be attested. Evidence IDs are given exactly;"));
-        // The batch is the last action line, the shapes are listed in the enum order.
-        let lines: Vec<&str> = lead_d.lines().collect();
-        assert!(lines.iter().position(|l| l.starts_with("- {action:batch")).is_some_and(|i| i == lines.len() - 4));
-        assert_eq!(lines.iter().filter(|l| l.starts_with("- ")).count(), 19);
-        assert_eq!(child.lines().filter(|l| l.starts_with("- ")).count(), 18);
     }
 
     #[test]
@@ -2005,22 +1430,16 @@ mod tests {
             locator_of(&ok(lead(asset("service", "http://127.0.0.1:19752 acme-sso Flask/Werkzeug 3.1.9")))),
             "http://127.0.0.1:19752"
         );
-        assert!(err(lead(asset("service", "172.17.0.3:8080"))).starts_with("Give the scheme as well"));
+        let r = ok(lead(asset("service", "172.17.0.3:8080")));
+        assert_eq!(locator_of(&r), "http://172.17.0.3:8080");
+        assert_eq!(locator_of(&ok(lead(asset("service", "10.0.0.5:443")))), "https://10.0.0.5:443");
         assert!(
             err(lead(asset("endpoint", "GET /render?name="))).starts_with("An endpoint locator is one absolute URL")
         );
-        // hypotheses
-        let r = ok(lead(json!({"action": "hypothesis_open", "hypothesis": {"statement": "s", "status": "verified",
-            "priority": "high", "evidence": ["e1"]}})));
-        assert!(matches!(&r.op, SecurityOp::Batch { operations } if operations.len() == 2));
-        let r = ok(lead(json!({"action": "hypothesis_open", "text": "s"})));
-        assert_eq!(json_of(&r.op)["priority"], 3);
-        let r = ok(lead(json!({"action": "hypothesis_evidence", "hypothesis": "hy-1", "evidence": ["e1"]})));
-        assert_eq!(json_of(&r.op)["counterevidence"], json!([]));
-        assert!(err(lead(json!({"action": "hypothesis_verdict", "verdict": "supported"})))
-            .starts_with("Only an independent"));
-        assert!(err(lead(json!({"action": "hypothesis_verdict", "status": "confirmed"})))
-            .starts_with("Only an independent"));
+        // removed operations are refused, never read
+        for a in ["hypothesis_open", "hypothesis_evidence", "hypothesis_verdict", "rule_install"] {
+            assert!(err(lead(json!({"action": a, "text": "s"}))).starts_with("Hypotheses are not recorded"), "{a}");
+        }
         // batch spellings
         assert!(ok(lead(json!({"action": "batch", "ops": [asset("host", "h")]}))).notes.len() == 1);
         assert!(ok(lead(json!({"action": "batch", "items": [asset("host", "h")]}))).notes.len() == 1);
@@ -2052,7 +1471,6 @@ mod tests {
             json!({"action": "coverage_set", "asset": "as-1", "disposition": {"status": "tested"}}),
             json!({"action": "crash_record", "signature": {"sanitizer": "asan", "frames": [{"function": "f", "file": "a.c"}], "outcome": "crash"}, "attempt": {"vector": "v", "summary": "s"}}),
             json!({"action": "fact_assert", "fact": {"predicate": "seen", "args": ["a"]}}),
-            json!({"action": "hypothesis_evidence", "id": "hy-1"}),
         ];
         for op in cases {
             let r = ok(lead(op.clone()));
@@ -2063,14 +1481,6 @@ mod tests {
             json!({"action": "coverage_set", "asset": "as-1", "disposition": {"status": "deferred", "reason": "oob"}}),
         ));
         assert!(matches!(r.op, SecurityOp::CoverageSet { .. }));
-        // Judge verdict with omitted evidence and counterevidence decodes quietly.
-        let r = ok(go(
-            Standing::Judge,
-            &[],
-            json!({"action": "hypothesis_verdict", "id": "hy-1", "status": "supported", "note": "checked"}),
-        ));
-        assert_eq!(json_of(&r.op)["evidence"], json!([]));
-        assert_eq!(json_of(&r.op)["counterevidence"], json!([]));
     }
 
     #[test]
@@ -2096,7 +1506,7 @@ mod tests {
             json!({"action": "asset_upsert", "asset": {"kind": "endpoint", "locator": "/login", "evidence": ["e1"]}}),
             json!({"action": "asset_upsert", "asset": {"kind": "service", "locator": "GET /api/v1", "evidence": ["e1"], "parent": "  "}}),
         ] {
-            let r = ok(go_in(&state, Standing::Lead, &[], op));
+            let r = ok(go_in(&state, &[], op));
             let v = json_of(&r.op);
             assert_eq!(v["asset"]["parent"], service_id);
             assert!(v["asset"]["locator"].as_str().unwrap().starts_with("http://10.0.0.5:8080/"));
@@ -2105,7 +1515,6 @@ mod tests {
         // Joining `/` to the sole service itself does not assign itself as parent.
         let r = ok(go_in(
             &state,
-            Standing::Lead,
             &[],
             json!({"action": "asset_upsert", "asset": {"kind": "service", "locator": "/app/", "evidence": ["e1"], "parent": ""}}),
         ));
@@ -2115,7 +1524,6 @@ mod tests {
         // Traversal out of origin still hits R6.
         let e = err(go_in(
             &state,
-            Standing::Lead,
             &[],
             json!({"action": "asset_upsert", "asset": {"kind": "endpoint", "locator": "/\\evil.test/x", "evidence": ["e1"]}}),
         ));
@@ -2135,7 +1543,7 @@ mod tests {
                 n: 3,
             },
         );
-        let e = err(go_in(&state, Standing::Lead, &[], asset("endpoint", "/login")));
+        let e = err(go_in(&state, &[], asset("endpoint", "/login")));
         assert!(e.starts_with("An endpoint locator is one absolute URL"), "{e}");
     }
 
@@ -2204,7 +1612,7 @@ mod tests {
         assert!(err(lead(json!({"action": "blocked_on", "target": "c1", "reason": "502"}))).contains("report_blocker"));
     }
 
-    /// Replays logged operations (a JSON array of {"standing", "tools", "operation"}) named by the
+    /// Replays logged operations (a JSON array of {"tools", "operation"}) named by the
     /// environment variable LOOM_SECURITY_REPLAY and prints how each was read.
     #[test]
     #[ignore = "reads the file named by LOOM_SECURITY_REPLAY"]
@@ -2218,16 +1626,11 @@ mod tests {
         let mut core_refused: std::collections::BTreeMap<String, usize> = Default::default();
         let mask = regex::Regex::new(r"`[^`]*`|\d").unwrap();
         for entry in &entries {
-            let standing = match entry["standing"].as_str() {
-                Some("child") => Standing::Child,
-                Some("judge") => Standing::Judge,
-                _ => Standing::Lead,
-            };
             let tools: Vec<String> = entry["tools"]
                 .as_array()
                 .map(|a| a.iter().filter_map(|t| t.as_str().map(String::from)).collect())
                 .unwrap_or_default();
-            match read(&Caller { standing, tools: &tools }, &state, &entry["operation"]) {
+            match read(&Caller { tools: &tools }, &state, &entry["operation"]) {
                 Ok(read) => {
                     ok_count += 1;
                     if !read.notes.is_empty() {

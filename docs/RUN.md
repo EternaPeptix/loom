@@ -331,8 +331,8 @@ loom run -w /path/to/workspace --prior m-0abc… "the task"
 Before its first model request the new lead gets one note with, per named mission, its title and when its
 ledger was last written; the goal, rules and answers you gave it (marked as your words from an earlier
 mission); its goal status; where its work stood when it ended (claims, plan, dead ends — marked as written
-by the model there and not verified); and its security record as counts and asset locators (no hypotheses,
-no credentials, no identities by name, no query strings in a locator). Your own words are shown exactly as you
+by the model there and not verified); and its security record as counts and asset locators (no
+credentials, no identities by name, no query strings in a locator). Your own words are shown exactly as you
 wrote them; what the model wrote is shown with URL queries, fragments and passwords removed, but may still hold
 whatever else the model wrote there. The source is each mission's sealed ledger; a ledger that fails
 verification or was written by a newer loom is named as unreadable and nothing from it is shown. Nothing

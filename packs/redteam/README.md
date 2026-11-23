@@ -11,8 +11,7 @@ acceptance contract. No credential spraying, target discovery, guest provisionin
 exfiltration or remote deployment happens merely by loading the pack.
 
 Use typed asset/credential/foothold records, coverage dispositions and blocked/unlocked conditions.
-`security_query` path suggestions are bounded investigation hints over explicit evidence-linked
-relations, not validated exploit chains. A credential record holds a secret output handle; it is not
+Relations are explicit, evidence-linked observations, not validated exploit chains. A credential record holds a secret output handle; it is not
 an authorization grant or proof that the credential works. Read the underlying evidence before use.
 Scanner imports do not promote findings into vulnerabilities or infer exploitable BloodHound ACLs.
 

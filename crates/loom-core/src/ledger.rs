@@ -417,7 +417,7 @@ pub struct ScopeGrantRecord {
 /// approvals `a1…`, questions `q1…`, finish claims `f1…`, scope grants `s1…`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LedgerState {
-    /// Security observations and deterministic causal projections. Absent in older snapshots.
+    /// Security observations. Absent in older snapshots.
     #[serde(default)]
     pub security: crate::security_state::SecurityState,
     pub goal: Option<String>,
@@ -456,7 +456,7 @@ pub struct LedgerState {
 // CONTRACT.
 // `Security` delegates validation/folding to `security_state`, whose contract defines its additive
 // records. Security IDs never reuse existing ledger prefixes. The complete security state appears
-// in generated Markdown; `security_query` exposes typed bounded projections. Coverage is checked by
+// in generated Markdown; `security_query` exposes typed views. Coverage is checked by
 // the runtime finish gate using `security.mandatory_open()`; legacy missions have no security assets.
 //
 // Ids are assigned by position: the i-th `ConstraintAdd` is `k{i}`, plan steps `p{i}` (a `PlanSet`
