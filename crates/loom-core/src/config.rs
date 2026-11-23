@@ -196,6 +196,20 @@ pub struct ToolsCfg {
     /// Start a reply's leading read-only calls (`read`, `glob`, `grep`, `out_read`, `out_grep`) while
     /// the rest of the reply is still streaming. What is recorded and shown is the same either way.
     pub speculate: bool,
+    /// The argument names the file and shell tools are shown with (`docs/TOOL-SHAPES.md`). Calls in
+    /// either shape, and in other widely trained shapes, are accepted whichever is shown.
+    pub dialect: Dialect,
+}
+
+/// See `ToolsCfg::dialect`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Dialect {
+    /// Claude Code's argument names and units for read, write, edit, bash, grep and glob.
+    #[default]
+    Trained,
+    /// loom's own argument names, as before.
+    Loom,
 }
 
 impl Default for ToolsCfg {
@@ -212,6 +226,7 @@ impl Default for ToolsCfg {
             job_wake_gap_s: 30,
             job_wake_max: 20,
             speculate: true,
+            dialect: Dialect::Trained,
         }
     }
 }

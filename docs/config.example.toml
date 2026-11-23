@@ -65,6 +65,10 @@ job_wake_max = 20          # reports per watched job; after the last one it is f
 # still writing the rest. Results are recorded in call order and used only if the finished reply holds
 # the same call. false = run calls only after the whole reply has arrived.
 speculate = true
+# Argument names the file and shell tools are shown with: "trained" (Claude Code's, which most models are
+# tuned on) or "loom". Calls in either shape, and in Codex/Gemini/OpenHands/Cline shapes, run either way.
+# See docs/TOOL-SHAPES.md.
+dialect = "trained"
 
 [sandbox]
 mode = "seatbelt"          # "seatbelt" (macOS), "bubblewrap" (Linux, no shell network), or explicitly unconfined "none".

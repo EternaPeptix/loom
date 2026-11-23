@@ -52,6 +52,7 @@ pub mod capabilities;
 pub mod codec;
 pub mod cve;
 pub mod depscan;
+pub mod dialect;
 pub mod files;
 pub mod fstools;
 pub mod http;
