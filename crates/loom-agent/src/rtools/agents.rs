@@ -25,7 +25,9 @@
 //! and are lowered to those values when larger (the result then carries the header fact `budget
 //! lowered to {steps} steps / {minutes} min`).
 //!
-//! The title of a child is its question cut to 80 characters.
+//! The title of a child is its question cut to 80 characters. `agent_spawn` also takes an optional `title`
+//! (a string, else an error); when it is non-empty after trimming, its first 80 characters are the title.
+//! `agent_fanout` items and `attempt` have no `title`.
 //!
 //! ## `agent_spawn`
 //! One assignment from the call's own arguments (the same keys, plus `mode`, `max_steps`,
@@ -613,6 +615,7 @@ impl Tool for AgentSpawn {
             opt("mode", "string", "fresh: the agent starts with only the assignment. fork: it starts with everything you have seen so far.")
                 .one_of(&["fresh", "fork"])
                 .default(json!("fresh")),
+            opt("title", "string", "A short label for the operator (default: the question cut to 80 characters)."),
             opt("max_steps", "integer", "The most model steps the agent may take.").min(1),
             opt("max_minutes", "integer", "The longest the agent may run.").min(1),
             opt("background", "boolean", "true to keep working while the agent runs; its report then arrives later as a message.")
@@ -630,7 +633,9 @@ impl Tool for AgentSpawn {
         let shared = &*self.0;
         let mut fields: Map<String, Value> = args
             .iter()
-            .filter(|(k, _)| !matches!(k.as_str(), "mode" | "max_steps" | "max_minutes" | "background" | "workspace"))
+            .filter(|(k, _)| {
+                !matches!(k.as_str(), "mode" | "max_steps" | "max_minutes" | "background" | "workspace" | "title")
+            })
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         let role_note = resolve_role_synonym(shared, &mut fields);
@@ -645,7 +650,20 @@ impl Tool for AgentSpawn {
             Ok(w) => w,
             Err(e) => return ToolOutput::error(e),
         };
+        let title = match args.get("title") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(t)) => Some(cut(t.trim(), 80)).filter(|t| !t.is_empty()),
+            Some(other) => {
+                return ToolOutput::error(format!(
+                    "`title` must be a string; received {}. Give it as text.",
+                    describe(other)
+                ));
+            }
+        };
         let mut req = request(ctx, role.clone(), mode, brief, budget, !background);
+        if let Some(title) = title {
+            req.title = title;
+        }
         req.workspace = workspace;
         req.prerequisite = match prerequisite(shared, args) {
             Ok(p) => p,
@@ -1699,6 +1717,21 @@ mod tests {
         let sp = spawned(&r);
         assert_eq!(sp[0].mode, SpawnMode::Fork);
         assert_eq!(sp[0].title.chars().count(), 80);
+    }
+
+    #[tokio::test]
+    async fn spawn_title_is_used_trimmed_and_cut() {
+        let r = lead();
+        r.call("agent_spawn", json!({"question":"Find the long question text","title":"  Find it  "})).await;
+        r.call("agent_spawn", json!({"question":"q2","title":"x".repeat(100)})).await;
+        r.call("agent_spawn", json!({"question":"q3","title":"   "})).await;
+        let sp = spawned(&r);
+        assert_eq!(sp[0].title, "Find it");
+        assert_eq!(sp[1].title.chars().count(), 80);
+        assert_eq!(sp[2].title, "q3");
+        let res = r.call("agent_spawn", json!({"question":"q","title":3})).await;
+        // The schema refuses a non-string `title` before the tool runs.
+        assert_eq!(res.status, ToolStatus::Invalid, "{}", res.text);
     }
 
     #[tokio::test]

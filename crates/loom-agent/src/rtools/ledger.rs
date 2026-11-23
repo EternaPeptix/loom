@@ -11,8 +11,18 @@
 //! `[x] p1 text — note` (done), `[>] p2 text` (doing), `[ ] p3 text` (todo), `[-] p4 text — note`
 //! (dropped); `(no plan)` when empty.
 //!
-//! - `plan`: `PlanSet { steps }` (each step trimmed; an empty step is refused before the append with
-//!   a sentence naming its position). Outcome `plan set`; text `plan_lines`.
+//! - `plan`: `steps` are strings or objects `{step|text|content|description, status?, activeForm?, id?}`
+//!   (`activeForm` and `id` are accepted and ignored). `status` is `pending|todo`, `in_progress|doing`,
+//!   `completed|done` or `cancelled|dropped` (case and `-` ignored); any other value is refused before
+//!   anything is written, naming the accepted values. Each step is trimmed; an empty step is refused with a
+//!   sentence naming its position. When the given texts equal the current plan's step texts (same count,
+//!   same order) the plan is kept, with its ids, notes and evidence, and only steps whose status differs
+//!   are updated with `PlanUpdate` (a step given no status is left as it is). Outcome `plan updated`; text
+//!   `Plan unchanged; step p2 → doing, p1 → done.` (or `Plan unchanged; no step changed status.`) then
+//!   `plan_lines`. Otherwise `PlanSet { steps }` replaces the plan (outcome `plan set`), then each step
+//!   given a status other than todo is updated; text `plan_lines`, preceded by `Plan set; step p1 → done.`
+//!   when any status was applied. The ledger refuses `done` and `dropped` without a note, so a step
+//!   moved to either keeps its existing note, or gets `marked done in `plan`` / `dropped in `plan``.
 //! - `step`: with `text` and no `id` → `PlanAdd { text }`, outcome `step added`. With `id` and
 //!   `status` → `PlanUpdate { id, status, note, evidence }`, outcome `step {id} {status}`. Any other
 //!   combination is refused: `Give `id` and `status` to update a step, or `text` alone to add one.`
@@ -148,7 +158,7 @@ fn step_text(step: &Value) -> &str {
         return s.trim();
     }
     if let Some(obj) = step.as_object() {
-        for key in ["step", "text", "content"] {
+        for key in ["step", "text", "content", "description"] {
             if let Some(s) = obj.get(key).and_then(Value::as_str) {
                 let trimmed = s.trim();
                 if !trimmed.is_empty() {
@@ -160,17 +170,52 @@ fn step_text(step: &Value) -> &str {
     ""
 }
 
+/// A step status as the `plan` tool takes it: loom's names and the TodoWrite / Codex ones.
+fn plan_status(word: &str) -> Option<StepStatus> {
+    match word.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+        "pending" | "todo" => Some(StepStatus::Todo),
+        "in_progress" | "doing" => Some(StepStatus::Doing),
+        "completed" | "done" => Some(StepStatus::Done),
+        "cancelled" | "dropped" => Some(StepStatus::Dropped),
+        _ => None,
+    }
+}
+
+fn status_word(status: StepStatus) -> &'static str {
+    match status {
+        StepStatus::Todo => "todo",
+        StepStatus::Doing => "doing",
+        StepStatus::Done => "done",
+        StepStatus::Dropped => "dropped",
+    }
+}
+
+/// The update that moves step `id` to `status`. The ledger refuses `done` and `dropped` without a note, so a
+/// step that has none gets a short one saying where the status came from.
+fn plan_update(id: &str, status: StepStatus, current_note: &str) -> LedgerOp {
+    let note = if !current_note.trim().is_empty() {
+        current_note.to_string()
+    } else {
+        match status {
+            StepStatus::Done => "marked done in `plan`".to_string(),
+            StepStatus::Dropped => "dropped in `plan`".to_string(),
+            StepStatus::Todo | StepStatus::Doing => String::new(),
+        }
+    };
+    LedgerOp::PlanUpdate { id: id.to_string(), status, note, evidence: Vec::new() }
+}
+
 #[async_trait]
 impl Tool for Plan {
     fn spec(&self) -> ToolSpec {
         spec(
             "plan",
-            "Set the plan for the mission: an ordered list of steps, each one concrete enough to be checked off. This replaces the current plan. Use `step` to update a single step as you go.",
+            "Set the plan for the mission: an ordered list of steps, each one concrete enough to be checked off. This replaces the current plan, unless the step texts are the same as the current plan's: then the plan is kept and only the statuses you give are applied. Use `step` to update a single step as you go.",
             ToolClass::State,
             &[req(
                 "steps",
                 "array",
-                "The steps, in order. Plain strings or {step|text|content} objects, one sentence each.",
+                "The steps, in order. Plain strings or {step|text|content, status?} objects, one sentence each. `status` is pending, in_progress, completed or cancelled.",
             )
             .with("items", json!({"anyOf": [{"type": "string"}, {"type": "object"}]}))],
         )
@@ -180,20 +225,77 @@ impl Tool for Plan {
             return ToolOutput::error("`steps` must be a list of sentences, one per plan step.");
         };
         let mut texts = Vec::new();
+        let mut statuses: Vec<Option<StepStatus>> = Vec::new();
         for (i, step) in steps.iter().enumerate() {
+            let position = i.saturating_add(1);
             let text = step_text(step);
             if text.is_empty() {
                 return ToolOutput::error(format!(
-                    "Step {} of the plan is empty. Give every step a sentence saying what is to be done; nothing was recorded.",
-                    i.saturating_add(1)
+                    "Step {position} of the plan is empty. Give every step a sentence saying what is to be done; nothing was recorded.",
                 ));
             }
             texts.push(text.to_string());
+            let status = match step.as_object().and_then(|o| o.get("status")) {
+                None | Some(Value::Null) => None,
+                Some(v) => match v.as_str().and_then(plan_status) {
+                    Some(parsed) => Some(parsed),
+                    None => {
+                        return ToolOutput::error(format!(
+                            "Step {position} of the plan has the status {v}, which is not one of pending, in_progress, completed, cancelled (or todo, doing, done, dropped). Nothing was recorded; send the plan again with one of those."
+                        ));
+                    }
+                },
+            };
+            statuses.push(status);
         }
-        match self.0.ledger_append(false, LedgerOp::PlanSet { steps: texts }) {
-            Ok((_, state)) => ToolOutput::ok("plan set", Body::Message(plan_lines(&state))),
-            Err(text) => ToolOutput::error(text),
+        let current = self.0.ledger().ok();
+        // The current plan is the last block of the ledger's step list: a `PlanSet` keeps the steps it
+        // replaced (dropped) and appends its own.
+        let same_plan = current.as_ref().is_some_and(|state| {
+            state.plan.len().checked_sub(texts.len()).is_some_and(|skip| {
+                state.plan.iter().skip(skip).zip(&texts).all(|(step, text)| step.text.trim() == text)
+            })
+        });
+        let (kept, outcome, mut state, mut head) = match current {
+            Some(state) if same_plan => (true, "plan updated", state, "Plan unchanged".to_string()),
+            _ => match self.0.ledger_append(false, LedgerOp::PlanSet { steps: texts }) {
+                Ok((_, state)) => (false, "plan set", state, "Plan set".to_string()),
+                Err(text) => return ToolOutput::error(text),
+            },
+        };
+        let mut changes = Vec::new();
+        let first = state.plan.len().saturating_sub(statuses.len());
+        for (i, wanted) in statuses.iter().enumerate() {
+            let Some(wanted) = *wanted else { continue };
+            let Some(step) = state.plan.get(first.saturating_add(i)) else { continue };
+            if step.status == wanted {
+                continue;
+            }
+            let (id, note) = (step.id.clone(), step.note.clone());
+            match self.0.ledger_append(false, plan_update(&id, wanted, &note)) {
+                Ok((_, next)) => {
+                    state = next;
+                    changes.push(format!("{id} → {}", status_word(wanted)));
+                }
+                Err(text) => {
+                    let applied = if changes.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" Already applied: {}.", changes.join(", "))
+                    };
+                    return ToolOutput::error(format!("{text}{applied}"));
+                }
+            }
         }
+        if changes.is_empty() {
+            if !kept {
+                return ToolOutput::ok(outcome, Body::Message(plan_lines(&state)));
+            }
+            head.push_str("; no step changed status.");
+        } else {
+            head.push_str(&format!("; step {}.", changes.join(", ")));
+        }
+        ToolOutput::ok(outcome, Body::Message(format!("{head}\n{}", plan_lines(&state))))
     }
 }
 
@@ -717,6 +819,68 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn plan_same_texts_keep_ids_and_apply_statuses() {
+        let rig = rig("lead", false, true);
+        ok(&rig, "plan", json!({"steps": ["read", "fix", "ship"]})).await;
+        ok(&rig, "step", json!({"id": "p3", "status": "doing"})).await;
+        let t = ok(
+            &rig,
+            "plan",
+            json!({"steps": [
+                {"content": "read", "status": "completed", "activeForm": "Reading", "id": "7"},
+                {"description": " fix ", "status": "in_progress"},
+                {"text": "ship", "status": "doing"},
+            ]}),
+        )
+        .await;
+        assert!(t.contains("plan updated"), "{t}");
+        assert!(t.contains("Plan unchanged; step p1 → done, p2 → doing."), "{t}");
+        assert!(t.contains("[x] p1 read — marked done in `plan`\n[>] p2 fix\n[>] p3 ship"), "{t}");
+        // Resent with nothing new: nothing changes, and a plain-string resend leaves statuses alone.
+        let t = ok(&rig, "plan", json!({"steps": ["read", "fix", "ship"]})).await;
+        assert!(t.contains("Plan unchanged; no step changed status."), "{t}");
+        assert!(t.contains("[x] p1 read"), "{t}");
+        let state = rig.shared.ledger().unwrap();
+        assert_eq!(state.plan.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), ["p1", "p2", "p3"]);
+    }
+
+    #[tokio::test]
+    async fn plan_changed_text_sets_new_plan_with_statuses() {
+        let rig = rig("lead", false, true);
+        ok(&rig, "plan", json!({"steps": ["read", "fix"]})).await;
+        ok(&rig, "step", json!({"id": "p1", "status": "done", "note": "read it"})).await;
+        let t = ok(
+            &rig,
+            "plan",
+            json!({"steps": [
+                {"content": "read", "status": "completed"},
+                {"content": "fix it properly", "status": "pending"},
+                {"content": "ship", "status": "in_progress"},
+            ]}),
+        )
+        .await;
+        assert!(t.contains("plan set"), "{t}");
+        // The old plan's steps stay listed (p2 dropped as replaced); numbering continues.
+        assert!(t.contains("Plan set; step p3 → done, p5 → doing."), "{t}");
+        assert!(t.contains("[x] p1 read — read it\n[-] p2 fix — replaced by a new plan\n"), "{t}");
+        assert!(t.contains("[x] p3 read — marked done in `plan`\n[ ] p4 fix it properly\n[>] p5 ship"), "{t}");
+    }
+
+    #[tokio::test]
+    async fn plan_refuses_an_unknown_status_and_takes_plain_strings() {
+        let rig = rig("lead", false, true);
+        let t = refused(&rig, "plan", json!({"steps": ["a", {"content": "b", "status": "blocked"}]})).await;
+        assert!(t.contains("Step 2") && t.contains("pending, in_progress, completed, cancelled"), "{t}");
+        assert!(t.contains("Nothing was recorded"), "{t}");
+        assert!(rig.shared.ledger().unwrap().plan.is_empty());
+        let t = ok(&rig, "plan", json!({"steps": ["a", "b"]})).await;
+        assert!(t.contains("plan set") && t.contains("[ ] p1 a\n[ ] p2 b"), "{t}");
+        assert!(!t.contains("Plan set;"), "{t}");
+        let t = ok(&rig, "plan", json!({"steps": [{"text": "a", "status": "cancelled"}, "c"]})).await;
+        assert!(t.contains("[-] p3 a — dropped in `plan`\n[ ] p4 c"), "{t}");
     }
 
     #[tokio::test]
