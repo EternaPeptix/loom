@@ -1554,7 +1554,8 @@ function renderHeader() {
   $("composer-recipient").textContent = a.send ? `Message to ${lead ? "the lead of " : ""}${info.title || info.id}` : "";
   const sending = S.sending.has(info.id);
   const message = S.messageState.get(info.id);
-  const pendingReceipt = message?.accepted && message.recordedSeq === undefined && message.state !== "failed";
+  // A message held for after the turn is on disk and listed above; it must not lock Send until the turn ends.
+  const pendingReceipt = message?.accepted && message.recordedSeq === undefined && message.state !== "failed" && message.state !== "held";
   $("msg").disabled = sending;
   const att = attachState("message:" + info.id);
   $("attach-bar").hidden = !a.send;
@@ -5033,14 +5034,16 @@ async function sendMessage(when = S.sendWhen || "now") {
   S.messageState.set(id, { state: "sending", accepted: false, sentText: text, attached: att.paths.length > 0, afterSeq: C.lastSeq(S.rec) ?? -1, text: "Sending to " + (info.title || id) + "…", at: ++S.stamp });
   renderHeader();
   try {
-    await api("POST", "/api/sessions/" + encodeURIComponent(id) + "/messages", { ...(att.paths.length ? { text, attachments: att.paths } : { text }), ...(queueNow(id, when) ? { when: "after_turn" } : {}) });
+    const reply = await api("POST", "/api/sessions/" + encodeURIComponent(id) + "/messages", { ...(att.paths.length ? { text, attachments: att.paths } : { text }), ...(queueNow(id, when) ? { when: "after_turn" } : {}) });
     const sent = new Set(att.paths);
     const rest = attachList(key).filter(a => !sent.has(a.path));
     if (rest.length) attachments.set(key, rest); else attachments.delete(key);
     renderChips(attachCtx.composer);
     const state = S.messageState.get(id);
     state.accepted = true;
-    if (state.state !== "delivered") { state.state = "queued"; state.text = "Message accepted · awaiting its recorded delivery."; state.at = ++S.stamp; }
+    // A message held for after the turn answers {queued: {...}}; an idle lead took it at once and answers {}.
+    if (reply && reply.queued) { state.state = "held"; state.text = "Queued for after this turn; edit or send it now above."; state.at = ++S.stamp; }
+    else if (state.state !== "delivered") { state.state = "queued"; state.text = "Message accepted · awaiting its recorded delivery."; state.at = ++S.stamp; }
     if (C.clearDraftIfUnchanged(S.drafts, key, text)) setDraft(key, "");
     if (S.openId === id) { updateDelivery(id); S.follow = true; }
   } catch (e) {

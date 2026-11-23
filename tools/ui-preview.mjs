@@ -810,7 +810,7 @@ const server = createServer(async (req, res) => {
         if (data.when === "after_turn") {
           const item = { id: "q" + (++queuedN), text: String(data.text || ""), attachments: data.attachments || [], created_ms: Date.now() };
           queued.set(id, [...queuedOf(id), item]); emitQueued(id);
-          return json(res, { queued: item.id }, 202);
+          return json(res, { queued: item }, 202); // the daemon answers the whole queued message
         }
         const attached = attachmentBlock(info.workspace, data.attachments);
         if (attached.error) return json(res, { error: attached.error }, 400);
