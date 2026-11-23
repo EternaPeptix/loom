@@ -170,7 +170,7 @@
 //! - every handle in `opened` must open (`loom_tools::outputs::open`) and must be an output this session
 //!   itself produced or opened: some `tool_result` record in `S.log_path` has that blob as `output`
 //!   or names it in `meta[META_OF_BLOB]`. Otherwise: ``You listed {handle} as examined, but this
-//!   session never opened it. Open it with out_read, or take it off the list.``
+//!   session never opened it. Open it with `read`, or take it off the list.``
 //! - when the assignment (the `Assignment` note in `S.log_path`) names outputs of this mission (`out:…`, each kept only when `outputs::open` opens it; any other handle
 //!   in the text, existing in another mission or not, is ignored), `opened`
 //!   must include at least one of them.
@@ -731,7 +731,7 @@ impl Finish {
         let open = state.open_items().plan;
         if !open.is_empty() {
             let mut text = String::from(
-                "conclude `unreachable` cannot be recorded yet: the plan still has open steps, so not every route is closed:",
+                "`unreachable` cannot be recorded yet: the plan still has open steps, so not every route is closed:",
             );
             for id in &open {
                 if let Some(p) = state.plan.iter().find(|p| &p.id == id) {
@@ -743,7 +743,7 @@ impl Finish {
                     ));
                 }
             }
-            text.push_str("\nClose each route with `step`: status done (say what showed it) or dropped (say why); the ledger is what turns 'unreachable' from an impression into a finding. Then call conclude again.");
+            text.push_str("\nClose each route with `plan`: status done (say what showed it) or dropped (say why); the ledger is what turns 'unreachable' from an impression into a finding. Then record the conclusion again.");
             text.push_str(texts::CONCLUDE_OPEN_ROUTES_TAIL);
             return Err(text);
         }
@@ -1335,7 +1335,7 @@ fn finish_tools(role: &RoleDef) -> texts::FinishTools {
     texts::FinishTools {
         conclude: has("conclude"),
         block: has("report_blocker"),
-        ask_for: has("ask_for"),
+        ask_for: has("ask_for") && !role.hidden_tools.iter().any(|h| h == "ask_for"),
         spawn: has("agent_spawn") && !role.may_spawn.is_empty(),
         plan: has("plan") || has("step"),
         solvable: role.solvable,
@@ -1345,15 +1345,21 @@ fn finish_tools(role: &RoleDef) -> texts::FinishTools {
 /// The refusal of `finish` (or `hand_off`, named by `tool`) while work this session started is still running.
 /// It names only tools the role has, and says what to do about an agent that no tool of the session can end.
 fn running_refusal(tool: &str, role: &RoleDef, jobs: &[String], agents: &[String]) -> String {
-    let has = |name: &str| role.tools.iter().any(|t| t == name);
+    let has = |name: &str| role.tools.iter().any(|t| t == name) && !role.hidden_tools.iter().any(|h| h == name);
+    // `job_wait` without `job` is `wait`: a role that has either can wait for work to report.
+    let can_wait = has("wait") || has("job_wait");
     let running: Vec<&str> = jobs.iter().chain(agents).map(String::as_str).collect();
     let mut text = format!(
         "{tool} cannot be accepted yet: work started by this session is still running: {}. Nothing was delivered.",
         running.join(", ")
     );
     let mut ways: Vec<&str> = Vec::new();
-    if has("wait") {
-        ways.push("wait for it to report (`wait`)");
+    if can_wait {
+        ways.push(if has("wait") {
+            "wait for it to report (`wait`)"
+        } else {
+            "wait for it to report (`job_wait` without `job`)"
+        });
     }
     if !jobs.is_empty() && has("job_kill") {
         ways.push("end a job with `job_kill`");
@@ -1509,7 +1515,7 @@ impl Tool for Finish {
     fn spec(&self) -> ToolSpec {
         spec(
             "finish",
-            "Deliver the result and end the work. This is the only way a result is delivered. `answer` is the result, written for someone who has not seen your work. `quotes` are the lines of stored output that support it. Name them by handle and line numbers and the harness takes their text from the stored output: do this when you have the numbers from `out_read`, `out_grep` or `read`. Otherwise add `text`, copied exactly (line numbers optional when unique); it is checked against the stored output and refused if it does not match. Pass `status` (`met` or `unreachable`) to conclude the goal inline when not yet concluded. `not_established` says what you could not determine or did not check. If the harness refuses the call, it says what is still open; deal with that and call finish again.",
+            "Deliver the result and end the work. This is the only way a result is delivered. `answer` is the result, written for someone who has not seen your work. `quotes` are the lines of stored output that support it. Name them by handle and line numbers and the harness takes their text from the stored output: do this when you have the numbers from `read` or `grep`. Otherwise add `text`, copied exactly (line numbers optional when unique); it is checked against the stored output and refused if it does not match. Pass `status` (`met` or `unreachable`) to conclude the goal inline when not yet concluded. `not_established` says what you could not determine or did not check. If the harness refuses the call, it says what is still open; deal with that and call finish again.",
             ToolClass::Terminal,
             &[
                 req("answer", "string", "The result: what was done or found, and how it was confirmed."),
@@ -1761,7 +1767,7 @@ impl Tool for Verdict {
             let known = outputs::open(ctx, handle).await.ok().is_some_and(|id| seen.contains(&id));
             if !known {
                 return ToolOutput::error(format!(
-                    "You listed {handle} as examined, but this session never opened it. Open it with out_read, or take it off the list."
+                    "You listed {handle} as examined, but this session never opened it. Open it with `read`, or take it off the list."
                 ));
             }
         }
@@ -1776,7 +1782,7 @@ impl Tool for Verdict {
         if !assigned.is_empty() && !assigned.iter().any(|(_, id)| opened_ids.contains(id)) {
             let named: Vec<&str> = assigned.iter().map(|(h, _)| h.as_str()).collect();
             return ToolOutput::error(format!(
-                "Your assignment names outputs to examine ({}), but none of them is in `opened`. Open the evidence first (out_read), then call verdict again with the handles you opened.",
+                "Your assignment names outputs to examine ({}), but none of them is in `opened`. Open the evidence first (`read` on its `out:` handle), then call verdict again with the handles you opened.",
                 named.join(", ")
             ));
         }
@@ -2897,7 +2903,7 @@ mod tests {
             let res = r.call("finish", json!({"answer": "No result: the objective was not reached."})).await;
             assert_eq!(res.status, Status::Error, "{}", res.text);
             assert!(res.text.contains("finish is not available yet: the goal is not concluded"), "{}", res.text);
-            assert!(res.text.contains("call conclude with status met"), "{}", res.text);
+            assert!(res.text.contains("call `finish` again with `status` `met`"), "{}", res.text);
             assert!(
                 res.text.contains("a well-evidenced unreachable conclusion is a reportable outcome"),
                 "{}",
@@ -2912,7 +2918,7 @@ mod tests {
                 assert_eq!(items.len(), 1, "{items:?}");
                 assert!(!items[0].blocking && items[0].kind == InboxKind::Question, "{items:?}");
                 assert!(items[0].text.contains("has not advanced in 2 finish attempts"), "{items:?}");
-                assert!(res.text.contains("conclude` with status `unreachable`"), "{}", res.text);
+                assert!(res.text.contains("`status` `unreachable`"), "{}", res.text);
             } else {
                 assert!(items.is_empty(), "{items:?}");
             }
@@ -2936,7 +2942,7 @@ mod tests {
         let res = r.call("finish", json!({"answer": "done"})).await;
         assert_eq!(res.status, Status::Error, "{}", res.text);
         assert!(
-            res.text.contains("call conclude with status met") && !res.text.contains("report_blocker"),
+            res.text.contains("call `finish` again with `status` `met`") && !res.text.contains("report_blocker"),
             "{}",
             res.text
         );
@@ -2978,7 +2984,7 @@ mod tests {
     async fn conclude_unreachable_is_refused_in_a_solvable_pack_and_met_is_not() {
         let blocker = " If something only the operator can supply is missing, call report_blocker.";
         let keep = " Otherwise keep working: pick an open route from the mission state and run it.";
-        let base = "conclude unreachable is not available in this mission: the operator set it up as solvable, so not having found the way is not a finding.";
+        let base = "The `unreachable` conclusion is not available in this mission: the operator set it up as solvable, so not having found the way is not a finding.";
         for with_blocker in [true, false] {
             let mut role = core_role("lead");
             role.solvable = true;
@@ -3012,7 +3018,7 @@ mod tests {
         let res = r.call("conclude", args.clone()).await;
         assert_eq!(res.status, Status::Error, "{}", res.text);
         assert!(res.text.contains("p1 (todo): try the other parser"), "{}", res.text);
-        assert!(res.text.contains("Close each route with `step`"), "{}", res.text);
+        assert!(res.text.contains("Close each route with `plan`"), "{}", res.text);
         assert_eq!(r.shared.ledger().unwrap().goal_met.map(|g| g.status), Some(loom_core::ledger::GoalMetStatus::Open));
         // With the routes closed, the conclusion is accepted.
         r.model_op(LedgerOp::PlanUpdate {
@@ -3082,7 +3088,7 @@ mod tests {
         let res = r.call("finish", json!({"answer": "No result."})).await;
         assert_eq!(res.status, Status::Error, "{}", res.text);
         assert!(res.text.contains("shows no open route"), "{}", res.text);
-        assert!(!res.text.contains("conclude with status unreachable"), "{}", res.text);
+        assert!(!res.text.contains("`status` `unreachable`"), "{}", res.text);
         // With a route open, the unreachable refusal names it.
         r.model_op(LedgerOp::PlanAdd { text: "try the other parser".into() });
         let e = record_run(&r);
@@ -3105,7 +3111,7 @@ mod tests {
         let res = r.call("conclude", json!({"status": "unreachable", "note": "n", "evidence": [e]})).await;
         assert_eq!(res.status, Status::Error, "{}", res.text);
         assert!(
-            res.text.contains("Then call conclude again. These are routes still open; run one of them.\n"),
+            res.text.contains("Then record the conclusion again. These are routes still open; run one of them.\n"),
             "{}",
             res.text
         );
@@ -3134,7 +3140,7 @@ mod tests {
         let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
         assert_eq!(res.status, Status::Error, "{}", res.text);
         assert!(res.text.contains("the goal is open again"), "{}", res.text);
-        assert!(res.text.contains("conclude the goal on that run and call finish again"), "{}", res.text);
+        assert!(res.text.contains("call finish again with `status` `met` and that run as `evidence`"), "{}", res.text);
         assert_eq!(res.meta.get(META_REFUSAL), Some(&json!(REFUSAL_VERIFIER)), "the record says who refused");
         let (items, _) = drain(&r);
         assert!(items.is_empty(), "a rejection opens no inbox item: {items:?}");
@@ -3346,7 +3352,7 @@ mod tests {
         let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
         assert_eq!(res.status, Status::Error, "{}", res.text);
         assert!(res.text.contains("The operator has been notified as a non-blocking item"), "{}", res.text);
-        assert!(res.text.contains("conclude` with status `unreachable`"), "{}", res.text);
+        assert!(res.text.contains("`status` `unreachable`"), "{}", res.text);
         let (items, notes) = drain(&r);
         assert_eq!(items.len(), 1, "{items:?}");
         let item = &items[0];
@@ -3744,7 +3750,7 @@ mod tests {
         assert!(res.text.contains("Nothing was delivered."), "{}", res.text);
         assert!(
             res.text.contains(
-                "To go on: wait for it to report (`wait`), or end a job with `job_kill`; then call finish again."
+                "To go on: wait for it to report (`job_wait` without `job`), or end a job with `job_kill`; then call finish again."
             ),
             "{}",
             res.text
@@ -3765,7 +3771,9 @@ mod tests {
 
     #[tokio::test]
     async fn finish_is_refused_while_a_child_agent_is_running() {
-        let r = lead();
+        let mut role = core_role("lead");
+        role.hidden_tools.clear();
+        let r = rig_with(role, false, true, Default::default());
         r.orch.running_child("s-kid9", "worker");
         let res = r.call("finish", json!({"answer": "Parser fixed."})).await;
         assert_eq!(res.status, Status::Error, "{}", res.text);
@@ -3782,6 +3790,8 @@ mod tests {
     #[test]
     fn the_running_work_refusal_names_only_tools_the_role_has() {
         let mut role = core_role("lead");
+        // The core lead hides `agent_stop`; this test is about the logic, so show it.
+        role.hidden_tools.clear();
         let (jobs, agents) = (vec!["job j1 (make)".to_string()], vec!["agent s-kid1 (worker)".to_string()]);
         let all = running_refusal("finish", &role, &jobs, &agents);
         assert!(
@@ -3789,10 +3799,11 @@ mod tests {
             "{all}"
         );
         assert!(all.contains("`job_kill` and `finish` can go in the same reply"), "{all}");
-        role.tools.retain(|t| !matches!(t.as_str(), "wait" | "job_kill" | "agent_stop" | "report_blocker"));
+        role.tools
+            .retain(|t| !matches!(t.as_str(), "wait" | "job_wait" | "job_kill" | "agent_stop" | "report_blocker"));
         let bare = running_refusal("finish", &role, &jobs, &agents);
         assert!(bare.contains("Nothing was delivered. Call finish again when it has ended."), "{bare}");
-        assert!(!bare.contains("`wait`") && !bare.contains("job_kill") && !bare.contains("agent_stop"), "{bare}");
+        assert!(!bare.contains("`job_wait`") && !bare.contains("job_kill") && !bare.contains("agent_stop"), "{bare}");
         assert!(
             bare.ends_with(
                 "This session cannot stop an agent: if one does not end, tell the operator with `ask_user`."
@@ -3895,7 +3906,7 @@ mod tests {
         r.orch.in_scope(&other.id);
         let other = other.handle();
         let res = r.call("verdict", json!({"accepted": true, "opened": [other]})).await;
-        assert!(res.text.contains("never opened it. Open it with out_read, or take it off the list."), "{}", res.text);
+        assert!(res.text.contains("never opened it. Open it with `read`, or take it off the list."), "{}", res.text);
         assert!(effect(&r).is_none());
     }
 
@@ -4154,14 +4165,14 @@ mod tests {
         let Body::Message(m) = out.body else { panic!("message expected") };
         assert_eq!(
             m,
-            "`ask_for` is for the lead. An agent working on an assignment uses `hand_off` to return the work with what it needs."
+            "Asking for more is for the lead. An agent working on an assignment uses `hand_off` to return the work with what it needs."
         );
         let mut role = core_role("worker");
         role.tools.retain(|t| t != "hand_off");
         let r = rig_with(role, true, false, Default::default());
         let out = AskFor(r.shared.clone()).run(&r.env.ctx, &map(ask("hint"))).await;
         let Body::Message(m) = out.body else { panic!("message expected") };
-        assert_eq!(m, "`ask_for` is for the lead.");
+        assert_eq!(m, "Asking for more is for the lead.");
         assert!(effect(&r).is_none());
         assert!(inbox_items(&r).is_empty());
     }
@@ -4253,10 +4264,7 @@ mod tests {
         let out = HandOff(r.shared.clone()).run(&r.env.ctx, &map(hand("hint"))).await;
         assert_eq!(out.status, Status::Error);
         let Body::Message(m) = out.body else { panic!("message expected") };
-        assert_eq!(
-            m,
-            "`hand_off` returns an assignment to the agent that gave it; this session has none. If you are stuck, use `ask_for`."
-        );
+        assert_eq!(m, "`hand_off` returns an assignment to the agent that gave it; this session has none.");
         assert!(effect(&r).is_none());
         let mut role = core_role("lead");
         role.tools.retain(|t| t != "ask_for");

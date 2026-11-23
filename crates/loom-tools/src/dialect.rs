@@ -600,7 +600,32 @@ fn convert(tool: &str, kind: Kind, args: Value, dialect: Dialect, has: &dyn Fn(&
         Kind::FileSearch => file_search_args(&mut c)?,
         Kind::WebFetch => web_fetch_args(&mut c),
         Kind::Plan => plan_args(&mut c)?,
-        Kind::JobWait => job_args(&mut c, true)?,
+        Kind::JobWait => {
+            let sent_timeout = c.map.contains_key("timeout_s");
+            job_args(&mut c, true)?;
+            // `job_wait` with no job is `wait`: end the turn until something running reports back.
+            let no_job =
+                c.map.get("job").is_none_or(|v| v.is_null() || v.as_str().is_some_and(|s| s.trim().is_empty()));
+            if no_job {
+                if !has("wait") {
+                    return Err(
+                        "Give `job`, the id of the job to wait for, for example `j1`. Nothing was executed.".into()
+                    );
+                }
+                if sent_timeout {
+                    c.note(
+                        "`timeout_s` is not used without `job`; the turn ends until something running reports back"
+                            .into(),
+                    );
+                }
+                let reason = c.map.remove("reason");
+                c.map.clear();
+                if let Some(r) = reason.filter(|r| !r.is_null()) {
+                    c.map.insert("reason".into(), r);
+                }
+                target = "wait".to_string();
+            }
+        }
         Kind::JobKill => job_args(&mut c, false)?,
         Kind::Agent => {
             c.alias("question", &["prompt", "task"])?;
@@ -1208,7 +1233,7 @@ fn job_args(c: &mut Conv, wait: bool) -> Step {
     c.alias("job", &["bash_id", "shell_id", "job_id", "id"])?;
     if wait {
         if c.map.remove("filter").is_some() {
-            return Err("`filter` is not supported on a job's output. Read the output without it, then search it with `out_grep`. Nothing was executed.".into());
+            return Err("`filter` is not supported on a job's output. Read the output without it, then search it with `grep`. Nothing was executed.".into());
         }
         c.map.entry("timeout_s".to_string()).or_insert(json!(0));
     }
@@ -1607,6 +1632,32 @@ mod tests {
         assert_eq!(a.tool, "plan");
         let steps = a.args["steps"].as_array().unwrap();
         assert_eq!((steps[0]["step"].clone(), steps[0]["status"].clone()), (json!("a"), json!("completed")));
+    }
+
+    #[test]
+    fn job_wait_without_job_is_wait_in_both_dialects() {
+        let has_wait = |t: &str| t == "wait" || has(t);
+        for d in [Dialect::Trained, Dialect::Loom] {
+            match adapt("job_wait", json!({"reason": "the build", "timeout_s": 30}), d, &has_wait) {
+                Adapt::Run(a) => {
+                    assert_eq!((a.tool.as_str(), &a.args), ("wait", &json!({"reason": "the build"})));
+                    assert!(
+                        a.notes.iter().any(|n| n.contains("`timeout_s` is not used without `job`")),
+                        "{:?}",
+                        a.notes
+                    );
+                }
+                other => panic!("expected Run, got {other:?}"),
+            }
+            match adapt("job_wait", json!({}), d, &has) {
+                Adapt::Refuse(s) => assert!(s.contains("Give `job`"), "{s}"),
+                other => panic!("expected Refuse, got {other:?}"),
+            }
+            match adapt("job_wait", json!({"job": "j1"}), d, &has_wait) {
+                Adapt::Run(a) => assert_eq!(a.tool, "job_wait"),
+                other => panic!("expected Run, got {other:?}"),
+            }
+        }
     }
 
     #[test]

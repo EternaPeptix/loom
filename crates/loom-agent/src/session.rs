@@ -8592,14 +8592,15 @@ mod tests {
         let mut baseline_session = baseline_fx.create();
         let baseline_wire = baseline_session.woven().weave.tools;
         let baseline_names: Vec<&str> = baseline_wire.iter().map(|t| t.name.as_str()).collect();
-        assert!(baseline_names.contains(&"out_read"));
-        assert!(baseline_names.contains(&"step"));
+        // The pack hides the tools another tool absorbs (TOOL-SHAPES §4.3); `note` is still shown.
+        assert!(!baseline_names.contains(&"out_read"));
+        assert!(!baseline_names.contains(&"step"));
         assert!(baseline_names.contains(&"note"));
 
-        // With compact_tools = true and hidden_tools = ["note"], wire specs shrink statically while
+        // With compact_tools = true and `note` added to the hidden tools, wire specs shrink statically while
         // all tools remain registered, callable directly (even when hidden), and resolvable via aliases.
         let mut role_no_conclude = core_role("lead");
-        role_no_conclude.hidden_tools = vec!["note".into()];
+        role_no_conclude.hidden_tools.push("note".into());
         role_no_conclude.tools.retain(|t| t != "conclude" && t != "request_scope");
         let script = seq(vec![
             Reply::tool("read_file", json!({"path": "Cargo.toml"}).to_string()).into(),

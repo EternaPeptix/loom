@@ -655,7 +655,7 @@ fn render_cut(inp: &CutInput<'_>, head: usize, tail: usize, body_budget: usize) 
         let at = |i: usize| inp.starts.get(i).copied().unwrap_or(inp.text.len());
         let omitted_bytes = at(end_omitted).saturating_sub(at(first_omitted));
         let marker = format!(
-            "[cut by harness: lines {}-{} of {} are not shown here ({} bytes). Nothing was discarded.\n Read them with out_read(\"{h}\", start, end) or search with out_grep(\"{h}\", pattern).]",
+            "[cut by harness: lines {}-{} of {} are not shown here ({} bytes). Nothing was discarded.\n Read them with read(\"{h}\", start, end) or search with grep(\"{h}\", pattern).]",
             first_omitted + 1,
             end_omitted,
             n,
@@ -992,7 +992,7 @@ mod tests {
         assert_eq!(a.shown, vec![(1, 3), (999, 1000)]);
         let omitted: usize = text.lines().skip(3).take(995).map(|l| l.len() + 1).sum();
         let expect_body = format!(
-            "line 1\nline 2\nline 3\n[cut by harness: lines 4-998 of 1000 are not shown here ({omitted} bytes). Nothing was discarded.\n Read them with out_read(\"{h}\", start, end) or search with out_grep(\"{h}\", pattern).]\nline 999\nline 1000",
+            "line 1\nline 2\nline 3\n[cut by harness: lines 4-998 of 1000 are not shown here ({omitted} bytes). Nothing was discarded.\n Read them with read(\"{h}\", start, end) or search with grep(\"{h}\", pattern).]\nline 999\nline 1000",
             h = b.handle()
         );
         let header = format!("[bash · exit 1 · 2.4s · 1000 lines · CUT · {}]\n", b.handle());

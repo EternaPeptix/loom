@@ -109,9 +109,7 @@ fn secs_text(ms: u64) -> String {
 }
 
 fn missing_job() -> ToolOutput {
-    ToolOutput::error(
-        "No job id was given. Call the tool again with `job` set to a job id such as `j1` (job_list shows them).",
-    )
+    ToolOutput::error("Give `job`, the id of the job to wait for, for example `j1`. Nothing was executed.")
 }
 
 fn add_ended_meta(out: ToolOutput, ended: &Ended) -> ToolOutput {
@@ -186,7 +184,7 @@ impl Tool for Bash {
     fn spec(&self) -> ToolSpec {
         params::spec(
             "bash",
-            "Run a shell command with bash and return what it printed. stdout and stderr are captured together, in the order they were written. The complete output is always stored: when it is long you are shown its start and end, with a marker that says exactly which lines are missing and how to read them (out_read, out_grep). The result header gives the exit status. Each call starts a new shell in the workspace directory, so `cd` and variables do not carry over between calls — use `cd dir && command` or absolute paths. A command that is still running after the foreground limit is not stopped: it continues as a background job and the result tells you its job id.",
+            "Run a shell command with bash and return what it printed. stdout and stderr are captured together, in the order they were written. The complete output is always stored: when it is long you are shown its start and end, with a marker that says exactly which lines are missing and how to read them (`read` or `grep` on its handle). The result header gives the exit status. Each call starts a new shell in the workspace directory, so `cd` and variables do not carry over between calls — use `cd dir && command` or absolute paths. A command that is still running after the foreground limit is not stopped: it continues as a background job and the result tells you its job id.",
             ToolClass::Exec,
             &[
                 params::req("command", "string", "The command line to run."),
@@ -195,7 +193,7 @@ impl Tool for Bash {
                 params::opt("background", "boolean", "Start the command as a background job and return immediately (default false). Use for servers and long runs; read its output with job_wait."),
                 params::opt("cwd", "string", "Directory to run in (default: the workspace)."),
                 params::opt("idle_timeout_s", "integer", "Stop a foreground command after this many seconds without output. Silent computation can also trigger it; omitted means no idle watchdog.").min(1).max(300),
-                params::opt("wake_on", "string", "For a background job: a regular expression. When a line of the job's output matches it you are told at once, with the matching lines and the handle of that part of the output, and if you had ended your turn with `wait` you are resumed, as when a job ends. Use it for a fuzzer, cracker, scan or listener that runs for hours and matters only when it finds something, e.g. `(?i)crash|panic|FOUND`. Rust regex syntax, matched line by line."),
+                params::opt("wake_on", "string", "For a background job: a regular expression. When a line of the job's output matches it you are told at once, with the matching lines and the handle of that part of the output, and if you had ended your turn with `job_wait` and no `job` you are resumed, as when a job ends. Use it for a fuzzer, cracker, scan or listener that runs for hours and matters only when it finds something, e.g. `(?i)crash|panic|FOUND`. Rust regex syntax, matched line by line."),
                 params::opt("wake_every_s", "integer", "With `wake_on`: tell you at most once in this many seconds; lines that match in between come with the next notice (default 30).").min(1).max(3600),
             ],
         )
@@ -211,10 +209,11 @@ impl Tool for JobWait {
     fn spec(&self) -> ToolSpec {
         params::spec(
             "job_wait",
-            "Wait for a background job to finish, or for the given time, and return the output it has produced since you last looked at it, together with its state (running, or its exit status).",
+            "With `job`: wait for that background job to finish, or for the given time, and return the output it has produced since you last looked at it, together with its state (running, or its exit status). Without `job`: end your turn until something you started (a job or an agent) reports back, and be resumed with its result; use it when there is nothing useful to do until then.",
             ToolClass::Exec,
             &[
-                params::req("job", "string", "The job id, e.g. `j1`."),
+                params::opt("job", "string", "The job id, e.g. `j1`. Leave it out to end your turn until a job or agent you started reports back."),
+                params::opt("reason", "string", "Without `job`: what you are waiting for, in a few words."),
                 params::opt("timeout_s", "integer", "How long to wait for the job to finish before returning what there is (default 120).").min(0),
             ],
         )

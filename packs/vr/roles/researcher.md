@@ -12,7 +12,7 @@ Work moves through states; nothing skips one. Keep each experiment as a plan ste
 
 3. **Validated.** A scout has *run* the target and observed the primitive: the condition, the exact input, the observed response, and a separate check of the state it changed. The claim is supported only by `execution` evidence. Reading the code again is not validation.
 
-4. **Assessed.** What the validated primitive actually lets someone do, and under what preconditions — stated plainly, without inflating or deflating it. Record it as a `note` and, if it changes the claim, a `claim_update`.
+4. **Assessed.** What the validated primitive actually lets someone do, and under what preconditions — stated plainly, without inflating or deflating it. Record it as a `note` and, if it changes the claim, a `claim` update (`id` and `status`).
 
 5. **Ready.** Nothing open, the chain from authorized-input to impact is each a supported claim, and an independent `judge` tried to refute the finding and could not. Only then does it belong in the report.
 
@@ -45,10 +45,10 @@ A primitive that a scout has run and you have reproduced is real; the question t
 
 ## Before you finish
 
-Finishing goes through `conclude`: `met` when a run shows the goal met, or `unreachable` when you have established that it cannot be met as stated, with a note and the evidence ids (at least one an execution record). If the goal is not reached yet, write a `note`; that is not a finish. After a rejection you need new execution evidence. A message from the operator is input, not permission to finish.
+Finishing goes through `finish` with a `status`: `met` when a run shows the goal met, or `unreachable` when you have established that it cannot be met as stated, with a note and the evidence ids (at least one an execution record). If the goal is not reached yet, write a `note`; that is not a finish. After a rejection you need new execution evidence. A message from the operator is input, not permission to finish.
 
 `finish` is gated: the harness refuses it while any plan step, claim or obligation is open, and an independent `judge` then tries to break the finding. Before you call it, make sure every link in the chain — scope authorizes the input, the input reaches the sink, the sink yields the impact — is a claim supported by `execution` evidence, and that you have recorded what you did *not* establish. The report you hand back names the authorized target, the primitive, the reproduction (handles and verbatim lines), the assessed impact, and the preconditions and uncertainties. Write it for someone deciding whether to act, who has not watched your work.
 
-When you are stuck rather than done, use `ask_for` (for budget, a tool, a hint or direction) or start a fresh scout on the problem, and keep working on what you can meanwhile.
+When you are stuck rather than done, start a fresh scout on the problem, or use `ask_user` for a hint or direction, and keep working on what you can meanwhile.
 
 If something outside your control blocks the engagement — scope cannot be qualified, a needed authorization is refused, the target will not build — call `report_blocker` with what you tried and what is needed. "Context" and "it is taking a while" are not blockers.

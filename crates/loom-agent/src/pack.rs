@@ -825,14 +825,12 @@ mod tests {
         }
         // The prompts say what the new tools are for.
         let lead = &p.get("core").unwrap().roles["lead"].prompt;
-        assert!(lead.contains("`conclude`") && lead.contains("`request_scope`") && lead.contains("not a finish"));
+        assert!(lead.contains("`finish`") && lead.contains("`request_scope`") && lead.contains("not a finish"));
         let chat = &p.get("vr").unwrap().roles["chat"].prompt;
-        assert!(chat.contains("`request_scope`") && !chat.contains("`conclude`"));
+        assert!(chat.contains("`request_scope`") && !chat.contains("`finish`"));
         let vr = &p.get("vr").unwrap().preamble;
         assert!(
-            vr.contains("`request_scope`")
-                && vr.contains("`conclude`")
-                && vr.contains("Only the operator grants scope")
+            vr.contains("`request_scope`") && vr.contains("`finish`") && vr.contains("Only the operator grants scope")
         );
     }
 
@@ -1022,6 +1020,89 @@ mod tests {
         assert!(Packs::load(mk(&bad).path()).unwrap_err().contains("max_steps"));
         let missing_oracle_verifier = GOOD.replace("[roles.a]", "[roles.a]\nrequire_oracle = true");
         assert!(Packs::load(mk(&missing_oracle_verifier).path()).unwrap_err().contains("require_oracle"));
+    }
+
+    /// TOOL-SHAPES section 4.3: the wire tools the model is shown, in presented form.
+    fn shown_specs(role: &RoleDef, dialect: loom_core::config::Dialect) -> Vec<loom_core::event::ToolSpec> {
+        let rig = crate::rtools::testkit::rig_with(role.clone(), false, true, loom_core::config::AgentsCfg::default());
+        rig.registry
+            .specs()
+            .into_iter()
+            .filter(|s| !role.hidden_tools.contains(&s.name))
+            .map(|s| loom_tools::dialect::present(&s, dialect))
+            .collect()
+    }
+
+    #[test]
+    fn core_roles_hide_what_another_tool_absorbs_and_show_the_counted_tools() {
+        let packs = Packs::builtin().unwrap();
+        let shown = |role: &str| -> Vec<String> {
+            let r = packs.role(None, Some(role)).unwrap();
+            let mut names: Vec<String> =
+                shown_specs(r, loom_core::config::Dialect::Loom).into_iter().map(|s| s.name).collect();
+            names.sort();
+            names
+        };
+        let sorted = |list: &str| -> Vec<String> {
+            let mut v: Vec<String> = list.split_whitespace().map(String::from).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(
+            shown("lead"),
+            sorted("bash job_wait job_kill read write edit glob grep web_fetch dep_scan plan note claim evidence ledger log_search agent_spawn verify request_scope finish ask_user report_blocker")
+        );
+        assert_eq!(
+            shown("worker"),
+            sorted("bash job_wait job_kill read write edit glob grep web_fetch dep_scan note claim evidence ledger log_search finish report_blocker hand_off")
+        );
+        assert_eq!(
+            shown("verifier"),
+            sorted("bash job_wait job_kill read glob grep web_fetch dep_scan ledger log_search verdict report_blocker")
+        );
+        assert_eq!((shown("lead").len(), shown("worker").len(), shown("verifier").len()), (22, 18, 12));
+        // The chat role follows the generic rule: out_read/out_grep/job_list/pin are hidden, nothing else.
+        let chat = packs.role(None, Some("chat")).unwrap();
+        for hidden in ["out_read", "out_grep", "job_list", "pin"] {
+            assert!(chat.hidden_tools.iter().any(|t| t == hidden), "chat should hide {hidden}");
+        }
+        assert_eq!(chat.hidden_tools.len(), 4);
+    }
+
+    #[test]
+    fn what_a_role_reads_never_names_a_tool_it_hides() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packs");
+        let packs = Packs::load(&dir).unwrap();
+        let mut checked = 0;
+        let mut found: Vec<String> = Vec::new();
+        for pack in packs.names().iter().filter_map(|n| packs.get(n)) {
+            for role in pack.roles.values() {
+                for h in &role.hidden_tools {
+                    assert!(role.tools.contains(h), "{}/{} hides `{h}`, which it does not list", pack.name, role.name);
+                }
+                let mut texts: Vec<(String, String)> =
+                    vec![("harness.md".into(), pack.preamble.clone()), ("role prompt".into(), role.prompt.clone())];
+                for dialect in [loom_core::config::Dialect::Trained, loom_core::config::Dialect::Loom] {
+                    for spec in shown_specs(role, dialect) {
+                        texts.push((
+                            format!("tool `{}` ({dialect:?})", spec.name),
+                            format!("{}\n{}", spec.description, spec.parameters),
+                        ));
+                    }
+                }
+                for (what, text) in &texts {
+                    for h in &role.hidden_tools {
+                        if text.contains(&format!("`{h}`")) {
+                            found.push(format!("{}/{}: the {what} names the hidden tool `{h}`", pack.name, role.name));
+                        }
+                    }
+                }
+                checked += 1;
+            }
+        }
+        assert!(checked >= 20, "only {checked} roles checked");
+        found.dedup();
+        assert!(found.is_empty(), "{}", found.join("\n"));
     }
 
     #[test]

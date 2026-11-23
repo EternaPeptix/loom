@@ -160,7 +160,7 @@ pub const REASON_PARENT: &str = "stopped by the agent that assigned this work";
 /// A stretch of steps that recorded nothing and changed nothing.
 pub fn stall(steps: u32) -> String {
     format!(
-        "The last {steps} steps recorded nothing in the ledger and changed no file. If you have learned something, record it now (`note`, or `claim` with `evidence`). If the current approach is not getting anywhere, record it as a dead end with `note` and take a different one. Record what you ruled out and why, the best next route you can see, and the evidence that would change your conclusion — `reflect` if your role has it, `note` otherwise. If you cannot continue, call `report_blocker`."
+        "The last {steps} steps recorded nothing in the ledger and changed no file. If you have learned something, record it now (`note`, or `claim` with `evidence`). If the current approach is not getting anywhere, record it as a dead end with `note` and take a different one. Record what you ruled out and why, the best next route you can see, and the evidence that would change your conclusion with `note`. If you cannot continue, call `report_blocker`."
     )
 }
 
@@ -217,7 +217,7 @@ pub fn ask_for_already(label: &str, qid: Option<&str>) -> String {
 
 /// `ask_for` in a child session.
 pub fn ask_for_in_child(has_hand_off: bool) -> String {
-    let mut text = "`ask_for` is for the lead.".to_string();
+    let mut text = "Asking for more is for the lead.".to_string();
     if has_hand_off {
         text.push_str(" An agent working on an assignment uses `hand_off` to return the work with what it needs.");
     }
@@ -228,7 +228,7 @@ pub fn ask_for_in_child(has_hand_off: bool) -> String {
 pub fn hand_off_in_root(has_ask_for: bool) -> String {
     let mut text = "`hand_off` returns an assignment to the agent that gave it; this session has none.".to_string();
     if has_ask_for {
-        text.push_str(" If you are stuck, use `ask_for`.");
+        text.push_str("");
     }
     text
 }
@@ -264,7 +264,7 @@ pub fn conclude_unreachable_refused(has_blocker: bool) -> String {
     let blocker =
         if has_blocker { " If something only the operator can supply is missing, call report_blocker." } else { "" };
     format!(
-        "conclude unreachable is not available in this mission: the operator set it up as solvable, so not having found the way is not a finding.{blocker} Otherwise keep working: pick an open route from the mission state and run it."
+        "The `unreachable` conclusion is not available in this mission: the operator set it up as solvable, so not having found the way is not a finding.{blocker} Otherwise keep working: pick an open route from the mission state and run it."
     )
 }
 
@@ -410,7 +410,7 @@ pub fn job_matched(n: &JobMatchNote<'_>) -> String {
     match n.handle {
         Some(h) => {
             out.push_str(&format!(
-                "\nThat part of its output is stored as {h} ({} {}, from byte {} of what the job has written): the lines before and after a match are there to read with out_read, and to quote as evidence.",
+                "\nThat part of its output is stored as {h} ({} {}, from byte {} of what the job has written): the lines before and after a match are there to read with `read`, and to quote as evidence.",
                 n.part_lines,
                 lines_word(n.part_lines),
                 n.from
@@ -421,7 +421,10 @@ pub fn job_matched(n: &JobMatchNote<'_>) -> String {
             ));
             let more = n.matches.saturating_sub(n.lines.len() as u64);
             if more > 0 {
-                out.push_str(&format!("\n{more} more matching {} are in {h}: out_grep finds them.", lines_word(more)));
+                out.push_str(&format!(
+                    "\n{more} more matching {} are in {h}: `grep` on it finds them.",
+                    lines_word(more)
+                ));
             }
         }
         None => out.push_str(&format!(
@@ -612,7 +615,7 @@ fn append_last_reply(out: &mut String, last_reply: &str) {
 /// a paragraph says that folded attempts are ground covered, not a verdict on the task.
 pub fn reweave_brief(ledger_brief: &str, frontier: Option<&str>) -> String {
     let mut out = String::from(
-        "Older tool output above this point is now shown in shortened form. Nothing was deleted: each shortened result names its handle (out:…), `out_read` and `out_grep` open any part of it again, and `log_search` searches the whole session. If you need something you saw earlier, reopen it rather than working from memory.",
+        "Older tool output above this point is now shown in shortened form. Nothing was deleted: each shortened result names its handle (out:…), `read` and `grep` open any part of it again, and `log_search` searches the whole session. If you need something you saw earlier, reopen it rather than working from memory.",
     );
     if let Some(frontier) = frontier {
         out.push_str(
@@ -640,7 +643,7 @@ pub const FRESH_START_REASON: &str = "finish not accepted";
 /// that is the pack's rule, and elsewhere the finish refusals already name it).
 pub fn fresh_start_brief(objections: &[String], reopened: bool, frontier: Option<&str>, ledger_brief: &str) -> String {
     let mut out = String::from(
-        "A check independent of you examined the work so far and did not find the goal established. From here you start afresh: your earlier messages are folded out of view and earlier tool output is shown in shortened form, so that you look at the problem itself again and not at an account of it. Nothing was deleted: each shortened result names its handle (out:…), `out_read` and `out_grep` open any part of it again, and `log_search` searches the whole session.",
+        "A check independent of you examined the work so far and did not find the goal established. From here you start afresh: your earlier messages are folded out of view and earlier tool output is shown in shortened form, so that you look at the problem itself again and not at an account of it. Nothing was deleted: each shortened result names its handle (out:…), `read` and `grep` open any part of it again, and `log_search` searches the whole session.",
     );
     let found: Vec<&str> = objections.iter().map(|o| o.trim()).filter(|o| !o.is_empty()).collect();
     if !found.is_empty() {
@@ -657,7 +660,7 @@ pub fn fresh_start_brief(objections: &[String], reopened: bool, frontier: Option
         out.push_str(" Each point above is an open obligation that only a run recorded from now on settles.");
     }
     if reopened {
-        out.push_str(" The goal is open again, so `conclude` it on such a run before you call `finish`.");
+        out.push_str(" The goal is open again, so call `finish` with `status` `met` on such a run.");
     }
     if let Some(frontier) = frontier {
         out.push_str(
@@ -922,9 +925,11 @@ pub fn finish_unavailable(tools: &FinishTools, directions: &[String]) -> String 
         "finish is not available yet: the goal is not concluded, so nothing was delivered and no verifier was started. Not having found the way yet is the normal state of a hard task, not a result.",
     );
     if tools.conclude {
-        out.push_str(" Once a run shows the goal met, call conclude with status met and that run as evidence.");
+        out.push_str(
+            " Once a run shows the goal met, call `finish` again with `status` `met` and that run as `evidence`.",
+        );
         if !tools.solvable {
-            out.push_str(" If every route is closed, conclude with status unreachable and its execution evidence: a well-evidenced unreachable conclusion is a reportable outcome, not a failure.");
+            out.push_str(" If every route is closed, call `finish` with `status` `unreachable` and its execution evidence: a well-evidenced unreachable conclusion is a reportable outcome, not a failure.");
         }
     }
     out.push('\n');
@@ -977,7 +982,7 @@ pub fn finish_not_accepted_tail(tools: &FinishTools) -> String {
     out.push_str("\n- Fix the problem, then run the target again and record the run with `evidence` (it must be a run: a scan, a decompilation or a lookup is not one). An objection settles only by new execution evidence recorded after it — rewording the result, answering the operator, or calling finish again does not.");
     out.push_str("\n- Show with a new run that the objection is wrong, recorded the same way.");
     if tools.conclude && !tools.solvable {
-        out.push_str("\n- If you have genuinely closed every route — every plan step done or dropped with a reason — conclude with status `unreachable`, citing attested execution evidence, then call finish. A rigorous \"cannot be met as stated\" is a complete, reportable outcome, not a failure.");
+        out.push_str("\n- If you have genuinely closed every route — every plan step done or dropped with a reason — call `finish` with `status` `unreachable`, citing attested execution evidence in `evidence`. A rigorous \"cannot be met as stated\" is a complete, reportable outcome, not a failure.");
     }
     if tools.block {
         out.push_str("\n- If something only the operator can supply would change things, call `report_blocker` — that routes the decision to the human who owns the goal.");
@@ -987,7 +992,7 @@ pub fn finish_not_accepted_tail(tools: &FinishTools) -> String {
 
 /// What follows the objections instead of [`finish_not_accepted_tail`] when the rejection also reopened the
 /// goal: the next finish needs a new conclusion first.
-pub const FINISH_REOPENED_TAIL: &str = "The mission is not finished, and the goal is open again. Each objection is now an open obligation: it is settled only by new execution evidence recorded after it (run the target again and record the run with `evidence`). Fix the problem, or show with a new run that the objection is wrong; then conclude the goal on that run and call finish again.";
+pub const FINISH_REOPENED_TAIL: &str = "The mission is not finished, and the goal is open again. Each objection is now an open obligation: it is settled only by new execution evidence recorded after it (run the target again and record the run with `evidence`). Fix the problem, or show with a new run that the objection is wrong; then call finish again with `status` `met` and that run as `evidence`.";
 
 /// A non-blocking record that a finish was rejected `n` times since the last accepted one. Nothing is
 /// asked of the operator.
@@ -997,7 +1002,7 @@ pub fn finish_rejected_notice(solvable: bool) -> String {
     let routes = if solvable {
         "pick an open route from the mission state and run it"
     } else {
-        "pick an open route from the mission state and run it, or, if every route is genuinely closed, `conclude` with `unreachable` and its execution evidence"
+        "pick an open route from the mission state and run it, or, if every route is genuinely closed, call `finish` with `status` `unreachable` and its execution evidence"
     };
     format!("The verifier has not accepted the finish again. The session keeps working: answer the objection with a new run, {routes}. If only the operator can unblock this, call `report_blocker`.")
 }
@@ -1010,7 +1015,7 @@ pub fn stuck_inbox_text(k: usize, plan_closed: bool, solvable: bool) -> String {
         "The mission has not advanced in {k} finish attempts: the verifier has not accepted a finish, and no new execution evidence has been recorded since the last objection. The session keeps working — nothing here pauses it. For the operator's awareness:"
     );
     if !solvable {
-        out.push_str("\n- If the goal as stated is unreachable, the session can conclude `unreachable` with its evidence and finish as a reported negative result.");
+        out.push_str("\n- If the goal as stated is unreachable, the session can finish with `status` `unreachable` and its evidence as a reported negative result.");
     }
     out.push_str("\n- If the goal should be narrowed or released, send the session a message; narrowing the goal or releasing the mission is an operator decision.\n- Otherwise the session continues on its current route.");
     if plan_closed {
@@ -1024,7 +1029,7 @@ pub fn stuck_model_line(solvable: bool) -> &'static str {
     if solvable {
         "The operator has been notified as a non-blocking item — this does not pause your work, and nothing is asked of you."
     } else {
-        "The operator has been notified as a non-blocking item — this does not pause your work, and nothing is asked of you. If you believe every route is genuinely closed, call `conclude` with status `unreachable` and your evidence; a well-evidenced negative conclusion is a complete, reportable outcome."
+        "The operator has been notified as a non-blocking item — this does not pause your work, and nothing is asked of you. If you believe every route is genuinely closed, call `finish` with `status` `unreachable` and your evidence; a well-evidenced negative conclusion is a complete, reportable outcome."
     }
 }
 
@@ -1052,7 +1057,7 @@ pub fn verification_fault_result(why: &str) -> String {
 pub fn finish_status_line(goal_unconcluded: bool, objection_open: bool, solvable: bool) -> Option<String> {
     if objection_open && goal_unconcluded {
         return Some(
-            "Finish: the goal is open. Answer each open objection with a new run and record it, conclude the goal on that run, then finish."
+            "Finish: the goal is open. Answer each open objection with a new run and record it, then call finish with `status` `met` and that run as `evidence`."
                 .to_string(),
         );
     }
@@ -1060,7 +1065,7 @@ pub fn finish_status_line(goal_unconcluded: bool, objection_open: bool, solvable
         return Some(if solvable {
             "Finish: the check raised an objection — answer it with a new run recorded with `evidence`.".to_string()
         } else {
-            "Finish: the check raised an objection — answer it with a new run recorded with `evidence`, or conclude `unreachable` if every route is closed.".to_string()
+            "Finish: the check raised an objection — answer it with a new run recorded with `evidence`, or call finish with `status` `unreachable` if every route is closed.".to_string()
         });
     }
     goal_unconcluded.then(|| {
@@ -1095,7 +1100,7 @@ pub fn repeated_reasoning(n: u32) -> String {
     format!("The model produced reasoning without a visible answer or complete tool call {n} times in a row.")
 }
 pub fn wrapup_refused(name: &str) -> String {
-    format!("Budget wrap-up active: `{}` was not run. Inspect existing outputs with out_read/out_grep, attach evidence, close existing plan steps as done/dropped, and deliver with your role's ending tool. If open requirements need new work, use report_blocker and state the partial result honestly; no further probing, edits or delegation are admitted. job_wait requires timeout_s at most 2.", shown_name(name))
+    format!("Budget wrap-up active: `{}` was not run. Inspect existing outputs with read/grep, attach evidence, close existing plan steps as done/dropped, and deliver with your role's ending tool. If open requirements need new work, use report_blocker and state the partial result honestly; no further probing, edits or delegation are admitted. job_wait requires timeout_s at most 2 when it names a job.", shown_name(name))
 }
 pub fn exec_cap(cap: u32) -> String {
     format!("This role has used its limit of {cap} admitted execution calls. Delegate remaining work to an allowed child role, or report what is still unestablished. This limit counts execution attempts, not subprocesses or commands.")
@@ -1251,8 +1256,9 @@ mod tests {
     }
 
     const OPEN: &str = "finish is not available yet: the goal is not concluded, so nothing was delivered and no verifier was started. Not having found the way yet is the normal state of a hard task, not a result.";
-    const MET: &str = " Once a run shows the goal met, call conclude with status met and that run as evidence.";
-    const UNREACHABLE: &str = " If every route is closed, conclude with status unreachable and its execution evidence: a well-evidenced unreachable conclusion is a reportable outcome, not a failure.";
+    const MET: &str =
+        " Once a run shows the goal met, call `finish` again with `status` `met` and that run as `evidence`.";
+    const UNREACHABLE: &str = " If every route is closed, call `finish` with `status` `unreachable` and its execution evidence: a well-evidenced unreachable conclusion is a reportable outcome, not a failure.";
     const STUCK: &str = "If you are stuck rather than done: ask_for (budget, a tool, a hint or direction); start a fresh agent with agent_spawn for another view; report_blocker if something only the operator can supply is missing; keep working meanwhile.";
 
     #[test]
@@ -1502,7 +1508,7 @@ mod tests {
         let cut_line = a.lines().find(|l| l.starts_with("> 9: ")).expect("line 9");
         assert!(cut_line.chars().count() < JOB_TAIL_LINE_CHARS + 20, "{cut_line}");
         let b = note(true, Some("out:abc"), 7, true);
-        assert!(b.contains("\n5 more matching lines are in out:abc: out_grep finds them."), "{b}");
+        assert!(b.contains("\n5 more matching lines are in out:abc: `grep` on it finds them."), "{b}");
         assert!(
             b.ends_with("This was the last notice of a match for this job: from here on, look at it with job_wait."),
             "{b}"
@@ -1600,7 +1606,7 @@ mod tests {
 
     #[test]
     fn reweave_brief_with_and_without_ledger_and_frontier() {
-        let first = "Older tool output above this point is now shown in shortened form. Nothing was deleted: each shortened result names its handle (out:…), `out_read` and `out_grep` open any part of it again, and `log_search` searches the whole session. If you need something you saw earlier, reopen it rather than working from memory.";
+        let first = "Older tool output above this point is now shown in shortened form. Nothing was deleted: each shortened result names its handle (out:…), `read` and `grep` open any part of it again, and `log_search` searches the whole session. If you need something you saw earlier, reopen it rather than working from memory.";
         let map = "\n\nWhat was folded is mostly attempts. Read them as ground covered, not as a verdict on the task: a failed attempt rules out that attempt, not the approach. What is established, ruled out with evidence, set aside and still open is below.\n\n";
         let block = "Where the work stands:\n- Established: 1 (c1)";
         let ledger = "\n\nThe mission ledger at this point:\nGoal: ship it";
@@ -1629,10 +1635,10 @@ mod tests {
         assert!(!b.contains("\nsee out:ab"), "{b}");
         assert!(b.contains("How to go on: treat the goal as unsolved, not as decided either way."), "{b}");
         assert!(b.contains("Each point above is an open obligation that only a run recorded from now on settles."));
-        assert!(b.contains("The goal is open again, so `conclude` it on such a run before you call `finish`."));
+        assert!(b.contains("The goal is open again, so call `finish` with `status` `met` on such a run."));
         assert!(b.ends_with("The mission ledger at this point:\nGoal: ship it"), "{b}");
         // It says where folded material is, and never speaks of a finish that was made or rejected.
-        assert!(b.contains("`out_read`") && b.contains("`log_search`"));
+        assert!(b.contains("`read`") && b.contains("`log_search`"));
         for word in ["reject", "not accept", "attempt", "again and again", "failed"] {
             assert!(!b.to_lowercase().contains(word), "{word}: {b}");
         }
@@ -1677,7 +1683,7 @@ mod tests {
         let fresh = finish_status_line(true, true, false).unwrap_or_default();
         assert_eq!(
             fresh,
-            "Finish: the goal is open. Answer each open objection with a new run and record it, conclude the goal on that run, then finish."
+            "Finish: the goal is open. Answer each open objection with a new run and record it, then call finish with `status` `met` and that run as `evidence`."
         );
         assert_eq!(finish_status_line(true, true, true).unwrap_or_default(), fresh, "no unreachable either way");
         // No line says that a finish was made before: it is in view after a fresh start.
@@ -1775,12 +1781,12 @@ mod tests {
             stuck.contains("has not advanced in 2 finish attempts") && stuck.contains("plan step is closed"),
             "{stuck}"
         );
-        assert!(stuck.contains("conclude `unreachable`"), "{stuck}");
+        assert!(stuck.contains("`status` `unreachable`"), "{stuck}");
         let open = stuck_inbox_text(2, false, false);
         assert!(!open.contains("plan step is closed"), "{open}");
         let solvable = stuck_inbox_text(2, false, true);
         assert!(!solvable.contains("unreachable") && solvable.contains("narrowed or released"), "{solvable}");
-        assert!(stuck_model_line(false).contains("conclude") && stuck_model_line(false).contains("unreachable"));
+        assert!(stuck_model_line(false).contains("finish") && stuck_model_line(false).contains("unreachable"));
         assert!(!stuck_model_line(true).contains("unreachable"));
         assert!(!stuck_model_line(false).chars().any(|c| c.is_ascii_digit()));
         assert!(stuck_notice().contains("notified as a non-blocking item"));

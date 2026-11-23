@@ -1052,13 +1052,13 @@ impl LedgerState {
                 if !self.plan.iter().any(|p| &p.id == id) {
                     return Err(no_such("plan step", id, ids(self.plan.iter().map(|p| p.id.as_str()))));
                 }
-                self.check_evidence_ids(evidence, "`step`")?;
+                self.check_evidence_ids(evidence, "`plan`")?;
                 match status {
                     StepStatus::Done if blank(note) && evidence.is_empty() => {
-                        return Err(format!("Plan step {id} cannot be marked done without saying how it was verified. Call `step` again with a `note` describing the check you ran and what it showed, or with `evidence` ids from the `evidence` tool."));
+                        return Err(format!("Plan step {id} cannot be marked done without saying how it was verified. Call `plan` again with a `note` describing the check you ran and what it showed, or with `evidence` ids from the `evidence` tool."));
                     }
                     StepStatus::Dropped if blank(note) => {
-                        return Err(format!("Plan step {id} cannot be dropped without a reason. Call `step` again with a `note` saying why the step is no longer needed."));
+                        return Err(format!("Plan step {id} cannot be dropped without a reason. Call `plan` again with a `note` saying why the step is no longer needed."));
                     }
                     _ => {}
                 }
@@ -1107,7 +1107,7 @@ impl LedgerState {
                             .iter()
                             .any(|e| e.input.claim == claim.id && e.input.supports && e.input.attested);
                         if !backed {
-                            return Err(format!("Claim {id} cannot be marked supported: it has no attested evidence that supports it. Run or read something that shows it, then call `evidence` with claim {id}, the `out:` handle of that output, the line range `start` and `end`, and a `quote` copied from those lines; evidence the harness did not witness does not count. Then call `claim_update` again."));
+                            return Err(format!("Claim {id} cannot be marked supported: it has no attested evidence that supports it. Run or read something that shows it, then call `evidence` with claim {id}, the `out:` handle of that output, the line range `start` and `end`, and a `quote` copied from those lines; evidence the harness did not witness does not count. Then call `claim` again with `id`."));
                         }
                     }
                     ClaimStatus::Refuted | ClaimStatus::Withdrawn if blank(note) => {
@@ -1335,7 +1335,7 @@ impl LedgerState {
             "Cannot finish yet: the ledger still has open items. Close each one, then call finish again.\n",
         );
         if !open.plan.is_empty() {
-            out.push_str("Plan steps still todo or doing (close with `step`: status done with a note saying how it was verified or with evidence ids, or status dropped with a note saying why):\n");
+            out.push_str("Plan steps still todo or doing (close with `plan`: status done with a note saying how it was verified or with evidence ids, or status dropped with a note saying why):\n");
             for id in &open.plan {
                 if let Some(p) = self.plan.iter().find(|p| &p.id == id) {
                     out.push_str(&format!("- {} {}\n", p.id, preview(&p.text)));
@@ -1351,7 +1351,7 @@ impl LedgerState {
             }
         }
         if !open.claims.is_empty() {
-            out.push_str("Claims still open (close with `claim_update`: supported once `evidence` has attached attested supporting evidence, or refuted/withdrawn with a note):\n");
+            out.push_str("Claims still open (close with `claim` and `id`: supported once `evidence` has attached attested supporting evidence, or refuted/withdrawn with a note):\n");
             for id in &open.claims {
                 if let Some(c) = self.claims.iter().find(|c| &c.id == id) {
                     out.push_str(&format!("- {} {}\n", c.id, preview(&c.text)));
@@ -2374,7 +2374,7 @@ mod tests {
             "{m}"
         );
         assert!(!m.contains("q2"), "{m}");
-        for tool in ["`step`", "wait for the job or agent", "claim_update", "ask_user"] {
+        for tool in ["`plan`", "wait for the job or agent", "`claim`", "ask_user"] {
             assert!(m.contains(tool), "{tool} missing: {m}");
         }
         let clean = build(vec![
