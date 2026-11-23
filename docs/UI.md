@@ -712,3 +712,21 @@ request reads "Approved · hosts granted: …", a refused one "Refused".
   missing path or session, 409 for every other refusal, 400 for a bad query.
 - **Open file** on a tool row (inside the expanded row) shows the Files tab at that path when the call's `path`, `file_path`
   or `file` is inside the workspace; the entry is selected, and a missing one is said.
+
+## Pass 3: changes, plan and stop where the eyes are
+
+Compared against the other agent GUIs (Claude Code, Codex, Cursor, Devin, Copilot, OpenHands, Cline, Kilo, Zed, Amp, Antigravity,
+Goose, Warp, Factory) in November 2026; these are the patterns most of them share that loom lacked.
+
+- An edit or write row says how much it changed ("+3 −2") in its head, and its expanded output colours the unified diff the tool
+  returned: added lines green, removed red, hunk headers blue, the tool's own `[...]` header and footer dim. Only the look
+  changes; the text is the stored output, byte for byte, and copying it copies that text.
+- The Overview has a "Files changed" section: one row per path this session's edit and write calls changed (newest first), its
+  total "+N −M" (or "new"), and how many edits. The path jumps to the latest change in the chat; Open shows the file in the Files
+  tab. It says what it leaves out: changes made by shell commands or by agents.
+- A call still running counts its time up in its row ("running · 41s"), so a long build reads as working, not stuck.
+- While the session runs, a Stop button sits beside Send. It asks first, as the header's Stop does.
+- "Plan 2 of 6 done" in the progress line is a button: it opens the plan's steps as a short checklist above the message box.
+- `[` and `]` jump to your previous and next message in the record (not while typing), for reading a long record prompt by
+  prompt.
+- A tool row's arguments are behind "Show arguments", not a bare "args" link.

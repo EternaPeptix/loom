@@ -375,6 +375,7 @@ details.thought > summary { color: var(--caption); }
 .capsule.tone-running { color: var(--info); }
 .thead .dur { flex: 0 0 auto; font-size: 11px; color: var(--caption); font-variant-numeric: tabular-nums; }
 .tbody { padding: 4px 8px 8px 28px; }
+.tbody .targs { display: inline-flex; margin: 2px 0 4px; padding: 0; min-height: 0; font-size: 12px; }
 .out { background: var(--code-bg); border: 1px solid var(--line); border-radius: var(--r-sm); padding: 8px 10px; max-height: 70vh; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-family: var(--mono); font-size: 12px; line-height: 1.5; }
 .tnote { font-size: 11px; color: var(--dim); margin-top: 3px; }
 .tnote.cutline { color: var(--warn-soft); }
@@ -478,6 +479,10 @@ select.model-seat option { background: var(--surface-card); color: var(--fg); }
 .send-btn:active:not(:disabled) { transform: scale(.96); }
 .send-btn:disabled { background: var(--bg-4); color: var(--caption); cursor: default; }
 .send-btn[aria-busy="true"] .icon { opacity: .6; }
+.stop-btn { display: inline-grid; place-items: center; flex: 0 0 auto; width: 32px; height: 32px; padding: 0; border: 1px solid var(--line-2, var(--line)); border-radius: 50%; background: var(--bg-3, transparent); color: var(--bad); cursor: pointer; }
+.stop-btn .icon { width: 14px; height: 14px; fill: currentColor; stroke: none; }
+.stop-btn:hover { background: var(--bad-bg); }
+.stop-btn[hidden] { display: none; }
 /* In the DOM between the seat and Send (so Tab goes seat, Switch, Keep, Send); drawn on its own row below. */
 .model-confirm { order: 3; flex: 1 0 100%; display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; padding: 8px 10px; border: 1px solid var(--accent-line); border-radius: var(--r-md); background: var(--accent-tint); }
 .model-confirm-text { flex: 1 1 240px; min-width: 0; margin: 0; font-size: 13px; color: var(--strong); overflow-wrap: anywhere; }
@@ -677,6 +682,14 @@ button.id-chip:hover { background: var(--bg-3); border-color: var(--line-2); }
 .change-item time { flex: 0 0 64px; font-size: 12px; }
 .change-item .btn.link { min-height: 0; padding: 0; text-align: left; white-space: normal; overflow-wrap: anywhere; }
 .change-item.bad .btn.link { color: var(--bad-soft); }
+.overview-files:empty { display: none; }
+.file-list { margin: 0; padding: 0; list-style: none; }
+.file-item { display: flex; gap: 10px; align-items: center; padding: 5px 0; border-bottom: 1px solid var(--line); font-size: 13px; }
+.file-item:last-child { border-bottom: 0; }
+.file-item .file-jump { display: block; flex: 1 1 auto; min-width: 0; min-height: 0; padding: 0; text-align: left; justify-content: flex-start; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+.file-item .diffstat { flex: 0 0 auto; }
+.ds-new { color: var(--info); }
+.files-count { font-weight: 400; }
 .rail-card { display: flex; flex-direction: column; gap: 10px; padding: 14px 16px; border: 1px solid var(--line); border-radius: var(--r-lg); background: var(--bg-2); }
 .mission-panel .rail-card h3 { margin: 0; font-size: 12px; font-weight: 600; color: var(--dim); }
 .rail-session { display: flex; align-items: flex-start; gap: 8px; color: var(--fg); }
@@ -714,6 +727,17 @@ button.id-chip:hover { background: var(--bg-3); border-color: var(--line-2); }
 .evidence-claim .ev { padding: 12px 14px; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--surface-card); }
 .evidence-claim .ev.no { border-color: var(--bad-line); }
 .ev .out { max-height: 40vh; }
+/* Tool output lines (C.outputLineKinds): the text is raw; only its look changes. */
+.ol { display: inline; }
+.ol-meta { color: var(--caption); }
+.has-diff .ol-add, .has-diff .ol-del, .has-diff .ol-hunk { display: inline-block; width: 100%; margin: 0 -10px; padding: 0 10px; box-sizing: content-box; }
+.ol-add { color: var(--ok); background: color-mix(in srgb, var(--ok) 12%, transparent); }
+.ol-del { color: var(--bad); background: var(--bad-bg); }
+.ol-hunk { color: var(--info); background: color-mix(in srgb, var(--info) 8%, transparent); }
+.ol-file { color: var(--dim); font-weight: 600; }
+.diffstat { display: inline-flex; gap: 4px; font-family: var(--mono); font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.ds-add { color: var(--ok); }
+.ds-del { color: var(--bad); }
 .report-prose { margin-top: 6px; padding-left: 10px; border-left: 2px solid var(--line); }
 .report-prose > :first-child { margin-top: 0; }
 .report-prose > :last-child { margin-bottom: 0; }
@@ -944,6 +968,13 @@ kbd { display: inline-block; min-width: 1.6em; padding: 0 5px; border: 1px solid
 /* The progress line above the composer: a fact line, never an alarm. */
 .progress-line { display: flex; flex-wrap: wrap; gap: 2px 14px; margin: 0 auto 6px; padding: 0 4px; font-size: 12px; color: var(--dim); }
 .progress-line[hidden] { display: none; }
+.progress-plan { padding: 0; border: 0; background: none; font: inherit; color: var(--text); text-decoration: underline dotted; text-underline-offset: 3px; cursor: pointer; }
+.progress-plan::after { content: " ▸"; color: var(--caption); }
+.progress-plan[aria-expanded="true"]::after { content: " ▾"; }
+.mini-plan { margin: 0 auto 6px; padding: 8px 12px; list-style: none; border: 1px solid var(--line); border-radius: var(--r-lg); background: var(--bg-2, transparent); max-height: 30vh; overflow: auto; font-size: 13px; }
+.mini-plan[hidden] { display: none; }
+.mini-step { display: flex; align-items: flex-start; gap: 8px; padding: 3px 0; }
+.mini-step .step-mark { flex: 0 0 auto; margin-top: 2px; }
 .progress-now { color: var(--fg); min-width: 0; overflow-wrap: anywhere; }
 
 @media (pointer: coarse) {
@@ -1271,6 +1302,9 @@ details.reasoning > .copy-row { margin: 4px 0 2px; }
   #msg { grid-area: msg; min-height: 40px; padding: 8px 2px; max-height: 32vh; }
   #composer-row { display: contents; }
   #send { grid-area: send; align-self: end; }
+  /* On a phone Stop takes the caption row's end, below Send, at the same 44px size. */
+  #c-stop { grid-row: 4; grid-column: 3; width: 44px; height: 44px; justify-self: end; }
+  .composer-card:has(#c-stop:not([hidden])) .s-caption { grid-column: 2; }
   .seat { grid-area: seat; flex: none; margin: 0; max-width: 34vw; }
   select.model-seat { width: auto; max-width: 34vw; }
   #model-confirm { grid-area: conf; order: 0; }

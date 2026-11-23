@@ -230,7 +230,11 @@ append("s-fl-net", "inbox_opened", { ts_ms: now - 9 * MIN, ...inbox.find(e => e.
   t = step("s-tools", t, { command: "make lint", out: "lint: clean", exit: 0 });
   // Paths for the Files tab's "Open file": inside /fixture/loom (absolute and relative), the binary one, and one that is not there.
   t = step("s-tools", t, { name: "read", cls: "read", args: { path: "/fixture/loom/crates/loom-agent/src/runtime.rs", start: 1, end: 5 }, out: "//! runtime.rs: fixture source\n    // line 2 of runtime.rs", ms: 12 });
-  t = step("s-tools", t, { name: "edit", cls: "write", args: { path: "notes/no-newline.txt", old: "one", new: "two" }, out: "edited notes/no-newline.txt", ms: 9 });
+  // As the daemon records an edit: its facts line, the unified diff it applied, its end line (crates/loom-core admit.rs).
+  t = step("s-tools", t, { name: "edit", cls: "write", args: { path: "crates/loom-agent/src/runtime.rs", old: "timeout_ms: 30_000", new: "timeout_ms: 60_000" }, meta: { path: "/fixture/loom/crates/loom-agent/src/runtime.rs" }, ms: 9,
+    out: "[edit · edited · /fixture/loom/crates/loom-agent/src/runtime.rs · 2 replacements · 17 lines · out:cc8752638528652e]\n--- /fixture/loom/crates/loom-agent/src/runtime.rs\n+++ /fixture/loom/crates/loom-agent/src/runtime.rs\n@@ -1592,7 +1592,8 @@\n     let report = RecoveryReport {\n         outcome,\n-        report: text,\n+        report: text.clone(),\n+        summary: summarize(&text),\n         full: None,\n         steps,\n         usage: Usage::default(),\n@@ -2210,3 +2211,3 @@\n fn retry_policy() -> Policy {\n-    Policy { timeout_ms: 30_000, attempts: 3 }\n+    Policy { timeout_ms: 60_000, attempts: 3 }\n }\n[end of edit output · edited]" });
+  t = step("s-tools", t, { name: "write", cls: "write", args: { path: "notes/no-newline.txt", content: "one line without a final newline" }, meta: { path: "/fixture/loom/notes/no-newline.txt" }, ms: 6,
+    out: "[write · created · /fixture/loom/notes/no-newline.txt · 1 line]\n(new file)\n[end of write output · created]" });
   t = step("s-tools", t, { name: "read", cls: "read", args: { path: "target.bin" }, out: "(binary file)", ms: 4 });
   t = step("s-tools", t, { name: "read", cls: "read", args: { path: "src/removed.rs" }, status: "error", out: "no such file: src/removed.rs", ms: 4 });
   t = step("s-tools", t, { name: "write", cls: "write", args: { path: "/etc/hosts", text: "127.0.0.1 fixture" }, status: "denied", out: "denied: /etc/hosts is outside the sandbox's writable paths (the workspace and /tmp). Nothing was written." });

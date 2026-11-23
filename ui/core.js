@@ -63,6 +63,57 @@ export function pct(part, whole) {
 }
 
 /** First `max` lines of `text`: {text, total, clipped}. A trailing newline does not add a line. */
+// Tool output is shown raw; these only choose a look for each line, never change its text.
+// Every stored result starts "[tool · facts]" and ends "[end of tool output · outcome]" (crates/loom-core admit.rs).
+const ENVELOPE_HEAD = /^\[[a-z][a-z0-9_]* · .*\]$/;
+const ENVELOPE_FOOT = /^\[end of [a-z][a-z0-9_]* output · .*\]$/;
+
+/** Where a unified diff starts in `lines`: a "--- " line directly followed by "+++ " and then "@@ " (-1 when none). */
+function diffStart(lines) {
+  for (let i = 0; i + 2 < lines.length; i++) {
+    if (lines[i].startsWith("--- ") && lines[i + 1].startsWith("+++ ") && lines[i + 2].startsWith("@@ ")) return i;
+  }
+  return -1;
+}
+
+/**
+ * The look of each line of a tool output, parallel to `text.split("\n")`: "meta" for the harness's own first and last
+ * lines, and inside a unified diff "file", "hunk", "add", "del" or "ctx"; "" for anything else.
+ */
+export function outputLineKinds(text) {
+  const lines = String(text ?? "").split("\n");
+  const kinds = lines.map(() => "");
+  let last = lines.length - 1;
+  while (last > 0 && lines[last] === "") last--;
+  if (lines.length > 1 && ENVELOPE_HEAD.test(lines[0])) kinds[0] = "meta";
+  if (last > 0 && ENVELOPE_FOOT.test(lines[last])) kinds[last] = "meta";
+  const start = diffStart(lines);
+  if (start < 0) return kinds;
+  let inHunk = false;
+  for (let i = start; i < lines.length; i++) {
+    if (kinds[i] === "meta") continue;
+    const l = lines[i];
+    if ((l.startsWith("--- ") && i + 1 < lines.length && lines[i + 1].startsWith("+++ ")) || (l.startsWith("+++ ") && i > 0 && lines[i - 1].startsWith("--- "))) { kinds[i] = "file"; inHunk = false; }
+    else if (l.startsWith("@@ ")) { kinds[i] = "hunk"; inHunk = true; }
+    else if (!inHunk) continue;
+    else if (l.startsWith("+")) kinds[i] = "add";
+    else if (l.startsWith("-")) kinds[i] = "del";
+    else if (l.startsWith(" ") || l === "") kinds[i] = "ctx";
+    else if (l.startsWith("\\")) kinds[i] = "meta";
+    else inHunk = false;
+  }
+  return kinds;
+}
+
+/** Lines added and removed by the unified diff in a tool output, or null when it holds none. */
+export function diffStat(text) {
+  const kinds = outputLineKinds(text);
+  if (!kinds.includes("hunk")) return null;
+  let added = 0, removed = 0;
+  for (const k of kinds) { if (k === "add") added++; else if (k === "del") removed++; }
+  return { added, removed, text: `+${added} −${removed}`, words: `${count(added, "line")} added, ${count(removed, "line")} removed` };
+}
+
 export function clip(text, max) {
   const s = String(text ?? "");
   let total = 0;
@@ -3183,6 +3234,21 @@ export function shortcutFor(e, opts = {}) {
   }
   if (e.key === "?") return "keys";
   if (e.key === "/") return "find"; // on layouts where / needs Shift the key is still "/"
+  if (e.key === "[") return "mine-prev";
+  if (e.key === "]") return "mine-next";
+  return null;
+}
+
+/**
+ * mineStep(blocks, fromSeq, dir): the seq of the operator's own message one step from `fromSeq` (the record nearest the top of
+ * the view) in `dir` (1 later, -1 earlier), or null at an end. Long records are read prompt by prompt this way.
+ */
+export function mineStep(blocks, fromSeq, dir) {
+  const mine = (blocks || []).filter((b) => b.kind === "user" && Number.isFinite(b.seq)).map((b) => b.seq);
+  if (!mine.length) return null;
+  if (!Number.isFinite(fromSeq)) return dir > 0 ? mine[0] : mine[mine.length - 1];
+  if (dir > 0) return mine.find((q) => q > fromSeq) ?? null;
+  for (let i = mine.length - 1; i >= 0; i--) if (mine[i] < fromSeq) return mine[i];
   return null;
 }
 
@@ -3215,6 +3281,8 @@ export function keySheet(mac = false) {
     ] },
     { title: "In a record", rows: [
       { keys: ["/"], text: "Find in this record" },
+      { keys: ["["], text: "Your previous message in this record" },
+      { keys: ["]"], text: "Your next message in this record" },
       { keys: ["Enter"], text: "In Find: next match" },
       { keys: ["Shift", "Enter"], text: "In Find: previous match" },
       { keys: ["Enter"], text: "In the message box: send" },
@@ -3939,6 +4007,30 @@ export function workspaceRelative(workspace, text) {
   }
   const parts = squash(raw.split("/"));
   return parts ? parts.join("/") : null;
+}
+
+/**
+ * fileChanges(blocks, workspace): the files this session's edit and write tools changed, most recent first, one row per path:
+ * {path, rel, edits, added, removed, created, lastSeq, lastId, lastTs}. Counts come from the diffs in the recorded results, so a
+ * result without a diff ("(new file)") counts as an edit with `created` set and no line counts. Only calls that succeeded are
+ * counted; shell commands and agents' edits are not seen here (the caller says so).
+ */
+export function fileChanges(blocks, workspace = "") {
+  const rows = new Map();
+  for (const b of blocks || []) {
+    if (!b || b.kind !== "tool" || b.cls !== "write" || !b.result || b.result.status !== "ok") continue;
+    const path = (b.result.meta && typeof b.result.meta.path === "string" && b.result.meta.path) || toolPathArg(b.args);
+    if (!path) continue;
+    const stat = diffStat(b.result.text);
+    const row = rows.get(path) || { path, rel: workspaceRelative(workspace, path), edits: 0, added: 0, removed: 0, created: false, lastSeq: 0, lastId: null, lastTs: 0 };
+    row.edits++;
+    if (stat) { row.added += stat.added; row.removed += stat.removed; }
+    if (/\n\(new file\)\n|^\(new file\)$/m.test(b.result.text || "")) row.created = true;
+    const seq = b.result.seq ?? b.seq ?? 0;
+    if (seq >= row.lastSeq) { row.lastSeq = seq; row.lastId = b.id; row.lastTs = b.result.ts || b.ts || 0; }
+    rows.set(path, row);
+  }
+  return [...rows.values()].sort((a, b) => b.lastSeq - a.lastSeq);
 }
 
 /** The path a tool call names, from its arguments (`path`, `file_path` or `file`), or null. */

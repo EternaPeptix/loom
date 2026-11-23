@@ -146,6 +146,7 @@
         <button id="jump" type="button" class="btn jump" hidden>Jump to latest</button>
       </div>
       <footer id="composer" class="composer">
+        <ol id="s-plan" class="mini-plan" aria-label="Plan" hidden></ol>
         <p id="s-progress" class="progress-line" hidden></p>
         <div class="composer-card">
           <div class="composer-heading"><span id="composer-recipient" class="dim"></span><span id="send-state" class="dim" role="status" aria-live="polite"></span></div>
@@ -165,6 +166,7 @@
                 <button id="model-confirm-no" type="button" class="btn small">Keep</button>
               </span>
             </div>
+            <button id="c-stop" type="button" class="stop-btn" title="Stop this session (asks first)" aria-label="Stop this session" hidden><svg class="icon" viewBox="0 0 12 12" aria-hidden="true"><rect x="3" y="3" width="6" height="6" rx="1"/></svg></button>
             <button id="send" type="button" class="send-btn" aria-label="Send" title="Send (Enter)"><svg class="icon" viewBox="0 0 12 12" aria-hidden="true"><path d="M6 10V2.5M2.8 5.6 6 2.4l3.2 3.2"/></svg></button>
           </div>
           <button id="s-caption" type="button" class="s-caption" aria-haspopup="dialog" aria-controls="session-sheet" hidden><span id="s-caption-text" class="s-caption-text"></span><svg class="icon" viewBox="0 0 12 12" aria-hidden="true"><path d="M4.5 2.5 8 6 4.5 9.5"/></svg></button>

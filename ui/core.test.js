@@ -3546,3 +3546,39 @@ test("contextCardModel: a fold mark inside the scale is drawn even when it folds
   assert.match(m.fold.text, /folds at/);
   assert.doesNotMatch(m.fold.text, /down to/);
 });
+
+test("outputLineKinds marks the envelope and a unified diff, and nothing in plain output", () => {
+  const text = "[edit · edited · /w/a.rs · 1 replacement · 7 lines]\n--- /w/a.rs\n+++ /w/a.rs\n@@ -1,3 +1,3 @@\n-timeout = 30\n+timeout = 60\n retries = 3\n[end of edit output · edited]";
+  assert.deepEqual(C.outputLineKinds(text), ["meta", "file", "file", "hunk", "del", "add", "ctx", "meta"]);
+  assert.deepEqual(C.outputLineKinds("total 4\n-rw-r--r-- a\n+ b"), ["", "", ""], "a line that only starts with - or + is not a diff");
+  assert.deepEqual(C.diffStat(text), { added: 1, removed: 1, text: "+1 −1", words: "1 line added, 1 line removed" });
+  assert.equal(C.diffStat("(new file)"), null);
+});
+
+test("fileChanges sums successful edit and write results per path, newest first", () => {
+  const diff = (a, r) => "--- /w/x\n+++ /w/x\n@@ -1 +1 @@\n" + "-o\n".repeat(r) + "+n\n".repeat(a);
+  const tool = (id, seq, path, text, status = "ok", cls = "write") => ({ id, seq, kind: "tool", cls, args: { path }, result: { seq: seq + 1, status, text, meta: {}, ts: seq * 1000 } });
+  const blocks = [
+    tool(1, 10, "/w/src/a.rs", diff(2, 1)),
+    tool(2, 20, "/w/notes.txt", "[write · created · /w/notes.txt · 1 line]\n(new file)\n[end of write output · created]"),
+    tool(3, 30, "/w/src/a.rs", diff(1, 0)),
+    tool(4, 40, "/w/src/b.rs", diff(5, 5), "error"),
+    tool(5, 50, "/w/src/c.rs", "file text", "ok", "read"),
+  ];
+  const rows = C.fileChanges(blocks, "/w");
+  assert.deepEqual(rows.map(r => [r.rel, r.edits, r.added, r.removed, r.created, r.lastId]), [["src/a.rs", 2, 3, 1, false, 3], ["notes.txt", 1, 0, 0, true, 2]]);
+});
+
+test("mineStep walks the operator's own messages; [ and ] are the keys, never while typing", () => {
+  const blocks = [{ kind: "user", seq: 1 }, { kind: "tool", seq: 2 }, { kind: "user", seq: 5 }, { kind: "response", seq: 6 }, { kind: "user", seq: 9 }];
+  assert.equal(C.mineStep(blocks, 2, 1), 5);
+  assert.equal(C.mineStep(blocks, 5, 1), 9);
+  assert.equal(C.mineStep(blocks, 9, 1), null);
+  assert.equal(C.mineStep(blocks, 6, -1), 5);
+  assert.equal(C.mineStep(blocks, 1, -1), null);
+  assert.equal(C.mineStep(blocks, null, -1), 9);
+  assert.equal(C.mineStep([], 3, 1), null);
+  assert.equal(C.shortcutFor({ key: "]" }), "mine-next");
+  assert.equal(C.shortcutFor({ key: "[" }), "mine-prev");
+  assert.equal(C.shortcutFor({ key: "]" }, { typing: true }), null);
+});

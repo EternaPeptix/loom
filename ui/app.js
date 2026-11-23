@@ -1502,6 +1502,8 @@ function renderHeader() {
   renderStats();
   const a = C.sessionActions(info);
   $("b-stop").hidden = !a.stop;
+  // While it runs, Stop also sits beside Send, where the eyes are when it goes wrong; it asks in the header like the header button.
+  $("c-stop").hidden = !(a.stop && a.running && a.send);
   $("b-resume").hidden = !a.resume;
   $("b-archive").hidden = !a.archive;
   $("b-unarchive").hidden = !a.unarchive;
@@ -1581,7 +1583,7 @@ function renderOverview() {
   if (S.section !== "overview" && S.section !== "evidence") return;
   const panel = $("mission-overview");
   if (!panel.firstElementChild) {
-    const main = add(el("div", "overview-main"), el("div", "overview-decisions"), el("section", "overview-section overview-plan"), el("section", "overview-section overview-changes"));
+    const main = add(el("div", "overview-main"), el("div", "overview-decisions"), el("section", "overview-section overview-plan"), el("section", "overview-section overview-files"), el("section", "overview-section overview-changes"));
     const rail = el("aside", "overview-rail");
     rail.setAttribute("aria-label", "Mission standing");
     panel.append(add(el("div", "overview-layout"), main, rail));
@@ -1589,7 +1591,7 @@ function renderOverview() {
   const entries = missionEntries();
   const model = C.missionOverview(S.rec.records.values(), S.ledger.state, entries, S.sinceSeq);
   reconcileInbox(panel.querySelector(".overview-decisions"), entries.filter(e => e.item.item_kind !== "finished"), "overview");
-  for (const [selector, build] of [[".overview-plan", planSection], [".overview-changes", changesSection], [".overview-rail", railSection]]) {
+  for (const [selector, build] of [[".overview-plan", planSection], [".overview-files", filesSection], [".overview-changes", changesSection], [".overview-rail", railSection]]) {
     const box = panel.querySelector(selector);
     const body = build(model);
     preserveFocus(box, () => box.replaceChildren(body));
@@ -1655,6 +1657,44 @@ function changesSection(model) {
   group(recent.fresh.length && recent.earlier.length ? "Earlier" : null, recent.earlier);
   if (recent.total > recent.shown) body.append(el("p", "dim fineprint", `Showing the latest ${recent.shown} of ${C.num(recent.total)} recorded changes.`));
   body.append(el("p", "dim fineprint", "Activity is derived from recorded events. Completed steps and matching quotes do not by themselves establish a claim."));
+  return body;
+}
+
+// Files this session changed through its edit and write tools: what a reviewer looks at first. Each row jumps to the latest
+// change in the chat and opens the file as it is now. Commands and agents can change files too; the note says so.
+function filesSection() {
+  const body = document.createDocumentFragment();
+  const info = S.sessions.byId.get(S.openId);
+  const rows = S.rec && !S.rec.loading ? C.fileChanges(S.rec.blocks, info ? info.workspace : "") : [];
+  if (!rows.length) return body; // the section is empty, and an empty section is not shown
+  const added = rows.reduce((n, r) => n + r.added, 0), removed = rows.reduce((n, r) => n + r.removed, 0);
+  const total = el("span", "diffstat");
+  add(total, el("span", "ds-add", "+" + C.num(added)), el("span", "ds-del", "−" + C.num(removed)));
+  total.title = `${C.count(added, "line")} added, ${C.count(removed, "line")} removed, from the recorded diffs`;
+  body.append(heading("h2", "Files changed", add(el("span", "dim files-count", C.count(rows.length, "file") + " · "), total)));
+  const list = el("ul", "file-list");
+  for (const r of rows.slice(0, 50)) {
+    const shown = r.rel !== null && r.rel !== "" ? r.rel : r.path;
+    const jump = btn("", "link mono file-jump", () => jumpToRecord(r.lastSeq));
+    jump.textContent = shown;
+    jump.title = `Show the latest change to ${shown} in the chat`;
+    jump.dataset.focusKey = "file:" + r.path;
+    const stat = el("span", "diffstat");
+    if (r.created) add(stat, el("span", "ds-new", "new"));
+    if (r.added || r.removed) add(stat, el("span", "ds-add", "+" + C.num(r.added)), el("span", "ds-del", "−" + C.num(r.removed)));
+    const meta = el("span", "dim", r.edits > 1 ? `${r.edits} edits` : "");
+    const li = add(el("li", "file-item"), jump, stat, meta);
+    if (r.rel !== null) {
+      const open = btn("Open", "small ghost", (e) => showFiles(e.currentTarget, r.rel));
+      open.title = "Show the file as it is in the workspace now";
+      open.dataset.focusKey = "file-open:" + r.path;
+      li.append(open);
+    }
+    list.append(li);
+  }
+  body.append(list);
+  if (rows.length > 50) body.append(el("p", "dim fineprint", `Showing the 50 most recent of ${C.num(rows.length)} files.`));
+  body.append(el("p", "dim fineprint", "From this session's edit and write calls. Changes made by shell commands or by agents are not listed here."));
   return body;
 }
 
@@ -2100,8 +2140,32 @@ function renderProgress(info) {
   node.dataset.sig = sig;
   node.hidden = !line;
   renderCaption(info);
-  if (!line) { node.replaceChildren(); return; }
-  node.replaceChildren(...line.parts.map(p => el("span", "progress-part progress-" + p.key, p.text)), el("span", "sr-only", line.parts.some(p => p.key === "budget") ? ". The budget is a limit, not a measure of progress." : ""));
+  if (!line) { node.replaceChildren(); renderMiniPlan(info); return; }
+  const parts = line.parts.map(p => {
+    if (p.key !== "plan") return el("span", "progress-part progress-" + p.key, p.text);
+    // The plan count opens the steps above the composer, so the plan can be read without leaving the chat.
+    const b = btn(p.text, "progress-part progress-plan link", () => { S.planOpen = !S.planOpen; renderMiniPlan(info); });
+    b.setAttribute("aria-controls", "s-plan");
+    b.setAttribute("aria-expanded", String(!!S.planOpen));
+    b.title = S.planOpen ? "Hide the plan" : "Show the plan's steps";
+    return b;
+  });
+  node.replaceChildren(...parts, el("span", "sr-only", line.parts.some(p => p.key === "budget") ? ". The budget is a limit, not a measure of progress." : ""));
+  renderMiniPlan(info);
+}
+
+/** The plan's steps above the composer, open while S.planOpen; the Overview tab keeps the full view with notes. */
+function renderMiniPlan(info) {
+  const list = $("s-plan");
+  const steps = info && !info.parent ? (S.ledger.model?.plan || []).filter(st => st.status !== "dropped") : [];
+  const open = !!S.planOpen && steps.length > 0;
+  const toggle = $("s-progress").querySelector(".progress-plan");
+  if (toggle) { toggle.setAttribute("aria-expanded", String(open)); toggle.title = open ? "Hide the plan" : "Show the plan's steps"; }
+  const sig = open ? JSON.stringify(steps.map(st => [st.status, st.text])) : "";
+  if (list.dataset.sig === sig && list.hidden === !open) return;
+  list.dataset.sig = sig;
+  list.hidden = !open;
+  list.replaceChildren(...(open ? steps.map(st => add(el("li", "mini-step step-" + st.status), stepMarkEl(st.status), el("span", "step-text", st.text))) : []));
 }
 
 /**
@@ -2241,6 +2305,30 @@ function evidenceCard(evidence) {
 
 function textBox(text, cls) {
   return el("pre", cls || "txt", text);
+}
+
+/**
+ * Tool output, raw, with a look per line (C.outputLineKinds): the harness's own first and last lines muted, a unified
+ * diff in green and red. Only spans are added; the text, and what a selection copies, stay exactly as recorded.
+ * `kinds` may cover more lines than `text` (a clipped view of a longer output).
+ */
+function outputBox(text, kinds) {
+  if (!kinds || !kinds.some(Boolean)) return textBox(text, "txt out");
+  const pre = el("pre", "txt out");
+  const lines = text.split("\n");
+  let plain = "";
+  const flush = () => { if (plain) { pre.append(document.createTextNode(plain)); plain = ""; } };
+  lines.forEach((line, i) => {
+    const nl = i < lines.length - 1 ? "\n" : "";
+    if (!kinds[i]) { plain += line + nl; return; }
+    flush();
+    // The line break stays outside the span, so a full-width diff line never carries an extra blank line.
+    pre.append(el("span", "ol ol-" + kinds[i], line));
+    plain = nl;
+  });
+  flush();
+  if (kinds.includes("hunk")) pre.classList.add("has-diff");
+  return pre;
 }
 
 const modelChip = (m, extra = "") => {
@@ -2411,7 +2499,8 @@ function collapsible(b, key, text, max, opts = {}) {
   const wrap = el("div");
   const all = !!b.ui[key];
   const c = C.clip(text, max);
-  add(wrap, opts.prose ? add(el("div", "report-prose"), prose(all ? text : c.text)) : textBox(all ? text : c.text, "txt out"));
+  const shown = all ? text : c.text;
+  add(wrap, opts.prose ? add(el("div", "report-prose"), prose(shown)) : opts.styled ? outputBox(shown, C.outputLineKinds(text)) : textBox(shown, "txt out"));
   if (c.clipped) {
     add(wrap, keyed(btn(all ? "show less" : `show all ${C.num(c.total)} lines`, "link", () => {
       b.ui[key] = !all;
@@ -2450,7 +2539,22 @@ function buildTool(root, b) {
     mark.title = row.partial.words;
     add(head, mark);
   }
+  // A file change says how big it was, as the diff it returned counts it.
+  const stat = res && b.cls === "write" ? C.diffStat(res.text) : null;
+  if (stat) {
+    const chip = el("span", "diffstat");
+    add(chip, el("span", "ds-add", "+" + C.num(stat.added)), el("span", "ds-del", "−" + C.num(stat.removed)));
+    chip.title = stat.words;
+    add(head, chip);
+  }
   if (row.duration) add(head, el("span", "dur", row.duration));
+  else if (row.state === "running" && Number.isFinite(b.ts)) {
+    // A call still out counts up, so a long build reads as working, not stuck (tickGroups moves it each second).
+    const live = el("span", "dur live-dur", C.seconds(Math.max(0, Date.now() - b.ts)));
+    live.dataset.since = String(b.ts);
+    live.title = "Running for this long so far";
+    add(head, live);
+  }
   head.addEventListener("click", () => {
     b.ui.open = !open;
     refresh(b);
@@ -2460,7 +2564,7 @@ function buildTool(root, b) {
   const body = el("div", "tbody");
   add(body, toolOpenRow(b), toolCopyRow(b));
   if (b.args !== undefined && b.args !== null) {
-    add(body, keyed(btn(b.ui.args ? "hide args" : "args", "link", () => {
+    add(body, keyed(btn(b.ui.args ? "Hide arguments" : "Show arguments", "small link targs", () => {
       b.ui.args = !b.ui.args;
       refresh(b);
     }), "args:" + b.id));
@@ -2468,7 +2572,7 @@ function buildTool(root, b) {
   if (b.ui.args) add(body, textBox(JSON.stringify(b.args, null, 2), "txt out"));
   if (res) {
     if (res.text === "") add(body, el("div", "dim", "(no output)"));
-    else add(body, collapsible(b, "all", res.text, 24));
+    else add(body, collapsible(b, "all", res.text, 24, { styled: true }));
     const s = res.shown;
     if (s.words || s.blob) {
       const note = el("div", "tnote" + (s.cut ? " cutline" : ""));
@@ -2757,6 +2861,8 @@ function syncChat() {
 function tickGroups() {
   const R = S.r;
   if (!R) return;
+  const now = Date.now();
+  for (const n of document.querySelectorAll("#blocks .live-dur[data-since]")) n.textContent = C.seconds(Math.max(0, now - Number(n.dataset.since)));
   for (const [, entry] of R.nodes) {
     const it = entry.item;
     if (it.type !== "group" || !it.running || !entry.label) continue;
@@ -5003,6 +5109,26 @@ function keyboard(e) {
   else if (action === "needs-prev") stepNeeds(-1);
   else if (action === "keys") openKeys();
   else if (action === "find") openFind();
+  else if (action === "mine-next") stepMine(1);
+  else if (action === "mine-prev") stepMine(-1);
+}
+
+/** [ and ]: the operator's own previous or next message, from the record nearest the top of the transcript. */
+function stepMine(dir) {
+  if (S.view !== "session" || !S.rec) return;
+  if (S.section !== "chat") setSection("chat");
+  // The record at the top of the visible transcript: the first rendered block whose bottom is below the scroller's top edge.
+  const edge = chatScroller().getBoundingClientRect().top + 8;
+  const byId = new Map(S.rec.blocks.map(b => [String(b.id), b]));
+  let top = null;
+  for (const n of $("blocks").querySelectorAll("[data-bid]")) {
+    if (n.getBoundingClientRect().bottom <= edge) continue;
+    const b = byId.get(n.dataset.bid);
+    if (b && Number.isFinite(b.seq)) { top = b.seq; break; }
+  }
+  const seq = C.mineStep(S.rec.blocks, top, dir);
+  if (seq === null) { toast(dir > 0 ? "No later message of yours" : "No earlier message of yours"); return; }
+  jumpToRecord(seq, { highlight: true });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -5740,6 +5866,7 @@ function wire() {
   $("b-rename").addEventListener("click", renameSession);
   $("b-rename").title = "Rename this mission.";
   $("b-stop").addEventListener("click", (e) => askHeaderConfirm("stop", S.sessions.byId.get(S.openId), e.currentTarget));
+  $("c-stop").addEventListener("click", (e) => askHeaderConfirm("stop", S.sessions.byId.get(S.openId), e.currentTarget));
   $("b-stop").title = "Stop this session and cancel its descendant agents and tracked jobs.";
   $("b-resume").addEventListener("click", () => sessionAction("resume"));
   $("b-archive").addEventListener("click", (e) => askHeaderConfirm("archive", S.sessions.byId.get(S.openId), e.currentTarget));
