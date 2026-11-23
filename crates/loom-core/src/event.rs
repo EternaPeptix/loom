@@ -223,7 +223,10 @@ pub enum Event {
     /// Intent to run a tool. Appended and synced before the tool starts.
     ToolCall(ToolCall),
     ToolResult(ToolResult),
+    /// Superseded by [`Event::Compaction`]; no new one is written, old ones still render.
     Reweave(Reweave),
+    /// The window was compacted: a note with a key table replaces what came before. See [`Compaction`].
+    Compaction(Compaction),
     /// Keep this call's output verbatim through evictions until unpinned.
     Pin {
         call_id: CallId,
@@ -543,6 +546,8 @@ pub enum Purpose {
     Step,
     /// A digest request made on the existing prefix before a re-weave.
     Digest,
+    /// The note request of a compaction.
+    Compact,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -714,6 +719,47 @@ pub struct Reweave {
     pub reason: String,
     pub before_tokens: u64,
     pub after_tokens_est: u64,
+}
+
+/// A compaction of the window (CONTRACTS-COMPACTION Part K). Records at or before `upto_seq` leave the
+/// window; nothing is deleted from the log. The weave renders the compaction item, then the records after
+/// `upto_seq`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Compaction {
+    /// Previous epoch + 1 (re-weaves count as epochs).
+    pub epoch: u32,
+    /// Records at or before this seq leave the window.
+    pub upto_seq: Seq,
+    /// `size`, `refused`, `stall`, `operator` or `fresh_start`.
+    pub reason: String,
+    /// The request size that triggered it (measured, else estimated).
+    pub before_tokens: u64,
+    /// Estimate of the first request after it.
+    pub after_tokens_est: u64,
+    /// The model's note; `None` when the note request failed.
+    #[serde(default)]
+    pub note: Option<String>,
+    #[serde(default)]
+    pub note_req: Option<String>,
+    /// The key table, rendered by the harness.
+    pub table: String,
+    /// Every key listed in `table`, in order.
+    #[serde(default)]
+    pub keys: Vec<String>,
+    /// Keys the note cited that do not exist; removed from it.
+    #[serde(default)]
+    pub dropped_keys: Vec<String>,
+    /// `fresh_start`: what the verifier objected to.
+    #[serde(default)]
+    pub objections: Option<String>,
+    /// The ledger brief (and frontier) at the time, as the session rendered it. Not in the contract's field
+    /// list: the weave is a pure function of the log and cannot reach the ledger.
+    #[serde(default)]
+    pub brief: String,
+    /// The size the session compacts at, which bounds the operator messages and pins the item carries.
+    /// `0` (an old or hand-written record) reads as 400 000.
+    #[serde(default)]
+    pub compact_at: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1141,6 +1187,24 @@ mod tests {
                     reason: "target".into(),
                     before_tokens: 9,
                     after_tokens_est: 4,
+                }),
+            ),
+            (
+                "compaction",
+                Event::Compaction(Compaction {
+                    epoch: 2,
+                    upto_seq: 7,
+                    reason: "size".into(),
+                    before_tokens: 9,
+                    after_tokens_est: 4,
+                    note: Some("n".into()),
+                    note_req: Some("r-9".into()),
+                    table: "t".into(),
+                    keys: vec!["out:0123456789abcdef".into()],
+                    dropped_keys: vec!["out:ffffffffffffffff".into()],
+                    objections: None,
+                    brief: "b".into(),
+                    compact_at: 50_000,
                 }),
             ),
             ("pin", Event::Pin { call_id: c(), reason: "r".into() }),

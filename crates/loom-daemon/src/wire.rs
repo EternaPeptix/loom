@@ -167,6 +167,9 @@ pub struct RecordsPage {
     pub records: Vec<Record>,
     /// Pass as `after` to get the next page; `null` when this page reached the end of the log.
     pub next_after: Option<Seq>,
+    /// With `before`: pass it as `before` to get the page before this one; `null` at the start of the log.
+    #[serde(default)]
+    pub prev_before: Option<Seq>,
 }
 
 fn records_as_stored<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<Record>, D::Error> {

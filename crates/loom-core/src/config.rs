@@ -60,7 +60,6 @@
 use crate::admit::AdmitPolicy;
 use crate::event::ReasoningReplay;
 use crate::ids::{MissionId, SessionId};
-use crate::weave::ReweavePolicy;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, HashSet};
@@ -80,6 +79,79 @@ pub enum ConfigError {
     Invalid(String),
 }
 
+/// `[context]`: when the window is compacted (CONTRACTS-COMPACTION K2, K8).
+///
+/// `compact_at_tokens` is the request size at which a session compacts; `0` means 40% of the profile's
+/// context window, never above 400 000 (100 000 when the window is not known). The keys of the re-weave
+/// (`target_tokens`, `floor_tokens`, `keep_recent_steps`, `stub_tail_lines`) are still accepted and ignored,
+/// with a startup warning ([`ContextCfg::warnings`]); `target_tokens` is read as `compact_at_tokens` when
+/// that is absent.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ContextCfg {
+    pub compact_at_tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub floor_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keep_recent_steps: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stub_tail_lines: Option<u32>,
+}
+
+/// Most a default `compact_at` can be.
+pub const COMPACT_AT_CAP: u64 = 400_000;
+
+impl ContextCfg {
+    /// The size at which a session with context window `window` compacts. Never above four fifths of a
+    /// known window, so the reply still fits.
+    pub fn compact_at(&self, window: Option<u64>) -> u64 {
+        let set = if self.compact_at_tokens > 0 { self.compact_at_tokens } else { self.target_tokens.unwrap_or(0) };
+        let size = if set > 0 {
+            set
+        } else {
+            match window {
+                Some(w) => (w / 5 * 2).min(COMPACT_AT_CAP),
+                None => 100_000,
+            }
+        };
+        match window {
+            Some(w) => size.min(w / 5 * 4).max(1_000),
+            None => size,
+        }
+    }
+
+    /// One sentence for the old keys that are set and ignored.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut old: Vec<&str> = Vec::new();
+        if self.target_tokens.is_some() {
+            old.push("target_tokens");
+        }
+        if self.floor_tokens.is_some() {
+            old.push("floor_tokens");
+        }
+        if self.keep_recent_steps.is_some() {
+            old.push("keep_recent_steps");
+        }
+        if self.stub_tail_lines.is_some() {
+            old.push("stub_tail_lines");
+        }
+        if old.is_empty() {
+            return Vec::new();
+        }
+        let used = if self.compact_at_tokens == 0 && self.target_tokens.is_some() {
+            " target_tokens is read as compact_at_tokens."
+        } else {
+            ""
+        };
+        vec![format!(
+            "config: [context] {} no longer change anything: the window is compacted at compact_at_tokens (0 = 40% of the model's window).{used}",
+            old.join(", "),
+        )]
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -87,7 +159,7 @@ pub struct Config {
     pub default_model: String,
     pub daemon: DaemonCfg,
     pub models: BTreeMap<String, ModelProfile>,
-    pub context: ReweavePolicy,
+    pub context: ContextCfg,
     pub admit: AdmitPolicy,
     pub tools: ToolsCfg,
     pub sandbox: SandboxCfg,
@@ -728,9 +800,6 @@ impl Config {
                 self.daemon.bind
             )));
         }
-        if self.context.floor_tokens >= self.context.target_tokens {
-            return Err(ConfigError::Invalid("context.floor_tokens must be below context.target_tokens".into()));
-        }
         self.boxed.check().map_err(ConfigError::Invalid)?;
         if self.boxed.enabled && self.sandbox.mode == SandboxMode::None {
             return Err(ConfigError::Invalid(
@@ -1206,7 +1275,9 @@ allow = ["*.example.test"]
         assert_eq!(name, "lan");
         assert_eq!(p.extra_body["reasoning_effort"], "max");
         assert_eq!(p.reasoning_replay, ReasoningReplay::All);
-        assert_eq!(c.context.keep_recent_steps, 60);
+        // The old `[context]` keys load; `target_tokens` stands in for `compact_at_tokens`.
+        assert_eq!(c.context.compact_at(Some(1_000_000)), 300_000);
+        assert_eq!(c.context.warnings().len(), 1);
         assert_eq!(c.network.mode, NetworkMode::Allowlist);
     }
 
@@ -1253,10 +1324,7 @@ allow = ["*.example.test"]
         let mut c = Config::default();
         c.daemon.bind = "0.0.0.0:7878".into();
         assert!(c.check().is_err());
-        let mut c = Config::default();
-        c.context.floor_tokens = c.context.target_tokens;
-        assert!(c.check().is_err());
-        // A window below the re-weave bounds is not an error: a session clamps the bounds to it.
+        // A window below the compaction size is not an error: a session clamps the size to it.
         let mut c = Config::default();
         c.models.insert("a".into(), ModelProfile { context_window: Some(100_000), ..Default::default() });
         assert!(c.check().is_ok());

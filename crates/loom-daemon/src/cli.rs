@@ -42,7 +42,7 @@
 //!   `--file` is read and uploaded (`upload_files`: `client.upload` into the session's workspace, `docs/UPLOADS.md`)
 //!   before the message, which carries the returned paths as attachments; with files the text may be empty.
 //!   `run` takes `--file` the same way (the workspace must exist: it is uploaded to before the session is made).
-//! - `stop <session>`, `resume <session>`, `reweave <session>`, `archive <session> [--undo]`: the
+//! - `stop <session>`, `resume <session>`, `compact <session>` (alias `reweave`), `archive <session> [--undo]`: the
 //!   call, then one line saying what was asked (`stop requested for {id}`).
 //! - `rule <session> <text…>` (`-` = standard input): `client.add_rule`; `rule sent to {lead}`.
 //!   `rule <session> --withdraw <rule-id> [--reason <text>]`: `client.withdraw_rule`; `withdrawal of
@@ -149,11 +149,10 @@ max_concurrent = 4           # requests in flight at once (lead, agents and vote
 retry_window_s = 300         # keep retrying an unreachable server this long; 0 = until it returns
 
 [context]
-# The request is re-woven (old tool output folded out of view, never lost) when it passes
-# target_tokens, down to floor_tokens (floor below target). A session clamps both to a smaller model window
-# automatically, so a small context_window needs no change here.
-target_tokens = 400000
-floor_tokens = 180000
+# The window is compacted (the model writes a note, old output stays readable by key, nothing is lost) when a
+# request reaches compact_at_tokens. 0 = 40% of the model's window, never above 400000; a session clamps it to a
+# smaller model window automatically, so a small context_window needs no change here.
+compact_at_tokens = 0
 
 [network]
 # deny_all (the default): tools reach no host through the egress proxy.
@@ -207,7 +206,8 @@ pub enum Command {
     /// Let a stopped session carry on
     Resume(SessionArg),
     /// Fold old tool output out of a session's context now
-    Reweave(SessionArg),
+    #[command(alias = "reweave")]
+    Compact(SessionArg),
     /// Hide a finished session (or bring it back with --undo)
     Archive(ArchiveArgs),
     /// Rename a mission (set its lead session's title)
@@ -1294,11 +1294,11 @@ async fn dispatch(command: Command) -> Result<i32, String> {
             c.resume(&id).await?;
             outln(&format!("resume requested for {id}")).map(|()| 0)
         }
-        Command::Reweave(a) => {
+        Command::Compact(a) => {
             let c = client_of(&paths)?;
             let id = c.resolve(&a.session).await?;
-            c.reweave(&id).await?;
-            outln(&format!("re-weave requested for {id}")).map(|()| 0)
+            c.compact(&id).await?;
+            outln(&format!("compaction requested for {id}")).map(|()| 0)
         }
         Command::Archive(a) => {
             let c = client_of(&paths)?;
@@ -1925,10 +1925,10 @@ mod tests {
     fn session_commands_parse_and_need_their_argument() {
         assert!(matches!(ok(&["stop", "s-1"]), Command::Stop(SessionArg { .. })));
         assert!(matches!(ok(&["resume", "s-1"]), Command::Resume(_)));
-        assert!(matches!(ok(&["reweave", "s-1"]), Command::Reweave(_)));
+        assert!(matches!(ok(&["compact", "s-1"]), Command::Compact(_)));
         assert!(matches!(ok(&["ledger", "m-1"]), Command::Ledger(_)));
         assert!(matches!(ok(&["window", "s-1"]), Command::Window(_)));
-        for cmd in ["stop", "resume", "reweave", "archive", "ledger", "score", "window", "net", "answer", "out"] {
+        for cmd in ["stop", "resume", "compact", "archive", "ledger", "score", "window", "net", "answer", "out"] {
             rejected(&[cmd]);
         }
         let Command::Score(a) = ok(&["score", "last"]) else { panic!("not score") };
@@ -2153,9 +2153,9 @@ mod tests {
         assert!(text.contains("\ncontext_window = 32768"));
         let config = Config::parse(&text).unwrap();
         config.check().unwrap();
-        // The session clamps the bounds to the window (`session::reweave_bounds`); the config keeps its values.
+        // The session clamps the bounds to the window (`ContextCfg::compact_at`); the config keeps its values.
         assert_eq!(config.models["local"].context_window, Some(32768));
-        assert!(config.context.target_tokens >= 32768);
+        assert_eq!(config.context.compact_at(Some(32768)), 13_106);
     }
 
     #[test]
@@ -2891,7 +2891,7 @@ mod tests {
                         let records: Vec<Record> =
                             log.iter().filter(|r| after.is_none_or(|a| r.seq > a)).take(limit).cloned().collect();
                         let next_after = (records.len() == limit).then(|| records.last().map(|r| r.seq)).flatten();
-                        json(&crate::wire::RecordsPage { records, next_after })
+                        json(&crate::wire::RecordsPage { records, next_after, prev_before: None })
                     }
                 }),
             )

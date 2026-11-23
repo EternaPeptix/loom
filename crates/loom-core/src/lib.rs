@@ -19,6 +19,7 @@
 
 pub mod admit;
 pub mod blob;
+pub mod compaction;
 pub mod config;
 pub mod estimate;
 pub mod event;

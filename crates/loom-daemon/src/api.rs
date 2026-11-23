@@ -59,7 +59,7 @@
 //! | `POST /sessions/{id}/release` (`ReleaseBody`; `reason` required) | `runtime.release` (operator only; closes the mission without the goal established; `409` for a blank reason) | `202` `RuleReceipt` |
 //! | `POST /sessions/{id}/stop` | `runtime.stop` | `202` `{}` |
 //! | `POST /sessions/{id}/resume` | `runtime.resume` | `202` `{}` |
-//! | `POST /sessions/{id}/reweave` | `runtime.reweave` | `202` `{}` |
+//! | `POST /sessions/{id}/compact` (alias `/reweave`) | `runtime.compact` | `202` `{}` |
 //! | `POST /sessions/{id}/archive` (`ArchiveBody`) | `runtime.archive` | `200` `{}` |
 //! | `POST /sessions/{id}/rename` (`RenameBody`) | `runtime.rename` | `200` `{}` |
 //! | `POST /sessions/{id}/model` (`ModelBody`) | `runtime.set_session_model` | `ModelSwitchReceipt` |
@@ -229,7 +229,8 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/sessions/{id}/release", post(release))
         .route("/api/sessions/{id}/stop", post(stop))
         .route("/api/sessions/{id}/resume", post(resume))
-        .route("/api/sessions/{id}/reweave", post(reweave))
+        .route("/api/sessions/{id}/compact", post(compact))
+        .route("/api/sessions/{id}/reweave", post(compact))
         .route("/api/sessions/{id}/archive", post(archive))
         .route("/api/sessions/{id}/rename", post(rename))
         .route("/api/sessions/{id}/model", post(set_model))
@@ -638,6 +639,7 @@ enum Served {
 struct ServedPage {
     records: Vec<Served>,
     next_after: Option<Seq>,
+    prev_before: Option<Seq>,
 }
 
 /// The stored line of a record read as `Event::Unknown`, as JSON to send as it is.
@@ -655,12 +657,30 @@ fn served(mut stored: StoredRecord) -> Served {
 async fn records(State(s): State<ApiState>, Path(id): Path<String>, q: RawQuery) -> Res<Json<ServedPage>> {
     let q = params(q)?;
     let after = number(&q, "after")?;
+    let before = number(&q, "before")?;
     let limit = clamp_limit(number(&q, "limit")?, RECORDS_DEFAULT, RECORDS_MAX);
+    if after.is_some() && before.is_some() {
+        return Err(ApiError::bad_query("after and before cannot be asked together: pick the direction to page in."));
+    }
     // The log is read from disk; keep that off the async workers.
     let runtime = s.runtime.clone();
+    if let Some(before) = before {
+        // The `limit` records before `before`, oldest first: sequence numbers are dense from 0.
+        let first = before.saturating_sub(u64::try_from(limit).unwrap_or(u64::MAX));
+        let count = usize::try_from(before.saturating_sub(first)).unwrap_or(limit);
+        let from = first.checked_sub(1);
+        let records =
+            blocking(move || runtime.stored_records(&SessionId::from(id), from, count).map_err(rt_err)).await?;
+        let prev_before = if first > 0 && !records.is_empty() { Some(first) } else { None };
+        return Ok(Json(ServedPage {
+            records: records.into_iter().map(served).collect(),
+            next_after: None,
+            prev_before,
+        }));
+    }
     let records = blocking(move || runtime.stored_records(&SessionId::from(id), after, limit).map_err(rt_err)).await?;
     let next_after = if records.len() >= limit { records.last().map(|r| r.record.seq) } else { None };
-    Ok(Json(ServedPage { records: records.into_iter().map(served).collect(), next_after }))
+    Ok(Json(ServedPage { records: records.into_iter().map(served).collect(), next_after, prev_before: None }))
 }
 
 async fn message(State(s): State<ApiState>, Path(id): Path<String>, body: Bytes) -> Res<Response> {
@@ -805,8 +825,8 @@ async fn resume(State(s): State<ApiState>, Path(id): Path<String>) -> Res<Respon
     Ok(accepted())
 }
 
-async fn reweave(State(s): State<ApiState>, Path(id): Path<String>) -> Res<Response> {
-    s.runtime.reweave(&SessionId::from(id)).await.map_err(rt_err)?;
+async fn compact(State(s): State<ApiState>, Path(id): Path<String>) -> Res<Response> {
+    s.runtime.compact(&SessionId::from(id)).await.map_err(rt_err)?;
     Ok(accepted())
 }
 
@@ -1913,6 +1933,26 @@ mod tests {
         }
         assert_eq!(seen, all);
         assert_eq!(all[0]["seq"], 0);
+
+        // Paging backward: `before` gives the records before a seq, oldest first, and `prev_before` goes on.
+        let last = all.last().unwrap()["seq"].as_u64().unwrap();
+        let (s, page) = e.get(&format!("/api/sessions/{id}/records?limit=3&before={}", last + 1)).await;
+        assert_eq!(s, 200);
+        let got = page["records"].as_array().unwrap().clone();
+        assert_eq!(got, all[all.len() - 3..].to_vec());
+        assert_eq!(page["prev_before"].as_u64(), Some(last + 1 - 3));
+        let mut back: Vec<Value> = got;
+        let mut before = page["prev_before"].as_u64();
+        while let Some(b) = before {
+            let (_, page) = e.get(&format!("/api/sessions/{id}/records?limit=3&before={b}")).await;
+            let mut older = page["records"].as_array().unwrap().clone();
+            older.extend(back);
+            back = older;
+            before = page["prev_before"].as_u64();
+        }
+        assert_eq!(back, all);
+        let (s, b) = e.get(&format!("/api/sessions/{id}/records?before=3&after=1")).await;
+        assert_eq!(s, 400, "{b}");
         assert_eq!(all[0]["kind"], "session_start");
 
         let (s, w) = e.get(&format!("/api/sessions/{id}/window")).await;
@@ -1922,7 +1962,7 @@ mod tests {
         let parts = w["breakdown"]["segments"].as_array().unwrap();
         assert_eq!(parts.len(), 15);
         assert_eq!(parts.iter().map(|p| p["tokens"].as_u64().unwrap()).sum::<u64>(), w["breakdown"]["total_tokens"]);
-        assert!(w["fold_at"].as_u64().unwrap() > w["fold_to"].as_u64().unwrap());
+        assert!(w["fold_at"].as_u64().unwrap() > 0);
         assert!(w.get("measured_now").is_some() && w.get("last_request").is_some());
 
         let (s, net) = e.get(&format!("/api/sessions/{id}/net?limit=5")).await;
@@ -2279,7 +2319,7 @@ mod tests {
         assert_eq!((s, b), (202, json!({})));
         let (s, b) = e.post(&format!("/api/sessions/{id}/resume"), json!({})).await;
         assert_eq!((s, b), (202, json!({})));
-        let (s, b) = e.post(&format!("/api/sessions/{id}/reweave"), Value::Null).await;
+        let (s, b) = e.post(&format!("/api/sessions/{id}/compact"), Value::Null).await;
         assert_eq!((s, b), (202, json!({})));
         e.wait_turn_ends(&id, 3).await;
 
@@ -2352,7 +2392,7 @@ mod tests {
             let (s, b) = e.get(path).await;
             assert_eq!((s, b["error"].as_str().unwrap()), (404, missing), "{path}");
         }
-        for path in ["stop", "resume", "reweave"] {
+        for path in ["stop", "resume", "compact", "reweave"] {
             let (s, b) = e.post(&format!("/api/sessions/s-nope/{path}"), json!({})).await;
             assert_eq!((s, b["error"].as_str().unwrap()), (404, missing), "{path}");
         }

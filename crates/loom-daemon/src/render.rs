@@ -32,7 +32,9 @@
 //!   lines` and, when the result has a stored output, ` — loom out {handle}` (dim). The first line
 //!   is red when the status is not `Ok`.
 //! - `reweave`: `⟲ context re-woven ({reason}): {evictions} items folded out of view, about
-//!   {tokens(before)} → {tokens(after)} tokens` (yellow).
+//!   {tokens(before)} → {tokens(after)} tokens` (yellow; old logs).
+//! - `compaction`: `⟲ context compacted ({reason}): {keys} outputs in the key table, about {tokens(before)} →
+//!   {tokens(after)} tokens`, plus ` (no note)` when the note request failed (yellow).
 //! - `pin` / `unpin`: `∙ pinned {call_id}: {reason}` / `∙ unpinned {call_id}` (dim).
 //! - `child_spawned`: `⇢ agent {child} ({role}, {mode}): {brief.question}` (cyan).
 //! - `child_settled`: `⇠ agent {child} {outcome word}` (cyan), then the report indented two spaces,
@@ -481,6 +483,17 @@ pub fn record(rec: &Record, style: &Style, opts: &RecordOpts) -> String {
                 w.evictions.len(),
                 tokens(w.before_tokens),
                 tokens(w.after_tokens_est)
+            );
+            out.push(paint(style, YELLOW, &text));
+        }
+        Event::Compaction(c) => {
+            let text = format!(
+                "⟲ context compacted ({}): {} outputs in the key table, about {} → {} tokens{}",
+                c.reason,
+                c.keys.len(),
+                tokens(c.before_tokens),
+                tokens(c.after_tokens_est),
+                if c.note.is_some() { "" } else { " (no note)" }
             );
             out.push(paint(style, YELLOW, &text));
         }

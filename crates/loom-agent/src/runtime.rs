@@ -413,7 +413,7 @@
 //!   restart leaves a child idle that way: a child that is stopped settles. Unsettled children that
 //!   have no task (the lead could not be opened at start) are first restored as an unarchive does,
 //!   and what children ended with while the lead could not take it is delivered.
-//! - `reweave(id)`: activate; `Input::Reweave`.
+//! - `compact(id)`: activate; `Input::Compact`.
 //! - `rename(id, title)`: root only (an agent is named by its question); blank title refused (`Write
 //!   the new title.`). Trims `title`, sets it in the lead's `meta.json`, updates the titles cached on
 //!   that session's open inbox items, and publishes a `session` event. No turn is started. Allowed in
@@ -576,8 +576,8 @@
 //!   to it exactly, `framing` taking the remainder; without a count, `basis` is `default_ratio` and the
 //!   total is the estimate), `measured_now` (`session`'s size of the request it would send now, `None`
 //!   before the first counted request of the epoch), `last_request` (the latest step request and the
-//!   server's count for its reply, 0 while missing) and `fold_at`/`fold_to` (`reweave_bounds` of the
-//!   configured target and floor for the session's window and profile).
+//!   server's count for its reply, 0 while missing) and `fold_at` (the session's `compact_at`;
+//!   `fold_to` is always `None` now).
 //! - `missions()`: one per root session. `ledger(mission)`: the journal read and folded
 //!   (`No ledger: this mission's lead does not keep one.` when there is no journal file and the
 //!   lead's role keeps none or can no longer be looked up; a lead that keeps one but has no journal
@@ -5992,14 +5992,14 @@ impl Runtime {
         Ok(())
     }
 
-    pub async fn reweave(&self, id: &SessionId) -> Result<(), String> {
+    pub async fn compact(&self, id: &SessionId) -> Result<(), String> {
         self.inner.check_open()?;
         if !self.inner.st().known.contains_key(id) {
             return Err(no_session(id));
         }
         self.inner.activate(id)?;
         self.inner.box_reopen_for(id);
-        self.inner.send_input(id, Input::Reweave);
+        self.inner.send_input(id, Input::Compact);
         Ok(())
     }
 
@@ -6265,10 +6265,10 @@ impl Runtime {
 
     pub fn window(&self, id: &SessionId) -> Result<WindowView, String> {
         self.inner.check_open()?;
-        let (context_window, status, profile) = {
+        let (context_window, status) = {
             let st = self.inner.st();
             let k = st.known.get(id).ok_or_else(|| no_session(id))?;
-            (k.meta.context_window, k.status.clone(), k.meta.profile.clone())
+            (k.meta.context_window, k.status.clone())
         };
         let records = read_records(&self.inner.paths.session_log(id)).map_err(|e| e.to_string())?.records;
         let w = weave(&records);
@@ -6289,23 +6289,21 @@ impl Runtime {
             measured_now,
             &estimator,
         );
-        let max_output = self.inner.models().get(&profile).and_then(|p| p.client.profile().max_output_tokens);
-        let policy = &self.inner.config.context;
-        let (fold_at, fold_to) = crate::session::reweave_bounds(policy, context_window, max_output);
+        let compact_at = self.inner.config.context.compact_at(context_window);
         Ok(WindowView {
             epoch: w.epoch,
             items: w.items,
             est_tokens,
-            target_tokens: policy.target_tokens,
-            floor_tokens: policy.floor_tokens,
+            target_tokens: compact_at,
+            floor_tokens: 0,
             context_window,
             prompt_tokens: status.prompt_tokens,
             cached_tokens: status.cached_tokens,
             breakdown,
             measured_now,
             last_request,
-            fold_at: Some(fold_at),
-            fold_to: Some(fold_to),
+            fold_at: Some(compact_at),
+            fold_to: None,
         })
     }
 
@@ -7129,7 +7127,7 @@ mod tests {
         assert_eq!(w.breakdown.segments.iter().map(|s| s.tokens).sum::<u64>(), w.breakdown.total_tokens);
         assert!(by_key("system").tokens > 0 && by_key("tools").tokens > 0 && by_key("tools").count.unwrap() > 0);
         assert!(w.last_request.as_ref().is_some_and(|r| r.step >= 1 && r.n_messages > 0));
-        assert!(w.fold_at.is_some_and(|at| at > 0) && w.fold_to.is_some_and(|to| to > 0));
+        assert!(w.fold_at.is_some_and(|at| at > 0));
         assert_eq!(e.rt.missions().len(), 1);
         e.rt.shutdown().await;
         assert_eq!(e.rt.send_message(&id, "x").await.unwrap_err(), "The harness is shutting down.");
@@ -8146,11 +8144,19 @@ mod tests {
     async fn rejected_finish_with_real_children_starts_the_lead_afresh_on_what_the_check_found() {
         let e = env_with(
             Script::new(move |body, _| {
+                if body["messages"]
+                    .as_array()
+                    .and_then(|m| m.last())
+                    .and_then(|l| l["content"].as_str())
+                    .is_some_and(|c| c.starts_with(texts::COMPACT_PROMPT))
+                {
+                    return Action::Reply(Reply::text("NOTEMARK: the check found that no test ran."));
+                }
                 if has_tool(body, "verdict") {
                     return verifier_turn(body, false);
                 }
                 // The lead works, gives up in a finish, and, started afresh, goes on working.
-                if mentions(body, "What the check found") {
+                if mentions(body, "Context was compacted") {
                     return Action::Stall { ms: 600_000 };
                 }
                 match tool_msgs(body) {
@@ -8171,18 +8177,19 @@ mod tests {
         .await;
         let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
         let id = info.meta.id.clone();
-        let afresh = |b: &Value| has_tool(b, "finish") && mentions(b, "What the check found");
+        let afresh = |b: &Value| has_tool(b, "finish") && mentions(b, "Context was compacted");
         until("the lead was started afresh", || e.server.requests().iter().any(afresh)).await;
         let request = e.server.requests().into_iter().find(afresh).unwrap();
-        // What the check found is there, as a brief; the run the lead made is still in view.
+        // What the check found is there, in the note and in the ledger's obligation; the run the lead made is
+        // a row of the key table.
+        assert!(mentions(&request, "NOTEMARK"), "{request}");
         assert!(mentions(&request, "no test ran"), "{request}");
-        assert!(mentions(&request, "treat the goal as unsolved"), "{request}");
         assert!(mentions(&request, "WORKMARK"), "{request}");
         // Nothing of the attempt is: not the call, not its result, not what the lead said or thought around it.
         for gone in ["GIVEUPMARK", "DESPAIRMARK", "PLANMARK", "REASONMARK", "did not accept it"] {
             assert!(!mentions(&request, gone), "{gone} is still in view: {request}");
         }
-        assert_eq!(tool_msgs(&request), 1, "the finish call left the window with its result: {request}");
+        assert_eq!(tool_msgs(&request), 0, "the fresh start keeps no tail: {request}");
         let hud = hud_of(&request);
         assert!(hud.contains("Finish: the check raised an objection"), "{hud}");
         assert!(!hud.contains("GIVEUPMARK") && !hud.contains("reject"), "{hud}");
@@ -8195,18 +8202,17 @@ mod tests {
             &id,
             |ev| matches!(ev, Event::ToolCall(c) if c.name == "finish" && c.args.to_string().contains("GIVEUPMARK"))
         ));
-        let folds: Vec<loom_core::event::Reweave> = e
+        let folds: Vec<loom_core::event::Compaction> = e
             .records(&id)
             .into_iter()
-            .filter_map(|r| if let Event::Reweave(w) = r.event { Some(w) } else { None })
+            .filter_map(|r| if let Event::Compaction(c) = r.event { Some(c) } else { None })
             .collect();
         assert_eq!(folds.len(), 1, "one rejection, one fresh start");
         assert_eq!(folds[0].reason, texts::FRESH_START_REASON);
-        // The brief carries the frontier picture, as a re-weave brief does, and no count of anything refused.
-        assert!(folds[0].brief.contains("ground covered"), "{}", folds[0].brief);
-        assert!(folds[0].brief.contains("Where the work stands:"), "{}", folds[0].brief);
-        assert!(folds[0].brief.contains("a failed attempt rules out that attempt, not the approach"));
-        assert!(folds[0].evictions.iter().any(|x| x.action == loom_core::event::EvictAction::Remove));
+        assert!(folds[0].note.as_deref().is_some_and(|n| n.contains("NOTEMARK")), "{:?}", folds[0].note);
+        assert!(folds[0].objections.as_deref().is_some_and(|o| o.contains("no test ran")), "{:?}", folds[0].objections);
+        assert!(folds[0].table.contains("echo WORKMARK"), "{}", folds[0].table);
+        assert!(folds[0].brief.contains("no test ran"), "{}", folds[0].brief);
         let ledger = e.rt.ledger(&info.meta.mission).unwrap();
         let verdicts: Vec<Option<bool>> = ledger.state.finishes.iter().map(|f| f.accepted).collect();
         assert_eq!(verdicts, vec![Some(false)]);
@@ -8226,10 +8232,18 @@ mod tests {
     async fn a_fresh_start_leaves_no_harness_note_about_the_attempt_in_view() {
         let e = env_with(
             Script::new(move |body, _| {
+                if body["messages"]
+                    .as_array()
+                    .and_then(|m| m.last())
+                    .and_then(|l| l["content"].as_str())
+                    .is_some_and(|c| c.starts_with(texts::COMPACT_PROMPT))
+                {
+                    return Action::Reply(Reply::text("NOTEMARK: the check found that no test ran."));
+                }
                 if has_tool(body, "verdict") {
                     return verifier_turn(body, false);
                 }
-                if mentions(body, "What the check found") {
+                if mentions(body, "Context was compacted") {
                     return Action::Stall { ms: 600_000 };
                 }
                 let replies =
@@ -8246,7 +8260,7 @@ mod tests {
         )
         .await;
         let _info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
-        let afresh = |b: &Value| has_tool(b, "finish") && mentions(b, "What the check found");
+        let afresh = |b: &Value| has_tool(b, "finish") && mentions(b, "Context was compacted");
         until("the lead was started afresh", || e.server.requests().iter().any(afresh)).await;
         // Before the fold the note was in view.
         let before = e.server.requests().into_iter().find(|b| mentions(b, "WORKMARK") && !afresh(b)).unwrap();
@@ -8263,14 +8277,22 @@ mod tests {
     async fn a_fresh_start_keeps_what_was_delivered_and_leaves_the_attempt_reachable() {
         let e = env_with(
             Script::new(move |body, _| {
+                if body["messages"]
+                    .as_array()
+                    .and_then(|m| m.last())
+                    .and_then(|l| l["content"].as_str())
+                    .is_some_and(|c| c.starts_with(texts::COMPACT_PROMPT))
+                {
+                    return Action::Reply(Reply::text("NOTEMARK: the check found that no test ran."));
+                }
                 if has_tool(body, "verdict") {
                     // The first result is accepted, the one after it is not.
                     return verifier_turn(body, !mentions(body, "SECONDANSWER"));
                 }
-                if mentions(body, "What the check found") {
+                if mentions(body, "Context was compacted") {
                     // Started afresh, the lead looks its attempt up in the record, then works on.
                     return match tool_msgs(body) {
-                        1 => call("log_search", json!({"pattern": "SECONDANSWER", "in": "calls"})),
+                        0 => call("log_search", json!({"pattern": "SECONDANSWER", "in": "calls"})),
                         _ => Action::Stall { ms: 600_000 },
                     };
                 }
@@ -8288,22 +8310,22 @@ mod tests {
         let id = info.meta.id.clone();
         until("the first result was delivered", || inbox_kinds(&e).contains(&InboxKind::Finished)).await;
         e.rt.send_message(&id, "MOREMARK: now the second part").await.unwrap();
-        let afresh = |b: &Value| has_tool(b, "finish") && mentions(b, "What the check found");
+        let afresh = |b: &Value| has_tool(b, "finish") && mentions(b, "Context was compacted");
         until("the lead was started afresh", || e.server.requests().iter().any(afresh)).await;
         let request = e.server.requests().into_iter().find(afresh).unwrap();
-        // The delivered result and its call are not an attempt: they stay. The rejected one is gone.
-        assert!(mentions(&request, "FIRSTANSWER"), "{request}");
+        // The operator's message stays whole; the delivered result and the rejected one are out of view, and
+        // both stay in the record.
         assert!(mentions(&request, "MOREMARK"), "{request}");
         assert!(!mentions(&request, "SECONDANSWER"), "{request}");
         assert!(!mentions(&request, "did not accept it"), "{request}");
-        assert_eq!(tool_msgs(&request), 1, "{request}");
+        assert_eq!(tool_msgs(&request), 0, "{request}");
         // The record still has the attempt: a search of the session finds the call.
         until("the search answered", || {
-            e.server.requests().iter().any(|b| afresh(b) && tool_msgs(b) == 2 && mentions(b, "SECONDANSWER"))
+            e.server.requests().iter().any(|b| afresh(b) && tool_msgs(b) == 1 && mentions(b, "SECONDANSWER"))
         })
         .await;
         let kinds = e.kinds(&id);
-        assert_eq!(kinds.iter().filter(|k| *k == "reweave").count(), 1, "{kinds:?}");
+        assert_eq!(kinds.iter().filter(|k| *k == "compaction").count(), 1, "{kinds:?}");
         assert!(!kinds.iter().any(|k| k == "cache_break"), "a fresh start is a new epoch, not a break: {kinds:?}");
         e.rt.shutdown().await;
     }
@@ -8338,8 +8360,8 @@ mod tests {
                 .any(|b| has_tool(b, "finish") && mentions(b, "did not accept it") && mentions(b, "no test ran"))
         })
         .await;
-        assert!(!e.has(&id, |ev| matches!(ev, Event::Reweave(_))));
-        assert!(e.server.requests().iter().all(|b| !mentions(b, "What the check found")));
+        assert!(!e.has(&id, |ev| matches!(ev, Event::Compaction(_))));
+        assert!(e.server.requests().iter().all(|b| !mentions(b, "Context was compacted")));
         let ledger = e.rt.ledger(&info.meta.mission).unwrap();
         assert_eq!(ledger.state.obligations.len(), 1);
         e.rt.shutdown().await;
