@@ -25,7 +25,6 @@ loom-agent = { path = "crates/loom-agent" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
 thiserror = "2"
-anyhow = "1"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 futures-util = "0.3"
@@ -33,7 +32,6 @@ async-trait = "0.1"
 bytes = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json", "cookies"] }
 axum = { version = "0.8", features = ["macros"] }
-tower-http = { version = "0.6", features = ["trace"] }
 clap = { version = "4", features = ["derive"] }
 sha2 = "0.11"
 hmac = "0.13"

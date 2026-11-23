@@ -167,13 +167,34 @@ pub struct Limits {
     pub max_bytes: u64,
 }
 
-/// Size, modification time and permission bits of a file.
+/// Size, modification time and permission bits of a file, and which file it is (device and inode).
+///
+/// The identity matters where times are coarse: on Linux two files written within one clock tick can
+/// have the same size, time and mode, and a different file put under a path (a directory swapped for a
+/// link, say) must never pass for the one the copy was made from. A manifest written before the identity
+/// was recorded has `id: None`, and then only the other fields are compared.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Stamp {
     pub size: u64,
     pub secs: i64,
     pub nanos: u32,
     pub mode: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<(u64, u64)>,
+}
+
+impl Stamp {
+    /// Whether `now` is the file this stamp was taken of, unchanged.
+    fn matches(&self, now: &Stamp) -> bool {
+        self.size == now.size
+            && self.secs == now.secs
+            && self.nanos == now.nanos
+            && self.mode == now.mode
+            && match (self.id, now.id) {
+                (Some(a), Some(b)) => a == b,
+                _ => true,
+            }
+    }
 }
 
 /// One path of the manifest.
@@ -267,7 +288,8 @@ fn stamp(md: &std::fs::Metadata) -> Stamp {
         },
         Err(_) => (0, 0),
     };
-    Stamp { size: md.len(), secs, nanos, mode: md.permissions().mode() & 0o7777 }
+    use std::os::unix::fs::MetadataExt;
+    Stamp { size: md.len(), secs, nanos, mode: md.permissions().mode() & 0o7777, id: Some((md.dev(), md.ino())) }
 }
 
 fn stamp_ms(s: &Stamp) -> u64 {
@@ -677,7 +699,7 @@ pub fn make(source: &Path, dest: &Path, limits: &Limits, readable: Readable<'_>)
 /// Whether what is at a path of the copy is what the manifest recorded for it.
 fn unchanged_in_copy(entry: &Entry, now: &Seen) -> bool {
     match (entry, now) {
-        (Entry::File { copy, .. }, Seen::File(s)) => copy == s,
+        (Entry::File { copy, .. }, Seen::File(s)) => copy.matches(s),
         (Entry::Link { target }, Seen::Link(t)) => target == t,
         _ => false,
     }
@@ -699,7 +721,7 @@ fn as_the_copy_has_it(there: &Seen, here: &Seen, in_dest: &Path, in_copy: &Path,
 /// Whether what is at a path of the workspace is what the copy was made from.
 fn unchanged_in_source(entry: &Entry, now: &Seen) -> bool {
     match (entry, now) {
-        (Entry::File { source, .. }, Seen::File(s)) => source == s,
+        (Entry::File { source, .. }, Seen::File(s)) => source.matches(s),
         (Entry::Link { target }, Seen::Link(t)) => target == t,
         _ => false,
     }
@@ -1175,7 +1197,7 @@ mod tests {
         // only their bytes say that they are not what the copy has.
         for same in ["new.txt", "run.sh"] {
             set_mtime(&f.ws.join(same), &stamp(&fs::metadata(f.copy.join(same)).unwrap())).unwrap();
-            assert_eq!(seen(&f.ws.join(same)), seen(&f.copy.join(same)), "{same}");
+            assert_eq!(alike(seen(&f.ws.join(same))), alike(seen(&f.copy.join(same))), "{same}");
         }
         let Err(AdoptError::Conflicts(conflicts)) = adopt(&made.manifest, &f.copy, &f.ws, &allow, &allow) else {
             panic!("conflicts expected")
@@ -1229,9 +1251,33 @@ mod tests {
         assert_eq!(fs::read_to_string(f.ws.join("src/b.rs")).unwrap(), "fn b() { 2 }\n");
     }
 
+    /// What two different files share when they look alike: everything but their identity.
+    fn alike(s: Seen) -> Seen {
+        match s {
+            Seen::File(st) => Seen::File(Stamp { id: None, ..st }),
+            other => other,
+        }
+    }
+
+    #[test]
+    fn a_stamp_tells_another_file_with_the_same_size_time_and_mode_apart() {
+        let a = Stamp { size: 4, secs: 100, nanos: 0, mode: 0o644, id: Some((1, 10)) };
+        let other = Stamp { id: Some((1, 11)), ..a };
+        assert!(a.matches(&a));
+        assert!(!a.matches(&other), "another inode with the same size, time and mode is another file");
+        // A manifest written before the identity was recorded still matches on the rest.
+        let old = Stamp { id: None, ..a };
+        assert!(old.matches(&other) && other.matches(&old));
+        assert!(!old.matches(&Stamp { size: 5, ..other }));
+        // The identity is left out of a manifest that has none, and an old one still parses.
+        let json = serde_json::to_string(&old).unwrap();
+        assert!(!json.contains("id"), "{json}");
+        assert_eq!(serde_json::from_str::<Stamp>(&json).unwrap(), old);
+    }
+
     #[test]
     fn when_a_copy_is_made_the_clock_is_past_the_times_it_recorded() {
-        let at = |secs: i64, nanos: u32| Stamp { size: 1, secs, nanos, mode: 0o644 };
+        let at = |secs: i64, nanos: u32| Stamp { size: 1, secs, nanos, mode: 0o644, id: None };
         let file = |s: Stamp| Entry::File { source: s, copy: s };
         let mut files = BTreeMap::new();
         assert_eq!(settled_at(&files), None);
@@ -1561,6 +1607,11 @@ mod tests {
     fn a_directory_swapped_for_a_link_does_not_get_a_file_removed_there() {
         for swap_at in [1, 2] {
             let r = raced(&[("x/old", "old\n"), ("x/seed", "s")], &[("old", "old\n"), ("keep", "k")]);
+            // The file outside gets the size, time and mode of the workspace's, as two files written within
+            // one tick of a coarse clock (Linux) do: only which file it is tells them apart.
+            let st = stamp(&fs::symlink_metadata(r.ws.join("x/old")).unwrap());
+            set_mtime(&r.outside.join("old"), &st).unwrap();
+            fs::set_permissions(r.outside.join("old"), fs::Permissions::from_mode(st.mode)).unwrap();
             let made = make(&r.ws, &r.copy, &ROOMY, &allow).unwrap();
             fs::remove_file(r.copy.join("x/old")).unwrap();
             let before = listing(&r.outside);
@@ -1703,7 +1754,7 @@ mod tests {
         fs::write(f.copy.join("src/secret"), "B").unwrap();
         fs::write(f.ws.join("src/secret"), "B").unwrap();
         set_mtime(&f.ws.join("src/secret"), &stamp(&fs::metadata(f.copy.join("src/secret")).unwrap())).unwrap();
-        assert_eq!(seen(&f.ws.join("src/secret")), seen(&f.copy.join("src/secret")));
+        assert_eq!(alike(seen(&f.ws.join("src/secret"))), alike(seen(&f.copy.join("src/secret"))));
         // Judged fit to read, the two are the same and nothing is to be brought; refused, they are not.
         assert!(adopt(&made.manifest, &f.copy, &f.ws, &allow, &allow).unwrap().is_empty());
         let Err(AdoptError::Conflicts(conflicts)) = adopt(&made.manifest, &f.copy, &f.ws, &allow, &refuse_secret)

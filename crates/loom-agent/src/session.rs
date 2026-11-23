@@ -3190,6 +3190,8 @@ Name them when you start a new mission instead."
                 seed: None,
                 extra: Map::new(),
                 images: ImageResolver::for_model(self.deps.client.profile().vision, &self.deps.ctx.blobs),
+                // A free-form role's text is an answer to the operator and is never run.
+                text_calls: self.deps.shared.role.termination == loom_core::event::Termination::Explicit,
             };
             let result = self.complete_streaming(&request, &req_id, &token).await?;
             let queue_ms = permit.waited_ms;
@@ -3945,6 +3947,7 @@ Name them when you start a new mission instead."
             seed: None,
             extra: Map::new(),
             images: ImageResolver::for_model(self.deps.client.profile().vision, &self.deps.ctx.blobs),
+            text_calls: false,
         };
         // Its events are not shown to viewers: they would read as the step's reply.
         let result = self.complete_watched(&request, token, |_| {}).await?;

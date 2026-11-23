@@ -2597,6 +2597,7 @@ impl Orchestrator for Orch {
                 seed: Some(seed),
                 extra: serde_json::Map::new(),
                 images: loom_model::ImageResolver::for_model(rt.client.profile().vision, &inner.blobs),
+                text_calls: false,
             };
             let client = rt.client.clone();
             let limiter = rt.limiter.clone();

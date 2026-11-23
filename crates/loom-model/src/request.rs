@@ -98,6 +98,11 @@ pub struct ChatRequest {
     pub extra: Map<String, Value>,
     /// Set for a model that takes images (`vision`); off, images are sentences in the text.
     pub images: ImageResolver,
+    /// Take tool calls the model wrote into the reply's text, in the profile's `text_tool_calls`
+    /// format and only when they end the reply. Set for a step of a role that ends by calling a tool;
+    /// off (the default) for everything else (a free-form role, a digest, a vote, a compaction),
+    /// whose text is never run.
+    pub text_calls: bool,
 }
 
 impl ChatRequest {
@@ -173,6 +178,7 @@ mod tests {
             seed: Some(7),
             extra: map(json!({"top_p": 0.5})),
             images: ImageResolver::default(),
+            text_calls: false,
         }
     }
 

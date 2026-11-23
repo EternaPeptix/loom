@@ -27,6 +27,8 @@ max_concurrent = 4                      # concurrent requests to this server acr
 stall_timeout_s = 240                   # abort and retry a stream that delivers nothing this long
 retry_window_s = 300                    # keep retrying an unreachable or failing server this long; 0 = until it returns
 retry_max_delay_s = 30                  # longest pause between retries
+# text_tool_calls = "any"              # calls a model writes into its text, taken only at the
+                                        # reply's end: any | tool_call | dsml | invoke | fenced_json | off
 
 # Request fields sent verbatim on every call. Fixed for a session's life: some chat templates render
 # them into the prompt head, and changing one would break the prompt cache.

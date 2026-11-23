@@ -152,6 +152,30 @@ pub struct ModelProfile {
     pub retry_window_s: u64,
     /// Longest pause between retries.
     pub retry_max_delay_s: u64,
+    /// Tool calls the model writes into its reply text instead of the tool-call channel, which the
+    /// harness then runs (see *text tool calls* in `docs/DESIGN.md`): `"any"` takes every known
+    /// format, a named format takes only that one, `"off"` takes none. Whatever the format, only
+    /// calls that end the reply are taken, and only in a step of a role that ends by calling a tool.
+    pub text_tool_calls: TextToolCalls,
+}
+
+/// The text form of tool calls a model is known to write when its server does not parse them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextToolCalls {
+    /// Every format below.
+    #[default]
+    Any,
+    /// None: text stays text.
+    Off,
+    /// `<tool_call>{"name": …, "arguments": …}</tool_call>` (Hermes, Qwen).
+    ToolCall,
+    /// `<｜DSML｜function_calls>` / `<｜DSML｜invoke name=…>` (DeepSeek).
+    Dsml,
+    /// `<function_calls>` / `<invoke name=…>` with `<parameter>` children.
+    Invoke,
+    /// A fenced JSON block holding `{"name": …, "arguments": …}`.
+    FencedJson,
 }
 
 impl Default for ModelProfile {
@@ -170,6 +194,7 @@ impl Default for ModelProfile {
             stall_timeout_s: 240,
             retry_window_s: 300,
             retry_max_delay_s: 30,
+            text_tool_calls: TextToolCalls::Any,
         }
     }
 }

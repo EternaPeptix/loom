@@ -1018,6 +1018,15 @@ The module documentation of `client.rs`, `assemble.rs` and `request.rs` is the p
   move to another model or change its settings. One mission was parked 17 times, about 27 hours of
   waiting, by such a loop before this rule.
 - **Other 4xx** are refused with the server's message; the step fails (§8).
+- **Tool calls written as text.** Some servers return a model's calls inside the reply's text (a
+  `<tool_call>` block, DeepSeek's DSML, `<function_calls>`/`<invoke>`, or a fenced JSON object with
+  `name` and `arguments`) rather than as `tool_calls`. Such calls are taken only when (1) the request
+  asks for them: a step of a role that ends by calling a tool, never a free-form role's step, a
+  digest, a vote or a compaction; (2) they are in the profile's `text_tool_calls` format (`any`, the
+  default, or one of `tool_call`, `dsml`, `invoke`, `fenced_json`; `off` takes none); and (3) they
+  end the reply: only a run of calls with nothing but whitespace after the last and between them is
+  taken. A call shown as an example, with words after it, is text and is never run. A taken call gets
+  a fresh `call-` id like any other call, and its text is removed from the reply.
 - **Discovery and the window.** The first session created for a profile asks `GET {base_url}/models`
   (the first success is remembered for the process). The window is the first positive integer of
   `max_model_len`, `context_window`, `context_length`, `max_context_length` in the model's entry; a
@@ -1087,10 +1096,12 @@ included, is 404), inline, with its mime type and `Cache-Control: private, max-a
 
 **Tools.** Built in (`Registry::builtin`): `bash`, `job_wait`, `job_kill`, `job_list`, `read`,
 `write`, `edit`, `glob`, `grep`, `out_read`, `out_grep`, `web_fetch`, `cve_lookup`, `cve_search`,
-`advisory_lookup`, `dep_scan`. Box tools (`rtools::BOX_NAMES`, `[box]` only): `box_exec`, `box_get`, `box_reset`. Runtime-owned (`loom-agent::rtools`, `NAMES`): `plan`, `step`, `note`, `claim`,
-`claim_update`, `evidence`, `ledger`, `pin`, `log_search`, `reflect`, `finish`, `verdict`, `ask_user`,
-`report_blocker`, `wait`, `agent_spawn`, `agent_fanout`, `attempt`, `agent_adopt`, `agent_message`,
-`agent_stop`, `decide`, `verify`. A role lists the tools it has, in request order; a name in neither set is a pack error. The
+`advisory_lookup`, `dep_scan`, and for the packs that list them `pty_open`, `pty_exec`, `pty_close`, `http_send`,
+`http_repeat`, `codec_calc`, `bin_survey`, `bin_decompile`, `bin_xrefs`, `gdb_probe`, `oracle_check`. Box tools (`rtools::BOX_NAMES`, `[box]` only): `box_exec`, `box_get`, `box_reset`. Runtime-owned (`loom-agent::rtools`, `NAMES`): `plan`, `step`, `note`, `claim`,
+`claim_update`, `evidence`, `ledger`, `pin`, `log_search`, `reflect`, `security_record`, `security_query`,
+`security_ingest`, `finish`, `verdict`, `ask_user`, `ask_for`, `hand_off`, `report_blocker`, `wait`, `conclude`,
+`agent_spawn`, `agent_fanout`, `attempt`, `agent_adopt`, `agent_message`, `agent_stop`, `decide`, `verify`,
+`request_scope`, and `guarded_plan` (harnessmm). A role's `hidden_tools` are run when called but not listed to the model (`docs/TOOL-SHAPES.md` §4). A role lists the tools it has, in request order; a name in neither set is a pack error. The
 set is frozen in `session_start`. Every call goes through one pipeline (`loom_tools::prepare` → `run`
 → `finish`): lookup, argument check, run (a panic becomes an error result), store and admit. Each tool
 has a class — `Nav`, `Read`, `Exec`, `Write`, `State`, `Terminal` — which drives eviction order,

@@ -61,6 +61,7 @@
 //! accumulated content, the reasoning, or the tool-call names and arguments together pass
 //! `MAX_COMPLETION_BYTES` (64 MiB) each. The parser is unusable after such an error.
 
+use loom_core::config::TextToolCalls;
 use loom_core::event::{FinishReason, Timing, ToolCallRequest, Usage};
 use loom_core::CallId;
 use serde_json::Value;
@@ -231,6 +232,8 @@ pub struct Assembler {
     call_bytes: usize,
     /// Full JSON chunk of the last `{"error": ...}` payload seen, for structured classification.
     last_error: Option<Value>,
+    /// Which tool calls written into the text are taken at `finish` (see `extract_leaked_tool_calls`).
+    text_calls: TextToolCalls,
 }
 
 /// What an empty tool-call entry is counted as, so that endless new indices are bounded too.
@@ -637,18 +640,36 @@ fn strip_extracted_spans(text: &str, spans: &[(usize, usize)]) -> String {
     out.trim().to_string()
 }
 
-fn extract_leaked_tool_calls(text: &str) -> Option<(Vec<ToolCallRequest>, String)> {
-    let mut extracted: Vec<(String, Value)> = Vec::new();
-    let mut spans: Vec<(usize, usize)> = Vec::new();
+/// Tool calls written into a reply's text, in `format`, taken only when they END the reply.
+///
+/// Every call found is a span of the text. Only the trailing run of spans is taken: after the last
+/// span nothing but white space may follow, and between the spans of the run only white space may
+/// stand. So a call shown as an example in prose, in a code block followed by an explanation, or
+/// anywhere but the end, stays text and is never run; a reply that is only calls, or prose followed
+/// by calls, gives the calls. Each call gets a fresh random id (`call-…`), as a streamed call
+/// without an id does, so that no two calls of a session share one.
+/// A span of text holding calls: its start, its end, and the calls (name, arguments) in it.
+type Span = (usize, usize, Vec<(String, Value)>);
+
+fn extract_leaked_tool_calls(text: &str, format: TextToolCalls) -> Option<(Vec<ToolCallRequest>, String)> {
+    if format == TextToolCalls::Off {
+        return None;
+    }
+    let takes = |f: TextToolCalls| format == TextToolCalls::Any || format == f;
+    // One entry per span: (start, end, the calls in it).
+    let mut found: Vec<Span> = Vec::new();
     let mut pos = 0usize;
     while pos < text.len() {
         let at_line_start = pos == 0 || text.as_bytes().get(pos.saturating_sub(1)) == Some(&b'\n');
         if at_line_start {
             match try_fenced_tool_call(text, pos) {
-                FencedStep::Matched { end, name, args } => {
-                    spans.push((pos, end));
-                    extracted.push((name, args));
+                FencedStep::Matched { end, name, args } if takes(TextToolCalls::FencedJson) => {
+                    found.push((pos, end, vec![(name, args)]));
                     pos = if text.as_bytes().get(end) == Some(&b'\n') { end + 1 } else { end };
+                    continue;
+                }
+                FencedStep::Matched { end, .. } => {
+                    pos = end;
                     continue;
                 }
                 FencedStep::SkipTo(end) => {
@@ -663,26 +684,25 @@ fn extract_leaked_tool_calls(text: &str) -> Option<(Vec<ToolCallRequest>, String
             pos += 1;
             continue;
         }
-        let matched = if rest.starts_with("<tool_call") {
+        let matched = if rest.starts_with("<tool_call") && takes(TextToolCalls::ToolCall) {
             try_parse_tool_call_tag(rest)
-        } else if rest.starts_with("<｜DSML｜function_calls>") {
+        } else if rest.starts_with("<｜DSML｜function_calls>") && takes(TextToolCalls::Dsml) {
             parse_xml_function_calls(rest, "<｜DSML｜", "</｜DSML｜")
-        } else if rest.starts_with("<|DSML|function_calls>") {
+        } else if rest.starts_with("<|DSML|function_calls>") && takes(TextToolCalls::Dsml) {
             parse_xml_function_calls(rest, "<|DSML|", "</|DSML|")
-        } else if rest.starts_with("<｜DSML｜invoke") {
+        } else if rest.starts_with("<｜DSML｜invoke") && takes(TextToolCalls::Dsml) {
             parse_xml_invoke(rest, "<｜DSML｜", "</｜DSML｜").map(|(len, n, a)| (len, vec![(n, a)]))
-        } else if rest.starts_with("<|DSML|invoke") {
+        } else if rest.starts_with("<|DSML|invoke") && takes(TextToolCalls::Dsml) {
             parse_xml_invoke(rest, "<|DSML|", "</|DSML|").map(|(len, n, a)| (len, vec![(n, a)]))
-        } else if rest.starts_with("<function_calls>") {
+        } else if rest.starts_with("<function_calls>") && takes(TextToolCalls::Invoke) {
             parse_xml_function_calls(rest, "<", "</")
-        } else if rest.starts_with("<invoke") {
+        } else if rest.starts_with("<invoke") && takes(TextToolCalls::Invoke) {
             parse_xml_invoke(rest, "<", "</").map(|(len, n, a)| (len, vec![(n, a)]))
         } else {
             None
         };
         if let Some((len, calls)) = matched {
-            spans.push((pos, pos + len));
-            extracted.extend(calls);
+            found.push((pos, pos + len, calls));
             pos += len;
             continue;
         }
@@ -694,26 +714,44 @@ fn extract_leaked_tool_calls(text: &str) -> Option<(Vec<ToolCallRequest>, String
         let jump = pos + step + rel;
         pos = if after.as_bytes().get(rel) == Some(&b'\n') { jump + 1 } else { jump };
     }
-    if extracted.is_empty() {
+    // The trailing run: nothing but white space after the last span, or between spans of the run.
+    let blank = |a: usize, b: usize| text.get(a..b).is_some_and(|g| g.trim().is_empty());
+    let (_, last_end, _) = found.last()?;
+    if !blank(*last_end, text.len()) {
         return None;
     }
-    let tool_calls = extracted
+    let mut first = found.len() - 1;
+    while first > 0 && blank(found[first - 1].1, found[first].0) {
+        first -= 1;
+    }
+    let run = found.split_off(first);
+    let spans: Vec<(usize, usize)> = run.iter().map(|(a, b, _)| (*a, *b)).collect();
+    let tool_calls: Vec<ToolCallRequest> = run
         .into_iter()
-        .enumerate()
-        .map(|(i, (name, args))| ToolCallRequest {
-            call_id: CallId(format!("rec_{i}")),
+        .flat_map(|(_, _, calls)| calls)
+        .map(|(name, args)| ToolCallRequest {
+            call_id: CallId(random_call_id()),
             name,
             arguments: serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string()),
             complete: true,
         })
         .collect();
+    if tool_calls.is_empty() {
+        return None;
+    }
     let cleaned = strip_extracted_spans(text, &spans);
     Some((tool_calls, cleaned))
 }
 
 impl Assembler {
+    /// An assembler that takes text tool calls in every known format (tests and tools).
     pub fn new() -> Assembler {
         Assembler::default()
+    }
+
+    /// An assembler that takes text tool calls only in `format` (`Off`: none).
+    pub fn with_text_calls(format: TextToolCalls) -> Assembler {
+        Assembler { text_calls: format, ..Assembler::default() }
     }
 
     /// Apply one data payload; returns the events it produced, in order.
@@ -859,7 +897,7 @@ impl Assembler {
         if tool_calls.is_empty()
             && !matches!(recorded, FinishReason::Length | FinishReason::Error | FinishReason::Aborted)
         {
-            if let Some((recovered, stripped_text)) = extract_leaked_tool_calls(&text) {
+            if let Some((recovered, stripped_text)) = extract_leaked_tool_calls(&text, self.text_calls) {
                 tool_calls = recovered;
                 text = stripped_text;
             }
@@ -1546,14 +1584,15 @@ mod tests {
         assert_eq!(c.finish, FinishReason::ToolCalls);
         assert_eq!(c.text, "Let me inspect both files.");
         assert_eq!(c.tool_calls.len(), 2);
-        assert_eq!(c.tool_calls[0].call_id.as_str(), "rec_0");
+        assert!(c.tool_calls[0].call_id.as_str().starts_with("call-"));
         assert_eq!(c.tool_calls[0].name, "read");
         assert_eq!(
             serde_json::from_str::<Value>(&c.tool_calls[0].arguments).unwrap(),
             serde_json::json!({"path": "a.rs"})
         );
         assert!(c.tool_calls[0].complete);
-        assert_eq!(c.tool_calls[1].call_id.as_str(), "rec_1");
+        assert!(c.tool_calls[1].call_id.as_str().starts_with("call-"));
+        assert_ne!(c.tool_calls[0].call_id, c.tool_calls[1].call_id);
         assert_eq!(c.tool_calls[1].name, "bash");
         assert_eq!(
             serde_json::from_str::<Value>(&c.tool_calls[1].arguments).unwrap(),
@@ -1578,13 +1617,13 @@ mod tests {
         assert_eq!(c.finish, FinishReason::ToolCalls);
         assert_eq!(c.text, "Running search.");
         assert_eq!(c.tool_calls.len(), 2);
-        assert_eq!(c.tool_calls[0].call_id.as_str(), "rec_0");
+        assert!(c.tool_calls[0].call_id.as_str().starts_with("call-"));
         assert_eq!(c.tool_calls[0].name, "read");
         assert_eq!(
             serde_json::from_str::<Value>(&c.tool_calls[0].arguments).unwrap(),
             serde_json::json!({"path": "42", "start": 10})
         );
-        assert_eq!(c.tool_calls[1].call_id.as_str(), "rec_1");
+        assert!(c.tool_calls[1].call_id.as_str().starts_with("call-"));
         assert_eq!(c.tool_calls[1].name, "wait");
         assert_eq!(c.tool_calls[1].arguments, "{}");
     }
@@ -1602,7 +1641,7 @@ mod tests {
         assert_eq!(c.finish, FinishReason::ToolCalls);
         assert_eq!(c.text, "");
         assert_eq!(c.tool_calls.len(), 1);
-        assert_eq!(c.tool_calls[0].call_id.as_str(), "rec_0");
+        assert!(c.tool_calls[0].call_id.as_str().starts_with("call-"));
         assert_eq!(c.tool_calls[0].name, "grep");
         assert_eq!(
             serde_json::from_str::<Value>(&c.tool_calls[0].arguments).unwrap(),
@@ -1614,14 +1653,13 @@ mod tests {
     fn text_leaked_standalone_fenced_json_calls_are_extracted_and_stripped() {
         let content = concat!(
             "First step:\n\n",
-            "```json\n{\"name\": \"bash\", \"arguments\": {\"command\": \"echo hi\"}}\n```\n\n",
-            "After block.",
+            "```json\n{\"name\": \"bash\", \"arguments\": {\"command\": \"echo hi\"}}\n```\n",
         );
         let c = text_reply(content, r#""stop""#);
         assert_eq!(c.finish, FinishReason::ToolCalls);
-        assert_eq!(c.text, "First step:\n\nAfter block.");
+        assert_eq!(c.text, "First step:");
         assert_eq!(c.tool_calls.len(), 1);
-        assert_eq!(c.tool_calls[0].call_id.as_str(), "rec_0");
+        assert!(c.tool_calls[0].call_id.as_str().starts_with("call-"));
         assert_eq!(c.tool_calls[0].name, "bash");
         assert_eq!(
             serde_json::from_str::<Value>(&c.tool_calls[0].arguments).unwrap(),
@@ -1675,5 +1713,55 @@ mod tests {
         assert_eq!(c.tool_calls.len(), 1);
         assert_eq!(c.tool_calls[0].call_id.as_str(), "A");
         assert_eq!(c.text, leaked);
+    }
+
+    #[test]
+    fn a_call_shown_as_an_example_with_text_after_it_is_never_run() {
+        // The reported case: a chat reply that only shows a call, then explains it.
+        let shown = concat!(
+            "To clean the build you would run:\n\n",
+            "```json\n{\"name\":\"bash\",\"arguments\":{\"command\":\"rm -rf build\"}}\n```\n\n",
+            "but only after checking nothing in it is needed.",
+        );
+        let c = text_reply(shown, r#""stop""#);
+        assert!(c.tool_calls.is_empty());
+        assert_eq!(c.finish, FinishReason::Stop);
+        assert_eq!(c.text, shown);
+        // An example early in the reply, a real call at its end: only the last is taken.
+        let both = concat!(
+            "An example: <tool_call>{\"name\": \"bash\", \"arguments\": {\"command\": \"rm -rf /\"}}</tool_call> is not what I want.\n",
+            "<tool_call>{\"name\": \"read\", \"arguments\": {\"path\": \"a.rs\"}}</tool_call>\n",
+        );
+        let c = text_reply(both, r#""stop""#);
+        assert_eq!(c.tool_calls.len(), 1);
+        assert_eq!(c.tool_calls[0].name, "read");
+        assert!(c.text.contains("rm -rf /"), "{}", c.text);
+    }
+
+    #[test]
+    fn only_the_profiles_format_is_taken_and_off_takes_none() {
+        let tagged = "<tool_call>{\"name\": \"read\", \"arguments\": {\"path\": \"a\"}}</tool_call>";
+        let delta = serde_json::json!({ "content": tagged }).to_string();
+        let with = |f: TextToolCalls| {
+            let mut a = Assembler::with_text_calls(f);
+            a.push(&chunk(&delta, "null")).unwrap();
+            a.push(&chunk("{}", r#""stop""#)).unwrap();
+            a.finish().unwrap()
+        };
+        assert_eq!(with(TextToolCalls::ToolCall).tool_calls.len(), 1);
+        assert_eq!(with(TextToolCalls::Any).tool_calls.len(), 1);
+        for f in [TextToolCalls::Dsml, TextToolCalls::Invoke, TextToolCalls::FencedJson, TextToolCalls::Off] {
+            let c = with(f);
+            assert!(c.tool_calls.is_empty(), "{f:?}");
+            assert_eq!(c.text, tagged, "{f:?}");
+        }
+    }
+
+    #[test]
+    fn recovered_calls_get_ids_no_other_reply_shares() {
+        let leaked = "<tool_call>{\"name\": \"read\", \"arguments\": {\"path\": \"a\"}}</tool_call>";
+        let ids: std::collections::HashSet<String> =
+            (0..50).map(|_| text_reply(leaked, r#""stop""#).tool_calls[0].call_id.as_str().to_string()).collect();
+        assert_eq!(ids.len(), 50);
     }
 }

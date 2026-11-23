@@ -188,6 +188,22 @@ fn clamp_max_value(
     }
 }
 
+/// `limit` (or `num_lines`) is a count of lines, as in the trained read tools: with `start` (default 1)
+/// it becomes `end = start + limit - 1`. Used where no `end` was given; a `limit` below 1 or not a number
+/// is left for the schema check to refuse.
+fn limit_to_end(map: &mut Map<String, Value>, notes: &mut Vec<String>) {
+    if !is_absent_or_null(map, "end") {
+        return;
+    }
+    let Some(limit_key) = ["limit", "num_lines"].into_iter().find(|k| map.contains_key(*k)) else { return };
+    let Some(limit) = map.get(limit_key).and_then(parse_i64_like).filter(|n| *n >= 1) else { return };
+    let start = map.get("start").and_then(parse_i64_like).unwrap_or(1).max(1);
+    let end = start.saturating_add(limit - 1);
+    map.remove(limit_key);
+    map.insert("end".to_string(), Value::from(end));
+    notes.push(format!("argument alias: `{limit_key}` ({limit}) -> `end` ({end})"));
+}
+
 /// Normalize well-known model parameter habits for `tool` before [`check`] runs.
 /// Only inserts or renames keys when the canonical key is absent or `null`, and returns a repair
 /// sentence for every transformation applied.
@@ -201,17 +217,7 @@ pub fn normalize_for_tool(tool: &str, value: &mut Value) -> Vec<String> {
             alias_key(map, "path", &["file_path", "filepath", "filename"], &mut notes);
             alias_key(map, "start", &["offset", "start_line", "from_line"], &mut notes);
             alias_key(map, "end", &["end_line", "to_line"], &mut notes);
-            if is_absent_or_null(map, "end") {
-                if let Some(limit_key) = ["limit", "num_lines"].into_iter().find(|k| map.contains_key(*k)) {
-                    if let Some(limit) = map.get(limit_key).and_then(parse_i64_like).filter(|n| *n >= 1) {
-                        let start = map.get("start").and_then(parse_i64_like).unwrap_or(1).max(1);
-                        let end = start.saturating_add(limit - 1);
-                        map.remove(limit_key);
-                        map.insert("end".to_string(), Value::from(end));
-                        notes.push(format!("argument alias: `{limit_key}` ({limit}) -> `end` ({end})"));
-                    }
-                }
-            }
+            limit_to_end(map, &mut notes);
             alias_key(map, "old", &["old_string", "old_text", "old_str", "target"], &mut notes);
             alias_key(map, "new", &["new_string", "new_text", "new_str", "replacement"], &mut notes);
             alias_key(map, "all", &["replace_all"], &mut notes);
@@ -250,7 +256,8 @@ pub fn normalize_for_tool(tool: &str, value: &mut Value) -> Vec<String> {
                 notes.push("stripped harmless extra `total_lines` argument".to_string());
             }
             alias_key(map, "start", &["offset", "start_line"], &mut notes);
-            alias_key(map, "end", &["end_line", "limit"], &mut notes);
+            alias_key(map, "end", &["end_line"], &mut notes);
+            limit_to_end(map, &mut notes);
         }
         "claim_update" => {
             alias_key(map, "id", &["claim", "claim_id"], &mut notes);
@@ -908,7 +915,19 @@ mod tests {
         let mut or = json!({"handle": "out:1", "total_lines": 500, "offset": 5, "limit": 25});
         let or_notes = normalize_for_tool("out_read", &mut or);
         assert!(or_notes.iter().any(|n| n.contains("total_lines")), "{or_notes:?}");
-        assert_eq!(or, json!({"handle": "out:1", "start": 5, "end": 25}));
+        assert_eq!(or, json!({"handle": "out:1", "start": 5, "end": 29}), "`limit` is a count of lines");
+        // The case that was refused: lines 100 to 149, not an end before the start.
+        let mut or2 = json!({"handle": "out:1", "offset": 100, "limit": 50});
+        let notes2 = normalize_for_tool("out_read", &mut or2);
+        assert_eq!(or2, json!({"handle": "out:1", "start": 100, "end": 149}));
+        assert!(notes2.iter().any(|n| n.contains("`limit` (50) -> `end` (149)")), "{notes2:?}");
+        // A given `end` wins, and a `limit` alone counts from line 1.
+        let mut or3 = json!({"handle": "out:1", "start": 3, "end_line": 9, "limit": 50});
+        normalize_for_tool("out_read", &mut or3);
+        assert_eq!(or3["end"], json!(9));
+        let mut or4 = json!({"handle": "out:1", "limit": 20});
+        normalize_for_tool("out_read", &mut or4);
+        assert_eq!(or4, json!({"handle": "out:1", "end": 20}));
 
         let mut cu = json!({"claim_id": "c1"});
         assert!(!normalize_for_tool("claim_update", &mut cu).is_empty());
