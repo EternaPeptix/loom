@@ -589,6 +589,7 @@ function openSession(id) {
   S.agentsActive = null;
   $("msg").value = C.getDraft(S.drafts, "message:" + id);
   $("msg").dataset.draftKey = "message:" + id;
+  renderChips(attachCtx.composer);
   want("header", "blocks", "live", "right", "overview");
   loadProfiles();
   loadRecords(S.rec, 0);
@@ -1551,11 +1552,14 @@ function renderHeader() {
   const message = S.messageState.get(info.id);
   const pendingReceipt = message?.accepted && message.recordedSeq === undefined && message.state !== "failed";
   $("msg").disabled = sending;
-  $("send").disabled = sending || pendingReceipt || !S.rec?.initialComplete || !$("msg").value.trim();
+  const att = attachState("message:" + info.id);
+  $("attach-bar").hidden = !a.send;
+  $("attach-btn").disabled = sending;
+  $("send").disabled = sending || pendingReceipt || !S.rec?.initialComplete || (!$("msg").value.trim() && !att.paths.length) || att.busy || att.failed;
   // The button is an icon; its accessible name says the state, and send-state (live) says it in words.
   const sendLabel = sending ? "Sending…" : pendingReceipt ? "Awaiting receipt…" : "Send";
   $("send").setAttribute("aria-label", sendLabel);
-  $("send").title = sendLabel === "Send" ? (COARSE.matches ? "Send" : "Send (Enter)") : sendLabel;
+  $("send").title = att.busy ? "Waiting for the uploads to finish" : att.failed ? "Remove the attachment that failed to upload first" : sendLabel === "Send" ? (COARSE.matches ? "Send" : "Send (Enter)") : sendLabel;
   $("send").setAttribute("aria-busy", String(sending || !!pendingReceipt));
   const question = renderSeat(info);
   $("send-state").textContent = question ? "" : C.sendStateText({ loaded: !!S.rec?.initialComplete, seat: S.seatNote.get(info.id), message });
@@ -2355,6 +2359,35 @@ function childLink(id) {
   return a;
 }
 
+/** The attachment block of an operator message (docs/UPLOADS.md): file chips that open in the Files tab, the inline copies folded. */
+function attachedFiles(b, sp) {
+  const box = el("div", "attached");
+  const list = el("ul", "attach-chips");
+  list.setAttribute("aria-label", "Attached files");
+  const ws = (S.sessions.byId.get(S.openId) || {}).workspace || "";
+  for (const f of sp.files) {
+    const chip = el("button", "attach-chip attach-open");
+    chip.type = "button";
+    chip.title = "Open " + f.path + " in the Files tab";
+    add(chip, icon("source"), el("span", "attach-name", f.name), el("span", "attach-size", f.size));
+    chip.addEventListener("click", () => {
+      const rel = C.workspaceRelative(ws, f.path);
+      if (rel === null) toast(f.path + " is outside this session's workspace.");
+      else showFiles(chip, rel);
+    });
+    add(list, add(el("li"), chip));
+  }
+  add(box, list);
+  if (sp.inline) {
+    const d = el("details", "attach-inline");
+    add(d, el("summary", "", "Inline copies"));
+    remembered(d, b, "inline");
+    add(d, textBox(sp.inline, "txt out"));
+    add(box, d);
+  }
+  return box;
+}
+
 function buildBlock(b, ctx = {}) {
   const root = el("div", "block " + b.kind + (b.detail ? " detail" : ""));
   b.ui = b.ui || {};
@@ -2362,9 +2395,13 @@ function buildBlock(b, ctx = {}) {
   switch (b.kind) {
     case "user": {
       if (b.author !== "user") add(root, el("div", "label", C.authorLabel(b.author)));
-      const bubble = textBox(b.text, "txt bubble");
-      root.classList.add("reveal-copy");
-      add(root, bubble, copyButton("Copy message", () => C.messageCopyText(b), { what: "Message", source: bubble, key: "copy-msg:" + b.id }));
+      const sp = C.splitAttachments(b.text);
+      if (sp.text || !sp.files.length) {
+        const bubble = textBox(sp.text, "txt bubble");
+        root.classList.add("reveal-copy");
+        add(root, bubble, copyButton("Copy message", () => C.messageCopyText(b), { what: "Message", source: bubble, key: "copy-msg:" + b.id }));
+      }
+      if (sp.files.length) add(root, attachedFiles(b, sp));
       break;
     }
     case "note": {
@@ -2523,7 +2560,9 @@ function buildTool(root, b) {
   head.setAttribute("aria-expanded", String(open));
   head.dataset.focusKey = "tool:" + b.id;
   add(head, icon("chevron"), icon(row.icon), el("span", "name", b.name));
-  const args = el("span", "args", row.argsLine);
+  // A call that says what it is for (bash's `description`) leads with that; the command stays beside it, dimmer.
+  if (row.label) add(head, el("span", "tlabel", row.label));
+  const args = el("span", row.label ? "args sub" : "args", row.argsLine);
   if (b.argsInvalid) args.title = "The model's arguments were not valid JSON; this is what it wrote.";
   add(head, args);
   if (row.capsule) {
@@ -3581,6 +3620,13 @@ async function submitNew(ev, create = false) {
     err.hidden = false;
     return;
   }
+  const att = attachState("new");
+  if (att.busy || att.failed) {
+    err.textContent = att.busy ? "Wait for the attached files to finish uploading." : "Remove the attached file that failed to upload, then start the mission.";
+    err.hidden = false;
+    return;
+  }
+  if (att.paths.length) r.body.attachments = att.paths;
   err.hidden = true;
   $("f-submit").disabled = true;
   $("f-create-yes").disabled = true;
@@ -3590,6 +3636,8 @@ async function submitNew(ev, create = false) {
     const { created, ...info } = answer;
     C.applySessionEvent(S.sessions, info);
     $("f-message").value = "";
+    attachments.delete("new");
+    renderChips(attachCtx.start);
     $("f-title").value = "";
     $("f-prior").value = "";
     pickerCreate = null;
@@ -4673,7 +4721,7 @@ function updateDelivery(id) {
   const state = S.messageState.get(id);
   if (!state || !S.rec || S.rec.session !== id || state.state === "failed") return;
   const records = [...S.rec.records.values()];
-  const user = records.find(r => r.seq > state.afterSeq && r.kind === "user_message" && r.text === state.sentText);
+  const user = records.find(r => r.seq > state.afterSeq && r.kind === "user_message" && (r.text === state.sentText || (state.attached && C.splitAttachments(r.text).text === state.sentText.trimEnd())));
   if (!user) return;
   state.recordedSeq = user.seq;
   const request = records.find(r => r.seq > user.seq && r.kind === "model_request" && (!r.purpose || r.purpose === "step"));
@@ -4683,12 +4731,153 @@ function updateDelivery(id) {
   state.text = text;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Attachments (docs/UPLOADS.md): each file uploads at once and shows as a chip; Send carries the saved paths.
+
+/** Kept in memory with the drafts: draft key -> [{id, name, size, state: "uploading"|"done"|"failed", path, error, ws}]. */
+const attachments = new Map();
+let attachSeq = 0;
+const attachCtx = {
+  composer: {
+    chips: "attach-chips",
+    key: () => (S.openId ? "message:" + S.openId : null),
+    workspace: () => (S.sessions.byId.get(S.openId) || {}).workspace || "",
+    changed: () => renderHeader(),
+  },
+  start: {
+    chips: "f-attach-chips",
+    key: () => "new",
+    workspace: () => $("f-workspace").value.trim(),
+    changed: () => {},
+  },
+};
+const attachList = (key) => attachments.get(key) || [];
+/** What Send needs to know: the saved paths, and whether an upload is still going or has failed. */
+function attachState(key) {
+  const list = attachList(key);
+  return {
+    paths: list.filter(a => a.state === "done").map(a => a.path),
+    busy: list.some(a => a.state === "uploading"),
+    failed: list.some(a => a.state === "failed"),
+  };
+}
+
+function renderChips(c) {
+  const key = c.key();
+  const list = key ? attachList(key) : [];
+  const box = $(c.chips);
+  box.replaceChildren();
+  box.hidden = !list.length;
+  for (const a of list) {
+    const chip = el("li", "attach-chip " + a.state);
+    add(chip, icon(a.state === "failed" ? "alert" : "source"), el("span", "attach-name", a.name));
+    if (a.state === "uploading") add(chip, el("span", "attach-size", "Uploading…"));
+    else if (a.state === "failed") add(chip, el("span", "attach-error", a.error));
+    else add(chip, el("span", "attach-size", C.byteSize(a.size)));
+    const x = btn("×", "attach-x", () => {
+      attachments.set(key, attachList(key).filter(o => o !== a));
+      if (!attachList(key).length) attachments.delete(key);
+      renderChips(c);
+    });
+    x.setAttribute("aria-label", "Remove " + a.name);
+    x.title = "Remove " + a.name;
+    add(chip, x);
+    if (a.state === "failed") chip.setAttribute("role", "alert");
+    add(box, chip);
+  }
+  c.changed();
+}
+
+function addFiles(c, files) {
+  const key = c.key();
+  const ws = c.workspace();
+  if (!key || !files.length) return;
+  if (!ws) { toast("Enter a workspace first: attached files are saved in it."); return; }
+  const list = attachList(key);
+  attachments.set(key, list);
+  for (const file of files) {
+    const a = { id: ++attachSeq, name: file.name || "pasted-file", size: file.size, state: "uploading", path: "", error: "", ws };
+    list.push(a);
+    uploadOne(c, key, a, file);
+  }
+  renderChips(c);
+}
+
+async function uploadOne(c, key, a, file) {
+  try {
+    const r = await fetch("/api/uploads?workspace=" + encodeURIComponent(a.ws) + "&name=" + encodeURIComponent(a.name), {
+      method: "POST",
+      credentials: "omit",
+      headers: authHeaders({ "Content-Type": file.type || "application/octet-stream" }),
+      body: file,
+    });
+    if (r.status === 401) { lost(); return; }
+    const text = await r.text();
+    if (!r.ok) throw new Error(C.errorSentence(r.status, text));
+    const v = JSON.parse(text);
+    a.path = v.path;
+    a.name = v.name || a.name;
+    a.size = Number.isFinite(v.bytes) ? v.bytes : a.size;
+    a.state = "done";
+  } catch (e) {
+    a.state = "failed";
+    a.error = e.message;
+  }
+  if (attachList(key).includes(a) && c.key() === key) renderChips(c);
+}
+
+/** Wire one attach button, file input, drop zones and paste target to a context. */
+function wireAttach(c, { button, input, drops, paste, canDrop = () => true }) {
+  $(button).addEventListener("click", () => $(input).click());
+  $(input).addEventListener("change", () => { addFiles(c, [...$(input).files]); $(input).value = ""; });
+  const hasFiles = (e) => e.dataTransfer && [...(e.dataTransfer.types || [])].includes("Files");
+  for (const id of drops) {
+    const zone = $(id);
+    zone.addEventListener("dragover", (e) => {
+      if (!hasFiles(e) || !canDrop()) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = "copy";
+      zone.classList.add("drop-on");
+    });
+    zone.addEventListener("dragleave", (e) => { if (!zone.contains(e.relatedTarget)) zone.classList.remove("drop-on"); });
+    zone.addEventListener("drop", (e) => {
+      zone.classList.remove("drop-on");
+      if (!hasFiles(e) || !canDrop()) return;
+      e.preventDefault();
+      addFiles(c, [...e.dataTransfer.files]);
+    });
+  }
+  $(paste).addEventListener("paste", (e) => {
+    const files = [...((e.clipboardData && e.clipboardData.files) || [])];
+    // Text that arrives with a file (a copied cell also brings its picture) pastes as text.
+    if (!files.length || (e.clipboardData.getData("text/plain") || "") !== "") return;
+    e.preventDefault();
+    addFiles(c, files);
+  });
+}
+
+/** The new-mission form: attaching waits for a workspace, and a changed workspace drops the files saved in the old one. */
+function syncNewAttach() {
+  const ws = $("f-workspace").value.trim();
+  $("f-attach").disabled = !ws;
+  $("f-attach").title = ws ? "Attach files; they are saved in the workspace" : "Enter a workspace first: attached files are saved in it.";
+  const list = attachList("new");
+  const note = $("f-attach-note");
+  if (list.some(a => a.ws !== ws)) {
+    attachments.delete("new");
+    renderChips(attachCtx.start);
+    note.textContent = "The workspace changed, so the attached files were cleared. Attach them again.";
+    note.hidden = false;
+  } else if (!list.length && ws) note.hidden = true;
+}
+
 async function sendMessage() {
   const id = S.openId;
   const key = "message:" + id;
   const text = $("msg").value;
   const previous = S.messageState.get(id);
-  if (!id || !text.trim() || S.sending.has(id)) return;
+  const att = attachState(key);
+  if (!id || (!text.trim() && !att.paths.length) || att.busy || att.failed || S.sending.has(id)) return;
   if (!S.rec?.initialComplete) {
     toast("Wait for the session record to finish loading before sending.");
     return;
@@ -4702,10 +4891,14 @@ async function sendMessage() {
   C.setDraft(S.drafts, key, text);
   S.seatNote.delete(id);
   S.sending.add(id);
-  S.messageState.set(id, { state: "sending", accepted: false, sentText: text, afterSeq: C.lastSeq(S.rec) ?? -1, text: "Sending to " + (info.title || id) + "…", at: ++S.stamp });
+  S.messageState.set(id, { state: "sending", accepted: false, sentText: text, attached: att.paths.length > 0, afterSeq: C.lastSeq(S.rec) ?? -1, text: "Sending to " + (info.title || id) + "…", at: ++S.stamp });
   renderHeader();
   try {
-    await api("POST", "/api/sessions/" + encodeURIComponent(id) + "/messages", { text });
+    await api("POST", "/api/sessions/" + encodeURIComponent(id) + "/messages", att.paths.length ? { text, attachments: att.paths } : { text });
+    const sent = new Set(att.paths);
+    const rest = attachList(key).filter(a => !sent.has(a.path));
+    if (rest.length) attachments.set(key, rest); else attachments.delete(key);
+    renderChips(attachCtx.composer);
     const state = S.messageState.get(id);
     state.accepted = true;
     if (state.state !== "delivered") { state.state = "queued"; state.text = "Message accepted · awaiting its recorded delivery."; state.at = ++S.stamp; }
@@ -5269,6 +5462,7 @@ function workspaceNote() {
   if (!pending) pickerCreate = null;
   note.textContent = pending ? "This folder does not exist yet. It is created when the mission starts." : "";
   note.hidden = !pending;
+  syncNewAttach();
 }
 
 function hideCreateAsk() {
@@ -5918,8 +6112,13 @@ function wire() {
   const msg = $("msg");
   msg.addEventListener("input", () => { if (S.openId) C.setDraft(S.drafts, "message:" + S.openId, msg.value); renderHeader(); });
   $("send").addEventListener("click", sendMessage);
+  wireAttach(attachCtx.composer, {
+    button: "attach-btn", input: "attach-file", drops: ["composer", "scroller"], paste: "msg",
+    canDrop: () => !$("attach-bar").hidden && !$("msg").disabled,
+  });
+  wireAttach(attachCtx.start, { button: "f-attach", input: "f-file", drops: ["new-form"], paste: "f-message" });
   msg.addEventListener("keydown", (e) => {
-    if (C.composerAction({ key: e.key, shiftKey: e.shiftKey, isComposing: e.isComposing, text: msg.value, coarse: COARSE.matches, mod: e.ctrlKey || e.metaKey }) !== "none") {
+    if (C.composerAction({ key: e.key, shiftKey: e.shiftKey, isComposing: e.isComposing, text: msg.value || (attachState("message:" + S.openId).paths.length ? "attached" : ""), coarse: COARSE.matches, mod: e.ctrlKey || e.metaKey }) !== "none") {
       e.preventDefault();
       sendMessage();
     }

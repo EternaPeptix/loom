@@ -344,6 +344,30 @@ lost and an open question keeps its focus. "What these mean" keeps its open stat
 after a redraw, and Stop's confirmation says only a root can be resumed (an agent ends; its lead can start a new one). The
 MODEL row shows the session's own context limit; if only the profile reports one, it says so.
 
+### Attachments
+
+The composer and the new-mission form take files (the contract is `docs/UPLOADS.md`). A paperclip button opens a
+multi-file picker; files can also be dropped on the composer card or the transcript (a dashed highlight shows the zone)
+and pasted into the message box, clipboard images included. Text on the clipboard wins over a file that comes with it.
+Each file uploads at once with `POST /api/uploads?workspace=&name=` (same bearer header, no cookies as `api()`) and shows
+as a chip above the text: name, size (`byteSize`), "Uploading…", and × to remove. A failed upload shows the daemon's
+`error` sentence on its chip and Send stays disabled until it is removed; Send also waits for uploads in flight. Send is
+enabled with attachments and no text, posts `attachments: [path…]` with the message, and clears the chips once the
+daemon accepts it. Chips are drafts: they are kept per session with the message draft for as long as the page is open.
+
+The new-mission form has the same button and drop zone, disabled (tooltip: enter a workspace first) until the workspace
+field has a value. Changing the workspace after files are attached clears the chips and says so. `attachments` goes in
+`POST /api/sessions`.
+
+In the transcript, an operator message whose text holds the runtime's block (first line exactly
+``Attached files (saved read-only; read them with `read`):``, `splitAttachments` in `core.js`) shows the text above the
+block as before, the list as file chips (name, size) that open the file in the Files tab (path made workspace-relative
+with `workspaceRelative`), and the inline copies in one collapsed "Inline copies" disclosure. Copy message copies only
+the text above the block.
+
+Tool rows (`docs/TOOL-SHAPES.md` section 3): `toolPathArg` also reads `absolute_path` and `target_file`. A call whose
+arguments have a string `description` (bash) is labelled with it; the command stays on the row, dimmer, beside the label.
+
 ## Drafts, submissions and updates
 
 Drafts are keyed by session ID for messages and item ID for inbox answers. They survive mission/view

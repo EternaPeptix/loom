@@ -1292,7 +1292,7 @@ details.reasoning > .copy-row { margin: 4px 0 2px; }
 
   /* ---- the composer: heading, text and Send, then the seat and the caption ---- */
   .composer { padding-top: 6px; padding-bottom: max(6px, env(safe-area-inset-bottom)); }
-  .composer-card { display: grid; grid-template-columns: minmax(0, auto) minmax(0, 1fr) 44px; grid-template-areas: "head head head" "conf conf conf" "msg msg send" "seat cap cap" "help help help"; gap: 0 8px; padding: 4px 10px 2px; align-items: center; }
+  .composer-card { display: grid; grid-template-columns: minmax(0, auto) minmax(0, 1fr) 44px; grid-template-areas: "head head head" "conf conf conf" "attach attach attach" "msg msg send" "seat cap cap" "help help help"; gap: 0 8px; padding: 4px 10px 2px; align-items: center; }
   .composer-card.is-agent { display: flex; flex-direction: row; flex-wrap: wrap; align-items: center; gap: 8px 10px; padding: 8px 12px; }
   .composer-card.is-agent #composer-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; width: 100%; margin-left: 0; }
   .composer-card.is-agent .s-caption { margin-left: auto; }
@@ -1303,7 +1303,7 @@ details.reasoning > .copy-row { margin: 4px 0 2px; }
   #composer-row { display: contents; }
   #send { grid-area: send; align-self: end; }
   /* On a phone Stop takes the caption row's end, below Send, at the same 44px size. */
-  #c-stop { grid-row: 4; grid-column: 3; width: 44px; height: 44px; justify-self: end; }
+  #c-stop { grid-row: 5; grid-column: 3; width: 44px; height: 44px; justify-self: end; }
   .composer-card:has(#c-stop:not([hidden])) .s-caption { grid-column: 2; }
   .seat { grid-area: seat; flex: none; margin: 0; max-width: 34vw; }
   select.model-seat { width: auto; max-width: 34vw; }
@@ -1361,3 +1361,45 @@ details.reasoning > .copy-row { margin: 4px 0 2px; }
 .form-more > summary:hover { color: var(--text); }
 .form-more[open] { display: flex; flex-direction: column; gap: 14px; }
 .form-more[open] > summary { margin-bottom: 2px; }
+
+/* ---- attachments: the paperclip, the chips, the drop highlight (docs/UPLOADS.md) ---- */
+.attach-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; min-width: 0; }
+.attach-bar[hidden], .attach-chips[hidden] { display: none; }
+.attach-btn { display: inline-grid; place-items: center; flex: 0 0 auto; width: 28px; height: 28px; padding: 0; border: 0; border-radius: 50%; background: transparent; color: var(--dim); cursor: pointer; }
+.attach-btn:hover:not(:disabled) { background: var(--hover); color: var(--strong); }
+.attach-btn:disabled { opacity: .5; cursor: default; }
+.attach-btn .icon, .attach-row .btn .icon { width: 14px; height: 14px; }
+.attach-chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 0; padding: 0; list-style: none; min-width: 0; }
+.attach-bar .attach-chips { flex: 1 1 0; }
+.attach-chip { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; min-height: 28px; padding: 2px 4px 2px 9px; border: 1px solid var(--line-2); border-radius: var(--r-pill); background: var(--bg-3, var(--hover)); color: var(--fg); font-size: 12px; }
+.attach-chip .icon { width: 12px; height: 12px; flex: 0 0 auto; }
+.attach-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); }
+.attach-size { flex: 0 0 auto; color: var(--caption); font-variant-numeric: tabular-nums; }
+.attach-chip.uploading .attach-size { font-style: italic; }
+.attach-chip.failed { border-color: var(--bad); background: var(--bad-bg); }
+.attach-error { min-width: 0; color: var(--bad); }
+.attach-x { display: inline-grid; place-items: center; flex: 0 0 auto; width: 22px; height: 22px; padding: 0; border: 0; border-radius: 50%; background: transparent; color: var(--dim); font-size: 15px; line-height: 1; cursor: pointer; }
+.attach-x:hover { background: var(--hover); color: var(--strong); }
+button.attach-open { padding-right: 9px; cursor: pointer; font: inherit; font-size: 12px; }
+button.attach-open:hover { border-color: var(--accent-line); background: var(--accent-tint); }
+.attached { display: flex; flex-direction: column; gap: 6px; margin-top: 6px; min-width: 0; }
+.attach-inline > summary { cursor: pointer; color: var(--dim); font-size: 12px; width: max-content; }
+.attach-inline[open] > summary { margin-bottom: 4px; }
+.attach-row { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; }
+.attach-row .field-note { margin: 0; }
+.attach-row .btn { display: inline-flex; align-items: center; gap: 6px; }
+.drop-on { outline: 2px dashed var(--accent-line); outline-offset: -3px; background: var(--accent-tint); }
+.composer-card.drop-on, .form.drop-on { border-radius: var(--r-xl); }
+.thead .tlabel { flex: 0 1 auto; min-width: 0; max-width: 60%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg); }
+.thead .args.sub { opacity: .75; }
+@media (max-width: 699px) {
+  #attach-bar { grid-area: attach; }
+  #attach-bar:has(#attach-chips[hidden]) { justify-self: start; }
+}
+@media (pointer: coarse) {
+  .attach-btn { width: 44px; height: 44px; }
+  .attach-chip { min-height: 44px; }
+  .attach-x { width: 44px; height: 44px; }
+  .attach-row .btn { min-height: 44px; }
+  .attach-btn .icon { width: 18px; height: 18px; }
+}
