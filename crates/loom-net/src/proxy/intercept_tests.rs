@@ -94,7 +94,7 @@ async fn plain_server(reply: &'static str) -> u16 {
     port
 }
 
-/// Reads requests (head plus Content-Length body) from `s` and answers each with `f(first line)`.
+/// Reads requests (head plus Content-Length body) from `s` and answers each with `f(head)`.
 async fn http_requests<S: AsyncRead + AsyncWrite + Unpin>(
     s: &mut S,
     f: impl Fn(&str) -> String,
@@ -122,13 +122,14 @@ async fn http_requests<S: AsyncRead + AsyncWrite + Unpin>(
             got.extend_from_slice(&b[..n]);
         }
         got.drain(..end + want);
-        let reply = f(head.lines().next().unwrap_or(""));
+        let reply = f(&head);
         s.write_all(reply.as_bytes()).await?;
         s.flush().await?;
     }
 }
 
 fn ok_reply(first_line: &str) -> String {
+    let first_line = first_line.lines().next().unwrap_or("");
     let body = format!("you asked: {first_line}");
     format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{body}", body.len())
 }
@@ -419,4 +420,285 @@ fn host_patterns() {
     assert!(listed(&l(&["10.0.0.1:8443"]), "10.0.0.1", 8443));
     assert!(!listed(&l(&["10.0.0.1:8443"]), "10.0.0.1", 443));
     assert!(!listed(&[], "x", 1));
+}
+
+// ---- credential profiles (CONTRACTS-TRAFFIC-TARGETS S3, S9, S2) ----
+
+use crate::inject::Inject;
+use loom_core::creds::{Item, ItemKind};
+use loom_core::target::Scope;
+
+type Heads = Arc<Mutex<Vec<String>>>;
+
+fn item(kind: ItemKind, name: &str, value: &str, host: &str) -> Item {
+    Item { kind, name: name.into(), value: value.into(), host: host.into() }
+}
+
+fn profile() -> Arc<Inject> {
+    Arc::new(Inject::new(vec![
+        item(ItemKind::Cookie, "session", "ours", "127.0.0.1"),
+        item(ItemKind::Header, "Authorization", "Bearer ours", "127.0.0.1"),
+        item(ItemKind::Cookie, "elsewhere", "no", "other.test"),
+    ]))
+}
+
+fn set_profile(e: &Env) {
+    assert!(e.proxy.set_inject(&SessionId::from("s-capture"), Some(profile())));
+}
+
+/// A plain HTTP server that records each request head it receives.
+async fn recording_plain_server() -> (u16, Heads) {
+    let heads: Heads = Arc::new(Mutex::new(Vec::new()));
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    let seen = heads.clone();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = l.accept().await {
+            let seen = seen.clone();
+            tokio::spawn(async move {
+                let _ = http_requests(&mut s, |head| {
+                    lock(&seen).push(head.to_string());
+                    ok_reply(head)
+                })
+                .await;
+            });
+        }
+    });
+    (port, heads)
+}
+
+/// As [`recording_plain_server`], over TLS.
+async fn recording_https_server() -> (u16, Heads) {
+    let heads: Heads = Arc::new(Mutex::new(Vec::new()));
+    let seen = heads.clone();
+    let port = tls_server(move |mut s| {
+        let seen = seen.clone();
+        async move {
+            let _ = http_requests(&mut s, |head| {
+                lock(&seen).push(head.to_string());
+                ok_reply(head)
+            })
+            .await;
+        }
+    })
+    .await;
+    (port, heads)
+}
+
+fn plain_get(e: &Env, port: u16, extra: &str) -> String {
+    format!("GET http://127.0.0.1:{port}/p HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{}{extra}\r\n", auth(&e.grant))
+}
+
+#[tokio::test]
+async fn plain_http_gets_the_profile_items_and_the_request_wins() {
+    let mut e = env(cg(1024)).await;
+    set_profile(&e);
+    let (port, heads) = recording_plain_server().await;
+    // One cookie of its own: the profile's cookie joins it and the header is added; the captured request
+    // holds the injected head.
+    let r = plain_via_proxy(&e, plain_get(&e, port, "Cookie: a=1\r\n")).await;
+    assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+    let sent = lock(&heads).last().cloned().unwrap();
+    assert!(sent.contains("Cookie: a=1; session=ours\r\n"), "{sent}");
+    assert!(sent.contains("Authorization: Bearer ours\r\n"), "{sent}");
+    assert!(!sent.contains("elsewhere"), "{sent}");
+    let c = next(&mut e.rx).await;
+    assert!(text(&c.request).contains("Cookie: a=1; session=ours\r\n"), "{}", text(&c.request));
+    assert!(text(&c.request).contains("Authorization: Bearer ours\r\n"));
+    // The request's own cookie of that name and its own header win.
+    plain_via_proxy(&e, plain_get(&e, port, "cookie: session=mine\r\nauthorization: Basic x\r\n")).await;
+    let sent = lock(&heads).last().cloned().unwrap();
+    assert!(sent.contains("session=mine") && !sent.contains("session=ours"), "{sent}");
+    assert!(sent.contains("Basic x") && !sent.contains("Bearer ours"), "{sent}");
+    let c = next(&mut e.rx).await;
+    assert!(!text(&c.request).contains("ours"));
+}
+
+#[tokio::test]
+async fn plain_http_to_a_host_no_item_names_is_untouched() {
+    let mut e = env(cg(1024)).await;
+    let other = Arc::new(Inject::new(vec![item(ItemKind::Cookie, "session", "ours", "localhost")]));
+    assert!(e.proxy.set_inject(&SessionId::from("s-capture"), Some(other)));
+    let (port, heads) = recording_plain_server().await;
+    plain_via_proxy(&e, plain_get(&e, port, "")).await;
+    let sent = lock(&heads).last().cloned().unwrap();
+    assert!(!sent.to_ascii_lowercase().contains("cookie"), "{sent}");
+    let c = next(&mut e.rx).await;
+    assert!(!text(&c.request).to_ascii_lowercase().contains("cookie"));
+    // set_inject(None) stops attaching.
+    set_profile(&e);
+    assert!(e.proxy.set_inject(&SessionId::from("s-capture"), None));
+    plain_via_proxy(&e, plain_get(&e, port, "")).await;
+    assert!(!lock(&heads).last().unwrap().contains("session=ours"));
+    assert!(!e.proxy.set_inject(&SessionId::from("nobody"), None));
+}
+
+#[tokio::test]
+async fn intercepted_https_injects_each_request_of_a_keep_alive_connection_and_captures_the_injected_head() {
+    let mut e = env(intercepting()).await;
+    set_profile(&e);
+    let (port, heads) = recording_https_server().await;
+    let mut s = tunnel_tls(&e, port, true).await.expect("the client trusts the loom CA");
+    roundtrip(&mut s, "GET /one HTTP/1.1\r\nHost: 127.0.0.1\r\nCookie: a=1\r\n\r\n").await;
+    roundtrip(&mut s, "POST /two HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 3\r\n\r\nabc").await;
+    let sent = lock(&heads).clone();
+    assert_eq!(sent.len(), 2);
+    assert!(sent[0].contains("Cookie: a=1; session=ours\r\n") && sent[0].contains("Authorization: Bearer ours\r\n"));
+    assert!(sent[1].contains("Cookie: session=ours\r\n") && sent[1].contains("Content-Length: 3\r\n"), "{}", sent[1]);
+    let (c1, c2) = (next(&mut e.rx).await, next(&mut e.rx).await);
+    assert!(text(&c1.request).contains("Cookie: a=1; session=ours\r\n"), "{}", text(&c1.request));
+    assert!(text(&c2.request).starts_with("POST /two HTTP/1.1\r\n"));
+    assert!(text(&c2.request).contains("Authorization: Bearer ours\r\n"));
+    assert!(text(&c2.request).ends_with("\r\n\r\nabc"));
+    assert_eq!(c2.request_bytes, c2.request.len() as u64);
+}
+
+fn grant_tool(e: &Env) -> SessionGrant {
+    SessionGrant { user: e.grant.tool_user.clone(), password: e.grant.tool_password.clone(), ..e.grant.clone() }
+}
+
+#[tokio::test]
+async fn the_tool_credential_is_the_same_session_but_never_in_env() {
+    let e = env(cg(1024)).await;
+    assert!(e.grant.tool_user.starts_with("tool-") && e.grant.tool_user != e.grant.user);
+    assert_ne!(e.grant.tool_password, e.grant.password);
+    let env_values: Vec<String> = e.grant.env().into_values().collect();
+    assert!(env_values.iter().all(|v| !v.contains(&e.grant.tool_user) && !v.contains(&e.grant.tool_password)));
+    assert!(e.grant.tool_url().contains(&e.grant.tool_user));
+    let sessions = lock(&e.proxy.inner.shared.sessions);
+    let (cmd, tool) = (sessions.get("s-capture").unwrap(), sessions.get(&e.grant.tool_user).unwrap());
+    assert!(tool.tool && !tool.reference && tool.session == cmd.session);
+    assert!(Arc::ptr_eq(&cmd.permits, &tool.permits) && Arc::ptr_eq(&cmd.lookups, &tool.lookups));
+    assert!(Arc::ptr_eq(&cmd.policy, &tool.policy));
+    assert!(tool.capture.is_none() && tool.inject.is_none());
+}
+
+#[tokio::test]
+async fn a_plain_request_with_the_tool_credential_is_neither_captured_nor_injected() {
+    let mut e = env(cg(1024)).await;
+    set_profile(&e);
+    let (port, heads) = recording_plain_server().await;
+    let req = plain_get(&e, port, "").replace(&auth(&e.grant), &auth(&grant_tool(&e)));
+    let r = plain_via_proxy(&e, req).await;
+    assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+    let sent = lock(&heads).last().cloned().unwrap();
+    assert!(!sent.to_ascii_lowercase().contains("cookie") && !sent.contains("Bearer"), "{sent}");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(e.rx.try_recv().is_err());
+    assert!(lock(&e.proxy.inner.shared.sessions).get(&e.grant.tool_user).unwrap().inject.is_none());
+    // The command credential of the same session still injects and captures.
+    plain_via_proxy(&e, plain_get(&e, port, "")).await;
+    assert!(lock(&heads).last().unwrap().contains("session=ours"));
+    next(&mut e.rx).await;
+}
+
+/// `CONNECT` as `g` (the command or the tool credential); returns the connection after the `200`.
+async fn connect_as(e: &Env, port: u16, g: &SessionGrant) -> TcpStream {
+    let mut s = TcpStream::connect(("127.0.0.1", session_port(e))).await.unwrap();
+    let req = format!("CONNECT 127.0.0.1:{port} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{}\r\n", auth(g));
+    s.write_all(req.as_bytes()).await.unwrap();
+    let mut got = Vec::new();
+    let mut b = [0u8; 1];
+    while !got.ends_with(b"\r\n\r\n") {
+        timeout(T, s.read_exact(&mut b)).await.unwrap().unwrap();
+        got.push(b[0]);
+    }
+    assert!(text(&got).starts_with("HTTP/1.1 200"), "{}", text(&got));
+    s
+}
+
+#[tokio::test]
+async fn a_connect_with_the_tool_credential_is_an_opaque_tunnel_and_captures_nothing() {
+    let mut e = env(intercepting()).await;
+    set_profile(&e);
+    let port = https_server().await;
+    // Through the tool credential the real upstream's certificate answers, which a client trusting only the
+    // loom CA cannot verify.
+    let s = connect_as(&e, port, &grant_tool(&e)).await;
+    let mut roots = RootCertStore::empty();
+    roots.add(e.ca.cert_der()).unwrap();
+    let cfg = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let name = ServerName::try_from("127.0.0.1".to_string()).unwrap();
+    assert!(TlsConnector::from(Arc::new(cfg)).connect(name, s).await.is_err());
+    // Bytes that are not TLS go through untouched, as in any opaque tunnel.
+    let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let eport = echo.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = echo.accept().await {
+            tokio::spawn(async move {
+                let (mut r, mut w) = s.split();
+                let _ = tokio::io::copy(&mut r, &mut w).await;
+            });
+        }
+    });
+    let mut s = connect_as(&e, eport, &grant_tool(&e)).await;
+    s.write_all(b"\x16not really tls").await.unwrap();
+    let mut back = [0u8; 15];
+    timeout(T, s.read_exact(&mut back)).await.unwrap().unwrap();
+    assert_eq!(&back, b"\x16not really tls");
+    drop(s);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(e.rx.try_recv().is_err());
+    // The command credential of the same session is intercepted as before.
+    assert!(tunnel_tls(&e, port, true).await.is_ok());
+}
+
+#[tokio::test]
+async fn set_policy_and_revoke_keep_the_tool_credential_with_the_session() {
+    let e = env(cg(1024)).await;
+    let sid = SessionId::from("s-capture");
+    assert!(e.proxy.set_policy(&sid, lab()));
+    {
+        let sessions = lock(&e.proxy.inner.shared.sessions);
+        let (cmd, tool) = (sessions.get("s-capture").unwrap(), sessions.get(&e.grant.tool_user).unwrap());
+        assert!(Arc::ptr_eq(&cmd.policy, &tool.policy));
+    }
+    // A new grant of the session replaces the tool credential too.
+    let again = e.proxy.grant(&sid, lab()).unwrap();
+    {
+        let sessions = lock(&e.proxy.inner.shared.sessions);
+        assert!(!sessions.contains_key(&e.grant.tool_user));
+        assert!(sessions.contains_key(&again.tool_user));
+    }
+    e.proxy.revoke(&sid);
+    assert!(lock(&e.proxy.inner.shared.sessions).is_empty());
+}
+
+fn scope_of(hosts: &[&str]) -> Scope {
+    let include: Vec<String> = hosts.iter().map(|h| h.to_string()).collect();
+    Scope::parse(&include, &[]).unwrap()
+}
+
+#[tokio::test]
+async fn intercept_scope_intercepts_only_in_scope_connects() {
+    let mut e = env(CaptureGrant { intercept_scope: Some(scope_of(&["127.0.0.1"])), ..intercepting() }).await;
+    let port = https_server().await;
+    let mut s = tunnel_tls(&e, port, true).await.expect("in scope: intercepted");
+    roundtrip(&mut s, "GET /in HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await;
+    let c = next(&mut e.rx).await;
+    assert_eq!((c.transport, c.target.as_str()), (Transport::Intercepted, "/in"));
+    drop(s);
+
+    let mut e = env(CaptureGrant { intercept_scope: Some(scope_of(&["10.9.9.9", "*.acme.test"])), ..intercepting() }).await;
+    // Out of scope: the real certificate answers (the loom CA is not trusted for it) and nothing is captured.
+    assert!(tunnel_tls(&e, port, true).await.is_err());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(e.rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn intercept_scope_captures_nothing_of_an_out_of_scope_plain_request() {
+    let mut e = env(CaptureGrant { intercept_scope: Some(scope_of(&["10.9.9.9"])), ..cg(1024) }).await;
+    let port = plain_server("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await;
+    let r = plain_via_proxy(&e, plain_get(&e, port, "")).await;
+    assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(e.rx.try_recv().is_err());
+    let mut e2 = env(CaptureGrant { intercept_scope: Some(scope_of(&["127.0.0.1"])), ..cg(1024) }).await;
+    plain_via_proxy(&e2, plain_get(&e2, port, "")).await;
+    next(&mut e2.rx).await;
 }
