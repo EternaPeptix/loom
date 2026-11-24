@@ -378,6 +378,21 @@ verification or was written by a newer loom is named as unreadable and nothing f
 else carries over: the earlier mission's stored outputs cannot be opened from the new one, and its
 approvals and network grants do not apply.
 
+### A target
+
+Missions that work on the same thing can share a scope and what they found:
+
+```
+loom target add acme --scope acme.test --scope '*.acme.test' --scope 10.20.0.0/24 --exclude vpn.acme.test
+loom run -w /path/to/workspace --target acme "map the API and test the login"
+loom target show acme --nodes
+```
+
+The scope is reachable from the mission even with `network.mode = "deny_all"`; the excluded entries never
+are. The lead starts with a `# Target acme` section (scope, untested services and endpoints, findings) and
+the next mission against `acme` sees what the earlier ones tested. `loom target scope acme --add HOST
+--remove HOST --exclude HOST` edits it; the target's files are under `~/.loom/targets/acme/`.
+
 Exit status of `run` and `send`: 0 after `Finished` or `Yielded`; 2 when you are needed (`Asked`,
 `Blocked`, `Parked`: the inbox item was printed); 1 after `Stopped`, `BudgetExhausted` or an error.
 

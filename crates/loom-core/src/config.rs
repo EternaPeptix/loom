@@ -1333,6 +1333,10 @@ impl Paths {
     pub fn sessions_dir(&self) -> PathBuf {
         self.home.join("sessions")
     }
+    /// Where the targets live (`{name}/target.toml`, `{name}/graph.jsonl`).
+    pub fn targets_dir(&self) -> PathBuf {
+        self.home.join("targets")
+    }
     pub fn session_dir(&self, id: &SessionId) -> PathBuf {
         self.sessions_dir().join(id_dir(id.as_str()))
     }

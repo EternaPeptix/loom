@@ -9,6 +9,14 @@
   ECDSA P-256, key mode 0600, per-host 24 h leaves, `ca_bundle`), an allowed `CONNECT` is TLS-terminated, relayed
   to a verified (or `upstream_insecure`) upstream and captured request by request; a non-HTTP stream is recorded as
   `TLS`. A session granted with `grant` is relayed exactly as before.
+### Targets
+
+- A target (`~/.loom/targets/{name}`) is a named scope shared across missions with a hash-chained `graph.jsonl`
+  of hosts, services and endpoints, their coverage and findings (CONTRACTS-TRAFFIC-TARGETS T1 to T7).
+  `loom run --target`, the `target` field of `POST /api/sessions`, `loom target list|add|show|scope`,
+  `loom ca show|rotate`, `/api/targets*` and `/api/exchanges/{session}`. The scope joins the mission's network
+  policy (reachable in `deny_all`, exclusions always refused); the lead's prompt gets a `# Target` section and
+  `security_query` has a `target` view. A mission without a target is unchanged.
 
 ### MCP client
 

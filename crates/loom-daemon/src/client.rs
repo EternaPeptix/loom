@@ -71,6 +71,7 @@ use loom_agent::runtime::{
     BusEvent, InboxEntry, LedgerView, MissionInfo, MissionModels, ModelSwitchReceipt, ModelsReload, NetEntry,
     NewSession, RoleModelReceipt, RuleReceipt, ScoreView, SessionInfo, WindowView,
 };
+use loom_agent::runtime::{GraphView, TargetBody, TargetView};
 use loom_core::config::{Config, Paths};
 use loom_core::event::Seq;
 use loom_core::log::record_from_value;
@@ -658,6 +659,28 @@ impl Client {
         self.call(Method::GET, &format!("/api/sessions/{}/net", segment(id.as_str())), &query, None).await
     }
 
+    pub async fn targets(&self) -> Result<Vec<TargetView>, String> {
+        self.call(Method::GET, "/api/targets", &[], None).await
+    }
+
+    pub async fn target(&self, name: &str) -> Result<TargetView, String> {
+        self.call(Method::GET, &format!("/api/targets/{}", segment(name)), &[], None).await
+    }
+
+    pub async fn target_create(&self, body: &TargetBody) -> Result<TargetView, String> {
+        let body = serde_json::to_value(body).map_err(|e| format!("The target cannot be encoded ({e})."))?;
+        self.call(Method::POST, "/api/targets", &[], Some(body)).await
+    }
+
+    pub async fn target_update(&self, name: &str, body: &TargetBody) -> Result<TargetView, String> {
+        let body = serde_json::to_value(body).map_err(|e| format!("The target cannot be encoded ({e})."))?;
+        self.call(Method::PUT, &format!("/api/targets/{}", segment(name)), &[], Some(body)).await
+    }
+
+    pub async fn target_graph(&self, name: &str) -> Result<GraphView, String> {
+        self.call(Method::GET, &format!("/api/targets/{}/graph", segment(name)), &[], None).await
+    }
+
     pub async fn missions(&self) -> Result<Vec<MissionInfo>, String> {
         self.call(Method::GET, "/api/missions", &[], None).await
     }
@@ -992,6 +1015,7 @@ pub(crate) mod testkit {
                 gate: None,
                 prior: Vec::new(),
                 role_models: Default::default(),
+                target: None,
             },
             active: false,
             status: status(Phase::Idle),

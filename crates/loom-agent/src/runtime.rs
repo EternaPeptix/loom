@@ -655,6 +655,8 @@
 
 use crate::pack::{self, Packs, PromptEnv, RoleDef};
 use crate::prior;
+mod target_api;
+mod targets;
 use crate::rtools::{
     self, ChildCopy, ChildInfo, Orchestrator, Producer, Run, Settlement, Shared, SpawnReq, Vote, Workspace,
 };
@@ -694,6 +696,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
+pub use target_api::{ca_rotate, ca_show, ExchangeEntry, GraphView, TargetBody, TargetView};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
@@ -734,6 +737,9 @@ pub struct NewSession {
     /// `docs/UPLOADS.md`). Not written when empty, so a request that names none is accepted by an older daemon.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<String>,
+    /// The name of a target (`~/.loom/targets/{name}`) the mission works on (CONTRACTS-TRAFFIC-TARGETS T2).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
 }
 
 /// `meta.json`: what a session is, fixed when it is created.
@@ -782,6 +788,10 @@ pub struct SessionMeta {
     /// [`Runtime::set_role_model`]). Empty for an agent.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub role_models: BTreeMap<String, String>,
+    /// The target the mission works on, as it was when the lead started (CONTRACTS-TRAFFIC-TARGETS T2):
+    /// an agent inherits it, and a session restored after a restart uses this record, not the target's file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<loom_core::event::TargetRef>,
 }
 
 /// The key of [`SessionMeta::role_models`] that stands for every role the lead starts (`may_spawn`),
@@ -1307,6 +1317,10 @@ pub enum BusEvent {
     /// list again (`Runtime::queued`).
     Queued {
         session: SessionId,
+    },
+    /// The graph of a target changed (sent at most once a second per target): read it again.
+    Target {
+        name: String,
     },
 }
 
@@ -2334,6 +2348,21 @@ const NOT_YOURS: &str = "is not an agent this session started.";
 
 #[async_trait]
 impl Orchestrator for Orch {
+    fn ledger_appended(
+        &self,
+        session: &SessionId,
+        op: &loom_core::ledger::LedgerOp,
+        state: &loom_core::ledger::LedgerState,
+    ) {
+        if let Ok(inner) = self.up() {
+            inner.target_ledger(session, op, state);
+        }
+    }
+
+    fn target_nodes(&self, session: &SessionId) -> Option<Result<(String, Vec<loom_core::target::NodeView>), String>> {
+        self.up().ok()?.target_nodes_of(session)
+    }
+
     async fn spawn(&self, parent: &SessionId, req: SpawnReq) -> Result<SessionId, String> {
         let inner = self.up()?;
         if !req.harness {
@@ -2913,6 +2942,9 @@ impl Inner {
                 self.repeat_notice(&kind, session, &title, &item);
             }
         }
+        if let Event::Exchange(x) = &record.event {
+            self.target_exchange(session, record.ts_ms, x);
+        }
         self.publish(BusEvent::Record { session: session.clone(), record: Box::new(record.clone()) });
     }
 
@@ -3227,13 +3259,18 @@ impl Inner {
                 hosts.push(h);
             }
         }
-        match Policy::with_hosts(&self.config.network, &hosts) {
-            Ok(p) => Ok(p),
+        let policy = match Policy::with_hosts(&self.config.network, &hosts) {
+            Ok(p) => p,
             Err(e) if !hosts.is_empty() => {
                 tracing::warn!(session = %meta.id, "granted hosts ignored: {e}");
-                Policy::new(&self.config.network)
+                Policy::new(&self.config.network)?
             }
-            Err(e) => Err(e),
+            Err(e) => return Err(e),
+        };
+        // The mission target's scope joins the policy, from the record made at the lead's start (T2).
+        match &meta.target {
+            Some(t) => policy.with_target(&t.scope, &t.exclude),
+            None => Ok(policy),
         }
     }
 
@@ -3422,7 +3459,8 @@ impl Inner {
             workspace: deps.ctx.workspace.display().to_string(),
             platform: format!("{} ({})", std::env::consts::OS, std::env::consts::ARCH),
             sandbox: deps.ctx.sandbox.describe(),
-            network: network_text(&self.config),
+            network: targets::network_with_target(network_text(&self.config), meta.target.as_ref()),
+            target: targets::prompt_target(meta),
             // Read now, once: the record below carries them, and the prompt is rendered from this value.
             project_instructions: if self.config.agents.project_instructions {
                 pack::read_project_instructions(&deps.ctx.workspace)
@@ -3451,7 +3489,7 @@ impl Inner {
             unattended: meta.unattended,
             schema: loom_core::event::SCHEMA,
             intercept: false,
-            target: None,
+            target: meta.target.clone(),
             title: meta.title.clone(),
             project_instructions: env.project_instructions,
             mcp: Vec::new(),
@@ -4002,6 +4040,7 @@ impl Inner {
                 archived: false,
                 gate: req.harness.then(|| req.brief.clone()),
                 prior: Vec::new(),
+                target: p.meta.target.clone(),
             };
             let explicit = prole.termination == Termination::Explicit;
             st.known.insert(child_id.clone(), Known::new(meta.clone(), idle_status()));
@@ -5137,6 +5176,8 @@ impl Runtime {
                 check_role_choice(&role, &profile_name, &models, r, p)?;
             }
         }
+        // The target is read once, here: the lead records it (scope and summary) and the agents inherit it.
+        let target = inner.target_ref(new.target.as_deref())?;
         let (model, window, from_config) = inner.facts(&profile_name).await?;
         // The earlier missions to recall can refuse the request too, so they are read before the folder is made.
         let (prior_ids, recalled) = self.recall_earlier(&new.prior).await?;
@@ -5177,6 +5218,7 @@ impl Runtime {
                 gate: None,
                 prior: prior_ids,
                 role_models,
+                target,
             };
             inner.st().known.insert(id.clone(), Known::new(meta.clone(), idle_status()));
             (made, workspace, created, id, meta)
@@ -13778,6 +13820,153 @@ done
         a.unwrap();
         b.unwrap();
         assert!(ws_shared.join(".loom").is_dir());
+        e.rt.shutdown().await;
+    }
+
+    // --- Targets (CONTRACTS-TRAFFIC-TARGETS T) ---
+
+    fn target_body(scope: &[&str], exclude: &[&str]) -> TargetBody {
+        let v = |x: &[&str]| Some(x.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        TargetBody { name: Some("acme".into()), scope: v(scope), exclude: v(exclude), ..Default::default() }
+    }
+
+    fn start_of(e: &Env, id: &SessionId) -> loom_core::event::SessionStart {
+        e.records(id)
+            .into_iter()
+            .find_map(|r| match r.event {
+                Event::SessionStart(s) => Some(s),
+                _ => None,
+            })
+            .expect("session_start")
+    }
+
+    fn exchange(host: &str, method: &str, path: &str) -> loom_core::event::Exchange {
+        serde_json::from_value(json!({
+            "id": "ex-aaaaaaaaaaaa", "source": "tool", "scheme": "https", "tls": "tool", "method": method,
+            "host": host, "port": 443, "target": path,
+            "request": {"id": "b-1", "bytes": 1, "lines": 1}, "request_bytes": 1, "response_bytes": 0,
+            "duration_ms": 1
+        }))
+        .unwrap()
+    }
+
+    fn locators(e: &Env) -> Vec<(String, String)> {
+        let g = e.rt.target_graph("acme", None, None, None).unwrap();
+        g.nodes
+            .iter()
+            .map(|n| (serde_json::to_value(n.status).unwrap().as_str().unwrap().to_string(), n.locator.clone()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_mission_with_a_target_reaches_its_scope_in_deny_all_and_never_its_exclusions() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        e.rt.target_create(&target_body(&["*.acme.test", "acme.test"], &["vpn.acme.test"])).unwrap();
+        let mut new = e.new_session(Some("go"));
+        new.target = Some("acme".into());
+        let info = e.rt.create_session(new).await.unwrap();
+        let id = info.meta.id.clone();
+        let rule = |host: &str| e.rt.inner.proxy.check_name(&id, host, 443).map(|v| (v.allowed, v.rule));
+        assert!(rule("www.acme.test").unwrap().0);
+        assert!(!rule("vpn.acme.test").unwrap().0);
+        assert!(!rule("other.test").unwrap().0);
+        let start = start_of(&e, &id);
+        let t = start.target.expect("target recorded");
+        assert_eq!(t.name, "acme");
+        assert_eq!(t.exclude, vec!["vpn.acme.test"]);
+        assert!(start.system_prompt.contains("\n\n# Target acme\n"), "{}", start.system_prompt);
+        // A mission without a target is unchanged: no section, nothing allowed.
+        let plain = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
+        let ps = start_of(&e, &plain.meta.id);
+        assert!(ps.target.is_none() && !ps.system_prompt.contains("# Target"));
+        assert!(!e.rt.inner.proxy.check_name(&plain.meta.id, "www.acme.test", 443).unwrap().allowed);
+        // An unknown target or an invalid name is refused with a sentence.
+        let mut bad = e.new_session(None);
+        bad.target = Some("nope".into());
+        assert!(e.rt.create_session(bad).await.unwrap_err().contains("no target"));
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn target_graph_is_written_from_exchanges_assets_coverage_and_claims_in_scope_only() {
+        use loom_core::ledger::{Claim, ClaimStatus, LedgerOp, LedgerState};
+        use loom_core::security_state::SecurityOp;
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        e.rt.target_create(&target_body(&["*.acme.test", "acme.test"], &["vpn.acme.test"])).unwrap();
+        let mut new = e.new_session(Some("go"));
+        new.target = Some("acme".into());
+        let one = e.rt.create_session(new).await.unwrap().meta.id;
+        let inner = &e.rt.inner;
+
+        // An exchange: host, service, endpoint with a path template; out of scope and excluded: nothing.
+        inner.target_exchange(&one, 5, &exchange("WWW.acme.test", "get", "/users/42/orders?x=1"));
+        inner.target_exchange(&one, 6, &exchange("evil.example", "GET", "/"));
+        inner.target_exchange(&one, 7, &exchange("vpn.acme.test", "GET", "/"));
+        let seen = locators(&e);
+        let has = |l: &str| seen.iter().any(|(_, x)| x == l);
+        assert!(has("www.acme.test") && has("www.acme.test:443/tcp"), "{seen:?}");
+        assert!(has("GET https://www.acme.test:443/users/{id}/orders"), "{seen:?}");
+        assert!(!seen.iter().any(|(_, x)| x.contains("evil") || x.contains("vpn")), "{seen:?}");
+
+        // An asset_upsert and a coverage_set of the security state, as the ledger took them.
+        let mut state = LedgerState::default();
+        let ops: Vec<SecurityOp> = vec![
+            serde_json::from_value(
+                json!({"action":"asset_upsert","asset":{"kind":"host","locator":"api.acme.test","evidence":[]}}),
+            )
+            .unwrap(),
+            serde_json::from_value(
+                json!({"action":"asset_upsert","asset":{"kind":"host","locator":"evil.example","evidence":[]}}),
+            )
+            .unwrap(),
+        ];
+        for (i, op) in ops.iter().enumerate() {
+            state.security.apply(op, i as u64 + 1, &one);
+            inner.target_ledger(&one, &LedgerOp::Security(op.clone()), &state);
+        }
+        let api = state.security.assets.values().find(|a| a.locator == "api.acme.test").unwrap().id.clone();
+        let cov: SecurityOp = serde_json::from_value(
+            json!({"action":"coverage_set","asset":api,"disposition":{"status":"deferred","reason":"later"}}),
+        )
+        .unwrap();
+        state.security.apply(&cov, 3, &one);
+        inner.target_ledger(&one, &LedgerOp::Security(cov), &state);
+        let g = e.rt.target_graph("acme", None, None, None).unwrap();
+        let api_node = g.nodes.iter().find(|n| n.locator == "api.acme.test").expect("asset written");
+        assert_eq!(serde_json::to_value(api_node.status).unwrap(), "deferred");
+        assert!(!g.nodes.iter().any(|n| n.locator.contains("evil")));
+
+        // A supported claim naming an in-scope host becomes a finding; withdrawn, it stops counting.
+        state.claims.push(Claim {
+            id: "c1".into(),
+            text: "api.acme.test accepts any token".into(),
+            status: ClaimStatus::Supported,
+            note: String::new(),
+            evidence: vec![],
+        });
+        let upd = |status| LedgerOp::ClaimUpdate { id: "c1".into(), status, note: String::new() };
+        inner.target_ledger(&one, &upd(ClaimStatus::Supported), &state);
+        let status_of = || {
+            let g = e.rt.target_graph("acme", None, None, None).unwrap();
+            serde_json::to_value(g.nodes.iter().find(|n| n.locator == "api.acme.test").unwrap().status).unwrap()
+        };
+        assert_eq!(status_of(), "finding");
+        state.claims[0].status = ClaimStatus::Withdrawn;
+        inner.target_ledger(&one, &upd(ClaimStatus::Withdrawn), &state);
+        assert_eq!(status_of(), "deferred");
+        assert!(inner.target_store().verify("acme").unwrap());
+
+        // A second mission of the target sees the first one's work at its start, and the first one's
+        // recorded summary does not change.
+        let before = start_of(&e, &one).target.unwrap().summary;
+        let mut new = e.new_session(Some("go"));
+        new.target = Some("acme".into());
+        let two = e.rt.create_session(new).await.unwrap().meta.id;
+        let s2 = start_of(&e, &two).target.unwrap().summary;
+        assert!(s2.contains("GET https://www.acme.test:443/users/{id}/orders"), "{s2}");
+        assert!(s2.contains("Known: 1 domain, 2 hosts"), "{s2}");
+        assert_ne!(before, s2);
+        assert_eq!(start_of(&e, &one).target.unwrap().summary, before);
         e.rt.shutdown().await;
     }
 }

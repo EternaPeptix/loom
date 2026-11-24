@@ -1151,6 +1151,53 @@ pub fn net_table(entries: &[NetEntry], style: &Style) -> String {
     table(style, &["TIME", "VERDICT", "METHOD", "HOST:PORT", "RULE"], &rows)
 }
 
+fn counts_line(v: &loom_agent::runtime::TargetView) -> String {
+    ["finding", "tested", "deferred", "untested", "not_seen"]
+        .iter()
+        .map(|k| format!("{} {}", k.replace('_', " "), v.counts.get(*k).copied().unwrap_or(0)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// `loom target list`: one line per target.
+pub fn target_list(list: &[loom_agent::runtime::TargetView]) -> String {
+    let mut out = String::new();
+    for v in list {
+        out.push_str(&format!("{}  {} scope entries  {}\n", v.name, v.scope.len(), counts_line(v)));
+    }
+    out
+}
+
+/// `loom target show`: the settings and the counts.
+pub fn target_show(v: &loom_agent::runtime::TargetView) -> String {
+    let mut out = format!("{}\nscope: {}\n", v.name, v.scope.join(", "));
+    if !v.exclude.is_empty() {
+        out.push_str(&format!("exclude: {}\n", v.exclude.join(", ")));
+    }
+    if !v.upstream_insecure.is_empty() {
+        out.push_str(&format!("upstream_insecure: {}\n", v.upstream_insecure.join(", ")));
+    }
+    if !v.intercept_passthrough.is_empty() {
+        out.push_str(&format!("intercept_passthrough: {}\n", v.intercept_passthrough.join(", ")));
+    }
+    if !v.notes.trim().is_empty() {
+        out.push_str(&format!("notes: {}\n", flat(&v.notes)));
+    }
+    out.push_str(&format!("nodes: {}\n", counts_line(v)));
+    out
+}
+
+/// `loom target show --nodes`: each node with its status.
+pub fn target_nodes(g: &loom_agent::runtime::GraphView) -> String {
+    let mut out = String::new();
+    for n in &g.nodes {
+        let status =
+            serde_json::to_value(n.status).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
+        out.push_str(&format!("{status:<10} {}\n", flat(&n.locator)));
+    }
+    out
+}
+
 pub fn score_table(view: &ScoreView, style: &Style) -> String {
     let mut header = vec!["SESSION".to_string(), "ROLE".to_string()];
     header.extend(COLUMNS.iter().map(|c| c.to_uppercase()));
@@ -1987,6 +2034,7 @@ mod tests {
             gate: None,
             prior: Vec::new(),
             role_models: Default::default(),
+            target: None,
         }
     }
 

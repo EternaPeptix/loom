@@ -1795,6 +1795,38 @@ as workspace content.
   `LOOM_LANE` gives a run its own source copy and target directory on that host). Set
   `LOOM_BUILD_HOST` before using it: unset, the script falls back to a host name of its author's.
 
+## Targets (`loom-core::target`, `loom-agent::runtime::targets`)
+
+A target is a named scope that missions share, with a graph of what they found (CONTRACTS-TRAFFIC-TARGETS T).
+
+- **Files (T1).** `~/.loom/targets/{name}/` (name `[a-z0-9][a-z0-9_-]{0,63}`) holds `target.toml` (`scope`,
+  `exclude`, `upstream_insecure`, `intercept_passthrough`, `notes`) and `graph.jsonl`, append-only and
+  hash-chained like the session log (`prev` is the SHA-256 of the previous line), written under an exclusive
+  lock (`graph.lock`) so several missions can append. A scope entry is a host, a `*.` glob, an IP or a CIDR;
+  `exclude` wins. Entries are validated when a target is written; a bad one is refused by name.
+- **Naming it (T2).** A mission names one target at start (`target` in the `POST /api/sessions` body,
+  `loom run --target NAME`). The lead's `session_start.target` records the scope, settings and the summary as of
+  that start; children inherit it; a restored session uses its record, never the file. The scope joins the
+  mission's network policy in every mode but `open`: scope hosts, IPs and CIDR blocks are reachable even in
+  `deny_all`, and `exclude` is refused whatever else would allow it (`open` included). The start note's network
+  sentence says so. A mission without a target is unchanged, byte for byte.
+- **Graph (T3).** Nodes `domain`, `host`, `ip`, `service` (`host:port/proto`), `endpoint`
+  (`METHOD scheme://host:port/path-template`; numeric, UUID-like and long hex segments become `{id}`); edges
+  `parent`, `resolves`, `runs`, `serves`. Node ids are the security state's asset ids of the same kind and
+  locator. Lines are `node_seen`, `edge`, `coverage`, `finding`.
+- **Writes (T4).** From the runtime, synchronously with the record that caused them: an `exchange` record of a
+  bound mission, a security `asset_upsert` (host, service, endpoint), a `coverage_set` (tested or deferred), and a
+  claim update to supported, withdrawn or refuted that names hosts (`claim_hosts`). Out-of-scope and excluded
+  hosts are never written.
+- **Reading (T5, T6).** Status of a node: `finding` if any open finding, else `tested`, else `deferred`, else
+  `untested`; scope entries with no node are `not_seen`. The lead's system prompt gets `# Target {name}` with the
+  scope and a deterministic summary of at most 8 KiB (counts, untested services and endpoints most recent first,
+  at most 40; findings, at most 20), computed once at the start and recorded. `security_query` view `target`
+  (filters `kind`, `status`, `under`, `max`) reads the live graph.
+- **API (T7).** `GET/POST /api/targets`, `GET/PUT /api/targets/{name}`, `GET /api/targets/{name}/graph`,
+  `GET /api/targets/{name}/exchanges`, `GET /api/exchanges/{session}`; `loom target list|add|show|scope`,
+  `loom ca show|rotate`. The SSE stream sends `{type:"target", name}` at most once a second per target.
+
 ## Security workflow extensions
 
 Typed asset/credential/foothold records, coverage, revisit triggers and facts live in the sealed mission journal; see `docs/SECURITY_STATE.md`. They are
