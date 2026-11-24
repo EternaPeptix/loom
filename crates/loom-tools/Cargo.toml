@@ -42,3 +42,6 @@ testutil = ["dep:tempfile"]
 [dev-dependencies]
 tempfile.workspace = true
 axum.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true

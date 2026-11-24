@@ -29,6 +29,11 @@ pub struct SessionTools {
     /// The proxy URL with the session's tool credential (S9), set by the runtime; unset = the command proxy
     /// from `ToolCtx::env` (tests and callers without a runtime).
     pub tool_proxy: OnceLock<String>,
+    /// The mission target's `upstream_insecure` list (CONTRACTS-TRAFFIC-TARGETS S12), set by the runtime for a
+    /// session with a target; unset = every certificate is verified.
+    pub upstream_insecure: OnceLock<Vec<String>>,
+    /// The mission target's scope, set with `upstream_insecure`; only used to word a certificate failure (S13).
+    pub target_scope: OnceLock<loom_core::target::Scope>,
 }
 
 impl Default for SessionTools {
@@ -50,6 +55,8 @@ impl SessionTools {
             creds: OnceLock::new(),
             secrets: OnceLock::new(),
             tool_proxy: OnceLock::new(),
+            upstream_insecure: OnceLock::new(),
+            target_scope: OnceLock::new(),
         }
     }
 }

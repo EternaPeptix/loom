@@ -187,6 +187,7 @@
 //! when they have already been relayed.
 
 mod intercept;
+pub use self::intercept::listed as host_listed;
 
 use self::intercept::{CaptureCfg, Tap};
 use crate::policy::{is_local_literal, normalize_host, Policy, Verdict};

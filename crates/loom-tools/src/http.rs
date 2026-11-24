@@ -321,8 +321,10 @@ fn expand(s: &str, vars: &BTreeMap<String, Variable>, origin: &str) -> Result<St
     Ok(result)
 }
 
-pub(crate) fn client(ctx: &ToolCtx, jar: Arc<Jar>) -> Result<Client, String> {
+/// `insecure`: do not verify the server certificate (S12; the caller asks `web::insecure_for_str`).
+pub(crate) fn client(ctx: &ToolCtx, jar: Arc<Jar>, insecure: bool) -> Result<Client, String> {
     let mut b = Client::builder()
+        .danger_accept_invalid_certs(insecure)
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .pool_max_idle_per_host(0)
@@ -669,7 +671,10 @@ async fn exchange(
     let response = match client.request(method, url.clone()).headers(headers).body(body).send().await {
         Ok(r) => r,
         Err(e) => {
-            let msg = format!("HTTP exchange failed: {e}. Consult the session egress log for proxy decisions.");
+            let msg = format!(
+                "HTTP exchange failed: {}. Consult the session egress log for proxy decisions.",
+                crate::web::transport_error(ctx, &url, &e)
+            );
             if let Some((tool, out)) = sink {
                 let made = crate::traffic::Made {
                     tool,
@@ -680,6 +685,7 @@ async fn exchange(
                     status: None,
                     error: Some(msg.clone()),
                     response_cut: false,
+                    unverified: crate::web::insecure_for(ctx, &url),
                     started,
                 };
                 if let Some(x) = crate::traffic::record(ctx, &made) {
@@ -714,7 +720,7 @@ async fn exchange(
                 body.extend_from_slice(&c);
             }
             Err(e) => {
-                read_error = Some(e.to_string());
+                read_error = Some(crate::web::error_chain(&e));
                 break;
             }
         }
@@ -734,6 +740,7 @@ async fn exchange(
             status: Some(status),
             error: read_error.clone(),
             response_cut: truncated,
+            unverified: crate::web::insecure_for(ctx, &url),
             started,
         };
         if let Some(x) = crate::traffic::record(ctx, &made) {
@@ -804,7 +811,7 @@ async fn run(ctx: &ToolCtx, tool: &str, mut r: Request, args: &Map<String, Value
     }
     let principal = principal_tag(&jar, &parsed_url, &r);
     let jar_for_inject = jar.clone();
-    let client = match client(ctx, jar) {
+    let client = match client(ctx, jar, crate::web::insecure_for(ctx, &parsed_url)) {
         Ok(c) => c,
         Err(e) => return ToolOutput::error(e),
     };

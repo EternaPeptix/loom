@@ -142,7 +142,48 @@ impl Tool for WebFetch {
 /// A client that never follows redirects itself, keeps no idle connection, uses the session's proxy if
 /// there is one, and reads nothing from the process environment.
 pub(crate) fn build_client(ctx: &ToolCtx) -> Result<Client, String> {
-    build_client_with_proxy(session_proxy(ctx).map(str::to_string))
+    build_client_for(ctx, false)
+}
+
+/// [`build_client`], optionally not verifying the server certificate (S12; see [`insecure_for`]).
+pub(crate) fn build_client_for(ctx: &ToolCtx, insecure: bool) -> Result<Client, String> {
+    build_client_with_proxy(session_proxy(ctx).map(str::to_string), insecure)
+}
+
+/// Whether a request to `url` is sent without verifying the server's certificate (S12): the URL is `https`
+/// and its host and port (`port_or_known_default`) are on the target's `upstream_insecure` list, which the
+/// runtime set on this session. Only `http_send`, `http_repeat`, `web_fetch` and the oracle ask; the
+/// reference path, `cve`, `dep_scan` and MCP build verifying clients and never do.
+pub(crate) fn insecure_for(ctx: &ToolCtx, url: &Url) -> bool {
+    let Some(list) = ctx.capabilities.upstream_insecure.get() else { return false };
+    match (url.scheme(), url.host_str(), url.port_or_known_default()) {
+        ("https", Some(host), Some(port)) => loom_net::host_listed(list, host, port),
+        _ => false,
+    }
+}
+
+/// [`insecure_for`] for a URL still in text (an unparsable one is verified, and fails later anyway).
+pub(crate) fn insecure_for_str(ctx: &ToolCtx, url: &str) -> bool {
+    Url::parse(url).is_ok_and(|u| insecure_for(ctx, &u))
+}
+
+/// The text of a failed in-process request (S13): the error and its causes (see [`error_chain`]); for a
+/// certificate failure on a host in the target's scope that is not listed in `upstream_insecure`, the
+/// sentence that tells the model what the operator can do. A certificate failure is recognised by the word
+/// `certificate` in a cause (rustls: `invalid peer certificate: UnknownIssuer`), not in the error's own
+/// text, which names the URL.
+pub(crate) fn transport_error(ctx: &ToolCtx, url: &Url, e: &(dyn std::error::Error + 'static)) -> String {
+    let mut text = error_chain(e);
+    if let (Some(host), Some(scope)) = (url.host_str(), ctx.capabilities.target_scope.get()) {
+        if url.scheme() == "https"
+            && causes(e).to_lowercase().contains("certificate")
+            && !insecure_for(ctx, url)
+            && scope.contains(host)
+        {
+            text.push_str(&format!(". The server's certificate did not verify; the operator can list {host} in the target's upstream_insecure if it is a lab host with a self-signed certificate."));
+        }
+    }
+    text
 }
 
 pub(crate) fn reference_proxy(ctx: &ToolCtx, url: &Url) -> Option<String> {
@@ -155,11 +196,12 @@ pub(crate) fn reference_proxy(ctx: &ToolCtx, url: &Url) -> Option<String> {
 }
 
 pub(crate) fn reference_client(ctx: &ToolCtx, url: &Url) -> Result<Option<Client>, String> {
-    reference_proxy(ctx, url).map(|p| build_client_with_proxy(Some(p))).transpose()
+    reference_proxy(ctx, url).map(|p| build_client_with_proxy(Some(p), false)).transpose()
 }
 
-fn build_client_with_proxy(proxy_url: Option<String>) -> Result<Client, String> {
+fn build_client_with_proxy(proxy_url: Option<String>, insecure: bool) -> Result<Client, String> {
     let mut builder = Client::builder()
+        .danger_accept_invalid_certs(insecure)
         .redirect(redirect::Policy::none())
         .no_proxy()
         .pool_max_idle_per_host(0)
@@ -254,7 +296,7 @@ impl Tunnel {
 /// The causes of an error as one line, without the error's own text: for a request error that names
 /// the URL, whose words say nothing about the stage that failed.
 pub(crate) fn causes(e: &(dyn std::error::Error + 'static)) -> String {
-    e.source().map(describe).unwrap_or_default()
+    e.source().map(error_chain).unwrap_or_default()
 }
 
 /// Whether lowercased error causes (see [`causes`]) name a TLS or certificate failure.
@@ -277,8 +319,8 @@ fn denied(text: &str, status: u16) -> ToolOutput {
     ))
 }
 
-/// The error and its causes, as one line.
-fn describe(e: &(dyn std::error::Error + 'static)) -> String {
+/// The error and its causes, `: `-joined, a cause whose text the line already holds left out (S13).
+pub(crate) fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
     let mut parts = vec![e.to_string()];
     let mut source = e.source();
     while let Some(s) = source {
@@ -293,8 +335,8 @@ fn describe(e: &(dyn std::error::Error + 'static)) -> String {
 
 /// `tunnel`: for an https request through the egress proxy that failed to connect, what the proxy
 /// said about the destination afterwards.
-fn request_error(e: &reqwest::Error, url: &Url, hops: &[Url], tunnel: Option<&Tunnel>) -> ToolOutput {
-    let detail = describe(e);
+fn request_error(ctx: &ToolCtx, e: &reqwest::Error, url: &Url, hops: &[Url], tunnel: Option<&Tunnel>) -> ToolOutput {
+    let detail = transport_error(ctx, url, e);
     let lower = causes(e).to_lowercase();
     let has = |words: &[&str]| words.iter().any(|w| lower.contains(w));
     let (stage, advice) = if e.is_timeout() {
@@ -354,6 +396,7 @@ async fn follow(
     made: &mut Vec<loom_core::event::Exchange>,
 ) -> ToolOutput {
     let mut hops = vec![start];
+    let mut loose: Option<Client> = None;
     loop {
         let current = hops.last().cloned().unwrap_or_else(|| hops[0].clone());
         if !current.username().is_empty() || current.password().is_some() {
@@ -366,7 +409,19 @@ async fn follow(
             Err(e) => return ToolOutput::error(e),
         };
         *via_reference = reference.is_some();
-        let client = reference.as_ref().unwrap_or(client);
+        // S12: decided again on every hop's own URL; the reference path always verifies.
+        let insecure = reference.is_none() && insecure_for(ctx, &current);
+        if insecure && loose.is_none() {
+            loose = match build_client_for(ctx, true) {
+                Ok(c) => Some(c),
+                Err(e) => return ToolOutput::error(e),
+            };
+        }
+        let client = match (&reference, &loose) {
+            (Some(r), _) => r,
+            (None, Some(l)) if insecure => l,
+            _ => client,
+        };
         let proxied = session_proxy(ctx).is_some() || reference.is_some();
         // The proxy answers the CONNECT of an https URL out of the client's sight, so it is asked first.
         let tunnelled = proxied && current.scheme() == "https";
@@ -400,7 +455,7 @@ async fn follow(
             // A refused CONNECT looks like any failure to connect: the proxy is asked again (see [`Tunnel`]).
             Err(e) if tunnelled && e.is_connect() && !names_tls_failure(&e) => {
                 return match verdict(proxy_verdict(client, &current).await, &current) {
-                    Ok(tunnel) => request_error(&e, &current, &hops, Some(&tunnel)),
+                    Ok(tunnel) => request_error(ctx, &e, &current, &hops, Some(&tunnel)),
                     Err(out) => *out,
                 };
             }
@@ -412,12 +467,13 @@ async fn follow(
                     request: &req_wire,
                     response: None,
                     status: None,
-                    error: Some(describe(&e)),
+                    error: Some(transport_error(ctx, &current, &e)),
                     response_cut: false,
+                    unverified: insecure,
                     started,
                 };
                 made.extend(traffic::record(ctx, &made_one));
-                return request_error(&e, &current, &hops, None);
+                return request_error(ctx, &e, &current, &hops, None);
             }
         };
         if resp.status().is_redirection() {
@@ -432,6 +488,7 @@ async fn follow(
                 status: Some(resp.status().as_u16()),
                 error: None,
                 response_cut: false,
+                unverified: insecure,
                 started,
             };
             made.extend(traffic::record(ctx, &made_one));
@@ -461,7 +518,7 @@ async fn follow(
                 continue;
             }
         }
-        return finish(ctx, resp, &hops, raw, proxied, (&req_wire, started, made)).await;
+        return finish(ctx, resp, &hops, raw, proxied, insecure, (&req_wire, started, made)).await;
     }
 }
 
@@ -485,7 +542,7 @@ async fn read_body(resp: reqwest::Response, limit: usize) -> (Vec<u8>, Ended) {
                 }
                 buf.extend_from_slice(&c);
             }
-            Err(e) => return (buf, Ended::Failed(describe(&e))),
+            Err(e) => return (buf, Ended::Failed(error_chain(&e))),
         }
     }
     (buf, Ended::Complete)
@@ -510,6 +567,7 @@ async fn finish(
     hops: &[Url],
     raw: bool,
     proxied: bool,
+    unverified: bool,
     (req_wire, started, made): (&[u8], std::time::Instant, &mut Vec<loom_core::event::Exchange>),
 ) -> ToolOutput {
     let status = resp.status();
@@ -539,6 +597,7 @@ async fn finish(
                 _ => None,
             },
             response_cut: matches!(ended, Ended::Limit),
+            unverified,
             started,
         };
         made.extend(traffic::record(ctx, &made_one));
@@ -1117,18 +1176,20 @@ mod tests {
         };
         // Inside the tunnel of an https URL only the origin speaks: its 403 is an observation.
         let https = [Url::parse("https://origin.test/x").unwrap()];
-        let r = finish(&e.ctx, answer(), &https, false, true, (b"", std::time::Instant::now(), &mut Vec::new())).await;
+        let r = finish(&e.ctx, answer(), &https, false, true, false, (b"", std::time::Instant::now(), &mut Vec::new()))
+            .await;
         assert_eq!(
             (r.status, r.outcome.as_str(), raw_body(&r).as_str()),
             (ToolStatus::Ok, "HTTP 403", "origin says no")
         );
         // The answer to an http URL through the proxy is the proxy's.
         let http = [Url::parse("http://origin.test/x").unwrap()];
-        let r = finish(&e.ctx, answer(), &http, false, true, (b"", std::time::Instant::now(), &mut Vec::new())).await;
+        let r = finish(&e.ctx, answer(), &http, false, true, false, (b"", std::time::Instant::now(), &mut Vec::new()))
+            .await;
         assert_eq!(r.status, ToolStatus::Denied);
         // Without a proxy there is no proxy to answer.
         assert_eq!(
-            finish(&e.ctx, answer(), &http, false, false, (b"", std::time::Instant::now(), &mut Vec::new()))
+            finish(&e.ctx, answer(), &http, false, false, false, (b"", std::time::Instant::now(), &mut Vec::new()))
                 .await
                 .status,
             ToolStatus::Ok

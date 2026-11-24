@@ -420,6 +420,7 @@ fn host_patterns() {
     assert!(listed(&l(&["10.0.0.1:8443"]), "10.0.0.1", 8443));
     assert!(!listed(&l(&["10.0.0.1:8443"]), "10.0.0.1", 443));
     assert!(!listed(&[], "x", 1));
+    assert!(crate::host_listed(&l(&["*.example.com"]), "a.example.com", 443));
 }
 
 // ---- credential profiles (CONTRACTS-TRAFFIC-TARGETS S3, S9, S2) ----

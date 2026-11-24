@@ -2028,6 +2028,10 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 #[cfg(test)]
 static PANIC_TITLES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
+/// The in-process tool state each session was given (tests only).
+#[cfg(test)]
+static SESSION_TOOLS: Mutex<Vec<(SessionId, Arc<loom_tools::capabilities::SessionTools>)>> = Mutex::new(Vec::new());
+
 /// Every agent a `Resume` was sent to, once per `Resume` (tests only).
 #[cfg(test)]
 static RESUMES: Mutex<Vec<SessionId>> = Mutex::new(Vec::new());
@@ -3495,6 +3499,18 @@ impl Inner {
         }
         // S9: in-process clients reach the proxy with the tool credential, which is never intercepted.
         let _ = capabilities.tool_proxy.set(grant.tool_url());
+        // S12: the target's `upstream_insecure` and scope reach the in-process tools; no target, nothing set.
+        if let Some(t) = &meta.target {
+            let _ = capabilities.upstream_insecure.set(t.upstream_insecure.clone());
+            match loom_core::target::Scope::parse(&t.scope, &t.exclude) {
+                Ok(scope) => {
+                    let _ = capabilities.target_scope.set(scope);
+                }
+                Err(e) => {
+                    tracing::warn!(target = %t.name, "the target scope does not parse, certificate hints off: {e}")
+                }
+            }
+        }
         // S11: the mission's profile items, shared by its sessions, reach the proxy and the tools.
         if let Some((inject, secrets)) = self.mission_creds(meta) {
             self.proxy.set_inject(id, Some(inject.clone()));
@@ -3502,6 +3518,8 @@ impl Inner {
             let _ = capabilities.secrets.set(secrets.clone());
             let _ = traffic.secrets.set(secrets);
         }
+        #[cfg(test)]
+        lock(&SESSION_TOOLS).push((id.clone(), capabilities.clone()));
         let ctx = ToolCtx {
             session: id.clone(),
             call_id: CallId::from(""),
@@ -14285,6 +14303,29 @@ done
         }
         assert_eq!(before, count(&e), "a refused start must create nothing");
         assert!(e.rt.sessions(true).is_empty());
+        e.rt.shutdown().await;
+    }
+
+    fn tools_of(id: &SessionId) -> Arc<loom_tools::capabilities::SessionTools> {
+        lock(&SESSION_TOOLS).iter().rev().find(|(s, _)| s == id).map(|(_, t)| t.clone()).expect("session tools")
+    }
+
+    #[tokio::test]
+    async fn a_target_session_gets_upstream_insecure_and_the_scope_and_one_without_a_target_gets_none() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let mut body = target_body(&["*.acme.test", "127.0.0.1"], &["no.acme.test"]);
+        body.upstream_insecure = Some(vec!["127.0.0.1".into(), "*.lab.acme.test".into()]);
+        e.rt.target_create(&body).unwrap();
+        let mut new = e.new_session(Some("go"));
+        new.target = Some("acme".into());
+        let lead = e.rt.create_session(new).await.unwrap().meta.id;
+        let t = tools_of(&lead);
+        assert_eq!(t.upstream_insecure.get().cloned(), Some(vec!["127.0.0.1".to_string(), "*.lab.acme.test".into()]));
+        let scope = t.target_scope.get().expect("scope");
+        assert!(scope.contains("www.acme.test") && !scope.contains("no.acme.test"));
+        let plain = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
+        let t = tools_of(&plain);
+        assert!(t.upstream_insecure.get().is_none() && t.target_scope.get().is_none());
         e.rt.shutdown().await;
     }
 

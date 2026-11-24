@@ -15,4 +15,6 @@ pub mod tls;
 pub use capture::{CaptureGrant, CaptureSink, Captured, Transport};
 pub use inject::Inject;
 pub use policy::{Policy, Verdict};
-pub use proxy::{AuditFn, Limits, Proxy, ProxyError, ReferenceGrant, SessionGrant, CHECK_METHOD, RULE_HEADER};
+pub use proxy::{
+    host_listed, AuditFn, Limits, Proxy, ProxyError, ReferenceGrant, SessionGrant, CHECK_METHOD, RULE_HEADER,
+};

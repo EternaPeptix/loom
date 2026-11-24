@@ -58,7 +58,7 @@ pub(super) struct CaptureCfg {
 }
 
 /// Whether `host:port` is named by one of `patterns`: `host`, `host:port`, `*` or `*.suffix` (any depth).
-pub(super) fn listed(patterns: &[String], host: &str, port: u16) -> bool {
+pub fn listed(patterns: &[String], host: &str, port: u16) -> bool {
     let host = normalize_host(host);
     patterns.iter().any(|p| {
         let p = p.trim();

@@ -1050,6 +1050,9 @@ pub mod testutil {
 mod creds_tests;
 
 #[cfg(test)]
+mod tls_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

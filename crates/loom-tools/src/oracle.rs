@@ -350,7 +350,7 @@ async fn check(ctx: &ToolCtx, contract: Contract, candidate: &[u8]) -> Result<Va
             let nonce = format!("{:032x}", rand::random::<u128>());
             let candidate_hash = hex::encode(Sha256::digest(candidate));
             let r:crate::http::Request=serde_json::from_value(json!({"url":endpoint,"method":"POST","json":{"nonce":nonce,"candidate_sha256":candidate_hash,"candidate_base64":STANDARD.encode(candidate)}})).map_err(|e|e.to_string())?;
-            let client = crate::http::client(ctx, Default::default())?;
+            let client = crate::http::client(ctx, Default::default(), crate::web::insecure_for_str(ctx, &r.url))?;
             let exchange = crate::http::one(ctx, &client, &r).await?;
             if exchange.truncated || exchange.read_error.is_some() || exchange.status != 200 {
                 return Err("The trusted supervisor did not return a complete HTTP 200 response.".into());
@@ -402,8 +402,9 @@ async fn check(ctx: &ToolCtx, contract: Contract, candidate: &[u8]) -> Result<Va
             if success_body_regex.trim().is_empty() {
                 return Err("Differential contract requires an operator-pinned success-body criterion.".into());
             }
-            let client = crate::http::client(ctx, Default::default())?;
-            let control_client = crate::http::client(ctx, Default::default())?;
+            let client = crate::http::client(ctx, Default::default(), crate::web::insecure_for_str(ctx, &attack.url))?;
+            let control_client =
+                crate::http::client(ctx, Default::default(), crate::web::insecure_for_str(ctx, &control.url))?;
             let a = crate::http::one(ctx, &client, &attack).await?;
             let c = crate::http::one(ctx, &control_client, &control).await?;
             let normalize = normalize_regex.map(|s| regex::Regex::new(&s)).transpose().map_err(|e| e.to_string())?;

@@ -103,6 +103,8 @@ pub struct Made<'a> {
     pub error: Option<String>,
     /// The tool itself cut the response body (its own read limit).
     pub response_cut: bool,
+    /// The request was sent without verifying the server certificate (S12).
+    pub unverified: bool,
     pub started: Instant,
 }
 
@@ -149,7 +151,7 @@ pub fn record(ctx: &ToolCtx, made: &Made<'_>) -> Option<Exchange> {
         request_bytes: request_msg.len() as u64,
         response_bytes: response_msg.as_ref().map_or(0, |r| r.len() as u64),
         truncated: req_cut || resp_cut || made.response_cut,
-        upstream_unverified: false,
+        upstream_unverified: made.unverified,
         duration_ms: made.started.elapsed().as_millis() as u64,
     })
 }

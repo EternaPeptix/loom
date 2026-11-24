@@ -225,6 +225,7 @@ fn traffic_record_redacts_both_messages() {
         status: Some(200),
         error: Some(format!("failed with {COOKIE_VALUE}")),
         response_cut: false,
+        unverified: false,
         started: std::time::Instant::now(),
     };
     let x = traffic::record(&e.ctx, &made).unwrap();
@@ -248,6 +249,7 @@ fn traffic_record_keeps_everything_without_secrets() {
         status: None,
         error: None,
         response_cut: false,
+        unverified: false,
         started: std::time::Instant::now(),
     };
     let x = traffic::record(&e.ctx, &made).unwrap();
