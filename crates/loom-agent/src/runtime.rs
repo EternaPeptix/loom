@@ -10138,7 +10138,6 @@ done
     }
 
     #[tokio::test]
-    #[ignore = "needs CONTRACTS-MCP M2 (merged separately)"]
     async fn the_lead_records_the_listing_and_the_note_once_and_a_child_and_a_reopened_session_reuse_it() {
         let dir = tempfile::tempdir().unwrap();
         let script = fake_mcp_script(dir.path(), "echo other");
@@ -10151,6 +10150,8 @@ done
         })
         .await;
         let id = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
+        // A new session is idle before its first turn starts: wait for the turn to end, then for idle.
+        until("lead turn end", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { .. }))).await;
         until("lead idle", || e.rt.session(&id).is_some_and(|s| s.status.phase == Phase::Idle)).await;
         let start = mcp_start(&e, &id);
         assert_eq!(start.mcp.len(), 1);
@@ -10188,7 +10189,6 @@ done
     }
 
     #[tokio::test]
-    #[ignore = "needs CONTRACTS-MCP M2 (merged separately)"]
     async fn a_failed_server_is_recorded_with_its_error_and_no_tools() {
         let e = env_with(Script::new(|_, _| finish("ok")), false, |c| {
             let s = loom_core::config::McpServerCfg {
@@ -10207,7 +10207,6 @@ done
     }
 
     #[tokio::test]
-    #[ignore = "needs CONTRACTS-MCP M2 (merged separately)"]
     async fn a_resolved_secret_is_in_no_record() {
         let dir = tempfile::tempdir().unwrap();
         let script = fake_mcp_script(dir.path(), "echo");

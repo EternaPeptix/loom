@@ -3448,7 +3448,6 @@ done
     }
 
     #[tokio::test]
-    #[ignore = "needs CONTRACTS-MCP M2 (merged separately)"]
     async fn mcp_session_route_lists_the_servers_of_a_session() {
         let tmp = tempfile::tempdir().unwrap();
         let script = fake_mcp(tmp.path());
@@ -3464,7 +3463,6 @@ done
     }
 
     #[tokio::test]
-    #[ignore = "needs CONTRACTS-MCP M2 (merged separately)"]
     async fn mcp_check_route_lists_the_tools_of_a_server() {
         let tmp = tempfile::tempdir().unwrap();
         let script = fake_mcp(tmp.path());
