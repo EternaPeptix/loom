@@ -945,6 +945,7 @@ dependencies = [
  "loom-net",
  "loom-tools",
  "quick-xml",
+ "rand",
  "regex",
  "serde",
  "serde_json",

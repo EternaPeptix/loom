@@ -683,14 +683,12 @@ impl Client {
 
     /// `GET /api/targets/{name}/creds` (S7).
     pub async fn creds_list(&self, target: &str) -> Result<Vec<loom_core::creds::ProfileSummary>, String> {
-        let _ = target;
-        todo!("S7")
+        self.call(Method::GET, &format!("/api/targets/{}/creds", segment(target)), &[], None).await
     }
 
     /// `GET /api/targets/{name}/creds/{profile}` (S7).
     pub async fn creds_show(&self, target: &str, profile: &str) -> Result<loom_agent::runtime::ProfileShow, String> {
-        let _ = (target, profile);
-        todo!("S7")
+        self.call(Method::GET, &format!("/api/targets/{}/creds/{}", segment(target), segment(profile)), &[], None).await
     }
 
     /// `POST /api/targets/{name}/creds` with one of `record`, `stop`, `set`; the answer as JSON.
@@ -699,8 +697,8 @@ impl Client {
         target: &str,
         body: &loom_agent::runtime::CredsBody,
     ) -> Result<serde_json::Value, String> {
-        let _ = (target, body);
-        todo!("S2, S7")
+        let body = serde_json::to_value(body).map_err(|e| format!("The request cannot be encoded ({e})."))?;
+        self.call(Method::POST, &format!("/api/targets/{}/creds", segment(target)), &[], Some(body)).await
     }
 
     /// `GET /api/targets/{name}/creds/record/{handle}?after={n}` (S2).
@@ -710,14 +708,20 @@ impl Client {
         handle: &str,
         after: usize,
     ) -> Result<loom_agent::runtime::RecordLines, String> {
-        let _ = (target, handle, after);
-        todo!("S2")
+        let query = [("after", after.to_string())];
+        self.call(
+            Method::GET,
+            &format!("/api/targets/{}/creds/record/{}", segment(target), segment(handle)),
+            &query,
+            None,
+        )
+        .await
     }
 
     /// `DELETE /api/targets/{name}/creds/{profile}` (S7).
     pub async fn creds_remove(&self, target: &str, profile: &str) -> Result<(), String> {
-        let _ = (target, profile);
-        todo!("S7")
+        self.call_unit(Method::DELETE, &format!("/api/targets/{}/creds/{}", segment(target), segment(profile)), None)
+            .await
     }
 
     pub async fn missions(&self) -> Result<Vec<MissionInfo>, String> {
