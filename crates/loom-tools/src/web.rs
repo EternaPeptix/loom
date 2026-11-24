@@ -52,7 +52,7 @@
 //! one fetched directly or through the session proxy carries no grade, including after a redirect from a
 //! reference host to a granted target host.
 
-use crate::{params, Body, Tool, ToolCtx, ToolOutput};
+use crate::{params, traffic, Body, Tool, ToolCtx, ToolOutput};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use loom_core::event::{ToolClass, ToolSpec, ToolStatus, META_EVIDENCE_GRADE, META_RAW_BLOB};
@@ -80,7 +80,11 @@ impl Tool for WebFetch {
             ToolClass::Read,
             &[
                 params::req("url", "string", "The http:// or https:// URL."),
-                params::opt("raw", "boolean", "Return the body exactly as served instead of rendering HTML as text (default false)."),
+                params::opt(
+                    "raw",
+                    "boolean",
+                    "Return the body exactly as served instead of rendering HTML as text (default false).",
+                ),
             ],
         )
     }
@@ -90,19 +94,21 @@ impl Tool for WebFetch {
         let raw = args.get("raw").and_then(Value::as_bool).unwrap_or(false);
         let url = match Url::parse(&given) {
             Ok(u) if !u.username().is_empty() || u.password().is_some() => {
-                return ToolOutput::denied("web_fetch does not send embedded URL credentials. Use an explicit authorized http_send request instead.");
+                return ToolOutput::denied(
+                    "web_fetch does not send embedded URL credentials. Use an explicit authorized http_send request instead.",
+                );
             }
             Ok(u) if matches!(u.scheme(), "http" | "https") && u.host_str().is_some() => u,
             Ok(u) => {
                 return ToolOutput::error(format!(
                     "`{given}` cannot be fetched: web_fetch handles http:// and https:// URLs with a host, and this one is `{}`. Call again with a full http:// or https:// URL.",
                     u.scheme()
-                ))
+                ));
             }
             Err(e) => {
                 return ToolOutput::error(format!(
                     "`{given}` is not a valid URL ({e}). Call again with a full http:// or https:// URL."
-                ))
+                ));
             }
         };
         let client = match build_client(ctx) {
@@ -325,7 +331,8 @@ fn chain_text(hops: &[Url]) -> String {
 /// `reference` when the final hop went through the reference client.
 async fn fetch(ctx: &ToolCtx, client: &Client, start: Url, raw: bool) -> ToolOutput {
     let mut via_reference = false;
-    let out = follow(ctx, client, start, raw, &mut via_reference).await;
+    let mut made = Vec::new();
+    let out = follow(ctx, client, start, raw, &mut via_reference, &mut made).await.with_exchanges(&made);
     if via_reference {
         out.with_meta(META_EVIDENCE_GRADE, json!("reference"))
     } else {
@@ -334,12 +341,21 @@ async fn fetch(ctx: &ToolCtx, client: &Client, start: Url, raw: bool) -> ToolOut
 }
 
 /// The redirect loop of [`fetch`]; `via_reference` says whether the last hop used the reference client.
-async fn follow(ctx: &ToolCtx, client: &Client, start: Url, raw: bool, via_reference: &mut bool) -> ToolOutput {
+async fn follow(
+    ctx: &ToolCtx,
+    client: &Client,
+    start: Url,
+    raw: bool,
+    via_reference: &mut bool,
+    made: &mut Vec<loom_core::event::Exchange>,
+) -> ToolOutput {
     let mut hops = vec![start];
     loop {
         let current = hops.last().cloned().unwrap_or_else(|| hops[0].clone());
         if !current.username().is_empty() || current.password().is_some() {
-            return ToolOutput::denied("web_fetch does not send embedded URL credentials. Use an explicit authorized http_send request instead.");
+            return ToolOutput::denied(
+                "web_fetch does not send embedded URL credentials. Use an explicit authorized http_send request instead.",
+            );
         }
         let reference = match reference_client(ctx, &current) {
             Ok(c) => c,
@@ -355,6 +371,9 @@ async fn follow(ctx: &ToolCtx, client: &Client, start: Url, raw: bool, via_refer
                 return *out;
             }
         }
+        let started = std::time::Instant::now();
+        let req_wire =
+            traffic::request_message("GET", &current, &[("user-agent".into(), "loom-web-fetch/0.1".into())], b"");
         let resp = match client.get(current.clone()).send().await {
             Ok(r) => r,
             // A refused CONNECT looks like any failure to connect: the proxy is asked again (see [`Tunnel`]).
@@ -364,9 +383,37 @@ async fn follow(ctx: &ToolCtx, client: &Client, start: Url, raw: bool, via_refer
                     Err(out) => *out,
                 };
             }
-            Err(e) => return request_error(&e, &current, &hops, None),
+            Err(e) => {
+                let made_one = traffic::Made {
+                    tool: "web_fetch",
+                    url: &current,
+                    method: "GET",
+                    request: &req_wire,
+                    response: None,
+                    status: None,
+                    error: Some(describe(&e)),
+                    response_cut: false,
+                    started,
+                };
+                made.extend(traffic::record(ctx, &made_one));
+                return request_error(&e, &current, &hops, None);
+            }
         };
         if resp.status().is_redirection() {
+            let pairs = header_pairs(resp.headers());
+            let wire = traffic::response_message(resp.status().as_u16(), &pairs, b"");
+            let made_one = traffic::Made {
+                tool: "web_fetch",
+                url: &current,
+                method: "GET",
+                request: &req_wire,
+                response: Some(&wire),
+                status: Some(resp.status().as_u16()),
+                error: None,
+                response_cut: false,
+                started,
+            };
+            made.extend(traffic::record(ctx, &made_one));
             let target = resp.headers().get(header::LOCATION).and_then(|v| v.to_str().ok()).map(str::to_string);
             if let Some(location) = target {
                 if hops.len() > MAX_REDIRECTS {
@@ -381,19 +428,19 @@ async fn follow(ctx: &ToolCtx, client: &Client, start: Url, raw: bool, via_refer
                     Ok(n) => {
                         return ToolOutput::error(format!(
                             "{current} redirects to `{n}`, which is not an http:// or https:// URL, so web_fetch did not follow it. Use `bash` if that target is what you need."
-                        ))
+                        ));
                     }
                     Err(e) => {
                         return ToolOutput::error(format!(
                             "{current} redirects to `{location}`, which is not a usable URL ({e}); nothing further was fetched."
-                        ))
+                        ));
                     }
                 };
                 hops.push(next);
                 continue;
             }
         }
-        return finish(ctx, resp, &hops, raw, proxied).await;
+        return finish(ctx, resp, &hops, raw, proxied, (&req_wire, started, made)).await;
     }
 }
 
@@ -432,7 +479,18 @@ fn looks_like_html(content_type: &str, body: &[u8]) -> bool {
     head.starts_with(b"<!doctype html") || head.starts_with(b"<html")
 }
 
-async fn finish(ctx: &ToolCtx, resp: reqwest::Response, hops: &[Url], raw: bool, proxied: bool) -> ToolOutput {
+fn header_pairs(h: &HeaderMap) -> Vec<(String, String)> {
+    h.iter().map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("(non-UTF8)").to_string())).collect()
+}
+
+async fn finish(
+    ctx: &ToolCtx,
+    resp: reqwest::Response,
+    hops: &[Url],
+    raw: bool,
+    proxied: bool,
+    (req_wire, started, made): (&[u8], std::time::Instant, &mut Vec<loom_core::event::Exchange>),
+) -> ToolOutput {
     let status = resp.status();
     let content_type =
         resp.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
@@ -444,7 +502,26 @@ async fn finish(ctx: &ToolCtx, resp: reqwest::Response, hops: &[Url], raw: bool,
     }
 
     let limit = ctx.cfg.web_fetch_max_bytes;
+    let head_pairs = header_pairs(resp.headers());
     let (bytes, ended) = read_body(resp, usize::try_from(limit).unwrap_or(usize::MAX)).await;
+    if let Some(url) = hops.last() {
+        let wire = traffic::response_message(status.as_u16(), &head_pairs, &bytes);
+        let made_one = traffic::Made {
+            tool: "web_fetch",
+            url,
+            method: "GET",
+            request: req_wire,
+            response: Some(&wire),
+            status: Some(status.as_u16()),
+            error: match &ended {
+                Ended::Failed(why) => Some(why.clone()),
+                _ => None,
+            },
+            response_cut: matches!(ended, Ended::Limit),
+            started,
+        };
+        made.extend(traffic::record(ctx, &made_one));
+    }
 
     let mut more = Vec::new();
     if hops.len() > 1 {
@@ -1019,17 +1096,22 @@ mod tests {
         };
         // Inside the tunnel of an https URL only the origin speaks: its 403 is an observation.
         let https = [Url::parse("https://origin.test/x").unwrap()];
-        let r = finish(&e.ctx, answer(), &https, false, true).await;
+        let r = finish(&e.ctx, answer(), &https, false, true, (b"", std::time::Instant::now(), &mut Vec::new())).await;
         assert_eq!(
             (r.status, r.outcome.as_str(), raw_body(&r).as_str()),
             (ToolStatus::Ok, "HTTP 403", "origin says no")
         );
         // The answer to an http URL through the proxy is the proxy's.
         let http = [Url::parse("http://origin.test/x").unwrap()];
-        let r = finish(&e.ctx, answer(), &http, false, true).await;
+        let r = finish(&e.ctx, answer(), &http, false, true, (b"", std::time::Instant::now(), &mut Vec::new())).await;
         assert_eq!(r.status, ToolStatus::Denied);
         // Without a proxy there is no proxy to answer.
-        assert_eq!(finish(&e.ctx, answer(), &http, false, false).await.status, ToolStatus::Ok);
+        assert_eq!(
+            finish(&e.ctx, answer(), &http, false, false, (b"", std::time::Instant::now(), &mut Vec::new()))
+                .await
+                .status,
+            ToolStatus::Ok
+        );
     }
 
     /// A destination that answers `/a` with a redirect to `/b` that keeps the connection open and,

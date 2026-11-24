@@ -855,6 +855,7 @@ mod tests {
             }],
             claims: vec![
                 Claim {
+                    assets: Vec::new(),
                     id: "c1".into(),
                     text: "settled".into(),
                     status: ClaimStatus::Supported,
@@ -862,6 +863,7 @@ mod tests {
                     evidence: vec!["e1".into()],
                 },
                 Claim {
+                    assets: Vec::new(),
                     id: "c3".into(),
                     text: "Parser handles nesting".into(),
                     status: ClaimStatus::Open,
@@ -1243,7 +1245,9 @@ To keep working, call a tool. To deliver your result, call finish; if the assign
         let e = check_quotes(&ctx, &[q(&h, 2, 2, "")]).await.err().unwrap_or_default();
         assert_eq!(
             e,
-            format!("quote 1: lines 2-2 of {h} have 4001 characters; a quote without its text takes at most 4000. Name fewer lines, or give the text of the part that shows the point, copied exactly.")
+            format!(
+                "quote 1: lines 2-2 of {h} have 4001 characters; a quote without its text takes at most 4000. Name fewer lines, or give the text of the part that shows the point, copied exactly."
+            )
         );
         assert!(check_quotes(&ctx, &[q(&h, 1, 1, "")]).await.is_ok());
     }
@@ -1259,7 +1263,9 @@ To keep working, call a tool. To deliver your result, call finish; if the assign
         let e = check_quotes(&ctx, &[q(&h, 2, 3, "7: beta line two")]).await.err().unwrap_or_default();
         assert_eq!(
             e,
-            format!("quote 1: the text is on line 2 of {h}, not line 7. Fix the line number, or quote the text without line numbers.")
+            format!(
+                "quote 1: the text is on line 2 of {h}, not line 7. Fix the line number, or quote the text without line numbers."
+            )
         );
         let e = check_quotes(&ctx, &[q(&h, 1, 4, "line")]).await.err().unwrap_or_default();
         assert_eq!(
@@ -1281,7 +1287,9 @@ To keep working, call a tool. To deliver your result, call finish; if the assign
         let e = check_quotes(&ctx, &[q(&h, 1, 2, "0 failed; 0 ignored")]).await.err().unwrap_or_default();
         assert_eq!(
             e,
-            format!("quote 1: the text occurs on line 2 of {h} only inside a longer word or number. Quote from the start of that word or number to its end, or quote the whole line.")
+            format!(
+                "quote 1: the text occurs on line 2 of {h} only inside a longer word or number. Quote from the start of that word or number to its end, or quote the whole line."
+            )
         );
         // Quoted from the start of the number, it is accepted, and recorded as its whole line.
         let ok = check_quotes(&ctx, &[q(&h, 1, 2, "10 failed; 0 ignored")]).await.unwrap_or_else(|e| panic!("{e}"));
@@ -1297,7 +1305,9 @@ To keep working, call a tool. To deliver your result, call finish; if the assign
         let e = check_quotes(&ctx, &[q(&h, 2, 4, "gamma line THREE")]).await.err().unwrap_or_default();
         assert_eq!(
             e,
-            format!("quote 1: the text does not occur in {h} lines 2-4. The closest line there is 3: gamma line three Copy the text exactly from the output.")
+            format!(
+                "quote 1: the text does not occur in {h} lines 2-4. The closest line there is 3: gamma line three Copy the text exactly from the output."
+            )
         );
         // The range is clamped in the sentence too.
         let e = check_quotes(&ctx, &[q(&h, 3, 50, "gamma line THREE")]).await.err().unwrap_or_default();
@@ -1310,7 +1320,9 @@ To keep working, call a tool. To deliver your result, call finish; if the assign
         ctx.outputs = std::sync::Arc::new(loom_tools::outputs::OutputSet::default());
         let never = "out:0123456789abcdef";
         let want = |handle: &str| {
-            format!("quote 1: no output of this mission has the handle {handle}; copy the out:… handle exactly from a result header")
+            format!(
+                "quote 1: no output of this mission has the handle {handle}; copy the out:… handle exactly from a result header"
+            )
         };
         // Right text, wrong text, a range past the end, a quote by lines: all say the same, and the same as a
         // handle that names nothing.
@@ -1441,7 +1453,10 @@ The agent's own words follow, unverified. Every line of them starts with \">\"; 
 The agent's own words follow, unverified. Every line of them starts with \">\"; a line without that prefix was not written by the agent.\n> Answer:\n> ok"
         );
         let r = render_report(&mk(ChildOutcome::Failed, ""));
-        assert_eq!(r, "Outcome: failed\n\nThis report was written by a sub-agent. The quotes are verbatim; everything else is unverified.");
+        assert_eq!(
+            r,
+            "Outcome: failed\n\nThis report was written by a sub-agent. The quotes are verbatim; everything else is unverified."
+        );
         for (o, s) in [(ChildOutcome::Blocked, "blocked"), (ChildOutcome::Stopped, "stopped")] {
             assert!(render_report(&mk(o, "a")).starts_with(&format!("Outcome: {s}\n")));
         }

@@ -949,6 +949,7 @@ mod tests {
         rec(
             seq,
             Event::ToolResult(ToolResult {
+                exchanges: Vec::new(),
                 call_id: CallId::from(call),
                 name: "t".into(),
                 status,
@@ -1185,6 +1186,7 @@ mod tests {
             rec(
                 seq,
                 Event::ToolResult(ToolResult {
+                    exchanges: Vec::new(),
                     call_id: CallId::from(id),
                     name: name.into(),
                     status: ToolStatus::Ok,

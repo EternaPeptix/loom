@@ -1259,6 +1259,7 @@ mod tests {
 
     fn result(text: &str, status: ToolStatus, output: Option<BlobRef>) -> Event {
         Event::ToolResult(ToolResult {
+            exchanges: Vec::new(),
             call_id: CallId::from("c1"),
             name: "bash".into(),
             status,
@@ -2017,6 +2018,7 @@ mod tests {
         SessionMeta {
             id: SessionId::from(id),
             mission: MissionId::from("m-a"),
+            intercept: false,
             parent: parent.map(SessionId::from),
             workspace: "/w".into(),
             copy_of: None,

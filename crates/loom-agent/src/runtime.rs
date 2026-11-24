@@ -705,6 +705,17 @@ use tokio_util::sync::CancellationToken;
 /// Events the bus keeps for a slow subscriber before it is told it lagged.
 pub const BUS_CAPACITY: usize = 8_192;
 
+/// Whether a new mission decrypts HTTPS (CONTRACTS-TRAFFIC-TARGETS I1): `[network] intercept` decides
+/// (`always` / `never`), else the mission's own choice, else its pack's flag.
+pub fn decide_intercept(mode: &loom_core::config::InterceptMode, pack: bool, asked: Option<bool>) -> bool {
+    use loom_core::config::InterceptMode;
+    match mode {
+        InterceptMode::Always => true,
+        InterceptMode::Never => false,
+        InterceptMode::Pack => asked.unwrap_or(pack),
+    }
+}
+
 /// What the operator gives to start a session.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -740,6 +751,11 @@ pub struct NewSession {
     /// The name of a target (`~/.loom/targets/{name}`) the mission works on (CONTRACTS-TRAFFIC-TARGETS T2).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
+    /// Decrypt the mission's HTTPS (CONTRACTS-TRAFFIC-TARGETS I1): `Some(false)` turns it off for a pack that
+    /// asks for it, `Some(true)` turns it on for one that does not. Absent = the pack decides. Fixed for the
+    /// mission; `[network] intercept = "always"|"never"` overrides it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub intercept: Option<bool>,
 }
 
 /// `meta.json`: what a session is, fixed when it is created.
@@ -747,6 +763,9 @@ pub struct NewSession {
 pub struct SessionMeta {
     pub id: SessionId,
     pub mission: MissionId,
+    /// HTTPS interception is on for the mission (I1); decided once at its start, inherited by every agent.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub intercept: bool,
     #[serde(default)]
     pub parent: Option<SessionId>,
     pub workspace: String,
@@ -2275,6 +2294,12 @@ struct Inner {
     pagers: Mutex<Vec<(SessionId, Arc<Mutex<PageReader>>)>>,
     /// The Docker host of `[box]`, when the operator enabled one (see `loom_tools::boxctl`).
     box_host: Option<Arc<DockerHost>>,
+    /// Where the proxy hands the exchanges it captured (CONTRACTS-TRAFFIC-TARGETS C3).
+    capture_tx: loom_net::CaptureSink,
+    /// Each live session's capture state, by session; dead ones are pruned when a session is built.
+    traffic: Mutex<HashMap<SessionId, Weak<crate::traffic::Traffic>>>,
+    /// Each mission's index of exchanges, shared by its sessions.
+    mission_traffic: Mutex<HashMap<MissionId, Weak<crate::traffic::MissionTraffic>>>,
 }
 
 impl Drop for Inner {
@@ -3249,6 +3274,37 @@ impl Inner {
         hosts
     }
 
+    /// The capture state of a session, registered for the proxy's sink, with its mission's index of exchanges.
+    fn traffic_for(&self, meta: &SessionMeta) -> Arc<crate::traffic::Traffic> {
+        let mission = {
+            let mut missions = self.mission_traffic.lock().unwrap_or_else(|p| p.into_inner());
+            missions.retain(|_, w| w.strong_count() > 0);
+            match missions.get(&meta.mission).and_then(Weak::upgrade) {
+                Some(m) => m,
+                None => {
+                    let m = Arc::new(crate::traffic::MissionTraffic::default());
+                    missions.insert(meta.mission.clone(), Arc::downgrade(&m));
+                    m
+                }
+            }
+        };
+        let traffic =
+            Arc::new(crate::traffic::Traffic::new(mission, meta.intercept, self.config.network.capture_max_exchanges));
+        let mut sessions = self.traffic.lock().unwrap_or_else(|p| p.into_inner());
+        sessions.retain(|_, w| w.strong_count() > 0);
+        sessions.insert(meta.id.clone(), Arc::downgrade(&traffic));
+        traffic
+    }
+
+    /// One exchange from the proxy's sink: store it and wake the session so that it is appended to its log.
+    fn ingest_capture(&self, session: &SessionId, captured: loom_net::Captured) {
+        let traffic = self.traffic.lock().unwrap_or_else(|p| p.into_inner()).get(session).and_then(Weak::upgrade);
+        let Some(traffic) = traffic else { return };
+        if traffic.ingest(&self.blobs, captured) || traffic.has_pending() {
+            self.send_input(session, Input::DrainQueued);
+        }
+    }
+
     /// The proxy policy of a session: the configured network plus the mission's granted hosts. A
     /// granted host that cannot be parsed is left out (with a warning), which only narrows the policy.
     fn session_policy(&self, meta: &SessionMeta, explicit: bool) -> Result<Policy, String> {
@@ -3361,11 +3417,32 @@ impl Inner {
         }
         let jobs_dir = self.paths.session_dir(id).join("jobs");
         let policy = self.session_policy(meta, explicit)?;
+        // Interception needs the CA before anything else is opened: a mission that was promised decrypted
+        // traffic does not start without it (I2).
+        let ca = if meta.intercept {
+            let ca = loom_net::tls::Ca::load_or_create(&self.paths.ca_dir())
+                .map_err(|e| format!("HTTPS interception is on for this mission but the CA cannot be loaded: {e}"))?;
+            Some(ca)
+        } else {
+            None
+        };
+        let traffic = self.traffic_for(meta);
         // The session's own proxy listener comes first: its port is the only one the sandbox allows.
-        let grant = self
-            .proxy
-            .grant(id, policy)
-            .map_err(|e| format!("The egress proxy cannot open a port for this session: {e}"))?;
+        let net = &self.config.network;
+        let capturing = meta.intercept || (net.capture_max_exchanges > 0 && net.capture_max_bytes > 0);
+        let grant = if capturing {
+            let capture = loom_net::CaptureGrant {
+                max_bytes: net.capture_max_bytes,
+                intercept: meta.intercept,
+                passthrough: net.intercept_passthrough.clone(),
+                // The target's `upstream_insecure` joins here when targets are wired (part T).
+                upstream_insecure: Vec::new(),
+            };
+            self.proxy.grant_with_capture(id, policy, capture, self.capture_tx.clone(), ca.clone())
+        } else {
+            self.proxy.grant(id, policy)
+        }
+        .map_err(|e| format!("The egress proxy cannot open a port for this session: {e}"))?;
         // From here a failure takes the grant, and with it the listener, back.
         let mut revoke = RevokeOnDrop { proxy: &self.proxy, session: id, armed: true };
         let sandbox = Sandbox::new(&cfg, &workspace, &tmp, &self.paths.home, (!bubblewrap).then_some(grant.port))
@@ -3379,6 +3456,22 @@ impl Inner {
             Some(self.proxy.grant_reference(id, &self.config.network)?)
         };
         let pack = self.packs.get(&meta.pack).ok_or_else(|| format!("Pack {} is no longer loaded.", meta.pack))?;
+        // I3: only an intercepting session's commands trust the CA; nothing is added to a trust store.
+        let mut env = grant.env();
+        if let Some(ca) = &ca {
+            let bundle = loom_net::tls::ca_bundle(ca, &tmp)
+                .map_err(|e| format!("The CA bundle for this session cannot be written: {e}"))?;
+            for name in loom_net::tls::BUNDLE_ENV {
+                env.insert(name.to_string(), bundle.to_string_lossy().into_owned());
+            }
+        }
+        let capabilities =
+            Arc::new(loom_tools::capabilities::SessionTools::new(pack.command_guard, pack.target_concurrency));
+        {
+            // C4: replay by `ex-` id reads the mission's recorded exchanges (its sessions' logs, loaded as they open).
+            let index = traffic.mission.clone();
+            let _ = capabilities.exchange_lookup.set(Arc::new(move |id: &str| index.find(id)));
+        }
         let ctx = ToolCtx {
             session: id.clone(),
             call_id: CallId::from(""),
@@ -3388,15 +3481,12 @@ impl Inner {
             outputs: Arc::new(MissionOutputs { runtime: self.me.clone(), mission: meta.mission.clone() }),
             cfg: Arc::new(self.config.tools.clone()),
             sandbox: Arc::new(sandbox),
-            env: Arc::new(grant.env()),
+            env: Arc::new(env),
             reference_proxy,
             files: Arc::new(loom_tools::files::FileTracker::new()),
             jobs: jobs.clone(),
             cancel: CancellationToken::new(),
-            capabilities: Arc::new(loom_tools::capabilities::SessionTools::new(
-                pack.command_guard,
-                pack.target_concurrency,
-            )),
+            capabilities,
             // The session sets it again for every call from its admission of that moment.
             view_chars: self
                 .config
@@ -3415,16 +3505,19 @@ impl Inner {
         if !role.tools.iter().any(|t| matches!(t.as_str(), "note" | "claim" | "evidence")) {
             agents.stall_steps = 0;
         }
-        let shared = Arc::new(Shared::new(
-            id.clone(),
-            Some(meta.mission.clone()),
-            meta.parent.clone(),
-            role,
-            journal,
-            self.paths.session_log(id),
-            self.config.agents.clone(),
-            self.orch.clone(),
-        ));
+        let shared = Arc::new(
+            Shared::new(
+                id.clone(),
+                Some(meta.mission.clone()),
+                meta.parent.clone(),
+                role,
+                journal,
+                self.paths.session_log(id),
+                self.config.agents.clone(),
+                self.orch.clone(),
+            )
+            .with_traffic(traffic),
+        );
         let control = Arc::new(Control::new());
         let deps = Deps {
             paths: self.paths.clone(),
@@ -3488,7 +3581,7 @@ impl Inner {
             budget,
             unattended: meta.unattended,
             schema: loom_core::event::SCHEMA,
-            intercept: false,
+            intercept: meta.intercept,
             target: meta.target.clone(),
             title: meta.title.clone(),
             project_instructions: env.project_instructions,
@@ -3867,7 +3960,10 @@ impl Inner {
         req.prerequisite =
             rtools::validate_dispatch_prerequisite(&shared, requires_credential, req.prerequisite.as_ref(), now_ms())?;
         if let Some(p) = &req.prerequisite {
-            let header=format!("Dispatch prerequisite checked by Loom: asset {}; credential {}. This observation does not grant network scope or guarantee the credential remains valid.",p.asset,p.credential);
+            let header = format!(
+                "Dispatch prerequisite checked by Loom: asset {}; credential {}. This observation does not grant network scope or guarantee the credential remains valid.",
+                p.asset, p.credential
+            );
             req.brief.context = Some(match req.brief.context.take() {
                 Some(context) => format!("{header}\n\n{context}"),
                 None => header,
@@ -4024,6 +4120,8 @@ impl Inner {
                 // Choices are the lead's, for the mission; an agent has none of its own.
                 role_models: BTreeMap::new(),
                 mission: p.meta.mission.clone(),
+                // Fixed for the mission (I1): children inherit it.
+                intercept: p.meta.intercept,
                 parent: Some(parent.clone()),
                 workspace,
                 copy_of,
@@ -4686,8 +4784,7 @@ pub const LOW_DISK_BYTES: u64 = 5 << 30;
 pub const LOW_DISK_PERCENT: u64 = 5;
 
 /// What the low-disk notification says.
-const LOW_DISK_NOTICE: &str =
-    "The disk that holds the loom home is nearly full, so sessions will fail when it fills. Free space, or run `loom gc`.";
+const LOW_DISK_NOTICE: &str = "The disk that holds the loom home is nearly full, so sessions will fail when it fills. Free space, or run `loom gc`.";
 
 /// How often the disk is checked.
 #[cfg(not(test))]
@@ -4932,6 +5029,7 @@ impl Runtime {
         };
         let (bus, _) = broadcast::channel(BUS_CAPACITY);
         let (net_tx, mut net_rx) = unbounded_channel();
+        let (capture_tx, mut capture_rx) = unbounded_channel::<(SessionId, loom_net::Captured)>();
         let audit = net_audit(paths.clone(), bus.clone());
         let proxy = Proxy::start_with(config.daemon.proxy_port, net_tx, Some(audit), Default::default())
             .await
@@ -4959,6 +5057,9 @@ impl Runtime {
             sink: Arc::new(SinkImpl(me.clone())),
             pagers: Mutex::new(Vec::new()),
             box_host,
+            capture_tx,
+            traffic: Mutex::new(HashMap::new()),
+            mission_traffic: Mutex::new(HashMap::new()),
         });
 
         let weak = Arc::downgrade(&inner);
@@ -4971,6 +5072,16 @@ impl Runtime {
             }
         });
         inner.st().tasks.push(forwarder);
+        let weak = Arc::downgrade(&inner);
+        let captures = tokio::spawn(async move {
+            while let Some((session, captured)) = capture_rx.recv().await {
+                match weak.upgrade() {
+                    Some(inner) => inner.ingest_capture(&session, captured),
+                    None => return,
+                }
+            }
+        });
+        inner.st().tasks.push(captures);
         // Not under test: whether the disk of the machine that runs the tests is low must not change them.
         #[cfg(not(test))]
         {
@@ -5201,6 +5312,7 @@ impl Runtime {
             let meta = SessionMeta {
                 id: id.clone(),
                 mission: MissionId::generate(),
+                intercept: decide_intercept(&inner.config.network.intercept, role.intercept, new.intercept),
                 parent: None,
                 workspace: workspace.display().to_string(),
                 copy_of: None,
@@ -7080,6 +7192,8 @@ mod tests {
 
     fn config_for(server: &MockServer, notify_file: Option<&Path>) -> Config {
         let mut c = Config::default();
+        // These tests do not look at traffic; `0` keeps the plain relay path.
+        c.network.capture_max_exchanges = 0;
         c.models.clear();
         c.models.insert(
             "mock".into(),
@@ -7923,6 +8037,83 @@ mod tests {
         assert_eq!(loom_net::netlog::verify(&text), Ok(()));
     }
 
+    fn captured(host: &str) -> loom_net::Captured {
+        loom_net::Captured {
+            ts_ms: now_ms(),
+            transport: loom_net::Transport::Plain,
+            method: "GET".into(),
+            host: host.into(),
+            port: 80,
+            target: "/a?b=1".into(),
+            status: Some(200),
+            error: None,
+            request: b"GET /a?b=1 HTTP/1.1\r\nHost: x\r\n\r\n".to_vec(),
+            response: Some(b"HTTP/1.1 200 OK\r\n\r\nhi".to_vec()),
+            request_bytes: 30,
+            response_bytes: 24,
+            truncated: false,
+            upstream_unverified: false,
+            duration_ms: 3,
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "needs CONTRACTS-TRAFFIC-TARGETS I4 (merged separately)"]
+    async fn a_captured_exchange_reaches_the_session_log_with_its_blobs_and_survives_a_reopen() {
+        let e = env_with(Script::new(|_, _| finish("ok")), false, |c| c.network.capture_max_exchanges = 1000).await;
+        let info = e.rt.create_session(e.new_session(Some("cap"))).await.unwrap();
+        let id = info.meta.id.clone();
+        until("turn end", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { .. }))).await;
+        e.rt.inner.capture_tx.send((id.clone(), captured("one.test"))).unwrap();
+        until("exchange", || e.has(&id, |ev| matches!(ev, Event::Exchange(x) if x.host == "one.test"))).await;
+        let log = std::fs::read_to_string(e.rt.paths().session_log(&id)).unwrap();
+        let line = log.lines().find(|l| l.contains("\"one.test\"") && l.contains("\"exchange\"")).expect("record");
+        let rec: serde_json::Value = serde_json::from_str(line).unwrap();
+        eprintln!("{rec}");
+        let x = &rec["event"];
+        assert_eq!(x["source"], "proxy");
+        assert_eq!(x["tls"], "plain");
+        assert!(x["id"].as_str().unwrap().starts_with("ex-"));
+        assert!(x["call_id"].is_null(), "no call was running: {x}");
+        let req = x["request"]["id"].as_str().unwrap();
+        let bytes = e.rt.inner.blobs.read_all(&loom_core::BlobId::from(req)).unwrap();
+        assert!(bytes.starts_with(b"GET /a?b=1"));
+        e.rt.shutdown().await;
+    }
+
+    #[test]
+    fn the_intercept_switch_follows_the_config_the_pack_and_the_mission_override() {
+        use loom_core::config::InterceptMode::{Always, Never, Pack};
+        assert!(decide_intercept(&Pack, true, None));
+        assert!(!decide_intercept(&Pack, false, None));
+        assert!(!decide_intercept(&Pack, true, Some(false)));
+        assert!(decide_intercept(&Pack, false, Some(true)));
+        assert!(decide_intercept(&Always, false, Some(false)));
+        assert!(!decide_intercept(&Never, true, Some(true)));
+    }
+
+    #[test]
+    fn the_security_packs_intercept_and_others_do_not() {
+        let packs = Packs::load(std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../packs"))).unwrap();
+        for (pack, role) in [("ctf", "dispatcher"), ("redteam", "commander"), ("vr", "researcher")] {
+            let r = packs.role(Some(pack), Some(role)).unwrap();
+            assert!(r.intercept, "{pack}");
+            assert!(r.require_traffic, "{pack}/{role}");
+        }
+        assert!(!packs.role(None, Some("lead")).unwrap().intercept);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs CONTRACTS-TRAFFIC-TARGETS I4 (merged separately)"]
+    async fn an_intercepting_mission_records_it_in_session_start_hands_children_the_bundle_and_stays_in_the_tmp_dir() {
+        let mut e = env(Script::new(|_, _| finish("ok"))).await;
+        e.config.network.intercept = loom_core::config::InterceptMode::Always;
+        let info = e.rt.create_session(e.new_session(Some("i"))).await.unwrap();
+        assert!(info.meta.intercept);
+        let tmp = e.rt.paths().session_tmp(&info.meta.id);
+        assert!(tmp.join("ca-bundle.pem").exists());
+    }
+
     /// Standard base64, for a Basic credential in a test.
     fn base64(s: &str) -> String {
         const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -8212,7 +8403,9 @@ mod tests {
         assert!(e.rt.inner.orch.spawn(&parent, request(None)).await.unwrap_err().contains("requires explicit"));
         assert!(e.children(&parent).is_empty());
         let shared = e.rt.inner.st().known.get(&parent).unwrap().active.as_ref().unwrap().shared.clone();
-        shared.ledger_append(false, LedgerOp::ClaimAdd { text: "credential observed".into() }).unwrap();
+        shared
+            .ledger_append(false, LedgerOp::ClaimAdd { text: "credential observed".into(), assets: Vec::new() })
+            .unwrap();
         shared
             .ledger_append(
                 false,
@@ -9098,6 +9291,7 @@ mod tests {
 
     fn named_result(call_id: &str, name: &str, output: Option<&BlobRef>, meta: Value) -> Event {
         Event::ToolResult(loom_core::event::ToolResult {
+            exchanges: Vec::new(),
             call_id: call_id.into(),
             name: name.into(),
             status: ToolStatus::Ok,
@@ -9433,6 +9627,7 @@ mod tests {
 
     fn tool_result(call_id: &str, name: &str, class: ToolClass, output: Option<&str>, meta: Value) -> Event {
         Event::ToolResult(loom_core::event::ToolResult {
+            exchanges: Vec::new(),
             call_id: CallId::from(call_id),
             name: name.into(),
             status: ToolStatus::Ok,
@@ -10924,6 +11119,7 @@ done
             });
             let (mut log, _) = SessionLog::open(&path, Durability::Always).unwrap();
             let result = loom_core::event::ToolResult {
+                exchanges: Vec::new(),
                 call_id: call_id.unwrap(),
                 name: "agent_spawn".into(),
                 status: loom_core::event::ToolStatus::Error,
@@ -13943,6 +14139,7 @@ done
             status: ClaimStatus::Supported,
             note: String::new(),
             evidence: vec![],
+            assets: vec![],
         });
         let upd = |status| LedgerOp::ClaimUpdate { id: "c1".into(), status, note: String::new() };
         inner.target_ledger(&one, &upd(ClaimStatus::Supported), &state);

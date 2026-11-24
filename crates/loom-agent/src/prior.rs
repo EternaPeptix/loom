@@ -673,6 +673,7 @@ mod tests {
 
     fn claim(id: &str, text: &str, status: ClaimStatus, evidence: &[&str]) -> Claim {
         Claim {
+            assets: Vec::new(),
             id: id.into(),
             text: text.into(),
             status,

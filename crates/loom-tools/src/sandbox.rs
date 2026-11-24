@@ -1354,7 +1354,7 @@ fn resolve_path(path: &Path, lenient: bool) -> Result<PathBuf, String> {
                 return Err(format!(
                     "{} cannot be resolved ({e}); it may be a symlink that points nowhere. Use a path whose links all resolve.",
                     prefix.display()
-                ))
+                ));
             }
         }
     }
@@ -1605,8 +1605,8 @@ impl Sandbox {
                 Some(p) => p,
                 None if given == "~" || given.starts_with("~/") => {
                     return Err(invalid(format!(
-                    "the sandbox path {given:?} needs the home directory, but HOME is not set; write the path in full."
-                )))
+                        "the sandbox path {given:?} needs the home directory, but HOME is not set; write the path in full."
+                    )));
                 }
                 None => PathBuf::from(given),
             };
@@ -1741,7 +1741,10 @@ impl Sandbox {
                         && home.as_ref().is_some_and(|home| under(path, home))
                         && !writable.iter().any(|root| under(path, root)));
                 if !path.exists() && !hidden {
-                    return Err(invalid(format!("Bubblewrap cannot hide the missing unreadable path {}. Create it before starting the session or choose a scope whose parent can be hidden.", path.display())));
+                    return Err(invalid(format!(
+                        "Bubblewrap cannot hide the missing unreadable path {}. Create it before starting the session or choose a scope whose parent can be hidden.",
+                        path.display()
+                    )));
                 }
             }
             Some(linux::prepare(&loom_home)?)
@@ -1841,7 +1844,10 @@ impl Sandbox {
         }
         let canonical = |path: &Path| -> Result<PathBuf, String> {
             if !path.is_dir() {
-                return Err(format!("Replay directory {} does not exist. Create private staging directories outside the session temp first.", path.display()));
+                return Err(format!(
+                    "Replay directory {} does not exist. Create private staging directories outside the session temp first.",
+                    path.display()
+                ));
             }
             std::fs::canonicalize(path).map_err(|e| {
                 format!("Replay directory {} cannot be resolved: {e}. Inspect it before retrying.", path.display())
@@ -1879,7 +1885,10 @@ impl Sandbox {
                     || (!self.credentials.is_empty() && self.home.as_ref().is_some_and(|home| under(origin, home)))
                     || ["/tmp", "/var/tmp", "/run"].iter().any(|root| origin.starts_with(root));
                 if !origin.exists() && !hidden {
-                    return Err(format!("The untrusted replay origin {} is missing and Bubblewrap cannot reserve that future path. Create the actor directory before replay or choose a scope hidden by a private parent.", origin.display()));
+                    return Err(format!(
+                        "The untrusted replay origin {} is missing and Bubblewrap cannot reserve that future path. Create the actor directory before replay or choose a scope hidden by a private parent.",
+                        origin.display()
+                    ));
                 }
             }
         }
@@ -2269,7 +2278,10 @@ impl Sandbox {
             ));
         }
         if self.mode == SandboxMode::Bubblewrap && self.git_dirs.iter().any(|dir| under(&r, dir)) {
-            return Err(format!("{} is in Git metadata mounted read-only by Bubblewrap. Ask the operator to update Git metadata outside the session.", r.display()));
+            return Err(format!(
+                "{} is in Git metadata mounted read-only by Bubblewrap. Ask the operator to update Git metadata outside the session.",
+                r.display()
+            ));
         }
         // The session temp dir is writable even when it lies inside a protected directory.
         let in_tmp = r.starts_with(&self.tmp_dir) && !self.inside_tmp_protected().iter().any(|p| under(&r, p));
@@ -2419,7 +2431,10 @@ impl Sandbox {
             );
         }
         if self.mode == SandboxMode::Bubblewrap {
-            return format!("Commands run in Linux bubblewrap with a read-only host filesystem, writable roots {}, a private /tmp, and all socket creation/connections denied. Protected paths {protected} and discovered Git metadata remain read-only; credential paths are hidden. {own}{exception} New Git repositories must be created by the operator outside the session. File tools additionally refuse Git config and hook writes.", join_list(&self.writable));
+            return format!(
+                "Commands run in Linux bubblewrap with a read-only host filesystem, writable roots {}, a private /tmp, and all socket creation/connections denied. Protected paths {protected} and discovered Git metadata remain read-only; credential paths are hidden. {own}{exception} New Git repositories must be created by the operator outside the session. File tools additionally refuse Git config and hook writes.",
+                join_list(&self.writable)
+            );
         }
         let git = " No Git repository can be made where commands write, and no Git configuration, hooks, worktree or \
                    submodule repository can be written or moved into place: ask the operator to run `git worktree add` \
@@ -3737,6 +3752,8 @@ mod tests {
             ("logs/daemon.log", "DAEMON-LOG"),
             ("config.toml", "CONFIG"),
             ("packs/p1/pack.toml", "PACK"),
+            ("ca/loom-ca.key", "CA-PRIVATE-KEY"),
+            ("ca/loom-ca.pem", "CA-CERT"),
         ] {
             let p = f.home.join(rel);
             std::fs::create_dir_all(p.parent().expect("parent")).expect("mkdir");
@@ -3768,6 +3785,10 @@ mod tests {
                 "logs",
                 "config.toml",
                 "packs/p1/pack.toml",
+                // The interception CA's key is never readable from a sandbox (I3).
+                "ca/loom-ca.key",
+                "ca/loom-ca.pem",
+                "ca",
                 "sessions",
                 "sessions/s1",
                 "other",
@@ -3835,8 +3856,9 @@ mod tests {
         let (h, t, a) = (s(&f.home), s(&f.tmp), format!("{}/sessions/s1/analysis", s(&f.home)));
         // Names are hidden as well as content: `file-read*` alone leaves `fsgetpath` and `searchfs` their way.
         let deny = p.find(&format!("(deny file-read* file-test-existence (subpath \"{h}\"))\n")).expect("home deny");
-        let meta_line =
-            format!("(allow file-read-metadata file-test-existence (literal \"{h}\") (literal \"{h}/sessions\") (literal \"{h}/sessions/s1\"))\n");
+        let meta_line = format!(
+            "(allow file-read-metadata file-test-existence (literal \"{h}\") (literal \"{h}/sessions\") (literal \"{h}/sessions/s1\"))\n"
+        );
         let meta = p.find(&meta_line).expect("lookup of the ancestors, not listing and not the temp dir");
         let allow = p
             .find(&format!("(allow file-read* file-test-existence (subpath \"{t}\") (subpath \"{a}\"))\n"))

@@ -998,6 +998,7 @@ pub(crate) mod testkit {
             meta: SessionMeta {
                 id: SessionId::from(id),
                 mission: MissionId::from(format!("m-of-{id}")),
+                intercept: false,
                 parent: None,
                 workspace: "/w".into(),
                 copy_of: None,

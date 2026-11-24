@@ -77,6 +77,7 @@ pub mod pty;
 pub mod sandbox;
 pub mod schema;
 pub mod search;
+pub mod traffic;
 pub mod view;
 pub mod web;
 pub mod workcopy;
@@ -127,6 +128,10 @@ pub struct ToolCtx {
     /// share it; a child agent or fork starts with its own, empty one.
     pub shell: Arc<bash::ShellState>,
 }
+
+/// Reserved meta key: the exchanges a tool made itself (`Vec<loom_core::event::Exchange>`). `finalize` moves
+/// them to `ToolResult::exchanges`; they never reach the record's meta.
+pub const META_EXCHANGES: &str = "\u{0}exchanges";
 
 /// Reserved `ToolOutput::meta` key that carries a tool's images to `finalize`; never written to a record.
 pub const META_IMAGES: &str = "\u{0}images";
@@ -232,6 +237,14 @@ impl ToolOutput {
 
     /// Images the result carries (already stored in the blob store). `finalize` moves them out of `meta`
     /// (the reserved key [`META_IMAGES`]) into `ToolResult::images`, so they never reach the record's meta.
+    /// Attach the exchanges this call made (C3). The tool stored the messages as blobs already.
+    pub fn with_exchanges(mut self, exchanges: &[loom_core::event::Exchange]) -> ToolOutput {
+        if !exchanges.is_empty() {
+            self.meta.insert(META_EXCHANGES.to_string(), json!(exchanges));
+        }
+        self
+    }
+
     pub fn with_images(mut self, images: &[loom_core::ImageRef]) -> ToolOutput {
         if !images.is_empty() {
             self.meta.insert(META_IMAGES.to_string(), json!(images));
@@ -429,6 +442,7 @@ pub fn prepare(registry: &Registry, ctx: &ToolCtx, name: &str, arguments: &str) 
                 meta: Map::new(),
                 duration_ms: started.elapsed().as_millis() as u64,
                 images: Vec::new(),
+                exchanges: Vec::new(),
             }))
         }
         Adapt::Run(call) => {
@@ -667,6 +681,8 @@ pub fn finalize(
     let outcome_text = outcome.clone();
     let mut facts = Facts { tool: spec.name.clone(), outcome, more, notes: None };
     let duration_ms = started.elapsed().as_millis() as u64;
+    let exchanges: Vec<loom_core::event::Exchange> =
+        meta.remove(META_EXCHANGES).and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
     let images: Vec<loom_core::ImageRef> =
         meta.remove(META_IMAGES).and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
     let derived: Vec<&str> = {
@@ -697,6 +713,7 @@ pub fn finalize(
             meta,
             duration_ms,
             images: images.clone(),
+            exchanges: exchanges.clone(),
         }
     };
     // A view sized for the bound the call ran with is not cut for a lower one that came after it.
@@ -741,7 +758,7 @@ pub fn finalize(
             let stored = match ctx.blobs.put_bytes(normalized.text.as_bytes()) {
                 Ok(b) => b,
                 Err(e) => {
-                    return base(ToolStatus::Error, storage_failure(&facts, &normalized.text, &e), None, true, meta)
+                    return base(ToolStatus::Error, storage_failure(&facts, &normalized.text, &e), None, true, meta);
                 }
             };
             if normalized.changed {
@@ -805,6 +822,7 @@ pub fn refused(ctx: &ToolCtx, name: &str, class: ToolClass, message: String, sta
         meta: Map::new(),
         duration_ms: started.elapsed().as_millis() as u64,
         images: Vec::new(),
+        exchanges: Vec::new(),
     }
 }
 

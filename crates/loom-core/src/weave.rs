@@ -670,6 +670,7 @@ mod tests {
         l.push(
             Author::Tool,
             Event::ToolResult(ToolResult {
+                exchanges: Vec::new(),
                 call_id: call.call_id,
                 name: "bash".into(),
                 status: ToolStatus::Ok,
@@ -799,6 +800,7 @@ mod tests {
             self.push(
                 Author::Tool,
                 Event::ToolResult(ToolResult {
+                    exchanges: Vec::new(),
                     call_id: CallId::from(id),
                     name: "bash".into(),
                     status: ToolStatus::Ok,
@@ -818,6 +820,7 @@ mod tests {
             self.push(
                 Author::Tool,
                 Event::ToolResult(ToolResult {
+                    exchanges: Vec::new(),
                     call_id: CallId::from(id),
                     name: name.into(),
                     status,
@@ -1098,6 +1101,7 @@ mod tests {
         l.push(
             Author::Tool,
             Event::ToolResult(ToolResult {
+                exchanges: Vec::new(),
                 call_id: CallId::from("c1"),
                 name: "read".into(),
                 status: ToolStatus::Ok,

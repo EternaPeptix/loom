@@ -358,6 +358,8 @@ pub struct Shared {
     pub log_path: PathBuf,
     pub agents: AgentsCfg,
     pub orch: Arc<dyn Orchestrator>,
+    /// The session's captured exchanges and the mission's index of them (CONTRACTS-TRAFFIC-TARGETS C, F).
+    pub traffic: Arc<crate::traffic::Traffic>,
     slots: Mutex<Slots>,
     /// The MCP servers this session owns (CONTRACTS-MCP M6), set once before its registry is built.
     mcp: std::sync::OnceLock<Arc<crate::mcp::McpSession>>,
@@ -384,6 +386,7 @@ impl Shared {
             log_path,
             agents,
             orch,
+            traffic: Arc::new(crate::traffic::Traffic::none()),
             slots: Mutex::new(Slots::default()),
             mcp: std::sync::OnceLock::new(),
         }
@@ -397,6 +400,12 @@ impl Shared {
     /// The session's MCP servers; `None` when it has none.
     pub fn mcp(&self) -> Option<&Arc<crate::mcp::McpSession>> {
         self.mcp.get()
+    }
+
+    /// Give the session the capture state the runtime shares with its proxy sink.
+    pub fn with_traffic(mut self, traffic: Arc<crate::traffic::Traffic>) -> Shared {
+        self.traffic = traffic;
+        self
     }
 
     pub fn is_child(&self) -> bool {
@@ -637,7 +646,7 @@ pub fn build_registry(shared: &Arc<Shared>) -> Result<Registry, String> {
                 return Err(format!(
                     "role `{}` of pack `{}` lists the tool `{name}`, which does not exist",
                     shared.role.name, shared.role.pack
-                ))
+                ));
             }
         }
     }
@@ -709,7 +718,7 @@ mod tests {
         let r = rig("lead", false, true);
         assert!(validate_dispatch_prerequisite(&r.shared, true, None, 100).is_err());
         assert_eq!(validate_dispatch_prerequisite(&r.shared, false, None, 100).unwrap(), None);
-        r.model_op(LedgerOp::ClaimAdd { text: "fixture credential observed".into() });
+        r.model_op(LedgerOp::ClaimAdd { text: "fixture credential observed".into(), assets: Vec::new() });
         r.model_op(LedgerOp::EvidenceAdd(EvidenceInput {
             claim: "c1".into(),
             kind: EvidenceKind::Execution,
@@ -797,7 +806,7 @@ mod tests {
         for (pack, role_name) in [("redteam", "op_judge"), ("ctf", "flag_judge")] {
             let role = packs.role(Some(pack), Some(role_name)).unwrap().clone();
             let r = rig_with(role, true, true, AgentsCfg::default());
-            r.model_op(LedgerOp::ClaimAdd { text: "candidate reaches target".into() });
+            r.model_op(LedgerOp::ClaimAdd { text: "candidate reaches target".into(), assets: Vec::new() });
             let h = r.output("verified oracle receipt output\n", "oracle_check", ToolClass::Exec);
             let res = r
                 .call(
@@ -815,7 +824,7 @@ mod tests {
             assert_eq!(res.status, loom_core::event::ToolStatus::Ok, "{pack}/{role_name}: {}", res.text);
             assert_eq!(r.shared.ledger().unwrap().evidence.len(), 1);
             for op in [
-                LedgerOp::ClaimAdd { text: "new claim".into() },
+                LedgerOp::ClaimAdd { text: "new claim".into(), assets: Vec::new() },
                 LedgerOp::ClaimUpdate { id: "c1".into(), status: ClaimStatus::Supported, note: String::new() },
                 LedgerOp::Decision { text: "d".into(), reason: "r".into() },
             ] {
@@ -841,7 +850,7 @@ mod tests {
         // A read-only verifier without `evidence` stays blocked from EvidenceAdd.
         let verifier_role = packs.role(Some("core"), Some("verifier")).unwrap().clone();
         let v = rig_with(verifier_role, true, true, AgentsCfg::default());
-        v.model_op(LedgerOp::ClaimAdd { text: "lead claim".into() });
+        v.model_op(LedgerOp::ClaimAdd { text: "lead claim".into(), assets: Vec::new() });
         let ev = LedgerOp::EvidenceAdd(EvidenceInput {
             claim: "c1".into(),
             kind: EvidenceKind::Static,
@@ -862,7 +871,12 @@ mod tests {
         let w = rig("worker", true, true);
         let journal = w.shared.journal.as_ref().unwrap();
         journal
-            .append(&SessionId::from("s-lead"), false, LedgerOp::ClaimAdd { text: "lead claim".into() }, &|_| Ok(()))
+            .append(
+                &SessionId::from("s-lead"),
+                false,
+                LedgerOp::ClaimAdd { text: "lead claim".into(), assets: Vec::new() },
+                &|_| Ok(()),
+            )
             .unwrap();
         let h = w.output("worker observed line\n", "bash", ToolClass::Exec);
         let res = w

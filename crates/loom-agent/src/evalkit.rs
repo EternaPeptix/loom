@@ -579,6 +579,8 @@ fn script(scenario: &Scenario) -> Script {
 /// The configuration a scenario starts from: see `run` in the module contract.
 fn base_config(base_url: String) -> Config {
     let mut config = Config::default();
+    // Scenarios judge the agent, not the traffic: no proxy capture.
+    config.network.capture_max_exchanges = 0;
     config.models.clear();
     config.models.insert(
         "mock".into(),

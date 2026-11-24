@@ -3,10 +3,12 @@ description = "Vulnerability research on local and authorized targets: a researc
 default_role = "researcher"
 preamble = "harness.md"
 requires_restricted_network = true
+intercept = true
 
 # The engagement lead. Turns a broad scope into narrow experiments and hands them to scouts; does not
 # run experiments or write findings prose itself. Finishing is gated by an independent judge.
 [roles.researcher]
+require_traffic = true
 description = "Owns an engagement: qualifies scope through a judge, decomposes into one-hypothesis experiments, delegates them, and gates every result before believing it."
 prompt = "roles/researcher.md"
 termination = "explicit"
@@ -25,6 +27,7 @@ hidden_tools = ["out_read", "out_grep", "claim_update", "step", "wait", "conclud
 # One experiment per scout: one hypothesis, one input, one observation, the smallest harness that
 # establishes the primitive. Returns executed evidence or a blocker, never a narrative.
 [roles.scout]
+require_traffic = true
 description = "Runs one experiment from the researcher and returns one atomic executed check with its conditions, the exact run, the observed response and a separate state check — or a blocker."
 prompt = "roles/scout.md"
 termination = "explicit"

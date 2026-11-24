@@ -711,8 +711,33 @@ impl Tool for McpTool {
     }
 
     async fn run(&self, ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
+        let _ = self.handle.shared.take_traffic();
         let (result, restarted) = self.handle.call_restarting(ctx, &self.def.name, Value::Object(args.clone())).await;
         let mut out = map_result(ctx, &self.handle.server.name, result, restarted);
+        let made: Vec<_> = self
+            .handle
+            .shared
+            .take_traffic()
+            .into_iter()
+            .filter_map(|raw| {
+                let url = url::Url::parse(&raw.url).ok()?;
+                crate::traffic::record(
+                    ctx,
+                    &crate::traffic::Made {
+                        tool: &self.name,
+                        url: &url,
+                        method: "POST",
+                        request: &raw.request,
+                        response: raw.response.as_deref(),
+                        status: raw.status,
+                        error: raw.error.clone(),
+                        response_cut: false,
+                        started: raw.started,
+                    },
+                )
+            })
+            .collect();
+        out = out.with_exchanges(&made);
         if let Body::Message(t) = &out.body {
             out.body = Body::Message(self.handle.redact(t));
         }

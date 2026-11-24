@@ -66,6 +66,14 @@ impl MissionId {
     }
 }
 
+/// A new exchange id: `ex-` and 12 random base32 characters (CONTRACTS-TRAFFIC-TARGETS C1).
+pub fn new_exchange_id() -> String {
+    use rand::RngExt;
+    let mut rng = rand::rng();
+    let body: String = (0..12).map(|_| ALPHABET[rng.random_range(0..32)] as char).collect();
+    format!("ex-{body}")
+}
+
 /// A new inbox item id (`i-…`), unique across sessions.
 pub fn new_item_id() -> String {
     format!("i-{}", sortable(crate::now_ms()))

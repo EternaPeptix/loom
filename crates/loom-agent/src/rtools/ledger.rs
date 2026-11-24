@@ -34,7 +34,7 @@
 //!   would_change }`. Outcome `reflection {id} recorded`; text one line echoing the id and `next_route`.
 //!   A structured self-check for when progress stalls: what is ruled out, the best next route, and the
 //!   evidence that would change the conclusion. Each field must say something true, not a ritual glyph.
-//! - `claim`: `ClaimAdd { text }`. Outcome `claim {id} open`. Text: ``{id}: {text}`` and the line
+//! - `claim`: `ClaimAdd { text, assets: Vec::new() }`. Outcome `claim {id} open`. Text: ``{id}: {text}`` and the line
 //!   `Attach evidence with `evidence`, then set its status with `claim` and `id`.`
 //! - `claim_update`: `ClaimUpdate { id, status, note }`. Outcome `claim {id} {status}`. When the claim moves INTO
 //!   `supported` from another status, the text gains the line `Established: {id}. Results established in this
@@ -425,7 +425,8 @@ impl Tool for Step {
                 opt("id", "string", "The step to update, for example p2."),
                 opt("status", "string", "The step's new status.").one_of(&["todo", "doing", "done", "dropped"]),
                 opt("note", "string", "What showed the step is done, or why it was dropped."),
-                opt("evidence", "array", "Ids of evidence records (e1, e2) that show the step is done.").items("string"),
+                opt("evidence", "array", "Ids of evidence records (e1, e2) that show the step is done.")
+                    .items("string"),
                 opt("text", "string", "The text of a new step to add."),
             ],
         )
@@ -508,7 +509,11 @@ impl Tool for Reflect {
             &[
                 req("ruled_out", "string", "What you have ruled out, and why. One or two sentences."),
                 req("next_route", "string", "The single best next route you can see, and why."),
-                req("would_change", "string", "The evidence that, if you saw it, would change your conclusion about this mission — and what you would do with it."),
+                req(
+                    "would_change",
+                    "string",
+                    "The evidence that, if you saw it, would change your conclusion about this mission — and what you would do with it.",
+                ),
             ],
         )
     }
@@ -543,6 +548,7 @@ impl Tool for Claim {
                 opt("quote", "string", "The exact text, copied from an output you were shown; line numbers are not needed. Leave out to take lines start-end whole, as stored."),
                 opt("status", "string", "Optional status to set immediately after attaching evidence.").one_of(&["supported", "refuted", "withdrawn"]),
                 opt("note", "string", "One sentence explaining what the evidence shows, or why the claim is refuted/withdrawn."),
+                opt("assets", "array", "Optional: the assets (ids or locators of the security state) a new claim is about. The hosts of host, service and endpoint assets are the hosts the claim names.").items("string"),
             ],
         )
     }
@@ -578,7 +584,7 @@ impl Tool for Claim {
         }
         let text = str_arg(args, "text").unwrap_or("").to_string();
         if text.trim().is_empty() {
-            return match shared.ledger_append(false, LedgerOp::ClaimAdd { text }) {
+            return match shared.ledger_append(false, LedgerOp::ClaimAdd { text, assets: Vec::new() }) {
                 Ok(_) => unreachable!("empty claim text must be refused by ledger"),
                 Err(err) => ToolOutput::error(err),
             };
@@ -637,7 +643,13 @@ impl Tool for Claim {
             None
         };
 
-        let (_, mut state) = match shared.ledger_append(false, LedgerOp::ClaimAdd { text }) {
+        let assets: Vec<String> = match args.get("assets") {
+            Some(Value::Array(a)) => {
+                a.iter().filter_map(|v| v.as_str()).map(|v| v.trim().to_string()).filter(|v| !v.is_empty()).collect()
+            }
+            _ => Vec::new(),
+        };
+        let (_, mut state) = match shared.ledger_append(false, LedgerOp::ClaimAdd { text, assets }) {
             Ok(ok) => ok,
             Err(err) => return ToolOutput::error(err),
         };
@@ -1667,7 +1679,7 @@ mod tests {
             .append(
                 &loom_core::ids::SessionId::from("s-lead"),
                 false,
-                LedgerOp::ClaimAdd { text: "the lead's claim".into() },
+                LedgerOp::ClaimAdd { text: "the lead's claim".into(), assets: Vec::new() },
                 &|_| Ok(()),
             )
             .unwrap();
@@ -1715,7 +1727,7 @@ mod tests {
         let before = rig.shared.journal.as_ref().unwrap().read().unwrap();
         assert!(ok(&rig, "ledger", json!({})).await.contains("verify this mission"));
         for op in [
-            LedgerOp::ClaimAdd { text: "my finding".into() },
+            LedgerOp::ClaimAdd { text: "my finding".into(), assets: Vec::new() },
             LedgerOp::Decision { text: "accept".into(), reason: "looks right".into() },
             LedgerOp::DeadEnd { what: "try again".into(), why: "failed".into() },
         ] {

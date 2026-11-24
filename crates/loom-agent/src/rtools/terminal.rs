@@ -377,13 +377,18 @@ async fn check_mechanical_oracle(
             return Ok(());
         }
     }
-    Err(format!("The goal is not mechanically established. Have an independent `{verifier}` child run oracle_check against the current operator contract, attach its passing output as attested mission evidence, and cite that evidence ID. A banner, model-authored JSON, self-verification, another role's receipt, or a receipt for an older contract does not count."))
+    Err(format!(
+        "The goal is not mechanically established. Have an independent `{verifier}` child run oracle_check against the current operator contract, attach its passing output as attested mission evidence, and cite that evidence ID. A banner, model-authored JSON, self-verification, another role's receipt, or a receipt for an older contract does not count."
+    ))
 }
 
 fn check_security_coverage(state: &LedgerState) -> Result<(), String> {
     let pending = state.security.mandatory_open();
     if state.release.is_none() && !pending.is_empty() {
-        return Err(format!("Mandatory security coverage is still untested for {}. Record tested evidence or a reasoned deferral with security_record coverage_set before concluding or finishing.",pending.join(", ")));
+        return Err(format!(
+            "Mandatory security coverage is still untested for {}. Record tested evidence or a reasoned deferral with security_record coverage_set before concluding or finishing.",
+            pending.join(", ")
+        ));
     }
     Ok(())
 }
@@ -636,7 +641,9 @@ const QUOTE_SHAPE: &str = "{handle, start, end, text}";
 fn parse_quotes(args: &Map<String, Value>) -> Result<Vec<Quote>, String> {
     let Some(list) = args.get("quotes") else { return Ok(Vec::new()) };
     let Some(list) = list.as_array() else {
-        return Err(format!("`quotes` must be a list of objects {QUOTE_SHAPE}; `text` may be left out. Nothing was delivered. This is a shape fix, not a finding about the work — call finish again once the quotes are in that shape."));
+        return Err(format!(
+            "`quotes` must be a list of objects {QUOTE_SHAPE}; `text` may be left out. Nothing was delivered. This is a shape fix, not a finding about the work — call finish again once the quotes are in that shape."
+        ));
     };
     let mut out = Vec::new();
     for (idx, v) in list.iter().enumerate() {
@@ -658,7 +665,7 @@ fn parse_quotes(args: &Map<String, Value>) -> Result<Vec<Quote>, String> {
             None => {
                 return Err(format!(
                     "quote {pos} is not an object with the fields {QUOTE_SHAPE} (handle is a string, start and end are line numbers; text is a string, or left out to quote those lines whole). Nothing was delivered. This is a shape fix, not a finding about the work — call finish again once the quotes match the shape."
-                ))
+                ));
             }
         }
     }
@@ -727,7 +734,7 @@ impl Finish {
                 Err(e) => {
                     return ToolOutput::error(format!(
                         "The full answer could not be stored ({e}); this is a harness fault. Nothing was delivered. Call finish again."
-                    ))
+                    ));
                 }
             }
         } else {
@@ -890,7 +897,9 @@ impl Finish {
         }
         if !verified.is_empty() {
             let summary = cut_chars(answer.trim(), 240);
-            let (_, st) = s.ledger_append(false, LedgerOp::ClaimAdd { text: summary.clone() }).map_err(err_out)?;
+            let (_, st) = s
+                .ledger_append(false, LedgerOp::ClaimAdd { text: summary.clone(), assets: Vec::new() })
+                .map_err(err_out)?;
             let claim_id =
                 st.claims.last().map(|c| c.id.clone()).ok_or_else(|| {
                     err_out("The synthetic claim was not recorded; this is a harness fault.".to_string())
@@ -990,6 +999,12 @@ impl Finish {
         let released = state.release.is_some();
         if let Err(e) = check_security_coverage(&state) {
             return ToolOutput::error(e);
+        }
+        // F1: a finding about a host needs traffic with that host (roles with `require_traffic`).
+        if !released {
+            if let Err(e) = crate::traffic::check_traffic(&s.role, "finish", &state, &evidence, &s.traffic) {
+                return ToolOutput::error(e);
+            }
         }
         state = match self.settle_objections(state, released) {
             Ok(st) => st,
@@ -1571,11 +1586,21 @@ impl Tool for Finish {
             ToolClass::Terminal,
             &[
                 req("answer", "string", "The result: what was done or found, and how it was confirmed."),
-                opt("quotes", "array", "Supporting lines of stored output: by line numbers, or with the text copied exactly.").with("items", quote_items()),
+                opt(
+                    "quotes",
+                    "array",
+                    "Supporting lines of stored output: by line numbers, or with the text copied exactly.",
+                )
+                .with("items", quote_items()),
                 opt("not_established", "string", "What you could not determine, and what you did not check."),
-                opt("evidence", "array", "Ids of ledger evidence records (e1, e2) the result rests on.").items("string"),
-                opt("status", "string", "Optional goal conclusion (`met` or `unreachable`) to record automatically before finishing.")
-                    .one_of(&["met", "unreachable"]),
+                opt("evidence", "array", "Ids of ledger evidence records (e1, e2) the result rests on.")
+                    .items("string"),
+                opt(
+                    "status",
+                    "string",
+                    "Optional goal conclusion (`met` or `unreachable`) to record automatically before finishing.",
+                )
+                .one_of(&["met", "unreachable"]),
             ],
         )
     }
@@ -1585,7 +1610,7 @@ impl Tool for Finish {
             _ => {
                 return ToolOutput::error(
                     "finish needs an `answer`: the result, written for someone who has not seen your work. Nothing was delivered.",
-                )
+                );
             }
         };
         let requested_status = match str_arg(args, "status").map(str::trim).filter(|s| !s.is_empty()) {
@@ -1595,7 +1620,7 @@ impl Tool for Finish {
             Some(_) => {
                 return ToolOutput::error(
                     "`status` must be `met` (the goal is achieved) or `unreachable` (it cannot be met as stated).",
-                )
+                );
             }
         };
         let quotes = match parse_quotes(args) {
@@ -1609,7 +1634,7 @@ impl Tool for Finish {
             Err(text) => {
                 return quote_refused(format!(
                     "{text}\nNothing was delivered. These are mechanical fixes, not findings about the work — correct the quotes above and call finish again."
-                ))
+                ));
             }
         };
         // A quote is attested support, so it comes from an observation, as evidence does.
@@ -1653,9 +1678,15 @@ impl Tool for Conclude {
             "Record whether the mission's goal is met. This is what makes `finish` available: a finish is refused until the goal is concluded. Use `met` once a run of the target shows the goal achieved; use `unreachable` only once you have established that the goal cannot be met as stated: every plan step closed (done or dropped), every route tried, with execution evidence for it. Cite evidence records (ids from `evidence`) that are attested and show a run; reading source, a dependency scan, a decompilation or a CVE lookup alone is refused. Not being there yet is neither: keep working. After concluding, call `finish` with the result; a verifier checks it.",
             ToolClass::State,
             &[
-                req("status", "string", "met: the goal is achieved. unreachable: it cannot be met as stated.").one_of(&["met", "unreachable"]),
+                req("status", "string", "met: the goal is achieved. unreachable: it cannot be met as stated.")
+                    .one_of(&["met", "unreachable"]),
                 req("note", "string", "What the evidence shows about the goal."),
-                req("evidence", "array", "Ids of evidence records (e1, e2) that show it: attested, and at least one a run of the target.").items("string"),
+                req(
+                    "evidence",
+                    "array",
+                    "Ids of evidence records (e1, e2) that show it: attested, and at least one a run of the target.",
+                )
+                .items("string"),
             ],
         )
     }
@@ -1672,7 +1703,7 @@ impl Tool for Conclude {
             _ => {
                 return ToolOutput::error(
                     "`status` must be `met` (the goal is achieved) or `unreachable` (it cannot be met as stated).",
-                )
+                );
             }
         };
         let state = match s.ledger() {
@@ -1691,6 +1722,17 @@ impl Tool for Conclude {
             if let Err(e) = check_mechanical_oracle(s, ctx, &state, &strings_of(args.get("evidence"))).await {
                 return ToolOutput::error(e);
             }
+            if state.release.is_none() {
+                if let Err(e) = crate::traffic::check_traffic(
+                    &s.role,
+                    "conclude",
+                    &state,
+                    &strings_of(args.get("evidence")),
+                    &s.traffic,
+                ) {
+                    return ToolOutput::error(e);
+                }
+            }
         }
         let note = str_arg(args, "note").unwrap_or("").trim().to_string();
         let op = LedgerOp::GoalMetSet { status, note, evidence: strings_of(args.get("evidence")) };
@@ -1707,7 +1749,9 @@ impl Tool for Conclude {
         };
         ToolOutput::ok(
             outcome,
-            Body::Message(format!("The conclusion is recorded in the ledger. You may now call `finish` with the result, written for someone who has not seen your work. {next}")),
+            Body::Message(format!(
+                "The conclusion is recorded in the ledger. You may now call `finish` with the result, written for someone who has not seen your work. {next}"
+            )),
         )
     }
 }
@@ -1789,7 +1833,9 @@ impl Tool for Verdict {
                 Err(e) => return ToolOutput::error(e),
             };
             if evidence.iter().any(|id| !state.evidence.iter().any(|e| &e.id == id && e.input.attested)) {
-                return ToolOutput::error("Every verdict evidence ID must name an attested record in this mission; record the observation first.");
+                return ToolOutput::error(
+                    "Every verdict evidence ID must name an attested record in this mission; record the observation first.",
+                );
             }
         }
         let (seen, seen_handles) = outputs_seen_ordered(&s.log_path);
@@ -2020,9 +2066,14 @@ impl Tool for HandOff {
             ToolClass::Terminal,
             &[
                 req("state", "string", "Where the work stands and what you learned."),
-                req("leads", "array", "Open leads the next agent should pursue, one per entry (1 to 8).").items("string"),
-                req("ask", "string", "What you ask for.")
-                    .one_of(&["fresh_eyes", "stronger_model", "hint", "more_steps"]),
+                req("leads", "array", "Open leads the next agent should pursue, one per entry (1 to 8).")
+                    .items("string"),
+                req("ask", "string", "What you ask for.").one_of(&[
+                    "fresh_eyes",
+                    "stronger_model",
+                    "hint",
+                    "more_steps",
+                ]),
                 req("why", "string", "Why you are asking for it."),
             ],
         )
@@ -2077,7 +2128,12 @@ impl Tool for ReportBlocker {
             "Report that the work cannot continue because of something outside your control, and end. Use it only after you have tried what is within your reach: say in `tried` what you tried and what happened. Running low on patience, a long task, or an error you have not yet investigated are not blockers.",
             ToolClass::Terminal,
             &[
-                req("class", "string", "The kind of blocker.").one_of(&["needs_approval", "needs_input", "environment", "impossible"]),
+                req("class", "string", "The kind of blocker.").one_of(&[
+                    "needs_approval",
+                    "needs_input",
+                    "environment",
+                    "impossible",
+                ]),
                 req("what", "string", "What is blocking the work."),
                 req("tried", "string", "What you tried, and what happened each time."),
                 req("needs", "string", "What would unblock it, and from whom."),
@@ -2093,7 +2149,7 @@ impl Tool for ReportBlocker {
                 None => {
                     return ToolOutput::error(format!(
                         "report_blocker needs `{key}` to contain text: what is blocking, what you tried, and what would unblock it."
-                    ))
+                    ));
                 }
             }
         }
@@ -2276,7 +2332,7 @@ mod tests {
 
     fn observed_evidence(r: &Rig, body: &str, tool: &str, session: &str, role: Option<&str>) -> String {
         r.user_op(LedgerOp::GoalSet { text: "fixture goal".into() });
-        r.model_op(LedgerOp::ClaimAdd { text: "fixture observation".into() });
+        r.model_op(LedgerOp::ClaimAdd { text: "fixture observation".into(), assets: Vec::new() });
         let blob = r.env.ctx.blobs.put_bytes(body.as_bytes()).unwrap();
         r.orch.produced(&blob, session, "oracle-call", tool, ToolClass::Exec);
         if let Some(role) = role {
@@ -2771,7 +2827,7 @@ mod tests {
     #[tokio::test]
     async fn lead_finish_with_open_items_is_refused() {
         let r = lead();
-        r.model_op(LedgerOp::ClaimAdd { text: "the parser is fixed".into() });
+        r.model_op(LedgerOp::ClaimAdd { text: "the parser is fixed".into(), assets: Vec::new() });
         let res = r.call("finish", json!({"answer": "all done"})).await;
         assert_eq!(res.status, Status::Error);
         assert!(res.text.contains("still has open items"), "{}", res.text);
@@ -2825,7 +2881,9 @@ mod tests {
         assert_eq!(items[0].kind, InboxKind::Finished);
         assert_eq!(
             items[0].text,
-            format!("Parser fixed.\n\nQuoted support (checked against the stored output):\n- {h} lines 1-1: alpha\n\n[verified by s-kid1]")
+            format!(
+                "Parser fixed.\n\nQuoted support (checked against the stored output):\n- {h} lines 1-1: alpha\n\n[verified by s-kid1]"
+            )
         );
         assert_eq!(items[0].reference.as_deref(), Some("f1"));
         assert!(!items[0].blocking);
@@ -2888,7 +2946,7 @@ mod tests {
     /// Record a run of the target: a supported claim with attested execution evidence. Returns the evidence id.
     fn record_run(r: &Rig) -> String {
         let claim = format!("c{}", r.shared.ledger().unwrap().claims.len() + 1);
-        r.model_op(LedgerOp::ClaimAdd { text: "the target runs".into() });
+        r.model_op(LedgerOp::ClaimAdd { text: "the target runs".into(), assets: Vec::new() });
         r.model_op(LedgerOp::EvidenceAdd(EvidenceInput {
             claim: claim.clone(),
             kind: EvidenceKind::Execution,
@@ -2912,7 +2970,7 @@ mod tests {
     /// it fails if the evidence tool records a scan as a run. Returns the evidence id.
     async fn record_analysis(r: &Rig) -> String {
         let claim = format!("c{}", r.shared.ledger().unwrap().claims.len() + 1);
-        r.model_op(LedgerOp::ClaimAdd { text: "the target has a vulnerable dependency".into() });
+        r.model_op(LedgerOp::ClaimAdd { text: "the target has a vulnerable dependency".into(), assets: Vec::new() });
         let h = r.output_graded(
             "pkg:cargo/time@0.1.44 RUSTSEC-2020-0071 reachable\n",
             "dep_scan",
@@ -3279,7 +3337,7 @@ mod tests {
         assert_eq!(spawn_count(&r), 1);
         assert_eq!(open_objections(&r), 2);
         // Static evidence and unattested records settle nothing; an execution record after them does.
-        r.model_op(LedgerOp::ClaimAdd { text: "read the source".into() });
+        r.model_op(LedgerOp::ClaimAdd { text: "read the source".into(), assets: Vec::new() });
         r.model_op(LedgerOp::EvidenceAdd(EvidenceInput {
             claim: "c2".into(),
             kind: EvidenceKind::Static,
@@ -3908,6 +3966,7 @@ mod tests {
         let mut log = SessionLog::create(&r.shared.log_path, Durability::Batch).unwrap();
         let result = |output: Option<BlobRef>, meta: Map<String, Value>| {
             Event::ToolResult(ToolResult {
+                exchanges: Vec::new(),
                 call_id: "c1".into(),
                 name: "bash".into(),
                 status: Status::Ok,
@@ -4555,6 +4614,7 @@ mod tests {
     #[test]
     fn brief_lists_supported_claims_and_cuts_long_quotes() {
         let claim = |id: &str, text: &str, status| loom_core::ledger::Claim {
+            assets: Vec::new(),
             id: id.into(),
             text: text.into(),
             status,
@@ -4602,6 +4662,7 @@ mod tests {
         };
         let st = LedgerState {
             claims: vec![loom_core::ledger::Claim {
+                assets: Vec::new(),
                 id: "c1".into(),
                 text: "it works".into(),
                 status: ClaimStatus::Supported,
@@ -4634,7 +4695,7 @@ mod tests {
     #[tokio::test]
     async fn finish_gives_the_verifier_the_handles_of_the_evidence_it_rests_on() {
         let r = lead();
-        r.model_op(LedgerOp::ClaimAdd { text: "the parser is fixed".into() });
+        r.model_op(LedgerOp::ClaimAdd { text: "the parser is fixed".into(), assets: Vec::new() });
         let h = r.output("line one\nline two\n", "bash", ToolClass::Exec);
         r.model_op(LedgerOp::EvidenceAdd(EvidenceInput {
             claim: "c1".into(),
@@ -4817,7 +4878,7 @@ mod tests {
 
         // Once concluded, an open claim causes check_finish_lead refusal tagged REFUSAL_CEREMONY.
         conclude_met(&r_std).await;
-        r_std.model_op(LedgerOp::ClaimAdd { text: "left open".into() });
+        r_std.model_op(LedgerOp::ClaimAdd { text: "left open".into(), assets: Vec::new() });
         let open_ref = r_std.call("finish", json!({"answer": "Done"})).await;
         assert_eq!(open_ref.status, Status::Error);
         assert_eq!(open_ref.meta.get(META_REFUSAL), Some(&json!(REFUSAL_CEREMONY)));
@@ -4901,5 +4962,130 @@ mod tests {
         let missing_assign = r3.call("verdict", json!({"accepted": true})).await;
         assert_eq!(missing_assign.status, Status::Error);
         assert!(missing_assign.text.contains("Your assignment names outputs to examine"), "{}", missing_assign.text);
+    }
+
+    // CONTRACTS-TRAFFIC-TARGETS F: findings tied to traffic.
+
+    fn traffic_lead(require: bool, tools: &[&str]) -> Rig {
+        let mut role = core_role("lead");
+        for t in tools {
+            if !role.tools.iter().any(|x| x == t) {
+                role.tools.push((*t).into());
+            }
+        }
+        role.require_traffic = require;
+        let r = rig_with(role, false, true, loom_core::config::AgentsCfg::default());
+        r.user_op(LedgerOp::GoalSet { text: "find the leak".into() });
+        r
+    }
+
+    /// A supported claim with attested execution evidence from `call-0`; returns the evidence id.
+    fn claim_about(r: &Rig, text: &str, assets: Vec<String>) -> String {
+        let claim = format!("c{}", r.shared.ledger().unwrap().claims.len() + 1);
+        r.model_op(LedgerOp::ClaimAdd { text: text.into(), assets });
+        r.model_op(LedgerOp::EvidenceAdd(EvidenceInput {
+            claim: claim.clone(),
+            kind: EvidenceKind::Execution,
+            supports: true,
+            session: "s-test".into(),
+            call_id: "call-0".into(),
+            blob: None,
+            lines: None,
+            quote: None,
+            note: "ran it".into(),
+            attested: true,
+            tool: None,
+            grade: None,
+        }));
+        r.model_op(LedgerOp::ClaimUpdate { id: claim, status: ClaimStatus::Supported, note: String::new() });
+        format!("e{}", r.shared.ledger().unwrap().evidence.len())
+    }
+
+    fn reached(r: &Rig, host: &str, call: &str) {
+        let blob = r.env.ctx.blobs.put_bytes(b"GET / HTTP/1.1\r\n\r\n").unwrap();
+        r.shared.traffic.mission.add(&loom_core::event::Exchange {
+            id: loom_core::ids::new_exchange_id(),
+            call_id: Some(call.into()),
+            source: "tool".into(),
+            tool: Some("http_send".into()),
+            scheme: "http".into(),
+            tls: "tool".into(),
+            method: "GET".into(),
+            host: host.into(),
+            port: 80,
+            target: "/".into(),
+            status: Some(200),
+            error: None,
+            request: blob.clone(),
+            response: Some(blob),
+            request_bytes: 1,
+            response_bytes: 1,
+            truncated: false,
+            upstream_unverified: false,
+            duration_ms: 1,
+        });
+    }
+
+    #[tokio::test]
+    async fn conclude_met_is_refused_when_a_claim_names_a_host_no_evidence_reached() {
+        let r = traffic_lead(true, &["http_send", "web_fetch"]);
+        let e = claim_about(&r, "http://api.acme.test/v1/users leaks the token", vec![]);
+        let res = r.call("conclude", json!({"status": "met", "note": "n", "evidence": [e.clone()]})).await;
+        assert_eq!(res.status, Status::Error, "{}", res.text);
+        assert!(
+            res.text.contains("conclude cannot be accepted yet: c1 names api.acme.test, but none of its supporting evidence reached it. Cite the evidence of a call that did (http_send, web_fetch, or a command while interception is on for this mission; interception is off), or take the host out of the claim."),
+            "{}",
+            res.text
+        );
+        // An http_send evidence of that call that reached the host is accepted.
+        reached(&r, "api.acme.test", "call-0");
+        let res = r.call("conclude", json!({"status": "met", "note": "n", "evidence": [e]})).await;
+        assert_eq!(res.status, Status::Ok, "{}", res.text);
+    }
+
+    #[tokio::test]
+    async fn the_refusal_names_only_shown_tools_and_says_whether_interception_is_on() {
+        let r = traffic_lead(true, &["bash"]);
+        let mut role = r.shared.role.clone();
+        role.tools.retain(|t| t != "http_send" && t != "web_fetch");
+        let e = claim_about(&r, "http://api.acme.test/ is open", vec![]);
+        let state = r.shared.ledger().unwrap();
+        let text = crate::traffic::check_traffic(&role, "finish", &state, &[e], &r.shared.traffic).unwrap_err();
+        assert!(!text.contains("http_send") && !text.contains("web_fetch"), "{text}");
+        assert!(text.contains("a command while interception is on for this mission; interception is off"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_claim_naming_only_a_file_asset_or_no_host_is_not_gated() {
+        let r = traffic_lead(true, &["http_send"]);
+        let first = claim_about(&r, "the box exists", vec![]);
+        let asset = loom_core::security_state::AssetInput {
+            kind: loom_core::security_state::AssetKind::File,
+            locator: "/etc/passwd".into(),
+            evidence: vec![first],
+            mandatory: false,
+            parent: None,
+        };
+        r.model_op(LedgerOp::Security(loom_core::security_state::SecurityOp::AssetUpsert { asset }));
+        let e = claim_about(&r, "the file is world readable", vec!["/etc/passwd".into()]);
+        let state = r.shared.ledger().unwrap();
+        crate::traffic::check_traffic(&r.shared.role, "finish", &state, &[e], &r.shared.traffic).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_role_without_require_traffic_is_not_gated() {
+        let r = traffic_lead(false, &["http_send"]);
+        let e = claim_about(&r, "http://api.acme.test/ leaks", vec![]);
+        let state = r.shared.ledger().unwrap();
+        crate::traffic::check_traffic(&r.shared.role, "finish", &state, &[e], &r.shared.traffic).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_host_reached_only_by_unrelated_calls_does_not_count() {
+        let r = traffic_lead(true, &["http_send"]);
+        let e = claim_about(&r, "http://api.acme.test/ leaks", vec![]);
+        reached(&r, "api.acme.test", "call-9");
+        let state = r.shared.ledger().unwrap();
+        assert!(crate::traffic::check_traffic(&r.shared.role, "finish", &state, &[e], &r.shared.traffic).is_err());
     }
 }

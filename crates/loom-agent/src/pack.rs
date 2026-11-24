@@ -11,6 +11,7 @@
 //! preamble = "harness.md"       # optional file; when absent the built-in preamble is used
 //! command_guard = "off"         # "off" | "offensive" command preflight policy
 //! target_concurrency = 2        # positive per-target tool concurrency
+//! intercept = false             # missions decrypt HTTPS by default ([network] intercept = "pack")
 //! requires_restricted_network = false  # optional; true = refuse to start sessions while the network mode is open
 //! solvable = false              # optional; true = the operator built this mission to be solvable (see below)
 //!
@@ -23,6 +24,7 @@
 //! verify_finish = true          # optional, default false
 //! require_oracle = false        # optional, default false; operator-pinned mechanical finish gate
 //! requires_credential = false   # optional explicit asset/credential dispatch gate
+//! require_traffic = false      # optional; finish is refused while a claim names a host no evidence reached
 //! max_steps = 35                # optional hard child epoch slice; zero is rejected
 //! verifier = "verifier"         # optional; the role that attacks this role's finish (see below)
 //! read_only = false             # optional, default false
@@ -127,6 +129,11 @@ pub struct RoleDef {
     pub default_shell: Option<String>,
     /// Optional per-role tool names omitted from wire tool specs (still runnable if called).
     pub hidden_tools: Vec<String>,
+    /// `finish` (and `conclude` with `met`) is refused while a claim it relies on names a host that no
+    /// evidence of the claim reached (CONTRACTS-TRAFFIC-TARGETS F1).
+    pub require_traffic: bool,
+    /// Copied from the pack's `intercept` key at load: missions of this pack decrypt HTTPS by default.
+    pub intercept: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -144,6 +151,8 @@ pub struct Pack {
     pub solvable: bool,
     pub command_guard: bool,
     pub target_concurrency: u32,
+    /// Missions of this pack intercept HTTPS unless started without it (CONTRACTS-TRAFFIC-TARGETS I1).
+    pub intercept: bool,
     pub roles: BTreeMap<String, RoleDef>,
 }
 
@@ -261,6 +270,8 @@ struct RawPack {
     command_guard: Option<String>,
     target_concurrency: Option<u32>,
     #[serde(default)]
+    intercept: bool,
+    #[serde(default)]
     roles: BTreeMap<String, RawRole>,
 }
 
@@ -294,6 +305,8 @@ struct RawRole {
     default_shell: Option<String>,
     #[serde(default)]
     hidden_tools: Vec<String>,
+    #[serde(default)]
+    require_traffic: bool,
 }
 
 fn valid_name(s: &str) -> bool {
@@ -433,7 +446,7 @@ fn parse_pack(
             None | Some("explicit") => Termination::Explicit,
             Some("free") => Termination::Free,
             Some(other) => {
-                return Err(format!("{at}: `termination` = \"{other}\" is not valid; use \"explicit\" or \"free\""))
+                return Err(format!("{at}: `termination` = \"{other}\" is not valid; use \"explicit\" or \"free\""));
             }
         };
         let tools = r.tools.clone().ok_or_else(|| format!("{at} is missing the required key `tools`"))?;
@@ -505,6 +518,8 @@ fn parse_pack(
                 solvable: raw.solvable,
                 default_shell: r.default_shell.clone(),
                 hidden_tools: r.hidden_tools.clone(),
+                require_traffic: r.require_traffic,
+                intercept: raw.intercept,
             },
         );
     }
@@ -526,6 +541,7 @@ fn parse_pack(
         solvable: raw.solvable,
         command_guard,
         target_concurrency,
+        intercept: raw.intercept,
         roles,
     })
 }
@@ -612,7 +628,10 @@ impl Packs {
             for role in pack.roles.values() {
                 for name in role.model.iter().chain(role.escalation_model.iter()).chain(role.alloy_models.iter()) {
                     if !models.contains_key(name) {
-                        return Err(format!("pack {} role {}: model profile \"{}\" is not configured; add [models.{}] or change the role", pack.name, role.name, name, name));
+                        return Err(format!(
+                            "pack {} role {}: model profile \"{}\" is not configured; add [models.{}] or change the role",
+                            pack.name, role.name, name, name
+                        ));
                     }
                 }
             }
@@ -1199,11 +1218,15 @@ mod tests {
         };
         assert_eq!(
             shown("lead"),
-            sorted("bash job_wait job_kill read write edit glob grep web_fetch dep_scan plan note claim evidence ledger log_search agent_spawn agent_message verify request_scope finish ask_user report_blocker")
+            sorted(
+                "bash job_wait job_kill read write edit glob grep web_fetch dep_scan plan note claim evidence ledger log_search agent_spawn agent_message verify request_scope finish ask_user report_blocker"
+            )
         );
         assert_eq!(
             shown("worker"),
-            sorted("bash job_wait job_kill read write edit glob grep web_fetch dep_scan note claim evidence ledger log_search finish report_blocker hand_off")
+            sorted(
+                "bash job_wait job_kill read write edit glob grep web_fetch dep_scan note claim evidence ledger log_search finish report_blocker hand_off"
+            )
         );
         assert_eq!(
             shown("verifier"),

@@ -100,11 +100,15 @@ pub enum JournalError {
     Encode(#[from] serde_json::Error),
     /// The journal holds a validly sealed entry whose op this build cannot parse. `detail` names the
     /// op and gives the parse error.
-    #[error("the mission journal was written by a newer loom (entry {n} is sealed correctly but this build cannot read it: {detail}); upgrade loom to record to this mission")]
+    #[error(
+        "the mission journal was written by a newer loom (entry {n} is sealed correctly but this build cannot read it: {detail}); upgrade loom to record to this mission"
+    )]
     NewerVersion { n: u64, detail: String },
     /// An append failed after its bytes were written and they could not be removed again, so entry
     /// `n` may or may not be in the journal. Read the journal before repeating the op.
-    #[error("journal i/o on {path}: {source}; removing the unconfirmed entry {n} failed as well ({undo}), so it may still be in the journal")]
+    #[error(
+        "journal i/o on {path}: {source}; removing the unconfirmed entry {n} failed as well ({undo}), so it may still be in the journal"
+    )]
     Unconfirmed {
         path: PathBuf,
         n: u64,
@@ -751,7 +755,7 @@ mod tests {
     fn evidence_keeps_its_own_session() {
         let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
         let j = journal(&dir);
-        add(&j, LedgerOp::ClaimAdd { text: "works".into() });
+        add(&j, LedgerOp::ClaimAdd { text: "works".into(), assets: Vec::new() });
         let input = EvidenceInput {
             claim: "c1".into(),
             kind: EvidenceKind::Static,

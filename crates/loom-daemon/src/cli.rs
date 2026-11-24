@@ -340,6 +340,9 @@ pub struct StartOpts {
     /// graph is shared with the other missions of the target
     #[arg(long, value_name = "NAME")]
     pub target: Option<String>,
+    /// Do not decrypt HTTPS for this mission, whatever its pack says (`[network] intercept = "pack"` only)
+    #[arg(long)]
+    pub no_intercept: bool,
 }
 
 #[derive(Args, Debug)]
@@ -897,6 +900,7 @@ fn new_session(opts: &StartOpts, message: Option<String>, cwd: &Path, prior: Vec
         create_workspace: opts.create_workspace,
         attachments: Vec::new(),
         target: opts.target.clone().filter(|t| !t.trim().is_empty()),
+        intercept: opts.no_intercept.then_some(false),
     }
 }
 
@@ -2558,9 +2562,11 @@ mod tests {
             prior: Vec::new(),
             create_workspace: true,
             target: Some("acme".into()),
+            no_intercept: true,
             agent_models: vec![("worker".into(), "fast".into()), (ANY_ROLE.into(), "big".into())],
         };
         let n = new_session(&opts, None, cwd, vec![MissionId::from("m-1"), MissionId::from("m-2")]);
+        assert_eq!(n.intercept, Some(false));
         assert_eq!(n.prior, [MissionId::from("m-1"), MissionId::from("m-2")]);
         assert_eq!(
             n.role_models,
