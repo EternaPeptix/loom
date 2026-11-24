@@ -173,8 +173,12 @@ fn build_client_with_proxy(proxy_url: Option<String>) -> Result<Client, String> 
     builder.build().map_err(|e| format!("The HTTP client could not be built ({e}); this is a harness fault."))
 }
 
-/// The session's egress proxy, when the command environment in `ctx.env` names one.
+/// The proxy the in-process clients use (CONTRACTS-TRAFFIC-TARGETS S9): the session's tool credential when
+/// the runtime set it, else the command proxy the environment in `ctx.env` names, if any.
 pub(crate) fn session_proxy(ctx: &ToolCtx) -> Option<&str> {
+    if let Some(p) = ctx.capabilities.tool_proxy.get().map(|p| p.trim()).filter(|p| !p.is_empty()) {
+        return Some(p);
+    }
     ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"]
         .iter()
         .find_map(|k| ctx.env.get(*k).map(|v| v.trim()).filter(|v| !v.is_empty()))
@@ -372,9 +376,26 @@ async fn follow(
             }
         }
         let started = std::time::Instant::now();
+        // The session's credential profile (S8), decided again for each hop on that hop's own host; never on
+        // the reference path. The tool keeps no cookie jar, so nothing is "already sent".
+        let base = vec![("user-agent".to_string(), b"loom-web-fetch/0.1".to_vec())];
+        let injected = match (reference.is_some(), current.host_str()) {
+            (false, Some(host)) => traffic::inject(ctx, host, &base, &[]),
+            _ => None,
+        };
+        let text = |pairs: &[(String, Vec<u8>)]| -> Vec<(String, String)> {
+            pairs.iter().map(|(k, v)| (k.clone(), String::from_utf8_lossy(v).into_owned())).collect()
+        };
         let req_wire =
-            traffic::request_message("GET", &current, &[("user-agent".into(), "loom-web-fetch/0.1".into())], b"");
-        let resp = match client.get(current.clone()).send().await {
+            traffic::request_message("GET", &current, &text(injected.as_ref().map_or(&base, |i| &i.shown)), b"");
+        let mut builder = client.get(current.clone());
+        if let Some(inj) = &injected {
+            // Everything past `base` is an addition (`base` has no `Cookie`, so none merges into it).
+            for (k, v) in inj.real.iter().skip(base.len()) {
+                builder = builder.header(k.as_str(), v.as_slice());
+            }
+        }
+        let resp = match builder.send().await {
             Ok(r) => r,
             // A refused CONNECT looks like any failure to connect: the proxy is asked again (see [`Tunnel`]).
             Err(e) if tunnelled && e.is_connect() && !names_tls_failure(&e) => {

@@ -64,6 +64,32 @@ fn bounded(message: &[u8]) -> (&[u8], bool) {
     (message.get(..keep).unwrap_or(message), keep < message.len())
 }
 
+/// Header pairs as the tool sends them and as it records them.
+pub(crate) struct Injected {
+    /// What goes on the wire.
+    pub real: Vec<(String, Vec<u8>)>,
+    /// The same with every value loom added replaced by `[redacted]`: what is recorded (S5).
+    pub shown: Vec<(String, Vec<u8>)>,
+}
+
+const REDACTED: &str = "[redacted]";
+
+/// Applies the session's credential profile items (S8) to `headers` for a request to `host`, with
+/// `loom_net::inject::apply` semantics. `already` = cookie names the client sends anyway. `None` when the
+/// session has no items, none is for `host`, or nothing was added (the request goes out as it is).
+pub(crate) fn inject(ctx: &ToolCtx, host: &str, headers: &[(String, Vec<u8>)], already: &[String]) -> Option<Injected> {
+    let inject = ctx.capabilities.creds.get().filter(|i| i.applies_to(host))?;
+    let mut real = headers.to_vec();
+    if loom_net::inject::apply(inject.items(), host, &mut real, already) == 0 {
+        return None;
+    }
+    let masked: Vec<loom_core::creds::Item> =
+        inject.items().iter().map(|i| loom_core::creds::Item { value: REDACTED.to_string(), ..i.clone() }).collect();
+    let mut shown = headers.to_vec();
+    loom_net::inject::apply(&masked, host, &mut shown, already);
+    Some(Injected { real, shown })
+}
+
 /// What a tool knows of one exchange.
 pub struct Made<'a> {
     pub tool: &'a str,
@@ -83,9 +109,19 @@ pub struct Made<'a> {
 /// Stores the messages and returns the record. `None` when the blob store refuses (a harness fault the
 /// tool should not turn into a failed call).
 pub fn record(ctx: &ToolCtx, made: &Made<'_>) -> Option<Exchange> {
-    let (req, req_cut) = bounded(made.request);
+    // Session secrets (S5) never reach the blob store; redacted before cutting so a value is never split.
+    let secrets = ctx.capabilities.secrets.get().filter(|s| !s.is_empty());
+    fn mask<'a>(secrets: Option<&loom_core::creds::Secrets>, m: &'a [u8]) -> std::borrow::Cow<'a, [u8]> {
+        match secrets {
+            Some(s) => s.redact_bytes(m),
+            None => std::borrow::Cow::Borrowed(m),
+        }
+    }
+    let request_msg = mask(secrets.map(|s| &**s), made.request);
+    let response_msg = made.response.map(|r| mask(secrets.map(|s| &**s), r));
+    let (req, req_cut) = bounded(&request_msg);
     let request = ctx.blobs.put_bytes(req).ok()?;
-    let (response, resp_cut) = match made.response {
+    let (response, resp_cut) = match &response_msg {
         Some(r) => {
             let (kept, cut) = bounded(r);
             (Some(ctx.blobs.put_bytes(kept).ok()?), cut)
@@ -104,11 +140,14 @@ pub fn record(ctx: &ToolCtx, made: &Made<'_>) -> Option<Exchange> {
         port: made.url.port_or_known_default().unwrap_or(0),
         target: target_of(made.url),
         status: made.status,
-        error: made.error.clone(),
+        error: made.error.as_ref().map(|e| match secrets {
+            Some(s) => s.redact(e).into_owned(),
+            None => e.clone(),
+        }),
         request,
         response,
-        request_bytes: made.request.len() as u64,
-        response_bytes: made.response.map_or(0, |r| r.len() as u64),
+        request_bytes: request_msg.len() as u64,
+        response_bytes: response_msg.as_ref().map_or(0, |r| r.len() as u64),
         truncated: req_cut || resp_cut || made.response_cut,
         upstream_unverified: false,
         duration_ms: made.started.elapsed().as_millis() as u64,
