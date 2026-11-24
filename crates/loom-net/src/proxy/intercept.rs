@@ -42,6 +42,7 @@ use crate::tls::Ca;
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::ClientConfig;
 use std::time::Instant;
+use crate::inject::{apply_head, Inject};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
@@ -82,7 +83,15 @@ pub(super) fn listed(patterns: &[String], host: &str, port: u16) -> bool {
 impl CaptureCfg {
     /// Whether a tunnel to `host:port` is decrypted.
     pub fn intercepts(&self, host: &str, port: u16) -> bool {
-        self.grant.intercept && self.ca.is_some() && !listed(&self.grant.passthrough, host, port)
+        self.grant.intercept
+            && self.ca.is_some()
+            && !listed(&self.grant.passthrough, host, port)
+            && self.in_scope(host)
+    }
+
+    /// Whether `host` passes the grant's `intercept_scope` (always, when it has none).
+    fn in_scope(&self, host: &str) -> bool {
+        self.grant.intercept_scope.as_ref().is_none_or(|s| s.contains(host))
     }
 
     fn insecure(&self, host: &str, port: u16) -> bool {
@@ -91,6 +100,9 @@ impl CaptureCfg {
 
     /// Hands a capture to the sink, with the destination of `cx`. A closed sink drops it.
     pub fn send(&self, cx: &Ctx<'_>, mut c: Captured) {
+        if !self.in_scope(cx.host) {
+            return;
+        }
         c.host = cx.host.to_string();
         c.port = cx.port;
         let _ = self.sink.send((cx.session.clone(), c));
@@ -236,6 +248,7 @@ pub(super) async fn run(
     cx: &Ctx<'_>,
     allowed: &Allowed,
     cap: &CaptureCfg,
+    inject: Option<&Inject>,
     cancel: &CancellationToken,
 ) -> Ended {
     let Some(ca) = cap.ca.as_ref() else { return Ended::Opaque(client, up) };
@@ -282,7 +295,7 @@ pub(super) async fn run(
         return Ended::Done;
     };
     tokio::select! {
-        _ = serve(client_tls, up_tls, cx, cap, insecure) => {}
+        _ = serve(client_tls, up_tls, cx, cap, inject, insecure) => {}
         _ = cancel.cancelled() => cx.failed_after_allow(allowed, SHUTDOWN).await,
     }
     Ended::Done
@@ -372,7 +385,7 @@ async fn bad_request_tls<W: AsyncWrite + Unpin>(w: &mut W, why: &str, idle: Dura
 }
 
 /// The decrypted stream of an intercepted tunnel: requests one by one, then closed.
-async fn serve(client: Cs, up: Us, cx: &Ctx<'_>, cap: &CaptureCfg, unverified: bool) {
+async fn serve(client: Cs, up: Us, cx: &Ctx<'_>, cap: &CaptureCfg, inject: Option<&Inject>, unverified: bool) {
     let idle = cx.shared.limits.idle_timeout;
     let (mut cr, mut cw) = tokio::io::split(client);
     let (mut ur, mut uw) = tokio::io::split(up);
@@ -392,6 +405,11 @@ async fn serve(client: Cs, up: Us, cx: &Ctx<'_>, cap: &CaptureCfg, unverified: b
             }
         };
         first = false;
+        // S3, S6: decided again for every request of the connection, on the tunnel's destination.
+        let raw = match inject.filter(|i| i.applies_to(cx.host)).and_then(|i| apply_head(i.items(), cx.host, &raw)) {
+            Some(injected) => injected,
+            None => raw,
+        };
         let body = match body_kind(&head) {
             Ok(Body::Stream) => {
                 bad_request_tls(&mut cw, "a request body with this transfer coding cannot be relayed", idle).await;
