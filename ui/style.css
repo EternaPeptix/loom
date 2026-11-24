@@ -1586,3 +1586,13 @@ a.id-target:hover { background: var(--bg-3); }
   .tlayout { grid-template-columns: minmax(0, 1fr); }
   .tstatus { display: none; }
 }
+
+.tcreds { max-width: 900px; margin: 12px 0; }
+.tcred-list { list-style: none; margin: 0 0 8px; padding: 0; }
+.tcred { padding: 4px 0; border-bottom: 1px solid var(--line-2); }
+.tcred-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; }
+.tcred-text { flex: 1 1 260px; overflow-wrap: anywhere; }
+.tcred-items { margin: 4px 0; padding-left: 18px; font-size: 12px; }
+.tcred-cmd { display: flex; align-items: center; gap: 6px; margin: 4px 0; }
+.tcred-cmd code { overflow-wrap: anywhere; font-size: 12px; }
+.id-creds { cursor: default; }

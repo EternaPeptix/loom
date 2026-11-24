@@ -4302,3 +4302,34 @@ test("graph nodes take their parent from the edges when a node does not name one
   assert.deepEqual(C.callWindowExchanges(block, list).map((x) => x.id), ["a"]);
   assert.deepEqual(C.callWindowExchanges({ ...block, name: "read" }, list), []);
 });
+
+// ---- credential profiles (CONTRACTS-TRAFFIC-TARGETS S7, S10, U5) ----
+
+test("credRowText leaves out a zero count, sorts and trims hosts, and shows an error instead of counts", () => {
+  const now = 1_000_000_000;
+  assert.equal(C.credRowText({ profile: "default", cookies: 2, headers: 0, hosts: ["acme.test"], recorded_ms: now - 5 * 60_000 }, now), "default · 2 cookies · acme.test · recorded 5m ago");
+  assert.equal(C.credRowText({ profile: "admin", cookies: 1, headers: 1, hosts: ["b.test", "a.test"], recorded_ms: now - 1000 }, now), "admin · 1 cookie, 1 header · a.test, b.test · recorded just now");
+  assert.equal(C.credRowText({ profile: "p", cookies: 0, headers: 3, hosts: ["e", "d", "c", "b", "a"], recorded_ms: now - 3 * 3600_000 }, now), "p · 3 headers · a, b, c and 2 more · recorded 3h ago");
+  assert.equal(C.credRowText({ profile: "bad", cookies: 4, headers: 4, hosts: ["a"], recorded_ms: now - 86400_000 * 2, error: "does not open" }, now), "bad · does not open · recorded 2d ago");
+  assert.equal(C.credRowText({ profile: "x", cookies: 0, headers: 0, hosts: [], recorded_ms: 0 }, now), "x");
+});
+
+test("credShow lists kind name and host, credCommands names the target, credsRefOf reads session_start", () => {
+  const r = C.credShow({ summary: "default · 1 cookie · a.test", items: [{ kind: "cookie", name: "sid", host: "a.test" }, { kind: "header", name: "Authorization", host: "a.test" }] });
+  assert.deepEqual(r.lines, ["cookie sid · a.test", "header Authorization · a.test"]);
+  assert.equal(r.summary, "default · 1 cookie · a.test");
+  assert.deepEqual(C.credShow(null), { summary: "", lines: [] });
+  assert.equal(C.credCommands("acme")[0], "loom creds record --target acme");
+  assert.match(C.credCommands("acme")[1], /^loom creds set --target acme --host .* --cookie '.*'$/);
+  assert.deepEqual(C.credsRefOf({ creds: { profile: "default", summary: "s", dropped: 2 } }), { profile: "default", summary: "s", dropped: 2 });
+  assert.equal(C.credsRefOf({}), null);
+  assert.equal(C.credsRefOf(null), null);
+});
+
+test("buildNewSession sends creds only with a target and not for none", () => {
+  const base = { workspace: "/w", message: "go" };
+  assert.equal(C.buildNewSession({ ...base, target: "acme", creds: "default" }).body.creds, "default");
+  assert.equal("creds" in C.buildNewSession({ ...base, target: "acme", creds: "" }).body, false);
+  assert.equal("creds" in C.buildNewSession({ ...base, target: "acme", creds: "none" }).body, false);
+  assert.equal("creds" in C.buildNewSession({ ...base, target: "", creds: "default" }).body, false);
+});
