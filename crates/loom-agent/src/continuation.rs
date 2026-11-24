@@ -258,6 +258,7 @@ mod tests {
             &e.ctx,
         );
         let mut receipt = ToolResult {
+            exchanges: Vec::new(),
             call_id: "actual".into(),
             name: "bash".into(),
             status: ToolStatus::Ok,
@@ -267,6 +268,7 @@ mod tests {
             class: ToolClass::Exec,
             meta: Map::new(),
             duration_ms: 1,
+            images: Vec::new(),
         };
         p.advance(&receipt);
         assert!(p.check(&e.ctx, "mission").is_err());

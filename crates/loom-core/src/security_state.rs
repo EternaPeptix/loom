@@ -9,21 +9,14 @@
 //! Mandatory coverage is open until tested with evidence or deferred with a nonblank reason. Typed
 //! conditions unblock claim/dead-end references only when every prerequisite is recorded. Crash
 //! signatures retain frame-zero lines, omit caller lines, and exclude timeout/OOM/non-crash outcomes;
-//! each signature retains its last six attempts. Hypothesis priority belongs to the lead; verdicts
-//! belong to an independent read-only verifier, enforced by the runtime tool using authenticated
-//! session capabilities. Every supported/refuted verdict cites evidence, with counterevidence for
-//! refutation. Fresh counterevidence reopens a previously supported hypothesis.
+//! each signature retains its last six attempts. Prefix resolution prefers exact IDs/aliases and
+//! refuses ambiguous prefixes. All maps/outputs have deterministic ordering.
 //!
-//! `projection`, `why`, and `what_if` implement finite, function-free, range-restricted stratified
-//! Datalog (variables start `?`, no aggregates/arithmetic). Negation is absence, not evidence of
-//! truth. Retractions rebuild the projection and expose disappeared conclusions; base observations
-//! and historical hypotheses are preserved. Evaluation is bounded and reports incompleteness rather
-//! than presenting a truncated closure as complete. See `security_state::causal`.
-//!
-//! `path_suggest` returns at most three weighted simple paths of at most eight hops, omits expired
-//! edges, and discounts edges out of known footholds. These are prioritization hints over explicit
-//! relations, never validated attack paths. Prefix resolution prefers exact IDs/aliases and refuses
-//! ambiguous prefixes. All maps/outputs have deterministic ordering.
+//! Hypotheses and the rule engine are not part of the state any more: the operations
+//! `hypothesis_open`, `hypothesis_priority`, `hypothesis_evidence`, `hypothesis_verdict`,
+//! `rule_install` and `rule_retract` stay deserializable so old journals load, are refused when
+//! validated for a new append (`REMOVED_OP_REFUSAL`), and change nothing when applied. A snapshot
+//! that still carries `hypotheses`, `rules`, `died` or `retraction_limitation` loads; they are dropped.
 //!
 //! `SecurityOp::action` is the serialized `action` tag of an op (`asset_upsert`, …, `batch`). A batch
 //! stays one atomic append; when one of its operations fails validation the error is
@@ -32,9 +25,6 @@
 //! (batch): Nested security batches are not supported; flatten the operations."). Tests required: the
 //! prefix for a failing second operation of three, the nested batch, and that nothing of the batch was
 //! applied.
-
-pub mod causal;
-pub use causal::{Atom, Fact, Literal, Projection, Rule, WhatIf};
 
 use crate::ledger::LedgerState;
 use crate::SessionId;
@@ -239,20 +229,6 @@ pub enum HypothesisStatus {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Hypothesis {
-    pub id: String,
-    pub text: String,
-    pub priority: u8,
-    pub owner: SessionId,
-    pub status: HypothesisStatus,
-    pub evidence: Vec<String>,
-    pub counterevidence: Vec<String>,
-    pub note: String,
-    pub judge: Option<SessionId>,
-    pub n: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RelationInput {
     pub from: String,
@@ -272,26 +248,72 @@ pub struct Relation {
     pub n: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SuggestedPath {
-    pub assets: Vec<String>,
-    pub relations: Vec<String>,
-    pub cost: u64,
+/// A ground tuple the lead asserted as an observation. It is recorded and shown, never evaluated.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Fact {
+    pub predicate: String,
+    pub args: Vec<String>,
 }
+
+impl Fact {
+    pub fn id(&self) -> String {
+        let parts: Vec<_> =
+            std::iter::once(self.predicate.as_str()).chain(self.args.iter().map(String::as_str)).collect();
+        stable_id("ft", &parts)
+    }
+    pub fn validate(&self) -> Result<(), String> {
+        if self.predicate.is_empty()
+            || self.predicate.len() > 80
+            || !self.predicate.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            || self.args.len() > 8
+        {
+            return Err(
+                "Use an ASCII predicate name of one to 80 letters/digits/underscores and at most eight arguments."
+                    .into(),
+            );
+        }
+        for a in &self.args {
+            text(a, "fact argument")?;
+        }
+        Ok(())
+    }
+}
+
+/// The shape of a removed `rule_install` operation, kept so old journals deserialize.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Atom {
+    pub predicate: String,
+    pub args: Vec<String>,
+}
+
+/// See [`Atom`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Literal {
+    pub atom: Atom,
+    #[serde(default)]
+    pub negated: bool,
+}
+
+/// See [`Atom`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Rule {
+    pub name: String,
+    pub head: Atom,
+    pub body: Vec<Literal>,
+}
+
+/// What a call to one of the removed hypothesis or rule operations is told.
+pub const REMOVED_OP_REFUSAL: &str = "Hypotheses are not recorded in the security state any more: write the idea as a note (`note` with kind `decision`) or test it and record what the run showed.";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssertedFact {
     pub id: String,
     pub fact: Fact,
     pub evidence: Vec<String>,
-    pub active: bool,
-    pub n: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct InstalledRule {
-    pub id: String,
-    pub rule: Rule,
     pub active: bool,
     pub n: u64,
 }
@@ -387,15 +409,9 @@ pub struct SecurityState {
     pub revisited: BTreeMap<String, u64>,
     pub crashes: BTreeMap<String, CrashRecord>,
     pub vector_attempts: BTreeMap<String, Vec<AttemptInput>>,
-    pub hypotheses: BTreeMap<String, Hypothesis>,
     pub relations: BTreeMap<String, Relation>,
     pub facts: BTreeMap<String, AssertedFact>,
-    pub rules: BTreeMap<String, InstalledRule>,
     pub aliases: BTreeMap<String, String>,
-    /// Conclusions removed by the most recent fact/rule retraction.
-    pub died: Vec<Fact>,
-    /// Retraction differences are unknown when either closure exhausted its evaluation budget.
-    pub retraction_limitation: Option<String>,
 }
 
 /// Hash a length-delimited tuple; no separator ambiguity or truncated-hash collisions.
@@ -509,10 +525,8 @@ impl SecurityState {
             .chain(self.credentials.keys())
             .chain(self.footholds.keys())
             .chain(self.crashes.keys())
-            .chain(self.hypotheses.keys())
             .chain(self.relations.keys())
             .chain(self.facts.keys())
-            .chain(self.rules.keys())
             .map(String::as_str)
             .collect();
         if ids.contains(wanted) {
@@ -584,13 +598,6 @@ impl SecurityState {
                 Ok(())
             } else {
                 Err(format!("Asset `{id}` does not exist; record it first."))
-            }
-        };
-        let hypothesis = |id: &str| -> Result<(), String> {
-            if self.hypotheses.contains_key(id) {
-                Ok(())
-            } else {
-                Err(format!("Hypothesis `{id}` does not exist; the lead must open it first."))
             }
         };
         match op {
@@ -703,31 +710,12 @@ impl SecurityState {
                     return Err("The attempt registry reached its vector bound; start a narrower mission.".into());
                 }
             }
-            SecurityOp::HypothesisOpen { text: t, .. } => text(t, "hypothesis")?,
-            SecurityOp::HypothesisPriority { id, .. } => hypothesis(id)?,
-            SecurityOp::HypothesisEvidence { id, evidence: e, counterevidence: c } => {
-                hypothesis(id)?;
-                evidence(e, false)?;
-                evidence(c, false)?;
-                if e.is_empty() && c.is_empty() {
-                    return Err("Attach supporting evidence or counterevidence to the hypothesis.".into());
-                }
-            }
-            SecurityOp::HypothesisVerdict { id, status, note, evidence: e, counterevidence: c } => {
-                hypothesis(id)?;
-                text(note, "verdict note")?;
-                evidence(e, false)?;
-                evidence(c, false)?;
-                if *status == HypothesisStatus::Open
-                    || (*status == HypothesisStatus::Supported && e.is_empty())
-                    || (*status == HypothesisStatus::Refuted && c.is_empty())
-                {
-                    return Err("A judge verdict must be supported with evidence, or refuted with counterevidence; use an evidence update to reopen.".into());
-                }
-                if self.hypotheses.get(id).is_some_and(|h| h.counterevidence.iter().any(|id| !c.contains(id))) {
-                    return Err("The verdict must acknowledge every existing counterevidence ID; include and review them explicitly.".into());
-                }
-            }
+            SecurityOp::HypothesisOpen { .. }
+            | SecurityOp::HypothesisPriority { .. }
+            | SecurityOp::HypothesisEvidence { .. }
+            | SecurityOp::HypothesisVerdict { .. }
+            | SecurityOp::RuleInstall { .. }
+            | SecurityOp::RuleRetract { .. } => return Err(REMOVED_OP_REFUSAL.into()),
             SecurityOp::RelationAdd { relation: r } => {
                 asset(&r.from)?;
                 asset(&r.to)?;
@@ -742,15 +730,6 @@ impl SecurityState {
             SecurityOp::FactAssert { fact, evidence: e } => {
                 fact.validate()?;
                 evidence(e, true)?;
-                if let Some(&(_, expected)) = causal::BUILTIN_ARITIES.iter().find(|&&(pred, _)| pred == fact.predicate)
-                {
-                    if fact.args.len() != expected {
-                        return Err(format!(
-                            "Predicate `{}` is built-in with arity {expected}; use that arity or choose another predicate name.",
-                            fact.predicate
-                        ));
-                    }
-                }
                 if self
                     .facts
                     .values()
@@ -761,39 +740,11 @@ impl SecurityState {
                             .into(),
                     );
                 }
-                for r in self.rules.values().filter(|r| r.active) {
-                    if std::iter::once(&r.rule.head)
-                        .chain(r.rule.body.iter().map(|l| &l.atom))
-                        .any(|a| a.predicate == fact.predicate && a.args.len() != fact.args.len())
-                    {
-                        return Err("The fact arity disagrees with an installed rule; correct the tuple shape.".into());
-                    }
-                }
             }
             SecurityOp::FactRetract { id, reason } => {
                 text(reason, "retraction reason")?;
                 if !self.facts.get(id).is_some_and(|f| f.active) {
                     return Err("Retract an existing active base fact, not a derived conclusion.".into());
-                }
-            }
-            SecurityOp::RuleInstall { rule } => {
-                let mut rules: Vec<_> = self.rules.values().filter(|r| r.active).map(|r| r.rule.clone()).collect();
-                rules.push(rule.clone());
-                causal::validate_rules(&rules)?;
-                for atom in std::iter::once(&rule.head).chain(rule.body.iter().map(|l| &l.atom)) {
-                    if self
-                        .facts
-                        .values()
-                        .any(|f| f.active && f.fact.predicate == atom.predicate && f.fact.args.len() != atom.args.len())
-                    {
-                        return Err("The rule arity disagrees with an asserted fact; correct the tuple shape.".into());
-                    }
-                }
-            }
-            SecurityOp::RuleRetract { id, reason } => {
-                text(reason, "retraction reason")?;
-                if !self.rules.get(id).is_some_and(|r| r.active) {
-                    return Err("Retract an existing active rule ID.".into());
                 }
             }
             SecurityOp::AliasAdd { alias, target } => {
@@ -815,10 +766,8 @@ impl SecurityState {
                 SecurityOp::AssetUpsert { .. }
                     | SecurityOp::CredentialAdd { .. }
                     | SecurityOp::FootholdAdd { .. }
-                    | SecurityOp::HypothesisOpen { .. }
                     | SecurityOp::RelationAdd { .. }
                     | SecurityOp::FactAssert { .. }
-                    | SecurityOp::RuleInstall { .. }
                     | SecurityOp::CrashRecord { .. }
             )
         {
@@ -833,14 +782,14 @@ impl SecurityState {
             .chain(self.credentials.keys())
             .chain(self.footholds.keys())
             .chain(self.crashes.keys())
-            .chain(self.hypotheses.keys())
             .chain(self.relations.keys())
             .chain(self.facts.keys())
-            .chain(self.rules.keys())
             .cloned()
             .collect()
     }
 
+    // `session` is kept so callers and the journal format do not change; no operation uses it any more.
+    #[allow(clippy::only_used_in_recursion)]
     pub fn apply(&mut self, op: &SecurityOp, n: u64, session: &SessionId) {
         match op {
             SecurityOp::Batch { operations } => {
@@ -936,49 +885,13 @@ impl SecurityState {
                     }
                 }
             }
-            SecurityOp::HypothesisOpen { text, priority } => {
-                let id = stable_id("hy", &[text.trim()]);
-                self.hypotheses.entry(id.clone()).or_insert_with(|| Hypothesis {
-                    id,
-                    text: text.trim().into(),
-                    priority: *priority,
-                    owner: session.clone(),
-                    status: HypothesisStatus::Open,
-                    evidence: Vec::new(),
-                    counterevidence: Vec::new(),
-                    note: String::new(),
-                    judge: None,
-                    n,
-                });
-            }
-            SecurityOp::HypothesisPriority { id, priority } => {
-                if let Some(h) = self.hypotheses.get_mut(id) {
-                    h.priority = *priority;
-                }
-            }
-            SecurityOp::HypothesisEvidence { id, evidence, counterevidence } => {
-                if let Some(h) = self.hypotheses.get_mut(id) {
-                    let new_counter = counterevidence.iter().any(|e| !h.counterevidence.contains(e));
-                    let new_support = evidence.iter().any(|e| !h.evidence.contains(e));
-                    merge(&mut h.evidence, evidence);
-                    merge(&mut h.counterevidence, counterevidence);
-                    if (new_counter && h.status == HypothesisStatus::Supported)
-                        || (new_support && h.status == HypothesisStatus::Refuted)
-                    {
-                        h.status = HypothesisStatus::Open;
-                        h.judge = None;
-                    }
-                }
-            }
-            SecurityOp::HypothesisVerdict { id, status, note, evidence, counterevidence } => {
-                if let Some(h) = self.hypotheses.get_mut(id) {
-                    h.status = *status;
-                    h.note = note.clone();
-                    h.judge = Some(session.clone());
-                    merge(&mut h.evidence, evidence);
-                    merge(&mut h.counterevidence, counterevidence);
-                }
-            }
+            // Removed operations: old journals still hold them; they change nothing.
+            SecurityOp::HypothesisOpen { .. }
+            | SecurityOp::HypothesisPriority { .. }
+            | SecurityOp::HypothesisEvidence { .. }
+            | SecurityOp::HypothesisVerdict { .. }
+            | SecurityOp::RuleInstall { .. }
+            | SecurityOp::RuleRetract { .. } => {}
             SecurityOp::RelationAdd { relation } => self.add_relation(relation.clone(), n),
             SecurityOp::FactAssert { fact, evidence } => {
                 let id = fact.id();
@@ -992,25 +905,9 @@ impl SecurityState {
                 record.active = true;
                 merge(&mut record.evidence, evidence);
             }
-            SecurityOp::RuleInstall { rule } => {
-                let id = rule.id();
-                self.rules.insert(id.clone(), InstalledRule { id, rule: rule.clone(), active: true, n });
-            }
-            SecurityOp::FactRetract { id, .. } | SecurityOp::RuleRetract { id, .. } => {
-                let before = self.projection();
+            SecurityOp::FactRetract { id, .. } => {
                 if let Some(f) = self.facts.get_mut(id) {
                     f.active = false;
-                }
-                if let Some(r) = self.rules.get_mut(id) {
-                    r.active = false;
-                }
-                let after = self.projection();
-                if before.complete && after.complete {
-                    self.died = before.facts.into_iter().filter(|f| !after.contains(&f.fact)).map(|f| f.fact).collect();
-                    self.retraction_limitation = None;
-                } else {
-                    self.died.clear();
-                    self.retraction_limitation = Some("The retraction closure is incomplete; disappeared conclusions are unknown. Narrow the causal rules and query again.".into());
                 }
             }
             SecurityOp::AliasAdd { alias, target } => {
@@ -1025,64 +922,6 @@ impl SecurityState {
         merge(&mut r.input.evidence, &input.evidence);
         r.input.cost = input.cost;
         r.input.expires_ms = input.expires_ms;
-    }
-
-    pub fn projection(&self) -> Projection {
-        self.what_if(&[], &[]).projection
-    }
-
-    pub fn why(&self, fact: &Fact) -> Option<causal::Explanation> {
-        self.projection().why(fact)
-    }
-
-    pub fn what_if(&self, assume: &[Fact], retract: &[String]) -> WhatIf {
-        causal::evaluate(self, assume, retract)
-    }
-
-    pub fn path_suggest(&self, from: &str, to: &str, now_ms: u64) -> Vec<SuggestedPath> {
-        let mut frontier = vec![SuggestedPath { assets: vec![from.into()], relations: Vec::new(), cost: 0 }];
-        let mut found = Vec::new();
-        let mut visited = 0usize;
-        while !frontier.is_empty() && visited < 10_000 && found.len() < 3 {
-            frontier.sort_by(|a, b| (b.cost, &b.assets, &b.relations).cmp(&(a.cost, &a.assets, &a.relations)));
-            let Some(path) = frontier.pop() else {
-                break;
-            };
-            visited = visited.saturating_add(1);
-            let Some(last) = path.assets.last() else {
-                continue;
-            };
-            if last == to && path.assets.len() > 1 {
-                found.push(path);
-                continue;
-            }
-            if path.relations.len() >= 8 {
-                continue;
-            }
-            for edge in self.relations.values().filter(|e| {
-                &e.input.from == last
-                    && e.input.expires_ms.is_none_or(|t| t > now_ms)
-                    && !path.assets.contains(&e.input.to)
-            }) {
-                let known = self
-                    .footholds
-                    .values()
-                    .any(|f| &f.input.asset == last && f.input.expires_ms.is_none_or(|t| t > now_ms));
-                let mut next = path.clone();
-                next.assets.push(edge.input.to.clone());
-                next.relations.push(edge.id.clone());
-                next.cost = next.cost.saturating_add(u64::from(if known {
-                    edge.input.cost.div_ceil(2)
-                } else {
-                    edge.input.cost
-                }));
-                frontier.push(next);
-                if frontier.len() >= 10_000 {
-                    break;
-                }
-            }
-        }
-        found
     }
 }
 
@@ -1139,19 +978,6 @@ mod tests {
         apply(l, SecurityOp::AssetUpsert { asset: a });
         id
     }
-    fn fact(name: &str, args: &[&str]) -> Fact {
-        Fact { predicate: name.into(), args: args.iter().map(|s| (*s).into()).collect() }
-    }
-    fn atom(name: &str, args: &[&str]) -> Atom {
-        Atom { predicate: name.into(), args: args.iter().map(|s| (*s).into()).collect() }
-    }
-    fn rule(name: &str, head: Atom, body: Vec<Literal>) -> Rule {
-        Rule { name: name.into(), head, body }
-    }
-    fn positive(atom: Atom) -> Literal {
-        Literal { atom, negated: false }
-    }
-
     #[test]
     fn canonical_dedup_preserves_url_path_case_and_requires_attestation() {
         let mut l = ledger();
@@ -1286,148 +1112,6 @@ mod tests {
     }
 
     #[test]
-    fn causal_retraction_keeps_alternative_support_and_reports_dead_conclusions() {
-        let mut l = ledger();
-        let a = fact("observed", &["a"]);
-        let b = fact("backup", &["a"]);
-        apply(&mut l, SecurityOp::FactAssert { fact: a.clone(), evidence: vec!["e1".into()] });
-        apply(&mut l, SecurityOp::FactAssert { fact: b.clone(), evidence: vec!["e2".into()] });
-        for (name, base) in [("primary", "observed"), ("secondary", "backup")] {
-            apply(
-                &mut l,
-                SecurityOp::RuleInstall {
-                    rule: rule(name, atom("viable", &["?x"]), vec![positive(atom(base, &["?x"]))]),
-                },
-            );
-        }
-        apply(
-            &mut l,
-            SecurityOp::RuleInstall {
-                rule: rule("downstream", atom("plan_ready", &["?x"]), vec![positive(atom("viable", &["?x"]))]),
-            },
-        );
-        let result = l.security.projection();
-        assert!(result.complete);
-        assert!(result.contains(&fact("plan_ready", &["a"])));
-        let explanation = result.why(&fact("plan_ready", &["a"])).unwrap();
-        assert!(
-            serde_json::to_string(&explanation).unwrap().contains("e1")
-                || serde_json::to_string(&explanation).unwrap().contains("e2")
-        );
-        let snapshot = serde_json::to_vec(&l.security).unwrap();
-        let hypothetical = l.security.what_if(&[], &[a.id(), b.id()]);
-        assert!(hypothetical.died.contains(&fact("plan_ready", &["a"])));
-        assert_eq!(snapshot, serde_json::to_vec(&l.security).unwrap());
-        apply(&mut l, SecurityOp::FactRetract { id: a.id(), reason: "disproved".into() });
-        assert!(l.security.projection().contains(&fact("plan_ready", &["a"])));
-        apply(&mut l, SecurityOp::FactRetract { id: b.id(), reason: "disproved too".into() });
-        assert!(l.security.died.contains(&fact("viable", &["a"])));
-        assert!(l.security.died.contains(&fact("plan_ready", &["a"])));
-    }
-
-    #[test]
-    fn stratified_negation_recomputes_and_unsafe_rules_are_rejected() {
-        let mut l = ledger();
-        let observed = fact("observed", &["a"]);
-        apply(&mut l, SecurityOp::FactAssert { fact: observed, evidence: vec!["e1".into()] });
-        let r = rule(
-            "safe",
-            atom("candidate", &["?x"]),
-            vec![positive(atom("observed", &["?x"])), Literal { atom: atom("blocked", &["?x"]), negated: true }],
-        );
-        apply(&mut l, SecurityOp::RuleInstall { rule: r });
-        assert!(l.security.projection().contains(&fact("candidate", &["a"])));
-        apply(&mut l, SecurityOp::FactAssert { fact: fact("blocked", &["a"]), evidence: vec!["e1".into()] });
-        assert!(!l.security.projection().contains(&fact("candidate", &["a"])));
-        let negative_cycle = rule(
-            "cycle",
-            atom("blocked", &["?x"]),
-            vec![positive(atom("observed", &["?x"])), Literal { atom: atom("candidate", &["?x"]), negated: true }],
-        );
-        assert!(l.validate(&LedgerOp::Security(SecurityOp::RuleInstall { rule: negative_cycle }), false).is_err());
-        let unsafe_rule = rule("unsafe", atom("bad", &["?unbound"]), vec![positive(atom("observed", &["?x"]))]);
-        assert!(l.validate(&LedgerOp::Security(SecurityOp::RuleInstall { rule: unsafe_rule }), false).is_err());
-    }
-
-    #[test]
-    fn exhausted_closures_report_unknown_differences_instead_of_false_invalidation() {
-        let mut l = ledger();
-        for i in 0..101 {
-            for p in ["left", "right"] {
-                apply(
-                    &mut l,
-                    SecurityOp::FactAssert {
-                        fact: Fact { predicate: p.into(), args: vec![i.to_string()] },
-                        evidence: vec!["e1".into()],
-                    },
-                );
-            }
-        }
-        apply(
-            &mut l,
-            SecurityOp::RuleInstall {
-                rule: rule(
-                    "cartesian",
-                    atom("pair", &["?x", "?y"]),
-                    vec![positive(atom("left", &["?x"])), positive(atom("right", &["?y"]))],
-                ),
-            },
-        );
-        assert!(!l.security.projection().complete);
-        let retract: Vec<_> =
-            (0..5).map(|i| Fact { predicate: "left".into(), args: vec![i.to_string()] }.id()).collect();
-        let result = l.security.what_if(&[], &retract);
-        assert!(!result.projection.complete);
-        assert!(result.died.is_empty());
-        assert!(result.added.is_empty());
-        apply(&mut l, SecurityOp::FactRetract { id: retract[0].clone(), reason: "retracted observation".into() });
-        assert!(l.security.died.is_empty());
-        assert!(l.security.retraction_limitation.is_some());
-    }
-
-    #[test]
-    fn paths_are_simple_expiry_aware_and_discount_known_footholds() {
-        let mut l = ledger();
-        let a = asset(&mut l, "a.test");
-        let b = asset(&mut l, "b.test");
-        let c = asset(&mut l, "c.test");
-        for (from, to, cost, expiry) in
-            [(&a, &b, 10, None), (&b, &c, 6, None), (&a, &c, 1, Some(100)), (&b, &a, 1, None)]
-        {
-            apply(
-                &mut l,
-                SecurityOp::RelationAdd {
-                    relation: RelationInput {
-                        from: from.clone(),
-                        to: to.clone(),
-                        kind: "reachable".into(),
-                        cost,
-                        expires_ms: expiry,
-                        evidence: vec!["e1".into()],
-                    },
-                },
-            );
-        }
-        assert_eq!(l.security.path_suggest(&a, &c, 101)[0].cost, 16);
-        apply(
-            &mut l,
-            SecurityOp::FootholdAdd {
-                foothold: FootholdInput {
-                    asset: b.clone(),
-                    principal: "dummy".into(),
-                    access: "session".into(),
-                    evidence: vec!["e1".into()],
-                    unlocks: vec![],
-                    expires_ms: Some(200),
-                },
-            },
-        );
-        let paths = l.security.path_suggest(&a, &c, 101);
-        assert_eq!(paths[0].cost, 13);
-        assert_eq!(paths[0].assets, vec![a, b, c]);
-    }
-
-    #[test]
     fn batch_error_names_the_failing_operation_and_applies_nothing() {
         let l = ledger();
         let host = |name: &str, evidence: &str| SecurityOp::AssetUpsert {
@@ -1467,7 +1151,12 @@ mod tests {
         let journal = crate::journal::Journal::new(dir.path().join("journal.jsonl"), vec![7; 32]);
         let session = SessionId::from("s-test");
         journal
-            .append(&session, false, LedgerOp::ClaimAdd { text: "scanner observed host".into() }, &|_| Ok(()))
+            .append(
+                &session,
+                false,
+                LedgerOp::ClaimAdd { text: "scanner observed host".into(), assets: Vec::new() },
+                &|_| Ok(()),
+            )
             .unwrap();
         let mut input = ledger().evidence[0].input.clone();
         input.claim = "c1".into();
@@ -1504,29 +1193,81 @@ mod tests {
         }
     }
 
-    #[test]
-    fn fact_assert_reserves_builtin_predicate_arities() {
-        let mut l = ledger();
-        for (pred, wrong_args, right_args) in [
-            ("asset", vec!["web"], vec!["as-1", "host", "web"]),
-            ("credential", vec!["u"], vec!["cr-1", "as-1", "u"]),
-            ("foothold", vec!["sh"], vec!["fh-1", "as-1", "u", "sh"]),
-            ("related", vec!["a", "b"], vec!["as-1", "as-2", "reach"]),
-            ("condition", vec!["only-one"], vec!["auth", "x"]),
-        ] {
-            let bad = LedgerOp::Security(SecurityOp::FactAssert {
-                fact: Fact { predicate: pred.into(), args: wrong_args.into_iter().map(str::to_string).collect() },
+    fn removed_ops() -> Vec<SecurityOp> {
+        vec![
+            SecurityOp::HypothesisOpen { text: "the admin panel trusts a header".into(), priority: 3 },
+            SecurityOp::HypothesisPriority { id: "hy-1".into(), priority: 5 },
+            SecurityOp::HypothesisEvidence {
+                id: "hy-1".into(),
                 evidence: vec!["e1".into()],
-            });
-            let err = l.validate(&bad, false).unwrap_err();
-            assert!(err.contains("built-in with arity"), "{pred}: {err}");
+                counterevidence: Vec::new(),
+            },
+            SecurityOp::HypothesisVerdict {
+                id: "hy-1".into(),
+                status: HypothesisStatus::Supported,
+                note: "run showed it".into(),
+                evidence: vec!["e1".into()],
+                counterevidence: Vec::new(),
+            },
+            SecurityOp::RuleInstall {
+                rule: Rule {
+                    name: "r".into(),
+                    head: Atom { predicate: "viable".into(), args: vec!["?x".into()] },
+                    body: vec![Literal {
+                        atom: Atom { predicate: "asset".into(), args: vec!["?x".into(), "?k".into(), "?l".into()] },
+                        negated: false,
+                    }],
+                },
+            },
+            SecurityOp::RuleRetract { id: "ru-1".into(), reason: "gone".into() },
+        ]
+    }
 
-            let good = SecurityOp::FactAssert {
-                fact: Fact { predicate: pred.into(), args: right_args.into_iter().map(str::to_string).collect() },
-                evidence: vec!["e1".into()],
-            };
-            apply(&mut l, good);
+    #[test]
+    fn old_logs_with_removed_ops_load_and_project_the_rest_unchanged() {
+        let mut l = ledger();
+        let id = asset(&mut l, "example.test");
+        apply(&mut l, SecurityOp::AliasAdd { alias: "web".into(), target: id.clone() });
+        let expected = l.security.clone();
+        // Every removed op deserializes from its old JSON, applies as a no-op, and is named by `action`.
+        for op in removed_ops() {
+            let json = serde_json::to_string(&op).unwrap();
+            let back: SecurityOp = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, op);
+            assert_eq!(serde_json::to_value(&op).unwrap()["action"], op.action());
+            l.security.apply(&op, 99, &SessionId::from("s-old"));
+            assert_eq!(l.security, expected, "{}", op.action());
         }
-        assert!(l.security.projection().complete);
+        // They are also fine inside an old batch, and a new append of one is refused.
+        l.security.apply(&SecurityOp::Batch { operations: removed_ops() }, 100, &SessionId::from("s-old"));
+        assert_eq!(l.security, expected);
+        for op in removed_ops() {
+            let err = l.validate(&LedgerOp::Security(op), false).unwrap_err();
+            assert_eq!(err, REMOVED_OP_REFUSAL);
+        }
+        // A snapshot written with the removed fields still loads and drops them.
+        let mut json = serde_json::to_value(&expected).unwrap();
+        json["hypotheses"] = serde_json::json!({"hy-1": {"id": "hy-1", "text": "t", "priority": 1, "status": "open"}});
+        json["rules"] = serde_json::json!({});
+        json["died"] = serde_json::json!([{"predicate": "viable", "args": ["a"]}]);
+        json["retraction_limitation"] = serde_json::json!("old text");
+        let loaded: SecurityState = serde_json::from_value(json).unwrap();
+        assert_eq!(loaded, expected);
+        assert_eq!(loaded.aliases.get("web"), Some(&id));
+        assert_eq!(loaded.assets.len(), 1);
+    }
+
+    #[test]
+    fn asserted_facts_are_recorded_and_retracted_without_an_engine() {
+        let mut l = ledger();
+        let f = Fact { predicate: "seen".into(), args: vec!["a".into()] };
+        apply(&mut l, SecurityOp::FactAssert { fact: f.clone(), evidence: vec!["e1".into()] });
+        apply(&mut l, SecurityOp::FactRetract { id: f.id(), reason: "mistaken".into() });
+        assert!(!l.security.facts[&f.id()].active);
+        let wrong = SecurityOp::FactAssert {
+            fact: Fact { predicate: "seen".into(), args: vec![] },
+            evidence: vec!["e1".into()],
+        };
+        assert!(l.validate(&LedgerOp::Security(wrong), false).is_ok());
     }
 }

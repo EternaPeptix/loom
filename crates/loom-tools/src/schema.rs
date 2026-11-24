@@ -136,7 +136,7 @@ fn ms_to_ceil_secs(v: &Value) -> Option<u64> {
 }
 
 fn is_absent_or_null(map: &Map<String, Value>, key: &str) -> bool {
-    !map.get(key).is_some_and(|v| !v.is_null())
+    map.get(key).is_none_or(Value::is_null)
 }
 
 fn alias_key(map: &mut Map<String, Value>, canon: &str, aliases: &[&str], notes: &mut Vec<String>) {
@@ -188,6 +188,22 @@ fn clamp_max_value(
     }
 }
 
+/// `limit` (or `num_lines`) is a count of lines, as in the trained read tools: with `start` (default 1)
+/// it becomes `end = start + limit - 1`. Used where no `end` was given; a `limit` below 1 or not a number
+/// is left for the schema check to refuse.
+fn limit_to_end(map: &mut Map<String, Value>, notes: &mut Vec<String>) {
+    if !is_absent_or_null(map, "end") {
+        return;
+    }
+    let Some(limit_key) = ["limit", "num_lines"].into_iter().find(|k| map.contains_key(*k)) else { return };
+    let Some(limit) = map.get(limit_key).and_then(parse_i64_like).filter(|n| *n >= 1) else { return };
+    let start = map.get("start").and_then(parse_i64_like).unwrap_or(1).max(1);
+    let end = start.saturating_add(limit - 1);
+    map.remove(limit_key);
+    map.insert("end".to_string(), Value::from(end));
+    notes.push(format!("argument alias: `{limit_key}` ({limit}) -> `end` ({end})"));
+}
+
 /// Normalize well-known model parameter habits for `tool` before [`check`] runs.
 /// Only inserts or renames keys when the canonical key is absent or `null`, and returns a repair
 /// sentence for every transformation applied.
@@ -201,17 +217,7 @@ pub fn normalize_for_tool(tool: &str, value: &mut Value) -> Vec<String> {
             alias_key(map, "path", &["file_path", "filepath", "filename"], &mut notes);
             alias_key(map, "start", &["offset", "start_line", "from_line"], &mut notes);
             alias_key(map, "end", &["end_line", "to_line"], &mut notes);
-            if is_absent_or_null(map, "end") {
-                if let Some(limit_key) = ["limit", "num_lines"].into_iter().find(|k| map.contains_key(*k)) {
-                    if let Some(limit) = map.get(limit_key).and_then(parse_i64_like).filter(|n| *n >= 1) {
-                        let start = map.get("start").and_then(parse_i64_like).unwrap_or(1).max(1);
-                        let end = start.saturating_add(limit - 1);
-                        map.remove(limit_key);
-                        map.insert("end".to_string(), Value::from(end));
-                        notes.push(format!("argument alias: `{limit_key}` ({limit}) -> `end` ({end})"));
-                    }
-                }
-            }
+            limit_to_end(map, &mut notes);
             alias_key(map, "old", &["old_string", "old_text", "old_str", "target"], &mut notes);
             alias_key(map, "new", &["new_string", "new_text", "new_str", "replacement"], &mut notes);
             alias_key(map, "all", &["replace_all"], &mut notes);
@@ -250,7 +256,8 @@ pub fn normalize_for_tool(tool: &str, value: &mut Value) -> Vec<String> {
                 notes.push("stripped harmless extra `total_lines` argument".to_string());
             }
             alias_key(map, "start", &["offset", "start_line"], &mut notes);
-            alias_key(map, "end", &["end_line", "limit"], &mut notes);
+            alias_key(map, "end", &["end_line"], &mut notes);
+            limit_to_end(map, &mut notes);
         }
         "claim_update" => {
             alias_key(map, "id", &["claim", "claim_id"], &mut notes);
@@ -336,6 +343,92 @@ pub(crate) fn prepare_for_spec(schema: &Value, value: &mut Value) -> Vec<String>
         }
     }
     notes
+}
+
+/// [`check`] for an MCP tool (CONTRACTS-MCP M5): a schema that is not [`checkable`] only requires a JSON
+/// object (the server validates), and unknown arguments follow the schema's `additionalProperties`.
+pub fn check_mcp(schema: &Value, value: &Value) -> Result<Checked, Vec<String>> {
+    let Some(obj) = value.as_object() else {
+        return check(schema, value).and_then(|_| Err(vec!["the arguments must be a JSON object".to_string()]));
+    };
+    if !checkable(schema) {
+        return Ok(Checked { args: obj.clone(), notes: Vec::new() });
+    }
+    if schema.get("additionalProperties") == Some(&Value::Bool(false)) {
+        return check(schema, value);
+    }
+    let empty = Map::new();
+    let props = schema.get("properties").and_then(Value::as_object).unwrap_or(&empty);
+    let (known, extra): (Map<String, Value>, Map<String, Value>) =
+        obj.clone().into_iter().partition(|(k, _)| props.contains_key(k));
+    let mut checked = check(schema, &Value::Object(known))?;
+    checked.args.extend(extra);
+    Ok(checked)
+}
+
+/// True when `schema` uses only the keywords [`check`] understands (the module doc's list), so an MCP
+/// server's `inputSchema` can be checked here; otherwise the server validates (CONTRACTS-MCP M5).
+pub fn checkable(schema: &Value) -> bool {
+    const SCALARS: [&str; 4] = ["string", "integer", "number", "boolean"];
+    const PROP_KEYS: [&str; 9] =
+        ["type", "description", "title", "enum", "minimum", "maximum", "default", "items", "examples"];
+    let Some(root) = schema.as_object() else { return false };
+    if root.keys().any(|k| {
+        !["type", "properties", "required", "additionalProperties", "description", "title"].contains(&k.as_str())
+    }) {
+        return false;
+    }
+    if root.get("type").and_then(Value::as_str) != Some("object") {
+        return false;
+    }
+    // `check` refuses unknown arguments; a caller whose schema allows them sets those aside first.
+    if root.get("additionalProperties").is_some_and(|a| !a.is_boolean()) {
+        return false;
+    }
+    let empty = Map::new();
+    let props = match root.get("properties") {
+        None => &empty,
+        Some(Value::Object(p)) => p,
+        Some(_) => return false,
+    };
+    for spec in props.values() {
+        let Some(spec) = spec.as_object() else { return false };
+        if spec.keys().any(|k| !PROP_KEYS.contains(&k.as_str())) {
+            return false;
+        }
+        match spec.get("type").and_then(Value::as_str) {
+            Some(t) if SCALARS.contains(&t) => {
+                if spec.contains_key("items") {
+                    return false;
+                }
+            }
+            Some("object") => {
+                if spec.contains_key("items") {
+                    return false;
+                }
+            }
+            Some("array") => match spec.get("items") {
+                None => {}
+                Some(Value::Object(i)) => {
+                    let ok = i.keys().all(|k| ["type", "description", "title"].contains(&k.as_str()))
+                        && i.get("type").and_then(Value::as_str).is_some_and(|t| SCALARS.contains(&t));
+                    if !ok {
+                        return false;
+                    }
+                }
+                Some(_) => return false,
+            },
+            _ => return false,
+        }
+        if spec.get("enum").is_some_and(|e| !e.is_array()) {
+            return false;
+        }
+    }
+    match root.get("required") {
+        None => true,
+        Some(Value::Array(r)) => r.iter().all(|n| n.as_str().is_some_and(|n| props.contains_key(n))),
+        Some(_) => false,
+    }
 }
 
 pub fn check(schema: &Value, value: &Value) -> Result<Checked, Vec<String>> {
@@ -661,6 +754,28 @@ fn constrain(name: &str, spec: &Value, v: &Value) -> Result<(), Vec<String>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn checkable_accepts_only_the_supported_subset() {
+        use super::checkable;
+        assert!(checkable(
+            &json!({"type":"object","properties":{"a":{"type":"string","enum":["x"]},"n":{"type":"integer","minimum":1},"l":{"type":"array","items":{"type":"string"}},"o":{"type":"object"}},"required":["a"],"additionalProperties":false})
+        ));
+        assert!(checkable(&json!({"type":"object","additionalProperties":false})));
+        assert!(checkable(&json!({"type":"object","properties":{"a":{"type":"string"}}})));
+        assert!(!checkable(&json!({"type":"object","additionalProperties":{"type":"string"}})));
+        let wrap = |p: Value| json!({"type":"object","properties":{"a":p},"additionalProperties":false});
+        assert!(!checkable(&wrap(json!({"type":["string","null"]}))));
+        assert!(!checkable(&wrap(json!({"anyOf":[{"type":"string"}]}))));
+        assert!(!checkable(&wrap(json!({"$ref":"#/x"}))));
+        assert!(!checkable(&wrap(json!({"type":"string","pattern":"^a"}))));
+        assert!(!checkable(&wrap(json!({"type":"array","items":{"type":"object"}}))));
+        assert!(!checkable(
+            &json!({"type":"object","properties":{"a":{"type":"string"}},"required":["b"],"additionalProperties":false})
+        ));
+        assert!(!checkable(&json!({"type":"object","oneOf":[],"additionalProperties":false})));
+        assert!(!checkable(&json!("x")));
+    }
+
     use super::*;
     use serde_json::json;
 
@@ -908,7 +1023,19 @@ mod tests {
         let mut or = json!({"handle": "out:1", "total_lines": 500, "offset": 5, "limit": 25});
         let or_notes = normalize_for_tool("out_read", &mut or);
         assert!(or_notes.iter().any(|n| n.contains("total_lines")), "{or_notes:?}");
-        assert_eq!(or, json!({"handle": "out:1", "start": 5, "end": 25}));
+        assert_eq!(or, json!({"handle": "out:1", "start": 5, "end": 29}), "`limit` is a count of lines");
+        // The case that was refused: lines 100 to 149, not an end before the start.
+        let mut or2 = json!({"handle": "out:1", "offset": 100, "limit": 50});
+        let notes2 = normalize_for_tool("out_read", &mut or2);
+        assert_eq!(or2, json!({"handle": "out:1", "start": 100, "end": 149}));
+        assert!(notes2.iter().any(|n| n.contains("`limit` (50) -> `end` (149)")), "{notes2:?}");
+        // A given `end` wins, and a `limit` alone counts from line 1.
+        let mut or3 = json!({"handle": "out:1", "start": 3, "end_line": 9, "limit": 50});
+        normalize_for_tool("out_read", &mut or3);
+        assert_eq!(or3["end"], json!(9));
+        let mut or4 = json!({"handle": "out:1", "limit": 20});
+        normalize_for_tool("out_read", &mut or4);
+        assert_eq!(or4, json!({"handle": "out:1", "end": 20}));
 
         let mut cu = json!({"claim_id": "c1"});
         assert!(!normalize_for_tool("claim_update", &mut cu).is_empty());

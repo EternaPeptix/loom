@@ -22,8 +22,6 @@ pub const JOB_TAIL_LINES: u64 = 20;
 pub const JOB_TAIL_LINE_CHARS: usize = 400;
 /// Steps a child gets after its budget is used up, to deliver what it has.
 pub const BUDGET_GRACE_STEPS: u32 = 2;
-/// Most output tokens of a digest request (reasoning included).
-pub const DIGEST_MAX_TOKENS: u64 = 8_000;
 /// Most output tokens of one `decide` vote (reasoning included).
 pub const VOTE_MAX_TOKENS: u64 = 6_000;
 
@@ -157,13 +155,6 @@ pub const REASON_RESTART: &str = "the harness was restarted";
 /// `Interrupted::reason` when the agent that assigned the work stopped it.
 pub const REASON_PARENT: &str = "stopped by the agent that assigned this work";
 
-/// A stretch of steps that recorded nothing and changed nothing.
-pub fn stall(steps: u32) -> String {
-    format!(
-        "The last {steps} steps recorded nothing in the ledger and changed no file. If you have learned something, record it now (`note`, or `claim` with `evidence`). If the current approach is not getting anywhere, record it as a dead end with `note` and take a different one. Record what you ruled out and why, the best next route you can see, and the evidence that would change your conclusion — `reflect` if your role has it, `note` otherwise. If you cannot continue, call `report_blocker`."
-    )
-}
-
 /// The line a successful `claim_update` to `supported` adds: the result is banked. `n` and `ids` describe every
 /// result established in the mission after the write.
 pub fn result_banked(id: &str, n: usize, ids: &str) -> String {
@@ -217,7 +208,7 @@ pub fn ask_for_already(label: &str, qid: Option<&str>) -> String {
 
 /// `ask_for` in a child session.
 pub fn ask_for_in_child(has_hand_off: bool) -> String {
-    let mut text = "`ask_for` is for the lead.".to_string();
+    let mut text = "Asking for more is for the lead.".to_string();
     if has_hand_off {
         text.push_str(" An agent working on an assignment uses `hand_off` to return the work with what it needs.");
     }
@@ -228,7 +219,7 @@ pub fn ask_for_in_child(has_hand_off: bool) -> String {
 pub fn hand_off_in_root(has_ask_for: bool) -> String {
     let mut text = "`hand_off` returns an assignment to the agent that gave it; this session has none.".to_string();
     if has_ask_for {
-        text.push_str(" If you are stuck, use `ask_for`.");
+        text.push_str("");
     }
     text
 }
@@ -264,7 +255,7 @@ pub fn conclude_unreachable_refused(has_blocker: bool) -> String {
     let blocker =
         if has_blocker { " If something only the operator can supply is missing, call report_blocker." } else { "" };
     format!(
-        "conclude unreachable is not available in this mission: the operator set it up as solvable, so not having found the way is not a finding.{blocker} Otherwise keep working: pick an open route from the mission state and run it."
+        "The `unreachable` conclusion is not available in this mission: the operator set it up as solvable, so not having found the way is not a finding.{blocker} Otherwise keep working: pick an open route from the mission state and run it."
     )
 }
 
@@ -419,7 +410,7 @@ pub fn job_matched(n: &JobMatchNote<'_>) -> String {
     match n.handle {
         Some(h) => {
             out.push_str(&format!(
-                "\nThat part of its output is stored as {h} ({} {}, from byte {} of what the job has written): the lines before and after a match are there to read with out_read, and to quote as evidence.",
+                "\nThat part of its output is stored as {h} ({} {}, from byte {} of what the job has written): the lines before and after a match are there to read with `read`, and to quote as evidence.",
                 n.part_lines,
                 lines_word(n.part_lines),
                 n.from
@@ -430,7 +421,10 @@ pub fn job_matched(n: &JobMatchNote<'_>) -> String {
             ));
             let more = n.matches.saturating_sub(n.lines.len() as u64);
             if more > 0 {
-                out.push_str(&format!("\n{more} more matching {} are in {h}: out_grep finds them.", lines_word(more)));
+                out.push_str(&format!(
+                    "\n{more} more matching {} are in {h}: `grep` on it finds them.",
+                    lines_word(more)
+                ));
             }
         }
         None => out.push_str(&format!(
@@ -624,75 +618,31 @@ fn append_last_reply(out: &mut String, last_reply: &str) {
     }
 }
 
-/// The `brief` of a re-weave: what the model is told at the point where older material was folded.
-/// `ledger_brief` is `LedgerState::brief`, empty for a session without a ledger. `frontier` is the rendered
-/// `frontier::render` block, `None` for a session without a ledger or with nothing to show; when it is given,
-/// a paragraph says that folded attempts are ground covered, not a verdict on the task.
-pub fn reweave_brief(ledger_brief: &str, frontier: Option<&str>) -> String {
-    let mut out = String::from(
-        "Older tool output above this point is now shown in shortened form. Nothing was deleted: each shortened result names its handle (out:…), `out_read` and `out_grep` open any part of it again, and `log_search` searches the whole session. If you need something you saw earlier, reopen it rather than working from memory.",
-    );
-    if let Some(frontier) = frontier {
-        out.push_str(
-            "\n\nWhat was folded is mostly attempts. Read them as ground covered, not as a verdict on the task: a failed attempt rules out that attempt, not the approach. What is established, ruled out with evidence, set aside and still open is below.\n\n",
-        );
-        out.push_str(frontier.trim_end());
-    }
-    if !ledger_brief.trim().is_empty() {
-        out.push_str("\n\nThe mission ledger at this point:\n");
-        out.push_str(ledger_brief.trim_end());
-    }
-    out
+/// `Compaction::reason` of a fresh start.
+pub const FRESH_START_REASON: &str = "fresh_start";
+
+/// Most output tokens of a compaction's note request (reasoning included).
+pub const COMPACT_MAX_TOKENS: u64 = 12_000;
+
+/// The instruction of a compaction's note request, sent after the window exactly as the last step request
+/// sent it (CONTRACTS-COMPACTION K9).
+pub const COMPACT_PROMPT: &str = "Your context is about to be compacted. Everything above will be taken out of view and replaced by: the operator's messages, the mission ledger, a table of keys for this session's outputs, files, agents and jobs (built by the harness from the log, so it is exact), and the note you write now. Nothing is deleted: any output stays readable by its key with `read` (path `out:` and the key), and `log_search` searches the whole log. Write the note you will need to carry on without rereading everything. Cite keys rather than copying output: an output as `out:` with the key exactly as its result header shows it, a ledger item by its id (p2, c3, e5). Copy text only when it is short and you will need it word for word: a command line, an error message, a value. Use these headings, each with a short list: ## Goal, ## State, ## Established, ## Ruled out, ## Tried, not settled, ## Open leads, ## Next. Be specific. Do not retell the session in order. Do not call tools. At most 1,500 words.";
+
+/// Added to the note request of a fresh start: what the verifier objected to.
+pub fn compact_objections(objections: &str) -> String {
+    format!(
+        "The verifier did not accept your last finish: {} Do not list the result it rejected under Established; put what it objected to under Tried, not settled.",
+        objections.trim()
+    )
 }
 
-/// `Reweave::reason` of a fresh start: the fold made when a verifier did not accept a finish.
-pub const FRESH_START_REASON: &str = "finish not accepted";
-
-/// The `brief` of a fresh start: what the model reads in place of its own account of the attempt, at the
-/// point where everything before was folded. It names what the verifier found (`objections`, in its words)
-/// and how to go on, and never what the session had concluded or answered: that is what the fold takes out
-/// of view. `reopened` says the goal-met claim went back to open; `ledger_brief` is `LedgerState::brief`,
-/// empty for a session without a ledger. `frontier` is the rendered `frontier::render` block, exactly as a
-/// re-weave brief gets it (`None` without a ledger or with nothing to show). The brief carries no count and
-/// never says that a finish was made or rejected; it offers no `unreachable` conclusion (in a solvable pack
-/// that is the pack's rule, and elsewhere the finish refusals already name it).
-pub fn fresh_start_brief(objections: &[String], reopened: bool, frontier: Option<&str>, ledger_brief: &str) -> String {
-    let mut out = String::from(
-        "A check independent of you examined the work so far and did not find the goal established. From here you start afresh: your earlier messages are folded out of view and earlier tool output is shown in shortened form, so that you look at the problem itself again and not at an account of it. Nothing was deleted: each shortened result names its handle (out:…), `out_read` and `out_grep` open any part of it again, and `log_search` searches the whole session.",
-    );
-    let found: Vec<&str> = objections.iter().map(|o| o.trim()).filter(|o| !o.is_empty()).collect();
-    if !found.is_empty() {
-        out.push_str("\n\nWhat the check found missing or wrong:");
-        for o in &found {
-            // The verifier's words: further lines of a point cannot start a line of this brief.
-            out.push_str(&format!("\n- {}", loom_core::tagsafe::hang_lines(o)));
-        }
-    }
-    out.push_str(
-        "\n\nHow to go on: treat the goal as unsolved, not as decided either way. A route is closed only when a recorded run shows that it fails; one that was set aside without such a run is still open, and so is every route not tried yet. Work from what the check found: run the target, read what it did, and record each run with `evidence`.",
-    );
-    if !found.is_empty() {
-        out.push_str(" Each point above is an open obligation that only a run recorded from now on settles.");
-    }
-    if reopened {
-        out.push_str(" The goal is open again, so `conclude` it on such a run before you call `finish`.");
-    }
-    if let Some(frontier) = frontier {
-        out.push_str(
-            "\n\nWhat was folded is mostly attempts. Read them as ground covered, not as a verdict on the task: a failed attempt rules out that attempt, not the approach. What is established, ruled out with evidence, set aside and still open is below.\n\n",
-        );
-        out.push_str(frontier.trim_end());
-    }
-    if !ledger_brief.trim().is_empty() {
-        out.push_str("\n\nThe mission ledger at this point:\n");
-        out.push_str(ledger_brief.trim_end());
-    }
-    out
+/// Appended, with the reply, when the note cites keys that do not exist.
+pub fn compact_unknown_keys(keys: &[String]) -> String {
+    format!(
+        "These keys do not exist in this session: {}. Write the note again, citing only keys that appear in the result headers above.",
+        keys.join(", ")
+    )
 }
-
-/// The instruction of a digest request, sent after the session's current stable prefix. It is appended after
-/// the stable messages of the request, so changing it changes no cached prefix of an existing session.
-pub const DIGEST_PROMPT: &str = "Some of your own earlier messages in this session are about to be folded out of view (tool output stays reachable through its handles, and the mission ledger stays as it is). Write a note to yourself that keeps the map of the work, not its history. Use these headings, each with a short list: Established (results a run has shown, with handles); Ruled out (only what a run disproved, with the exact boundary of what was tested and its handle); Tried, not ruled out (attempts that failed without disproving their approach, and what would have to change); Open leads (what you have not followed up yet, and where things are: files, lines, commands, handles); Next (what you decided to try next, and why). Do not retell what went wrong in order. Be specific and brief: at most 600 words. Do not call tools and do not address anyone.";
 
 /// Inbox text for a session the harness could not continue (`why` is a complete sentence).
 pub fn turn_failed(why: &str) -> String {
@@ -940,9 +890,11 @@ pub fn finish_unavailable(tools: &FinishTools, directions: &[String]) -> String 
         "finish is not available yet: the goal is not concluded, so nothing was delivered and no verifier was started. Not having found the way yet is the normal state of a hard task, not a result.",
     );
     if tools.conclude {
-        out.push_str(" Once a run shows the goal met, call conclude with status met and that run as evidence.");
+        out.push_str(
+            " Once a run shows the goal met, call `finish` again with `status` `met` and that run as `evidence`.",
+        );
         if !tools.solvable {
-            out.push_str(" If every route is closed, conclude with status unreachable and its execution evidence: a well-evidenced unreachable conclusion is a reportable outcome, not a failure.");
+            out.push_str(" If every route is closed, call `finish` with `status` `unreachable` and its execution evidence: a well-evidenced unreachable conclusion is a reportable outcome, not a failure.");
         }
     }
     out.push('\n');
@@ -995,7 +947,7 @@ pub fn finish_not_accepted_tail(tools: &FinishTools) -> String {
     out.push_str("\n- Fix the problem, then run the target again and record the run with `evidence` (it must be a run: a scan, a decompilation or a lookup is not one). An objection settles only by new execution evidence recorded after it — rewording the result, answering the operator, or calling finish again does not.");
     out.push_str("\n- Show with a new run that the objection is wrong, recorded the same way.");
     if tools.conclude && !tools.solvable {
-        out.push_str("\n- If you have genuinely closed every route — every plan step done or dropped with a reason — conclude with status `unreachable`, citing attested execution evidence, then call finish. A rigorous \"cannot be met as stated\" is a complete, reportable outcome, not a failure.");
+        out.push_str("\n- If you have genuinely closed every route — every plan step done or dropped with a reason — call `finish` with `status` `unreachable`, citing attested execution evidence in `evidence`. A rigorous \"cannot be met as stated\" is a complete, reportable outcome, not a failure.");
     }
     if tools.block {
         out.push_str("\n- If something only the operator can supply would change things, call `report_blocker` — that routes the decision to the human who owns the goal.");
@@ -1005,7 +957,7 @@ pub fn finish_not_accepted_tail(tools: &FinishTools) -> String {
 
 /// What follows the objections instead of [`finish_not_accepted_tail`] when the rejection also reopened the
 /// goal: the next finish needs a new conclusion first.
-pub const FINISH_REOPENED_TAIL: &str = "The mission is not finished, and the goal is open again. Each objection is now an open obligation: it is settled only by new execution evidence recorded after it (run the target again and record the run with `evidence`). Fix the problem, or show with a new run that the objection is wrong; then conclude the goal on that run and call finish again.";
+pub const FINISH_REOPENED_TAIL: &str = "The mission is not finished, and the goal is open again. Each objection is now an open obligation: it is settled only by new execution evidence recorded after it (run the target again and record the run with `evidence`). Fix the problem, or show with a new run that the objection is wrong; then call finish again with `status` `met` and that run as `evidence`.";
 
 /// A non-blocking record that a finish was rejected `n` times since the last accepted one. Nothing is
 /// asked of the operator.
@@ -1015,7 +967,7 @@ pub fn finish_rejected_notice(solvable: bool) -> String {
     let routes = if solvable {
         "pick an open route from the mission state and run it"
     } else {
-        "pick an open route from the mission state and run it, or, if every route is genuinely closed, `conclude` with `unreachable` and its execution evidence"
+        "pick an open route from the mission state and run it, or, if every route is genuinely closed, call `finish` with `status` `unreachable` and its execution evidence"
     };
     format!("The verifier has not accepted the finish again. The session keeps working: answer the objection with a new run, {routes}. If only the operator can unblock this, call `report_blocker`.")
 }
@@ -1028,7 +980,7 @@ pub fn stuck_inbox_text(k: usize, plan_closed: bool, solvable: bool) -> String {
         "The mission has not advanced in {k} finish attempts: the verifier has not accepted a finish, and no new execution evidence has been recorded since the last objection. The session keeps working — nothing here pauses it. For the operator's awareness:"
     );
     if !solvable {
-        out.push_str("\n- If the goal as stated is unreachable, the session can conclude `unreachable` with its evidence and finish as a reported negative result.");
+        out.push_str("\n- If the goal as stated is unreachable, the session can finish with `status` `unreachable` and its evidence as a reported negative result.");
     }
     out.push_str("\n- If the goal should be narrowed or released, send the session a message; narrowing the goal or releasing the mission is an operator decision.\n- Otherwise the session continues on its current route.");
     if plan_closed {
@@ -1042,7 +994,7 @@ pub fn stuck_model_line(solvable: bool) -> &'static str {
     if solvable {
         "The operator has been notified as a non-blocking item — this does not pause your work, and nothing is asked of you."
     } else {
-        "The operator has been notified as a non-blocking item — this does not pause your work, and nothing is asked of you. If you believe every route is genuinely closed, call `conclude` with status `unreachable` and your evidence; a well-evidenced negative conclusion is a complete, reportable outcome."
+        "The operator has been notified as a non-blocking item — this does not pause your work, and nothing is asked of you. If you believe every route is genuinely closed, call `finish` with `status` `unreachable` and your evidence; a well-evidenced negative conclusion is a complete, reportable outcome."
     }
 }
 
@@ -1070,7 +1022,7 @@ pub fn verification_fault_result(why: &str) -> String {
 pub fn finish_status_line(goal_unconcluded: bool, objection_open: bool, solvable: bool) -> Option<String> {
     if objection_open && goal_unconcluded {
         return Some(
-            "Finish: the goal is open. Answer each open objection with a new run and record it, conclude the goal on that run, then finish."
+            "Finish: the goal is open. Answer each open objection with a new run and record it, then call finish with `status` `met` and that run as `evidence`."
                 .to_string(),
         );
     }
@@ -1078,7 +1030,7 @@ pub fn finish_status_line(goal_unconcluded: bool, objection_open: bool, solvable
         return Some(if solvable {
             "Finish: the check raised an objection — answer it with a new run recorded with `evidence`.".to_string()
         } else {
-            "Finish: the check raised an objection — answer it with a new run recorded with `evidence`, or conclude `unreachable` if every route is closed.".to_string()
+            "Finish: the check raised an objection — answer it with a new run recorded with `evidence`, or call finish with `status` `unreachable` if every route is closed.".to_string()
         });
     }
     goal_unconcluded.then(|| {
@@ -1113,7 +1065,7 @@ pub fn repeated_reasoning(n: u32) -> String {
     format!("The model produced reasoning without a visible answer or complete tool call {n} times in a row.")
 }
 pub fn wrapup_refused(name: &str) -> String {
-    format!("Budget wrap-up active: `{}` was not run. Inspect existing outputs with out_read/out_grep, attach evidence, close existing plan steps as done/dropped, and deliver with your role's ending tool. If open requirements need new work, use report_blocker and state the partial result honestly; no further probing, edits or delegation are admitted. job_wait requires timeout_s at most 2.", shown_name(name))
+    format!("Budget wrap-up active: `{}` was not run. Inspect existing outputs with read/grep, attach evidence, close existing plan steps as done/dropped, and deliver with your role's ending tool. If open requirements need new work, use report_blocker and state the partial result honestly; no further probing, edits or delegation are admitted. job_wait requires timeout_s at most 2 when it names a job.", shown_name(name))
 }
 pub fn exec_cap(cap: u32) -> String {
     format!("This role has used its limit of {cap} admitted execution calls. Delegate remaining work to an allowed child role, or report what is still unestablished. This limit counts execution attempts, not subprocesses or commands.")
@@ -1121,6 +1073,133 @@ pub fn exec_cap(cap: u32) -> String {
 
 pub fn flag_candidate(handle: &str) -> String {
     format!("Candidate flag pattern appeared in the admitted view of {handle}. This is an unverified candidate: inspect its stored output and validate against the challenge oracle or independent verifier. A regex match alone never establishes success.")
+}
+
+// ---------------------------------------------------------------------------------------------
+// Attachments (docs/UPLOADS.md)
+
+/// The fixed first line of the attachment block; the UI recognises the block by it.
+pub const ATTACH_HEADER: &str = "Attached files (saved read-only; read them with `read`):";
+/// The largest UTF-8 text file whose content is also shown inline in the message.
+pub const ATTACH_INLINE_MAX: u64 = 16 * 1024;
+
+/// One file attached to a message: an upload of the session's workspace, as the model is told of it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttachedFile {
+    /// Absolute path, `<workspace>/.loom/uploads/<name>`.
+    pub path: String,
+    pub bytes: u64,
+    pub mime: String,
+    /// The whole content, for a UTF-8 text file of at most [`ATTACH_INLINE_MAX`] bytes.
+    pub inline: Option<String>,
+}
+
+pub fn not_an_upload(path: &str) -> String {
+    format!("Attach files with POST /api/uploads first; {path} is not an upload of this workspace.")
+}
+
+/// A size in binary units, as the web UI writes it (`byteSize` in ui/core.js): `512 B`, `12.1 KiB`,
+/// `226 KiB`, `3.0 MiB`.
+pub fn file_size(n: u64) -> String {
+    if n < 1024 {
+        return format!("{n} B");
+    }
+    let units = ["KiB", "MiB", "GiB", "TiB"];
+    let mut x = n as f64 / 1024.0;
+    let mut i = 0usize;
+    while x >= 1024.0 && i + 1 < units.len() {
+        x /= 1024.0;
+        i += 1;
+    }
+    let unit = units.get(i).copied().unwrap_or("TiB");
+    if x >= 100.0 {
+        format!("{} {unit}", x.round())
+    } else {
+        format!("{x:.1} {unit}")
+    }
+}
+
+/// The media type of an upload: the `given` Content-Type when it says something (not blank, not
+/// `application/octet-stream`, not a form encoding), else from the extension of `name`, else
+/// `application/octet-stream`.
+pub fn mime_for(name: &str, given: Option<&str>) -> String {
+    if let Some(g) = given {
+        let base = g.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+        let vague = ["", "application/octet-stream", "application/x-www-form-urlencoded", "multipart/form-data"];
+        if base.contains('/') && !vague.contains(&base.as_str()) {
+            return base;
+        }
+    }
+    let ext = extension(name).to_ascii_lowercase();
+    let mime = match ext.as_str() {
+        "txt" | "log" | "text" => "text/plain",
+        "md" | "markdown" => "text/markdown",
+        "csv" => "text/csv",
+        "tsv" => "text/tab-separated-values",
+        "html" | "htm" => "text/html",
+        "css" => "text/css",
+        "xml" => "application/xml",
+        "json" => "application/json",
+        "yaml" | "yml" => "application/yaml",
+        "toml" => "application/toml",
+        "js" | "mjs" => "text/javascript",
+        "pdf" => "application/pdf",
+        "zip" => "application/zip",
+        "gz" | "tgz" => "application/gzip",
+        "tar" => "application/x-tar",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        "bmp" => "image/bmp",
+        "rs" => "text/x-rust",
+        "py" => "text/x-python",
+        "c" | "h" => "text/x-c",
+        "sh" => "text/x-shellscript",
+        _ => "application/octet-stream",
+    };
+    mime.to_string()
+}
+
+/// The part of `name` after its last dot (empty for none, or for a name that only starts with a dot).
+fn extension(name: &str) -> &str {
+    match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => ext,
+        _ => "",
+    }
+}
+
+/// `text` followed by the attachment block for `files`; `text` unchanged when there are none. An empty
+/// `text` gives the block alone.
+pub fn with_attachments(text: &str, files: &[AttachedFile]) -> String {
+    if files.is_empty() {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    let body = text.trim_end();
+    if !body.is_empty() {
+        out.push_str(body);
+        out.push_str("\n\n");
+    }
+    out.push_str(ATTACH_HEADER);
+    for f in files {
+        out.push_str(&format!("\n- {} ({}, {})", f.path, file_size(f.bytes), f.mime));
+    }
+    for f in files {
+        let Some(content) = &f.inline else { continue };
+        // A fence longer than any run of backticks in the content.
+        let longest = content.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+        let fence = "`".repeat(longest.max(2).saturating_add(1));
+        let name = f.path.rsplit('/').next().unwrap_or("");
+        let info = extension(name).to_ascii_lowercase();
+        out.push_str(&format!("\n\n`{}`:\n{fence}{info}\n{content}", f.path));
+        if !content.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&fence);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1160,8 +1239,9 @@ mod tests {
     }
 
     const OPEN: &str = "finish is not available yet: the goal is not concluded, so nothing was delivered and no verifier was started. Not having found the way yet is the normal state of a hard task, not a result.";
-    const MET: &str = " Once a run shows the goal met, call conclude with status met and that run as evidence.";
-    const UNREACHABLE: &str = " If every route is closed, conclude with status unreachable and its execution evidence: a well-evidenced unreachable conclusion is a reportable outcome, not a failure.";
+    const MET: &str =
+        " Once a run shows the goal met, call `finish` again with `status` `met` and that run as `evidence`.";
+    const UNREACHABLE: &str = " If every route is closed, call `finish` with `status` `unreachable` and its execution evidence: a well-evidenced unreachable conclusion is a reportable outcome, not a failure.";
     const STUCK: &str = "If you are stuck rather than done: ask_for (budget, a tool, a hint or direction); start a fresh agent with agent_spawn for another view; report_blocker if something only the operator can supply is missing; keep working meanwhile.";
 
     #[test]
@@ -1411,7 +1491,7 @@ mod tests {
         let cut_line = a.lines().find(|l| l.starts_with("> 9: ")).expect("line 9");
         assert!(cut_line.chars().count() < JOB_TAIL_LINE_CHARS + 20, "{cut_line}");
         let b = note(true, Some("out:abc"), 7, true);
-        assert!(b.contains("\n5 more matching lines are in out:abc: out_grep finds them."), "{b}");
+        assert!(b.contains("\n5 more matching lines are in out:abc: `grep` on it finds them."), "{b}");
         assert!(
             b.ends_with("This was the last notice of a match for this job: from here on, look at it with job_wait."),
             "{b}"
@@ -1508,74 +1588,6 @@ mod tests {
     }
 
     #[test]
-    fn reweave_brief_with_and_without_ledger_and_frontier() {
-        let first = "Older tool output above this point is now shown in shortened form. Nothing was deleted: each shortened result names its handle (out:…), `out_read` and `out_grep` open any part of it again, and `log_search` searches the whole session. If you need something you saw earlier, reopen it rather than working from memory.";
-        let map = "\n\nWhat was folded is mostly attempts. Read them as ground covered, not as a verdict on the task: a failed attempt rules out that attempt, not the approach. What is established, ruled out with evidence, set aside and still open is below.\n\n";
-        let block = "Where the work stands:\n- Established: 1 (c1)";
-        let ledger = "\n\nThe mission ledger at this point:\nGoal: ship it";
-        assert_eq!(reweave_brief("", None), first);
-        assert_eq!(reweave_brief("  \n", None), first);
-        assert_eq!(reweave_brief("Goal: ship it\n", None), format!("{first}{ledger}"));
-        assert_eq!(reweave_brief("", Some(block)), format!("{first}{map}{block}"));
-        assert_eq!(reweave_brief("Goal: ship it\n", Some(block)), format!("{first}{map}{block}{ledger}"));
-    }
-
-    #[test]
-    fn digest_prompt_asks_for_a_map() {
-        for heading in ["Established (", "Ruled out (", "Tried, not ruled out (", "Open leads (", "Next ("] {
-            assert!(DIGEST_PROMPT.contains(heading), "{heading}");
-        }
-        assert!(DIGEST_PROMPT.ends_with("at most 600 words. Do not call tools and do not address anyone."));
-    }
-
-    #[test]
-    fn a_fresh_start_brief_carries_what_was_found_and_nothing_of_the_attempt() {
-        let found = vec!["no test ran".to_string(), "  ".to_string(), "line 4 is wrong\nsee out:ab".to_string()];
-        let b = fresh_start_brief(&found, true, None, "Goal: ship it\n");
-        assert!(b.starts_with("A check independent of you examined the work so far"), "{b}");
-        // The verifier's points, blank ones left out, a second line hung under its point.
-        assert!(b.contains("What the check found missing or wrong:\n- no test ran\n- line 4 is wrong\n"), "{b}");
-        assert!(!b.contains("\nsee out:ab"), "{b}");
-        assert!(b.contains("How to go on: treat the goal as unsolved, not as decided either way."), "{b}");
-        assert!(b.contains("Each point above is an open obligation that only a run recorded from now on settles."));
-        assert!(b.contains("The goal is open again, so `conclude` it on such a run before you call `finish`."));
-        assert!(b.ends_with("The mission ledger at this point:\nGoal: ship it"), "{b}");
-        // It says where folded material is, and never speaks of a finish that was made or rejected.
-        assert!(b.contains("`out_read`") && b.contains("`log_search`"));
-        for word in ["reject", "not accept", "attempt", "again and again", "failed"] {
-            assert!(!b.to_lowercase().contains(word), "{word}: {b}");
-        }
-        // Without objections, a reopened goal or a ledger, those parts are left out.
-        let bare = fresh_start_brief(&[], false, None, " ");
-        assert!(!bare.contains("What the check found") && !bare.contains("Each point above"), "{bare}");
-        assert!(!bare.contains("conclude") && !bare.contains("mission ledger"), "{bare}");
-        assert!(bare.ends_with("record each run with `evidence`."), "{bare}");
-        assert!(!bare.chars().any(|c| c.is_ascii_digit()), "no count: {bare}");
-    }
-
-    #[test]
-    fn a_fresh_start_brief_carries_the_frontier_picture_of_a_reweave_brief() {
-        let block = "Where the work stands:\n- Established: 1";
-        let b = fresh_start_brief(&["no test ran".to_string()], true, Some(block), "Goal: ship it\n");
-        let reweave = reweave_brief("", Some(block));
-        // The same paragraph and block as a re-weave gives, before the ledger.
-        let map = reweave.split_once("\n\n").map(|(_, rest)| rest).unwrap_or_default();
-        assert!(b.contains(map), "{b}");
-        assert!(b.contains("a failed attempt rules out that attempt, not the approach"), "{b}");
-        let (at_map, at_ledger) = (b.find(block).unwrap_or(0), b.find("The mission ledger").unwrap_or(0));
-        assert!(0 < at_map && at_map < at_ledger, "{b}");
-        // No count, no finish made or rejected, and `unreachable` named nowhere: a solvable pack reads the
-        // same text.
-        let lower = b.to_lowercase();
-        for word in ["reject", "not accept", "unreachable"] {
-            assert!(!lower.contains(word), "{word}: {b}");
-        }
-        assert!(!b.contains("finish was") && !b.contains("finish that"), "{b}");
-        // Without a ledger there is no frontier and no paragraph about it.
-        assert!(!fresh_start_brief(&[], false, None, "").contains("ground covered"));
-    }
-
-    #[test]
     fn the_finish_line_says_what_leads_to_the_next_finish() {
         assert_eq!(finish_status_line(false, false, false), None);
         let concluded = finish_status_line(false, true, false).unwrap_or_default();
@@ -1586,7 +1598,7 @@ mod tests {
         let fresh = finish_status_line(true, true, false).unwrap_or_default();
         assert_eq!(
             fresh,
-            "Finish: the goal is open. Answer each open objection with a new run and record it, conclude the goal on that run, then finish."
+            "Finish: the goal is open. Answer each open objection with a new run and record it, then call finish with `status` `met` and that run as `evidence`."
         );
         assert_eq!(finish_status_line(true, true, true).unwrap_or_default(), fresh, "no unreachable either way");
         // No line says that a finish was made before: it is in view after a fresh start.
@@ -1684,12 +1696,12 @@ mod tests {
             stuck.contains("has not advanced in 2 finish attempts") && stuck.contains("plan step is closed"),
             "{stuck}"
         );
-        assert!(stuck.contains("conclude `unreachable`"), "{stuck}");
+        assert!(stuck.contains("`status` `unreachable`"), "{stuck}");
         let open = stuck_inbox_text(2, false, false);
         assert!(!open.contains("plan step is closed"), "{open}");
         let solvable = stuck_inbox_text(2, false, true);
         assert!(!solvable.contains("unreachable") && solvable.contains("narrowed or released"), "{solvable}");
-        assert!(stuck_model_line(false).contains("conclude") && stuck_model_line(false).contains("unreachable"));
+        assert!(stuck_model_line(false).contains("finish") && stuck_model_line(false).contains("unreachable"));
         assert!(!stuck_model_line(true).contains("unreachable"));
         assert!(!stuck_model_line(false).chars().any(|c| c.is_ascii_digit()));
         assert!(stuck_notice().contains("notified as a non-blocking item"));
@@ -1702,7 +1714,6 @@ mod tests {
         assert!(!stuck_notice().chars().any(|c| c.is_ascii_digit()));
         assert!(finish_status_line(false, true, false).is_some_and(|l| l.contains("unreachable")));
         assert!(finish_status_line(false, true, true).is_some_and(|l| !l.contains("unreachable")));
-        assert!(stall(30).contains("the evidence that would change your conclusion"));
     }
 
     #[test]
@@ -1710,7 +1721,6 @@ mod tests {
         assert_eq!(sentence(" no route to host "), "no route to host.");
         assert_eq!(sentence("Refused."), "Refused.");
         assert_eq!(sentence(""), "");
-        assert!(stall(30).starts_with("The last 30 steps recorded nothing"));
         assert_eq!(agent_message("stop at 3"), "Message from the agent that assigned this work:\nstop at 3");
     }
 
@@ -1727,5 +1737,64 @@ mod tests {
         assert_eq!(outcome_word(ChildOutcome::BudgetExhausted), "budget_exhausted");
         assert_eq!(not_in_assignment("write", "verifier", &["read".into(), "grep".into()]),
             "`write` is not available in this assignment (role `verifier`). Nothing was executed. Available here: read, grep.");
+    }
+
+    fn csv_and_png() -> Vec<AttachedFile> {
+        vec![
+            AttachedFile {
+                path: "/ws/.loom/uploads/report.csv".into(),
+                bytes: 12_400,
+                mime: "text/csv".into(),
+                inline: Some("a,b\n1,2\n".into()),
+            },
+            AttachedFile {
+                path: "/ws/.loom/uploads/screen.png".into(),
+                bytes: 231_000,
+                mime: "image/png".into(),
+                inline: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn the_attachment_block_is_exact() {
+        assert_eq!(
+            with_attachments("Look at these.", &csv_and_png()),
+            "Look at these.\n\nAttached files (saved read-only; read them with `read`):\n\
+             - /ws/.loom/uploads/report.csv (12.1 KiB, text/csv)\n\
+             - /ws/.loom/uploads/screen.png (226 KiB, image/png)\n\n\
+             `/ws/.loom/uploads/report.csv`:\n```csv\na,b\n1,2\n```"
+        );
+        // No text: the block alone. No files: the text as it is.
+        assert!(with_attachments("", &csv_and_png()).starts_with(ATTACH_HEADER));
+        assert_eq!(with_attachments("hi \n", &[]), "hi \n");
+    }
+
+    #[test]
+    fn an_inline_file_without_a_final_newline_or_with_backticks_is_fenced_safely() {
+        let f = AttachedFile {
+            path: "/w/.loom/uploads/n".into(),
+            bytes: 9,
+            mime: "text/plain".into(),
+            inline: Some("x\n```\ny".into()),
+        };
+        let out = with_attachments("t", &[f]);
+        assert!(out.ends_with("`/w/.loom/uploads/n`:\n````\nx\n```\ny\n````"), "{out}");
+    }
+
+    #[test]
+    fn sizes_use_the_ui_binary_units_and_types_come_from_the_extension_or_the_header() {
+        assert_eq!(file_size(0), "0 B");
+        assert_eq!(file_size(512), "512 B");
+        assert_eq!(file_size(1023), "1023 B");
+        assert_eq!(file_size(1024), "1.0 KiB");
+        assert_eq!(file_size(12_400), "12.1 KiB");
+        assert_eq!(file_size(231_000), "226 KiB");
+        assert_eq!(file_size(3_145_728), "3.0 MiB");
+        assert_eq!(mime_for("a.CSV", None), "text/csv");
+        assert_eq!(mime_for("a.png", Some("application/octet-stream")), "image/png");
+        assert_eq!(mime_for("a.bin", Some("Image/WebP; q=1")), "image/webp");
+        assert_eq!(mime_for("noext", None), "application/octet-stream");
+        assert_eq!(mime_for(".hidden", None), "application/octet-stream");
     }
 }

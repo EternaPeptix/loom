@@ -6,7 +6,9 @@
 //! Walk `path` (default: the workspace; `ctx.sandbox.resolve` + `check_read`; a file is allowed and
 //! is then the only member) with the `ignore` crate: `.gitignore`/`.ignore`/global git excludes are
 //! respected and hidden files skipped, unless `no_ignore` / `hidden` are set; `.git` directories are
-//! always skipped; symlinks are not followed; entries the sandbox makes unreadable are skipped. The
+//! always skipped; symlinks are not followed; entries the sandbox makes unreadable are skipped and counted
+//! (fact `{k} entries unreadable in the sandbox were skipped`, limit `unreadable skipped`; a result cut by the
+//! result bound carries limit `search cap`). The
 //! walk runs on a blocking thread and stops early when `ctx.cancel` fires (result status
 //! `Interrupted`, with what was found so far).
 //!
@@ -31,7 +33,14 @@
 //! - default: `path:line:text` per match; with `context` > 0 (at most 20), context lines are
 //!   `path-line-text` and groups are separated by `--`; matching lines past the bound inside the context of
 //!   the last kept match keep their `:` marker;
-//! - `files_only`: one path per line with its match count, `path (n)`.
+//! - `files_only`, or `mode` `files` or `count`: one path per line with its match count, `path (n)`
+//!   (`mode` `content` is the default; the three modes are how the trained dialect's `output_mode`
+//!   reaches this tool, and `files` and `count` print the same);
+//! - `before` / `after`: lines of context on one side only; each side shows the larger of it and
+//!   `context`, and is limited to 20 like `context`;
+//! - `type`: only files with the extensions of that ripgrep type name (`rust`, `py`, `js`, `ts`, `go`,
+//!   `java`, `c`, `cpp`, `md`, `json`, `yaml`, `toml`, `html`, `css`, `sh`, `rb`, `php`, `swift`, `kotlin`,
+//!   `txt`); another name is an error sentence listing the known ones; it combines with `glob`;
 //!   At most `cfg.search_max_results` entries (matching lines, or files for `files_only`) and
 //!   `MAX_BODY_BYTES` of body are kept; a cut result (also one whose trailing context the byte limit cut) carries
 //!   the same `Showing N of [at least] M` notice at both ends, and the counts stay exact.
@@ -334,7 +343,7 @@ fn set_description(hidden: bool, no_ignore: bool) -> String {
 /// Header facts about the walk itself.
 fn walk_facts(found: &Found, more: &mut Vec<String>) {
     if found.unreadable > 0 {
-        more.push(format!("{} entries skipped (not readable under the sandbox)", found.unreadable));
+        more.push(format!("{} entries unreadable in the sandbox were skipped", found.unreadable));
     }
     if found.errors > 0 {
         more.push(format!("{} entries could not be read during the walk", found.errors));
@@ -565,9 +574,18 @@ fn glob_job(scan: &Scan, glob: &PathGlob, pattern: &str, hidden: bool, no_ignore
             }
         }
         let total = hits.len();
+        let capped = sink.shown < total || sink.full;
         let body = sink.finish(total, found.interrupted, "files", GLOB_ADVICE);
-        ToolOutput::ok(format!("{total} files"), Body::Raw(body.into_bytes()))
+        let out = ToolOutput::ok(format!("{total} files"), Body::Raw(body.into_bytes()));
+        if capped {
+            out.with_limit("search cap")
+        } else {
+            out
+        }
     };
+    if found.unreadable > 0 {
+        out = out.with_limit("unreadable skipped");
+    }
     out.more = more;
     with_status(status, out)
 }
@@ -589,7 +607,11 @@ impl Tool for Grep {
                 params::opt("glob", "string", "Only search files matching this glob, e.g. `*.ts`."),
                 params::opt("context", "integer", "Lines of context to show before and after each match (default 0).").min(0),
                 params::opt("ignore_case", "boolean", "Match case-insensitively (default false)."),
-                params::opt("files_only", "boolean", "Show only the paths of files with matches, with a count each (default false)."),
+                params::opt("type", "string", "Only search files of this type, by ripgrep's type name (for example rust, py, js, ts, go, java, c, cpp, md, json, yaml, toml, html, css, sh). Combines with `glob`."),
+                params::opt("mode", "string", "What to show: `content` (matching lines, the default), `files` (the files with matches, with a count each) or `count` (the same as files).").one_of(&["content", "files", "count"]),
+                params::opt("before", "integer", "Lines of context to show before each match (default 0; `context` sets both sides).").min(0),
+                params::opt("after", "integer", "Lines of context to show after each match (default 0; `context` sets both sides).").min(0),
+                params::opt("files_only", "boolean", "Show only the paths of files with matches, with a count each (default false; the same as `mode` files)."),
                 params::opt("hidden", "boolean", "Include hidden files and directories (default false)."),
                 params::opt("no_ignore", "boolean", "Include files that .gitignore excludes (default false)."),
                 params::opt("max", "integer", "Maximum match lines to show.").min(1),
@@ -621,11 +643,25 @@ impl Tool for Grep {
             },
             None => None,
         };
+        let file_type = match text(args, "type").map(str::trim).filter(|t| !t.is_empty()) {
+            Some(t) => match type_extensions(t) {
+                Some(exts) => Some(exts),
+                None => {
+                    return ToolOutput::error(format!(
+                        "`type` `{t}` is not a type this search knows. Known types: {}. Use `glob` (for example `*.{t}`) for any other.",
+                        TYPES.iter().map(|(n, _)| *n).collect::<Vec<_>>().join(", ")
+                    ))
+                }
+            },
+            None => None,
+        };
         let scan = match Scan::new(ctx, text(args, "path")) {
             Ok(s) => s,
             Err(out) => return *out,
         };
-        let requested = args.get("context").and_then(Value::as_u64).unwrap_or(0);
+        let side = |key: &str| args.get(key).and_then(Value::as_u64).unwrap_or(0);
+        let (before, after) = (side("before"), side("after"));
+        let requested = args.get("context").and_then(Value::as_u64).unwrap_or(0).max(before).max(after);
         let max_results = args
             .get("max")
             .and_then(Value::as_u64)
@@ -638,7 +674,10 @@ impl Tool for Grep {
             filter,
             context: usize::try_from(requested).unwrap_or(usize::MAX).min(MAX_CONTEXT),
             context_clamped: requested > MAX_CONTEXT as u64,
-            files_only: flag(args, "files_only"),
+            files_only: flag(args, "files_only") || matches!(text(args, "mode"), Some("files" | "count")),
+            before: usize::try_from(before).unwrap_or(usize::MAX).min(MAX_CONTEXT),
+            after: usize::try_from(after).unwrap_or(usize::MAX).min(MAX_CONTEXT),
+            file_type,
             hidden: flag(args, "hidden"),
             no_ignore: flag(args, "no_ignore"),
             bound: Bound::new(max_results),
@@ -659,9 +698,62 @@ struct GrepOpts {
     context: usize,
     context_clamped: bool,
     files_only: bool,
+    /// Context lines wanted on one side only (the larger of this and `context` is shown).
+    before: usize,
+    after: usize,
+    /// Extensions of the requested `type`, lowercase.
+    file_type: Option<&'static [&'static str]>,
     hidden: bool,
     no_ignore: bool,
     bound: Bound,
+}
+
+/// ripgrep type names and the extensions they cover (a small fixed table).
+const TYPES: &[(&str, &[&str])] = &[
+    ("rust", &["rs"]),
+    ("py", &["py", "pyi"]),
+    ("js", &["js", "mjs", "cjs", "jsx"]),
+    ("ts", &["ts", "tsx", "mts", "cts"]),
+    ("go", &["go"]),
+    ("java", &["java"]),
+    ("c", &["c", "h"]),
+    ("cpp", &["cpp", "cc", "cxx", "hpp", "hh", "hxx", "h"]),
+    ("md", &["md", "markdown"]),
+    ("json", &["json"]),
+    ("yaml", &["yaml", "yml"]),
+    ("toml", &["toml"]),
+    ("html", &["html", "htm"]),
+    ("css", &["css", "scss"]),
+    ("sh", &["sh", "bash", "zsh"]),
+    ("rb", &["rb"]),
+    ("php", &["php"]),
+    ("swift", &["swift"]),
+    ("kotlin", &["kt", "kts"]),
+    ("txt", &["txt"]),
+];
+
+/// The extensions of a type name; a few common spellings (`rs`, `python`, `javascript`, `typescript`,
+/// `markdown`, `yml`) are accepted too.
+fn type_extensions(name: &str) -> Option<&'static [&'static str]> {
+    let lower = name.to_ascii_lowercase();
+    let canon = match lower.as_str() {
+        "rs" => "rust",
+        "python" => "py",
+        "javascript" | "node" => "js",
+        "typescript" => "ts",
+        "markdown" => "md",
+        "yml" => "yaml",
+        "shell" | "bash" => "sh",
+        "ruby" => "rb",
+        "c++" => "cpp",
+        "kt" => "kotlin",
+        other => other,
+    };
+    TYPES.iter().find(|(n, _)| *n == canon).map(|(_, e)| *e)
+}
+
+fn has_extension(rel: &str, exts: &[&str]) -> bool {
+    Path::new(rel).extension().and_then(|e| e.to_str()).is_some_and(|e| exts.iter().any(|x| x.eq_ignore_ascii_case(e)))
 }
 
 enum Read {
@@ -733,8 +825,12 @@ fn too_large_names(names: &[&str]) -> String {
 
 fn grep_job(scan: &Scan, opts: &GrepOpts, hint_limits: HintLimits) -> ToolOutput {
     let found = scan.collect(opts.hidden, opts.no_ignore);
-    let candidates: Vec<&Entry> =
-        found.files.iter().filter(|e| opts.filter.as_ref().is_none_or(|g| g.matches(&e.rel))).collect();
+    let candidates: Vec<&Entry> = found
+        .files
+        .iter()
+        .filter(|e| opts.filter.as_ref().is_none_or(|g| g.matches(&e.rel)))
+        .filter(|e| opts.file_type.is_none_or(|x| has_extension(&e.rel, x)))
+        .collect();
 
     let mut sink = Sink::new(opts.bound);
     let mut groups_written = false;
@@ -776,7 +872,8 @@ fn grep_job(scan: &Scan, opts: &GrepOpts, hint_limits: HintLimits) -> ToolOutput
         }
         // Only as many matches as the bound still allows are written; the rest are counted above.
         let allowed = hits.get(..hits.len().min(sink.room())).unwrap_or_default();
-        if opts.context == 0 {
+        let (before, after) = (opts.context.max(opts.before), opts.context.max(opts.after));
+        if before == 0 && after == 0 {
             for &i in allowed {
                 let line = lines.get(i).copied().unwrap_or_default();
                 if !sink.push(&format!("{}:{}:{}\n", entry.rel, i + 1, windowed(line, &opts.re)), true) {
@@ -787,7 +884,7 @@ fn grep_job(scan: &Scan, opts: &GrepOpts, hint_limits: HintLimits) -> ToolOutput
             let last_line = lines.len().saturating_sub(1);
             let mut ranges: Vec<(usize, usize)> = Vec::new();
             for &i in allowed {
-                let (lo, hi) = (i.saturating_sub(opts.context), i.saturating_add(opts.context).min(last_line));
+                let (lo, hi) = (i.saturating_sub(before), i.saturating_add(after).min(last_line));
                 match ranges.last_mut() {
                     Some(last) if lo <= last.1.saturating_add(1) => last.1 = last.1.max(hi),
                     _ => ranges.push((lo, hi)),
@@ -850,6 +947,7 @@ fn grep_job(scan: &Scan, opts: &GrepOpts, hint_limits: HintLimits) -> ToolOutput
                 extra
                     .iter()
                     .filter(|e| opts.filter.as_ref().is_none_or(|g| g.matches(&e.rel)))
+                    .filter(|e| opts.file_type.is_none_or(|x| has_extension(&e.rel, x)))
                     .filter(|e| {
                         if !budget.spend() {
                             return false;
@@ -887,9 +985,18 @@ fn grep_job(scan: &Scan, opts: &GrepOpts, hint_limits: HintLimits) -> ToolOutput
         let (total, unit) =
             if opts.files_only { (files_with, "files with matches") } else { (matches, "matching lines") };
         let advice = if opts.files_only { GREP_FILES_ADVICE } else { GREP_ADVICE };
+        let capped = sink.shown < total || sink.full;
         let body = sink.finish(total, interrupted, unit, advice);
-        ToolOutput::ok(format!("{matches} matches in {files_with} files"), Body::Raw(body.into_bytes()))
+        let out = ToolOutput::ok(format!("{matches} matches in {files_with} files"), Body::Raw(body.into_bytes()));
+        if capped {
+            out.with_limit("search cap")
+        } else {
+            out
+        }
     };
+    if found.unreadable > 0 || unreadable > 0 {
+        out = out.with_limit("unreadable skipped");
+    }
     out.more = more;
     with_status(status, out)
 }
@@ -1078,7 +1185,11 @@ mod tests {
 
     fn capped(max_results: usize) -> TestEnv {
         env_with(
-            ToolsCfg { search_max_results: max_results, ..ToolsCfg::default() },
+            ToolsCfg {
+                search_max_results: max_results,
+                dialect: loom_core::config::Dialect::Loom,
+                ..ToolsCfg::default()
+            },
             SandboxCfg { mode: SandboxMode::None, ..SandboxCfg::default() },
         )
     }
@@ -1135,6 +1246,9 @@ mod tests {
             context: 0,
             context_clamped: false,
             files_only: false,
+            before: 0,
+            after: 0,
+            file_type: None,
             hidden: false,
             no_ignore: false,
             bound: Bound { max_results: 1_000_000, max_bytes: 10_000 },
@@ -1166,6 +1280,9 @@ mod tests {
             context: 1,
             context_clamped: false,
             files_only: false,
+            before: 0,
+            after: 0,
+            file_type: None,
             hidden: false,
             no_ignore: false,
             bound: Bound { max_results: 100, max_bytes: 16 },
@@ -1202,6 +1319,9 @@ mod tests {
             context: 0,
             context_clamped: false,
             files_only: false,
+            before: 0,
+            after: 0,
+            file_type: None,
             hidden: false,
             no_ignore: false,
             bound: Bound::new(1),
@@ -1359,6 +1479,9 @@ mod tests {
             context: 0,
             context_clamped: false,
             files_only: false,
+            before: 0,
+            after: 0,
+            file_type: None,
             hidden: false,
             no_ignore: false,
             bound: Bound::new(200),
@@ -1469,13 +1592,15 @@ mod tests {
             unreadable_paths: vec!["secret".into(), "key.txt".into()],
             ..SandboxCfg::default()
         };
-        let e = env_with(ToolsCfg::default(), sandbox);
+        let e = env_with(ToolsCfg { dialect: loom_core::config::Dialect::Loom, ..ToolsCfg::default() }, sandbox);
         put(&e, "open.txt", "needle\n");
         put(&e, "secret/s.txt", "needle\n");
         put(&e, "key.txt", "needle\n");
         let r = e.call("grep", json!({"pattern": "needle"})).await;
         assert_eq!(e.stored(&r), "open.txt:1:needle\n");
-        assert!(r.text.contains("2 entries skipped"), "{}", r.text);
+        assert!(r.text.contains("2 entries unreadable in the sandbox were skipped"), "{}", r.text);
+        assert_eq!(r.meta.get("limits"), Some(&json!(["unreadable skipped"])));
+        assert_eq!(r.meta.get("complete"), Some(&json!(false)));
         let r = e.call("glob", json!({"pattern": "**"})).await;
         assert_eq!(lines(&e.stored(&r)), vec!["open.txt"]);
         let r = e.call("grep", json!({"pattern": "needle", "path": "secret"})).await;
@@ -1593,6 +1718,6 @@ mod tests {
         assert!(r.text.contains("1: hit one") && r.text.contains("3: hit two"), "{}", r.text);
         assert!(!r.text.contains("4: hit three"), "{}", r.text);
         assert!(r.text.contains("2 of 3 matching lines"), "{}", r.text);
-        assert!(r.text.contains("narrow the pattern or read ranges with out_read"), "{}", r.text);
+        assert!(r.text.contains("narrow the pattern or read ranges with read"), "{}", r.text);
     }
 }

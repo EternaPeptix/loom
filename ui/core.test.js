@@ -97,7 +97,8 @@ test("argsLine: bash is its command, file tools their path, the rest compact JSO
   assert.equal(C.argsLine("bash", { command: "ls  -la\n  /tmp" }), "ls -la /tmp");
   assert.equal(C.argsLine("read", { path: "/w/a.rs", offset: 3 }), "/w/a.rs");
   assert.equal(C.argsLine("edit", { path: "/w/b.rs", old: "x" }), "/w/b.rs");
-  assert.equal(C.argsLine("grep", { pattern: "x", path: "." }), '{"pattern":"x","path":"."}');
+  assert.equal(C.argsLine("grep", { pattern: "x", path: "." }), "x in .");
+  assert.equal(C.argsLine("note", { kind: "decision", text: "y" }), '{"kind":"decision","text":"y"}');
   assert.equal(C.argsLine("bash", null), "");
   assert.ok(C.argsLine("bash", { command: "x".repeat(1000) }, 50).length <= 50);
 });
@@ -1233,13 +1234,17 @@ test("events are handed on one by one: bad JSON is skipped and a handler that th
 
 // ---- app.js where it runs without a real page: a tab that is not signed in ----
 
+/** The text of a fake element: its own textContent, else its children's, in order. */
+const textOf = (k) => (k.textContent !== undefined ? String(k.textContent) : (k.kids || []).map(textOf).join(" "));
+
 /** Load a fresh copy of app.js at `hash` against a daemon that refuses every login code. */
 async function loadSignedOutPage(t, hash) {
   const page = { shown: [], hashchange: [], reloads: 0, requests: [], replaced: [] };
   const fake = {
     document: {
-      createElement: (tag) => ({ tag }),
-      body: { replaceChildren: (...kids) => (page.shown = kids.map((k) => k.textContent)) },
+      createElement: (tag) => ({ tag, kids: [], append(...k) { this.kids.push(...k); }, setAttribute(n, v) { this[n] = v; } }),
+      createTextNode: (text) => ({ textContent: text }),
+      body: { replaceChildren: (...kids) => (page.shown = kids.map(textOf)) },
     },
     window: { addEventListener: (type, fn) => type === "hashchange" && page.hashchange.push(fn) },
     location: { hash, pathname: "/", search: "", reload: () => page.reloads++ },
@@ -1264,7 +1269,9 @@ async function loadSignedOutPage(t, hash) {
 test("app.js: with no code and no stored secret the page says to run loom open, and a login address arriving in that tab loads it again", async (t) => {
   const page = await loadSignedOutPage(t, "");
   assert.deepEqual(page.requests, []);
-  assert.deepEqual(page.shown, [C.LOST_TOKEN]);
+  assert.equal(page.shown.length, 1);
+  assert.match(page.shown[0], /not signed in/);
+  assert.match(page.shown[0], /loom open/);
   // Pasting an address into the tab changes only the fragment; the page is not loaded by the browser.
   const arrive = (hash) => {
     globalThis.location.hash = hash;
@@ -1284,7 +1291,9 @@ test("app.js: a code the daemon refuses is sent once without credentials, leaves
     { url: "/api/web-sessions", method: "POST", credentials: "omit", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code }) },
   ]);
   assert.deepEqual(page.replaced, ["/"]);
-  assert.deepEqual(page.shown, [C.LOST_TOKEN]);
+  assert.equal(page.shown.length, 1);
+  assert.match(page.shown[0], /not signed in/);
+  assert.match(page.shown[0], /loom open/);
 });
 
 // ---- safety: nothing in the shipped DOM code can turn record content into markup ----
@@ -1824,13 +1833,24 @@ test("workspaceGroups: groups by workspace, newest activity first, Needs you pin
   assert.equal(ask.identity.waiting.text, "Approval waiting 5m");
   assert.equal(ask.identity.waiting.icon, "diamond");
   // no record has been loaded for the others: the age is unknown, never the time since creation
-  assert.equal(groups[2].rows[0].identity.text, "qwen · chat · activity not loaded");
+  assert.equal(groups[2].rows[0].identity.text, "qwen · chat", "an unknown age is left out of the line");
   assert.equal(groups[2].rows[0].identity.age, C.ACTIVITY_UNKNOWN);
   assert.equal(groups[2].rows[0].recordedMs, null);
   assert.equal(groups[2].rows[0].identity.waiting, null);
   // with a loaded record the age comes from the record
   const loaded = C.workspaceGroups(sessionStore(list), inboxWith([]), {}, now, { activity: new Map([["mid", { seq: 4, ts: now - 120000 }]]) });
   assert.equal(loaded.flatMap((g) => g.rows).find((r) => r.info.id === "mid").identity.text, "qwen · chat · 2m");
+  // the daemon's `last_ms` (its log's last write) ages and orders a row before it is opened; a later record wins
+  const listed = list.map((i) => (i.id === "mid" ? { ...i, last_ms: now - 300000 } : i));
+  const unopened = C.workspaceGroups(sessionStore(listed), inboxWith([]), {}, now).flatMap((g) => g.rows).find((r) => r.info.id === "mid");
+  assert.equal(unopened.identity.text, "qwen · chat · 5m");
+  assert.equal(unopened.recordedMs, now - 300000);
+  const opened = C.workspaceGroups(sessionStore(listed), inboxWith([]), {}, now, { activity: new Map([["mid", { seq: 4, ts: now - 60000 }]]) });
+  assert.equal(opened.flatMap((g) => g.rows).find((r) => r.info.id === "mid").recordedMs, now - 60000, "opening it does not move it unless a newer record arrived");
+  // a session event (no last_ms) keeps the one the list gave
+  const st = sessionStore(listed);
+  C.applySessionEvent(st, { ...list.find((i) => i.id === "mid"), title: "renamed" });
+  assert.equal(st.byId.get("mid").last_ms, now - 300000);
 });
 
 test("workspaceGroups: activity orders groups and rows; agents nest under their mission when expanded", () => {
@@ -2149,7 +2169,9 @@ test("runWords says an open question and a ready result in words, not only by sh
 test("identityLine: the age is a recorded time or an explicit unknown, and a waiting reason has its own line", () => {
   const i = infoOf("s", { profile: "qwen", role: "chat" });
   assert.equal(C.identityLine(i, 1000, null, 61000).text, "qwen · chat · 1m");
-  assert.equal(C.identityLine(i, null, null, 61000).text, "qwen · chat · activity not loaded");
+  assert.equal(C.identityLine(i, null, null, 61000).text, "qwen · chat");
+  assert.equal(C.identityLine(i, null, null, 61000).known, false);
+  assert.equal(C.identityLine(i, null, null, 61000).parts[2], null);
   assert.equal(C.identityLine(i, undefined, null, 61000).age, "activity not loaded");
   const w = C.identityLine(i, 1000, { blocking: { count: 1, kind: "question", since: 1000 } }, 61000);
   assert.equal(w.text, "qwen · chat");
@@ -2460,7 +2482,7 @@ test("scoreRows shapes /score: eight cells per session, the total, and the fine 
   assert.equal(s.bySession.get("kid").text, "1 hand-off");
   assert.equal(s.bySession.get("kid").unrecorded, true);
   assert.equal(s.total.cells.find((c) => c.key === "hand_offs").value, 1);
-  assert.equal(s.label, "Mission total: the result is the lead's, the effort everyone's");
+  assert.equal(s.label, "Mission total, every session");
   assert.equal(s.fineprint, "Run numbers describe effort, not completion.");
   assert.equal(C.scoreRows({ mission: "m", sessions: [{ session: "x", card: {} }], total: {} }).rows[0].text, "no calls recorded");
   for (const bad of [null, {}, { sessions: [] }, { sessions: "x", total: {} }]) assert.equal(C.scoreRows(bad), null);
@@ -2868,11 +2890,11 @@ test("keySheet lists real keys, spells Cmd and Option on a Mac, and offers no ke
   assert.ok(!flat(false).some((r) => /stop|interrupt/i.test(r.text.replace(/never stops anything/, ""))));
 });
 
-test("foldConfirm names the session and says what a fold does", () => {
-  const q = C.foldConfirm("Fix the flaky test");
-  assert.match(q.text, /^Fold Fix the flaky test's context now\? Older outputs become stubs that keep their out: handles; the next request re-reads the whole prompt once\.$/);
-  assert.equal(q.yes, "Fold now");
-  assert.match(C.foldConfirm().text, /^Fold the context of this session now\?/);
+test("compactConfirm names the session and says what a compaction does", () => {
+  const q = C.compactConfirm("Fix the flaky test");
+  assert.equal(q.text, "Compact Fix the flaky test's context now? The model writes a note and everything before the last few steps leaves its view; nothing is deleted.");
+  assert.equal(q.yes, "Compact now");
+  assert.match(C.compactConfirm().text, /^Compact the context of this session now\?/);
 });
 
 test("lastRecordedError reads the failure sentence the daemon records in a parked item or a failed-request answer", () => {
@@ -3473,6 +3495,10 @@ test("contextCardModel: rows and bar share their order, zero parts are dropped e
   assert.deepEqual(keys, ["system", "tools", "rules", "resume", "notes", "conversation", "tool_output", "pinned", "agent_reports", "stubs", "framing", "hud"]);
   assert.deepEqual(m.bar.segments.map((s) => s.key), keys);
   assert.equal(m.rows.find((r) => r.key === "tools").label, "Tool definitions · 42");
+  // images the daemon reports have their own row, counted, after the agent reports
+  const pics = C.contextCardModel(cardWindow({ breakdown: { basis: "default_ratio", chars_per_token: 3.3, total_tokens: 6600, segments: [{ key: "system", chars: 1, tokens: 5000 }, { key: "conversation", chars: 1, tokens: 100 }, { key: "images", chars: 0, tokens: 1500, count: 2 }] } }));
+  assert.deepEqual(pics.rows.map((r) => r.key), ["system", "conversation", "images"]);
+  assert.equal(pics.rows.find((r) => r.key === "images").label, "Images · 2");
   assert.equal(m.rows.find((r) => r.key === "system").value, "~4.9k");
   assert.equal(m.rows.reduce((n, r) => n + r.tokens, 0), 151200);
   // an empty conversation still has its row; other zero parts do not
@@ -3555,4 +3581,736 @@ test("contextCardModel: a fold mark inside the scale is drawn even when it folds
   assert.equal(m.fold.toPct, null);
   assert.match(m.fold.text, /folds at/);
   assert.doesNotMatch(m.fold.text, /down to/);
+});
+
+test("outputLineKinds marks the envelope and a unified diff, and nothing in plain output", () => {
+  const text = "[edit · edited · /w/a.rs · 1 replacement · 7 lines]\n--- /w/a.rs\n+++ /w/a.rs\n@@ -1,3 +1,3 @@\n-timeout = 30\n+timeout = 60\n retries = 3\n[end of edit output · edited]";
+  assert.deepEqual(C.outputLineKinds(text), ["meta", "file", "file", "hunk", "del", "add", "ctx", "meta"]);
+  assert.deepEqual(C.outputLineKinds("total 4\n-rw-r--r-- a\n+ b"), ["", "", ""], "a line that only starts with - or + is not a diff");
+  assert.deepEqual(C.diffStat(text), { added: 1, removed: 1, text: "+1 −1", words: "1 line added, 1 line removed" });
+  assert.equal(C.diffStat("(new file)"), null);
+});
+
+test("fileChanges sums successful edit and write results per path, newest first", () => {
+  const diff = (a, r) => "--- /w/x\n+++ /w/x\n@@ -1 +1 @@\n" + "-o\n".repeat(r) + "+n\n".repeat(a);
+  const tool = (id, seq, path, text, status = "ok", cls = "write") => ({ id, seq, kind: "tool", cls, args: { path }, result: { seq: seq + 1, status, text, meta: {}, ts: seq * 1000 } });
+  const blocks = [
+    tool(1, 10, "/w/src/a.rs", diff(2, 1)),
+    tool(2, 20, "/w/notes.txt", "[write · created · /w/notes.txt · 1 line]\n(new file)\n[end of write output · created]"),
+    tool(3, 30, "/w/src/a.rs", diff(1, 0)),
+    tool(4, 40, "/w/src/b.rs", diff(5, 5), "error"),
+    tool(5, 50, "/w/src/c.rs", "file text", "ok", "read"),
+  ];
+  const rows = C.fileChanges(blocks, "/w");
+  assert.deepEqual(rows.map(r => [r.rel, r.edits, r.added, r.removed, r.created, r.lastId]), [["src/a.rs", 2, 3, 1, false, 3], ["notes.txt", 1, 0, 0, true, 2]]);
+});
+
+test("mineStep walks the operator's own messages; [ and ] are the keys, never while typing", () => {
+  const blocks = [{ kind: "user", seq: 1 }, { kind: "tool", seq: 2 }, { kind: "user", seq: 5 }, { kind: "response", seq: 6 }, { kind: "user", seq: 9 }];
+  assert.equal(C.mineStep(blocks, 2, 1), 5);
+  assert.equal(C.mineStep(blocks, 5, 1), 9);
+  assert.equal(C.mineStep(blocks, 9, 1), null);
+  assert.equal(C.mineStep(blocks, 6, -1), 5);
+  assert.equal(C.mineStep(blocks, 1, -1), null);
+  assert.equal(C.mineStep(blocks, null, -1), 9);
+  assert.equal(C.mineStep([], 3, 1), null);
+  assert.equal(C.shortcutFor({ key: "]" }), "mine-next");
+  assert.equal(C.shortcutFor({ key: "[" }), "mine-prev");
+  assert.equal(C.shortcutFor({ key: "]" }, { typing: true }), null);
+});
+
+test("splitAttachments takes the runtime's attachment block apart", () => {
+  const head = "Attached files (saved read-only; read them with `read`):";
+  const text = `Compare these.\n\n${head}\n- /ws/.loom/uploads/report.csv (12.1 KiB, text/csv)\n- /ws/.loom/uploads/my (1).png (226 KiB, image/png)\n\n\`/ws/.loom/uploads/report.csv\`:\n\`\`\`csv\na,b\n\`\`\``;
+  const r = C.splitAttachments(text);
+  assert.equal(r.text, "Compare these.");
+  assert.deepEqual(r.files, [
+    { path: "/ws/.loom/uploads/report.csv", name: "report.csv", size: "12.1 KiB", mime: "text/csv" },
+    { path: "/ws/.loom/uploads/my (1).png", name: "my (1).png", size: "226 KiB", mime: "image/png" },
+  ]);
+  assert.equal(r.inline, "`/ws/.loom/uploads/report.csv`:\n```csv\na,b\n```");
+  // Attachments without text, and a list with no inline copies.
+  const bare = C.splitAttachments(`${head}\n- /ws/.loom/uploads/a.bin (3 B, application/octet-stream)`);
+  assert.equal(bare.text, "");
+  assert.equal(bare.files.length, 1);
+  assert.equal(bare.inline, "");
+  // No block, a heading that is not at a line start, or a heading with no list: the text comes back whole.
+  for (const plain of ["hello", `see ${head}\n- /a (1 B, x/y)`, `${head}\nnothing listed`, "", null]) {
+    const r2 = C.splitAttachments(plain);
+    assert.equal(r2.text, String(plain ?? ""));
+    assert.deepEqual(r2.files, []);
+  }
+  // A quoted heading earlier in the text does not hide the real block.
+  assert.equal(C.splitAttachments(`${head}\nnot a list\n\n${head}\n- /a/b.txt (1 B, text/plain)`).files[0].name, "b.txt");
+});
+
+test("Copy message copies only the text above the attachment block", () => {
+  const text = "Look at this.\n\nAttached files (saved read-only; read them with `read`):\n- /ws/.loom/uploads/a.txt (1 B, text/plain)";
+  assert.equal(C.messageCopyText({ kind: "user", text }), "Look at this.");
+  assert.equal(C.messageCopyText({ kind: "user", text: text.replace("Look at this.\n\n", "") }), null);
+});
+
+test("tool shapes: absolute_path and target_file are paths; description is the row label", () => {
+  assert.equal(C.toolPathArg({ absolute_path: "/ws/a.rs" }), "/ws/a.rs");
+  assert.equal(C.toolPathArg({ target_file: "src/b.rs" }), "src/b.rs");
+  assert.equal(C.argsLine("read", { target_file: "src/b.rs" }), "src/b.rs");
+  assert.equal(C.openFileTarget({ name: "read", args: { absolute_path: "/ws/a.rs" } }, "/ws"), "a.rs");
+  const row = C.toolRow({ kind: "tool", name: "bash", state: "done", argsLine: "cargo test", args: { command: "cargo test", description: "Run the tests" }, result: null });
+  assert.equal(row.label, "Run the tests");
+  assert.equal(row.argsLine, "cargo test");
+  assert.equal(C.toolRow({ kind: "tool", name: "bash", state: "done", argsLine: "ls", args: { command: "ls" }, result: null }).label, "");
+  assert.equal(C.toolRow({ kind: "tool", name: "bash", state: "done", argsLine: "ls", args: { command: "ls", description: 7 }, result: null }).label, "");
+});
+
+test("a call sent under another harness's name shows the loom tool that ran, and its path or pattern", () => {
+  const store = C.createRecordStore("s-1");
+  C.applyRecord(store, { seq: 0, ts_ms: 1, author: "model", kind: "tool_call", call_id: "c1", name: "Read", args: { file_path: "/ws/a.rs", offset: 1, limit: 5 }, class: "read" });
+  C.applyRecord(store, { seq: 1, ts_ms: 2, author: "tool", kind: "tool_result", call_id: "c1", name: "read", status: "ok", text: "[read · ok]", class: "read", meta: {}, duration_ms: 3 });
+  const b = store.blocks.find((x) => x.kind === "tool");
+  const row = C.toolRow(b);
+  assert.equal(row.name, "read");
+  assert.equal(row.calledAs, "Read");
+  assert.equal(row.argsLine, "/ws/a.rs");
+  assert.equal(C.argsLine("grep", { pattern: "fn main", path: "src" }), "fn main in src");
+  assert.equal(C.argsLine("web_fetch", { url: "https://example.invalid/x" }), "https://example.invalid/x");
+  assert.equal(C.argsLine("job_wait", { job: "j2" }), "j2");
+  assert.equal(C.toolRow({ ...b, ran: undefined, name: "read" }).calledAs, "");
+});
+
+// ---- images and queued messages (docs/CONTRACTS-2026-11-23.md D7, E5)
+
+test("composerAction: Alt+Enter queues only while a turn runs", () => {
+  const e = { key: "Enter", shiftKey: false, isComposing: false, text: "hi" };
+  assert.equal(C.composerAction({ ...e, alt: true, running: true }), "queue");
+  assert.equal(C.composerAction({ ...e, alt: true, running: false }), "send");
+  assert.equal(C.composerAction({ ...e, running: true }), "send");
+  assert.equal(C.composerAction({ ...e, alt: true, running: true, text: " " }), "ignore");
+  assert.equal(C.composerAction({ ...e, alt: true, running: true, shiftKey: true }), "none");
+  assert.equal(C.composerAction({ ...e, alt: true, running: true, isComposing: true }), "none");
+  assert.equal(C.composerAction({ ...e, alt: true, running: true, coarse: true }), "none");
+});
+
+test("composerHelp names the queue key while running; composerCaption leads with the queue", () => {
+  assert.equal(C.composerHelp({ running: true }).keys, "Enter sends now · Alt+Enter queues it for after this turn · Shift+Enter adds a line.");
+  assert.match(C.composerHelp({ running: true, mac: true }).keys, /⌥Enter queues/);
+  assert.equal(C.composerHelp({ running: true, coarse: true }).keys, "");
+  const c = C.composerCaption({ line: null, stats: { context: "context 9% of 1M", cache: "" }, queued: 2 });
+  assert.equal(c.text, "2 queued · context 9%");
+  assert.equal(c.label, "Session details: 2 queued, context 9% of 1M");
+  assert.equal(C.composerCaption({ line: null, stats: null, queued: 0 }).text, "Session details");
+});
+
+test("thumbSize fits 240 and never enlarges", () => {
+  assert.deepEqual(C.thumbSize(640, 400), { width: 240, height: 150 });
+  assert.deepEqual(C.thumbSize(400, 800), { width: 120, height: 240 });
+  assert.deepEqual(C.thumbSize(100, 50), { width: 100, height: 50 });
+  assert.deepEqual(C.thumbSize(10000, 1), { width: 240, height: 1 });
+  assert.deepEqual(C.thumbSize(0, 0), { width: 240, height: 240 });
+  assert.deepEqual(C.thumbSize(64, 64, 32), { width: 32, height: 32 });
+});
+
+test("imageList and imageUrl keep only hex blob ids and read from /api/images/", () => {
+  const ok = { blob: "AB".repeat(8), mime: "image/png", bytes: 5, width: 3, height: 2, name: "a.png" };
+  assert.deepEqual(C.imageList([ok, { blob: "../x" }, { blob: "https://evil/x.png" }, null, { blob: "" }]), [{ ...ok, blob: "ab".repeat(8) }]);
+  assert.deepEqual(C.imageList(undefined), []);
+  assert.equal(C.imageUrl("ab".repeat(32)), "/api/images/" + "ab".repeat(32));
+  assert.equal(C.imageUrl("../etc/passwd"), null);
+  assert.equal(C.imageUrl("http://x/y"), null);
+  assert.equal(C.imageUrl(undefined), null);
+});
+
+test("image records reach the blocks: user message and tool result", () => {
+  const img = { blob: "cd".repeat(16), mime: "image/png", bytes: 2048, width: 640, height: 400, name: "screen.png" };
+  const store = C.createRecordStore("s-1");
+  C.applyRecords(store, [
+    { seq: 0, ts_ms: 1, kind: "user_message", text: "look", images: [img] },
+    { seq: 1, ts_ms: 2, kind: "user_message", text: "none" },
+    { seq: 2, ts_ms: 3, kind: "tool_call", call_id: "c1", name: "read", args: { path: "/w/screen.png" }, class: "read" },
+    { seq: 3, ts_ms: 4, kind: "tool_result", call_id: "c1", name: "read", status: "ok", text: "[read · image]", class: "read", meta: {}, images: [img] },
+  ]);
+  const users = store.blocks.filter((b) => b.kind === "user");
+  assert.deepEqual(users[0].images, [img]);
+  assert.deepEqual(users[1].images, []);
+  assert.deepEqual(store.blocks.find((b) => b.kind === "tool").result.images, [img]);
+});
+
+test("image words: alt, facts, path, count", () => {
+  const img = { blob: "ab".repeat(8), mime: "image/png", bytes: 231424, width: 640, height: 400, name: "screen.png" };
+  assert.equal(C.imageAlt(img, "read"), "screen.png");
+  assert.equal(C.imageAlt({ ...img, name: "" }, "read"), "image from read");
+  assert.equal(C.imageAlt({ ...img, name: "" }), "attached image");
+  assert.equal(C.imageFacts(img), "640×400 · 226 KiB · image/png");
+  assert.equal(C.imageFacts({ blob: "x", mime: "", bytes: 0, width: 0, height: 0, name: "" }), "");
+  const files = [{ path: "/w/.loom/uploads/screen.png", name: "screen.png" }, { path: "/w/.loom/uploads/b.png", name: "b.png" }];
+  assert.equal(C.imagePath(img, { files }), "/w/.loom/uploads/screen.png");
+  assert.equal(C.imagePath({ ...img, name: "" }, { files, args: { path: "/w/x.png" } }), "/w/x.png");
+  assert.equal(C.imagePath({ ...img, name: "" }, { files: [files[1]] }), "/w/.loom/uploads/b.png");
+  assert.equal(C.imagePath({ ...img, name: "zzz.png" }, { files, args: { file_path: "/w/y.png" } }), "/w/y.png");
+  assert.equal(C.imagePath(img, {}), null);
+  assert.equal(C.imageCountLabel(1), "1 image");
+  assert.equal(C.imageCountLabel(3), "3 images");
+});
+
+test("isImageFile and modelVision", () => {
+  assert.equal(C.isImageFile({ name: "a.PNG", type: "" }), true);
+  assert.equal(C.isImageFile({ name: "a.bin", type: "image/webp" }), true);
+  assert.equal(C.isImageFile({ name: "a.png", type: "application/octet-stream" }), false);
+  assert.equal(C.isImageFile({ name: "a.svg", type: "image/svg+xml" }), false);
+  assert.equal(C.isImageFile({ name: "notes.txt", type: "" }), false);
+  const models = [{ profile: "dsv41", vision: true }, { profile: "qwen", vision: false }, { profile: "old" }];
+  assert.equal(C.modelVision(models, { profile: "dsv41" }), true);
+  assert.equal(C.modelVision(models, { profile: "qwen" }), false);
+  assert.equal(C.modelVision(models, { profile: "old" }), null);
+  assert.equal(C.modelVision(models, null), null);
+  assert.equal(C.modelVision(undefined, { profile: "qwen" }), null);
+});
+
+test("queued list words and routes", () => {
+  assert.equal(C.queuedLabel(0), "0 queued");
+  assert.equal(C.queuedLabel(3), "3 queued");
+  assert.equal(C.queuedPreview("  a\n\n  b   c "), "a b c");
+  const long = C.queuedPreview("x".repeat(300), 20);
+  assert.equal(long.length, 20);
+  assert.ok(long.endsWith("…"));
+  const q = C.queuedList([{ id: "b", text: "2", created_ms: 20 }, { id: "a", text: "1", created_ms: 10, attachments: ["/p"] }, { text: "no id" }, null]);
+  assert.deepEqual(q.map((x) => x.id), ["a", "b"]);
+  assert.deepEqual(q[0].attachments, ["/p"]);
+  assert.deepEqual(q[1].attachments, []);
+  assert.equal(C.queuedUrl("s 1"), "/api/sessions/s%201/queued");
+  assert.equal(C.queuedUrl("s1", "q/1"), "/api/sessions/s1/queued/q%2F1");
+  assert.equal(C.queuedUrl("s1", "q1", "send"), "/api/sessions/s1/queued/q1/send");
+  assert.deepEqual(C.SEND_CHOICES.map((c) => c.when), ["now", "after_turn"]);
+});
+
+
+// ---- compaction (docs/CONTRACTS-COMPACTION.md Part U) ----
+
+const K1 = "e134a0f0b4bf46c1", K2 = "cc8752638528652e", K3 = "5a1c3e7d90b2f648";
+const COMPACTION = {
+  epoch: 2, upto_seq: 40, reason: "size", before_tokens: 312000, after_tokens_est: 38000,
+  note: `## State\n- edited (out:${K2}); ran out:${K1}, again out:${K1}; short out:abc is not a key; out:${K3}.`,
+  note_req: "r-9", table: `Outputs\nout:${K1} · bash · ls · exit 0\nout:${K2} · edit · a.rs\nout:${"f".repeat(64)} · bash · x`,
+  keys: [K1, K2], dropped_keys: ["out:0123456789abcdef"], objections: null,
+};
+
+test("compactionHead: step, sizes and the reason in words", () => {
+  assert.equal(C.compactionHead(COMPACTION, 412), "Context compacted · step 412 · 312k → 38k tokens · size");
+  assert.match(C.compactionHead({ ...COMPACTION, reason: "fresh_start" }, 3), /fresh start$/);
+  assert.equal(C.compactionHead({ reason: "operator" }, undefined), "Context compacted · operator");
+});
+
+test("extractOutKeys and splitOutKeys find 8-64 hex keys, once each, in order", () => {
+  assert.deepEqual(C.extractOutKeys(COMPACTION.note, COMPACTION.table), [K2, K1, K3, "f".repeat(64)]);
+  const parts = C.splitOutKeys(`a out:${K1} b`);
+  assert.deepEqual(parts, [{ text: "a " }, { key: K1, text: "out:" + K1 }, { text: " b" }]);
+  assert.deepEqual(C.splitOutKeys("no keys here out:xyz"), [{ text: "no keys here out:xyz" }]);
+  assert.deepEqual(C.splitOutKeys(""), []);
+});
+
+test("compactionBlock: note keys, table keys, dropped keys, objections", () => {
+  const b = C.compactionBlock(COMPACTION, 7);
+  assert.equal(b.kind, "compaction");
+  assert.equal(b.head, "Context compacted · step 7 · 312k → 38k tokens · size");
+  assert.deepEqual(b.noteKeys, [K2, K1, K3]);
+  assert.deepEqual(b.tableKeys, [K1, K2, "f".repeat(64)]);
+  assert.deepEqual(b.droppedKeys, ["out:0123456789abcdef"]);
+  assert.equal(b.objections, null);
+  const fresh = C.compactionBlock({ ...COMPACTION, reason: "fresh_start", note: null, objections: "no run cited", dropped_keys: [] }, 9);
+  assert.equal(fresh.note, null);
+  assert.deepEqual(fresh.noteKeys, []);
+  assert.equal(fresh.objections, "no run cited");
+  assert.equal(C.compactionBlock({ reason: "size" }, 1).table, "");
+});
+
+test("a compaction record becomes a block, is found by Find, and refetches the window", () => {
+  const store = C.createRecordStore("s-c");
+  C.applyRecords(store, [
+    rec("model_request", { req_id: "r", step: 12, epoch: 1, purpose: "step", n_messages: 1, stable_hash: "h", hud: BLOB, est_tokens: 9 }, "harness", 0),
+    rec("compaction", COMPACTION, "harness", 1),
+  ]);
+  const b = store.blocks.find((x) => x.kind === "compaction");
+  assert.ok(b);
+  assert.match(b.head, /step 12/);
+  const hits = C.findInRecord(store.blocks, K2.slice(0, 8), "all", 2).hits;
+  assert.ok(hits.length >= 1, "Find searches the note and the table");
+});
+
+test("paging decisions: a page from the end, then earlier pages until the compaction's upto_seq is in", () => {
+  assert.equal(C.recordsUrl("s-1", null, 1000, C.TAIL_BEFORE), `/api/sessions/s-1/records?before=${C.TAIL_BEFORE}&limit=1000`);
+  assert.equal(C.pagesBackward({ records: [], prev_before: null }), true);
+  assert.equal(C.pagesBackward({ records: [], next_after: null }), false, "an older daemon ignores before");
+  const seqs = (from, to, extra = {}) => { const out = []; for (let i = from; i <= to; i++) out.push({ seq: i, kind: "note", ...(extra[i] || {}) }); return out; };
+  // No compaction in view: the last page is all that loads.
+  assert.equal(C.tailNeedsMore(seqs(500, 1499), 500), null);
+  // A compaction whose upto_seq is inside the page: nothing more.
+  assert.equal(C.tailNeedsMore(seqs(500, 1499, { 900: { kind: "compaction", upto_seq: 800 } }), 500), null);
+  // upto_seq before the page: one more page, from prev_before.
+  assert.deepEqual(C.tailNeedsMore(seqs(500, 1499, { 900: { kind: "compaction", upto_seq: 100 } }), 500), { before: 500, limit: 1000 });
+  // The start of the log has been reached.
+  assert.equal(C.tailNeedsMore(seqs(0, 999, { 900: { kind: "compaction", upto_seq: 0 } }), null), null);
+});
+
+test("a store started from the tail knows its earlier records, prepends them, and keeps what arrives by after", () => {
+  seqCounter = 0;
+  const all = [];
+  for (let i = 0; i < 30; i++) all.push(rec(i % 2 ? "user_message" : "harness_note", i % 2 ? { text: "m" + i } : { note: "n", text: "t" + i }, i % 2 ? "user" : "harness", i));
+  const store = C.createRecordStore("s-t");
+  C.startTailStore(store, all.slice(20), 20, []);
+  assert.equal(C.hasEarlier(store), true);
+  assert.deepEqual(C.earlierRequest(store), { before: 20, limit: C.TAIL_LIMIT });
+  assert.equal(C.lastSeq(store), 29);
+  C.applyRecords(store, [rec("user_message", { text: "new" }, "user", 30)]);
+  assert.equal(C.lastSeq(store), 30);
+  const before = store.blocks.length;
+  const added = C.prependRecords(store, all.slice(0, 20), null);
+  assert.equal(added, store.blocks.length - before);
+  assert.equal(store.blocks.length, 31);
+  assert.equal(C.hasEarlier(store), false);
+  assert.equal(C.earlierRequest(store), null);
+  assert.equal(C.lastSeq(store), 30);
+});
+
+test("CTX_PARTS: a compaction segment replaces the re-weave brief and the stubs, and the threshold says compacts at", () => {
+  const segs = [{ key: "system", tokens: 5000 }, { key: "compaction", tokens: 9000 }, { key: "resume", tokens: 700 }, { key: "stubs", tokens: 300, count: 4 }, { key: "conversation", tokens: 4000 }];
+  const win = { context_window: 262144, compact_at: 104857, breakdown: { basis: "default_ratio", chars_per_token: 3.3, total_tokens: 19000, segments: segs }, measured_now: null };
+  const m = C.contextCardModel(win);
+  const labels = m.rows.map((r) => r.label);
+  assert.ok(labels.includes("Compaction"));
+  assert.ok(!labels.includes("Re-weave brief"));
+  assert.ok(!labels.some((l) => l.startsWith("Folded-out stubs")));
+  assert.match(m.fold.text, /compacts at/);
+  const old = C.contextCardModel({ ...win, compact_at: undefined, fold_at: 210000, breakdown: { ...win.breakdown, segments: segs.filter((x) => x.key !== "compaction") } });
+  const oldLabels = old.rows.map((r) => r.label);
+  assert.ok(oldLabels.includes("Re-weave brief") && oldLabels.some((l) => l.startsWith("Folded-out stubs")));
+  assert.match(old.fold.text, /folds at/);
+});
+
+test("runWords has a short form for the phone bar: the state alone, no step", () => {
+  const w = C.runWords({ status: { phase: "idle", step: 9, last_end: "waiting" } });
+  assert.equal(w.text, "Waiting for jobs or agents · step 9");
+  assert.equal(w.short, "Waiting on jobs");
+  const r = C.runWords({ status: { phase: "running", step: 142 } }, { now: 70000, startMs: 0 });
+  assert.equal(r.short, "Running · 1m10s");
+  assert.ok(!r.short.includes("step"));
+  const e = C.runWords({ status: { phase: "ended", step: 48, outcome: "done", last_end: "finished" } });
+  assert.ok(!e.short.includes("step") && e.short.startsWith("Ended"), e.short);
+  const i = C.runWords({ status: { phase: "idle", step: 3 } });
+  assert.equal(i.short, "Idle");
+});
+
+// ---------------------------------------------------------------------------------------------
+// Full output opens where the model looked; repeated calls collapse; Expand all stays bounded
+
+test("openAtLine: the first line the model saw past line 1, or the start of an omitted middle", () => {
+  assert.equal(C.openAtLine([], 100), 1);
+  assert.equal(C.openAtLine([[40, 60]], 100), 40);
+  assert.equal(C.openAtLine([[1, 20]], 100), 21);
+  assert.equal(C.openAtLine([[1, 20], [81, 100]], 100), 21);
+  assert.equal(C.openAtLine([[1, 100]], 100), 1);
+  assert.equal(C.openAtLine([[1, 20]], null), 1);
+  assert.equal(C.openAtLine([[1, 10], [11, 20]], 100), 21, "adjacent ranges merge");
+});
+
+test("viewerPlan marks the seen ranges only for a partial view", () => {
+  assert.deepEqual(C.viewerPlan({ ranges: [[1, 20], [81, 100]], total: 100, complete: false }), { start: 21, seenRanges: [[1, 20], [81, 100]] });
+  assert.deepEqual(C.viewerPlan({ ranges: [[1, 100]], total: 100, complete: true }), { start: 1, seenRanges: [] });
+  assert.deepEqual(C.viewerPlan({ ranges: [], total: 100 }), { start: 1, seenRanges: [] });
+  assert.deepEqual(C.viewerPlan(null), { start: 1, seenRanges: [] });
+});
+
+test("viewerStanding keeps the evidence wording for citations only, and names the marks", () => {
+  assert.doesNotMatch(C.viewerStanding({ seenRanges: [[1, 5]] }), /does not verify/);
+  assert.match(C.viewerStanding({ seenRanges: [[1, 5]] }), /Lines the model was shown are marked\./);
+  assert.match(C.viewerStanding({ citeStart: 3 }), /does not verify the claim/);
+  assert.doesNotMatch(C.viewerStanding({}), /marked/);
+  assert.equal(C.lineInRanges([[2, 4]], 4), true);
+  assert.equal(C.lineInRanges([[2, 4]], 5), false);
+  assert.equal(C.lineInRanges(undefined, 1), false);
+});
+
+test("shownOfTotal ranges drive the plan end to end", () => {
+  const v = C.shownOfTotal({ text: "x", cut: true, output: { id: "ab".repeat(32), bytes: 10, lines: 100 }, meta: { shown: [[1, 20], [81, 100]] } });
+  assert.deepEqual(C.viewerPlan(v), { start: 21, seenRanges: [[1, 20], [81, 100]] });
+});
+
+// A store of tool calls: `argsOf(i)` gives the arguments of call i; `statusOf(i)` its result status.
+function callsStore(n, argsOf, statusOf = () => "ok", name = "bash") {
+  reset();
+  const recs = [start()];
+  for (let i = 0; i < n; i++) {
+    recs.push(R("tool_call", { call_id: "c" + i, req_id: "r" + i, name, args: argsOf(i), class: "exec" }, undefined, "model"));
+    recs.push(R("tool_result", { call_id: "c" + i, name, status: statusOf(i), text: "out", class: "exec", meta: {}, duration_ms: 5 }, undefined, "tool"));
+  }
+  return storeOf(recs);
+}
+const groupsOf = (store, opts = {}) => C.chatItems(store.blocks, opts).filter((i) => i.type === "group");
+
+test("callSignature ignores key order and result status", () => {
+  const s = callsStore(2, (i) => (i ? { b: 1, a: { y: 2, x: 1 } } : { a: { x: 1, y: 2 }, b: 1 }), (i) => (i ? "error" : "ok"));
+  const [a, b] = s.blocks.filter((x) => x.kind === "tool");
+  assert.equal(C.callSignature(a), C.callSignature(b));
+  assert.notEqual(C.callSignature(a), C.callSignature({ ...a, name: "read", args: a.args }));
+});
+
+test("a run of 3 identical calls collapses, 2 do not; status may differ", () => {
+  const two = groupsOf(callsStore(2, () => ({ command: "ls" })))[0];
+  assert.deepEqual(C.rowsOf(two).map((r) => r.type), ["block", "block"]);
+  const three = groupsOf(callsStore(3, () => ({ command: "ls" }), (i) => (i === 1 ? "error" : "ok")))[0];
+  const rows = C.rowsOf(three);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].type, "run");
+  assert.equal(rows[0].count, 3);
+  assert.equal(three.loop, 0);
+});
+
+test("a run is cut by a different call; runs of 10 or more flag the group as a loop", () => {
+  const g = groupsOf(callsStore(25, (i) => ({ command: i === 12 ? "pwd" : "ls" })))[0];
+  assert.deepEqual(C.rowsOf(g).map((r) => (r.type === "run" ? r.count : 1)), [12, 1, 12]);
+  assert.equal(g.loop, 12);
+  assert.equal(groupsOf(callsStore(9, () => ({ command: "ls" })))[0].loop, 0);
+  assert.equal(groupsOf(callsStore(10, () => ({ command: "ls" })))[0].loop, 10);
+});
+
+test("pageOf and showMoreLabel", () => {
+  const list = Array.from({ length: 120 }, (_, i) => i);
+  const p1 = C.pageOf(list);
+  assert.equal(p1.visible.length, 50);
+  assert.equal(C.showMoreLabel(p1), "Show 50 more (70 hidden)");
+  const p3 = C.pageOf(list, 3);
+  assert.equal(p3.visible.length, 120);
+  assert.equal(p3.hidden, 0);
+  assert.equal(C.pageOf(list, 2).more, 20);
+});
+
+test("locateInGroup finds the page of a record, inside a run too", () => {
+  const s = callsStore(130, (i) => ({ command: "ls dir" + i }));
+  const g = groupsOf(s)[0];
+  const tools = g.shown.filter((b) => b.kind === "tool");
+  assert.equal(C.locateInGroup(g, tools[0].id).groupPages, 1);
+  assert.equal(C.locateInGroup(g, tools[120].id).groupPages, 3);
+  const loop = groupsOf(callsStore(120, () => ({ command: "cargo build" })))[0];
+  const calls = loop.shown.filter((b) => b.kind === "tool");
+  const at = C.locateInGroup(loop, calls[110].id);
+  assert.equal(at.groupPages, 1);
+  assert.equal(at.runPages, 3);
+  assert.ok(at.runKey);
+  assert.equal(C.locateInGroup(loop, -5), null);
+});
+
+test("Expand all on a 5,000-record store renders a bounded number of member rows", () => {
+  const s = callsStore(2500, (i) => ({ command: "ls dir" + i }));
+  const items = C.chatItems(s.blocks, { expandAll: true });
+  const g = items.filter((i) => i.type === "group");
+  assert.ok(g.length >= 1 && g.every((x) => x.open));
+  assert.ok(g.reduce((a, x) => a + x.toolCount, 0) >= 2500);
+  assert.ok(C.renderedRowCount(items) <= g.length * 51, "one page of rows and one button per group");
+  assert.ok(C.renderedRowCount(items) < 200);
+  // The same for a log that is one long loop, even with its run open.
+  const loop = C.chatItems(callsStore(2500, () => ({ command: "cargo build" })).blocks, { expandAll: true });
+  const lg = loop.find((i) => i.type === "group");
+  assert.equal(C.rowsOf(lg).length, 1);
+  assert.equal(C.renderedRowCount(loop, { openRuns: new Set(C.rowsOf(lg).map((r) => r.key)) }), 1 + 50 + 1);
+  assert.equal(lg.loop, 2500);
+});
+
+// ---- MCP tools (contract M8)
+
+test("mcpToolName / toolShownName: split at the first __ after the prefix; other names are not MCP", () => {
+  assert.deepEqual(C.mcpToolName("mcp__github__search_issues"), { server: "github", tool: "search_issues" });
+  assert.deepEqual(C.mcpToolName("mcp__docs__fetch__page"), { server: "docs", tool: "fetch__page" });
+  assert.deepEqual(C.mcpToolName("mcp__lonely"), { server: "", tool: "lonely" });
+  assert.equal(C.mcpToolName("bash"), null);
+  assert.equal(C.mcpToolName("my_mcp__x__y"), null);
+  assert.equal(C.mcpToolName(undefined), null);
+  assert.equal(C.toolShownName("mcp__github__search_issues"), "github · search_issues");
+  assert.equal(C.toolShownName("bash"), "bash");
+  assert.equal(C.countMcpTools([{ name: "bash" }, { name: "mcp__a__b" }, "mcp__c__d", null]), 2);
+  assert.equal(C.countMcpTools(undefined), 0);
+});
+
+test("toolRow: an MCP row reads server · tool with the badge and keeps the full name", () => {
+  const row = C.toolRow({ kind: "tool", name: "mcp__docs__fetch_page", cls: "exec", state: "done", argsLine: "", result: { status: "error", meta: {}, duration_ms: 310 } });
+  assert.equal(row.shown, "docs · fetch_page");
+  assert.equal(row.name, "mcp__docs__fetch_page");
+  assert.equal(row.mcp, true);
+  const plain = C.toolRow({ kind: "tool", name: "bash", cls: "exec", state: "running", argsLine: "ls", result: null });
+  assert.equal(plain.shown, "bash");
+  assert.equal(plain.mcp, false);
+});
+
+test("Find reads an MCP call as server · tool", () => {
+  const block = { kind: "tool", id: 1, seq: 3, callSeq: 3, name: "mcp__github__search_issues", argsLine: "retry", result: null };
+  assert.equal(C.findInRecord([block], "github · search").count, 1);
+  assert.equal(C.findInRecord([block], "mcp__").count, 0);
+});
+
+test("contextCardModel: the tools label says how many definitions are MCP, never more than the count", () => {
+  const label = (opts) => C.contextCardModel(cardWindow(), opts).rows.find((r) => r.key === "tools").label;
+  assert.equal(label(), "Tool definitions · 42");
+  assert.equal(label({ mcpTools: 0 }), "Tool definitions · 42");
+  assert.equal(label({ mcpTools: 4 }), "Tool definitions · 42 (4 MCP)");
+  assert.equal(label({ mcpTools: 99 }), "Tool definitions · 42 (42 MCP)");
+});
+
+test("session_start keeps the number of MCP tools for the context label", () => {
+  reset();
+  const store = storeOf([R("session_start", { session: "s-a", mission: "m-a", parent: null, workspace: "/w", pack: "core", role: "lead", model: MODEL_A, tools: [{ name: "bash" }, { name: "mcp__a__b" }, { name: "mcp__a__c" }], budget: {} })]);
+  assert.equal(store.start.tools, 3);
+  assert.equal(store.start.mcpTools, 2);
+});
+
+test("mcpServersModel: null for nothing, else one row per server with its facts", () => {
+  assert.equal(C.mcpServersModel([]), null);
+  assert.equal(C.mcpServersModel(undefined), null);
+  assert.equal(C.mcpServersModel({ error: "not found" }), null);
+  const m = C.mcpServersModel([
+    { server: "github", transport: "stdio", state: "running", tools: ["a", "b", "c"], error: null, stderr_tail: ["warn x"], list_changed: true, calls: 1, last_call_ms: 5 },
+    { server: "docs", transport: "http", state: "failed", tools: [], error: "connection refused", stderr_tail: [], list_changed: false, calls: 0 },
+    { server: "idle", transport: "stdio", state: "not started", tools: [], stderr_tail: [] },
+  ]);
+  assert.equal(m.length, 3);
+  assert.deepEqual([m[0].name, m[0].transport, m[0].state, m[0].tone, m[0].toolCount, m[0].toolsWords, m[0].changed, m[0].hasDetail, m[0].callsWords], ["github", "stdio", "running", "ok", 3, "3 tools", true, true, "1 call"]);
+  assert.deepEqual(m[0].stderr, ["warn x"]);
+  assert.deepEqual([m[1].tone, m[1].error, m[1].hasDetail, m[1].changed, m[1].toolsWords, m[1].callsWords], ["bad", "connection refused", true, false, "0 tools", ""]);
+  assert.deepEqual([m[2].tone, m[2].hasDetail, m[2].error], ["neutral", false, ""]);
+});
+
+// ---- captured exchanges and targets (docs/CONTRACTS-TRAFFIC-TARGETS.md, parts C, F, T, U) ----
+
+const exRec = (id, fields = {}) => ({
+  seq: seqCounter++, ts_ms: 5000 + seqCounter, kind: "exchange", id, call_id: "c-http", source: "tool", tool: "http_send", scheme: "https", tls: "tool",
+  method: "get", host: "API.acme.test", port: 443, target: "/v1/users?id=1", status: 200, error: null,
+  request: { id: "11".repeat(32), bytes: 120, lines: 4 }, response: { id: "22".repeat(32), bytes: 900, lines: 12 },
+  request_bytes: 120, response_bytes: 2048, truncated: false, upstream_unverified: false, duration_ms: 240, ...fields,
+});
+
+test("an exchange record joins the tool row of its call and the store's list, once", () => {
+  seqCounter = 0;
+  const store = C.createRecordStore("s-a");
+  C.applyRecords(store, [
+    rec("tool_call", { call_id: "c-http", req_id: "r", name: "http_send", args: { url: "https://api.acme.test/v1/users" }, class: "net" }, "model"),
+    rec("tool_result", { call_id: "c-http", name: "http_send", status: "ok", text: "ok", cut: false, class: "net", meta: {}, duration_ms: 5 }, "tool"),
+    exRec("ex-aaaaaaaaaaaa"),
+    exRec("ex-bbbbbbbbbbbb", { target: "/v1/other", status: null, error: "connection reset", response: null }),
+    exRec("ex-cccccccccccc", { call_id: null, source: "proxy", tls: "plain", scheme: "http", port: 80 }),
+  ]);
+  assert.deepEqual(store.exchanges.map((x) => x.id), ["ex-aaaaaaaaaaaa", "ex-bbbbbbbbbbbb", "ex-cccccccccccc"]);
+  const row = C.toolRow(store.blocks[0]);
+  assert.equal(row.requests, "2 requests");
+  assert.deepEqual(row.exchanges.map((x) => x.id), ["ex-aaaaaaaaaaaa", "ex-bbbbbbbbbbbb"]);
+  assert.equal(C.toolRow({ ...store.blocks[0], exchanges: undefined }).requests, "");
+  assert.equal(C.applyRecord(store, exRec("ex-aaaaaaaaaaaa", { seq: store.next })), true);
+  assert.equal(store.exchanges.length, 3, "an id already held is not listed twice");
+  assert.deepEqual(C.exchangesForCall(store.exchanges, "c-http").map((x) => x.id), ["ex-aaaaaaaaaaaa", "ex-bbbbbbbbbbbb"]);
+  assert.deepEqual(C.exchangesForCall(store.exchanges, null), []);
+});
+
+test("the exchange list model: one line each, marks, filters and the count line", () => {
+  const a = C.exchangeOf(exRec("ex-aaaaaaaaaaaa"));
+  const e = C.exchangeOf(exRec("ex-eeeeeeeeeeee", { tls: "intercepted", upstream_unverified: true, truncated: true, source: "proxy", status: 503, host: "10.20.0.4", port: 8443, target: "/x" }));
+  const n = C.exchangeOf(exRec("ex-nnnnnnnnnnnn", { status: null, error: "timed out", response: null, response_bytes: 0, host: "pay.acme.test", port: 80, scheme: "http", duration_ms: 30000 }));
+  assert.equal(C.exchangeOf({ kind: "exchange" }), null);
+  const r = C.exchangeRow(a);
+  assert.equal(r.text, "GET API.acme.test/v1/users?id=1 · 200 · 2.0 KiB · 240ms");
+  assert.equal(r.tone, "ok");
+  assert.deepEqual(r.marks, []);
+  const re = C.exchangeRow(e);
+  assert.equal(re.where, "10.20.0.4:8443/x");
+  assert.equal(re.tone, "bad");
+  assert.deepEqual(re.marks.map((m) => m.key), ["intercepted", "unverified", "cut"]);
+  const rn = C.exchangeRow(n);
+  assert.equal(rn.text, "GET pay.acme.test/v1/users?id=1 · no response · 30s");
+  assert.equal(rn.words, "timed out");
+  assert.equal(C.exchangeRow(C.exchangeOf(exRec("ex-x", { status: 404, response_bytes: 0 }))).tone, "warn");
+  assert.equal(C.exchangeWhere(C.exchangeOf(exRec("ex-x", { host: "::1", port: 8080, scheme: "http", target: "p" }))), "[::1]:8080/p");
+  const list = [a, e, n];
+  const opts = C.exchangeFilterOptions(list);
+  assert.deepEqual(opts.hosts, ["10.20.0.4", "api.acme.test", "pay.acme.test"]);
+  assert.deepEqual(opts.statuses.map((s) => s.label), ["2xx", "5xx", "no response"]);
+  assert.deepEqual(C.filterExchanges(list, { host: "API.acme.test" }).map((x) => x.id), [a.id]);
+  assert.deepEqual(C.filterExchanges(list, { status: "none" }).map((x) => x.id), [n.id]);
+  assert.deepEqual(C.filterExchanges(list, { host: "all", status: "all" }), list);
+  assert.deepEqual(C.filterExchanges(list, { host: "10.20.0.4", status: "ok" }), []);
+  assert.equal(C.exchangeCountLine(1, 3), "1 request of 3");
+  assert.equal(C.exchangeCountLine(3, 3), "3 requests");
+  assert.equal(C.exchangeCountLine(0, 0), "No requests were captured for this session.");
+  const merged = [];
+  C.mergeExchange(merged, C.exchangeOf(exRec("ex-late", { ts_ms: 9000 })));
+  C.mergeExchange(merged, C.exchangeOf(exRec("ex-early", { ts_ms: 100 })));
+  assert.equal(C.mergeExchange(merged, C.exchangeOf(exRec("ex-early", { ts_ms: 100 }))), false);
+  assert.deepEqual(merged.map((x) => x.id), ["ex-early", "ex-late"]);
+});
+
+test("a stored message splits into start line, headers and body, and secrets stay masked until revealed", () => {
+  const msg = "POST /login HTTP/1.1\r\nHost: api.acme.test\r\nauthorization: Bearer abc\r\nCookie: sid=1\r\nX-Api-Key: k\r\nSet-Cookie: a=b\r\nProxy-Authorization: Basic x\r\nAccept: */*\r\nX-Long: one\r\n two\r\n\r\n{\"user\":\"a\"}\r\n\r\ntail";
+  const v = C.messageView(msg);
+  assert.equal(v.start, "POST /login HTTP/1.1");
+  assert.equal(v.body, "{\"user\":\"a\"}\r\n\r\ntail");
+  assert.equal(v.hasSecrets, true);
+  assert.deepEqual(v.rows.map((r) => [r.name, r.sensitive]), [["Host", false], ["authorization", true], ["Cookie", true], ["X-Api-Key", true], ["Set-Cookie", true], ["Proxy-Authorization", true], ["Accept", false], ["X-Long", false]]);
+  assert.equal(v.rows[1].shown, C.HEADER_MASK);
+  assert.equal(v.rows[1].value, "Bearer abc", "the value is kept for the reveal");
+  assert.equal(v.rows[0].shown, "api.acme.test");
+  assert.equal(v.rows[7].shown, "one two");
+  const shown = C.messageView(msg, { revealed: true });
+  assert.equal(shown.rows[1].shown, "Bearer abc");
+  assert.equal(shown.rows[5].shown, "Basic x");
+  assert.equal(C.isSensitiveHeader(" COOKIE "), true);
+  assert.equal(C.isSensitiveHeader("Accept"), false);
+  const head = C.messageView("HTTP/1.1 204 No Content\r\nServer: x");
+  assert.equal(head.bodyWords, "no body");
+  assert.equal(head.hasSecrets, false);
+  const big = C.messageView("HTTP/1.1 200 OK\n\n" + "x".repeat(C.EXCHANGE_BODY_CAP + 5));
+  assert.equal(big.cut, true);
+  assert.equal(big.body.length, C.EXCHANGE_BODY_CAP);
+});
+
+const tscope = (inc, exc = []) => C.parseScope(inc, exc);
+
+test("scope entries parse and match as target.rs does (names, globs, IPs, CIDRs, exclude wins)", () => {
+  const s = tscope(["acme.test", "*.acme.test", "10.20.0.0/24", "192.0.2.7", "2001:db8::/32"], ["admin.acme.test", "10.20.0.9"]);
+  assert.deepEqual(s.errors, []);
+  assert.ok(s.contains("acme.test") && s.contains("ACME.test.") && s.contains("api.acme.test") && s.contains("a.b.acme.test"));
+  assert.ok(!s.contains("evilacme.test") && !s.contains("acme.test.evil"));
+  assert.ok(s.contains("10.20.0.5") && !s.contains("10.20.1.5") && s.contains("192.0.2.7") && s.contains("[2001:db8::1]"));
+  assert.ok(!s.contains("admin.acme.test") && !s.contains("10.20.0.9"));
+  assert.ok(s.excluded("admin.acme.test"));
+  assert.ok(!tscope(["*.acme.test"]).contains("acme.test"), "a glob does not include the bare domain");
+  for (const bad of ["https://acme.test", "acme.test:443", "10.0.0.0/33", "*.", "", "a b"]) {
+    const r = C.parseScopeEntry(bad);
+    assert.ok(r.error && (r.error.includes("scope entry") || r.error.includes("CIDR")), `${bad}: ${r.error}`);
+  }
+  assert.deepEqual(tscope(["acme.test", "a b"]).errors.length, 1);
+});
+
+test("claim hosts: the same cases as claim_hosts in target.rs", () => {
+  const s = tscope(["*.acme.test", "10.20.0.0/24"]);
+  const text = "The login at https://User@Login.acme.test:8443/auth?x=1 leaks; api.acme.test and 10.20.0.4:22 too, not example.com or http://other.test/x.";
+  assert.deepEqual(C.claimHosts(text, ["db.acme.test"], s), ["db.acme.test", "login.acme.test", "other.test", "api.acme.test", "10.20.0.4"]);
+  assert.deepEqual(C.claimHosts(text, [], null), ["login.acme.test", "other.test"], "without a scope only URLs count");
+  assert.deepEqual(C.claimHosts("see http://[::1]:8080/x", [], null), ["::1"]);
+  assert.deepEqual(C.claimHosts("ftp://files.acme.test/x and no hosts", [], null), []);
+  assert.deepEqual(C.claimHosts("seen on 10.20.1.4 and 10.20.0.4.", [], s), ["10.20.0.4"]);
+  assert.equal(C.assetHost("api.acme.test:8443/tcp"), "api.acme.test");
+  assert.equal(C.assetHost("GET https://Shop.acme.test:8443/cart/{id}"), "shop.acme.test");
+  assert.equal(C.assetHost("file:/etc/passwd"), "");
+  assert.equal(C.assetHost("a1b2c3d4"), "");
+  assert.equal(C.assetHost("[::1]:80/tcp"), "::1");
+});
+
+test("a claim's host is reached by evidence that cites a call (or a stored message) that got a response, and by nothing else", () => {
+  const ex = [
+    C.exchangeOf(exRec("ex-aaaaaaaaaaaa", { call_id: "c1", host: "api.acme.test" })),
+    C.exchangeOf(exRec("ex-bbbbbbbbbbbb", { call_id: "c2", host: "login.acme.test", status: null, response: null })),
+    C.exchangeOf(exRec("ex-cccccccccccc", { call_id: "c3", host: "other.test", request: { id: "99".repeat(32), bytes: 1, lines: 1 } })),
+  ];
+  const ev = (id, f) => ({ id, supports: true, attested: true, call_id: null, blob: null, session: null, ...f });
+  const s = tscope(["*.acme.test"]);
+  const claim = { text: "api.acme.test and login.acme.test leak, see http://other.test/x and www.acme.test", assets: ["db.acme.test:5432/tcp", "file:/etc/x"], evidence: [ev("e1", { call_id: "c1" }), ev("e2", { call_id: "c2" }), ev("e3", { blob: "99".repeat(32) })] };
+  assert.deepEqual(C.claimReach(claim, ex, s), [
+    { host: "db.acme.test", reached: false, ids: [] },
+    { host: "other.test", reached: true, ids: ["ex-cccccccccccc"] },
+    { host: "api.acme.test", reached: true, ids: ["ex-aaaaaaaaaaaa"] },
+    { host: "login.acme.test", reached: false, ids: [] },
+    { host: "www.acme.test", reached: false, ids: [] },
+  ]);
+  const weak = { ...claim, evidence: [ev("e1", { call_id: "c1", attested: false }), ev("e2", { call_id: "c1", supports: false }), ev("e3", { call_id: "c1", session: "s-elsewhere" })] };
+  assert.equal(C.claimReach(weak, [{ ...ex[0], session: "s-here" }], s).find((r) => r.host === "api.acme.test").reached, false);
+  assert.equal(C.claimReach({ text: "a note with no host", evidence: [] }, ex, s).length, 0);
+  assert.equal(C.reachWords({ host: "h.test", reached: true, ids: ["ex-1", "ex-2"] }), "h.test: reached by ex-1, ex-2");
+  assert.match(C.reachWords({ host: "h.test", reached: false, ids: [] }), /not reached/);
+});
+
+const gnode = (id, kind, locator, status, parent = null, extra = {}) => C.nodeOf({ id, kind, locator, status, parent, missions: ["m-1"], evidence: [], findings: [], ...extra });
+
+test("the target tree nests by parent, orders siblings, folds and filters with the path kept", () => {
+  const nodes = [
+    gnode("d1", "domain", "acme.test", "untested"),
+    gnode("h1", "host", "www.acme.test", "finding", "d1", { findings: [{ claim: "c1", text: "XSS", status: "open", mission: "m-1", evidence: [] }] }),
+    gnode("h2", "host", "api.acme.test", "tested", "d1"),
+    gnode("i1", "ip", "10.20.0.4", "untested", "h2"),
+    gnode("s1", "service", "10.20.0.4:443/tcp", "deferred", "i1"),
+    gnode("e1", "endpoint", "GET https://api.acme.test:443/v1/users/{id}", "tested", "s1"),
+    gnode("n1", "ip", "10.20.0.0/24", "not_seen"),
+    gnode("o1", "host", "orphan.test", "untested", "missing-parent"),
+    gnode("l1", "host", "loop-a.test", "untested", "l2"),
+    gnode("l2", "host", "loop-b.test", "untested", "l1"),
+  ];
+  const all = C.targetTree(nodes);
+  assert.deepEqual(all.rows.map((r) => [r.depth, r.node.locator]), [
+    [0, "acme.test"], [1, "www.acme.test"], [1, "api.acme.test"], [2, "10.20.0.4"], [3, "10.20.0.4:443/tcp"], [4, "GET https://api.acme.test:443/v1/users/{id}"],
+    [0, "loop-a.test"], [0, "loop-b.test"], [0, "orphan.test"], [0, "10.20.0.0/24"],
+  ]);
+  assert.equal(all.shown, 10);
+  const folded = C.targetTree(nodes, {}, new Set(["h2", "d1"]));
+  assert.deepEqual(folded.rows.filter((r) => r.hasKids).map((r) => [r.node.id, r.open]), [["d1", false]]);
+  assert.equal(C.targetTree(nodes, {}, new Set(["h2"])).rows.find((r) => r.id === "h2").open, false);
+  assert.equal(C.targetTree(nodes, {}, new Set(["h2"])).rows.some((r) => r.id === "i1"), false);
+  const tested = C.targetTree(nodes, { status: "tested" }, new Set(["d1"]));
+  assert.deepEqual(tested.rows.map((r) => [r.node.id, r.context]), [["d1", true], ["h2", false], ["i1", true], ["s1", true], ["e1", false]], "the path to a match is kept and opened");
+  assert.equal(tested.shown, 2);
+  assert.deepEqual(C.targetTree(nodes, { kind: "ip" }).rows.filter((r) => !r.context).map((r) => r.id), ["i1", "n1"]);
+  assert.deepEqual(C.targetTree(nodes, { text: " WWW" }).rows.map((r) => r.id), ["d1", "h1"]);
+  assert.deepEqual(C.targetTree(nodes, { text: "nothing like this" }).rows, []);
+  assert.deepEqual(C.targetCounts(nodes), { finding: 1, tested: 2, deferred: 1, untested: 5, not_seen: 1 });
+  assert.equal(C.countsWords({ finding: 1, tested: 2, deferred: 0, untested: 5, not_seen: 1 }), "1 finding · 2 tested · 5 not tested yet · 1 in scope, not seen");
+  assert.equal(C.countsWords({}), "nothing seen yet");
+  assert.equal(C.nodeStatusWords("not_seen"), "in scope, not seen");
+  assert.equal(gnode("x", "weird", "x", "weird").kind, "host", "an unknown kind or status is drawn, not dropped");
+  assert.equal(gnode("x", "weird", "x", "weird").status, "untested");
+});
+
+test("a long tree draws a window of rows; a short one draws all", () => {
+  assert.deepEqual(C.treeWindow(1500, 9000, 600), { start: 0, end: 1500, before: 0, after: 0, virtual: false });
+  const w = C.treeWindow(5000, 4000, 800, 40, 10);
+  assert.deepEqual(w, { start: 90, end: 130, before: 3600, after: 194800, virtual: true });
+  assert.equal(C.treeWindow(5000, 10 ** 9, 800).end, 5000);
+});
+
+test("findings, missions and the scope editor of a target", () => {
+  const nodes = [
+    gnode("h1", "host", "www.acme.test", "finding", null, { findings: [{ claim: "c1", text: "XSS", status: "open", mission: "m-1", evidence: ["out:aa"] }, { claim: "c0", text: "Old", status: "withdrawn", mission: "m-2", evidence: [] }], missions: ["m-1", "m-2"] }),
+    gnode("h2", "host", "api.acme.test", "tested", null, { missions: ["m-2"] }),
+  ];
+  const f = C.targetFindings(nodes);
+  assert.deepEqual(f.map((x) => [x.claim, x.open, x.locator]), [["c1", true, "www.acme.test"], ["c0", false, "www.acme.test"]]);
+  const byId = new Map([["s-1", { id: "s-1", mission: "m-1", title: "Audit acme" }], ["s-1a", { id: "s-1a", mission: "m-1", parent: "s-1", title: "agent" }], ["s-2", { id: "s-2", mission: "m-2", title: "Fleet" }]]);
+  const m = C.targetMissions(nodes, byId, "acme");
+  assert.deepEqual(m.map((x) => [x.id, x.session, x.title, x.seen, x.tested, x.findings]), [["m-1", "s-1", "Audit acme", 1, 0, 1], ["m-2", "s-2", "Fleet", 2, 1, 0]]);
+  assert.equal(m[1].words, "saw 2 nodes · tested 1");
+  assert.equal(C.targetMissions(nodes, new Map(), "acme")[0].session, null);
+  assert.equal(C.scopeText(["a.test", "*.a.test"]), "a.test\n*.a.test");
+  assert.deepEqual(C.scopeFromText("a.test, *.a.test\n\n a.test \n10.0.0.0/8"), { entries: ["a.test", "*.a.test", "10.0.0.0/8"] });
+  assert.match(C.scopeFromText("a.test\nhttps://x.test").error, /not a CIDR/);
+  assert.match(C.scopeFromText("a.test\nx y").error, /not a scope entry/);
+  const cfg = C.targetOf({ name: "acme", scope: ["a.test"], upstream_insecure: ["u.test"], notes: "n", counts: { tested: 2 } });
+  assert.equal(cfg.words, "2 tested");
+  assert.deepEqual(C.targetPut(cfg, "a.test\n*.a.test", "x.a.test").body, { scope: ["a.test", "*.a.test"], exclude: ["x.a.test"], upstream_insecure: ["u.test"], intercept_passthrough: [], notes: "n" });
+  assert.match(C.targetPut(cfg, "", "").error, /at least one/);
+  assert.match(C.targetPut(cfg, "a.test", "bad entry").error, /scope entry/);
+});
+
+test("targets have routes, a form field and an event; the new-mission body names the target only when one is chosen", () => {
+  assert.deepEqual(C.parseRoute("#/targets"), { view: "targets" });
+  assert.deepEqual(C.parseRoute("#/t/acme"), { view: "target", name: "acme" });
+  assert.deepEqual(C.parseRoute(C.targetHash("a b")), { view: "target", name: "a b" });
+  assert.equal(C.targetHash(""), "#/targets");
+  assert.deepEqual(C.parseRoute("#/t/"), { view: "empty" });
+  assert.deepEqual(C.parseRoute("#/t/a/b"), { view: "empty" });
+  assert.equal(C.buildNewSession({ workspace: "/w", message: "go", target: "acme" }).body.target, "acme");
+  assert.equal("target" in C.buildNewSession({ workspace: "/w", message: "go", target: " " }).body, false);
+  const fx = C.planEvent({ type: "target", name: "acme" }, { openId: null, known: () => true, missionOf: () => null });
+  assert.deepEqual(fx, [{ fx: "target_changed", name: "acme" }]);
+});
+
+test("graph nodes take their parent from the edges when a node does not name one; a bash row owns the proxy's calls made during it", () => {
+  const g = { nodes: [{ id: "d", kind: "domain", locator: "a.test", status: "untested" }, { id: "h", kind: "host", locator: "w.a.test", status: "tested" }, { id: "i", kind: "ip", locator: "10.0.0.1", status: "untested" }, { id: "s", kind: "service", locator: "10.0.0.1:80/tcp", status: "untested", parent: "h" }],
+    edges: [{ kind: "parent", from: "h", to: "d" }, { kind: "resolves", from: "h", to: "i" }, { kind: "runs", from: "i", to: "s" }] };
+  assert.deepEqual(C.graphNodes(g).map((n) => [n.id, n.parent]), [["d", null], ["h", "d"], ["i", "h"], ["s", "h"]]);
+  assert.deepEqual(C.graphNodes([{ id: "x", kind: "host", locator: "x", status: "tested" }]).map((n) => n.parent), [null]);
+  assert.deepEqual(C.graphNodes(null), []);
+  const block = { name: "bash", ts: 100, result: { ts: 200 } };
+  const list = [{ id: "a", call_id: null, source: "proxy", ts: 150 }, { id: "b", call_id: null, source: "proxy", ts: 250 }, { id: "c", call_id: "z", source: "proxy", ts: 150 }];
+  assert.deepEqual(C.callWindowExchanges(block, list).map((x) => x.id), ["a"]);
+  assert.deepEqual(C.callWindowExchanges({ ...block, name: "read" }, list), []);
 });

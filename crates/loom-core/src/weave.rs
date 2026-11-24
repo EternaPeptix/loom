@@ -118,10 +118,9 @@
 //! matching the weave rendered with the plan); `keep_recent_steps = 0` lets the plan stub the latest
 //! step's results; the stub of a view names the viewed output's handle.
 
-use crate::estimate::TokenEstimator;
 use crate::event::{
-    Author, Brief, Event, EvictAction, Eviction, FinishReason, NoteKind, ReasoningReplay, Record, Reweave, Seq,
-    ToolCall, ToolClass, ToolResult, ToolSpec,
+    Author, Brief, Compaction, Event, EvictAction, FinishReason, NoteKind, ReasoningReplay, Record, Reweave, Seq,
+    ToolClass, ToolResult, ToolSpec,
 };
 use crate::ids::CallId;
 use crate::message::{Message, Role};
@@ -170,6 +169,14 @@ pub struct WindowItem {
     /// For a `harness_note`: which kind of note it is (its `kind` attribute in the request).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<NoteKind>,
+    /// Estimated tokens of the images this item currently sends (`ImageRef::est_tokens`; 0 when it sends none,
+    /// as when it is stubbed). Not part of `chars`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub image_tokens: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -186,64 +193,15 @@ pub struct Weave {
     pub resume_chars: usize,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct ReweavePolicy {
-    /// Plan a re-weave when the server-reported prompt size exceeds this.
-    pub target_tokens: u64,
-    /// Evict until the estimate is at or below this.
-    pub floor_tokens: u64,
-    /// Model responses at the end of the log whose surroundings are never evicted.
-    pub keep_recent_steps: u32,
-    /// Trailing lines of an evicted `Exec` result kept in its stub.
-    pub stub_tail_lines: u32,
-}
-
-impl Default for ReweavePolicy {
-    fn default() -> Self {
-        Self { target_tokens: 400_000, floor_tokens: 180_000, keep_recent_steps: 60, stub_tail_lines: 12 }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct ReweavePlan {
-    pub upto_seq: Seq,
-    pub evictions: Vec<Eviction>,
-    pub before_tokens_est: u64,
-    pub after_tokens_est: u64,
-}
-
 /// Rendered at the head of the digest in a resume brief.
 const LEADS_LINE: &str =
     "Leads from earlier work (written by the model, not verified — re-check before relying on them):";
-
-/// What the planner needs to know about an item beyond its [`WindowItem`].
-struct Aux<'a> {
-    /// Index in `Weave::messages` of the message carrying this item, when it is rendered.
-    msg: Option<usize>,
-    /// Replayed reasoning currently rendered, in bytes.
-    reasoning: usize,
-    /// Response text currently rendered, in bytes.
-    text: usize,
-    /// Tool result text or agent report currently rendered, in bytes.
-    payload: usize,
-    /// A model response that carries complete tool calls.
-    has_calls: bool,
-    result: Option<&'a ToolResult>,
-}
-
-impl Aux<'_> {
-    fn none() -> Self {
-        Self { msg: None, reasoning: 0, text: 0, payload: 0, has_calls: false, result: None }
-    }
-}
 
 /// One rendered message before merging, with the record it came from.
 struct Elem {
     /// Seq of the record that produced it (for a tool message: of the response it answers).
     group: Seq,
     msg: Message,
-    entry: Option<usize>,
 }
 
 fn wire_name<T: Serialize>(v: &T) -> String {
@@ -270,6 +228,7 @@ fn item(seq: Seq, kind: &str, role: Role, chars: usize, state: ItemState, shown:
         class: None,
         preview: preview(shown),
         note: None,
+        image_tokens: 0,
     }
 }
 
@@ -290,12 +249,34 @@ fn resume_text(rw: &Reweave) -> Option<String> {
     Some(crate::tagsafe::block("resume", &[], &body))
 }
 
-fn build(records: &[Record]) -> (Weave, Vec<Aux<'_>>) {
-    build_with(records, None)
+/// The latest compaction of a log: its index and the record's fields.
+fn latest_compaction(records: &[Record]) -> Option<(usize, &Compaction)> {
+    records.iter().enumerate().rev().find_map(|(i, r)| match &r.event {
+        Event::Compaction(c) => Some((i, c)),
+        _ => None,
+    })
 }
 
-/// [`build`], as the log would render with `pending` appended as its next re-weave.
-fn build_with<'a>(records: &'a [Record], pending: Option<&'a Reweave>) -> (Weave, Vec<Aux<'a>>) {
+/// The records that render, in rendering order. Without a compaction, all of them. With one: the session
+/// start, the latest fork record (the assignment), the compaction itself, then the records after its
+/// `upto_seq` (the tail, which precedes the compaction record in the log, and what came later). Nothing
+/// before `upto_seq` renders, so the cost of a weave follows the window, not the log.
+fn window_records(records: &[Record]) -> Vec<&Record> {
+    let Some((ci, c)) = latest_compaction(records) else { return records.iter().collect() };
+    let first = records.partition_point(|r| r.seq <= c.upto_seq).min(ci);
+    let mut out: Vec<&Record> = Vec::new();
+    // The session start and the fork record (the assignment) are among the first records.
+    let head = records.get(..first.min(16)).unwrap_or_default();
+    out.extend(head.iter().find(|r| matches!(r.event, Event::SessionStart(_))));
+    out.extend(head.iter().rev().find(|r| matches!(r.event, Event::Forked(_))));
+    out.extend(records.get(ci));
+    let tail = records.get(first..ci).unwrap_or_default();
+    out.extend(tail.iter().filter(|r| !matches!(r.event, Event::SessionStart(_) | Event::Reweave(_))));
+    out.extend(records.iter().skip(ci.saturating_add(1)));
+    out
+}
+
+fn build(records: &[Record]) -> Weave {
     let mut replay_all = true;
     let mut tools: Vec<ToolSpec> = Vec::new();
     for r in records {
@@ -314,12 +295,15 @@ fn build_with<'a>(records: &'a [Record], pending: Option<&'a Reweave>) -> (Weave
         replay_all = m.reasoning_replay == ReasoningReplay::All;
     }
 
-    // Pass 1: whole-log state.
+    // Pass 1: whole-window state.
+    let order = window_records(records);
+    let compaction = latest_compaction(records).map(|(_, c)| c);
+    let compaction_seq = latest_compaction(records).and_then(|(i, _)| records.get(i)).map(|r| r.seq);
     let mut evictions: HashMap<Seq, &EvictAction> = HashMap::new();
     let mut latest: Option<&Reweave> = None;
     let mut pinned: HashSet<&str> = HashSet::new();
     let mut results: HashMap<&str, Vec<(Seq, &ToolResult)>> = HashMap::new();
-    for r in records {
+    for r in order.iter().copied() {
         match &r.event {
             Event::Reweave(rw) => {
                 for e in &rw.evictions {
@@ -337,21 +321,15 @@ fn build_with<'a>(records: &'a [Record], pending: Option<&'a Reweave>) -> (Weave
             _ => {}
         }
     }
-    if let Some(rw) = pending {
-        for e in &rw.evictions {
-            evictions.insert(e.seq, &e.action);
-        }
-        latest = Some(rw);
-    }
-    let epoch = latest.map_or(0, |rw| rw.epoch);
+    let epoch = latest.map_or(0, |rw| rw.epoch).max(compaction.map_or(0, |c| c.epoch));
 
     // Pass 2: render.
-    let mut entries: Vec<(WindowItem, Aux)> = Vec::new();
+    let mut entries: Vec<WindowItem> = Vec::new();
     let mut elems: Vec<Elem> = Vec::new();
     let mut used: HashSet<Seq> = HashSet::new();
     let mut started = false;
 
-    for rec in records {
+    for rec in order.iter().copied() {
         let seq = rec.seq;
         // Project an earlier model-authored action into the native call/result message shape.
         // Its durable event remains StoredAction, so accounting never invents an inference.
@@ -376,37 +354,42 @@ fn build_with<'a>(records: &'a [Record], pending: Option<&'a Reweave>) -> (Weave
                 started = true;
                 let mut msg = Message::system(s.system_prompt.clone());
                 msg.origin = vec![seq];
-                entries.push((
-                    item(seq, "session_start", Role::System, s.system_prompt.len(), ItemState::Live, &s.system_prompt),
-                    Aux::none(),
+                entries.push(item(
+                    seq,
+                    "session_start",
+                    Role::System,
+                    s.system_prompt.len(),
+                    ItemState::Live,
+                    &s.system_prompt,
                 ));
-                elems.push(Elem { group: seq, msg, entry: Some(entries.len() - 1) });
+                elems.push(Elem { group: seq, msg });
             }
-            Event::UserMessage { text } => {
+            Event::UserMessage { text, images } => {
                 let mut msg = Message::user(text.clone());
                 msg.origin = vec![seq];
-                entries.push((item(seq, "user_message", Role::User, text.len(), ItemState::Live, text), Aux::none()));
-                elems.push(Elem { group: seq, msg, entry: Some(entries.len() - 1) });
+                msg.images = images.clone();
+                let mut it = item(seq, "user_message", Role::User, text.len(), ItemState::Live, text);
+                it.image_tokens = images.iter().map(crate::image::ImageRef::est_tokens).sum();
+                entries.push(it);
+                elems.push(Elem { group: seq, msg });
             }
             Event::HarnessNote { note, text } => {
                 if !note.is_protected() && matches!(evictions.get(&seq), Some(EvictAction::Drop)) {
                     let mut it = item(seq, "harness_note", Role::User, 0, ItemState::Dropped, "");
                     it.note = Some(*note);
-                    entries.push((it, Aux::none()));
+                    entries.push(it);
                     continue;
                 }
                 let content = match &rec.author {
                     Author::Agent(id) => crate::tagsafe::block(note.as_str(), &[("from", id.as_str())], text),
                     _ => crate::tagsafe::block(note.as_str(), &[], text),
                 };
-                let mut aux = Aux::none();
-                aux.payload = text.len();
                 let mut it = item(seq, "harness_note", Role::User, content.len(), ItemState::Live, &content);
                 it.note = Some(*note);
-                entries.push((it, aux));
+                entries.push(it);
                 let mut msg = Message::user(content);
                 msg.origin = vec![seq];
-                elems.push(Elem { group: seq, msg, entry: Some(entries.len() - 1) });
+                elems.push(Elem { group: seq, msg });
             }
             Event::Forked(f) => {
                 // The contract is the harness's own text and stays as written; the brief is the payload.
@@ -416,10 +399,18 @@ fn build_with<'a>(records: &'a [Record], pending: Option<&'a Reweave>) -> (Weave
                     &f.contract,
                     &render_brief(&f.brief),
                 );
-                entries.push((item(seq, "forked", Role::User, content.len(), ItemState::Live, &content), Aux::none()));
+                entries.push(item(seq, "forked", Role::User, content.len(), ItemState::Live, &content));
                 let mut msg = Message::user(content);
                 msg.origin = vec![seq];
-                elems.push(Elem { group: seq, msg, entry: Some(entries.len() - 1) });
+                elems.push(Elem { group: seq, msg });
+            }
+            Event::Compaction(c) if Some(seq) == compaction_seq => {
+                let text = crate::compaction::item_text(records, seq, c);
+                let content = crate::tagsafe::block("compaction", &[], &text);
+                entries.push(item(seq, "compaction", Role::User, content.len(), ItemState::Live, &content));
+                let mut msg = Message::user(content);
+                msg.origin = vec![seq];
+                elems.push(Elem { group: seq, msg });
             }
             Event::ChildSettled(c) if c.inline => {}
             Event::ChildSettled(c) => {
@@ -433,12 +424,10 @@ fn build_with<'a>(records: &'a [Record], pending: Option<&'a Reweave>) -> (Weave
                     &[("agent", &c.child.to_string()), ("outcome", &wire_name(&c.outcome))],
                     report,
                 );
-                let mut aux = Aux::none();
-                aux.payload = report.len();
-                entries.push((item(seq, "child_settled", Role::User, content.len(), state, &content), aux));
+                entries.push(item(seq, "child_settled", Role::User, content.len(), state, &content));
                 let mut msg = Message::user(content);
                 msg.origin = vec![seq];
-                elems.push(Elem { group: seq, msg, entry: Some(entries.len() - 1) });
+                elems.push(Elem { group: seq, msg });
             }
             Event::ModelResponse(r) => {
                 if matches!(r.finish, FinishReason::Aborted | FinishReason::Error) {
@@ -503,19 +492,12 @@ fn build_with<'a>(records: &'a [Record], pending: Option<&'a Reweave>) -> (Weave
                 } else {
                     msg.content.clone()
                 };
-                let aux = Aux {
-                    msg: None,
-                    reasoning: msg.reasoning.as_ref().map_or(0, String::len),
-                    text: msg.content.len(),
-                    payload: 0,
-                    has_calls: !msg.tool_calls.is_empty(),
-                    result: None,
-                };
-                let chars = msg.content.len() + aux.reasoning + calls_chars(&msg.tool_calls);
+                let chars =
+                    msg.content.len() + msg.reasoning.as_ref().map_or(0, String::len) + calls_chars(&msg.tool_calls);
                 let kind = if matches!(rec.event, Event::StoredAction(_)) { "stored_action" } else { "model_response" };
-                entries.push((item(seq, kind, Role::Assistant, chars, state, &shown), aux));
+                entries.push(item(seq, kind, Role::Assistant, chars, state, &shown));
                 if rendered {
-                    elems.push(Elem { group: seq, msg, entry: Some(entries.len() - 1) });
+                    elems.push(Elem { group: seq, msg });
                 }
 
                 // The answers to its calls, in call order.
@@ -526,9 +508,7 @@ fn build_with<'a>(records: &'a [Record], pending: Option<&'a Reweave>) -> (Weave
                             it.pinned = pinned.contains(c.call_id.as_str());
                             it.call_id = Some(c.call_id.clone());
                             it.class = Some(t.class);
-                            let mut aux = Aux::none();
-                            aux.result = Some(t);
-                            entries.push((it, aux));
+                            entries.push(it);
                         }
                         Some((rseq, t)) => {
                             let (content, state) = match evictions.get(&rseq) {
@@ -539,19 +519,20 @@ fn build_with<'a>(records: &'a [Record], pending: Option<&'a Reweave>) -> (Weave
                             let mut msg = Message::tool(c.call_id.to_string(), content);
                             msg.origin = vec![rseq];
                             let mut it = item(rseq, "tool_result", Role::Tool, content.len(), state, content);
+                            if state == ItemState::Live {
+                                msg.images = t.images.clone();
+                                it.image_tokens = t.images.iter().map(crate::image::ImageRef::est_tokens).sum();
+                            }
                             it.pinned = pinned.contains(c.call_id.as_str());
                             it.call_id = Some(c.call_id.clone());
                             it.class = Some(t.class);
-                            let mut aux = Aux::none();
-                            aux.payload = content.len();
-                            aux.result = Some(t);
-                            entries.push((it, aux));
-                            elems.push(Elem { group: seq, msg, entry: Some(entries.len() - 1) });
+                            entries.push(it);
+                            elems.push(Elem { group: seq, msg });
                         }
                         None => {
                             let mut msg = Message::tool(c.call_id.to_string(), MISSING_RESULT);
                             msg.origin = vec![seq];
-                            elems.push(Elem { group: seq, msg, entry: None });
+                            elems.push(Elem { group: seq, msg });
                         }
                     }
                 }
@@ -568,7 +549,7 @@ fn build_with<'a>(records: &'a [Record], pending: Option<&'a Reweave>) -> (Weave
             let at = elems.iter().rposition(|e| e.group <= rw.upto_seq).map_or(0, |i| i + 1);
             let mut msg = Message::user(text);
             msg.origin = vec![rw.upto_seq];
-            elems.insert(at, Elem { group: rw.upto_seq, msg, entry: None });
+            elems.insert(at, Elem { group: rw.upto_seq, msg });
         }
     }
 
@@ -587,467 +568,30 @@ fn build_with<'a>(records: &'a [Record], pending: Option<&'a Reweave>) -> (Weave
         if !merged {
             messages.push(el.msg);
         }
-        if let Some(e) = el.entry {
-            if let Some(slot) = entries.get_mut(e) {
-                slot.1.msg = messages.len().checked_sub(1);
-            }
-        }
     }
 
-    entries.sort_by_key(|(it, _)| it.seq);
-    let (items, aux): (Vec<WindowItem>, Vec<Aux>) = entries.into_iter().unzip();
-    (Weave { messages, tools, epoch, items, resume_chars }, aux)
+    // The compaction item stands where the records it replaces were, before the tail.
+    let upto = compaction.map_or(0, |c| c.upto_seq);
+    entries.sort_by_key(|it| if it.kind == "compaction" { upto } else { it.seq });
+    Weave { messages, tools, epoch, items: entries, resume_chars }
 }
 
 /// Render the stable prefix from a session's records.
 pub fn weave(records: &[Record]) -> Weave {
-    build(records).0
+    build(records)
 }
 
-/// Per-message template overhead as the estimator counts it.
-fn message_overhead(estimator: &TokenEstimator) -> u64 {
-    let probe = Message::user("");
-    estimator.tokens_for_messages(std::slice::from_ref(&probe)).saturating_sub(estimator.tokens(probe.chars()))
-}
-
-/// Choose evictions for the next re-weave, or `None` if nothing can be evicted.
-pub fn plan_reweave(
-    records: &[Record],
-    estimator: &TokenEstimator,
-    policy: &ReweavePolicy,
-    allow_text_eviction: bool,
-) -> Option<ReweavePlan> {
-    Woven::new(records).plan(records, estimator, policy, allow_text_eviction)
-}
-
-/// A weave together with what re-weave planning needs to know about its items, so that one
-/// rendering serves a request and every plan made for it.
+/// A weave, as the session holds it for a step.
 #[derive(Clone, Debug)]
 pub struct Woven {
     pub weave: Weave,
-    facts: Vec<Facts>,
-}
-
-/// What planning needs to know about one item of a [`Woven`] (see [`Aux`]).
-#[derive(Clone, Copy, Debug)]
-struct Facts {
-    msg: Option<usize>,
-    reasoning: usize,
-    text: usize,
-    payload: usize,
-    has_calls: bool,
-    /// Seq of the `tool_result` record shown by this item.
-    result: Option<Seq>,
 }
 
 impl Woven {
-    /// Render `records` (see [`weave`]), keeping what planning needs.
+    /// Render `records` (see [`weave`]).
     pub fn new(records: &[Record]) -> Woven {
-        let (weave, aux) = build(records);
-        let facts = weave
-            .items
-            .iter()
-            .zip(&aux)
-            .map(|(it, a)| Facts {
-                msg: a.msg,
-                reasoning: a.reasoning,
-                text: a.text,
-                payload: a.payload,
-                has_calls: a.has_calls,
-                result: a.result.map(|_| it.seq),
-            })
-            .collect();
-        Woven { weave, facts }
+        Woven { weave: build(records) }
     }
-
-    /// [`plan_reweave`] without rendering again. `records` are those this weave was rendered from,
-    /// possibly followed by records that render nothing.
-    pub fn plan(
-        &self,
-        records: &[Record],
-        estimator: &TokenEstimator,
-        policy: &ReweavePolicy,
-        allow_text_eviction: bool,
-    ) -> Option<ReweavePlan> {
-        plan_on(&self.weave, &self.facts, records, estimator, policy, allow_text_eviction)
-    }
-
-    /// [`plan_fresh_start`] without rendering again. `records` are those this weave was rendered from.
-    pub fn plan_fresh_start(
-        &self,
-        records: &[Record],
-        estimator: &TokenEstimator,
-        policy: &ReweavePolicy,
-        attempt: IsAttempt<'_>,
-    ) -> Option<ReweavePlan> {
-        fresh_start_on(&self.weave, &self.facts, records, estimator, policy, attempt)
-    }
-}
-
-/// The calls and results of a log, by what names them in a weave: what a stub is written from.
-struct Outputs<'a> {
-    calls: HashMap<&'a str, &'a ToolCall>,
-    results: HashMap<Seq, &'a ToolResult>,
-}
-
-impl<'a> Outputs<'a> {
-    fn of(records: &'a [Record]) -> Self {
-        let mut calls: HashMap<&str, &ToolCall> = HashMap::new();
-        let mut results: HashMap<Seq, &ToolResult> = HashMap::new();
-        for r in records {
-            match &r.event {
-                Event::ToolCall(c) => {
-                    calls.entry(c.call_id.as_str()).or_insert(c);
-                }
-                Event::ToolResult(t) => {
-                    results.insert(r.seq, t);
-                }
-                _ => {}
-            }
-        }
-        Outputs { calls, results }
-    }
-
-    /// The stub for item `i` (a tool result or an agent report), when it is shorter than what is shown.
-    fn stub_for(&self, w: &Weave, aux: &[Facts], i: usize, stub_tail_lines: u32) -> Option<EvictAction> {
-        let (it, a) = (w.items.get(i)?, aux.get(i)?);
-        let text = if it.kind == "tool_result" {
-            let t = *self.results.get(&a.result?)?;
-            stub_text(self.calls.get(t.call_id.as_str()).copied(), t, stub_tail_lines)
-        } else {
-            format!("[agent report evicted from view, not from the record: {} bytes.]", a.payload)
-        };
-        (text.len() < a.payload).then_some(EvictAction::Stub { text })
-    }
-}
-
-/// Says whether a tool result (its seq, the record) is the answer to an attempt: a call that a fresh
-/// start takes out of the window (see [`plan_fresh_start`]).
-pub type IsAttempt<'a> = &'a dyn Fn(Seq, &ToolResult) -> bool;
-
-/// Choose the evictions of a fresh start (see the CONTRACT), or `None` if there is nothing to evict.
-pub fn plan_fresh_start(
-    records: &[Record],
-    estimator: &TokenEstimator,
-    policy: &ReweavePolicy,
-    attempt: IsAttempt<'_>,
-) -> Option<ReweavePlan> {
-    Woven::new(records).plan_fresh_start(records, estimator, policy, attempt)
-}
-
-fn fresh_start_on(
-    w: &Weave,
-    aux: &[Facts],
-    records: &[Record],
-    estimator: &TokenEstimator,
-    policy: &ReweavePolicy,
-    attempt: IsAttempt<'_>,
-) -> Option<ReweavePlan> {
-    let upto = records.last()?.seq;
-    let outputs = Outputs::of(records);
-    let notes: HashMap<Seq, NoteKind> = records
-        .iter()
-        .filter_map(|r| match &r.event {
-            Event::HarnessNote { note, .. } => Some((r.seq, *note)),
-            _ => None,
-        })
-        .collect();
-
-    let mut evictions: Vec<Eviction> = Vec::new();
-    for (i, it) in w.items.iter().enumerate() {
-        let Some(a) = aux.get(i) else { continue };
-        let live = it.state == ItemState::Live;
-        let action = match it.kind.as_str() {
-            "model_response" if it.state != ItemState::Dropped && a.text + a.reasoning > 0 => Some(EvictAction::Drop),
-            "tool_result" if it.state != ItemState::Dropped => {
-                let is_attempt = a
-                    .result
-                    .and_then(|seq| outputs.results.get(&seq).map(|t| (seq, *t)))
-                    .is_some_and(|(s, t)| attempt(s, t));
-                if is_attempt {
-                    Some(EvictAction::Remove)
-                } else if live && !it.pinned {
-                    outputs.stub_for(w, aux, i, policy.stub_tail_lines)
-                } else {
-                    None
-                }
-            }
-            "child_settled" if live => outputs.stub_for(w, aux, i, policy.stub_tail_lines),
-            "harness_note" if live => notes
-                .get(&it.seq)
-                .is_some_and(|k| matches!(k, NoteKind::Nudge | NoteKind::Stall | NoteKind::Verdict))
-                .then_some(EvictAction::Drop),
-            _ => None,
-        };
-        if let Some(action) = action {
-            evictions.push(Eviction { seq: it.seq, action });
-        }
-    }
-    if evictions.is_empty() {
-        return None;
-    }
-
-    // The estimate afterwards is of the weave as it renders with them, before any brief is written.
-    let pending = Reweave {
-        epoch: w.epoch.saturating_add(1),
-        upto_seq: upto,
-        evictions,
-        brief: String::new(),
-        digest: None,
-        reason: String::new(),
-        before_tokens: 0,
-        after_tokens_est: 0,
-    };
-    let after = estimator.tokens_for_messages(&build_with(records, Some(&pending)).0.messages);
-    Some(ReweavePlan {
-        upto_seq: upto,
-        evictions: pending.evictions,
-        before_tokens_est: estimator.tokens_for_messages(&w.messages),
-        after_tokens_est: after,
-    })
-}
-
-fn plan_on(
-    w: &Weave,
-    aux: &[Facts],
-    records: &[Record],
-    estimator: &TokenEstimator,
-    policy: &ReweavePolicy,
-    allow_text_eviction: bool,
-) -> Option<ReweavePlan> {
-    let before = estimator.tokens_for_messages(&w.messages);
-    if before <= policy.floor_tokens {
-        return None;
-    }
-
-    // The protected recent region starts at the first of the last `keep_recent_steps` steps: model
-    // responses, rendered or not (a reply cut off or aborted was a step as well). With fewer steps
-    // than that, it starts at the first step or at the last `keep_recent_steps` records that render
-    // (a call's results counted with the step that made it), whichever is later, so that what
-    // arrived after a few early steps can still be folded.
-    let keep = usize::try_from(policy.keep_recent_steps).unwrap_or(usize::MAX);
-    let upto = if keep == 0 {
-        records.last()?.seq
-    } else {
-        let steps: Vec<usize> = (0..records.len())
-            .filter(|&i| {
-                records.get(i).is_some_and(|r| matches!(r.event, Event::ModelResponse(_) | Event::StoredAction(_)))
-            })
-            .collect();
-        let first_recent = match steps.len().checked_sub(keep) {
-            Some(k) => *steps.get(k)?,
-            None => {
-                let rendered: HashSet<Seq> =
-                    w.items.iter().filter(|i| i.kind != "tool_result").map(|i| i.seq).collect();
-                let tail = (0..records.len())
-                    .rev()
-                    .filter(|&i| records.get(i).is_some_and(|r| rendered.contains(&r.seq)))
-                    .nth(keep.saturating_sub(1))
-                    .unwrap_or(0);
-                steps.first().map_or(tail, |&s| s.max(tail))
-            }
-        };
-        records.get(first_recent.checked_sub(1)?)?.seq
-    };
-
-    let outputs = Outputs::of(records);
-    let stub_for = |i: usize| outputs.stub_for(w, aux, i, policy.stub_tail_lines);
-
-    // Candidates in order of sacrifice.
-    let live = |i: usize| w.items.get(i).is_some_and(|it| it.seq <= upto && it.state == ItemState::Live && !it.pinned);
-    let mut steps: Vec<(usize, EvictAction)> = Vec::new();
-    for (i, it) in w.items.iter().enumerate() {
-        if it.kind == "model_response" && live(i) && aux.get(i).is_some_and(|a| a.reasoning > 0) {
-            steps.push((i, EvictAction::DropReasoning));
-        }
-    }
-    // Harness notes at or before `upto`, by kind, oldest first (the items are in log order).
-    let note_kinds: HashMap<Seq, NoteKind> = records
-        .iter()
-        .filter_map(|r| match &r.event {
-            Event::HarnessNote { note, .. } => Some((r.seq, *note)),
-            _ => None,
-        })
-        .collect();
-    // A note after the latest model response has not been seen by the model: never a candidate.
-    let latest_response: Option<Seq> =
-        records.iter().rev().find(|r| matches!(r.event, Event::ModelResponse(_))).map(|r| r.seq);
-    let notes_where = |pick: &dyn Fn(NoteKind) -> bool| -> Vec<usize> {
-        (0..w.items.len())
-            .filter(|&i| {
-                w.items.get(i).is_some_and(|it| {
-                    it.kind == "harness_note"
-                        && live(i)
-                        && latest_response.is_some_and(|lr| it.seq < lr)
-                        && note_kinds.get(&it.seq).is_some_and(|k| !k.is_protected() && pick(*k))
-                })
-            })
-            .collect()
-    };
-    for i in notes_where(&|k| {
-        matches!(
-            k,
-            NoteKind::Nudge
-                | NoteKind::Stall
-                | NoteKind::Verdict
-                | NoteKind::OutputCut
-                | NoteKind::Budget
-                | NoteKind::Interrupted
-        )
-    }) {
-        steps.push((i, EvictAction::Drop));
-    }
-    for (i, it) in w.items.iter().enumerate() {
-        if it.kind == "tool_result" && it.class == Some(ToolClass::Nav) && live(i) {
-            if let Some(s) = stub_for(i) {
-                steps.push((i, s));
-            }
-        }
-    }
-    let by_size = |pick: &dyn Fn(&WindowItem) -> bool| -> Vec<usize> {
-        let mut idx: Vec<usize> = (0..w.items.len()).filter(|&i| w.items.get(i).is_some_and(pick) && live(i)).collect();
-        idx.sort_by_key(|&i| std::cmp::Reverse(aux.get(i).map_or(0, |a| a.payload)));
-        idx
-    };
-    for i in by_size(&|it| it.kind == "tool_result" && it.class == Some(ToolClass::Read)) {
-        if let Some(s) = stub_for(i) {
-            steps.push((i, s));
-        }
-    }
-    let rest = by_size(&|it| {
-        (it.kind == "tool_result" && it.class != Some(ToolClass::Read) && it.class != Some(ToolClass::Nav))
-            || it.kind == "child_settled"
-    });
-    for i in rest {
-        if let Some(s) = stub_for(i) {
-            steps.push((i, s));
-        }
-    }
-    // Every other note that is not protected (arrival, info), after the results.
-    for i in notes_where(&|k| {
-        !matches!(
-            k,
-            NoteKind::Nudge
-                | NoteKind::Stall
-                | NoteKind::Verdict
-                | NoteKind::OutputCut
-                | NoteKind::Budget
-                | NoteKind::Interrupted
-        )
-    }) {
-        steps.push((i, EvictAction::Drop));
-    }
-    if allow_text_eviction {
-        for (i, it) in w.items.iter().enumerate() {
-            let evictable = it.kind == "model_response"
-                && it.seq <= upto
-                && it.state != ItemState::Dropped
-                && aux.get(i).is_some_and(|a| a.text > 0);
-            if evictable {
-                steps.push((i, EvictAction::Drop));
-            }
-        }
-    }
-
-    // Take them in order until the estimate reaches the floor.
-    let overhead = message_overhead(estimator);
-    let mut msg_chars: Vec<usize> = w.messages.iter().map(Message::chars).collect();
-    let mut tokens = before;
-    let mut chosen: Vec<Eviction> = Vec::new();
-    for (i, action) in steps {
-        if tokens <= policy.floor_tokens {
-            break;
-        }
-        let (Some(it), Some(a)) = (w.items.get(i), aux.get(i)) else { continue };
-        let Some(m) = a.msg else { continue };
-        let Some(old) = msg_chars.get(m).copied() else { continue };
-        let planned = match action {
-            EvictAction::Drop => chosen.iter().position(|e| e.seq == it.seq),
-            _ => None,
-        };
-        let already_reasoning_planned =
-            planned.and_then(|p| chosen.get(p)).is_some_and(|e| e.action == EvictAction::DropReasoning);
-        let (delta, removes) = match &action {
-            // A note leaves with the blank line that joined it to its message, or takes the message
-            // with it when it was the only item in it.
-            EvictAction::Drop if it.kind == "harness_note" => {
-                let sole = old <= it.chars.saturating_add(Message::user("").chars());
-                (it.chars.saturating_add(2), sole)
-            }
-            EvictAction::DropReasoning => (a.reasoning, false),
-            EvictAction::Stub { text } => (a.payload.saturating_sub(text.len()), false),
-            EvictAction::Drop => (a.text + if already_reasoning_planned { 0 } else { a.reasoning }, !a.has_calls),
-            // Never a candidate here: only a fresh start takes calls out of the window.
-            EvictAction::Remove => continue,
-        };
-        let new = if removes { 0 } else { old.saturating_sub(delta) };
-        let removed_tokens = estimator.tokens(old) + if removes { overhead } else { 0 };
-        tokens = tokens.saturating_sub(removed_tokens) + if removes { 0 } else { estimator.tokens(new) };
-        if let Some(slot) = msg_chars.get_mut(m) {
-            *slot = new;
-        }
-        // A response upgraded from DropReasoning to Drop moves to the end, where Drop belongs in the order.
-        if let Some(p) = planned {
-            chosen.remove(p);
-        }
-        chosen.push(Eviction { seq: it.seq, action });
-    }
-    if chosen.is_empty() {
-        return None;
-    }
-    Some(ReweavePlan { upto_seq: upto, evictions: chosen, before_tokens_est: before, after_tokens_est: tokens })
-}
-
-/// The stub that replaces an evicted tool result.
-///
-/// Line 1 is the first line of `result.text` (the envelope header written at admission), unchanged.
-/// For `ToolClass::Exec`, the last `stub_tail_lines` lines of `result.text` follow under the line
-/// `[last {n} lines as first shown]`. The final line is:
-/// `[evicted from view, not from the record: {lines} lines / {bytes} bytes. Full output: {handle} — read it again with out_read or out_grep before relying on it.]`
-/// (`{lines}`/`{bytes}`/`{handle}` from `result.output`). A view (no stored output of its own, and
-/// `meta[META_OF_BLOB]` a non-empty string) ends with `[evicted from view, not from the record. It
-/// showed lines of out:{the first 16 characters of that id} — read them again with out_read or out_grep
-/// before relying on it.]`, so its stub keeps the handle. With neither, the final line is `[evicted
-/// from view, not from the record. Run it again if the result matters.]`.
-pub fn stub_text(call: Option<&ToolCall>, result: &ToolResult, stub_tail_lines: u32) -> String {
-    let mut out = String::new();
-    let first = result.text.lines().next().unwrap_or("");
-    if first.is_empty() {
-        // An empty envelope header: still name the call and its outcome.
-        let name = call.map_or(result.name.as_str(), |c| c.name.as_str());
-        out.push_str(&format!("[{} {}: call {}]", name, wire_name(&result.status), result.call_id));
-    } else {
-        out.push_str(first);
-    }
-    if result.class == ToolClass::Exec {
-        let rest: Vec<&str> = result.text.lines().skip(1).collect();
-        let n = rest.len().min(usize::try_from(stub_tail_lines).unwrap_or(usize::MAX));
-        if n > 0 {
-            out.push_str(&format!("\n[last {n} lines as first shown]"));
-            for line in rest.iter().skip(rest.len().saturating_sub(n)) {
-                out.push('\n');
-                out.push_str(line);
-            }
-        }
-    }
-    out.push('\n');
-    match &result.output {
-        Some(b) => out.push_str(&format!(
-            "[evicted from view, not from the record: {} lines / {} bytes. Full output: {} — read it again with out_read or out_grep before relying on it.]",
-            b.lines,
-            b.bytes,
-            b.handle()
-        )),
-        None => match result.meta.get(crate::event::META_OF_BLOB).and_then(Value::as_str).filter(|id| !id.is_empty()) {
-            // A view stores nothing of its own; its stub names the output it showed.
-            Some(id) => out.push_str(&format!(
-                "[evicted from view, not from the record. It showed lines of out:{} — read them again with out_read or out_grep before relying on it.]",
-                id.chars().take(16).collect::<String>()
-            )),
-            None => out.push_str("[evicted from view, not from the record. Run it again if the result matters.]"),
-        },
-    }
-    out
 }
 
 /// Render a brief as the text a child sees. Fixed field order; absent fields are omitted:
@@ -1092,14 +636,12 @@ pub fn hud_message(hud: &str) -> Message {
 mod tests {
     use super::*;
     use crate::blob::BlobRef;
+    use crate::estimate::TokenEstimator;
     use crate::event::{
-        Budget, ChildOutcome, ChildSettled, FinishReason, Forked, ModelRef, ModelResponse, NoteKind, Reweave,
-        SessionStart, Termination, ToolCallRequest, ToolStatus, Usage,
+        Budget, ChildOutcome, ChildSettled, Eviction, FinishReason, Forked, ModelRef, ModelResponse, NoteKind, Reweave,
+        SessionStart, Termination, ToolCall, ToolCallRequest, ToolStatus, Usage,
     };
     use crate::ids::{BlobId, MissionId, SessionId};
-
-    const FLOOR_ZERO: ReweavePolicy =
-        ReweavePolicy { target_tokens: 0, floor_tokens: 0, keep_recent_steps: 1, stub_tail_lines: 3 };
 
     #[test]
     fn stored_actions_keep_native_call_result_pairs_without_inventing_inference() {
@@ -1128,6 +670,7 @@ mod tests {
         l.push(
             Author::Tool,
             Event::ToolResult(ToolResult {
+                exchanges: Vec::new(),
                 call_id: call.call_id,
                 name: "bash".into(),
                 status: ToolStatus::Ok,
@@ -1137,6 +680,7 @@ mod tests {
                 class: ToolClass::Exec,
                 meta: Default::default(),
                 duration_ms: 2,
+                images: Vec::new(),
             }),
         );
         let w = weave(&l.recs);
@@ -1145,38 +689,6 @@ mod tests {
         assert_eq!(w.messages[3].content, "native receipt");
         assert!(w.items.iter().any(|item| item.seq == action_seq && item.kind == "stored_action"));
         assert!(!l.recs.iter().any(|r| matches!(r.event, Event::ModelRequest(_) | Event::ModelResponse(_))));
-    }
-
-    #[test]
-    fn stored_dispatches_bound_the_recent_region_for_output_eviction() {
-        let mut l = Log::new();
-        let mut output_seqs = Vec::new();
-        for node in 1..=3 {
-            let id = format!("stored-{node}");
-            l.push(
-                Author::Harness,
-                Event::StoredAction(crate::event::StoredAction {
-                    plan_id: "p".into(),
-                    source_call: "author".into(),
-                    node,
-                    omitted_callback: format!("omitted-{node}"),
-                    call: ToolCallRequest {
-                        call_id: id.clone().into(),
-                        name: "bash".into(),
-                        arguments: "{}".into(),
-                        complete: true,
-                    },
-                    arguments_hash: "hash".into(),
-                    predecessor: None,
-                    file_guards: serde_json::json!([]),
-                    guard_ms: 1,
-                }),
-            );
-            output_seqs.push(l.result(&id, ToolClass::Exec, &"large output\n".repeat(1_000)));
-        }
-        let plan = plan_reweave(&l.recs, &TokenEstimator::default(), &FLOOR_ZERO, false).unwrap();
-        assert!(plan.evictions.iter().any(|e| e.seq == output_seqs[0]));
-        assert!(plan.evictions.iter().all(|e| e.seq != output_seqs[2]));
     }
 
     struct Log {
@@ -1212,7 +724,11 @@ mod tests {
                     budget: Budget::default(),
                     unattended: false,
                     schema: crate::event::SCHEMA,
+                    intercept: false,
+                    target: None,
                     title: String::new(),
+                    project_instructions: Vec::new(),
+                    mcp: Vec::new(),
                 }),
             );
             l
@@ -1225,7 +741,7 @@ mod tests {
         }
 
         fn user(&mut self, t: &str) -> Seq {
-            self.push(Author::User, Event::UserMessage { text: t.into() })
+            self.push(Author::User, Event::UserMessage { text: t.into(), images: vec![] })
         }
 
         fn note(&mut self, kind: NoteKind, t: &str) -> Seq {
@@ -1284,6 +800,7 @@ mod tests {
             self.push(
                 Author::Tool,
                 Event::ToolResult(ToolResult {
+                    exchanges: Vec::new(),
                     call_id: CallId::from(id),
                     name: "bash".into(),
                     status: ToolStatus::Ok,
@@ -1293,6 +810,7 @@ mod tests {
                     class,
                     meta: Default::default(),
                     duration_ms: 1,
+                    images: Vec::new(),
                 }),
             )
         }
@@ -1302,6 +820,7 @@ mod tests {
             self.push(
                 Author::Tool,
                 Event::ToolResult(ToolResult {
+                    exchanges: Vec::new(),
                     call_id: CallId::from(id),
                     name: name.into(),
                     status,
@@ -1311,6 +830,7 @@ mod tests {
                     class: ToolClass::Terminal,
                     meta: Default::default(),
                     duration_ms: 1,
+                    images: Vec::new(),
                 }),
             )
         }
@@ -1562,6 +1082,48 @@ mod tests {
                  <harness kind=\"resume\">\nBRIEF <b>\n\n{LEADS_LINE}\nlead: a < b\n</harness>"
             )
         );
+    }
+
+    #[test]
+    fn images_reach_the_messages_and_a_folded_result_gives_its_image_up() {
+        let img = |name: &str| crate::image::ImageRef {
+            blob: "ab".repeat(32),
+            mime: "image/png".into(),
+            bytes: 10,
+            width: 300,
+            height: 300,
+            name: Some(name.into()),
+        };
+        let mut l = Log::with_replay(ReasoningReplay::All);
+        l.push(Author::User, Event::UserMessage { text: "look".into(), images: vec![img("u.png")] });
+        l.resp("", "", &[("c1", "read", "{}")]);
+        l.call("c1", ToolClass::Read);
+        l.push(
+            Author::Tool,
+            Event::ToolResult(ToolResult {
+                exchanges: Vec::new(),
+                call_id: CallId::from("c1"),
+                name: "read".into(),
+                status: ToolStatus::Ok,
+                text: "[read]".into(),
+                output: None,
+                cut: false,
+                class: ToolClass::Read,
+                meta: Default::default(),
+                duration_ms: 1,
+                images: vec![img("/w/t.png")],
+            }),
+        );
+        let w = weave(&l.recs);
+        let with_images: Vec<_> = w.messages.iter().filter(|m| !m.images.is_empty()).map(|m| m.role).collect();
+        assert_eq!(with_images, vec![Role::User, Role::Tool]);
+        let est = TokenEstimator::default();
+        assert_eq!(est.image_tokens(&w.messages), 0, "a model without vision is charged no image tokens");
+        let mut vis = TokenEstimator::default();
+        vis.set_vision(true);
+        assert_eq!(vis.image_tokens(&w.messages), 240);
+        assert!(w.items.iter().any(|i| i.kind == "tool_result" && i.image_tokens == 120));
+        assert!(w.items.iter().any(|i| i.kind == "user_message" && i.image_tokens == 120));
     }
 
     #[test]
@@ -1831,6 +1393,51 @@ mod tests {
         assert_eq!(calls, w.messages.iter().filter(|m| m.role == Role::Tool).count());
     }
 
+    /// A log with re-weaves in it (every eviction action, a brief with a digest, a second re-weave).
+    fn rewoven_fixture() -> Log {
+        let mut l = Log::new();
+        let u = l.user("go");
+        let n1 = l.note(NoteKind::Info, "droppable");
+        let r1 = l.resp("text one", "reason one", &[("a", "bash", "{\"x\":1}")]);
+        let t1 = l.result("a", ToolClass::Exec, "BIG RESULT");
+        let r2 = l.resp("text two", "reason two", &[("b", "bash", "{}")]);
+        let t2 = l.result("b", ToolClass::Exec, "second");
+        let r3 = l.resp("only text", "reason three", &[]);
+        let ch = l.child("long report");
+        l.reweave(
+            ch,
+            vec![
+                (n1, EvictAction::Drop),
+                (r1, EvictAction::Drop),
+                (t1, EvictAction::Stub { text: "STUB".into() }),
+                (r2, EvictAction::DropReasoning),
+                (t2, EvictAction::Remove),
+                (r3, EvictAction::Drop),
+                (ch, EvictAction::Stub { text: "REPORT STUB".into() }),
+            ],
+            "BRIEF",
+            Some("lead A"),
+        );
+        l.resp("after", "why", &[("c", "bash", "{}")]);
+        l.result("c", ToolClass::Exec, "third");
+        let last = l.resp("last", "", &[]);
+        l.reweave(last, vec![(u, EvictAction::Drop)], "BRIEF TWO", None);
+        l
+    }
+
+    #[test]
+    fn an_old_log_with_reweaves_renders_the_bytes_it_always_did() {
+        let l = rewoven_fixture();
+        let w = weave(&l.recs);
+        let json = serde_json::to_string(&w.messages).unwrap();
+        // Computed with the code before compaction existed.
+        assert_eq!(w.epoch, 2);
+        assert_eq!(
+            crate::sha256_hex(json.as_bytes()),
+            "c4143c055c96462cc45ed897ad5a54548eb652aa0cb2a56e9960c349bf310673"
+        );
+    }
+
     #[test]
     fn reweaves_are_cumulative_and_later_wins() {
         let mut l = Log::new();
@@ -1924,444 +1531,6 @@ mod tests {
         assert_eq!(pinned, [true, false]);
     }
 
-    fn exec_text(lines: usize) -> String {
-        let mut s = String::from("[bash ok, 1 call]");
-        for i in 0..lines {
-            s.push_str(&format!("\noutput line {i} with some padding to take space"));
-        }
-        s
-    }
-
-    /// A log of `steps` steps; step i has a response with long reasoning and one call of the given class.
-    fn stepped(classes: &[ToolClass], lines: &[usize]) -> Log {
-        let mut l = Log::new();
-        l.user("go");
-        for (i, (c, n)) in classes.iter().zip(lines).enumerate() {
-            let id = format!("c{i}");
-            l.resp(&format!("step {i}"), &"because ".repeat(50), &[(&id, "bash", "{}")]);
-            l.call(&id, *c);
-            l.result(&id, *c, &exec_text(*n));
-        }
-        l
-    }
-
-    fn with_plan(l: &Log, plan: &ReweavePlan) -> Weave {
-        let mut recs = l.recs.clone();
-        let seq = recs.len() as Seq;
-        recs.push(Record {
-            seq,
-            ts_ms: 0,
-            author: Author::Harness,
-            prev: "0".repeat(64),
-            event: Event::Reweave(Reweave {
-                epoch: 1,
-                upto_seq: plan.upto_seq,
-                evictions: plan.evictions.clone(),
-                brief: String::new(),
-                digest: None,
-                reason: String::new(),
-                before_tokens: 0,
-                after_tokens_est: 0,
-            }),
-        });
-        weave(&recs)
-    }
-
-    #[test]
-    fn plan_order_and_estimates() {
-        use ToolClass::*;
-        let l = stepped(&[Exec, Nav, Read, Read, Exec, Write, Exec], &[30, 40, 20, 50, 60, 25, 10]);
-        let est = TokenEstimator::with_ratio(4.0);
-        let plan = plan_reweave(&l.recs, &est, &FLOOR_ZERO, false).expect("plan");
-        let w = weave(&l.recs);
-        let kind_of = |seq: Seq| w.items.iter().find(|i| i.seq == seq).map(|i| (i.kind.clone(), i.class));
-        let mut phases = Vec::new();
-        for e in &plan.evictions {
-            let (kind, class) = kind_of(e.seq).expect("item");
-            let phase = match (&e.action, kind.as_str(), class) {
-                (EvictAction::DropReasoning, "model_response", _) => 1,
-                (EvictAction::Stub { .. }, "tool_result", Some(Nav)) => 2,
-                (EvictAction::Stub { .. }, "tool_result", Some(Read)) => 3,
-                (EvictAction::Stub { .. }, "tool_result", _) => 4,
-                other => panic!("unexpected {other:?}"),
-            };
-            phases.push(phase);
-        }
-        let mut sorted = phases.clone();
-        sorted.sort_unstable();
-        assert_eq!(phases, sorted);
-        assert_eq!(phases.iter().filter(|p| **p == 1).count(), 6, "recent response keeps its reasoning");
-        // Reads: largest first (c3 has 50 lines, c2 has 20).
-        let read_seqs: Vec<Seq> =
-            plan.evictions.iter().filter(|e| matches!(kind_of(e.seq), Some((_, Some(Read))))).map(|e| e.seq).collect();
-        assert_eq!(read_seqs.len(), 2);
-        let size = |seq: Seq| w.items.iter().find(|i| i.seq == seq).map_or(0, |i| i.chars);
-        assert!(size(read_seqs[0]) > size(read_seqs[1]));
-        // Reasoning oldest first.
-        let reasoning: Vec<Seq> =
-            plan.evictions.iter().filter(|e| e.action == EvictAction::DropReasoning).map(|e| e.seq).collect();
-        assert!(reasoning.windows(2).all(|p| p[0] < p[1]));
-        // The recent region (the last response and everything after it) is untouched.
-        let last_resp = w.items.iter().rev().find(|i| i.kind == "model_response").map(|i| i.seq).unwrap_or(0);
-        assert!(plan.upto_seq < last_resp);
-        assert!(plan.evictions.iter().all(|e| e.seq <= plan.upto_seq));
-        // The estimate matches what the weave then renders.
-        assert_eq!(plan.before_tokens_est, est.tokens_for_messages(&w.messages));
-        assert_eq!(plan.after_tokens_est, est.tokens_for_messages(&with_plan(&l, &plan).messages));
-        assert!(plan.after_tokens_est < plan.before_tokens_est);
-    }
-
-    /// A mission with old harness chatter between steps; returns the log and the seqs of its notes.
-    fn chatty() -> (Log, Vec<(NoteKind, Seq)>) {
-        let mut l = Log::new();
-        l.user("go");
-        let mut notes = Vec::new();
-        let kinds = [
-            NoteKind::Arrival,
-            NoteKind::Nudge,
-            NoteKind::Constraint,
-            NoteKind::Verdict,
-            NoteKind::Info,
-            NoteKind::Stall,
-        ];
-        for (i, k) in kinds.iter().enumerate() {
-            let id = format!("c{i}");
-            // Two notes in a row merge into one user message; the last one stands alone before the response.
-            let seq = l.note(*k, &format!("{k:?} note number {i} with some words in it"));
-            notes.push((*k, seq));
-            l.resp(&format!("step {i}"), "", &[(&id, "bash", "{}")]);
-            l.call(&id, ToolClass::Exec);
-            l.result(&id, ToolClass::Exec, &exec_text(20));
-        }
-        let seq = l.note(NoteKind::Arrival, "late arrival that merges with the next note");
-        notes.push((NoteKind::Arrival, seq));
-        let seq = l.note(NoteKind::Nudge, "late nudge merged into the same message");
-        notes.push((NoteKind::Nudge, seq));
-        l.resp("recent", "", &[("c9", "bash", "{}")]);
-        l.call("c9", ToolClass::Exec);
-        l.result("c9", ToolClass::Exec, &exec_text(20));
-        (l, notes)
-    }
-
-    #[test]
-    fn plan_drops_harness_notes_in_two_classes_around_the_results() {
-        let (l, notes) = chatty();
-        let est = TokenEstimator::with_ratio(4.0);
-        let plan = plan_reweave(&l.recs, &est, &FLOOR_ZERO, false).expect("plan");
-        let w = weave(&l.recs);
-        let note_kind = |seq: Seq| notes.iter().find(|(_, s)| *s == seq).map(|(k, _)| *k);
-        let phase = |e: &Eviction| match (&e.action, note_kind(e.seq)) {
-            (EvictAction::Drop, Some(NoteKind::Nudge | NoteKind::Stall | NoteKind::Verdict)) => 2,
-            (EvictAction::Stub { .. }, None) => 3,
-            (EvictAction::Drop, Some(NoteKind::Arrival | NoteKind::Info)) => 4,
-            other => panic!("unexpected {other:?}"),
-        };
-        let phases: Vec<u8> = plan.evictions.iter().map(phase).collect();
-        let mut sorted = phases.clone();
-        sorted.sort_unstable();
-        assert_eq!(phases, sorted, "early notes, then results, then arrival and info notes");
-        for c in [2, 3, 4] {
-            assert!(phases.contains(&c), "class {c} present: {phases:?}");
-        }
-        for class in [2, 4] {
-            let seqs: Vec<Seq> = plan.evictions.iter().filter(|e| phase(e) == class).map(|e| e.seq).collect();
-            assert!(seqs.windows(2).all(|p| p[0] < p[1]), "oldest first");
-        }
-        // Protected notes and the recent region are never touched.
-        let constraint = notes.iter().find(|(k, _)| *k == NoteKind::Constraint).map(|(_, s)| *s).unwrap();
-        assert!(plan.evictions.iter().all(|e| e.seq != constraint));
-        let recent = w.items.iter().rev().find(|i| i.kind == "model_response").map(|i| i.seq).unwrap();
-        assert!(plan.upto_seq < recent);
-        assert!(plan.evictions.iter().all(|e| e.seq <= plan.upto_seq));
-        // The estimate is that of the weave rendered with the plan.
-        assert_eq!(plan.after_tokens_est, est.tokens_for_messages(&with_plan(&l, &plan).messages));
-        let after = with_plan(&l, &plan);
-        for e in plan.evictions.iter().filter(|e| e.action == EvictAction::Drop) {
-            assert_eq!(after.items.iter().find(|i| i.seq == e.seq).map(|i| i.state), Some(ItemState::Dropped));
-        }
-    }
-
-    #[test]
-    fn plan_keeps_a_note_after_the_latest_response_even_with_keep_zero_and_floor_zero() {
-        let mut l = Log::new();
-        l.user("start");
-        l.resp("old reply", "", &[]);
-        let old = l.note(NoteKind::Nudge, "an old nudge the model has seen");
-        l.user("more");
-        l.resp("latest reply", "", &[]);
-        let fresh = l.note(NoteKind::Nudge, "a nudge the model has not seen");
-        let est = TokenEstimator::with_ratio(4.0);
-        let policy = ReweavePolicy { target_tokens: 0, floor_tokens: 0, keep_recent_steps: 0, stub_tail_lines: 3 };
-        let plan = plan_reweave(&l.recs, &est, &policy, false).expect("plan");
-        assert!(plan.evictions.iter().any(|e| e.seq == old), "the older note is dropped: {plan:?}");
-        assert!(plan.evictions.iter().all(|e| e.seq != fresh), "the note after the latest response stays");
-    }
-
-    #[test]
-    fn plan_notes_estimate_counts_merged_and_lone_notes_exactly() {
-        // Each prefix of the plan's evictions, applied alone, is estimated like the weave renders it.
-        let (l, _) = chatty();
-        let est = TokenEstimator::with_ratio(4.0);
-        let full = plan_reweave(&l.recs, &est, &FLOOR_ZERO, false).expect("plan");
-        for k in 1..=full.evictions.len() {
-            let partial = ReweavePlan { evictions: full.evictions[..k].to_vec(), ..full.clone() };
-            let floor = est.tokens_for_messages(&with_plan(&l, &partial).messages);
-            let p =
-                plan_reweave(&l.recs, &est, &ReweavePolicy { floor_tokens: floor, ..FLOOR_ZERO }, false).expect("plan");
-            assert_eq!(p.after_tokens_est, floor, "k={k}");
-        }
-        // Two notes in one message: dropping both leaves no message, dropping one keeps the other.
-        let mut m = Log::new();
-        m.user("go");
-        let a = m.note(NoteKind::Nudge, &"first ".repeat(40));
-        let b = m.note(NoteKind::Verdict, &"second ".repeat(40));
-        m.resp("x", "", &[("c0", "bash", "{}")]);
-        m.call("c0", ToolClass::Exec);
-        m.result("c0", ToolClass::Exec, "[bash ok]");
-        let plan = plan_reweave(&m.recs, &est, &FLOOR_ZERO, false).expect("plan");
-        assert_eq!(plan.evictions.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![a, b]);
-        assert_eq!(plan.after_tokens_est, est.tokens_for_messages(&with_plan(&m, &plan).messages));
-        let one = ReweavePlan { evictions: plan.evictions[..1].to_vec(), ..plan.clone() };
-        let floor = est.tokens_for_messages(&with_plan(&m, &one).messages);
-        let p = plan_reweave(&m.recs, &est, &ReweavePolicy { floor_tokens: floor, ..FLOOR_ZERO }, false).unwrap();
-        assert_eq!(p.evictions.len(), 1);
-        assert_eq!(p.after_tokens_est, floor);
-    }
-
-    #[test]
-    fn keep_zero_stubs_the_latest_steps_result_with_its_handle() {
-        let l = stepped(&[ToolClass::Exec, ToolClass::Exec], &[40, 60]);
-        let est = TokenEstimator::with_ratio(4.0);
-        let keep0 = ReweavePolicy { keep_recent_steps: 0, ..FLOOR_ZERO };
-        let plan = plan_reweave(&l.recs, &est, &keep0, false).expect("plan");
-        assert_eq!(plan.upto_seq, l.recs.last().map(|r| r.seq).unwrap());
-        let latest = l.recs.last().map(|r| r.seq).unwrap();
-        let ev = plan.evictions.iter().find(|e| e.seq == latest).expect("latest result evicted");
-        match &ev.action {
-            EvictAction::Stub { text } => assert!(text.contains("out:abababababababab"), "{text}"),
-            other => panic!("{other:?}"),
-        }
-        // With keep 1 the latest step stays.
-        let plan1 = plan_reweave(&l.recs, &est, &FLOOR_ZERO, false).expect("plan");
-        assert!(plan1.evictions.iter().all(|e| e.seq != latest));
-    }
-
-    #[test]
-    fn a_views_stub_names_the_output_it_showed() {
-        let mut l = Log::new();
-        l.result_of("v", "out_read", ToolStatus::Ok, "[out_read ok]\nbody");
-        let mut t = match &l.recs[1].event {
-            Event::ToolResult(t) => t.clone(),
-            _ => unreachable!(),
-        };
-        t.meta.insert(crate::event::META_OF_BLOB.into(), serde_json::json!("cd".repeat(32)));
-        assert_eq!(
-            stub_text(None, &t, 2),
-            "[out_read ok]\n[evicted from view, not from the record. It showed lines of out:cdcdcdcdcdcdcdcd — read them again with out_read or out_grep before relying on it.]"
-        );
-        // An empty id, or a result with its own output, keeps the old lines.
-        t.meta.insert(crate::event::META_OF_BLOB.into(), serde_json::json!(""));
-        assert!(stub_text(None, &t, 2).ends_with("Run it again if the result matters.]"));
-        t.meta.insert(crate::event::META_OF_BLOB.into(), serde_json::json!("cd".repeat(32)));
-        t.output = Some(BlobRef { id: BlobId::from("ab".repeat(32)), bytes: 5, lines: 1 });
-        assert!(stub_text(None, &t, 2).contains("Full output: out:abababababababab"));
-    }
-
-    #[test]
-    fn plan_stops_as_soon_as_floor_is_reached() {
-        use ToolClass::*;
-        let l = stepped(&[Exec, Nav, Read, Exec, Exec], &[30, 40, 20, 60, 10]);
-        let est = TokenEstimator::with_ratio(4.0);
-        let full = plan_reweave(&l.recs, &est, &FLOOR_ZERO, false).expect("plan");
-        for k in 1..full.evictions.len() {
-            // Apply only the first k evictions and ask for exactly that much.
-            let partial = ReweavePlan { evictions: full.evictions[..k].to_vec(), ..full.clone() };
-            let floor = est.tokens_for_messages(&with_plan(&l, &partial).messages);
-            let policy = ReweavePolicy { floor_tokens: floor, ..FLOOR_ZERO };
-            let p = plan_reweave(&l.recs, &est, &policy, false).expect("plan");
-            assert_eq!(p.evictions, full.evictions[..k].to_vec(), "k={k}");
-            assert!(p.after_tokens_est <= floor);
-        }
-        // Already under the floor: nothing to do.
-        let roomy = ReweavePolicy { floor_tokens: u64::MAX, ..FLOOR_ZERO };
-        assert!(plan_reweave(&l.recs, &est, &roomy, true).is_none());
-    }
-
-    #[test]
-    fn plan_respects_pins_protection_and_stubbed_items() {
-        use ToolClass::*;
-        let mut l = Log::new();
-        l.user("go");
-        let constraint = l.note(NoteKind::Constraint, &"never evict me ".repeat(100));
-        let info = l.note(NoteKind::Info, &"plain note ".repeat(100));
-        l.resp("", "", &[("a", "bash", "{}")]);
-        let ta = l.result("a", Read, &exec_text(80));
-        l.resp("", "", &[("b", "bash", "{}")]);
-        let tb = l.result("b", Read, &exec_text(70));
-        l.push(Author::Model, Event::Pin { call_id: "a".into(), reason: "keep".into() });
-        l.resp("recent", "", &[("c", "bash", "{}")]);
-        l.result("c", Read, &exec_text(90));
-        let est = TokenEstimator::with_ratio(4.0);
-        let plan = plan_reweave(&l.recs, &est, &FLOOR_ZERO, true).expect("plan");
-        let seqs: Vec<Seq> = plan.evictions.iter().map(|e| e.seq).collect();
-        assert!(!seqs.contains(&ta), "pinned result");
-        assert!(seqs.contains(&tb));
-        assert!(seqs.iter().all(|s| *s > constraint), "no user message or protected note");
-        assert!(seqs.contains(&info), "an info note goes after the results");
-        assert_eq!(seqs.last(), Some(&info), "and is the last class here");
-        assert!(seqs.iter().all(|s| *s <= plan.upto_seq));
-        // Already stubbed results are skipped by the next plan.
-        l.reweave(plan.upto_seq, plan.evictions.iter().map(|e| (e.seq, e.action.clone())).collect(), "B", None);
-        assert!(plan_reweave(&l.recs, &est, &FLOOR_ZERO, true).is_none());
-        // Nothing evictable at all.
-        let mut tiny = Log::new();
-        tiny.user("hello");
-        assert!(plan_reweave(&tiny.recs, &est, &FLOOR_ZERO, true).is_none());
-        // Fewer responses than the recent region keeps.
-        let one = stepped(&[Exec], &[50]);
-        let keep3 = ReweavePolicy { keep_recent_steps: 3, ..FLOOR_ZERO };
-        assert!(plan_reweave(&one.recs, &est, &keep3, true).is_none());
-    }
-
-    #[test]
-    fn plan_without_a_model_response_protects_the_last_records_that_render() {
-        use ToolClass::*;
-        let mut l = Log::new();
-        let ask = l.user(&"the task ".repeat(100));
-        let rule = l.note(NoteKind::Constraint, &"never evict me ".repeat(100));
-        let old = l.child(&"findings ".repeat(400));
-        // A call whose reply was never recorded renders nothing, its output included.
-        l.call("a", Exec);
-        l.result("a", Exec, &exec_text(80));
-        let report = l.child(&"more findings ".repeat(300));
-        // Nor does this record, and it is not counted.
-        l.push(Author::Harness, Event::Interrupted { reason: "x".into() });
-        let recent = l.child(&"recent findings ".repeat(200));
-        let w = weave(&l.recs);
-        assert!(w.items.iter().all(|i| i.kind != "model_response" && i.kind != "tool_result"));
-        let est = TokenEstimator::with_ratio(4.0);
-        // The recent region is the last record that renders: the older reports are folded.
-        let plan = plan_reweave(&l.recs, &est, &FLOOR_ZERO, true).expect("a plan");
-        assert_eq!(plan.upto_seq, recent - 1);
-        let seqs: Vec<Seq> = plan.evictions.iter().map(|e| e.seq).collect();
-        assert_eq!(seqs, [report, old], "largest first");
-        assert!(!seqs.contains(&ask) && !seqs.contains(&rule));
-        let stubbed =
-            |e: &Eviction| matches!(&e.action, EvictAction::Stub { text } if text.contains("agent report evicted"));
-        assert!(plan.evictions.iter().all(stubbed));
-        let after = with_plan(&l, &plan);
-        assert!(after.messages.iter().any(|m| m.content.contains("the task the task")), "the user message stays");
-        assert!(after.messages.iter().any(|m| m.content.contains("never evict me")), "the rule stays");
-        assert!(after.messages.iter().any(|m| m.content.contains("recent findings")));
-        assert_eq!(plan.after_tokens_est, est.tokens_for_messages(&after.messages));
-        // Two records that render: the report before the newest one is protected as well.
-        let keep2 = ReweavePolicy { keep_recent_steps: 2, ..FLOOR_ZERO };
-        let plan = plan_reweave(&l.recs, &est, &keep2, true).expect("a plan");
-        assert_eq!(plan.evictions.iter().map(|e| e.seq).collect::<Vec<_>>(), [old]);
-        // A region as large as everything that renders leaves nothing to fold.
-        let all = ReweavePolicy { keep_recent_steps: w.items.len() as u32, ..FLOOR_ZERO };
-        assert!(plan_reweave(&l.recs, &est, &all, true).is_none());
-    }
-
-    #[test]
-    fn plan_counts_unrendered_replies_as_steps_and_folds_what_arrived_after_a_few() {
-        use ToolClass::*;
-        let mut l = Log::new();
-        let ask = l.user(&"the task ".repeat(100));
-        let rule = l.note(NoteKind::Constraint, &"never evict me ".repeat(100));
-        // One early reply that renders, then only agent reports.
-        l.resp("", "", &[("a", "bash", "{}")]);
-        l.call("a", Exec);
-        let out = l.result("a", Exec, &exec_text(80));
-        let first = l.child(&"findings ".repeat(400));
-        let second = l.child(&"more findings ".repeat(300));
-        let third = l.child(&"latest findings ".repeat(300));
-        let est = TokenEstimator::with_ratio(4.0);
-        let keep2 = ReweavePolicy { keep_recent_steps: 2, ..FLOOR_ZERO };
-        // Fewer replies than the region keeps: it starts at the last two records that render.
-        let plan = plan_reweave(&l.recs, &est, &keep2, true).expect("a plan");
-        assert_eq!(plan.upto_seq, first);
-        let seqs: Vec<Seq> = plan.evictions.iter().map(|e| e.seq).collect();
-        assert!(seqs.contains(&out) && seqs.contains(&first) && !seqs.contains(&second), "{seqs:?}");
-        assert!(!seqs.contains(&ask) && !seqs.contains(&rule));
-        // Replies that render nothing (cut off before any text, aborted) are steps as well.
-        let cut = l.resp_with("", "thinking", &[], FinishReason::Length);
-        l.note(NoteKind::OutputCut, "cut");
-        l.resp_with("", "", &[("b", "bash", "{}")], FinishReason::Aborted);
-        assert_eq!(weave(&l.recs).items.iter().filter(|i| i.kind == "model_response").count(), 1);
-        let plan = plan_reweave(&l.recs, &est, &keep2, true).expect("a plan");
-        assert_eq!(plan.upto_seq, cut - 1);
-        let seqs: Vec<Seq> = plan.evictions.iter().map(|e| e.seq).collect();
-        assert!([out, first, second, third].iter().all(|s| seqs.contains(s)), "{seqs:?}");
-        assert!(!seqs.contains(&ask) && !seqs.contains(&rule));
-    }
-
-    #[test]
-    fn a_woven_plans_like_a_fresh_render_and_ignores_records_that_render_nothing() {
-        use ToolClass::*;
-        let l = stepped(&[Exec, Nav, Read, Exec, Exec], &[30, 40, 20, 60, 10]);
-        let est = TokenEstimator::with_ratio(4.0);
-        let woven = Woven::new(&l.recs);
-        assert_eq!(woven.weave, weave(&l.recs));
-        for allow in [false, true] {
-            assert_eq!(woven.plan(&l.recs, &est, &FLOOR_ZERO, allow), plan_reweave(&l.recs, &est, &FLOOR_ZERO, allow));
-        }
-        // A request record appended after the render changes nothing.
-        let mut more = l.recs.clone();
-        more.push(Record {
-            seq: more.len() as Seq,
-            ts_ms: 0,
-            author: Author::Harness,
-            prev: "0".repeat(64),
-            event: Event::Interrupted { reason: "x".into() },
-        });
-        assert_eq!(woven.plan(&more, &est, &FLOOR_ZERO, true), plan_reweave(&l.recs, &est, &FLOOR_ZERO, true));
-    }
-
-    #[test]
-    fn plan_text_eviction_is_gated_and_last() {
-        use ToolClass::*;
-        let mut l = Log::new();
-        l.user("go");
-        for i in 0..3 {
-            let id = format!("c{i}");
-            l.resp(&"narration ".repeat(60), "reasoning ".repeat(30).as_str(), &[(&id, "bash", "{}")]);
-            l.result(&id, Exec, &exec_text(40));
-        }
-        let est = TokenEstimator::with_ratio(4.0);
-        let without = plan_reweave(&l.recs, &est, &FLOOR_ZERO, false).expect("plan");
-        assert!(without.evictions.iter().all(|e| !matches!(e.action, EvictAction::Drop)));
-        let with = plan_reweave(&l.recs, &est, &FLOOR_ZERO, true).expect("plan");
-        let first_drop = with.evictions.iter().position(|e| e.action == EvictAction::Drop).expect("a drop");
-        assert!(with.evictions[first_drop..].iter().all(|e| e.action == EvictAction::Drop));
-        // A response that was only given DropReasoning in this plan is upgraded in place.
-        let seqs: Vec<Seq> = with.evictions.iter().map(|e| e.seq).collect();
-        let mut dedup = seqs.clone();
-        dedup.sort_unstable();
-        dedup.dedup();
-        assert_eq!(seqs.len(), dedup.len(), "one eviction per seq");
-        assert_eq!(with.after_tokens_est, est.tokens_for_messages(&with_plan(&l, &with).messages));
-        // Every call is still paired in the rendering after the plan.
-        let w = with_plan(&l, &with);
-        let calls: usize = w.messages.iter().map(|m| m.tool_calls.len()).sum();
-        assert_eq!(calls, w.messages.iter().filter(|m| m.role == Role::Tool).count());
-    }
-
-    #[test]
-    fn plan_stubs_agent_reports_in_the_fourth_class() {
-        let mut l = Log::new();
-        l.user("go");
-        l.child(&"findings ".repeat(200));
-        l.resp("a", "", &[("a", "bash", "{}")]);
-        l.result("a", ToolClass::Exec, &exec_text(5));
-        l.resp("recent", "", &[]);
-        let est = TokenEstimator::with_ratio(4.0);
-        let plan = plan_reweave(&l.recs, &est, &FLOOR_ZERO, false).expect("plan");
-        assert_eq!(plan.evictions[0].seq, 2, "the larger report goes before the small result");
-        let w = with_plan(&l, &plan);
-        assert!(w.messages[1].content.contains("agent report evicted from view"));
-    }
-
     /// Every rendered call has exactly one tool message.
     fn assert_paired(w: &Weave) {
         let calls: Vec<&str> = w.messages.iter().flat_map(|m| m.tool_calls.iter().map(|c| c.id.as_str())).collect();
@@ -2421,127 +1590,6 @@ mod tests {
         assert_eq!(back.messages[2].tool_calls.len(), 2);
         assert_eq!(back.messages[4].content, "STUB");
         assert_paired(&back);
-    }
-
-    #[test]
-    fn fresh_start_plan_folds_the_window_and_removes_the_attempts() {
-        use EvictAction::{Drop, Remove, Stub};
-        let mut l = Log::new();
-        l.user("task A");
-        // An earlier result that was accepted: not an attempt, by the caller's rule.
-        l.resp("A is done", "", &[("f0", "finish", "{\"answer\":\"A works\"}")]);
-        let accepted = l.result_of("f0", "finish", ToolStatus::Ok, "finished");
-        l.user("task B");
-        let r1 = l.resp("looking", &"because ".repeat(20), &[("a", "bash", "{}")]);
-        l.call("a", ToolClass::Exec);
-        let ta = l.result("a", ToolClass::Exec, &exec_text(30));
-        // Nothing to drop in a response with neither text nor reasoning; a pinned result stays as it is.
-        let r2 = l.resp("", "", &[("p", "bash", "{}")]);
-        l.call("p", ToolClass::Read);
-        let tp = l.result("p", ToolClass::Read, &exec_text(30));
-        l.push(Author::Model, Event::Pin { call_id: "p".into(), reason: "keep".into() });
-        let nudge = l.note(NoteKind::Nudge, "you stopped without finishing");
-        let info = l.note(NoteKind::Info, "keep me");
-        let constraint = l.note(NoteKind::Constraint, "never push");
-        let ch = l.child(&"report ".repeat(40));
-        let r3 = l.resp("it cannot be done", "I give up", &[("c", "conclude", "{\"status\":\"unreachable\"}")]);
-        let tc = l.result_of("c", "conclude", ToolStatus::Ok, "goal concluded");
-        // An earlier re-weave had stubbed it, and the model had pinned the rejection: both still leave.
-        l.reweave(tc, vec![(tc, Stub { text: "old stub".into() })], "OLD BRIEF", None);
-        let r4 = l.resp("final", "", &[("f", "finish", "{\"answer\":\"impossible\"}")]);
-        let tf = l.result_of("f", "finish", ToolStatus::Error, "not accepted: no test ran");
-        l.push(Author::Model, Event::Pin { call_id: "f".into(), reason: "keep".into() });
-        let verdict = l.note(NoteKind::Verdict, "finish rejected 2 times; continuing");
-
-        let est = TokenEstimator::with_ratio(4.0);
-        let attempt = |seq: Seq, t: &ToolResult| seq > accepted && matches!(t.name.as_str(), "finish" | "conclude");
-        let policy = ReweavePolicy::default();
-        let plan = plan_fresh_start(&l.recs, &est, &policy, &attempt).expect("plan");
-        assert_eq!(plan.upto_seq, verdict, "no recent region is protected");
-        let action = |seq: Seq| plan.evictions.iter().find(|e| e.seq == seq).map(|e| e.action.clone());
-        assert_eq!(action(r1), Some(Drop));
-        assert!(matches!(action(ta), Some(Stub { .. })), "{:?}", action(ta));
-        assert_eq!(action(r2), None);
-        assert_eq!(action(tp), None, "pinned");
-        assert_eq!(action(nudge), Some(Drop));
-        assert_eq!(action(info), None);
-        assert_eq!(action(constraint), None);
-        assert!(matches!(action(ch), Some(Stub { .. })), "{:?}", action(ch));
-        assert_eq!(action(r3), Some(Drop));
-        assert_eq!(action(tc), Some(Remove), "stubbed earlier");
-        assert_eq!(action(r4), Some(Drop));
-        assert_eq!(action(tf), Some(Remove), "pinned");
-        assert_eq!(action(verdict), Some(Drop));
-        assert_ne!(action(accepted), Some(Remove));
-        assert_eq!(plan.evictions.iter().filter(|e| e.action == Remove).count(), 2);
-
-        l.reweave(plan.upto_seq, plan.evictions.iter().map(|e| (e.seq, e.action.clone())).collect(), "", None);
-        let w = weave(&l.recs);
-        assert_paired(&w);
-        let all = serde_json::to_string(&json(&w)).unwrap();
-        for gone in [
-            "I give up",
-            "impossible",
-            "it cannot be done",
-            "unreachable",
-            "not accepted",
-            "rejected 2 times",
-            "you stopped",
-            "looking",
-            "because",
-            "OLD BRIEF",
-        ] {
-            assert!(!all.contains(gone), "{gone} is still in the window: {all}");
-        }
-        // What the operator said, what was accepted before, standing notes and the pinned output stay.
-        for kept in ["task A", "task B", "A works", "keep me", "never push", "output line 29"] {
-            assert!(all.contains(kept), "{kept} left the window: {all}");
-        }
-        assert!(all.contains("evicted from view, not from the record"), "{all}");
-        assert_eq!(plan.before_tokens_est, est.tokens_for_messages(&before_fold(&l).messages));
-        assert_eq!(plan.after_tokens_est, est.tokens_for_messages(&w.messages));
-        assert!(plan.after_tokens_est < plan.before_tokens_est);
-        // Folded once, there is nothing left for a second fresh start to evict.
-        assert_eq!(plan_fresh_start(&l.recs, &est, &policy, &attempt), None);
-        assert_eq!(plan_fresh_start(&[], &est, &policy, &attempt), None);
-    }
-
-    /// The weave of a log without its last record (the re-weave a test has just appended).
-    fn before_fold(l: &Log) -> Weave {
-        weave(&l.recs[..l.recs.len() - 1])
-    }
-
-    #[test]
-    fn stub_text_shapes() {
-        let mut l = Log::new();
-        l.result("a", ToolClass::Exec, "[bash ok]\none\ntwo\nthree\nfour");
-        l.result("b", ToolClass::Read, "[read ok]\nbody");
-        let get = |i: usize| match &l.recs[i].event {
-            Event::ToolResult(t) => t.clone(),
-            _ => unreachable!(),
-        };
-        let exec = stub_text(None, &get(1), 2);
-        assert_eq!(
-            exec,
-            "[bash ok]\n[last 2 lines as first shown]\nthree\nfour\n[evicted from view, not from the record: 77 lines / 999 bytes. Full output: out:abababababababab — read it again with out_read or out_grep before relying on it.]"
-        );
-        let read = stub_text(None, &get(2), 2);
-        assert!(read.starts_with("[read ok]\n[evicted from view"));
-        assert!(!read.contains("body"));
-        let mut bare = get(2);
-        bare.output = None;
-        assert_eq!(
-            stub_text(None, &bare, 2),
-            "[read ok]\n[evicted from view, not from the record. Run it again if the result matters.]"
-        );
-        let mut empty = get(1);
-        empty.text = String::new();
-        assert!(stub_text(None, &empty, 0).starts_with("[bash ok: call a]"));
-        // Short outputs do not repeat the header as a tail.
-        let short = get(2);
-        let mut one = short.clone();
-        one.class = ToolClass::Exec;
-        assert!(stub_text(None, &one, 12).contains("[last 1 lines as first shown]\nbody"));
     }
 
     #[test]

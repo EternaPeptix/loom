@@ -27,7 +27,6 @@ serde = { version = "1", features = ["derive"] }
 # (monitor log, journals) gives the same text it was sealed over.
 serde_json = { version = "1", features = ["preserve_order", "raw_value", "float_roundtrip"] }
 thiserror = "2"
-anyhow = "1"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 futures-util = "0.3"
@@ -35,7 +34,6 @@ async-trait = "0.1"
 bytes = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json", "cookies"] }
 axum = { version = "0.8", features = ["macros"] }
-tower-http = { version = "0.6", features = ["trace"] }
 clap = { version = "4", features = ["derive"] }
 sha2 = "0.11"
 hmac = "0.13"
@@ -58,6 +56,11 @@ sha1 = "0.11"
 goblin = "0.10"
 shlex = "1"
 tracing = "0.1"
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+webpki-root-certs = "1"
+time = "0.3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [profile.release]

@@ -289,6 +289,45 @@ Environment variables whose names look like secrets (in any case: containing `KE
 variable whose value holds a URL with a password in it) are not passed to commands unless listed in
 `env_pass`.
 
+## Using MCP servers
+
+An MCP server gives the model more tools. Each tool shows up as `mcp__{server}__{tool}` and its result is
+stored like any other output (you can `read` and `grep` it, quote it as evidence, and the verifier can read it).
+Add servers under `[mcp.servers.NAME]` and restart the daemon:
+
+```toml
+[mcp]
+max_schema_tokens = 20000   # per role: MCP tool definitions beyond this are left out
+idle_close_s = 600
+
+# A local program, run inside the session's sandbox.
+[mcp.servers.github]
+command = ["npx", "-y", "@modelcontextprotocol/server-github"]
+env = { GITHUB_PERSONAL_ACCESS_TOKEN = "env:GITHUB_PAT" }   # read from the daemon's environment
+hosts = ["api.github.com"]            # the sandbox can reach these while the server is configured
+tools = ["search_issues", "get_issue"]
+
+# A remote server, reached through the session's egress proxy.
+[mcp.servers.docs]
+url = "https://mcp.example.com/mcp"
+headers = { Authorization = "file:/home/me/.docs-mcp-token" }
+hosts = ["mcp.example.com"]
+read_only = true                      # the verifier gets its tools too
+```
+
+Prefer `env:NAME` or `file:/path` for secrets: a literal in the file makes the daemon warn at start, and a value
+is never written to a log or a record. `hosts` are granted to every session whose role gets the server, and
+that includes the agent's own `bash` and `web_fetch`: list only hosts you would let the agent reach.
+
+```
+loom mcp list                                   # the configured servers, transport and roles
+loom mcp check github --workspace ~/work/repo   # start it for that workspace, list its tools, close it
+```
+
+`loom mcp check` prints the tools or the error with the server's last stderr lines. A mission lists its servers
+once, when its lead starts; to pick up a changed server, start a new mission. The Session view of the API
+(`GET /api/sessions/{id}/mcp`) shows each server's state.
+
 ## A box
 
 `[box]` gives the agent a place to run what the local sandbox cannot (raw TCP to a target, heavy
@@ -409,13 +448,28 @@ loom run -w /path/to/workspace --prior m-0abc… "the task"
 Before its first model request the new lead gets one note with, per named mission, its title and when its
 ledger was last written; the goal, rules and answers you gave it (marked as your words from an earlier
 mission); its goal status; where its work stood when it ended (claims, plan, dead ends — marked as written
-by the model there and not verified); and its security record as counts and asset locators (no hypotheses,
-no credentials, no identities by name, no query strings in a locator). Your own words are shown exactly as you
+by the model there and not verified); and its security record as counts and asset locators (no
+credentials, no identities by name, no query strings in a locator). Your own words are shown exactly as you
 wrote them; what the model wrote is shown with URL queries, fragments and passwords removed, but may still hold
 whatever else the model wrote there. The source is each mission's sealed ledger; a ledger that fails
 verification or was written by a newer loom is named as unreadable and nothing from it is shown. Nothing
 else carries over: the earlier mission's stored outputs cannot be opened from the new one, and its
 approvals and network grants do not apply.
+
+### A target
+
+Missions that work on the same thing can share a scope and what they found:
+
+```
+loom target add acme --scope acme.test --scope '*.acme.test' --scope 10.20.0.0/24 --exclude vpn.acme.test
+loom run -w /path/to/workspace --target acme "map the API and test the login"
+loom target show acme --nodes
+```
+
+The scope is reachable from the mission even with `network.mode = "deny_all"`; the excluded entries never
+are. The lead starts with a `# Target acme` section (scope, untested services and endpoints, findings) and
+the next mission against `acme` sees what the earlier ones tested. `loom target scope acme --add HOST
+--remove HOST --exclude HOST` edits it; the target's files are under `~/.loom/targets/acme/`.
 
 Exit status of `run` and `send`: 0 after `Finished` or `Yielded`; 2 when you are needed (`Asked`,
 `Blocked`, `Parked`: the inbox item was printed); 1 after `Stopped`, `BudgetExhausted` or an error.
@@ -431,13 +485,13 @@ Exit status of `run` and `send`: 0 after `Finished` or `Yielded`; 2 when you are
 | `loom monitor replay [--since 7d] [--positives FILE] [--home DIR] [--json]` | the tripwires over the history of a home, read-only and without a daemon: per-tripwire hits, would-be pauses per 100 active hours, precision and recall against known positives |
 | `loom status` | the daemon, each model server and whether it answered, counts, free disk space, the sandbox self-probe's egress line |
 | `loom open [--print]` | open the web UI in the browser (`--print` prints the address instead) |
-| `loom run [options] <task...>` | start a session and follow it; `-d` starts it and returns |
+| `loom run [options] [--file PATH]... <task...>` | start a session and follow it; `-d` starts it and returns; `--file` attaches files as `send` does (the workspace must already exist) |
 | `loom chat [options]` | turn-by-turn `chat` session; `--session <id>` continues one; `/quit` leaves |
 | `loom ls [-a]` | sessions (`-a`: archived too) |
 | `loom tail <session> [--since <seq>] [--no-follow]` | print a session's record and follow it |
-| `loom send <session> <text...>` | add a message to a running or idle session (`-d` to return at once) |
+| `loom send <session> [text...] [--file PATH]... [--after-turn]` | add a message to a running or idle session (`-d` to return at once; `--after-turn` holds it, while the lead is in a turn, until the turn ends, then it starts the next turn); each `--file` is uploaded to the session's workspace and attached, and the text may then be empty |
 | `loom stop <session>` / `resume <session>` | stop the turn, its jobs and agents / let a stopped session carry on |
-| `loom reweave <session>` | fold old tool output out of the context now |
+| `loom compact <session>` (alias `reweave`) | compact the context now: the model writes a note, old output stays readable by key |
 | `loom archive <session> [--undo]` | hide a finished session; archiving settles the mission's agents |
 | `loom rename <session> <title...>` | rename a mission (its lead's title) |
 | `loom rule <session> <text...>` | set a standing rule (a ledger constraint) for the mission |

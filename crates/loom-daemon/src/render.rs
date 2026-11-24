@@ -32,7 +32,9 @@
 //!   lines` and, when the result has a stored output, ` — loom out {handle}` (dim). The first line
 //!   is red when the status is not `Ok`.
 //! - `reweave`: `⟲ context re-woven ({reason}): {evictions} items folded out of view, about
-//!   {tokens(before)} → {tokens(after)} tokens` (yellow).
+//!   {tokens(before)} → {tokens(after)} tokens` (yellow; old logs).
+//! - `compaction`: `⟲ context compacted ({reason}): {keys} outputs in the key table, about {tokens(before)} →
+//!   {tokens(after)} tokens`, plus ` (no note)` when the note request failed (yellow).
 //! - `pin` / `unpin`: `∙ pinned {call_id}: {reason}` / `∙ unpinned {call_id}` (dim).
 //! - `child_spawned`: `⇢ agent {child} ({role}, {mode}): {brief.question}` (cyan).
 //! - `child_settled`: `⇠ agent {child} {outcome word}` (cyan), then the report indented two spaces,
@@ -92,7 +94,7 @@
 //!   bounded (…)` plain, `egress: UNBOUNDED, …` bold yellow, `egress: not probed yet` plain); one
 //!   line per model (`✓`/`✗`, base URL, model, window, detail when unreachable); the counts.
 //! - `models_table(view, style)`: one line per live profile, `✓`/`✗ {profile}[ (default)] · {model} ·
-//!   {base_url} · window {window} · {max_concurrent} at once[ · {detail}]`; then a line when no
+//!   {base_url} · window {window} · {max_concurrent} at once · vision {yes|no}[ · {detail}]`; then a line when no
 //!   `default_model` is set; `No model profiles are configured.` when there is none.
 //! - `models_reload(report)`: `No profile changed.` or one `added|changed|removed: a, b` line per
 //!   non-empty list; `{n} session(s) moved to the new settings of a changed profile`; `default model:
@@ -114,7 +116,7 @@
 //! the empty cases and the child indentation; rows never exceed `width` characters; the score table
 //! for one session and for several, with a card that is not recorded, wider than the width.
 
-use crate::wire::{ModelsView, StatusView};
+use crate::wire::{McpCheckView, McpConfigured, ModelsView, StatusView};
 use loom_agent::runtime::{
     InboxEntry, MissionModels, ModelSwitchReceipt, ModelsReload, NetEntry, RoleModelReceipt, RoleModels, ScoreView,
     SessionInfo, WindowView, ANY_ROLE,
@@ -391,7 +393,7 @@ pub fn record(rec: &Record, style: &Style, opts: &RecordOpts) -> String {
             out.push(paint(style, BOLD, &head));
             push_block(&mut out, style, None, &f.brief.question, "  ");
         }
-        Event::UserMessage { text } => {
+        Event::UserMessage { text, .. } => {
             out.push(paint(style, CYAN, "▌ you"));
             push_block(&mut out, style, None, text, "");
         }
@@ -483,6 +485,25 @@ pub fn record(rec: &Record, style: &Style, opts: &RecordOpts) -> String {
                 w.evictions.len(),
                 tokens(w.before_tokens),
                 tokens(w.after_tokens_est)
+            );
+            out.push(paint(style, YELLOW, &text));
+        }
+        Event::Exchange(x) => {
+            // CONTRACTS-TRAFFIC-TARGETS C1: one line per captured exchange.
+            let status =
+                x.status.map(|c| c.to_string()).or_else(|| x.error.clone()).unwrap_or_else(|| "no response".into());
+            let line =
+                format!("⇄ {} {} {}://{}{} · {} · {}", x.id, x.method, x.scheme, x.host, x.target, status, x.source);
+            out.push(paint(style, DIM, &line));
+        }
+        Event::Compaction(c) => {
+            let text = format!(
+                "⟲ context compacted ({}): {} outputs in the key table, about {} → {} tokens{}",
+                c.reason,
+                c.keys.len(),
+                tokens(c.before_tokens),
+                tokens(c.after_tokens_est),
+                if c.note.is_some() { "" } else { " (no note)" }
             );
             out.push(paint(style, YELLOW, &text));
         }
@@ -905,11 +926,12 @@ pub fn models_table(view: &ModelsView, style: &Style) -> String {
         let default = if m.profile == view.default_model { " (default)" } else { "" };
         let window = m.context_window.map_or_else(|| "unknown".to_string(), tokens);
         let mut text = format!(
-            "{}{default} · {} · {} · window {window} · {} at once",
+            "{}{default} · {} · {} · window {window} · {} at once · vision {}",
             flat(&m.profile),
             flat(&m.model),
             flat(&m.base_url),
-            m.max_concurrent
+            m.max_concurrent,
+            if m.vision { "yes" } else { "no" }
         );
         if !m.reachable && !m.detail.is_empty() {
             text.push_str(&format!(" · {}", flat(&m.detail)));
@@ -918,6 +940,77 @@ pub fn models_table(view: &ModelsView, style: &Style) -> String {
     }
     if view.default_model.is_empty() {
         out.push(cut("no default_model: a new session names its model with --model", width));
+    }
+    finish(out)
+}
+
+/// `loom mcp list`: one line per configured server. Names only: a secret value is never in it.
+pub fn mcp_list(servers: &[McpConfigured]) -> String {
+    if servers.is_empty() {
+        return "No MCP servers are configured. Add them under [mcp.servers.NAME] in the config.\n".to_string();
+    }
+    let rows: Vec<Vec<String>> = servers
+        .iter()
+        .map(|s| {
+            let roles =
+                if s.roles.is_empty() { "every role that is not read-only".to_string() } else { s.roles.join(", ") };
+            let mut extra = Vec::new();
+            if s.read_only {
+                extra.push("read_only".to_string());
+            }
+            if !s.hosts.is_empty() {
+                extra.push(format!("hosts {}", s.hosts.join(", ")));
+            }
+            if let Some(t) = &s.tools {
+                extra.push(format!("tools {}", t.join(", ")));
+            }
+            vec![flat(&s.server), s.transport.clone(), flat(&roles), flat(&extra.join(" · "))]
+        })
+        .collect();
+    let mut out = vec![format!("{} configured", servers.len())];
+    for r in rows {
+        out.push(format!(
+            "{} · {} · roles: {}{}",
+            r[0],
+            r[1],
+            r[2],
+            if r[3].is_empty() { String::new() } else { format!(" · {}", r[3]) }
+        ));
+    }
+    finish(out)
+}
+
+/// `loom mcp check`: the tools the server lists, or why it could not, with what it wrote to stderr.
+pub fn mcp_check(v: &McpCheckView) -> String {
+    let mut out = Vec::new();
+    match &v.error {
+        Some(e) => out.push(format!("{} ({}) failed: {}", flat(&v.server), v.transport, flat(e))),
+        None => {
+            out.push(format!(
+                "{} ({}) · {} {} · protocol {} · {} tools",
+                flat(&v.server),
+                v.transport,
+                flat(&v.server_name),
+                flat(&v.server_version),
+                flat(&v.protocol),
+                v.tools.len()
+            ));
+            for t in &v.tools {
+                let first = t.description.lines().next().unwrap_or("");
+                let ro = if t.read_only_hint == Some(true) { " [read-only]" } else { "" };
+                out.push(format!(
+                    "  {}{ro}{}",
+                    flat(&t.name),
+                    if first.is_empty() { String::new() } else { format!(" · {}", flat(first)) }
+                ));
+            }
+        }
+    }
+    if !v.stderr_tail.is_empty() {
+        out.push("stderr:".to_string());
+        for l in &v.stderr_tail {
+            out.push(format!("  {}", flat(l)));
+        }
     }
     finish(out)
 }
@@ -1068,6 +1161,53 @@ pub fn net_table(entries: &[NetEntry], style: &Style) -> String {
     table(style, &["TIME", "VERDICT", "METHOD", "HOST:PORT", "RULE"], &rows)
 }
 
+fn counts_line(v: &loom_agent::runtime::TargetView) -> String {
+    ["finding", "tested", "deferred", "untested", "not_seen"]
+        .iter()
+        .map(|k| format!("{} {}", k.replace('_', " "), v.counts.get(*k).copied().unwrap_or(0)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// `loom target list`: one line per target.
+pub fn target_list(list: &[loom_agent::runtime::TargetView]) -> String {
+    let mut out = String::new();
+    for v in list {
+        out.push_str(&format!("{}  {} scope entries  {}\n", v.name, v.scope.len(), counts_line(v)));
+    }
+    out
+}
+
+/// `loom target show`: the settings and the counts.
+pub fn target_show(v: &loom_agent::runtime::TargetView) -> String {
+    let mut out = format!("{}\nscope: {}\n", v.name, v.scope.join(", "));
+    if !v.exclude.is_empty() {
+        out.push_str(&format!("exclude: {}\n", v.exclude.join(", ")));
+    }
+    if !v.upstream_insecure.is_empty() {
+        out.push_str(&format!("upstream_insecure: {}\n", v.upstream_insecure.join(", ")));
+    }
+    if !v.intercept_passthrough.is_empty() {
+        out.push_str(&format!("intercept_passthrough: {}\n", v.intercept_passthrough.join(", ")));
+    }
+    if !v.notes.trim().is_empty() {
+        out.push_str(&format!("notes: {}\n", flat(&v.notes)));
+    }
+    out.push_str(&format!("nodes: {}\n", counts_line(v)));
+    out
+}
+
+/// `loom target show --nodes`: each node with its status.
+pub fn target_nodes(g: &loom_agent::runtime::GraphView) -> String {
+    let mut out = String::new();
+    for n in &g.nodes {
+        let status =
+            serde_json::to_value(n.status).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
+        out.push_str(&format!("{status:<10} {}\n", flat(&n.locator)));
+    }
+    out
+}
+
 pub fn score_table(view: &ScoreView, style: &Style) -> String {
     let mut header = vec!["SESSION".to_string(), "ROLE".to_string()];
     header.extend(COLUMNS.iter().map(|c| c.to_uppercase()));
@@ -1129,6 +1269,7 @@ mod tests {
 
     fn result(text: &str, status: ToolStatus, output: Option<BlobRef>) -> Event {
         Event::ToolResult(ToolResult {
+            exchanges: Vec::new(),
             call_id: CallId::from("c1"),
             name: "bash".into(),
             status,
@@ -1138,6 +1279,7 @@ mod tests {
             class: ToolClass::Exec,
             meta: Map::new(),
             duration_ms: 5,
+            images: Vec::new(),
         })
     }
 
@@ -1208,7 +1350,11 @@ mod tests {
                 budget: budget.clone(),
                 unattended: true,
                 schema: loom_core::event::SCHEMA,
+                intercept: false,
+                target: None,
                 title: s.into(),
+                project_instructions: Vec::new(),
+                mcp: Vec::new(),
             }),
             Event::Forked(Forked {
                 session: sid(),
@@ -1222,7 +1368,7 @@ mod tests {
                 allowed_tools: None,
                 title: s.into(),
             }),
-            Event::UserMessage { text: s.into() },
+            Event::UserMessage { text: s.into(), images: vec![] },
             Event::HarnessNote { note: NoteKind::Nudge, text: s.into() },
             Event::TurnStart { trigger: Trigger::User },
             Event::ModelRequest(ModelRequest {
@@ -1368,6 +1514,7 @@ mod tests {
             meta: meta(s, None, s, 0),
             active: false,
             status: status_of(Phase::Idle, None, None, 0),
+            last_ms: None,
         };
         no_escape(&sessions_table(&[hostile(EVIL)], 10, &MONO));
         let entry = InboxEntry {
@@ -1460,7 +1607,11 @@ mod tests {
             budget: Budget::default(),
             unattended: false,
             schema: loom_core::event::SCHEMA,
+            intercept: false,
+            target: None,
             title: String::new(),
+            project_instructions: Vec::new(),
+            mcp: Vec::new(),
         });
         assert_eq!(render(start, &MONO), "● session s-a · lead · mm · /w\n");
         let forked = Event::Forked(Forked {
@@ -1476,7 +1627,10 @@ mod tests {
             title: String::new(),
         });
         assert_eq!(render(forked, &MONO), "● agent s-a · worker · forked from s-p\n  why?\n  really\n");
-        assert_eq!(render(Event::UserMessage { text: "hi\nthere".into() }, &MONO), "▌ you\nhi\nthere\n");
+        assert_eq!(
+            render(Event::UserMessage { text: "hi\nthere".into(), images: vec![] }, &MONO),
+            "▌ you\nhi\nthere\n"
+        );
         assert_eq!(
             render(Event::HarnessNote { note: NoteKind::OutputCut, text: "cut".into() }, &MONO),
             "▌ harness · output_cut\ncut\n"
@@ -1604,7 +1758,10 @@ mod tests {
 
     #[test]
     fn colours_wrap_each_line() {
-        assert_eq!(render(Event::UserMessage { text: "x".into() }, &COLOR), "\x1b[36m▌ you\x1b[0m\nx\n");
+        assert_eq!(
+            render(Event::UserMessage { text: "x".into(), images: vec![] }, &COLOR),
+            "\x1b[36m▌ you\x1b[0m\nx\n"
+        );
         assert_eq!(
             render(Event::HarnessNote { note: NoteKind::Info, text: "a\nb".into() }, &COLOR),
             "\x1b[2m▌ harness · info\x1b[0m\n\x1b[2ma\x1b[0m\n\x1b[2mb\x1b[0m\n"
@@ -1878,6 +2035,7 @@ mod tests {
         SessionMeta {
             id: SessionId::from(id),
             mission: MissionId::from("m-a"),
+            intercept: false,
             parent: parent.map(SessionId::from),
             workspace: "/w".into(),
             copy_of: None,
@@ -1895,6 +2053,7 @@ mod tests {
             gate: None,
             prior: Vec::new(),
             role_models: Default::default(),
+            target: None,
         }
     }
 
@@ -1914,7 +2073,7 @@ mod tests {
     }
 
     fn info(id: &str, parent: Option<&str>, title: &str, status: Status) -> SessionInfo {
-        SessionInfo { meta: meta(id, parent, title, 1_000), active: false, status }
+        SessionInfo { meta: meta(id, parent, title, 1_000), active: false, status, last_ms: None }
     }
 
     #[test]
@@ -2084,6 +2243,7 @@ mod tests {
             class: None,
             preview: "first\nline".into(),
             note: None,
+            image_tokens: 0,
         }
     }
 
@@ -2131,6 +2291,7 @@ mod tests {
             detail: if reachable { String::new() } else { "connection refused".into() },
             context_window: if reachable { Some(1_000_000) } else { None },
             max_concurrent: 4,
+            vision: false,
         }
     }
 
@@ -2141,8 +2302,8 @@ mod tests {
         let view = ModelsView { default_model: "local".into(), models: vec![health(true), other] };
         assert_eq!(
             models_table(&view, &MONO),
-            "✓ local (default) · big · http://10.0.0.1:8000/v1 · window 1.00M · 4 at once\n\
-             ✗ other · big · http://10.0.0.1:8000/v1 · window unknown · 4 at once · connection refused\n"
+            "✓ local (default) · big · http://10.0.0.1:8000/v1 · window 1.00M · 4 at once · vision no\n\
+             ✗ other · big · http://10.0.0.1:8000/v1 · window unknown · 4 at once · vision no · connection refus…\n"
         );
         let none = ModelsView { default_model: String::new(), models: vec![health(true)] };
         assert!(models_table(&none, &MONO).ends_with("no default_model: a new session names its model with --model\n"));

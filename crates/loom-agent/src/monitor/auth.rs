@@ -324,7 +324,7 @@ mod tests {
         let entries = vec![
             entry(1, 10, "s-1", LedgerOp::GoalSet { text: "goal".into() }),
             entry(2, 11, "s-1", LedgerOp::Decision { text: "AGENT-DECISION".into(), reason: "AGENT-REASON".into() }),
-            entry(3, 12, "s-1", LedgerOp::ClaimAdd { text: "AGENT-CLAIM".into() }),
+            entry(3, 12, "s-1", LedgerOp::ClaimAdd { text: "AGENT-CLAIM".into(), assets: vec!["AGENT-ASSET".into()] }),
             entry(4, 13, "s-1", LedgerOp::DeadEnd { what: "AGENT-WHAT".into(), why: "AGENT-WHY".into() }),
             entry(5, 14, "s-1", LedgerOp::PlanSet { steps: vec!["AGENT-STEP".into()] }),
         ];

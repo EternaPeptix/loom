@@ -32,8 +32,8 @@
 //!   `verifier_rejections`: `finish` results with `meta[META_REFUSAL] == REFUSAL_VERIFIER`.
 //!   `verifier_accept_rate()` is accepts / (accepts + rejections), `None` when no verifier judged a
 //!   finish.
-//! - `fresh_starts`: `reweave` records whose evictions include a `Remove` (only a fresh start after a
-//!   finish that was not accepted plans one).
+//! - `fresh_starts`: `compaction` records with reason `fresh_start` (a fresh start after a finish that was
+//!   not accepted), and old `reweave` records whose evictions include a `Remove` (what it was before).
 //! - `hand_offs`, `asks`: `tool_result`s with status `Ok` of `hand_off` (a child returned its assignment
 //!   unfinished) and of `ask_for` (a lead asked the operator for budget, a tool, a hint or direction).
 //!   Neither is a finish, and neither says the work was wrong; they show how often a session used a way
@@ -270,6 +270,9 @@ pub fn score(records: &[Record]) -> Scorecard {
             Event::Reweave(w) if w.evictions.iter().any(|e| e.action == EvictAction::Remove) => {
                 card.fresh_starts = card.fresh_starts.saturating_add(1);
             }
+            Event::Compaction(c) if c.reason == "fresh_start" => {
+                card.fresh_starts = card.fresh_starts.saturating_add(1);
+            }
             _ => {}
         }
     }
@@ -328,6 +331,7 @@ mod tests {
 
     fn result(name: &str, status: ToolStatus, meta: Value) -> Event {
         Event::ToolResult(ToolResult {
+            exchanges: Vec::new(),
             call_id: CallId::from("c"),
             name: name.into(),
             status,
@@ -337,6 +341,7 @@ mod tests {
             class: ToolClass::State,
             meta: meta.as_object().cloned().unwrap_or_else(Map::new),
             duration_ms: 0,
+            images: Vec::new(),
         })
     }
 

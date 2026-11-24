@@ -61,8 +61,9 @@
 //!   `harness_test` flag (M4); the S3 of TW-17 beside a gated call (M8); a re-finish in a reopened turn (M9); gzip runs
 //!   (M6); a listener serving flag-shaped content (TW-19, needs the census to read content).
 //!
-//! A call is read as sent and as run: the paths and content that the executor's repair of an aliased tool or
-//! argument name adds (`loom_tools::canonical_tool_alias`, `schema::normalize_for_tool`) count like those sent.
+//! A call is read as sent and as run: the paths, URLs and content that the executor's adaptation of a call adds (an
+//! aliased tool or argument name, a Codex `apply_patch` split into one call per file, a fetch's `url` taken from its
+//! `prompt`: `loom_tools::dialect::adapt`, then `schema::normalize_for_tool`) count like those sent.
 //!
 //! Tests required (M2): a positive and a negative fixture per tripwire; every matching rule of §6.1 with a fixture (own
 //! TMPDIR stripped, prose ignored, `/.git/config` in a URL to a target not matched, decoded base64 matched); the
@@ -388,30 +389,42 @@ impl CallView {
         v
     }
 
-    /// A `tool_call` records the name and arguments as the model sent them; the executor runs the alias's tool
-    /// with the repaired arguments. The paths and content those add are read too, and nothing sent is dropped.
+    /// A `tool_call` records the name and arguments as the model sent them; the executor adapts them to loom's tools
+    /// (`loom_tools::dialect::adapt`: an alias's tool, other argument names, a Codex `apply_patch` as one call per
+    /// file) and then normalises each (`schema::normalize_for_tool`). The paths, URLs and content of the calls that run
+    /// are read too (a fetch whose page is named only in `prompt` fetches that page), and nothing sent is dropped. Every
+    /// tool counts as present, so a call the role would be refused is read as it would have run; the argument
+    /// conversion is the same in every dialect.
     fn add_repaired(&mut self, name: &str, args: &Value, sent: &[(String, String)]) {
-        let tool = loom_tools::canonical_tool_alias(name).unwrap_or(name);
-        let mut ran = args.clone();
-        if loom_tools::schema::normalize_for_tool(tool, &mut ran).is_empty() {
-            return;
-        }
-        let mut repaired = Vec::new();
-        leaves(&ran, &mut repaired, "", 0);
-        for (k, s) in repaired {
-            let key = k.as_str();
-            if PATH_KEYS.contains(&key) {
-                if !self.paths.contains(&s) {
-                    self.paths.push(s);
+        use loom_tools::dialect::{adapt, Adapt, Adapted};
+        let calls = match adapt(name, args.clone(), loom_core::config::Dialect::default(), &|_| true) {
+            Adapt::Run(call) => vec![call],
+            Adapt::Batch(calls) => calls,
+            Adapt::Noop(_) | Adapt::Refuse(_) | Adapt::Unknown => return,
+        };
+        for Adapted { tool, mut args, .. } in calls {
+            let _ = loom_tools::schema::normalize_for_tool(&tool, &mut args);
+            let mut repaired = Vec::new();
+            leaves(&args, &mut repaired, "", 0);
+            for (k, s) in repaired {
+                let key = k.as_str();
+                if PATH_KEYS.contains(&key) {
+                    if !self.paths.contains(&s) {
+                        self.paths.push(s);
+                    }
+                } else if URL_KEYS.contains(&key) {
+                    if !self.urls.contains(&s) {
+                        self.urls.push(s);
+                    }
+                } else if CONTENT_KEYS.contains(&key)
+                    && !matches!(self.class, ToolClass::Exec)
+                    && !sent.iter().any(|(sk, sv)| *sv == s && CONTENT_KEYS.contains(&sk.as_str()))
+                {
+                    if !self.content.is_empty() {
+                        self.content.push('\n');
+                    }
+                    self.content.push_str(&s);
                 }
-            } else if CONTENT_KEYS.contains(&key)
-                && !matches!(self.class, ToolClass::Exec)
-                && !sent.iter().any(|(sk, sv)| *sv == s && CONTENT_KEYS.contains(&sk.as_str()))
-            {
-                if !self.content.is_empty() {
-                    self.content.push('\n');
-                }
-                self.content.push_str(&s);
             }
         }
     }
@@ -2218,7 +2231,10 @@ impl Engine {
         match &entry.op {
             LedgerOp::Decision { text, reason } => prose.extend([text.as_str(), reason.as_str()]),
             LedgerOp::DeadEnd { what, why } => prose.extend([what.as_str(), why.as_str()]),
-            LedgerOp::ClaimAdd { text } => prose.push(text),
+            LedgerOp::ClaimAdd { text, assets } => {
+                prose.push(text);
+                prose.extend(assets.iter().map(String::as_str));
+            }
             LedgerOp::Reflection { ruled_out, next_route, would_change } => {
                 prose.extend([ruled_out.as_str(), next_route.as_str(), would_change.as_str()])
             }

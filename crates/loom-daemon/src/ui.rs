@@ -4,6 +4,7 @@ pub const INDEX_HTML: &str = include_str!("../../../ui/index.html");
 pub const APP_JS: &str = include_str!("../../../ui/app.js");
 pub const CORE_JS: &str = include_str!("../../../ui/core.js");
 pub const STYLE_CSS: &str = include_str!("../../../ui/style.css");
+pub const FAVICON_SVG: &str = include_str!("../../../ui/favicon.svg");
 
 /// Sent with every UI file. Nothing is loaded from anywhere but the daemon itself, and nothing
 /// inline runs: text written by a model or fetched from the network can never become script, and a

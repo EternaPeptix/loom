@@ -1,5 +1,5 @@
 // Isolated UI fixtures: no model, daemon, credentials, or workspace writes.
-// Run: node tools/ui-preview.mjs [port], then open the printed URL (/#code=fixture signs in, then /#/s/s-audit).
+// Run: node tools/ui-preview.mjs [port], then open the printed URL (/#code=facefeedfacefeed signs in, then /#/s/s-audit).
 // Fixture-only routes: GET /__fixture/state, POST /__fixture/question, POST /__fixture/reconnect, and
 // POST /__fixture/stream (streams a short live reply into s-other: reasoning, text and a tool call as delta frames, then
 // the model_response, tool_call and tool_result records; a second step follows, so a work group grows while it runs).
@@ -7,7 +7,10 @@
 // running s-notify mission live and opens its "finished" inbox item), and POST /api/sessions/{id}/reweave (202, writes a
 // reweave record). New sessions: m-fleet (13 agents to depth 4, s-fl-*), s-parked (parked on necromicon with a recorded
 // error), s-quiet (running, last record 41 min old), s-notify (running, for /__fixture/end), s-tools (every ToolStatus),
-// s-big (5,000 records for Find).
+// s-big (5,000 records for Find; it loads from the end and pages backward), s-compacted (two compactions: a size one whose note
+// cites keys of its log and one that does not exist, and a fresh start with objections and an empty tail).
+// Records: GET .../records?after=&limit= pages forward (next_after); ?before=&limit= pages backward (prev_before); both is a 400.
+// POST /api/sessions/{id}/compact (and /reweave) appends a `compaction` record and emits it.
 // Workspace folders add (shapes and status codes mirror crates/loom-daemon: refusals are 409, a missing path 404, a bad query 400):
 // GET /api/fs/dirs?path= (fake home /fixture/user; /fixture/home is the loom home and is refused;
 // /fixture/user/many has 2,300 folders; /fixture/user/shared is a link), POST /api/sessions (a missing workspace is refused
@@ -15,6 +18,10 @@
 // GET /api/sessions/{id}/files?path= and .../files/lines?path=&start=&count= over the workspaces /fixture/loom (nested
 // folders, big.log with 20,000 lines, target.bin binary, huge.sql over the 32 MiB cap, outside a link, locked unreadable,
 // pipe not a file, generated with 2,050 entries, .loom closed) and /fixture/indexer.
+// MCP adds: s-mcp (two MCP calls, one ok and one isError) and GET /api/sessions/{id}/mcp (two servers for s-mcp, [] for the rest).
+// Uploads add: POST /api/uploads?workspace=&name= (201 {path, name, bytes, mime} under <workspace>/.loom/uploads/, 413 over 32 MiB),
+// `attachments` in message and session bodies (the attachment block is appended as the daemon does), and the Files routes serve
+// .loom/uploads and nothing else under .loom. s-tools carries a user message with a CSV and a PNG attached.
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
@@ -22,6 +29,8 @@ import { dirname, join } from "node:path";
 
 const ui = join(dirname(fileURLToPath(import.meta.url)), "..", "ui");
 const now = Date.now();
+// The login code must be lowercase hex, 16–128 chars, so the UI's codeFromHash accepts it (real codes are 32 hex chars).
+const LOGIN_CODE = "facefeedfacefeed";
 const blob = "ab".repeat(32);
 const bigBlob = "cd".repeat(32); // a stored output of 3 MiB, over the 2 MiB a copy button fetches
 const clients = new Set();
@@ -33,12 +42,47 @@ lines[1596] = "payload: serde_json::Value::Null,"; lines[1597] = "steps,"; lines
 lines[211] = "$ sh -c 'sleep 30 & exit 0'"; lines[212] = "job settled (exit 0) while pid 4127 still running"; lines[213] = "tracked: 0 processes";
 
 // Profiles as the daemon's ModelHealth reports them; "necromicon" is the unreachable one.
+// ---- Images (contract D7) and queued messages (E5). Two small generated PNGs, encoded inline so the fixture has no dependencies.
+const IMG_SCREEN = "11".repeat(32), IMG_ICON = "22".repeat(32);
+const IMAGES = new Map([
+  [IMG_SCREEN, Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAeAAAAEsCAIAAACUnPcNAAAH2UlEQVR42u3UMRGAMBBE0ShJQYUIakQgAmGoRAIFxW1u3kwMvOzNH3NuJW8/rpLHy8vLu4p3GJiXl5dXoA3My8vLK9AG5uXlFWgD8/Ly8gq0gXl5eQXawLy8vLwCbWBeXl5egXbQvLy8Am1gXl5eXoE2MC8vr0AbmJeXl1egDczLy8sr0Ly8vLwCbWBeXl5egTYwLy+vQBuYl5eXV6ANzMvLK9AG5uXl5RVoA/Py8vIKtIPm5eUVaAPz8vLyCrSBeXl5BdrAvLy8vAJtYF5eXl6B5uXl5RVoA/Py8vIKtIF5eXkF2sC8vLy8Am1gXl5egTYwLy8vr0AbmJeXl1egDczLyyvQBubl5eUVaAPz8vIKtIF5eXl5BdrAvLy8vALNy8vLK9AG5uXl5RVoA/Py8rYMtI/m5eXlzfSWBfq8n5LHy8vLu4pXoHl5eXkF2sC8vLy8Am1gXl5egTYwLy8vr0AbmJeXV6ANzMvLyyvQBubl5eUVaAfNy8sr0Abm5eXlFWgD8/LyCrSBeXl5eQXawLy8vLwCzcvLyyvQBubl5eUVaAPz8vIKtIF5eXl5BdrAvLy8Am1gXl5eXoE2MC8vL69AO2heXl6BNjAvLy+vQBuYl5dXoA3My8vLK9AG5uXl5RVoXl5eXoE2MC8vL69AG5iXl1egDczLy8sr0Abm5eUVaAPz8vLyCrSBeXl5eQXawLy8vAJtYF5eXl6BNjAvL69AG5iXl5dXoA3My8vLK9AOmpeXV6ANzMvLy/sz0D6al5eXN9Mr0Ly8vLwCbWBeXl5egTYwLy+vQBuYl5eXV6ANzMvLK9AG5uXl5RVoA/Py8vIKtIPm5eUVaAPz8vLyCrSBeXl5BdrAvLy8vAJtYF5eXl6B5uXl5RVoA/Py8vIKtIF5eXkF2sC8vLy8Am1gXl5egTYwLy8vr0AbmJeXl1egHTQvL69AG5iXl5dXoA3My8sr0Abm5eXlFWgD8/Ly8go0Ly8vr0AbmJeXl1egDczLyyvQBubl5eUVaAPz8vIKtIF5eXl5BdrAvLy8vAJtYF5eXoE2MC8vL69AG5iXl1egDczLy8sr0Abm5eXlFWgHzcvLK9AG5uXl5RVoA/Py8vYMtI/m5eXlzfQKNC8vL69AG5iXl5dXoA3My8sr0Abm5eXlFWgD8/LyCrSBeXl5eQXawLy8vLwC7aB5eXkF2sC8vLy8Am1gXl5egTYwLy8vr0AbmJeXl1egeXl5eQXawLy8vLwCbWBeXl6BNjAvLy+vQBuYl5dXoA3My8vLK9AG5uXl5RVoB83LyyvQBubl5eUVaAPz8vIKtIF5eXl5BdrAvLy8vALNy8vLK9AG5uXl5RVoA/Py8gq0gXl5eXkF2sC8vLwCbWBeXl5egTYwLy8vr0AbmJeXV6ANzMvLyyvQBubl5RVoA/Py8vIKtIF5eXl5BdpB8/LyCrSBeXl5eQXawLy8vD0D7aN5eXl5M70CzcvLyyvQBubl5eUVaAPz8vIKtIF5eXl5BdrAvLy8Am1gXl5eXoE2MC8vL69AO2heXl6BNjAvLy+vQBuYl5dXoA3My8vLK9AG5uXl5RVoXl5eXoE2MC8vL69AG5iXl1egDczLy8sr0Abm5eUVaAPz8vLyCrSBeXl5eQXaQfPy8gq0gXl5eXkF2sC8vLwCbWBeXl5egTYwLy8vr0Dz8vLyCrSBeXl5eQXawLy8vAJtYF5eXl6BNjAvL69AG5iXl5dXoA3My8vLK9AG5uXlFWgD8/Ly8gq0gXl5eQXawLy8vLwCbWBeXl5egXbQvLy8Am1gXl5eXoE2MC8vb89A+2heXl7eTK9A8/Ly8gq0gXl5eXkF2sC8vLwCbWBeXl5egTYwLy+vQBuYl5eXV6ANzMvLyyvQDpqXl1egDczLy8sr0Abm5eUVaAPz8vLyCrSBeXl5eQWal5eXV6ANzMvLyyvQBubl5RVoA/Py8vIKtIF5eXkF2sC8vLy8Am1gXl5eXoF20Ly8vAJtYF5eXl6BNjAvL69AG5iXl5dXoA3My8vLK9C8vLy8Am1gXl5eXoE2MC8vr0AbmJeXl1egDczLyyvQBubl5eUVaAPz8vLyCrSBeXl5BdrAvLy8vAJtYF5eXoE2MC8vL69AG5iXl5dXoB00Ly+vQBuYl5eXV6ANzMvL2zPQPpqXl5c30yvQvLy8vAJtYF5eXl6BNjAvL69AG5iXl5dXoA3My8sr0Abm5eXlFWgD8/Ly8gq0g+bl5RVoA/Py8vIKtIF5eXkF2sC8vLy8Am1gXl5eXoHm5eXlFWgD8/Ly8gq0gXl5eQXawLy8vLwCbWBeXl6BNjAvLy+vQBuYl5eXV6AdNC8vr0AbmJeXl1egDczLyyvQBubl5eUVaAPz8vLyCjQvLy+vQBuYl5eXV6ANzMvLK9AG5uXl5RVoA/Py8gq0gXl5eXkF2sC8vLy8Am1gXl5egTYwLy8vr0AbmJeXV6ANzMvLyyvQBubl5eUVaAfNy8sr0Abm5eXlFWgD8/Ly9gy0j+bl5eXN9Ao0Ly8vr0AbmJeXl1egDczLyyvQBubl5eUVaAPz8vIKtIF5eXl5BdrAvLy8vALtoHl5eQXawLy8vLwCbWBeXl6BNjAvLy+vQBuYl5eXV6B5eXl5BdrAvLy8vAJtYF5eXoE2MC8vL69AG5iXl1egDczLy8sr0Abm5eXl/XgvVtbzdy9rEPEAAAAASUVORK5CYII=", "base64")],
+  [IMG_ICON, Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAHgAAACgCAIAAABIaz/HAAABNUlEQVR42u3bMQkAMAxFwQirkiqpxMiphHrIUAI5yB649fHj5ilf7lW+aX8DNGjQoEGDBg0aNGjQoEGDBg0aNGjQoEGDBg0aNOim0LD+/AUNGjRo0KBBgwYNGjRo0KBBgwYNGjRo0KBBgwYNuis0LBUcNGjQoEGDBg0aNGjQoEGDBg0aNGjQoEGDBg0atJ0hLBUcNGjQoEGDBg0aNGjQoEGDBg0aNGjQoEGDBg0atJ0hLBUcNGjQoEGDBg0aNGjQoEGDBg0aNGjQoEGDBg0atJ0hLBUcNGjQoEGDBg0aNGjQoEGDBg0aNGjQoEGDBg0atJ0hLBUcNGjQoEGDBg0aNGjQoEGDBg0aNGjQoEGDBg0atJ0hLBUcNGjQoEGDBg0aNGjQoEGDBg0aNGjQoEGDBg0a9Ji/D99qVMw+gBMMAAAAAElFTkSuQmCC", "base64")],
+]);
+const SCREEN_REF = { blob: IMG_SCREEN, mime: "image/png", bytes: IMAGES.get(IMG_SCREEN).length, width: 480, height: 300, name: "screen.png" };
+const ICON_REF = { blob: IMG_ICON, mime: "image/png", bytes: IMAGES.get(IMG_ICON).length, width: 120, height: 160 };
+// Queued messages per session, in memory. s-quiet and s-notify (running leads) start with two and one.
+const queued = new Map([
+  ["s-quiet", [{ id: "q1", text: "When the index is rebuilt, run the relevance check against the 200-query set and report the regressions.", attachments: [], created_ms: Date.now() - 4 * 60000 }, { id: "q2", text: "Then archive the old shards.", attachments: [], created_ms: Date.now() - 2 * 60000 }]],
+  ["s-notify", [{ id: "q3", text: "Skip packages we vendor.", attachments: [], created_ms: Date.now() - 60000 }]],
+]);
+let queuedN = 3;
+const queuedOf = id => queued.get(id) || [];
+const emitQueued = id => emit({ type: "queued", session: id });
 const profiles = [
-  { profile: "dsv41", base_url: "https://api.fixture.invalid/dsv41/v1", model: "dsv41", reachable: true, detail: "", context_window: 1000000, max_concurrent: 4 },
-  { profile: "qwen", base_url: "https://api.fixture.invalid/qwen/v1", model: "qwen4-max-preview", reachable: true, detail: "", context_window: 262144, max_concurrent: 2 },
+  { profile: "dsv41", base_url: "https://api.fixture.invalid/dsv41/v1", model: "dsv41", reachable: true, detail: "", context_window: 1000000, max_concurrent: 4, vision: true },
+  { profile: "qwen", base_url: "https://api.fixture.invalid/qwen/v1", model: "qwen4-max-preview", reachable: true, detail: "", context_window: 262144, max_concurrent: 2, vision: false },
   { profile: "necromicon", base_url: "http://10.0.0.9:8000/v1", model: "necromicon", reachable: false, detail: "connection refused: http://10.0.0.9:8000/v1 did not answer; start the server or run `loom models reload` after fixing the profile's base_url.", context_window: 128000, max_concurrent: 1 },
 ];
 const modelRef = p => ({ profile: p.profile, model: p.model, context_window: p.context_window });
+
+// The Models tab's view of a mission (crates/loom-agent MissionModels): the lead's model, the choice per role, live profiles.
+const roleChoices = new Map(); // mission -> {any: string|null, roles: Map<role, string|null>}
+function missionModels(id) {
+  const info = sessions.find(s => s.id === id);
+  if (!info) return null;
+  const lead = info.parent ? sessions.find(s => s.mission === info.mission && !s.parent) || info : info;
+  const ch = roleChoices.get(lead.mission) || { any: null, roles: new Map() };
+  const kids = sessions.filter(s => s.mission === lead.mission && s.parent && s.status.phase !== "ended");
+  const packRoles = lead.pack === "ctf"
+    ? [["dispatcher", "dsv41", [], null], ["web_solver", null, ["qwen", "dsv41"], "dsv41"], ["crypto_solver", "dsv41", [], null], ["binary_solver", "dsv41", [], null], ["worker", null, [], null], ["verifier", "qwen", [], null]]
+    : [["worker", null, [], null], ["verifier", null, [], null]];
+  const roles = packRoles.map(([role, pack_model, alloy_models, escalation_model]) => ({
+    role, verifier: role === "verifier", chosen: ch.roles.get(role) ?? null, pack_model, alloy_models, escalation_model,
+    agents: kids.filter(k => (k.role || "worker") === role).map(k => ({ session: k.id, profile: k.profile, forked: false })),
+  }));
+  return { mission: lead.mission, lead: lead.id, lead_model: { profile: lead.profile, model: lead.model, context_window: lead.context_window },
+    any_role: ch.any, roles, profiles: profiles.map(p => p.profile), default_model: "dsv41" };
+}
 const profileOf = name => profiles.find(p => p.profile === name);
 function session(id, title, { parent = null, phase = "running", last_end = null, outcome = null, workspace = "/fixture/loom", profile = "dsv41", prompt = 86000, cached = 84000, mission = null, role = null, pack = "core", age = 3600000, step = 48, completion = 18000 } = {}) {
   const p = profileOf(profile);
@@ -79,9 +123,12 @@ sessions.push(
   session("s-quiet", "Rebuild the search index", { phase: "running", profile: "dsv41", workspace: "/fixture/indexer", step: 27, completion: 33000, prompt: 410000, cached: 380000, age: 2 * 3600000 }),
   session("s-notify", "Nightly dependency sweep", { phase: "running", profile: "qwen", workspace: "/fixture/docs", step: 12, completion: 9000, age: 40 * MIN }),
   session("s-tools", "Tool result shapes", { phase: "idle", last_end: "waiting", profile: "dsv41", workspace: "/fixture/loom", step: 9, completion: 6000, age: 90 * MIN }),
+  session("s-compacted", "Long-running mission (two compactions)", { phase: "idle", last_end: "waiting", profile: "dsv41", workspace: "/fixture/loom", step: 17, completion: 120000, prompt: 61000, cached: 52000, age: 30 * 3600000 }),
+  session("s-loop", "Stuck build (60 identical calls)", { phase: "idle", last_end: "waiting", profile: "dsv41", workspace: "/fixture/loom", step: 64, completion: 40000, prompt: 90000, cached: 85000, age: 3 * 3600000 }),
+  session("s-mcp", "Triage issues through MCP servers", { phase: "idle", last_end: "waiting", profile: "dsv41", workspace: "/fixture/loom", step: 4, completion: 3000, age: 50 * MIN }),
   session("s-big", "Long investigation (5,000 records)", { phase: "idle", last_end: "waiting", profile: "dsv41", workspace: "/fixture/loom", step: 1250, completion: 900000, prompt: 300000, cached: 280000, age: 6 * 3600000 }),
 );
-for (const id of ["s-parked", "s-quiet", "s-notify", "s-tools", "s-big"]) custom.add(id);
+for (const id of ["s-parked", "s-quiet", "s-notify", "s-tools", "s-loop", "s-big", "s-mcp", "s-compacted", "s-result"]) custom.add(id);
 let inbox = [
   { session: "s-audit", mission: "m-audit", title: "Audit harness reliability", opened_ms: now - 240000, item: { item_id: "i-scope", item_kind: "question", text: "Include the desktop app in this audit?", options: ["Include desktop", "Runtime only"], blocking: true, call_id: "question", reference: "q1" } },
   { session: "s-result", mission: "m-s-result", title: "Dependency review", opened_ms: now - 600000, item: { item_id: "i-result", item_kind: "finished", text: "The review is ready to read.", options: [], blocking: false, call_id: "finish" } },
@@ -115,13 +162,13 @@ const startOf = (info, ts_ms, text) => {
 const sessionOf = id => sessions.find(s => s.id === id);
 let callN = 0;
 /** One model step (request, response with one call, the call, its result) starting at `t`; returns the next free time. */
-function step(id, t, { text = "", command = "make check", status = "ok", out = "ok", exit = null, ms = 1500, meta = {}, cut = false, output = null, name = "bash", cls = "exec", args = null }) {
+function step(id, t, { images = null, text = "", command = "make check", status = "ok", out = "ok", exit = null, ms = 1500, meta = {}, cut = false, output = null, name = "bash", cls = "exec", args = null }) {
   const n = ++callN; const req_id = `fx-r${n}`; const call_id = `fx-c${n}`;
   const a = args || { command };
   append(id, "model_request", { ts_ms: t, req_id, step: n, epoch: 1, purpose: "step", est_tokens: 80000 }, "harness");
   append(id, "model_response", { ts_ms: t + 800, req_id, text, reasoning: "", tool_calls: [{ call_id, name, arguments: JSON.stringify(a), complete: status !== "invalid" }], finish: "tool_calls", usage: { prompt_tokens: 80000, cached_tokens: 76000, completion_tokens: 50 }, timing: { ttft_ms: 300, total_ms: 800 }, attempts: 1 }, "model");
   append(id, "tool_call", { ts_ms: t + 900, call_id, req_id, name, args: status === "invalid" ? null : a, class: cls }, "model");
-  append(id, "tool_result", { ts_ms: t + 900 + ms, call_id, name, status, text: out, ...(output ? { output } : {}), cut, class: cls, meta: { ...(exit === null ? {} : { exit_code: exit }), ...meta }, duration_ms: ms }, "tool");
+  append(id, "tool_result", { ts_ms: t + 900 + ms, call_id, name, status, text: out, ...(images ? { images } : {}), ...(output ? { output } : {}), cut, class: cls, meta: { ...(exit === null ? {} : { exit_code: exit }), ...meta }, duration_ms: ms }, "tool");
   return t + 1000 + ms;
 }
 
@@ -150,6 +197,46 @@ for (const [id, , parent, , phase, last_end, outcome, , nsteps, , age, quiet] of
     append(id, "model_request", { ts_ms: lastTs, req_id: "fx-run-" + id, step: nsteps, epoch: 1, purpose: "step", est_tokens: 80000 }, "harness");
   }
 }
+
+// ---- Captured exchanges (CONTRACTS-TRAFFIC-TARGETS C1) ---------------------------------------------------------------
+// s-fl-web (a ctf solver) sends two requests with http_send (one redirect followed), runs two curls the proxy captured
+// (plain HTTP, and intercepted HTTPS) and makes one request its upstream refused. Messages are whole HTTP/1.1 texts in blobs.
+const EXBLOBS = new Map();
+const EXCHANGES = new Map(); // session -> exchange records, oldest first
+const EX_IDS = ["a2b3c4d5e6f7", "b3c4d5e6f7a2", "c4d5e6f7a2b3", "d5e6f7a2b3c4", "e6f7a2b3c4d5"];
+let exN = 0;
+const exBlob = (text) => { const id = (EXBLOBS.size + 1).toString(16).padStart(4, "0").repeat(16); EXBLOBS.set(id, text); return { id, bytes: Buffer.byteLength(text), lines: text.split("\n").length }; };
+function exchange(session, ts_ms, f) {
+  const n = exN++;
+  const reqText = `${f.method} ${f.target} HTTP/1.1\nHost: ${f.host}\nUser-Agent: loom/0.9\nAuthorization: Bearer fx-secret-token-9b2e\nCookie: session=fx-cookie-77c1; theme=dark\nAccept: application/json\n\n`;
+  const resText = f.status == null ? null : `HTTP/1.1 ${f.status} ${f.reason || "OK"}\nContent-Type: application/json\nSet-Cookie: session=fx-set-cookie-31d0; HttpOnly\nX-Request-Id: fx-req-${n}\n${f.location ? "Location: " + f.location + "\n" : ""}\n${f.body ?? ""}`;
+  const rec = { id: "ex-" + EX_IDS[n % EX_IDS.length], call_id: f.call_id ?? null, source: f.source || "tool", tool: f.tool ?? null, scheme: f.scheme || "https", tls: f.tls || "tool", method: f.method, host: f.host, port: f.port ?? 443, target: f.target, status: f.status ?? null, error: f.error ?? null, request: exBlob(reqText), response: resText === null ? null : exBlob(resText), request_bytes: reqText.length, response_bytes: resText ? resText.length : 0, truncated: !!f.truncated, upstream_unverified: !!f.unverified, duration_ms: f.ms ?? 120 };
+  append(session, "exchange", { ts_ms, ...rec }, "harness");
+  (EXCHANGES.get(session) || EXCHANGES.set(session, []).get(session)).push({ ts_ms, session, ...rec });
+}
+{
+  const id = "s-fl-web"; let t = now - 200 * MIN;
+  const call = (call_id, name, args, ms, text, run) => {
+    append(id, "tool_call", { ts_ms: t, call_id, req_id: "fx-ex-" + call_id, name, args, class: "exec" }, "model");
+    run(t);
+    append(id, "tool_result", { ts_ms: t + ms, call_id, name, status: "ok", text, cut: false, class: "exec", meta: {}, duration_ms: ms }, "tool");
+    t += ms + 4000;
+  };
+  call("fx-hs1", "http_send", { method: "GET", url: "https://api.acme.test/v1/users?id=1" }, 900, "HTTP 200 after one redirect (2 requests)", (at) => {
+    exchange(id, at + 100, { call_id: "fx-hs1", tool: "http_send", method: "GET", host: "api.acme.test", target: "/v1/users?id=1", status: 302, reason: "Found", location: "/v2/users?id=1", ms: 80 });
+    exchange(id, at + 400, { call_id: "fx-hs1", tool: "http_send", method: "GET", host: "api.acme.test", target: "/v2/users?id=1", status: 200, body: '{"id":1,"name":"Ada","email":"ada@acme.test","role":"admin"}', ms: 210 });
+  });
+  call("fx-b1", "bash", { command: "curl -s http://10.20.0.4:8080/health" }, 700, "ok", (at) =>
+    exchange(id, at + 200, { source: "proxy", scheme: "http", tls: "plain", method: "GET", host: "10.20.0.4", port: 8080, target: "/health", status: 200, body: '{"status":"ok"}', ms: 35 }));
+  call("fx-b2", "bash", { command: "curl -s https://login.acme.test/auth -d user=admin" }, 1300, '{"error":"bad credentials"}', (at) =>
+    exchange(id, at + 300, { source: "proxy", scheme: "https", tls: "intercepted", method: "POST", host: "login.acme.test", target: "/auth", status: 401, reason: "Unauthorized", body: '{"error":"bad credentials"}', unverified: true, truncated: true, ms: 310 }));
+  call("fx-hs2", "http_send", { method: "GET", url: "https://admin.acme.test/" }, 600, "error: connection refused", (at) =>
+    exchange(id, at + 100, { call_id: "fx-hs2", tool: "http_send", method: "GET", host: "admin.acme.test", target: "/", status: null, error: "connection refused (os error 61)", ms: 12 }));
+}
+// The fleet lead works on the `acme` target (TargetRef in its session_start, the field in the session list).
+sessionOf("s-fl-lead").target = "acme";
+for (const r of logs.get("s-fl-lead")) if (r.kind === "session_start") r.target = { name: "acme", scope: ["*.acme.test", "10.20.0.0/24"], exclude: ["pay.acme.test"], upstream_insecure: [], intercept_passthrough: [], summary: "" };
+
 // Parent logs were appended to out of time order: sort each by timestamp and renumber.
 for (const [id] of fleet) { const log = logs.get(id); log.sort((a, b) => a.ts_ms - b.ts_ms || a.seq - b.seq); log.forEach((r, i) => { r.seq = i; }); }
 
@@ -176,6 +263,17 @@ append("s-fl-net", "inbox_opened", { ts_ms: now - 9 * MIN, ...inbox.find(e => e.
   append("s-parked", "turn_end", { ts_ms: now - 50 * MIN, reason: "parked" }, "harness");
   append("s-parked", "inbox_opened", { ts_ms: now - 50 * MIN + 1, ...inbox.find(e => e.item.item_id === "i-parked").item }, "harness");
 }
+// s-result: a finished review. Its report is the last reply; the "finished" inbox item points at it.
+{
+  const t0 = now - 25 * MIN;
+  startOf(sessionOf("s-result"), t0, "Review the dependency tree and list anything unmaintained or vulnerable.");
+  const t = step("s-result", t0 + 2 * MIN, { text: "Reading the lockfile.", command: "cargo tree --depth 1", out: "loom v0.1.0\n├── axum v0.8.4\n├── serde v1.0.228\n└── tokio v1.48.0", exit: 0, ms: 2100 });
+  append("s-result", "model_request", { ts_ms: t, req_id: "fx-result-final", step: 48, epoch: 1, purpose: "step", est_tokens: 40000 }, "harness");
+  append("s-result", "model_response", { ts_ms: now - 11 * MIN, req_id: "fx-result-final", text: "## Dependency review\n\nNo direct dependency is unmaintained. Two need attention:\n\n1. **rand 0.10.3** has a patch release (0.10.4) with a fix for `fill_bytes` on short buffers.\n2. **shlex 1.3.0** is a major version behind; 2.0 changes quoting of empty strings.\n\nNo advisory matches the lockfile.", reasoning: "", tool_calls: [], finish: "stop", usage: { prompt_tokens: 40000, cached_tokens: 0, completion_tokens: 160 }, timing: { total_ms: 5200 }, attempts: 1 }, "model");
+  append("s-result", "inbox_opened", { ts_ms: now - 10 * MIN, ...inbox.find(e => e.item.item_id === "i-result").item }, "harness");
+  append("s-result", "turn_end", { ts_ms: now - 10 * MIN + 1, reason: "finished" }, "harness");
+  append("s-result", "session_end", { ts_ms: now - 10 * MIN + 2, outcome: "done", detail: "Finished." }, "harness");
+}
 // s-quiet: running, and its last record is 41 minutes old.
 {
   const t0 = now - 2 * 3600000;
@@ -196,9 +294,25 @@ append("s-fl-net", "inbox_opened", { ts_ms: now - 9 * MIN, ...inbox.find(e => e.
   startOf(sessionOf("s-tools"), t0, "Try the build, write the config, and read the log.");
   t = step("s-tools", t, { text: "Running the tests.", command: "make test", status: "error", out: "make: *** [test] Error 2", exit: 2 });
   t = step("s-tools", t, { command: "make lint", out: "lint: clean", exit: 0 });
+  t = step("s-tools", t, { command: "cargo test -p loom-agent recovery -- --nocapture 2>&1 | tail -n 40", args: { command: "cargo test -p loom-agent recovery -- --nocapture 2>&1 | tail -n 40", description: "Run the recovery tests" }, out: "test result: ok. 12 passed", exit: 0 });
+  t = step("s-tools", t, { name: "read", cls: "read", args: { absolute_path: "/fixture/loom/README.md" }, out: "# loom", ms: 4 });
+  t = step("s-tools", t, { name: "read", cls: "read", args: { target_file: "notes/empty.txt" }, out: "", ms: 4 });
+  // An operator message with two uploads and one inline copy, as the daemon records it.
+  {
+    // Written out here: the seed runs before the workspace trees exist, so attachmentBlock cannot read them yet.
+    const csv = "corpus,ms,notes\nsmall,412,warm\nlarge,9120,cold cache\nlarge,8740,warm";
+    const a = { block: "\n\nAttached files (saved read-only; read them with `read`):\n- /fixture/loom/.loom/uploads/report.csv (69 B, text/csv)\n- /fixture/loom/.loom/uploads/screen.png (226 KiB, image/png)\n\n`/fixture/loom/.loom/uploads/report.csv`:\n```csv\n" + csv + "\n```" };
+    append("s-tools", "user_message", { ts_ms: t, text: "These are the numbers and the screenshot from the failing run; compare them with the last build." + a.block, images: [SCREEN_REF] }, "user");
+    t += 1000;
+  }
   // Paths for the Files tab's "Open file": inside /fixture/loom (absolute and relative), the binary one, and one that is not there.
+  t = step("s-tools", t, { name: "read", cls: "read", args: { path: "/fixture/loom/.loom/uploads/screen.png" }, out: "[read · image · /fixture/loom/.loom/uploads/screen.png · 480x300 · " + SCREEN_REF.bytes + " B] The image is attached to this result.", images: [{ ...SCREEN_REF, name: "screen.png" }, ICON_REF], ms: 9 });
   t = step("s-tools", t, { name: "read", cls: "read", args: { path: "/fixture/loom/crates/loom-agent/src/runtime.rs", start: 1, end: 5 }, out: "//! runtime.rs: fixture source\n    // line 2 of runtime.rs", ms: 12 });
-  t = step("s-tools", t, { name: "edit", cls: "write", args: { path: "notes/no-newline.txt", old: "one", new: "two" }, out: "edited notes/no-newline.txt", ms: 9 });
+  // As the daemon records an edit: its facts line, the unified diff it applied, its end line (crates/loom-core admit.rs).
+  t = step("s-tools", t, { name: "edit", cls: "write", args: { path: "crates/loom-agent/src/runtime.rs", old: "timeout_ms: 30_000", new: "timeout_ms: 60_000" }, meta: { path: "/fixture/loom/crates/loom-agent/src/runtime.rs" }, ms: 9,
+    out: "[edit · edited · /fixture/loom/crates/loom-agent/src/runtime.rs · 2 replacements · 17 lines · out:cc8752638528652e]\n--- /fixture/loom/crates/loom-agent/src/runtime.rs\n+++ /fixture/loom/crates/loom-agent/src/runtime.rs\n@@ -1592,7 +1592,8 @@\n     let report = RecoveryReport {\n         outcome,\n-        report: text,\n+        report: text.clone(),\n+        summary: summarize(&text),\n         full: None,\n         steps,\n         usage: Usage::default(),\n@@ -2210,3 +2211,3 @@\n fn retry_policy() -> Policy {\n-    Policy { timeout_ms: 30_000, attempts: 3 }\n+    Policy { timeout_ms: 60_000, attempts: 3 }\n }\n[end of edit output · edited]" });
+  t = step("s-tools", t, { name: "write", cls: "write", args: { path: "notes/no-newline.txt", content: "one line without a final newline" }, meta: { path: "/fixture/loom/notes/no-newline.txt" }, ms: 6,
+    out: "[write · created · /fixture/loom/notes/no-newline.txt · 1 line]\n(new file)\n[end of write output · created]" });
   t = step("s-tools", t, { name: "read", cls: "read", args: { path: "target.bin" }, out: "(binary file)", ms: 4 });
   t = step("s-tools", t, { name: "read", cls: "read", args: { path: "src/removed.rs" }, status: "error", out: "no such file: src/removed.rs", ms: 4 });
   t = step("s-tools", t, { name: "write", cls: "write", args: { path: "/etc/hosts", text: "127.0.0.1 fixture" }, status: "denied", out: "denied: /etc/hosts is outside the sandbox's writable paths (the workspace and /tmp). Nothing was written." });
@@ -210,6 +324,39 @@ append("s-fl-net", "inbox_opened", { ts_ms: now - 9 * MIN, ...inbox.find(e => e.
   t = step("s-tools", t, { command: "cat build-unsized.log", cut: true, out: "build line 1\n[output cut]", output: { id: bigBlob, lines: 60000 }, meta: { shown: [[1, 1]] }, ms: 40 }); // no recorded size: the length is read from the route
   t = step("s-tools", t, { command: "make test", status: "error", out: "make: *** [test] Error 1", exit: 1 });
   append("s-tools", "turn_end", { ts_ms: t + 1000, reason: "waiting" }, "harness");
+}
+// s-mcp: two MCP calls (contract M8): a text result and an `isError` result, and the two servers GET /api/sessions/s-mcp/mcp lists.
+{
+  const id = "s-mcp"; const t0 = now - 50 * MIN; let t = t0 + 2 * MIN;
+  startOf(sessionOf(id), t0, "Find the open issues about retries and read the retry docs.");
+  // The session's tool names: 3 of github's and 1 of docs' are MCP tools (the Context tab counts them).
+  const tool = name => ({ name, description: name, parameters: { type: "object", properties: {} } });
+  logs.get(id)[0].tools = ["bash", "read", "edit", "write", "grep", "mcp__github__search_issues", "mcp__github__get_issue", "mcp__github__list_pulls", "mcp__docs__fetch_page"].map(tool);
+  const issues = ["#412 retry budget is not reset after a parked turn", "#397 backoff overflows after 31 attempts", "#388 retry on 429 ignores Retry-After", "#371 idempotent POSTs are retried without a key", "#365 retry count missing from the status line", "#350 jitter makes the recovery test flaky", "#344 retries hide the first error", "#339 no cap on total retry time", "#331 retry docs describe the old defaults", "#318 retry log lines lack the request id"];
+  t = step(id, t, { text: "Searching the tracker for retry issues.", name: "mcp__github__search_issues", cls: "exec", args: { query: "retry is:open", repo: "fixture/loom" }, ms: 840,
+    out: "[mcp__github__search_issues · ok · github · 12 lines · out:5c1e0a7d93b24f68]\n10 results for \"retry is:open\"\n" + issues.join("\n") });
+  t = step(id, t, { text: "Reading the retry docs.", name: "mcp__docs__fetch_page", cls: "exec", args: { path: "/missing" }, status: "error", ms: 310,
+    out: "[mcp__docs__fetch_page · error · docs · 1 line · out:9b04d2e6c7a15f30]\nPage not found: /missing" });
+  append(id, "turn_end", { ts_ms: t + 1000, reason: "waiting" }, "harness");
+}
+// GET /api/sessions/{id}/mcp (contract M7): the session's servers; s-mcp has two, every other session none.
+const MCP_SERVERS = {
+  "s-mcp": [
+    { server: "github", transport: "stdio", state: "running", tools: ["search_issues", "get_issue", "list_pulls"], error: null, stderr_tail: ["github-mcp 0.4.2 starting on stdio", "authenticated as fixture-bot", "warning: rate limit remaining 412"], list_changed: true, calls: 1, last_call_ms: now - 48 * MIN },
+    { server: "docs", transport: "http", state: "failed", tools: [], error: "connection refused: https://docs.fixture.invalid/mcp did not answer after 3 attempts", stderr_tail: [], list_changed: false, calls: 1, last_call_ms: now - 47 * MIN },
+  ],
+};
+// s-loop: a stuck model. Two different calls, then 60 identical failing `cargo build` calls, then a short run of 3 and a pair.
+{
+  const id = "s-loop"; const t0 = now - 3 * 3600000; let t = t0 + 2 * MIN;
+  startOf(sessionOf(id), t0, "Make the workspace build.");
+  t = step(id, t, { text: "Checking the tree first.", command: "ls", out: "Cargo.toml\ncrates", exit: 0 });
+  t = step(id, t, { command: "cat Cargo.toml", out: "[workspace]\nmembers = [\"crates/*\"]", exit: 0 });
+  const fail = "error[E0432]: unresolved import `loom_core::Missing`\n --> crates/loom-agent/src/lib.rs:3:5\nerror: could not compile `loom-agent` (lib) due to 1 previous error";
+  for (let i = 0; i < 60; i++) t = step(id, t, { command: "cargo build", status: "error", out: fail, exit: 101, ms: 900 });
+  for (let i = 0; i < 3; i++) t = step(id, t, { command: "cargo check", out: "Finished dev profile", exit: 0 });
+  for (let i = 0; i < 2; i++) t = step(id, t, { command: "cargo fmt --check", out: "", exit: 0 });
+  append(id, "turn_end", { ts_ms: t + 1000, reason: "waiting" }, "harness");
 }
 // s-big: 5,000 records (1,250 steps of request, response, call, result) with known needles for Find.
 {
@@ -232,15 +379,102 @@ append("s-fl-net", "inbox_opened", { ts_ms: now - 9 * MIN, ...inbox.find(e => e.
     append(id, "model_request", { ts_ms: t, req_id, step: i + 1, epoch: 1, purpose: "step", est_tokens: 300000 }, "harness");
     append(id, "model_response", { ts_ms: t + 3000, req_id, text, reasoning: "", tool_calls: [{ call_id, name: "bash", arguments: JSON.stringify({ command: `ls dir${i}` }), complete: true }], finish: "tool_calls", usage: { prompt_tokens: 300000, cached_tokens: 280000, completion_tokens: 40 }, timing: { ttft_ms: 400, total_ms: 3000 }, attempts: 1 }, "model");
     append(id, "tool_call", { ts_ms: t + 3100, call_id, req_id, name: "bash", args: { command: `ls dir${i}` }, class: "exec" }, "model");
-    append(id, "tool_result", { ts_ms: t + 3300, call_id, name: "bash", status: "ok", text: out, ...(cut ? { output: { id: blob, bytes: 128000, lines: 5000 } } : {}), cut, class: "exec", meta: { exit_code: 0 }, duration_ms: 200 }, "tool");
+    append(id, "tool_result", { ts_ms: t + 3300, call_id, name: "bash", status: "ok", text: out, ...(cut ? { output: { id: blob, bytes: 128000, lines: 5000 } } : {}), cut, class: "exec", meta: { exit_code: 0, ...(cut ? { shown: [[1, 40]] } : {}) }, duration_ms: 200 }, "tool");
   }
   append(id, "turn_end", { ts_ms: t0 + 10000 + 1250 * 15000, reason: "waiting" }, "harness");
+}
+
+// s-compacted: two compactions. #1 (size) has a note that cites real keys of this log and one key that does not exist (dropped);
+// #2 is a fresh start after the verifier objected, with an empty tail. Keys are the 16-hex prefixes of the stored handles.
+const CK = { test: "e134a0f0b4bf46c1", edit: "cc8752638528652e", grep: "5a1c3e7d90b2f648", log: "9f20d1c4a7b36e85" };
+const ckBlob = (k) => k + "0".repeat(48);
+const COMPACTION_TABLE_1 = [
+  "Outputs — read one with read(path: \"out:<key>\"); search everything with log_search",
+  `out:${CK.test} · bash · python3 public_sequence.py · exit 0 · 7 lines · step 3, 11-22 09:14`,
+  `out:${CK.edit} · edit · crates/loom-agent/src/runtime.rs · edited · +3 −2 · step 5`,
+  `out:${CK.grep} · grep · retry_after · 12 matches · step 6`,
+  "… 1,204 earlier outputs (steps 1–2) are not listed: search them with log_search.",
+  "Files changed by edit/write (shell commands are not tracked)",
+  `crates/loom-agent/src/runtime.rs · +3 −2 · 2 edits · last out:${CK.edit}`,
+  "Agents",
+  "s-fl-web · Solver: web build hooks · web_solver · finished · report out:5a1c3e7d90b2f648",
+  "Jobs still running",
+  "j4 · cargo test --workspace · since step 6",
+].join("\n");
+const COMPACTION_NOTE_1 = [
+  "## Goal", "- Make the retry path report its last error; the operator wants no change to the public API.", "",
+  "## State", `- Edited runtime.rs (out:${CK.edit}); p2 is doing; \`cargo test --workspace\` runs as j4.`, "",
+  "## Established", `- The sequence script exits 0 on the fixed build: out:${CK.test}.`, "",
+  "## Ruled out", `- The retry limit is not the cause: out:${CK.grep} lists every use, none caps below 3.`, "",
+  "## Tried, not settled", "- A cached-length check (see out:0123456789abcdef) [unknown key]", "",
+  "## Next", `- Read the log tail in out:${CK.log}, then finish p2.`,
+].join("\n");
+const COMPACTION_TABLE_2 = [
+  "Outputs — read one with read(path: \"out:<key>\"); search everything with log_search",
+  `out:${CK.log} · bash · tail -n 200 retry.log · exit 0 · 200 lines · step 14, 11-23 08:41`,
+  `out:${CK.edit} · edit · crates/loom-agent/src/runtime.rs · edited · +3 −2 · step 5`,
+  `out:${CK.test} · bash · python3 public_sequence.py · exit 0 · 7 lines · step 3`,
+  "Files changed by edit/write (shell commands are not tracked)",
+  `crates/loom-agent/src/runtime.rs · +3 −2 · 2 edits · last out:${CK.edit}`,
+].join("\n");
+{
+  const id = "s-compacted"; const t0 = now - 30 * 3600000; const H = 3600000;
+  startOf(sessionOf(id), t0, "Make the retry path report its last error, and keep notes.");
+  append(id, "turn_start", { ts_ms: t0 + 2000, trigger: "user" }, "harness");
+  let t = t0 + 10000;
+  const keyed = (k, lines, bytes) => ({ id: ckBlob(k), bytes, lines });
+  t = step(id, t, { command: "git status --short", out: "M crates/loom-agent/src/runtime.rs", exit: 0 });
+  t = step(id, t, { command: "cargo check -p loom-agent", out: "Finished dev profile", exit: 0 });
+  t = step(id, t, { command: "python3 public_sequence.py", out: "1\n2\n3\n4\n5\n6\n7\n[output cut: 7 lines stored]", cut: true, output: keyed(CK.test, 7, 420), exit: 0, meta: { shown: [[1, 7]] } });
+  t = step(id, t, { name: "read", cls: "read", args: { path: "crates/loom-agent/src/runtime.rs", start: 1594, end: 1599 }, out: lines.slice(1593, 1599).join("\n") });
+  t = step(id, t, { name: "edit", cls: "write", args: { path: "crates/loom-agent/src/runtime.rs" }, out: "edited crates/loom-agent/src/runtime.rs +3 −2", cut: true, output: keyed(CK.edit, 12, 900) });
+  t = step(id, t, { name: "grep", cls: "read", args: { pattern: "retry_after" }, out: "runtime.rs:1601: retry_after\n[output cut: 12 matches stored]", cut: true, output: keyed(CK.grep, 12, 1100) });
+  t = step(id, t, { command: "cargo test --workspace", out: "test result: ok", exit: 0 });
+  const upto1 = (logs.get(id) || []).length - 1 - 4; // the last step stays in view
+  append(id, "compaction", { ts_ms: t, epoch: 2, upto_seq: upto1, reason: "size", before_tokens: 312000, after_tokens_est: 38000, note: COMPACTION_NOTE_1, note_req: "fx-note-1", table: COMPACTION_TABLE_1, keys: [CK.test, CK.edit, CK.grep], dropped_keys: ["out:0123456789abcdef"], objections: null }, "harness");
+  t += 20000;
+  t = step(id, t + H, { command: "tail -n 200 retry.log", out: "retry 3 failed: connection reset\n[output cut: 200 lines stored]", cut: true, output: keyed(CK.log, 200, 15000), exit: 0, meta: { shown: [[1, 2]] } });
+  t = step(id, t, { command: "cargo test -p loom-agent retry", out: "test retry::reports_last_error ... FAILED", status: "error", exit: 101 });
+  t = step(id, t, { command: "cargo test -p loom-agent retry", out: "test result: ok", exit: 0 });
+  append(id, "model_response", { ts_ms: t, req_id: "fx-final", text: "The retry path reports its last error now.", reasoning: "", tool_calls: [], finish: "stop", usage: { prompt_tokens: 61000, cached_tokens: 52000, completion_tokens: 20 }, timing: { total_ms: 900 }, attempts: 1 }, "model");
+  append(id, "compaction", { ts_ms: t + 4000, epoch: 3, upto_seq: (logs.get(id) || []).length - 1, reason: "fresh_start", before_tokens: 118000, after_tokens_est: 22000, note: `## Goal\n- Report the last retry error.\n\n## Tried, not settled\n- The finish claimed the fix; the verifier rejected it (out:${CK.log}).\n\n## Next\n- Reproduce the failure with the test before claiming it again.`, note_req: "fx-note-2", table: COMPACTION_TABLE_2, keys: [CK.log, CK.edit, CK.test], dropped_keys: [], objections: "The finish cites no run of the failing test; the log tail in out:" + CK.log + " shows the error still occurs." }, "harness");
+  t = step(id, t + H, { command: "cargo test -p loom-agent retry -- --nocapture", out: "test result: ok. 1 passed", exit: 0 });
+  append(id, "turn_end", { ts_ms: t + 1000, reason: "waiting" }, "harness");
 }
 
 const ledger = { entries: 9, goal: "Find actionable reliability defects and preserve source evidence.", constraints: [{ id: "k1", text: "Read-only review." }], plan: [{ id: "p1", text: "Inspect recovery paths", status: "done", note: "Source finding recorded." }, { id: "p2", text: "Review tool execution", status: "doing" }, { id: "p3", text: "Independently verify findings", status: "todo" }], claims: [{ id: "c1", text: "Recovered reports may omit the answer.", status: "open", evidence: ["e1"], note: "Crash reproduction pending." }, { id: "c2", text: "Process tracking ends when the shell exits.", status: "supported", evidence: ["e2", "e3"] }], evidence: [{ id: "e1", supports: true, kind: "static", attested: true, quote: "full: None,", blob, lines: [1596, 1596], session: "s-audit", call_id: "read1", note: "Source text only." }, { id: "e2", supports: true, kind: "execution", attested: true, quote: "job settled (exit 0) while pid 4127 still running", blob, lines: [212, 214], session: "s-worker", call_id: "bash7" }, { id: "e3", supports: false, kind: "note", attested: false, quote: "a foreground pipeline was tracked to completion", note: "Only observed with a backgrounded child." }], obligations: [{ id: "o1", kind: "agent", text: "Recovery review", outcome: null }], decisions: [], dead_ends: [], questions: [] };
 
 // m-fleet keeps a ledger too: a six-step plan (two done, one doing) for the progress line, and an open claim.
 const fleetLedger = { entries: 14, goal: "Find where a release of the build pipeline could ship unverified.", constraints: [{ id: "k1", text: "Read-only: change nothing in the pipeline." }], plan: [{ id: "p1", text: "Inventory the dependencies", status: "done", note: "" }, { id: "p2", text: "Trace the release signing path", status: "done", note: "Signing key is out of the workspace." }, { id: "p3", text: "Audit the web build hooks", status: "doing", note: "" }, { id: "p4", text: "Check the registry mirrors", status: "todo", note: "" }, { id: "p5", text: "Re-check the release binary claims", status: "todo", note: "" }, { id: "p6", text: "Write up the findings", status: "todo", note: "" }], claims: [{ id: "c1", text: "build/sign.sh skips verification when verify=false.", status: "open", evidence: [], note: "Reproduction pending." }], evidence: [], obligations: [], decisions: [], dead_ends: [], questions: [{ id: "q2", text: "Is the signing key in the vault?", status: "open" }] };
+
+// Two claims that name hosts, with evidence that cites the calls above: c2 reached api.acme.test, c3 names admin.acme.test whose one request was refused.
+fleetLedger.evidence.push(
+  { id: "e10", supports: true, kind: "execution", attested: true, quote: '"role":"admin"', session: "s-fl-web", call_id: "fx-hs1", note: "Any caller can read another user." },
+  { id: "e11", supports: true, kind: "execution", attested: true, quote: "error: connection refused", session: "s-fl-web", call_id: "fx-hs2" },
+);
+fleetLedger.claims.push(
+  { id: "c2", text: "https://api.acme.test/v2/users returns another user's record, including its role, to any caller.", status: "supported", evidence: ["e10"], note: "" },
+  { id: "c3", text: "admin.acme.test answers without a login, and so does login.acme.test.", status: "open", evidence: ["e11"], note: "The one request to admin.acme.test was refused." },
+);
+
+// One target, `acme` (T1, T6, T7).
+const TARGETS = new Map([["acme", { name: "acme", scope: ["*.acme.test", "10.20.0.0/24"], exclude: ["pay.acme.test"], upstream_insecure: ["login.acme.test"], intercept_passthrough: [], notes: "Staging copy of the Acme shop. No load tests." }]]);
+const tnode = (id, kind, locator, status, parent, missions = [], evidence = [], findings = []) => ({ id, kind, locator, status, parent, missions, evidence, findings });
+const TARGET_NODES = [
+  tnode("n-dom", "domain", "acme.test", "tested", null, ["m-fleet", "m-audit"]),
+  tnode("n-www", "host", "www.acme.test", "tested", "n-dom", ["m-fleet"]),
+  tnode("n-api", "host", "api.acme.test", "finding", "n-dom", ["m-fleet"]),
+  tnode("n-login", "host", "login.acme.test", "tested", "n-dom", ["m-fleet"]),
+  tnode("n-admin", "host", "admin.acme.test", "deferred", "n-dom", ["m-audit"]),
+  tnode("n-docs", "host", "docs.acme.test", "not_seen", "n-dom"),
+  tnode("n-ip", "ip", "10.20.0.4", "untested", "n-api", ["m-fleet"]),
+  tnode("n-svc", "service", "10.20.0.4:8080/tcp", "tested", "n-ip", ["m-fleet"]),
+  tnode("n-ep1", "endpoint", "GET https://api.acme.test:443/v2/users/{id}", "finding", "n-api", ["m-fleet"], [blob], [{ claim: "c2", text: "Any caller can read another user's record.", status: "open", mission: "m-fleet", evidence: ["e10"] }]),
+  tnode("n-ep2", "endpoint", "POST https://login.acme.test:443/auth", "tested", "n-login", ["m-fleet"]),
+  tnode("n-ep3", "endpoint", "GET http://10.20.0.4:8080/health", "untested", "n-svc", ["m-fleet"]),
+];
+const targetCounts = () => { const c = { finding: 0, tested: 0, deferred: 0, untested: 0, not_seen: 0 }; for (const n of TARGET_NODES) c[n.status]++; return c; };
+
 const ledgers = new Map([["m-audit", ledger], ["m-fleet", fleetLedger]]);
 
 // GET /api/missions/{id}/score: the daemon's ScoreView, { mission, sessions: [{ session, role, parent, card }], total }.
@@ -330,12 +564,13 @@ const dirNode = (children = {}, extra = {}) => ({ kind: "dir", mtime: now - 3600
 const fileNode = (text, mtime = now - 7200000) => ({ kind: "file", mtime, text });
 const rustText = (name) => Array.from({ length: 140 }, (_, i) => i === 0 ? `//! ${name}: fixture source` : i % 9 === 0 ? `fn step_${i}() -> usize { ${i} }` : `    // line ${i + 1} of ${name}`).join("\n") + "\n";
 const bigLog = Array.from({ length: 20000 }, (_, i) => `2026-11-16T10:${String(Math.floor(i / 600) % 60).padStart(2, "0")}:${String(i % 60).padStart(2, "0")}Z INFO tick ${i + 1}${i === 12344 ? " needle: only in the loaded range" : ""}`).join("\n") + "\n";
+const SEED_CSV = "corpus,ms,notes\nsmall,412,warm\nlarge,9120,cold cache\nlarge,8740,warm\n";
 function loomTree() {
   return dirNode({
     "Cargo.toml": fileNode("[workspace]\nmembers = [\"crates/*\"]\n"),
     "README.md": fileNode("# loom\n\nA fixture workspace.\n\nA <b>line</b> with markup stays inert text.\n", now - 60000),
     ".gitignore": fileNode("target/\n"), ".env": fileNode("FIXTURE=1\n"),
-    ".loom": dirNode({ "oracle.key": fileNode("never listed\n") }, { harness: true }),
+    ".loom": dirNode({ "oracle.key": fileNode("never listed\n"), uploads: dirNode({ "report.csv": fileNode(SEED_CSV), "screen.png": { kind: "file", mtime: now - 3600000, binary: 231 * 1000 } }) }, { harness: true }),
     crates: dirNode({
       "loom-agent": dirNode({ src: dirNode({ "runtime.rs": fileNode(rustText("runtime.rs")), "session.rs": fileNode(rustText("session.rs")), "pack.rs": fileNode(rustText("pack.rs")) }) }),
       "loom-core": dirNode({ src: dirNode({ "ledger.rs": fileNode(rustText("ledger.rs")), "event.rs": fileNode(rustText("event.rs")) }) }),
@@ -435,7 +670,7 @@ function wsResolve(id, rel) {
   const pieces = raw.split("/").filter((p) => p && p !== ".");
   if (pieces.includes("..")) return { status: 409, error: `The path ${raw} uses \`..\`. Paths are relative to the workspace and stay inside it.` };
   const text = pieces.join("/");
-  if (pieces[0] && pieces[0].toLowerCase() === ".loom") return { status: 409, error: `${text} is not shown: harness files are not shown.` };
+  if (pieces[0] && pieces[0].toLowerCase() === ".loom" && !(pieces[0] === ".loom" && pieces[1] === "uploads")) return { status: 409, error: `${text} is not shown: harness files are not shown.` };
   let node = root;
   for (const part of pieces) {
     node = node.kind === "dir" ? (node.children || {})[part] : null;
@@ -480,12 +715,66 @@ function filesLines(id, rel, start, count) {
   const text = first > total ? "" : lines.slice(first - 1, last).join("");
   return { value: { path: r.text, text, first, last, total, total_lines: total, bytes: size, mtime_ms, binary: false } };
 }
+
+// File uploads (docs/UPLOADS.md): stored in memory at <workspace>/.loom/uploads/<name>; the attachment block is the daemon's text.
+const UPLOAD_MAX = 32 * 1024 * 1024;
+const MIME = { csv: "text/csv", txt: "text/plain", md: "text/markdown", json: "application/json", png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", pdf: "application/pdf", rs: "text/x-rust", log: "text/plain" };
+const unitSize = (n) => { // the daemon's texts::file_size, which matches the UI's byteSize
+  if (n < 1024) return `${n} B`;
+  const u = ["KiB", "MiB", "GiB"]; let x = n / 1024, i = 0;
+  while (x >= 1024 && i < u.length - 1) { x /= 1024; i++; }
+  return `${x >= 100 ? Math.round(x) : x.toFixed(1)} ${u[i]}`;
+};
+function uploadsDir(ws, make) {
+  let root = wsRoots.get(ws);
+  if (!root) { if (!make) return null; root = dirNode(); wsRoots.set(ws, root); }
+  root.children[".loom"] = root.children[".loom"] || dirNode({}, { harness: true });
+  const loom = root.children[".loom"];
+  if (!loom.children.uploads) { if (!make) return null; loom.children.uploads = dirNode(); }
+  return loom.children.uploads;
+}
+function storeUpload(ws, rawName, buf, given) {
+  let name = String(rawName).split(/[\\/]/).pop().replace(/[\u0000-\u001f\u007f]/g, "_").replace(/^\.+/, "");
+  name = Buffer.from(name).subarray(0, 120).toString();
+  if (!name) return { status: 400, error: "The upload needs a file name: pass ?name=<file name>." };
+  const dir = uploadsDir(ws, true);
+  const dot = name.lastIndexOf(".");
+  const stem = dot > 0 ? name.slice(0, dot) : name, ext = dot > 0 ? name.slice(dot) : "";
+  let stored = name;
+  for (let n = 2; dir.children[stored]; n++) stored = `${stem}-${n}${ext}`;
+  let text = null;
+  try { text = new TextDecoder("utf-8", { fatal: true }).decode(buf); if (text.includes("\u0000")) text = null; } catch { text = null; }
+  dir.children[stored] = text !== null ? fileNode(text, Date.now()) : { kind: "file", mtime: Date.now(), binary: buf.length };
+  const mime = given && given !== "application/octet-stream" ? given : MIME[ext.slice(1).toLowerCase()] || (text !== null ? "text/plain" : "application/octet-stream");
+  return { status: 201, value: { path: `${ws}/.loom/uploads/${stored}`, name: stored, bytes: buf.length, mime } };
+}
+/** The attachment block the daemon appends to the text, or {error}. */
+function attachmentBlock(ws, paths) {
+  if (paths === undefined || (Array.isArray(paths) && paths.length === 0)) return { block: "" };
+  if (!Array.isArray(paths)) return { error: "attachments must be a list of paths." };
+  const dir = uploadsDir(ws, false);
+  const list = [], inline = [];
+  for (const p of paths) {
+    const prefix = `${ws}/.loom/uploads/`;
+    const name = typeof p === "string" && p.startsWith(prefix) ? p.slice(prefix.length) : "";
+    const node = name && !name.includes("/") && dir ? dir.children[name] : null;
+    if (!node || node.kind !== "file") return { error: `Attach files with POST /api/uploads first; ${p} is not an upload of this workspace.` };
+    const bytes = nodeSize(node);
+    const ext = name.includes(".") ? name.split(".").pop().toLowerCase() : "";
+    const mime = MIME[ext] || (node.binary ? "application/octet-stream" : "text/plain");
+    list.push(`- ${p} (${unitSize(bytes)}, ${mime})`);
+    if (!node.binary && bytes <= 16384) inline.push(`\`${p}\`:\n\`\`\`${ext}\n${node.text.replace(/\n$/, "")}\n\`\`\``);
+  }
+  return { block: "\n\nAttached files (saved read-only; read them with `read`):\n" + list.join("\n") + (inline.length ? "\n\n" + inline.join("\n\n") : "") };
+}
 let createdSessions = 0;
 async function createSession(data) {
   const raw = String(data.workspace || "").trim();
   if (!raw) return { status: 400, error: "A workspace is required." };
   if (data.create_workspace !== undefined && typeof data.create_workspace !== "boolean") return { status: 400, error: "create_workspace must be true or false." };
   const path = cleanPath(expandHome(raw));
+  const attached = attachmentBlock(path, data.attachments);
+  if (attached.error) return { status: 400, error: attached.error };
   if (!path.startsWith("/")) return { status: 409, error: `The workspace ${raw} is a relative path that does not exist. Give an absolute path, or one that starts with ~/.` };
   if (inside(path, LOOM_HOME)) return { status: 409, error: `The workspace ${path} is inside the loom home (${LOOM_HOME}) or its copies folder, which sessions cannot use. Choose a folder elsewhere.` };
   // As the daemon does, the earlier missions to recall are checked before any folder is made.
@@ -505,7 +794,7 @@ async function createSession(data) {
   const info = session(id, String(data.title || "").trim() || String(data.message || "New mission").split("\n")[0].slice(0, 60), { phase: "idle", last_end: "waiting", workspace: path, profile: data.model && profileOf(data.model) ? data.model : "dsv41", mission: "m-" + id, age: 0 });
   sessions.push(info);
   append(id, "session_start", { session: id, mission: info.mission, parent: null, workspace: path, pack: info.pack, role: info.role, termination: "explicit", model: modelRef(profileOf(info.profile)), budget: {}, reasoning_replay: "all", tools: [] }, "harness", false);
-  append(id, "user_message", { text: data.message }, "user");
+  append(id, "user_message", { text: String(data.message || "") + attached.block }, "user");
   emit({ type: "session", info });
   return { status: 201, value: { ...info, created } };
 }
@@ -519,13 +808,15 @@ const PART_COUNT = { tools: 42, rules: 2, assignment: 0, conversation: 96, tool_
 function windowFor(info) {
   const st = (info && info.status) || {};
   const id = info ? info.id : "";
+  const compacted = id === "s-compacted";
   const win = id === "s-notify" ? null : info && info.context_window ? info.context_window : 262144;
   const counted = id !== "s-quiet";
   const total = id === "s-parked" ? 120000 : Math.max(20000, st.prompt_tokens || 148812);
   const ratio = 3.3;
   // The characters are kept in proportion to the size the session has, at about 3.6 characters a token when counted.
   const mult = (total * (counted ? 3.6 : ratio)) / Object.values(PART_CHARS).reduce((a, b) => a + b, 0);
-  const chars = Object.fromEntries(Object.entries(PART_CHARS).map(([k, c]) => [k, Math.round(c * mult)]));
+  const partChars = compacted ? { ...PART_CHARS, resume: 0, stubs: 0, compaction: 41000 } : PART_CHARS;
+  const chars = Object.fromEntries(Object.entries(partChars).map(([k, c]) => [k, Math.round(c * mult)]));
   const raw = Object.fromEntries(Object.entries(chars).map(([k, c]) => [k, Math.ceil(c / ratio)]));
   const hudChars = 2310;
   const rawHud = Math.ceil(hudChars / ratio);
@@ -556,7 +847,7 @@ function windowFor(info) {
     breakdown: { basis: measured ? "scaled_to_measured" : "default_ratio", chars_per_token: measured ? Math.round(ratio / factor * 100) / 100 : ratio, total_tokens: sum, segments },
     measured_now: measured,
     last_request: { req_id: "r-41", step: 41, epoch: 3, n_messages: 120, est_tokens: estTotal, prompt_tokens: lastPrompt, cached_tokens: id === "s-parked" ? 0 : counted ? Math.round(lastPrompt * 0.88) : 0, hud_bytes: hudChars },
-    fold_at: id === "s-parked" ? 100000 : foldAt, fold_to: id === "s-parked" ? 60000 : foldTo,
+    ...(compacted ? { compact_at: Math.min(400000, Math.floor(win * 0.4)) } : { fold_at: id === "s-parked" ? 100000 : foldAt, fold_to: id === "s-parked" ? 60000 : foldTo }),
   };
 }
 
@@ -565,6 +856,53 @@ const server = createServer(async (req, res) => {
     const url = new URL(req.url, "http://localhost");
     const path = url.pathname;
     if (path === "/__fixture/state") return json(res, { requests, inbox, scoreCalls });
+    const exchangesMatch = path.match(/^\/api\/exchanges\/([^/]+)$/);
+    if (exchangesMatch && req.method === "GET") {
+      const host = url.searchParams.get("host"); const after = Number(url.searchParams.get("after") ?? -1); const limit = Number(url.searchParams.get("limit") || 500);
+      return json(res, (EXCHANGES.get(decodeURIComponent(exchangesMatch[1])) || []).filter(x => (!host || x.host === host)).slice(0, limit));
+    }
+    if (path === "/api/targets" && req.method === "GET") return json(res, [...TARGETS.values()].map(t => ({ ...t, counts: targetCounts() })));
+    if (path === "/api/targets" && req.method === "POST") { const b = await body(req); TARGETS.set(b.name, { upstream_insecure: [], intercept_passthrough: [], notes: "", exclude: [], ...b }); return json(res, TARGETS.get(b.name), 201); }
+    const targetMatch = path.match(/^\/api\/targets\/([^/]+)(?:\/(graph|exchanges))?$/);
+    if (targetMatch) {
+      const name = decodeURIComponent(targetMatch[1]);
+      if (!TARGETS.has(name)) return json(res, { error: "No such target." }, 404);
+      if (targetMatch[2] === "graph") {
+        const status = url.searchParams.get("status"); const kind = url.searchParams.get("kind");
+        const nodes = TARGET_NODES.filter(n => (!status || n.status === status) && (!kind || n.kind === kind));
+        return json(res, { nodes, edges: TARGET_NODES.filter(n => n.parent).map(n => ({ kind: "parent", from: n.id, to: n.parent })) });
+      }
+      if (targetMatch[2] === "exchanges") {
+        const n = TARGET_NODES.find(x => x.id === url.searchParams.get("node"));
+        const host = n ? n.locator.replace(/^[A-Z]+ https?:\/\//, "").replace(/[:/].*$/, "") : "";
+        return json(res, [...EXCHANGES.values()].flat().filter(x => x.host === host));
+      }
+      if (req.method === "PUT") { const b = await body(req); TARGETS.set(name, { ...TARGETS.get(name), ...b, name }); return json(res, TARGETS.get(name)); }
+      return json(res, { ...TARGETS.get(name), counts: targetCounts() });
+    }
+    const imageMatch = path.match(/^\/api\/images\/([0-9a-f]+)$/);
+    if (imageMatch && req.method === "GET") {
+      const bytes = IMAGES.get(imageMatch[1]);
+      if (!bytes) return json(res, { error: "No such image." }, 404);
+      res.writeHead(200, { "content-type": "image/png", "cache-control": "private, max-age=31536000, immutable" });
+      return res.end(bytes);
+    }
+    const queuedMatch = path.match(/^\/api\/sessions\/([^/]+)\/queued(?:\/([^/]+)(\/send)?)?$/);
+    if (queuedMatch) {
+      const sid = decodeURIComponent(queuedMatch[1]); const qid = queuedMatch[2] && decodeURIComponent(queuedMatch[2]);
+      if (!sessions.find(x => x.id === sid)) return json(res, { error: "No such fixture session." }, 404);
+      if (!qid && req.method === "GET") return json(res, queuedOf(sid));
+      const item = qid && queuedOf(sid).find(q => q.id === qid);
+      if (qid && !item) return json(res, { error: `Message ${qid} is no longer queued.` }, 404);
+      if (qid && req.method === "PUT") { item.text = String((await body(req)).text ?? ""); emitQueued(sid); return json(res, item); }
+      if (qid && req.method === "DELETE") { queued.set(sid, queuedOf(sid).filter(q => q !== item)); emitQueued(sid); return json(res, {}, 202); }
+      if (qid && queuedMatch[3] && req.method === "POST") {
+        queued.set(sid, queuedOf(sid).filter(q => q !== item)); emitQueued(sid);
+        append(sid, "user_message", { text: item.text }, "user", true);
+        return json(res, {}, 202);
+      }
+      return json(res, { error: "Not a queued-message route." }, 405);
+    }
     const scoreMatch = path.match(/^\/api\/missions\/([^/]+)\/score$/);
     if (scoreMatch && req.method === "GET") {
       scoreCalls++;
@@ -614,8 +952,21 @@ const server = createServer(async (req, res) => {
     }
     if (req.method === "POST" && path === "/api/web-sessions") {
       const data = await body(req); requests.push({ path, body: data });
-      if (data.code !== "fixture") return json(res, { error: "That login code is not valid. Run `loom login` for a new one." }, 401);
+      if (data.code !== LOGIN_CODE) return json(res, { error: "Missing or wrong access token. Run `loom open`, or send the token in ~/.loom/token as a Bearer token." }, 401);
       return json(res, { secret: "fixture-secret" });
+    }
+    if (req.method === "POST" && path === "/api/uploads") {
+      const chunks = []; let size = 0;
+      for await (const chunk of req) { size += chunk.length; if (size <= UPLOAD_MAX) chunks.push(chunk); }
+      const ws = url.searchParams.get("workspace"), name = url.searchParams.get("name");
+      requests.push({ path, workspace: ws, name, bytes: size });
+      if (size > UPLOAD_MAX) return json(res, { error: `That file is ${Math.ceil(size / 1048576)} MiB, more than the 32 MiB an upload may be.` }, 413);
+      if (!ws || !ws.startsWith("/") || !name) return json(res, { error: "Give ?workspace=<absolute path>&name=<file name>." }, 400);
+      if (inside(cleanPath(ws), LOOM_HOME)) return json(res, { error: `The workspace ${ws} is inside the loom home (${LOOM_HOME}), which sessions cannot use. Choose a folder elsewhere.` }, 409);
+      if (fsDirs(cleanPath(ws)) === null) return json(res, { error: `There is no folder ${ws}.` }, 404);
+      await wait(400);
+      const r = storeUpload(cleanPath(ws), name, Buffer.concat(chunks), req.headers["content-type"] || "");
+      return r.error ? json(res, { error: r.error }, r.status) : json(res, r.value, r.status);
     }
     if (req.method === "POST" && path.startsWith("/api/")) {
       const data = await body(req); requests.push({ path, body: data });
@@ -628,6 +979,13 @@ const server = createServer(async (req, res) => {
       }
       const id = parts[3]; const info = sessions.find(s => s.id === id);
       if (!info) return json(res, { error: "No such fixture session." }, 404);
+      if (parts[4] === "role-model") {
+        const view = missionModels(id);
+        const ch = roleChoices.get(view.mission) || { any: null, roles: new Map() };
+        if (data.role === "*") ch.any = data.profile || null; else ch.roles.set(data.role, data.profile || null);
+        roleChoices.set(view.mission, ch);
+        return json(res, { switched: [], models: missionModels(id) });
+      }
       if (parts[4] === "model") {
         // The daemon refuses to re-seat a finished session (Runtime::switch); so does the fixture.
         if (info.status.phase === "ended") return json(res, { error: `Session ${id} has ended, so its model no longer changes.` }, 409);
@@ -642,18 +1000,32 @@ const server = createServer(async (req, res) => {
         return json(res, { session: id, model: modelRef(target), live });
       }
       if (parts[4] === "messages") {
-        await wait(2500); append(id, "user_message", { text: data.text }, "user", true); append(id, "model_request", { req_id: "fixture-delivery", purpose: "step", step: 49 }, "harness", true);
-      } else if (parts[4] === "reweave") {
-        if (info.status.phase === "ended") return json(res, { error: `Session ${id} has ended, so there is nothing to re-weave.` }, 409);
+        if (data.when === "after_turn") {
+          const item = { id: "q" + (++queuedN), text: String(data.text || ""), attachments: data.attachments || [], created_ms: Date.now() };
+          queued.set(id, [...queuedOf(id), item]); emitQueued(id);
+          return json(res, { queued: item }, 202); // the daemon answers the whole queued message
+        }
+        const attached = attachmentBlock(info.workspace, data.attachments);
+        if (attached.error) return json(res, { error: attached.error }, 400);
+        await wait(2500); append(id, "user_message", { text: String(data.text || "") + attached.block }, "user", true); append(id, "model_request", { req_id: "fixture-delivery", purpose: "step", step: 49 }, "harness", true);
+      } else if (parts[4] === "compact" || parts[4] === "reweave") {
+        if (info.status.phase === "ended") return json(res, { error: `Session ${id} has ended, so there is nothing to compact.` }, 409);
         await wait(400);
         const log = logs.get(id) || [];
-        append(id, "reweave", { epoch: info.status.epoch + 1, upto_seq: Math.max(0, log.length - 1), evictions: [], brief: "Fixture re-weave: older outputs became stubs; the ledger snapshot follows.", digest: null, reason: "operator", before_tokens: info.status.prompt_tokens, after_tokens_est: 30000 }, "harness", true);
+        // The newest stored outputs of this log are what the note and the table cite.
+        const outs = log.filter(r => r.kind === "tool_result" && r.output && r.output.id).slice(-3).reverse();
+        const key = (r) => r.output.id.slice(0, 16);
+        const table = outs.length ? ["Outputs — read one with read(path: \"out:<key>\"); search everything with log_search", ...outs.map(r => `out:${key(r)} · ${r.name} · ${r.output.lines} lines · step ${r.call_id}`)].join("\n") : "";
+        const note = `## Goal\n- Fixture compaction asked by the operator.\n\n## State\n${outs.length ? outs.map(r => `- see out:${key(r)}`).join("\n") : "- nothing stored yet"}\n\n## Next\n- Carry on.`;
+        append(id, "compaction", { epoch: info.status.epoch + 1, upto_seq: Math.max(0, log.length - 1), reason: "operator", before_tokens: info.status.prompt_tokens, after_tokens_est: 30000, note, note_req: "fx-note-op", table, keys: outs.map(key), dropped_keys: [], objections: null }, "harness", true);
         info.status = { ...info.status, epoch: info.status.epoch + 1 };
       } else if (parts[4] === "stop") { await wait(500); info.status = { ...info.status, phase: "idle", last_end: "stopped" }; }
       else if (parts[4] === "resume") info.status = { ...info.status, phase: "running", last_end: null };
       else if (parts[4] === "archive") info.archived = data.archived;
       emit({ type: "status", session: id, status: info.status }); return json(res, {}, 202);
     }
+    const modelsMatch = path.match(/^\/api\/sessions\/([^/]+)\/models$/);
+    if (modelsMatch && req.method === "GET") { const v = missionModels(decodeURIComponent(modelsMatch[1])); return v ? json(res, v) : json(res, { error: "No such fixture session." }, 404); }
     if (path === "/api/fs/dirs") { const r = fsListing(url.searchParams.get("path")); return r.error ? json(res, { error: r.error }, r.status) : json(res, r.value); }
     const filesMatch = path.match(/^\/api\/sessions\/([^/]+)\/files(\/lines)?$/);
     if (filesMatch && req.method === "GET") {
@@ -672,14 +1044,32 @@ const server = createServer(async (req, res) => {
     if (path === "/api/inbox") return json(res, inbox);
     if (path === "/api/status") return json(res, { version: "fixture", pid: 0, started_ms: now, bind: "127.0.0.1:7878", proxy_port: 0, home: "/fixture/home", sandbox: "seatbelt", network: "allowlist", disk: { free_bytes: 200e9, total_bytes: 500e9 }, models: profiles, sessions_total: sessions.length, sessions_active: sessions.filter(s => s.active).length, sessions_running: sessions.filter(s => s.status.phase === "running").length, inbox_open: inbox.length });
     if (path === "/api/models") return json(res, { default_model: "dsv41", models: profiles });
-    if (path.endsWith("/records")) { const after = Number(url.searchParams.get("after") ?? -1); return json(res, { records: (logs.get(path.split("/")[3]) || []).filter(r => r.seq > after), next_after: null }); }
+    if (path.endsWith("/records")) {
+      // The daemon's paging: `after` pages forward (next_after), `before` pages backward (the last n before seq, oldest first, prev_before).
+      const log = logs.get(path.split("/")[3]) || [];
+      const q = url.searchParams;
+      const limit = q.has("limit") ? Math.max(1, Math.min(5000, Number(q.get("limit")) || 500)) : 1000000;
+      if (q.has("after") && q.has("before")) return json(res, { error: "Give after or before, not both." }, 400);
+      if (q.has("before")) {
+        const before = Number(q.get("before"));
+        const older = log.filter(r => r.seq < before);
+        const page = older.slice(-limit);
+        return json(res, { records: page, prev_before: page.length && page[0].seq > 0 ? page[0].seq : null });
+      }
+      const after = Number(q.get("after") ?? -1);
+      const rest = log.filter(r => r.seq > after);
+      const page = rest.slice(0, limit);
+      return json(res, { records: page, next_after: rest.length > page.length ? page[page.length - 1].seq : null });
+    }
     if (path.endsWith("/ledger")) return json(res, { state: ledgers.get(decodeURIComponent(path.split("/")[3] || "")) || { entries: 0 }, markdown: "" });
     if (path.endsWith("/window")) return json(res, windowFor(sessions.find(x => x.id === decodeURIComponent(path.split("/")[3] || ""))));
     if (path.endsWith("/net")) return json(res, []);
+    if (/^\/api\/sessions\/[^/]+\/mcp$/.test(path)) return json(res, MCP_SERVERS[decodeURIComponent(path.split("/")[3])] || []);
     const rawMatch = path.match(/^\/api\/blobs\/([^/]+)\/raw$/);
     if (rawMatch) {
       // The whole stored output, as the daemon's blob_raw sends it (an attachment of bytes with a length).
-      const bytes = Buffer.from(decodeURIComponent(rawMatch[1]) === bigBlob ? "x".repeat(3 * 1024 * 1024 - 1) + "\n" : lines.join("\n") + "\n");
+      const exText = EXBLOBS.get(decodeURIComponent(rawMatch[1]));
+      const bytes = Buffer.from(exText !== undefined ? exText : decodeURIComponent(rawMatch[1]) === bigBlob ? "x".repeat(3 * 1024 * 1024 - 1) + "\n" : lines.join("\n") + "\n");
       res.writeHead(200, { "content-type": "application/octet-stream", "content-length": bytes.length, "content-disposition": 'attachment; filename="out-fixture"' });
       return res.end(bytes);
     }
@@ -688,7 +1078,7 @@ const server = createServer(async (req, res) => {
       const last = Math.min(lines.length, first + 4999, Number(url.searchParams.get("end") || first + 999));
       return json(res, { text: lines.slice(first - 1, last).join("\n") + "\n", first, last, total: lines.length });
     }
-    const assets = { "/": ["index.html", "text/html"], "/app.js": ["app.js", "text/javascript"], "/core.js": ["core.js", "text/javascript"], "/style.css": ["style.css", "text/css"] };
+    const assets = { "/": ["index.html", "text/html"], "/app.js": ["app.js", "text/javascript"], "/core.js": ["core.js", "text/javascript"], "/style.css": ["style.css", "text/css"], "/favicon.svg": ["favicon.svg", "image/svg+xml"] };
     if (!assets[path]) return json(res, { error: "No such fixture route." }, 404);
     const [file, type] = assets[path];
     res.writeHead(200, { "content-type": type + "; charset=utf-8", "cache-control": "no-store", "content-security-policy": "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'" });
@@ -698,6 +1088,6 @@ const server = createServer(async (req, res) => {
 const port = Number(process.argv[2] || 8766);
 server.listen(port, "127.0.0.1", () => {
   const base = `http://127.0.0.1:${server.address().port}`;
-  console.log(`UI fixtures: ${base}/#code=fixture (then /#/s/s-audit)`);
+  console.log(`UI fixtures: ${base}/#code=${LOGIN_CODE} (then /#/s/s-audit)`);
   console.log(`Fixture routes: GET /__fixture/state; POST /__fixture/question, /__fixture/reconnect, /__fixture/stream (a live reply, a running work group and its ticking label in s-other: curl -X POST ${base}/__fixture/stream)`);
 });

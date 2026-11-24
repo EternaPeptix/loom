@@ -6,10 +6,19 @@
 //! Pack-enabled command guards reject known interactive/unbounded patterns before a spawn. They
 //! are hygiene checks rather than shell containment; arbitrary scripts remain subject to sandbox,
 //! output, cancellation and time limits. Optional idle_timeout_s terminates a silent foreground call.
+//! `description` (optional string) labels the call for whoever reads the transcript (the trained
+//! dialect's `description`); it is accepted and never read here, and has no effect on running.
 //! 1. `cwd`: `ctx.sandbox.resolve`, must be an existing directory (else an error sentence); default
-//!    `ctx.workspace`.
-//! 2. `ctx.jobs.allocate()`, then `proc::spawn` with the script exactly as given, environment
-//!    `ctx.sandbox.env(<this process's environment>)` overlaid with `ctx.env`.
+//!    the session's shell directory (`ctx.shell`, a [`ShellState`]) when it is set and still a
+//!    directory, else `ctx.workspace`. When it was set and is no longer a directory the call runs in
+//!    the workspace, the state is cleared and the result has the fact `shell directory reset to the
+//!    workspace ({old} no longer exists)`. A `box_exec` launch uses neither.
+//! 2. `ctx.jobs.allocate()`, then `proc::spawn` with the script as given after the prefix
+//!    `trap 'pwd -P >| "$LOOM_SHELL_CWD" 2>/dev/null' EXIT; ` (same line, so line numbers in shell
+//!    errors are the script's), environment `ctx.sandbox.env(<this process's environment>)` overlaid
+//!    with `ctx.env` and `LOOM_SHELL_CWD` = `{tmp_dir}/.shell-cwd-{job id}`. Neither the prefix nor the
+//!    variable is used for `background` or a launch. A script that sets its own EXIT trap just does not
+//!    move the shell directory.
 //! 3. `background: true` → `ctx.jobs.register(...)` and return at once: outcome
 //!    `started as job {id}`, body `(running in the background — job_wait("{id}") returns its output)`,
 //!    meta `META_JOB`.
@@ -29,6 +38,13 @@
 //!      writing through a grace period); status `Error`, outcome `stopped: output passed {limit}
 //!      bytes`, the first `{limit}` bytes of the output (a fact gives the file's true size). No output
 //!      is ever read back beyond `max_output_bytes`.
+//!    - After a foreground call that ended by exit status or signal (not a timeout, not cancelled, not
+//!      one that became a job, not `background`) the `LOOM_SHELL_CWD` file is read (trimmed, absolute,
+//!      a directory) and deleted. When the directory differs from where the call started, it becomes
+//!      the shell directory, the result has the fact `cwd now {dir}` (relative to the workspace when
+//!      inside it, `.` for the workspace itself, else absolute) and meta `cwd` (`META_CWD`, absolute).
+//!      A call that ends where it started (so a `cwd` given for one call without a `cd`) leaves the
+//!      state alone. Read tracking uses the directory the call started in.
 //!    - ended while other processes of its group still run, and they are still there after a short
 //!      settle window (`GROUP_SETTLE`, for helpers bash does not wait for) → the leader's status in
 //!      the outcome and the output so far, and the rest continues as a job (fact with the job id,
@@ -81,17 +97,22 @@
 //! promotes to a job and `job_wait` then returns only the rest; `background`; cancel; output limit;
 //! job tools incl. unknown id; a long output is stored whole and the result is a cut with a handle;
 //! `wake_on` on a background call and on a promoted one (the watch starts after what was shown), a
-//! refused pattern runs nothing, `job_list` names the watch.
+//! refused pattern runs nothing, `job_list` names the watch; the shell directory: `cd` persists across
+//! calls, a removed directory resets with the fact, `exit 3` after `cd` still moves it, a timeout / a
+//! job / `background` does not, `cwd` given then `cd` moves it, a plain `cwd` does not, error line
+//! numbers are unchanged, a script's own EXIT trap disables it (and the session restores it from the
+//! log: `session::tests`).
 
 use crate::jobs::{JobState, JobView, Watch};
 use crate::proc::{self, Ended, Running, Spawn, WaitEnd};
 use crate::{params, Body, Tool, ToolCtx, ToolOutput};
 use async_trait::async_trait;
 use loom_core::config::SandboxMode;
-use loom_core::event::{ToolClass, ToolSpec, ToolStatus, META_EXIT_CODE, META_JOB, META_SIGNAL};
+use loom_core::event::{ToolClass, ToolSpec, ToolStatus, META_CWD, META_EXIT_CODE, META_JOB, META_SIGNAL};
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Shown when a command failed under the seatbelt profile with a permission error.
@@ -101,15 +122,66 @@ const SANDBOX_REMINDER: &str = "sandboxed: writes only under the workspace and t
 /// what is left of it is handed over as a job.
 const GROUP_SETTLE: Duration = Duration::from_millis(200);
 
+/// The session's shell directory: where a `bash` call without `cwd` runs. `None` until a call has
+/// left the shell somewhere (then the workspace is used).
+#[derive(Debug, Default)]
+pub struct ShellState {
+    cwd: Mutex<Option<PathBuf>>,
+}
+
+impl ShellState {
+    /// The directory the shell was left in, if one is set.
+    pub fn get(&self) -> Option<PathBuf> {
+        self.cwd.lock().ok().and_then(|g| g.clone())
+    }
+
+    /// Sets (or, with `None`, clears) the shell directory.
+    pub fn set(&self, dir: Option<PathBuf>) {
+        if let Ok(mut g) = self.cwd.lock() {
+            *g = dir;
+        }
+    }
+}
+
+/// What a call says about the shell directory, applied to its result.
+#[derive(Default)]
+struct ShellNote {
+    /// Facts for the result header, in order.
+    facts: Vec<String>,
+    /// Meta `cwd`: the directory the call left the shell in.
+    cwd: Option<String>,
+}
+
+/// The command as it is run: it records where it ends in `$LOOM_SHELL_CWD`. On the script's first line,
+/// so that the line numbers of shell errors stay the script's own.
+fn with_cwd_trap(script: &str) -> String {
+    format!("trap 'pwd -P >| \"$LOOM_SHELL_CWD\" 2>/dev/null' EXIT; {script}")
+}
+
+/// Reads and deletes the file the exit trap wrote: an absolute path of an existing directory.
+fn take_shell_cwd(path: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(path).ok();
+    let _ = std::fs::remove_file(path);
+    let dir = PathBuf::from(text?.trim());
+    (dir.is_absolute() && dir.is_dir()).then_some(dir)
+}
+
+/// A directory as the header names it: relative to the workspace when inside it, `.` for the workspace.
+fn dir_text(workspace: &Path, dir: &Path) -> String {
+    match dir.strip_prefix(workspace) {
+        Ok(rel) if rel.as_os_str().is_empty() => ".".to_string(),
+        Ok(rel) => rel.display().to_string(),
+        Err(_) => dir.display().to_string(),
+    }
+}
+
 /// Milliseconds as seconds with one decimal.
 fn secs_text(ms: u64) -> String {
     format!("{}.{}", ms / 1000, (ms % 1000) / 100)
 }
 
 fn missing_job() -> ToolOutput {
-    ToolOutput::error(
-        "No job id was given. Call the tool again with `job` set to a job id such as `j1` (job_list shows them).",
-    )
+    ToolOutput::error("Give `job`, the id of the job to wait for, for example `j1`. Nothing was executed.")
 }
 
 fn add_ended_meta(out: ToolOutput, ended: &Ended) -> ToolOutput {
@@ -184,15 +256,16 @@ impl Tool for Bash {
     fn spec(&self) -> ToolSpec {
         params::spec(
             "bash",
-            "Run a shell command with bash and return what it printed. stdout and stderr are captured together, in the order they were written. The complete output is always stored: when it is long you are shown its start and end, with a marker that says exactly which lines are missing and how to read them (out_read, out_grep). The result header gives the exit status. Each call starts a new shell in the workspace directory, so `cd` and variables do not carry over between calls — use `cd dir && command` or absolute paths. A command that is still running after the foreground limit is not stopped: it continues as a background job and the result tells you its job id.",
+            "Run a shell command with bash and return what it printed. stdout and stderr are captured together, in the order they were written. The complete output is always stored: when it is long you are shown its start and end, with a marker that says exactly which lines are missing and how to read them (`read` or `grep` on its handle). The result header gives the exit status. The working directory persists between calls: after `cd dir`, later commands run in `dir`. Environment variables do not persist. A command that is still running after the foreground limit is not stopped: it continues as a background job and the result tells you its job id.",
             ToolClass::Exec,
             &[
                 params::req("command", "string", "The command line to run."),
+                params::opt("description", "string", "A few words saying what the command is for. It labels the call; it does not change what runs."),
                 params::opt("timeout_s", "integer", "Stop the command if it has not finished after this many seconds. Leave it out to let the command run as long as it needs.").min(1),
                 params::opt("background", "boolean", "Start the command as a background job and return immediately (default false). Use for servers and long runs; read its output with job_wait."),
-                params::opt("cwd", "string", "Directory to run in (default: the workspace)."),
+                params::opt("cwd", "string", "Directory to run this command in (default: where the last command left the shell, at first the workspace)."),
                 params::opt("idle_timeout_s", "integer", "Stop a foreground command after this many seconds without output. Silent computation can also trigger it; omitted means no idle watchdog.").min(1).max(300),
-                params::opt("wake_on", "string", "For a background job: a regular expression. When a line of the job's output matches it you are told at once, with the matching lines and the handle of that part of the output, and if you had ended your turn with `wait` you are resumed, as when a job ends. Use it for a fuzzer, cracker, scan or listener that runs for hours and matters only when it finds something, e.g. `(?i)crash|panic|FOUND`. Rust regex syntax, matched line by line."),
+                params::opt("wake_on", "string", "For a background job: a regular expression. When a line of the job's output matches it you are told at once, with the matching lines and the handle of that part of the output, and if you had ended your turn with `job_wait` and no `job` you are resumed, as when a job ends. Use it for a fuzzer, cracker, scan or listener that runs for hours and matters only when it finds something, e.g. `(?i)crash|panic|FOUND`. Rust regex syntax, matched line by line."),
                 params::opt("wake_every_s", "integer", "With `wake_on`: tell you at most once in this many seconds; lines that match in between come with the next notice (default 30).").min(1).max(3600),
             ],
         )
@@ -208,10 +281,11 @@ impl Tool for JobWait {
     fn spec(&self) -> ToolSpec {
         params::spec(
             "job_wait",
-            "Wait for a background job to finish, or for the given time, and return the output it has produced since you last looked at it, together with its state (running, or its exit status).",
+            "With `job`: wait for that background job to finish, or for the given time, and return the output it has produced since you last looked at it, together with its state (running, or its exit status). Without `job`: end your turn until something you started (a job or an agent) reports back, and be resumed with its result; use it when there is nothing useful to do until then.",
             ToolClass::Exec,
             &[
-                params::req("job", "string", "The job id, e.g. `j1`."),
+                params::opt("job", "string", "The job id, e.g. `j1`. Leave it out to end your turn until a job or agent you started reports back."),
+                params::opt("reason", "string", "Without `job`: what you are waiting for, in a few words."),
                 params::opt("timeout_s", "integer", "How long to wait for the job to finish before returning what there is (default 120).").min(0),
             ],
         )
@@ -822,6 +896,23 @@ pub async fn run_launched(ctx: &ToolCtx, args: &Map<String, Value>, launch: &Lau
 }
 
 async fn run_command(ctx: &ToolCtx, args: &Map<String, Value>, launch: Option<&Launch>) -> ToolOutput {
+    let mut note = ShellNote::default();
+    let mut out = run_command_in_shell(ctx, args, launch, &mut note).await;
+    for fact in note.facts {
+        out = out.with_more(fact);
+    }
+    match note.cwd {
+        Some(dir) => out.with_meta(META_CWD, json!(dir)),
+        None => out,
+    }
+}
+
+async fn run_command_in_shell(
+    ctx: &ToolCtx,
+    args: &Map<String, Value>,
+    launch: Option<&Launch>,
+    shell_note: &mut ShellNote,
+) -> ToolOutput {
     let Some(command) = args.get("command").and_then(Value::as_str) else {
         return ToolOutput::error(
             "No command was given. Call bash again with `command` set to the command line to run.",
@@ -847,7 +938,17 @@ async fn run_command(ctx: &ToolCtx, args: &Map<String, Value>, launch: Option<&L
     let cwd = match (launch, args.get("cwd").and_then(Value::as_str)) {
         (Some(launch), _) => launch.cwd.clone(),
         (None, Some(given)) => ctx.sandbox.resolve(given),
-        (None, None) => ctx.workspace.clone(),
+        (None, None) => match ctx.shell.get() {
+            Some(dir) if dir.is_dir() => dir,
+            Some(old) => {
+                ctx.shell.set(None);
+                shell_note
+                    .facts
+                    .push(format!("shell directory reset to the workspace ({} no longer exists)", old.display()));
+                ctx.workspace.clone()
+            }
+            None => ctx.workspace.clone(),
+        },
     };
     if !Path::new(&cwd).is_dir() {
         return ToolOutput::error(format!(
@@ -860,12 +961,22 @@ async fn run_command(ctx: &ToolCtx, args: &Map<String, Value>, launch: Option<&L
         Ok(a) => a,
         Err(e) => return ToolOutput::error(format!("Nothing was run: the harness could not prepare the output files for the command ({e}). Try the call again.")),
     };
-    let env = match launch {
+    let mut env = match launch {
         Some(launch) => launch.env.clone(),
         None => command_env(ctx),
     };
+    // Only a foreground command of `bash` can move the shell directory.
+    let shell_file = (launch.is_none() && !background).then(|| ctx.tmp_dir.join(format!(".shell-cwd-{id}")));
+    let script = match &shell_file {
+        Some(file) => {
+            env.insert("LOOM_SHELL_CWD".to_string(), file.display().to_string());
+            with_cwd_trap(command)
+        }
+        None => command.to_string(),
+    };
+    let start_dir = std::fs::canonicalize(&cwd).unwrap_or_else(|_| cwd.clone());
     let track_cwd = launch.is_none().then(|| cwd.clone());
-    let spec = Spawn { script: command.to_string(), cwd, env, out_path, exit_path };
+    let spec = Spawn { script, cwd, env, out_path, exit_path };
     let started = Instant::now();
     let sandboxed = launch.is_none();
     let spawned = match launch {
@@ -877,6 +988,9 @@ async fn run_command(ctx: &ToolCtx, args: &Map<String, Value>, launch: Option<&L
         Err(e) => {
             let _ = std::fs::remove_file(&spec.out_path);
             let _ = std::fs::remove_file(&spec.exit_path);
+            if let Some(file) = &shell_file {
+                let _ = std::fs::remove_file(file);
+            }
             return ToolOutput::error(format!(
                 "The command could not be started ({e}). Nothing ran; try the call again."
             ));
@@ -933,6 +1047,9 @@ async fn run_command(ctx: &ToolCtx, args: &Map<String, Value>, launch: Option<&L
             }
         };
         remove_files(&running);
+        if let Some(file) = &shell_file {
+            let _ = std::fs::remove_file(file);
+        }
         return finish(Finish { ctx, status: ToolStatus::Timeout, outcome: "stopped: no output during idle timeout".into(), ended: &ended, output, elapsed: started.elapsed(), facts: note.into_iter().chain(["Silent computation can trigger this watchdog. Use batch flags for interactive tools, pty_open for interactive input, or omit idle_timeout_s for silent work.".into()]).collect(), job: None, sandboxed });
     }
     if end == WaitEnd::Deadline {
@@ -973,6 +1090,10 @@ async fn run_command(ctx: &ToolCtx, args: &Map<String, Value>, launch: Option<&L
             let status = if ended == Ended::Exit(0) { ToolStatus::Ok } else { ToolStatus::Error };
             let mut facts: Vec<String> = note.into_iter().collect();
             if group_runs {
+                // A call that became a job does not move the shell directory.
+                if let Some(file) = &shell_file {
+                    let _ = std::fs::remove_file(file);
+                }
                 // The leader is over, the rest of its group is not: it goes on as a job, from after what is shown.
                 facts.extend(watch.as_ref().map(watched_fact));
                 ctx.jobs.register_watched(&id, &ctx.call_id, command, running, output.len() as u64, watch).await;
@@ -992,6 +1113,18 @@ async fn run_command(ctx: &ToolCtx, args: &Map<String, Value>, launch: Option<&L
                 });
             }
             remove_files(&running);
+            if let Some(file) = &shell_file {
+                let left = take_shell_cwd(file);
+                if matches!(ended, Ended::Exit(_) | Ended::Signal(_)) {
+                    // Only a `cd` moves it: a call that ends where it started leaves the state alone, so a
+                    // `cwd` given for one call does not become the shell directory.
+                    if let Some(dir) = left.filter(|d| *d != start_dir) {
+                        shell_note.facts.push(format!("cwd now {}", dir_text(&ctx.workspace, &dir)));
+                        shell_note.cwd = Some(dir.display().to_string());
+                        ctx.shell.set(Some(dir));
+                    }
+                }
+            }
             if ended == Ended::Exit(0) {
                 if let Some(ref track_cwd) = track_cwd {
                     maybe_track_read(ctx, track_cwd, command);
@@ -1057,6 +1190,9 @@ async fn run_command(ctx: &ToolCtx, args: &Map<String, Value>, launch: Option<&L
                 }
             };
             remove_files(&running);
+            if let Some(file) = &shell_file {
+                let _ = std::fs::remove_file(file);
+            }
             let (status, outcome) = match end {
                 WaitEnd::Cancelled => (ToolStatus::Interrupted, "interrupted".to_string()),
                 WaitEnd::TooMuchOutput => (ToolStatus::Error, format!("stopped: output passed {limit} bytes")),
@@ -1159,6 +1295,111 @@ mod tests {
         let e = env();
         let r = e.call("bash", json!({"command": "echo a; echo b >&2; echo c; echo d >&2"})).await;
         assert_eq!(e.stored(&r), "a\nb\nc\nd\n");
+    }
+
+    #[tokio::test]
+    async fn cd_persists_across_calls_and_the_header_says_so() {
+        let e = env();
+        std::fs::create_dir_all(e.ctx.workspace.join("sub/deep")).expect("mkdir");
+        let r = e.call("bash", json!({"command": "cd sub && pwd"})).await;
+        assert_eq!(r.status, ToolStatus::Ok);
+        assert!(header(&r).contains("cwd now sub"), "{}", r.text);
+        let sub = e.ctx.workspace.join("sub");
+        assert_eq!(r.meta.get("cwd"), Some(&json!(sub.to_str().expect("utf-8"))));
+        let r = e.call("bash", json!({"command": "pwd"})).await;
+        assert_eq!(e.stored(&r).trim(), sub.to_str().expect("utf-8"));
+        assert!(!r.text.contains("cwd now"), "{}", r.text);
+        assert!(r.meta.get("cwd").is_none());
+        let r = e.call("bash", json!({"command": "cd deep"})).await;
+        assert!(header(&r).contains("cwd now sub/deep"), "{}", r.text);
+        let r = e.call("bash", json!({"command": "cd ../.."})).await;
+        assert!(header(&r).contains("cwd now ."), "{}", r.text);
+        let r = e.call("bash", json!({"command": "pwd"})).await;
+        assert_eq!(e.stored(&r).trim(), e.ctx.workspace.to_str().expect("utf-8"));
+        // The trap file is gone.
+        let left: Vec<_> = std::fs::read_dir(&e.ctx.tmp_dir).expect("tmp").flatten().collect();
+        assert!(left.iter().all(|f| !f.file_name().to_string_lossy().starts_with(".shell-cwd")), "{left:?}");
+    }
+
+    #[tokio::test]
+    async fn a_removed_shell_directory_resets_to_the_workspace_with_a_fact() {
+        let e = env();
+        std::fs::create_dir_all(e.ctx.workspace.join("gone")).expect("mkdir");
+        e.call("bash", json!({"command": "cd gone"})).await;
+        std::fs::remove_dir_all(e.ctx.workspace.join("gone")).expect("rmdir");
+        let r = e.call("bash", json!({"command": "pwd"})).await;
+        assert_eq!(r.status, ToolStatus::Ok);
+        let old = e.ctx.workspace.join("gone");
+        let fact = format!("shell directory reset to the workspace ({} no longer exists)", old.display());
+        assert!(header(&r).contains(&fact), "{}", r.text);
+        assert_eq!(e.stored(&r).trim(), e.ctx.workspace.to_str().expect("utf-8"));
+        assert!(e.ctx.shell.get().is_none());
+        let r = e.call("bash", json!({"command": "pwd"})).await;
+        assert!(!r.text.contains("reset to the workspace"), "{}", r.text);
+    }
+
+    #[tokio::test]
+    async fn a_nonzero_exit_after_cd_still_moves_the_shell() {
+        let e = env();
+        std::fs::create_dir_all(e.ctx.workspace.join("sub")).expect("mkdir");
+        let r = e.call("bash", json!({"command": "cd sub; exit 3"})).await;
+        assert_eq!(r.status, ToolStatus::Error);
+        assert!(header(&r).contains("exit 3") && header(&r).contains("cwd now sub"), "{}", r.text);
+        assert_eq!(e.ctx.shell.get(), Some(e.ctx.workspace.join("sub")));
+    }
+
+    #[tokio::test]
+    async fn a_timeout_or_a_job_or_background_does_not_move_the_shell() {
+        let cfg = ToolsCfg { bash_foreground_s: 1, ..ToolsCfg::default() };
+        let e = bash_env(cfg);
+        std::fs::create_dir_all(e.ctx.workspace.join("sub")).expect("mkdir");
+        let r = e.call("bash", json!({"command": "cd sub; sleep 30", "timeout_s": 1})).await;
+        assert_eq!(r.status, ToolStatus::Timeout);
+        assert!(e.ctx.shell.get().is_none() && !r.text.contains("cwd now"), "{}", r.text);
+        let r = e.call("bash", json!({"command": "cd sub; sleep 30"})).await;
+        assert!(r.meta.get(META_JOB).is_some(), "{}", r.text);
+        assert!(e.ctx.shell.get().is_none() && !r.text.contains("cwd now"), "{}", r.text);
+        e.call("job_kill", json!({"job": "j2"})).await;
+        let r = e.call("bash", json!({"command": "cd sub; echo hi", "background": true})).await;
+        assert!(r.meta.get(META_JOB).is_some(), "{}", r.text);
+        e.call("job_wait", json!({"job": "j3", "timeout_s": 30})).await;
+        assert!(e.ctx.shell.get().is_none());
+    }
+
+    #[tokio::test]
+    async fn cwd_given_then_cd_moves_the_shell_and_a_plain_cwd_does_not() {
+        let e = env();
+        std::fs::create_dir_all(e.ctx.workspace.join("a/b")).expect("mkdir");
+        let r = e.call("bash", json!({"command": "pwd", "cwd": "a"})).await;
+        assert!(!r.text.contains("cwd now"), "{}", r.text);
+        assert!(e.ctx.shell.get().is_none());
+        let r = e.call("bash", json!({"command": "cd b", "cwd": "a"})).await;
+        assert!(header(&r).contains("cwd now a/b"), "{}", r.text);
+        assert_eq!(e.ctx.shell.get(), Some(e.ctx.workspace.join("a/b")));
+    }
+
+    #[tokio::test]
+    async fn the_exit_trap_keeps_shell_error_line_numbers() {
+        // The prefix shares the script's first line, so bash numbers the lines as it does without it.
+        let e = env();
+        let script = "echo ok\n\nf() {\n  nosuch_cmd_x\n}\nf";
+        let plain = std::process::Command::new("/bin/bash").args(["-c", script]).output().expect("bash");
+        let stderr = String::from_utf8_lossy(&plain.stderr).to_string();
+        let want = stderr.split_once("line ").map(|(_, rest)| rest.trim().to_string()).unwrap_or_default();
+        assert!(want.contains("nosuch_cmd_x"), "{stderr}");
+        let r = e.call("bash", json!({"command": script})).await;
+        let text = e.stored(&r);
+        assert!(text.contains(&want), "{text} vs {want}");
+        assert!(e.ctx.shell.get().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_script_with_its_own_exit_trap_does_not_move_the_shell() {
+        let e = env();
+        std::fs::create_dir_all(e.ctx.workspace.join("sub")).expect("mkdir");
+        let r = e.call("bash", json!({"command": "trap 'echo bye' EXIT; cd sub"})).await;
+        assert_eq!(r.status, ToolStatus::Ok);
+        assert!(!r.text.contains("cwd now") && e.ctx.shell.get().is_none(), "{}", r.text);
     }
 
     #[tokio::test]

@@ -11,7 +11,7 @@
 //! `run` returns [`End::Fatal`] with the error text and writes nothing more.
 //!
 //! ## Authors
-//! `turn_start`, `turn_end`, `model_request`, `reweave`, `cache_break`, `interrupted`, `session_end`,
+//! `turn_start`, `turn_end`, `model_request`, `compaction`, `cache_break`, `interrupted`, `session_end`,
 //! `job_registered`, and the `harness_note`/`inbox_opened` records this file writes: `Harness`.
 //! `model_response`, `tool_call`: `Model`. `tool_result`, `job_settled`: `Tool`. `user_message`,
 //! `inbox_resolved`: `User`, except the resolution of a model-unavailable notice (see *Model server
@@ -47,7 +47,7 @@
 //!   `Harness`) to a session that has had no turn yet (no own `turn_start`), so that the note comes before
 //!   its first model request; on a session that has had one, `Err` and nothing is appended. Used once, by
 //!   `Runtime::create_session` for `prior` (`crate::prior::brief`). The note is an ordinary `Info` note: it
-//!   renders as one and a re-weave may drop it.
+//!   renders as one and a compaction may take it out of view.
 //! - `fork`: `loom_core::log::fork_file(parent_log, <own log path>, upto_seq, …)`, whose checked copy
 //!   gives the session its records, then appends `Event::Forked(forked)` (author `Agent(forked.parent)`).
 //!   A parent prefix that is not a sound chain fails the fork with the copy's sentence and no log.
@@ -125,6 +125,7 @@
 //!   ledger has no goal yet, `shared.ledger_append(true, GoalSet{text})` and append what it queued
 //!   (`shared.take_emitted()`); a failure is logged with `tracing::warn!` and otherwise ignored.
 //!   Start a turn (`Trigger::User`).
+//! - `Input::UserImages{text, images}`: as `Input::User`, the `user_message` carrying `images`.
 //! - `Input::Answer{item_id, answer}`: if no open inbox item of this session has that id, ignore.
 //!   Otherwise append `inbox_resolved{item_id, answer}`; when the item is a `Question` or `Blocker`
 //!   with a `reference` and the session has a journal, `shared.ledger_append(true,
@@ -180,7 +181,7 @@
 //! - `Input::AgentMessage{from, text}`: append `harness_note{Arrival, texts::agent_message(text)}`
 //!   authored `Agent(from)`. Start a turn (`Trigger::Resume`) only if the last turn ended `Waiting`.
 //! - `Input::Resume`: start a turn (`Trigger::Resume`).
-//! - `Input::Reweave`: run the re-weave procedure with reason `operator` (forced). No turn.
+//! - `Input::Compact`: run the compaction procedure with reason `operator`, whatever the size. No turn.
 //! - `Input::SwitchModel(sw)`: from the next request on, `deps.client`, `limiter`, `context_window`,
 //!   `model` and `reasoning_replay` are `sw`'s. When the model or the replay policy differs from the
 //!   one the log names, or `sw.settings_changed` (a reload changed the profile: the server or the
@@ -223,7 +224,7 @@
 //!    start activate the session). A turn started after that call is cancelled from birth.
 //! 2. **Arrivals.** Drain, without waiting, everything queued in `deps.job_events` and in the
 //!    inputs channel, handling each as under *Idle* except that nothing starts a turn, `Resume` is
-//!    ignored, and `Reweave` sets a flag that forces the re-weave in point 4. A `Stop` (one that
+//!    ignored, and `Compact` sets a flag that forces the compaction in point 5. A `Stop` (one that
 //!    arrived while a trigger was queued or between turns) cancels the turn's token and ends the
 //!    draining: what was sent after it stays queued for the idle loop, after the turn has ended
 //!    `Stopped` (point 1). An arrival that appended a `user_message` resets the nudge count.
@@ -241,17 +242,17 @@
 //!    own model response); a session that is not a child instead opens an inbox item (`Parked`,
 //!    blocking, text `texts::turn_failed("The session's budget is used up.")`) and the turn ends
 //!    `BudgetExhausted`.
-//! 4. **Stall** (only for `Termination::Explicit` sessions with a journal; `agents.stall_steps > 0`):
-//!    when the last `stall_steps` own steps contain no `ledger` record, no `tool_result` of class
-//!    `Write` with status `Ok`, and no `child_spawned`/`child_settled`, and no `Stall` note was given
-//!    within those steps, append `harness_note{Stall, texts::stall(stall_steps)}`.
-//! 5. **Re-weave.** `w = weave(all records)` (a `Woven`, which planning uses as it is), computed
-//!    here once and again only after a record that changes it (a `reweave`); points 5 and 6 and the
-//!    digest request all use it. See below. Forced when the flag from point 2 is set.
+//! 5. **Compaction** (CONTRACTS-COMPACTION Part K). `w = weave(records)` (a `Woven`), computed here
+//!    once and again only after a record that changes it (a `compaction`); points 5 and 6 and the note
+//!    request all use it. The size of the request is `measured_size` (the server's prompt size for the
+//!    latest request of this epoch, plus what was merged since) or, before the first response of an
+//!    epoch, the estimate. At or above `compact_at` (`deps.context.compact_at(window)`: `[context]
+//!    compact_at_tokens`, 0 = 40% of the window, never above 400 000, never above four fifths of a
+//!    known window) or forced by the flag from point 2, run the procedure below with reason `size` (or
+//!    `operator`).
 //! 6. **Request.** `PrefixGuard::check(w.epoch, &w.messages)`: on `Break`
 //!    append `cache_break{req_id, first_diff_message, detail}` and carry on. Render the HUD
-//!    (`hud::render`, over own records, with `jobs.list()` entries that are running — their output
-//!    lines counted on from where the previous request's count stopped —, `orch.children(session)`
+//!    (`hud::render`, over own records, with `jobs.list()` entries that are running, `orch.children(session)`
 //!    entries that are running, the ledger when there is a journal, `hud::brief_opts(&role.tools)`,
 //!    `agents.unviewed_min_lines`, own steps and start time counted from where the budget was granted
 //!    (see point 3), budget).
@@ -262,222 +263,59 @@
 //!    Acquire the limiter (`deps.limiter.acquire(deps.priority, token)`; `None` = cancelled). Send
 //!    `ChatRequest{messages: w.messages + weave::hud_message(hud), tools: w.tools, tool_choice:
 //!    Auto, max_tokens: client.profile().max_output_tokens, seed: None, extra: empty}` with
-//!    `client.complete`, forwarding every `StreamEvent` to `Sink::delta(session, req_id, …)` as it
-//!    arrives, and watching it as *Model server unavailable* says.
+//!    `client.complete`, forwarding every `StreamEvent` to `Sink::delta(session, req_id, ...)` as it
+//!    arrives, and watching it as *Model server unavailable* says. A request whose prompt is at least
+//!    `compact_at / 2` that has hit the profile's `stall_timeout_s` three times (`StreamEvent::Retrying`
+//!    for a stall) is cancelled and the window is compacted with reason `stall` (once per step), then
+//!    the step goes back to the start of this point.
 //!    - `Err(Cancelled)`: point 1.
-//!    - `Err(ContextOverflow{limit, ..})`: once per step, run the re-weave procedure forced with reason
-//!      `overflow` and that `limit`; if it appended a `reweave`, go back to the start of this point (new weave, new
-//!      `model_request`). Otherwise *fail* with `texts::OVERFLOW_UNFOLDABLE`.
+//!    - `Err(ContextOverflow{limit, ..})`: once per step, compact with reason `refused`; if it appended a
+//!      `compaction`, go back to the start of this point (new weave, new `model_request`). Otherwise
+//!      *fail* with `texts::OVERFLOW_UNFOLDABLE`.
 //!    - `Err(Rejected{status, message})` with `status` 400, 413 or 422 (a *refusal*: what a provider
 //!      answers when it refuses what the request carries, such as a content filter refusing a page or a
 //!      payload in the window): when the session's previous step request also ended in a refusal and
-//!      no re-weave has been appended since (its epoch is the current one: the refused prefix is still
-//!      the start of this request), and this step has not re-woven for a refusal yet, run the re-weave
-//!      procedure forced with reason `refused`; if it appended a `reweave`, go back to the start of this
+//!      no compaction has been appended since (its epoch is the current one: the refused prefix is still
+//!      the start of this request), and this step has not compacted for a refusal yet, compact with
+//!      reason `refused`; if it appended a `compaction`, go back to the start of this
 //!      point. Otherwise remember this epoch as refused and *fail* with the refusal texts:
-//!      `texts::refused(status, message, folded)` as the why (`folded` = a `reweave` with reason
-//!      `refused` was appended after the session's latest `model_response`: the window was folded for a
-//!      refusal and no reply has come since), and for a lead the inbox text `texts::refused_park(status, message, folded)` in place
-//!      of `texts::turn_failed(why)`. The epoch of the last refusal is kept in memory only: after a
-//!      restart the first refusal parks again before the next one re-weaves.
+//!      `texts::refused(status, message, folded)` as the why (`folded` = a `compaction` with reason
+//!      `refused` was appended after the session's latest `model_response`), and for a lead the inbox
+//!      text `texts::refused_park(status, message, folded)` in place of `texts::turn_failed(why)`. The
+//!      epoch of the last refusal is kept in memory only: after a restart the first refusal parks again
+//!      before the next one compacts.
 //!    - any other error: *fail* with `texts::sentence(&error.to_string())`.
 //!    - `Ok(c)`: calibrate the estimator with the characters sent (every message's `chars()`
 //!      including the HUD message, plus the length of each tool spec's `to_openai()` JSON) against
-//!      `c.usage.prompt_tokens` (skip when 0). Give every tool call whose id is empty or already
-//!      used by a `tool_call` in this log a fresh id `call-{sortable}`. Append `model_response`
-//!      (fields from the completion; `timing.queue_ms` = the permit's `waited_ms`). Publish status.
+//!      the prompt tokens the server reported, and go on as the rest of this point says.
 //!
-//!    *Fail* means: a child settles `Failed` with `texts::failed_report(why, last_reply)`; any other
-//!    session opens an inbox item (`Parked`, blocking, text `texts::turn_failed(why)`) and the turn
-//!    ends `Error`.
-//! 7. **Reply handling.**
-//!    - `finish` `Error` or `Aborted`: *fail* with `The model server ended the reply with an error.`
-//!    - Run the complete tool calls in order (below). Then, unless `finish == Length`, the calls that
-//!      have a name but are not complete (their arguments are not a JSON object) get one
-//!      `harness_note{Nudge, …}` made of `texts::malformed_call(name, arguments)` for each: they are
-//!      not run, and with no `tool_call` record they are not replayed to the server. If the turn
-//!      ended there, stop.
-//!    - `finish == Length`: when no call was complete, the reply counts as a nudge, and one past
-//!      `agents.max_nudges` gives up with `texts::repeated_cut(n)`. Otherwise append
-//!      `harness_note{OutputCut, texts::output_cut(completion_tokens, name of the first incomplete
-//!      call if any, number of calls run)}` and go to the next step.
-//!    - Malformed calls and no complete one: the reply counts as a nudge, and one past `max_nudges`
-//!      gives up with `texts::repeated_malformed(n)`; otherwise next step. It never reaches the gate.
-//!      *Give up*: a child settles `Failed` with `texts::failed_report(why, reply)`; any other session
-//!      opens an inbox item (`Parked`, blocking, `texts::turn_failed(why)`) and the turn ends `Parked`.
-//!    - No complete tool call (and not `Length`): `gate::on_yield` with the reply text, the
-//!      registry's names, the ledger (when there is a journal), the nudge count,
-//!      `agents.max_nudges`, and the running job and child counts.
-//!      `End` → the turn ends `Yielded`. `Nudge(t)` → append `harness_note{Nudge, t}`, count it,
-//!      next step. `Park(t)` → a child settles `Failed` with `texts::gave_up_report(nudges,
-//!      reply)`; any other session opens an inbox item (`Parked`, blocking, text `t`) and the turn
-//!      ends `Parked`.
-//!    - Otherwise next step. The nudge count returns to 0 whenever a tool call of the step ended
-//!      with status `Ok`.
+//! ## Compaction procedure
+//! `compact(woven, reason, objections)`:
+//! 1. The tail (K3): `upto_seq` is the seq just before the first record of the recent tail, the last
+//!    whole steps whose size together is at most 15% of `compact_at` (at least the last whole step when
+//!    that alone is within 50%); empty (`upto_seq` = the last record) for `refused`, `fresh_start`, and an
+//!    `operator` compaction while the current epoch is the one the last refusal recorded.
+//! 2. The note request (K4): the window exactly as the last step request sent it (so the server's cache
+//!    holds) plus one `user` message `texts::COMPACT_PROMPT` (and `texts::compact_objections` for a
+//!    fresh start), same tools, `max_tokens: COMPACT_MAX_TOKENS`, recorded as `model_request{purpose:
+//!    Compact, hud: None}`, sent at `deps.priority` and watched as a step's request is, with its stream
+//!    kept from the sink. For `refused` and `stall` the window is first made headers-only. Keys in the
+//!    reply are checked (`out:` handles against the blob store, ledger ids against the ledger): unknown
+//!    ones get one retry (`texts::compact_unknown_keys`), then are replaced by `[unknown key]` and
+//!    listed in `dropped_keys`. An error, an empty text or a cancellation of the request gives
+//!    `note: None`; a compaction never fails because its note did.
+//! 3. Append `compaction{epoch: current + 1, upto_seq, reason, before_tokens, after_tokens_est, note,
+//!    note_req, table, keys, dropped_keys, objections, brief, compact_at}`. `table` is
+//!    `compaction::build_table` (K5), `brief` the ledger brief and the frontier. Nothing leaves the log;
+//!    the weave renders the compaction item and the records after `upto_seq` only (K6, K7).
 //!
-//! ### Running the calls of a reply
-//! For each complete call, in order: append `tool_call{call_id, req_id, name, args, class}` (`args`
-//! = the arguments parsed as JSON, or the raw string as a JSON string when they do not parse;
-//! `class` from the registry's spec, `State` for a name it does not have). Then:
-//! - if an earlier call of this reply set an effect: the result is
-//!   `loom_tools::refused(ctx, name, class, texts::not_run_after(<that call's name>), now)`;
-//! - else if the name is not in the registry but is in `w.tools` (a forked session's request
-//!   carries its parent's tool list): `refused(…, texts::not_in_assignment(name, role name,
-//!   registry names), …)`;
-//! - else `loom_tools::execute(registry, ctx, name, arguments, admission)` with a `ToolCtx` cloned
-//!   from `deps.ctx` with this call's id, the turn's token and `view_chars` =
-//!   `policy.view_chars(estimator)`, and `Admission{policy: &policy, estimator}`, where `policy` =
-//!   `deps.admit.for_window(deps.context_window)` computed for this call (so a change of the session's
-//!   window applies from the next call). Early starts take `view_chars` the same way when they start,
-//!   and are admitted with the policy of the moment they are claimed.
-//!
-//! Append the `tool_result`, then every record the call queued (`shared.take_emitted()`), then take
-//! the effect (`shared.take_effect()`). After the last call, a fresh start that a call asked for
-//! (`shared.take_fresh_start()`) is made (*Fresh start*), whatever else the reply did; then apply the
-//! first effect that was set:
-//! `EndTurn(reason)` ends the turn with that reason; `Settle(delivery)` settles the child (below).
-//! Calls run one at a time, but for the early starts below.
-//!
-//! ### Early starts
-//! With `tools.speculate` (default true) a call of a tool whose `Tool::speculative` is true can be
-//! started before its turn. While the reply streams, `StreamEvent::ToolCallReady{index, ..}` starts
-//! the call when every call before it in this attempt was ready and is of such a tool (the first that
-//! is not, or a gap, ends early starts for the attempt), its arguments are a JSON object that
-//! `loom_tools::prepare` accepts, and fewer than `MAX_EARLY` early tasks are running (those of
-//! discarded calls count until they have ended). It runs (`prepare`, `Prepared::run`) in a task with
-//! the id the call will keep (the server's when `with_fresh_ids` would keep it, else a fresh one), a
-//! child of the turn's token and a `FileTracker` of its own; nothing of it counts until it is
-//! claimed. A new attempt or a failed request cancels every early call of the request. When the reply
-//! is in, its calls take the ids of the early calls they hold byte for byte (same index, name and
-//! arguments) unless the log or an earlier call already has that id; the others are cancelled,
-//! and the complete calls of the reply's leading run of such tools that were not started early are
-//! started together. In the in-order loop, a call with an early run of the same index, name, arguments
-//! and id takes that run's result (awaited; a stop interrupts it as it would a call run in place) in
-//! place of `execute`: its file records move into the session's tracker, `Ran::finish` stores and
-//! admits it, and its `tool_result` gets `meta[META_EARLY_MS]`. Early calls left unclaimed when the
-//! loop ends are cancelled and awaited, so none outlives the step. Records and what the model sees are
-//! those of running every call in place, but for timings, fresh call ids and that key. Counts (started,
-//! claimed, discarded, ms saved) are logged at debug level at the end of each turn.
-//!
-//! ### Model server unavailable
-//! Every model request of a session (a step's, a digest's) is watched through its stream events (the
-//! votes of `decide`, which the runtime sends, are not). A *failure* is a `StreamEvent::Retrying`; a
-//! *server event* is any event but `AttemptStart` and `Retrying`. The request's first failure is about
-//! when the client's retry window starts. It is *retrying* from a failure until the next server
-//! event. Its *outage* starts at its first failure, and again at a failure that ends an attempt whose
-//! server events began at least `agents.unavailable_notice_s` (`after`) before it (the server was
-//! answering, not unavailable). With `after` not 0, a notice is due when the request is retrying and
-//! its outage started `after` back — at once on a failure that comes later than that — unless
-//! `retry_window_s` is not 0 and the request's first failure plus the window is not later than that
-//! time (the request then fails at its next failed attempt, and that failure is handled as usual).
-//! Then the session appends `inbox_opened` (author `Harness`) of a *model-unavailable notice* —
-//! `kind: Blocker`, `blocking: false`, no `call_id`, no `reference`, the only item of that shape —
-//! with `texts::model_unavailable(base_url, since, last, until)`: `since` is the start of the outage,
-//! `last` the latest `Retrying` reason, `until` (when `retry_window_s` is not 0) the request's first
-//! failure plus the window, times by `texts::clock`. Status is published. At most one notice is
-//! opened per request (so one per session at a time; a later request opens its own). When the
-//! request ends, its notice is resolved:
-//! `inbox_resolved{item_id, answer}` authored `Harness`, `answer` being `texts::unavailable_answered(now)`
-//! for a completion, `texts::unavailable_stopped(now)` for `Cancelled` and `texts::unavailable_failed(now,
-//! error)` for any other error; then the result is handled as it would be without the notice. Neither
-//! record is rendered by the weave or starts a turn, and the request is never rebuilt: every attempt
-//! sends the body the client encoded once.
-//!
-//! ## Settling (children)
-//! Sync `child_completed` with the full typed settlement before `turn_end{reason}` and
-//! `session_end{outcome, detail}` per the table, kill the session's
-//! jobs, publish status (`Phase::Ended`), and return `End::Settled(Settlement{child: id, role,
-//! outcome, report, full, payload, steps: own steps, usage: sum of own responses' usage})`.
-//! `Returned` → `Finished`/`Done`; `Blocked` → `Blocked`/`Done`; `BudgetExhausted` →
-//! `BudgetExhausted`/`BudgetExhausted`; `Stopped` → `Stopped`/`Stopped`; `Failed` → `Error`/`Failed`.
-//! `detail` is the first line of the report cut to 200 characters. For settlements this file makes
-//! itself, `full` is `None` and `payload` is `Value::Null`.
-//!
-//! ## Re-weave procedure (`reason`: `target`, `overflow`, `refused`, `operator`)
-//! `est = estimator.tokens_for_messages(&w.messages)` plus the tokens of the tool specs' JSON.
-//! `size` is the size of the next request as the server counts it, when it has counted one in this
-//! epoch: with `m` the latest own-or-inherited step `model_request` of epoch `w.epoch` whose
-//! response reported `prompt_tokens > 0` and `n = m.n_messages`, `size = m's prompt_tokens +
-//! estimator.tokens(Σ (item.chars + 2) over the items merged into w.messages[n − 1] from records
-//! after m) + estimator.tokens_for_messages(&w.messages[n..])`. Before the first such response of
-//! an epoch, `size = est`. `window` is `deps.context_window`; for an `overflow` re-weave it
-//! is the smaller of that and the limit the server's error stated (the estimate of the refused
-//! request when it stated none), so that a forced re-weave can be planned when the window is unknown
-//! or set too large. `limit` = `deps.context.target_tokens`, lowered (when there is a `window`) to
-//! `window − reserve` and to four fifths of `window`; the floor used is `floor_tokens` lowered to
-//! half of `window`, and to half of `limit` when it is not below `limit`. `reserve` is, for a
-//! profile `max_output_tokens` (`max`) below `window`,
-//! `max + min(min(4_096, window / 4), window − max − 1)`: the reply asked for is always kept, so a
-//! request at the trigger plus the `max_tokens` it sends fits the window, and when the reply leaves
-//! little room the trigger can drop to 1 and the floor to 0. A `max_output_tokens` at or above
-//! `window` cannot be honoured and counts as none; without one `reserve` is
-//! `min(20_480, window / 4)`, so a small window keeps a positive trigger. For windows of 81_920
-//! tokens and more the quarter of the window never cuts the 4_096 or the 20_480, and for a 1M
-//! window the defaults (400k, 180k) are unchanged. Not forced and `size <= limit`: nothing to
-//! do. The plan counts in the estimator's units: it is made with the floor used × `est / size`, and
-//! is *enough* when its `after_tokens_est` is at or below the midpoint between the floor used and
-//! `limit`, × `est / size`.
-//! 1. `plan = w.plan(records, estimator, &policy, false)` (`plan_reweave` on the step's weave) with
-//!    `policy = deps.context`. While
-//!    the plan is not enough and `policy.keep_recent_steps` is above the minimum, halve
-//!    `keep_recent_steps` (not below the minimum) and plan again: when folding what lies outside the
-//!    protected recent steps does not make room, it is the output of recent steps that fills the
-//!    window, so fewer of them are protected. The minimum is `MIN_KEEP_RECENT_STEPS` (2), and 0 for an
-//!    `overflow` (one output of the latest step can be the whole problem: kept in view, it would make
-//!    every request overflow again). For `refused`, and for an `operator` re-weave while the current
-//!    epoch is the one the last refusal recorded, `keep_recent_steps` is 0 and `floor_tokens` is 0 from
-//!    the start: the plan folds everything it can (every live, unpinned result and report, the droppable
-//!    notes), whatever the size, because what the server refuses may be the newest output and is not a
-//!    matter of size; neither asks for a digest (the prefix was refused) nor goes on to point 2 (at floor
-//!    0 a text plan would drop every reply). A result folded this way keeps its handle in its stub.
-//! 2. Still not enough: `text_plan = w.plan(records, estimator, &policy, true)`. Not forced
-//!    and `text_plan` is not enough either: return without a record and without a digest request (see
-//!    "Why a re-weave must be worth it"). Otherwise, when `text_plan` exists and the re-weave is not
-//!    for an `overflow` or a `refused` (the server has just refused this prefix, and would refuse a
-//!    digest request on it as well), ask for a digest — a
-//!    request of the current stable messages plus one `user` message `texts::DIGEST_PROMPT`, same
-//!    tools, `max_tokens: DIGEST_MAX_TOKENS`, recorded as `model_request{purpose: Digest, hud: None}`
-//!    only (its reply is not appended as a record), and sent once the limiter grants it at
-//!    `deps.priority` (the step waits for it), watched as a step's request is (*Model server
-//!    unavailable*) but with its stream events kept from the sink. A non-empty reply text is the
-//!    digest; an error or an empty text gives none. A cancellation returns without a record (the step
-//!    handles it).
-//!    The plan becomes `text_plan`, with or without a digest: the ledger brief is the durable state,
-//!    the digest an addition to it.
-//! 3. No plan: return without a record. Otherwise append `reweave{epoch: current + 1, upto_seq,
-//!    evictions, brief: texts::reweave_brief(<ledger.brief(hud::brief_opts) or "">, <the rendered frontier, with
-//!    `attempts_run` of the records, when the session has a journal>), digest, reason,
-//!    before_tokens: size, after_tokens_est: size − (plan.before_tokens_est − plan.after_tokens_est)
-//!    × size / est}`.
-//!
-//! Why a re-weave must be worth it: every re-weave starts a new epoch, and the server's cache of
-//! the conversation is lost with the old one. A re-weave that frees little is needed again one step
-//! later, and again after that, each at the price of re-reading the whole context. So one that was
-//! not asked for (`target`) happens only when it buys room for a long stretch of steps; otherwise
-//! the context is left to grow until the window itself forces one (`overflow`).
-//!
-//! ## Fresh start (`reason`: `finish not accepted`)
+//! ## Fresh start (`reason`: `fresh_start`)
 //! A lead's `finish` that its verifier did not accept leaves a `FreshStart{objections, reopened}` in
-//! `Shared` when `agents.fresh_start` is on (default). A session that goes on from such a rejection
-//! with its own account of the attempt in view (the answer it gave, the conclusion it drew, the
-//! reasoning that led there, replayed at every step) tends to defend that account or to give up again.
-//! So the session goes on from the mission state instead: once every call of the reply has its result,
-//! one `reweave` is appended, of another kind than the procedure above. It is not driven by size, asks
-//! for no digest (a digest would be that account again) and protects no recent steps:
-//! `plan = woven.plan_fresh_start(records, estimator, &deps.context, ending)` on a weave rendered
-//! then, where `ending(seq, result)` holds for the results of `rtools::ENDING_TOOLS` (`finish`,
-//! `conclude`) that come after the latest `finish` result with status `Ok` among the own records (a
-//! result that was delivered, and what led to it, is not taken out). The plan drops the text and
-//! reasoning of every response, removes those calls with their results, stubs every other unpinned
-//! result and agent report, and drops the nudge, stall and verdict notes (`weave` has the rules). No
-//! plan: nothing is appended. Otherwise `reweave{epoch: current + 1, upto_seq: the last record's seq,
-//! evictions, brief: texts::fresh_start_brief(objections, reopened, <the rendered frontier, as for a
-//! re-weave>, <ledger.brief(hud::brief_opts) or "">),
-//! digest: None, reason: texts::FRESH_START_REASON, before_tokens, after_tokens_est}` with the sizes
-//! computed as in point 3 above, and status is published. The next request ends with the brief: what
-//! the verifier found and how to go on. Nothing leaves the record: the attempt stays in the log and
-//! its outputs in the store, so `log_search` and `out_read` reach them. With `agents.fresh_start` off
-//! no `FreshStart` is left and the rejection stays in the window as the result of the call.
+//! `Shared` when `agents.fresh_start` is on (default). Once every call of the reply has its result,
+//! the session compacts with reason `fresh_start`: an empty tail, and a note request that carries what
+//! the verifier objected to. The next request starts from the compaction item: the note, the table, the
+//! ledger (where the objections stand as open obligations). With `agents.fresh_start` off no `FreshStart`
+//! is left and the rejection stays in the window as the result of the call.
 //!
 //! ## Status
 //! [`Status`] is published through `Sink::status` whenever a field changes. `prompt_tokens` and
@@ -515,28 +353,22 @@
 //!   the shutdown stopped them;
 //! - inputs arriving mid-turn are in the next request; an inbox answer resolves the item, answers
 //!   the ledger question and starts a turn;
-//! - re-weave: with a small `target_tokens`, a `reweave` record appears, the epoch rises, the next
-//!   request no longer carries the stubbed output, and no `cache_break` is recorded for it; the
-//!   digest path (plan insufficient → digest request → text eviction) and its failure path;
-//!   `ContextOverflow` from the server triggers a forced re-weave and a retry; unfoldable overflow
-//!   fails the turn with an inbox item; an overflow caused by one huge result of the latest step
-//!   (above what two protected steps allow) is folded (keep 0) and the retry goes out with its stub;
+//! - compaction: with a small `compact_at_tokens`, a `compaction` record appears, the epoch rises, the
+//!   next request carries the compaction item and the tail only, and no `cache_break` is recorded for it;
+//!   a failed note request still compacts; unknown keys are retried once then dropped; three stalls
+//!   compact; `ContextOverflow` from the server compacts and retries; a long scripted session stays
+//!   bounded;
 //! - a refusal: a 400 parks a lead with `refused_park(.., false)`; an answer that meets the same 400
-//!   re-weaves with reason `refused` (the latest result is stubbed, with its handle) and the retry gets
-//!   200; a 400 after that re-weave parks with `refused_park(.., true)`; a refusal after a re-weave in
-//!   between parks again first; a 401 or 404 never re-weaves; a child settles `Failed` with
-//!   `refused(..)`; an `operator` re-weave after a refusal folds the latest step's results and asks for
-//!   no digest; with the default context policy (a floor far above the window's size) the refusal fold
-//!   still folds every output, the refused one included; a refusal long after a fold that worked parks
-//!   with `folded` false;
+//!   compacts with reason `refused` (headers-only note request, empty tail) and the retry gets
+//!   200; a 400 after that compaction parks with `refused_park(.., true)`; a refusal after a compaction in
+//!   between parks again first; a 401 or 404 never compacts; a child settles `Failed` with
+//!   `refused(..)`;
 //! - window-scaled admission: with a small `context_window` a large `bash` output is cut at
 //!   `window / 8` and a `read` of a large file ends at a whole line within `view_chars` and says where to
 //!   continue;
-//! - a fresh start: after a `finish` its verifier did not accept, one `reweave` with the fresh-start
-//!   reason follows the call's records, the next request carries the brief with the objection and
-//!   nothing of the attempt (no `finish` or `conclude` call, none of the reply texts, the reasoning or
-//!   the rejection), a result delivered earlier in the session stays, no `cache_break` is recorded,
-//!   and the folded text is still found by `log_search`; with `agents.fresh_start` off there is no
+//! - a fresh start: after a `finish` its verifier did not accept, one `compaction` with the fresh-start
+//!   reason follows the call's records, the next request carries the note and the table and nothing
+//!   of the attempt, no `cache_break` is recorded; with `agents.fresh_start` off there is no
 //!   such record and the rejection is in the next request;
 //! - a model error (`Rejected`) parks a lead with `turn_failed` and settles a child `Failed`;
 //! - a request retrying (503s) past `unavailable_notice_s` opens one notice with the address and the last
@@ -545,35 +377,35 @@
 //!   the step fails; none is opened when the window ends first; a reply that streams past the notice
 //!   time and then breaks starts a new outage; a stop resolves it; 0 opens none; a digest request is
 //!   watched too; a notice left open is resolved when `run` starts;
-//! - stall note after `stall_steps` steps of read-only calls, and not again until progress.
 
-use crate::frontier;
+use crate::completeness;
 use crate::gate::{self, Yield, YieldCtx};
 use crate::hud::{self, HudChild, HudInput, HudJob};
-use crate::rtools::{build_registry, ChildInfo, Delivery, Effect, FreshStart, Settlement, Shared, ENDING_TOOLS};
+use crate::rtools::{build_registry, ChildInfo, Delivery, Effect, FreshStart, Settlement, Shared};
 use crate::texts;
 use futures_util::FutureExt;
 use loom_core::admit::AdmitPolicy;
-use loom_core::config::{AgentsCfg, Paths};
+use loom_core::compaction::{self, TableInput};
+use loom_core::config::{AgentsCfg, ContextCfg, Paths};
 use loom_core::estimate::TokenEstimator;
 use loom_core::event::{
-    Author, Budget, ChildCompleted, ChildOutcome, ChildSettled, Event, EvidenceGrade, FinishReason, Forked, InboxItem,
-    InboxKind, ModelRef, ModelRequest, ModelResponse, ModelSwitched, NoteKind, Purpose, ReasoningReplay, Record,
-    Reweave, Seq, SessionOutcome, SessionStart, StoredAction, Termination, Timing, ToolCall, ToolCallRequest,
-    ToolClass, ToolSpec, ToolStatus, Trigger, TurnEndReason, Usage, META_DEFERRED_OBSERVATION, META_EXIT_CODE,
-    META_JOB, META_SIGNAL,
+    Author, Budget, ChildCompleted, ChildOutcome, ChildSettled, Compaction, Event, EvidenceGrade, FinishReason, Forked,
+    InboxItem, InboxKind, ModelRef, ModelRequest, ModelResponse, ModelSwitched, NoteKind, Purpose, ReasoningReplay,
+    Record, Seq, SessionOutcome, SessionStart, StoredAction, Termination, Timing, ToolCall, ToolCallRequest, ToolClass,
+    ToolSpec, ToolStatus, Trigger, TurnEndReason, Usage, META_DEFERRED_OBSERVATION, META_EXIT_CODE, META_JOB,
+    META_SIGNAL,
 };
 use loom_core::ids::{new_item_id, new_request_id, CallId, SessionId};
 use loom_core::ledger::{LedgerOp, LedgerState};
 use loom_core::log::{fork_file, Durability, SessionLog};
 use loom_core::message::Message;
 use loom_core::prefix::{stable_hash, PrefixCheck, PrefixGuard};
-use loom_core::weave::{hud_message, weave, ReweavePolicy, Weave, Woven};
+use loom_core::weave::{hud_message, weave, Weave, Woven};
 use loom_core::{now_ms, BlobRef};
 use loom_model::assemble::{Completion, StreamEvent};
 use loom_model::client::{ModelClient, ModelError};
 use loom_model::limit::{Limiter, Priority};
-use loom_model::request::{ChatRequest, ToolChoice};
+use loom_model::request::{ChatRequest, ImageResolver, ToolChoice};
 use loom_tools::files::FileTracker;
 use loom_tools::jobs::{JobEvent, JobInfo, JobState};
 use loom_tools::proc::Ended;
@@ -593,6 +425,8 @@ use tokio_util::sync::CancellationToken;
 pub enum Input {
     /// The operator wrote to the session.
     User(String),
+    /// The operator wrote to the session and attached images (already in the blob store).
+    UserImages { text: String, images: Vec<loom_core::ImageRef> },
     /// The operator answered one of the session's inbox items.
     Answer { item_id: String, answer: String },
     /// The operator set a standing rule for the mission.
@@ -616,14 +450,17 @@ pub enum Input {
     AgentMessage { from: SessionId, text: String },
     /// Carry on (operator request, or recovery after a restart).
     Resume,
-    /// Fold older material out of view now.
-    Reweave,
+    /// Compact the window now (the operator asked); no turn.
+    Compact,
     /// The operator pressed stop. The runtime also cancels the running turn through [`Control`];
     /// this input covers what is left when no turn is running.
     Stop,
     /// A `Constraint`, `Approval`, `Withdraw` or `Scope` kept on disk at `file` until it is recorded (see
     /// [`queue_input`]).
     Queued { file: PathBuf, input: Box<Input> },
+    /// Queued messages (see [`queue_user_message`]) were written to disk: when the session is idle, record
+    /// them and start a turn; during a turn it does nothing (they are recorded when the turn ends).
+    DrainQueued,
     /// Use another model from the next request on (the operator switched it, or its profile was
     /// reloaded). Applied between steps like a rule; it starts no turn. Not kept on disk: the runtime
     /// writes the new model to `meta.json` first, and `open` records a switch a restart cut short.
@@ -674,11 +511,38 @@ fn same_model(a: &ModelRef, b: &ModelRef) -> bool {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum KeptInput {
-    Constraint { text: String },
-    Approval { text: String, scope: String },
-    Withdraw { id: String, reason: String },
-    Scope { hosts: Vec<String>, note: Option<String> },
-    Release { reason: String },
+    Constraint {
+        text: String,
+    },
+    Approval {
+        text: String,
+        scope: String,
+    },
+    Withdraw {
+        id: String,
+        reason: String,
+    },
+    Scope {
+        hosts: Vec<String>,
+        note: Option<String>,
+    },
+    Release {
+        reason: String,
+    },
+    /// A message the operator queued to be sent when the lead's turn ends ([`queue_user_message`]). Not an
+    /// [`Input`] until then: it is never recorded by `kept_inputs`.
+    User {
+        id: String,
+        text: String,
+        attachments: Vec<String>,
+        created_ms: u64,
+        /// What is recorded: `text` with the attachments block; empty means `text` as it is.
+        #[serde(default)]
+        composed: String,
+        /// The attached images stored when it was queued (`Input::UserImages` when not empty).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<loom_core::ImageRef>,
+    },
 }
 
 impl KeptInput {
@@ -689,6 +553,14 @@ impl KeptInput {
             KeptInput::Withdraw { id, reason } => Input::Withdraw { id, reason },
             KeptInput::Scope { hosts, note } => Input::Scope { hosts, note },
             KeptInput::Release { reason } => Input::Release { reason },
+            KeptInput::User { text, composed, images, .. } => {
+                let text = if composed.is_empty() { text } else { composed };
+                if images.is_empty() {
+                    Input::User(text)
+                } else {
+                    Input::UserImages { text, images }
+                }
+            }
         }
     }
 }
@@ -720,6 +592,17 @@ pub fn queue_input(paths: &Paths, session: &SessionId, input: Input) -> Result<I
 
 /// Write `kept` durably as the next file of `dir`; file names sort in the order they were written.
 fn write_kept(dir: &Path, kept: &KeptInput) -> std::io::Result<PathBuf> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = dir.join(format!("{:016}-{n:010}.json", now_ms()));
+    write_kept_to(dir, &path, kept).inspect_err(|_| {
+        // The operator is told to send it again, so it must not be recorded later as well.
+        let _ = std::fs::remove_file(&path);
+    })
+}
+
+/// Write `kept` durably at `path` in `dir`, replacing what is there.
+fn write_kept_to(dir: &Path, path: &Path, kept: &KeptInput) -> std::io::Result<PathBuf> {
     fn write_synced(dir: &Path, tmp: &Path, path: &Path, kept: &KeptInput) -> std::io::Result<()> {
         use std::io::Write;
         let mut options = std::fs::OpenOptions::new();
@@ -731,19 +614,175 @@ fn write_kept(dir: &Path, kept: &KeptInput) -> std::io::Result<PathBuf> {
         std::fs::rename(tmp, path)?;
         std::fs::File::open(dir)?.sync_all()
     }
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     loom_core::config::ensure_private_dir(dir)?;
-    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let name = format!("{:016}-{n:010}.json", now_ms());
-    let path = dir.join(&name);
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let tmp = dir.join(format!(".{name}.tmp"));
-    if let Err(e) = write_synced(dir, &tmp, &path, kept) {
-        // The operator is told to send it again, so it must not be recorded later as well.
+    if let Err(e) = write_synced(dir, &tmp, path, kept) {
         let _ = std::fs::remove_file(&tmp);
-        let _ = std::fs::remove_file(&path);
         return Err(e);
     }
-    Ok(path)
+    Ok(path.to_path_buf())
+}
+
+/// A message the operator queued to be sent when the lead's turn ends.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueuedMessage {
+    pub id: String,
+    pub text: String,
+    /// Uploads of the session's workspace, as `Runtime::send_message_with` takes them.
+    pub attachments: Vec<String>,
+    pub created_ms: u64,
+}
+
+impl QueuedMessage {
+    fn of(kept: &KeptInput) -> Option<QueuedMessage> {
+        match kept {
+            KeptInput::User { id, text, attachments, created_ms, .. } => Some(QueuedMessage {
+                id: id.clone(),
+                text: text.clone(),
+                attachments: attachments.clone(),
+                created_ms: *created_ms,
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// Serializes the operator's changes to queued messages with the session taking them.
+static QUEUE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn queue_lock() -> std::sync::MutexGuard<'static, ()> {
+    QUEUE_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+fn no_queued(id: &str) -> String {
+    format!("There is no queued message {id}; it may have just been sent.")
+}
+
+/// The queued user messages of `dir` with their files, oldest first.
+fn queued_files(dir: &Path) -> Vec<(PathBuf, KeptInput)> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut files: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .collect();
+    files.sort();
+    files
+        .into_iter()
+        .filter_map(|f| {
+            let kept = std::fs::read(&f).ok().and_then(|b| serde_json::from_slice::<KeptInput>(&b).ok())?;
+            matches!(kept, KeptInput::User { .. }).then_some((f, kept))
+        })
+        .collect()
+}
+
+/// Keep a message for `session` on disk until its lead's turn ends. `composed` is `text` with the
+/// attachments block (`texts::with_attachments`), which is what is recorded, with `images` (the attached
+/// images, already stored as blobs). The caller then sends the session [`Input::DrainQueued`], so that a
+/// turn that ended meanwhile still sends it.
+pub fn queue_user_message(
+    paths: &Paths,
+    session: &SessionId,
+    text: &str,
+    attachments: &[String],
+    composed: &str,
+    images: &[loom_core::ImageRef],
+) -> Result<QueuedMessage, String> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let created_ms = now_ms();
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let message = QueuedMessage {
+        id: format!("q{created_ms}-{n}"),
+        text: text.to_string(),
+        attachments: attachments.to_vec(),
+        created_ms,
+    };
+    let kept = KeptInput::User {
+        id: message.id.clone(),
+        text: message.text.clone(),
+        attachments: message.attachments.clone(),
+        created_ms,
+        composed: composed.to_string(),
+        images: images.to_vec(),
+    };
+    let _guard = queue_lock();
+    write_kept(&queue_dir(paths, session), &kept).map_err(|e| {
+        format!("Could not keep the message for session {} on disk ({e}); send it again.", session.as_str())
+    })?;
+    Ok(message)
+}
+
+/// The messages queued for `session`, oldest first.
+pub fn queued_messages(paths: &Paths, session: &SessionId) -> Vec<QueuedMessage> {
+    let _guard = queue_lock();
+    queued_files(&queue_dir(paths, session)).iter().filter_map(|(_, k)| QueuedMessage::of(k)).collect()
+}
+
+/// Replace the text (and what is recorded for it) of queued message `id`.
+pub fn edit_queued_message(
+    paths: &Paths,
+    session: &SessionId,
+    id: &str,
+    text: &str,
+    composed: &str,
+) -> Result<QueuedMessage, String> {
+    let dir = queue_dir(paths, session);
+    let _guard = queue_lock();
+    for (file, kept) in queued_files(&dir) {
+        let KeptInput::User { id: have, attachments, created_ms, images, .. } = kept else { continue };
+        if have != id {
+            continue;
+        }
+        let message =
+            QueuedMessage { id: have.clone(), text: text.to_string(), attachments: attachments.clone(), created_ms };
+        let new = KeptInput::User {
+            id: have,
+            text: text.to_string(),
+            attachments,
+            created_ms,
+            composed: composed.to_string(),
+            images,
+        };
+        write_kept_to(&dir, &file, &new).map_err(|e| format!("Could not keep the edit on disk ({e}); try again."))?;
+        return Ok(message);
+    }
+    Err(no_queued(id))
+}
+
+/// Take queued message `id` off the queue: the message and the input that records it
+/// (`Input::UserImages` when images were attached).
+pub fn take_queued_message(paths: &Paths, session: &SessionId, id: &str) -> Result<(QueuedMessage, Input), String> {
+    let _guard = queue_lock();
+    for (file, kept) in queued_files(&queue_dir(paths, session)) {
+        let Some(message) = QueuedMessage::of(&kept) else { continue };
+        if message.id != id {
+            continue;
+        }
+        std::fs::remove_file(&file).map_err(|e| format!("Could not remove the queued message ({e}); try again."))?;
+        return Ok((message, kept.into_input()));
+    }
+    Err(no_queued(id))
+}
+
+/// Drop every message queued for `session` (it was archived). Returns how many there were.
+pub fn discard_queued_messages(paths: &Paths, session: &SessionId) -> usize {
+    let _guard = queue_lock();
+    queued_files(&queue_dir(paths, session)).iter().filter(|(f, _)| std::fs::remove_file(f).is_ok()).count()
+}
+
+/// The name a queued message's file takes while the session records it: `{stem}.{seq}.sending`, `seq`
+/// being the seq the message's `user_message` gets.
+fn sending_path(file: &Path, seq: Seq) -> PathBuf {
+    let name = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let stem = name.split('.').next().unwrap_or_default();
+    file.with_file_name(format!("{stem}.{seq}.sending"))
+}
+
+/// The stem and seq of a name made by [`sending_path`].
+fn sending_parts(file: &Path) -> Option<(String, Seq)> {
+    let name = file.file_name()?.to_str()?.strip_suffix(".sending")?;
+    let (stem, seq) = name.split_once('.')?;
+    Some((stem.to_string(), seq.parse().ok()?))
 }
 
 /// The name a kept input's `file` takes while the session records it: `{stem}.{seq}.taking`, where
@@ -765,6 +804,8 @@ pub trait Sink: Send + Sync {
     fn record(&self, session: &SessionId, record: &Record);
     fn delta(&self, session: &SessionId, req_id: &str, event: &StreamEvent);
     fn status(&self, session: &SessionId, status: &Status);
+    /// The session's queued messages changed (the session recorded some).
+    fn queued(&self, _session: &SessionId) {}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -854,7 +895,7 @@ impl Control {
 pub struct Deps {
     pub paths: Paths,
     pub agents: AgentsCfg,
-    pub context: ReweavePolicy,
+    pub context: ContextCfg,
     pub admit: AdmitPolicy,
     pub client: Arc<ModelClient>,
     pub limiter: Arc<Limiter>,
@@ -1023,18 +1064,21 @@ const COMPACT_HIDDEN_TOOLS: &[&str] = &[
 
 /// Build the static wire `ToolSpec` list once at session creation so KV prompt cache stays stable.
 fn wire_tools(registry: &Registry, deps: &Deps) -> Vec<ToolSpec> {
+    let dialect = deps.ctx.cfg.dialect;
     let hidden = &deps.shared.role.hidden_tools;
     let compact = deps.agents.compact_tools;
     registry
         .specs()
         .into_iter()
         .filter(|spec| {
-            !hidden.iter().any(|h| h == &spec.name) && !(compact && COMPACT_HIDDEN_TOOLS.contains(&spec.name.as_str()))
+            let compacted = compact && COMPACT_HIDDEN_TOOLS.contains(&spec.name.as_str());
+            !compacted && !hidden.iter().any(|h| h == &spec.name)
         })
+        .map(|spec| loom_tools::dialect::present(&spec, dialect))
         .collect()
 }
 
-/// A step request as the re-weave check needs it.
+/// A step request as the compaction check needs it.
 #[derive(Clone, Debug, Default)]
 struct Measured {
     req_id: String,
@@ -1102,6 +1146,7 @@ impl State {
                 self.usage.reasoning_tokens = self.usage.reasoning_tokens.saturating_add(r.usage.reasoning_tokens);
             }
             Event::Reweave(r) => self.epoch = r.epoch,
+            Event::Compaction(c) => self.epoch = c.epoch,
             Event::BudgetClock { running } => {
                 let old_elapsed = rec.ts_ms.saturating_sub(self.budget_from_ms.unwrap_or(self.started_ms));
                 let clock = self.clock.get_or_insert(ActiveClock { accrued_ms: old_elapsed, running_from: None });
@@ -1505,6 +1550,8 @@ pub struct Session {
     /// Replies in a row that made no progress: nudged by the gate, cut off by the output limit with
     /// no complete call, or with only malformed calls.
     nudges: u32,
+    /// The gate's "ended without a tool call" nudge was given in this turn; it is given once.
+    text_nudged: bool,
     phase: Phase,
     st: State,
     published: Option<Status>,
@@ -1515,27 +1562,134 @@ pub struct Session {
     early_counts: Arc<Mutex<EarlyCounts>>,
     /// The epoch of the weave whose request the server last refused (400, 413, 422); in memory only.
     refused_epoch: Option<u32>,
+    /// Set while a step request is watched for stalls: the third stall of it is cut (K2 `stall`).
+    stall_armed: bool,
+    /// The watched request was cut by its third stall.
+    stall_hit: bool,
 }
 
-/// How hard a re-weave folds, beyond its trigger (see the module contract's re-weave procedure).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Fold {
-    /// Protect `keep_recent_steps` recent steps, halving down to `MIN_KEEP_RECENT_STEPS`; ask for a digest.
-    Normal,
-    /// Protect nothing from the start (what the server refuses may be the newest output); ask for a digest.
-    KeepZero,
-    /// The server refused the request as too large for a window of this many tokens: halve down to
-    /// protecting nothing; no digest request (the server would refuse it too).
-    Overflow(u64),
-    /// The server refused the request for what it carries: protect nothing from the start; no digest.
-    Refused,
+/// What a note request gave: the note (keys it cited that do not exist are already replaced), the request's
+/// id, the output keys it cited that exist, and the citations dropped.
+#[derive(Default)]
+struct Note {
+    text: Option<String>,
+    req: Option<String>,
+    keys: Vec<String>,
+    dropped: Vec<String>,
+}
+
+/// A key a note cites: an output key (`out:` and 8 to 64 hex characters) or a ledger id (`p`, `c` or `e`
+/// and digits), with where it stands in the text.
+struct Cite {
+    start: usize,
+    end: usize,
+    out: bool,
+    /// The text as written.
+    text: String,
+    /// For a known output key: `out:` and 16 hex characters.
+    key: String,
+    known: bool,
+}
+
+/// The citations of `text` (K4).
+fn scan_cites(text: &str) -> Vec<Cite> {
+    let b = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b.get(i..).is_some_and(|r| r.starts_with(b"out:")) {
+            let mut j = i + 4;
+            while b.get(j).is_some_and(u8::is_ascii_hexdigit) {
+                j += 1;
+            }
+            if (8..=64).contains(&(j - i - 4)) {
+                if let Some(t) = text.get(i..j) {
+                    out.push(Cite {
+                        start: i,
+                        end: j,
+                        out: true,
+                        text: t.to_string(),
+                        key: String::new(),
+                        known: false,
+                    });
+                }
+                i = j;
+            } else {
+                i += 4;
+            }
+        } else if b.get(i).is_some_and(|c| c.is_ascii_alphanumeric()) {
+            let start = i;
+            while b.get(i).is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_') {
+                i += 1;
+            }
+            let word = text.get(start..i).unwrap_or_default();
+            let mut chars = word.chars();
+            let is_id = matches!(chars.next(), Some('p' | 'c' | 'e'))
+                && (1..=6).contains(&word.len().saturating_sub(1))
+                && chars.all(|c| c.is_ascii_digit());
+            if is_id {
+                out.push(Cite { start, end: i, out: false, text: word.to_string(), key: String::new(), known: true });
+            }
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// `text` with every unknown citation replaced by `[unknown key]`, and those citations (once each, as written).
+fn drop_unknown(text: &str, cites: &[Cite]) -> (String, Vec<String>) {
+    let mut out = String::new();
+    let mut dropped: Vec<String> = Vec::new();
+    let mut at = 0;
+    for c in cites.iter().filter(|c| !c.known) {
+        out.push_str(text.get(at..c.start).unwrap_or_default());
+        out.push_str("[unknown key]");
+        at = c.end;
+        if !dropped.contains(&c.text) {
+            dropped.push(c.text.clone());
+        }
+    }
+    out.push_str(text.get(at..).unwrap_or_default());
+    (out, dropped)
+}
+
+/// The window of a `refused` or `stall` compaction's note request (K4): each tool result is cut to its first
+/// and last line (the header and what ends it), each agent report to its first 2 000 characters.
+fn headers_only_messages(messages: &[Message]) -> Vec<Message> {
+    messages
+        .iter()
+        .map(|m| {
+            let mut m = m.clone();
+            if m.role == loom_core::message::Role::Tool {
+                let lines: Vec<&str> = m.content.lines().collect();
+                if let (Some(first), Some(last)) = (lines.first(), lines.last()) {
+                    if lines.len() > 2 {
+                        m.content = format!("{first}\n{last}");
+                    }
+                }
+                m.images.clear();
+            } else if m.role == loom_core::message::Role::User
+                && m.content.starts_with("<harness kind=\"agent-report\"")
+            {
+                m.content = texts::cut(&m.content, 2_000);
+            }
+            m
+        })
+        .collect()
+}
+
+/// Stalls of one step request after which the window is compacted (K2).
+const STALLS_BEFORE_COMPACTION: u32 = 3;
+
+/// Whether a stream event reports a stall (no response headers, or a stream that went quiet) being retried.
+fn is_stall(event: &StreamEvent) -> bool {
+    matches!(event, StreamEvent::Retrying { reason, .. }
+        if reason.contains("delivered nothing for") || reason.contains("no response headers within"))
 }
 
 /// Longest `session_end` detail.
 const DETAIL_CHARS: usize = 200;
-
-/// A re-weave never protects fewer recent steps than this.
-const MIN_KEEP_RECENT_STEPS: u32 = 2;
 
 fn fatal(e: impl std::fmt::Display) -> Fatal {
     Fatal(e.to_string())
@@ -1549,36 +1703,6 @@ fn to_u32(n: usize) -> u32 {
 /// Characters of the tool specs as they are sent.
 pub(crate) fn tools_chars(tools: &[ToolSpec]) -> usize {
     tools.iter().map(|t| t.to_openai().to_string().len()).sum()
-}
-
-/// The trigger and the floor of a re-weave (see the module contract): `policy`'s, lowered for a
-/// known `window` so that a request at the trigger leaves room for the reply. That room is
-/// `max_output` plus 4_096, or 20_480 without one. What the harness chooses itself (the 4_096, the
-/// 20_480) is at most a quarter of the window, so that a small window keeps a positive trigger and
-/// floor. A `max_output` below the window is never cut, since every request asks for that much as
-/// `max_tokens`: the 4_096 after it shrinks to what the window has left (`window − max − 1`), so
-/// the trigger can drop to 1 and the floor to 0. A `max_output` at or above the window cannot be
-/// honoured and counts as none. From a window of 81_920 tokens up the quarter of the window cuts
-/// nothing.
-pub(crate) fn reweave_bounds(policy: &ReweavePolicy, window: Option<u64>, max_output: Option<u64>) -> (u64, u64) {
-    let (mut limit, mut floor) = (policy.target_tokens, policy.floor_tokens);
-    if let Some(window) = window {
-        let slack = 4_096_u64.min(window / 4);
-        // A reply length the window cannot hold counts as none; one it can hold is kept, with the slack
-        // shrunk to what is left, because `step` sends it as max_tokens.
-        let reserve = match max_output {
-            Some(max) if max < window => max + slack.min(window - max - 1),
-            _ => 20_480_u64.min(window / 4),
-        };
-        // The trigger stays within four fifths of the window and the floor within half of it, so
-        // that a small window can always be planned for.
-        limit = limit.min(window.saturating_sub(reserve)).min(window / 5 * 4);
-        floor = floor.min(window / 2);
-        if floor >= limit {
-            floor = limit / 2;
-        }
-    }
-    (limit, floor)
 }
 
 /// [`Session::measured_size`] for a counted request `m` (the latest step request of `w`'s epoch that
@@ -1737,18 +1861,21 @@ impl Session {
             st.absorb(i, r);
         }
         let phase = if st.ended.is_some() { Phase::Ended } else { Phase::Idle };
+        let mut estimator = TokenEstimator::default();
+        estimator.set_vision(deps.client.profile().vision);
         Session {
             deps,
             log,
             records,
             registry,
-            estimator: TokenEstimator::default(),
+            estimator,
             guard: PrefixGuard::new(),
             inputs: None,
             inputs_seen_open: false,
             jobs_open: true,
             token: CancellationToken::new(),
             nudges: 0,
+            text_nudged: false,
             phase,
             st,
             published: None,
@@ -1757,6 +1884,8 @@ impl Session {
             weaves: 0,
             early_counts: Arc::default(),
             refused_epoch: None,
+            stall_armed: false,
+            stall_hit: false,
         }
     }
 
@@ -1775,6 +1904,10 @@ impl Session {
         start.tools = wire_tools(&registry, &deps);
         let mut session = Session::bare(deps, log, Vec::new(), registry);
         session.append(Author::Harness, Event::SessionStart(start)).map_err(|e| e.0)?;
+        // The MCP servers' note (CONTRACTS-MCP M6): once, before anything else is said.
+        if let Some(text) = session.deps.shared.mcp().and_then(|m| m.note().map(str::to_string)) {
+            session.append(Author::Harness, Event::HarnessNote { note: NoteKind::Info, text }).map_err(|e| e.0)?;
+        }
         if let Some((parent, text)) = assignment {
             session
                 .append(Author::Agent(parent), Event::HarnessNote { note: NoteKind::Assignment, text })
@@ -1814,6 +1947,11 @@ Name them when you start a new mission instead."
             return Err(format!("the session log {} holds no readable record", path.display()));
         }
         let mut session = Session::bare(deps, log, report.records, registry);
+        for r in &session.records {
+            if let Event::Exchange(x) = &r.event {
+                session.deps.shared.traffic.mission.add(x);
+            }
+        }
         session.deps.shared.take_continuation();
         // A durable plan is an audit artifact, never a restart queue: the last dispatch may
         // have taken effect without a receipt. Reconcile it through a real actor callback.
@@ -1845,6 +1983,7 @@ Name them when you start a new mission instead."
                 .map_err(|e| e.0)?;
             session.append(Author::Harness, Event::TurnEnd { reason: TurnEndReason::Stopped }).map_err(|e| e.0)?;
         }
+        session.restore_shell_dir();
         session.record_left_jobs()?;
         // After the jobs above are registered: an id they were given is not handed out again either.
         let top = session
@@ -1867,6 +2006,18 @@ Name them when you start a new mission instead."
         }
         session.seed_guard().map_err(|e| e.0)?;
         Ok(session)
+    }
+
+    /// The shell directory of a reopened session: the one the last `bash` result that names one left
+    /// the shell in, when it is still a directory.
+    fn restore_shell_dir(&self) {
+        let left = self.own().iter().rev().find_map(|r| match &r.event {
+            Event::ToolResult(t) if t.name == "bash" => t.meta.get(loom_core::event::META_CWD).and_then(|v| v.as_str()),
+            _ => None,
+        });
+        if let Some(dir) = left.map(std::path::PathBuf::from).filter(|d| d.is_absolute() && d.is_dir()) {
+            self.deps.ctx.shell.set(Some(dir));
+        }
     }
 
     /// Prime the prefix guard with the stable messages of the last request in the log, as they render
@@ -1902,6 +2053,7 @@ Name them when you start a new mission instead."
     fn switch_model(&mut self, sw: ModelSwitch) -> R<()> {
         let ModelSwitch { client, limiter, context_window, model, reasoning_replay, reason, settings_changed } = sw;
         self.deps.client = client;
+        self.estimator.set_vision(self.deps.client.profile().vision);
         self.deps.limiter = limiter;
         self.deps.context_window = context_window;
         self.deps.model = model;
@@ -2104,6 +2256,9 @@ Name them when you start a new mission instead."
             }
         }
         let record = self.log.append(author, event).map_err(fatal)?;
+        if let Event::Exchange(x) = &record.event {
+            self.deps.shared.traffic.mission.add(x);
+        }
         self.st.absorb(self.records.len(), &record);
         self.deps.sink.record(&self.deps.shared.session, &record);
         let seq = record.seq;
@@ -2115,6 +2270,20 @@ Name them when you start a new mission instead."
     fn flush_emitted(&mut self) -> R<()> {
         for (author, event) in self.deps.shared.take_emitted() {
             self.append(author, event)?;
+        }
+        self.flush_traffic()
+    }
+
+    /// Append the exchanges the proxy captured since the last flush (CONTRACTS-TRAFFIC-TARGETS C3), and the
+    /// one note that capture stopped at the session's cap.
+    fn flush_traffic(&mut self) -> R<()> {
+        let traffic = self.deps.shared.traffic.clone();
+        let (list, note) = traffic.take_pending();
+        for x in list {
+            self.append(Author::Harness, Event::Exchange(x))?;
+        }
+        if let Some(text) = note {
+            self.note(Author::Harness, NoteKind::Info, text)?;
         }
         Ok(())
     }
@@ -2216,6 +2385,7 @@ Name them when you start a new mission instead."
         }
         self.resolve_stale_notices()?;
         self.publish();
+        self.recover_sending();
         for input in self.kept_inputs() {
             self.arrival(input).await?;
         }
@@ -2256,22 +2426,108 @@ Name them when you start a new mission instead."
             if self.deps.control.is_closed() {
                 return self.close_idle().await;
             }
-            if let Some(trigger) = trigger {
+            let mut next = trigger;
+            while let Some(trigger) = next.take() {
                 if let Some(settled) = self.turn(trigger).await? {
                     return Ok(End::Settled(settled));
+                }
+                // The turn ended: what the operator queued for after it starts the next one. A stop
+                // keeps the queue for the operator's next message or resume.
+                if !self.deps.control.is_closed()
+                    && self.st.last_end != Some(TurnEndReason::Stopped)
+                    && self.flush_queued().await?
+                {
+                    next = Some(Trigger::User);
                 }
             }
         }
     }
 
+    /// Record the queued user messages (see [`queue_user_message`]), oldest first, as `user_message`s.
+    /// Whether any was recorded. Each file is renamed to `{stem}.{seq}.sending` (the seq of its record)
+    /// while it is recorded and deleted after, so that a harness that stops in between records it once
+    /// ([`Session::recover_sending`]).
+    async fn flush_queued(&mut self) -> R<bool> {
+        let dir = queue_dir(&self.deps.paths, &self.deps.shared.session);
+        let mut any = false;
+        loop {
+            let next = {
+                let _guard = queue_lock();
+                match queued_files(&dir).into_iter().next() {
+                    None => None,
+                    Some((file, kept)) => {
+                        let held = sending_path(&file, self.log.next_seq());
+                        match std::fs::rename(&file, &held) {
+                            Ok(()) => Some((held, kept)),
+                            Err(e) => {
+                                tracing::warn!(session = %self.deps.shared.session, "queued message {} not taken: {e}", file.display());
+                                None
+                            }
+                        }
+                    }
+                }
+            };
+            let Some((held, kept)) = next else { break };
+            let input = kept.into_input();
+            if matches!(input, Input::User(_) | Input::UserImages { .. }) {
+                self.record_input(input).await?;
+            }
+            if let Err(e) = std::fs::remove_file(&held) {
+                tracing::warn!(session = %self.deps.shared.session, "queued message {} not deleted: {e}", held.display());
+            }
+            any = true;
+        }
+        if any {
+            self.deps.sink.queued(&self.deps.shared.session);
+        }
+        Ok(any)
+    }
+
+    /// Settle the queued messages a harness that stopped left being recorded: one whose `user_message`
+    /// reached the log is deleted, any other is queued again.
+    fn recover_sending(&self) {
+        let dir = queue_dir(&self.deps.paths, &self.deps.shared.session);
+        let Ok(entries) = std::fs::read_dir(&dir) else { return };
+        for file in entries.filter_map(|e| e.ok().map(|e| e.path())) {
+            let Some((stem, seq)) = sending_parts(&file) else { continue };
+            let recorded = self
+                .records
+                .binary_search_by_key(&seq, |r| r.seq)
+                .ok()
+                .and_then(|i| self.records.get(i))
+                .is_some_and(|r| r.author == Author::User && matches!(r.event, Event::UserMessage { .. }));
+            let done = if recorded {
+                std::fs::remove_file(&file)
+            } else {
+                std::fs::rename(&file, dir.join(format!("{stem}.json")))
+            };
+            if let Err(e) = done {
+                tracing::warn!(session = %self.deps.shared.session, "queued message {} not settled: {e}", file.display());
+            }
+        }
+    }
+
     async fn idle_input(&mut self, input: Input) -> R<Option<Trigger>> {
+        self.flush_traffic()?;
         match input {
-            Input::Resume => Ok(Some(Trigger::Resume)),
-            Input::Reweave => {
+            Input::Resume => {
+                // What was queued while the session ran (and kept by a stop) goes first.
+                self.flush_queued().await?;
+                Ok(Some(Trigger::Resume))
+            }
+            Input::DrainQueued => {
+                // A stopped session keeps its queue until the operator messages or resumes it.
+                let stopped = self.st.last_end == Some(TurnEndReason::Stopped);
+                Ok(if !stopped && self.flush_queued().await? { Some(Trigger::User) } else { None })
+            }
+            Input::User(_) => {
+                self.flush_queued().await?;
+                Ok(self.arrival(input).await?.trigger)
+            }
+            Input::Compact => {
                 let token = self.deps.control.begin_turn();
                 let woven = self.woven();
-                let fold = self.operator_fold(&woven);
-                let res = self.reweave(&woven, "operator", true, &token, fold).await;
+                let res = self.compact(&woven, "operator", None, &token).await;
                 if self.st.clock.as_ref().is_some_and(|c| c.running_from.is_some()) {
                     let _ = self.clock_set(false);
                 }
@@ -2334,6 +2590,10 @@ Name them when you start a new mission instead."
                     return None;
                 }
                 let kept = std::fs::read(&file).ok().and_then(|b| serde_json::from_slice::<KeptInput>(&b).ok());
+                // A queued message waits for a turn to end, not for the session to start.
+                if matches!(kept, Some(KeptInput::User { .. })) {
+                    return None;
+                }
                 if kept.is_none() {
                     tracing::warn!(session = %self.deps.shared.session, "unreadable queued input {}", file.display());
                 }
@@ -2384,7 +2644,13 @@ Name them when you start a new mission instead."
         let mut out = Arrival::default();
         match input {
             Input::User(text) => {
-                self.append(Author::User, Event::UserMessage { text: text.clone() })?;
+                self.append(Author::User, Event::UserMessage { text: text.clone(), images: vec![] })?;
+                self.record_goal(&text)?;
+                out.trigger = Some(Trigger::User);
+                out.user = true;
+            }
+            Input::UserImages { text, images } => {
+                self.append(Author::User, Event::UserMessage { text: text.clone(), images })?;
                 self.record_goal(&text)?;
                 out.trigger = Some(Trigger::User);
                 out.user = true;
@@ -2411,7 +2677,10 @@ Name them when you start a new mission instead."
                     }
                     return Ok(out);
                 }
-                self.append(Author::User, Event::UserMessage { text: texts::inbox_answer(&item.text, &answer) })?;
+                self.append(
+                    Author::User,
+                    Event::UserMessage { text: texts::inbox_answer(&item.text, &answer), images: vec![] },
+                )?;
                 out.trigger = Some(Trigger::InboxAnswer);
                 out.user = true;
             }
@@ -2489,7 +2758,7 @@ Name them when you start a new mission instead."
                 }
             }
             Input::SwitchModel(sw) => self.switch_model(*sw)?,
-            Input::Resume | Input::Reweave | Input::Stop | Input::Queued { .. } => {}
+            Input::Resume | Input::Compact | Input::Stop | Input::Queued { .. } | Input::DrainQueued => {}
         }
         Ok(out)
     }
@@ -2533,6 +2802,7 @@ Name them when you start a new mission instead."
     /// Record a job event. True when a note was appended that should wake a waiting session.
     /// Record a job event. `Some`: the turn it starts when the session is idle.
     async fn on_job_event(&mut self, event: JobEvent) -> R<Option<Trigger>> {
+        self.flush_traffic()?;
         let asleep = matches!(self.st.last_end, Some(TurnEndReason::Waiting | TurnEndReason::Yielded));
         match event {
             JobEvent::Registered(info) => {
@@ -2633,6 +2903,7 @@ Name them when you start a new mission instead."
     async fn turn(&mut self, trigger: Trigger) -> R<Option<Settlement>> {
         self.token = self.deps.control.begin_turn();
         self.nudges = 0;
+        self.text_nudged = false;
         let renewed = renews_budget(trigger, self.st.last_end);
         self.append(Author::Harness, Event::TurnStart { trigger })?;
         self.clock_set(true)?;
@@ -2779,15 +3050,6 @@ Name them when you start a new mission instead."
         }
     }
 
-    /// How an operator's re-weave folds: from keep 0 while the weave is the one the server last refused.
-    fn operator_fold(&self, woven: &Woven) -> Fold {
-        if self.refused_epoch == Some(woven.weave.epoch) {
-            Fold::KeepZero
-        } else {
-            Fold::Normal
-        }
-    }
-
     /// The admission policy for a call started now: the configured one scaled to the session's window.
     fn admit_policy(&self) -> AdmitPolicy {
         self.deps.admit.for_window(self.deps.context_window)
@@ -2830,13 +3092,10 @@ Name them when you start a new mission instead."
         if let Some(flow) = self.run_continuation(force).await? {
             return Ok(flow);
         }
-        self.check_stall()?;
         let token = self.token.clone();
         // The weave of this step, rendered again only after a record that changes it.
         let mut woven = self.woven();
-        let (reason, forced) = if force { ("operator", true) } else { ("target", false) };
-        let fold = if force { self.operator_fold(&woven) } else { Fold::Normal };
-        if self.reweave(&woven, reason, forced, &token, fold).await? {
+        if self.compact_if_due(&woven, force, &token).await? {
             woven = self.woven();
         }
         if token.is_cancelled() {
@@ -2845,6 +3104,7 @@ Name them when you start a new mission instead."
 
         let mut overflowed = false;
         let mut refold = false;
+        let mut stall_folded = false;
         let (req_id, completion, queue_ms, tools, early, observed) = loop {
             let req_id = new_request_id();
             let w = &woven.weave;
@@ -2857,6 +3117,7 @@ Name them when you start a new mission instead."
             let mut messages = w.messages.clone();
             messages.push(hud_message(&hud_text));
             let sent_chars = messages.iter().map(Message::chars).sum::<usize>().saturating_add(tools_chars(&w.tools));
+            let image_tokens = self.estimator.image_tokens(&messages);
             let est_tokens = self
                 .estimator
                 .tokens_for_messages(&messages)
@@ -2888,25 +3149,40 @@ Name them when you start a new mission instead."
                 max_tokens: self.deps.client.profile().max_output_tokens,
                 seed: None,
                 extra: Map::new(),
+                images: ImageResolver::for_model(self.deps.client.profile().vision, &self.deps.ctx.blobs),
+                // A free-form role's text is an answer to the operator and is never run.
+                text_calls: self.deps.shared.role.termination == loom_core::event::Termination::Explicit,
             };
+            self.stall_armed = !stall_folded && est_tokens >= self.compact_at() / 2;
+            self.stall_hit = false;
             let result = self.complete_streaming(&request, &req_id, &token).await?;
+            self.stall_armed = false;
             let queue_ms = permit.waited_ms;
             drop(permit);
             match result {
                 Ok((c, early)) => {
                     if c.usage.prompt_tokens > 0 {
-                        self.estimator.calibrate(sent_chars, c.usage.prompt_tokens);
+                        self.estimator.calibrate(sent_chars, c.usage.prompt_tokens.saturating_sub(image_tokens));
                     }
                     self.refused_epoch = None;
                     break (req_id, c, queue_ms, request.tools, early, observed);
                 }
+                Err(ModelError::Cancelled { .. }) if self.stall_hit && !token.is_cancelled() => {
+                    // The same request stalled three times: compact the window (headers only) and ask again.
+                    self.stall_hit = false;
+                    stall_folded = true;
+                    if self.compact(&woven, "stall", None, &token).await? {
+                        woven = self.woven();
+                        continue;
+                    }
+                    return self.cancelled().await;
+                }
                 Err(ModelError::Cancelled { .. }) => return self.cancelled().await,
-                Err(ModelError::ContextOverflow { limit, .. }) => {
+                Err(ModelError::ContextOverflow { .. }) => {
                     if !overflowed {
                         overflowed = true;
                         // What the server refused bounds its window, whatever the session was told.
-                        let fold = Fold::Overflow(limit.unwrap_or(est_tokens));
-                        if self.reweave(&woven, "overflow", true, &token, fold).await? {
+                        if self.compact(&woven, "refused", None, &token).await? {
                             woven = self.woven();
                             continue;
                         }
@@ -2918,10 +3194,16 @@ Name them when you start a new mission instead."
                 }
                 Err(ModelError::Rejected { status, message }) if matches!(status, 400 | 413 | 422) => {
                     // The provider refuses what the request carries. The same prefix refused again
-                    // (nothing re-woven since the last refusal) is folded out of view once per step.
-                    if !refold && self.refused_epoch == Some(woven.weave.epoch) {
+                    // (nothing compacted since the last refusal) is folded out of view once per step.
+                    let folded = self
+                        .records
+                        .iter()
+                        .rev()
+                        .take_while(|r| !matches!(r.event, Event::ModelResponse(_)))
+                        .any(|r| matches!(&r.event, Event::Compaction(c) if c.reason == "refused"));
+                    if !refold && !folded && self.refused_epoch == Some(woven.weave.epoch) {
                         refold = true;
-                        if self.reweave(&woven, "refused", true, &token, Fold::Refused).await? {
+                        if self.compact(&woven, "refused", None, &token).await? {
                             woven = self.woven();
                             continue;
                         }
@@ -2930,12 +3212,6 @@ Name them when you start a new mission instead."
                         }
                     }
                     self.refused_epoch = Some(woven.weave.epoch);
-                    let folded = self
-                        .records
-                        .iter()
-                        .rev()
-                        .take_while(|r| !matches!(r.event, Event::ModelResponse(_)))
-                        .any(|r| matches!(&r.event, Event::Reweave(rw) if rw.reason == "refused"));
                     return self.fail_with(
                         &texts::refused(status, &message, folded),
                         texts::refused_park(status, &message, folded),
@@ -3160,7 +3436,10 @@ Name them when you start a new mission instead."
         let window_s = client.profile().retry_window_s;
         let mut outage = Outage::new(after, (window_s > 0).then(|| Duration::from_secs(window_s)));
         let (tx, mut rx) = unbounded_channel();
-        let call = client.complete(request, Some(&tx), token);
+        // A child token: the third stall of a request the session watches for it cuts the request alone.
+        let watch = token.child_token();
+        let mut stalls = 0u32;
+        let call = client.complete(request, Some(&tx), &watch);
         tokio::pin!(call);
         // The notice opened during this request; at most one, whatever happens after it.
         let mut notice: Option<String> = None;
@@ -3170,6 +3449,13 @@ Name them when you start a new mission instead."
                 biased;
                 r = &mut call => break r,
                 Some(event) = rx.recv() => {
+                    if self.stall_armed && is_stall(&event) {
+                        stalls = stalls.saturating_add(1);
+                        if stalls >= STALLS_BEFORE_COMPACTION {
+                            self.stall_hit = true;
+                            watch.cancel();
+                        }
+                    }
                     on_event(&event);
                     self.clock_event(&event)?;
                     outage.on_event(&event);
@@ -3361,7 +3647,7 @@ Name them when you start a new mission instead."
         }
         while let Some(input) = self.try_next_input() {
             match input {
-                Input::Reweave => force = true,
+                Input::Compact => force = true,
                 Input::Resume => {}
                 // What was sent after the stop is for the idle loop, once this turn has ended `Stopped`.
                 Input::Stop => {
@@ -3446,47 +3732,7 @@ Name them when you start a new mission instead."
         }
     }
 
-    /// A stretch of own steps with no ledger record, file change or child activity gets one note.
-    fn check_stall(&mut self) -> R<()> {
-        if !self.deps.agents.idle_ledger_nudge {
-            return Ok(());
-        }
-        let n = self.deps.agents.stall_steps;
-        if n == 0 || self.st.termination != Some(Termination::Explicit) || self.deps.shared.journal.is_none() {
-            return Ok(());
-        }
-        if self.st.step < n {
-            return Ok(());
-        }
-        let first_step = self.st.step.saturating_sub(n).saturating_add(1);
-        let own = self.own();
-        let mut step = 0u32;
-        let mut from = None;
-        for (i, r) in own.iter().enumerate() {
-            if matches!(&r.event, Event::ModelRequest(m) if m.purpose == Purpose::Step)
-                || matches!(&r.event, Event::StoredAction(_))
-            {
-                step = step.saturating_add(1);
-                if step == first_step {
-                    from = Some(i);
-                    break;
-                }
-            }
-        }
-        let Some(from) = from else { return Ok(()) };
-        let quiet = own.get(from..).unwrap_or_default().iter().all(|r| match &r.event {
-            Event::Ledger { .. } | Event::ChildSpawned(_) | Event::ChildSettled(_) => false,
-            Event::ToolResult(t) => !(t.class == ToolClass::Write && t.status == ToolStatus::Ok),
-            Event::HarnessNote { note: NoteKind::Stall, .. } => false,
-            _ => true,
-        });
-        if quiet {
-            self.note(Author::Harness, NoteKind::Stall, texts::stall(n))?;
-        }
-        Ok(())
-    }
-
-    // ---- re-weave ------------------------------------------------------------------------------
+    // ---- compaction ------------------------------------------------------------------------------
 
     /// The weave of the records as they are now, with what planning needs. Every weave a step uses
     /// is computed here, once, and again only after a record that changes it.
@@ -3512,94 +3758,161 @@ Name them when you start a new mission instead."
         measured_size(self.st.measured.as_ref(), w, &self.estimator)
     }
 
-    /// Fold older material out of view when the request has grown past the limit (or `forced`).
-    /// `woven` is the weave of the records as they are. `refused_at` is the window an overflow error
-    /// stated (or the size of the refused request). True when a `reweave` record was appended.
-    async fn reweave(
+    // ---- compaction (CONTRACTS-COMPACTION Part K) ------------------------------------------------
+
+    /// The size at which this session compacts, in tokens.
+    fn compact_at(&self) -> u64 {
+        self.deps.context.compact_at(self.deps.context_window)
+    }
+
+    /// Before a step's request: compact when the operator asked (`force`) or the request has reached
+    /// `compact_at`. True when a `compaction` record was appended.
+    async fn compact_if_due(&mut self, woven: &Woven, force: bool, token: &CancellationToken) -> R<bool> {
+        if force {
+            return self.compact(woven, "operator", None, token).await;
+        }
+        let est = self.estimate(&woven.weave);
+        let size = self.measured_size(&woven.weave).unwrap_or(est);
+        if size < self.compact_at() {
+            return Ok(false);
+        }
+        self.compact(woven, "size", None, token).await
+    }
+
+    /// The seq just before the first record of the tail (K3): the last whole steps that together fit in 15%
+    /// of `compact_at`, at least the last whole step when that alone fits in 50%, else none. A `refused` or
+    /// `fresh_start` compaction keeps no tail. Never below the previous compaction's `upto_seq`.
+    fn compaction_upto(&self, w: &Weave, reason: &str, refused_like: bool, compact_at: u64) -> Seq {
+        let last = self.records.last().map_or(0, |r| r.seq);
+        let prev = self
+            .records
+            .iter()
+            .rev()
+            .find_map(|r| match &r.event {
+                Event::Compaction(c) => Some(c.upto_seq),
+                _ => None,
+            })
+            .unwrap_or(0);
+        if refused_like || reason == "refused" || reason == texts::FRESH_START_REASON {
+            return last.max(prev);
+        }
+        let starts: Vec<Seq> = self
+            .records
+            .iter()
+            .filter(|r| r.seq > prev && matches!(&r.event, Event::ModelRequest(q) if q.purpose == Purpose::Step))
+            .map(|r| r.seq)
+            .collect();
+        let tail_tokens = |from: Seq| {
+            let chars = w.items.iter().filter(|i| i.seq >= from).fold(0usize, |n, i| n.saturating_add(i.chars));
+            self.estimator.tokens(chars)
+        };
+        let share = compact_at / 100 * 15;
+        let chosen = starts
+            .iter()
+            .copied()
+            .find(|s| tail_tokens(*s) <= share)
+            .or_else(|| starts.last().copied().filter(|s| tail_tokens(*s) <= compact_at / 2));
+        match chosen {
+            Some(s) => s.saturating_sub(1).max(prev),
+            None => last.max(prev),
+        }
+    }
+
+    /// What the compaction needs of the ledger: its brief, every id a note may cite (`None` for a session
+    /// without a ledger: nothing can be checked), and the calls its evidence cites.
+    fn ledger_for_compaction(&self) -> (String, Option<HashSet<String>>, HashSet<String>) {
+        let Some(Ok(l)) = self.deps.shared.journal.as_ref().map(|_| self.deps.shared.ledger()) else {
+            return (String::new(), None, HashSet::new());
+        };
+        let ids: HashSet<String> = l
+            .plan
+            .iter()
+            .map(|p| p.id.clone())
+            .chain(l.claims.iter().map(|c| c.id.clone()))
+            .chain(l.evidence.iter().map(|e| e.id.clone()))
+            .collect();
+        let cited = l.evidence.iter().map(|e| e.input.call_id.0.clone()).collect();
+        (l.brief(&hud::brief_opts(&self.deps.shared.role.tools)), Some(ids), cited)
+    }
+
+    /// Compact the window: ask the model for a note, build the key table, and append a `compaction` record
+    /// (never a failure: a note that could not be had is `None`). True when a record was appended; false
+    /// only when the session was stopped meanwhile.
+    async fn compact(
         &mut self,
         woven: &Woven,
         reason: &str,
-        forced: bool,
+        objections: Option<String>,
         token: &CancellationToken,
-        fold: Fold,
     ) -> R<bool> {
-        let refused_at = match fold {
-            Fold::Overflow(at) => Some(at),
-            _ => None,
-        };
-        let window = match (self.deps.context_window, refused_at) {
-            (Some(known), Some(refused)) => Some(known.min(refused)),
-            (known, refused) => known.or(refused),
-        };
-        let mut policy = self.deps.context.clone();
-        let min_keep = match fold {
-            Fold::Normal => MIN_KEEP_RECENT_STEPS,
-            Fold::KeepZero | Fold::Overflow(_) | Fold::Refused => 0,
-        };
-        if matches!(fold, Fold::KeepZero | Fold::Refused) {
-            policy.keep_recent_steps = 0;
-        }
-        let (limit, floor) = reweave_bounds(&policy, window, self.deps.client.profile().max_output_tokens);
-        let est = self.estimate(&woven.weave);
-        let size = self.measured_size(&woven.weave).unwrap_or(est);
-        if !forced && size <= limit {
+        let w = &woven.weave;
+        let compact_at = self.compact_at();
+        let est = self.estimate(w);
+        let size = self.measured_size(w).unwrap_or(est);
+        // An operator's compaction while the server is refusing this very window behaves as a refused one.
+        let refused_like = reason == "refused" || (reason == "operator" && self.refused_epoch == Some(w.epoch));
+        let upto = self.compaction_upto(w, reason, refused_like, compact_at);
+        let note = self.ask_note(w, refused_like || reason == "stall", objections.as_deref(), token).await?;
+        if token.is_cancelled() {
             return Ok(false);
         }
-        // The plan counts in the estimator's units, the check in the server's when it has counted.
-        policy.floor_tokens = if matches!(fold, Fold::KeepZero | Fold::Refused) { 0 } else { scaled(floor, est, size) };
-        let midpoint = scaled(floor.saturating_add(limit) / 2, est, size);
-        let enough =
-            |p: &Option<loom_core::weave::ReweavePlan>| p.as_ref().is_some_and(|p| p.after_tokens_est <= midpoint);
-        let mut plan = woven.plan(&self.records, &self.estimator, &policy, false);
-        while !enough(&plan) && policy.keep_recent_steps > min_keep {
-            policy.keep_recent_steps = (policy.keep_recent_steps / 2).max(min_keep);
-            plan = woven.plan(&self.records, &self.estimator, &policy, false);
-        }
-        let mut digest = None;
-        // A refusal fold takes the outputs out of view, never the replies: at floor 0 a text plan would
-        // drop every reply, with no digest to keep the map of the work.
-        if !enough(&plan) && !matches!(fold, Fold::Refused | Fold::KeepZero) {
-            let text_plan = woven.plan(&self.records, &self.estimator, &policy, true);
-            if !forced && !enough(&text_plan) {
-                return Ok(false);
-            }
-            // After an overflow or a refusal the server has just refused this prefix: a digest request on
-            // it would be refused as well.
-            if text_plan.is_some() && matches!(fold, Fold::Normal) {
-                digest = self.ask_digest(&woven.weave, token).await?;
-                if token.is_cancelled() {
-                    return Ok(false);
-                }
-            }
-            if text_plan.is_some() {
-                plan = text_plan;
-            }
-        }
-        let Some(plan) = plan else { return Ok(false) };
-        let freed = scaled(plan.before_tokens_est.saturating_sub(plan.after_tokens_est), size, est);
-        let (ledger_brief, frontier_block) = self.brief_parts();
-        self.append(
-            Author::Harness,
-            Event::Reweave(Reweave {
-                epoch: self.st.epoch.saturating_add(1),
-                upto_seq: plan.upto_seq,
-                evictions: plan.evictions,
-                brief: texts::reweave_brief(&ledger_brief, frontier_block.as_deref()),
-                digest,
-                reason: reason.to_string(),
-                before_tokens: size,
-                after_tokens_est: size.saturating_sub(freed),
-            }),
-        )?;
+        let (brief, _, cited_calls) = self.ledger_for_compaction();
+        let prev_keys = self
+            .records
+            .iter()
+            .rev()
+            .find_map(|r| match &r.event {
+                Event::Compaction(c) => Some(c.keys.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let (table, keys) = compaction::build_table(
+            &self.records,
+            &TableInput { upto_seq: upto, note_keys: note.keys.clone(), cited_calls, prev_keys, compact_at },
+        );
+        let mut c = Compaction {
+            epoch: self.st.epoch.saturating_add(1),
+            upto_seq: upto,
+            reason: reason.to_string(),
+            before_tokens: size,
+            after_tokens_est: 0,
+            note: note.text,
+            note_req: note.req,
+            table,
+            keys,
+            dropped_keys: note.dropped,
+            objections,
+            brief,
+            compact_at,
+        };
+        // The first request after it: system message, the item, the tail and the tools, in the units of
+        // the server's count when it has counted.
+        let next = self.records.last().map_or(1, |r| r.seq.saturating_add(1));
+        let item = compaction::item_text(&self.records, next, &c);
+        let system = w.messages.first().map_or(0, Message::chars);
+        let tail = w.items.iter().filter(|i| i.seq > upto).fold(0usize, |n, i| n.saturating_add(i.chars));
+        let after = self
+            .estimator
+            .tokens(system.saturating_add(item.len()).saturating_add(tail))
+            .saturating_add(self.estimator.tokens(tools_chars(&w.tools)));
+        c.after_tokens_est = scaled(after, size, est);
+        self.append(Author::Harness, Event::Compaction(c))?;
         self.publish();
         Ok(true)
     }
 
-    /// Ask the model, on the existing prefix `w`, for notes about what is about to be folded away.
-    /// The request waits for the limiter at the session's own priority: the step waits for it.
-    async fn ask_digest(&mut self, w: &Weave, token: &CancellationToken) -> R<Option<String>> {
+    /// Ask the model, on the window exactly as the last step request sent it (same tools: the cache), for the
+    /// note that carries the work across the compaction (K4). Waits for the limiter at the session's own
+    /// priority. A failed request, an empty reply or a cancelled request gives no note.
+    async fn ask_note(
+        &mut self,
+        w: &Weave,
+        headers_only: bool,
+        objections: Option<&str>,
+        token: &CancellationToken,
+    ) -> R<Note> {
         let was_running = self.st.clock.as_ref().is_some_and(|c| c.running_from.is_some());
-        let res = self.ask_digest_inner(w, token).await;
+        let res = self.ask_note_inner(w, headers_only, objections, token).await;
         if !was_running && self.st.clock.as_ref().is_some_and(|c| c.running_from.is_some()) {
             match res {
                 Ok(val) => {
@@ -3615,41 +3928,111 @@ Name them when you start a new mission instead."
         res
     }
 
-    async fn ask_digest_inner(&mut self, w: &Weave, token: &CancellationToken) -> R<Option<String>> {
-        let req_id = new_request_id();
-        self.append(
-            Author::Harness,
-            Event::ModelRequest(ModelRequest {
-                req_id: req_id.clone(),
-                step: self.st.step.saturating_add(1),
-                epoch: w.epoch,
-                purpose: Purpose::Digest,
-                n_messages: to_u32(w.messages.len()),
-                stable_hash: stable_hash(&w.messages),
-                hud: None,
-                est_tokens: self.estimate(w),
-            }),
-        )?;
-        self.clock_set(false)?;
-        let Some(permit) = self.deps.limiter.acquire(self.deps.priority, token).await else { return Ok(None) };
-        self.clock_set(true)?;
-        let mut messages = w.messages.clone();
-        messages.push(Message::user(texts::DIGEST_PROMPT));
-        let request = ChatRequest {
-            messages,
-            tools: w.tools.clone(),
-            tool_choice: ToolChoice::Auto,
-            max_tokens: Some(texts::DIGEST_MAX_TOKENS),
-            seed: None,
-            extra: Map::new(),
-        };
-        // Its events are not shown to viewers: they would read as the step's reply.
-        let result = self.complete_watched(&request, token, |_| {}).await?;
-        drop(permit);
-        Ok(match result {
-            Ok(c) if !c.text.trim().is_empty() => Some(c.text.trim().to_string()),
-            _ => None,
-        })
+    async fn ask_note_inner(
+        &mut self,
+        w: &Weave,
+        headers_only: bool,
+        objections: Option<&str>,
+        token: &CancellationToken,
+    ) -> R<Note> {
+        let mut out = Note::default();
+        let mut messages = if headers_only { headers_only_messages(&w.messages) } else { w.messages.clone() };
+        let mut prompt = texts::COMPACT_PROMPT.to_string();
+        if let Some(o) = objections.filter(|o| !o.trim().is_empty()) {
+            prompt.push_str("\n\n");
+            prompt.push_str(&texts::compact_objections(o));
+        }
+        messages.push(Message::user(prompt));
+        let (_, ledger_ids, _) = self.ledger_for_compaction();
+        // The latest reply and its citations; the first one is kept when the second request fails.
+        let mut reply: Option<(String, Vec<Cite>)> = None;
+        for attempt in 0..2 {
+            let req_id = new_request_id();
+            let est_tokens = self
+                .estimator
+                .tokens_for_messages(&messages)
+                .saturating_add(self.estimator.tokens(tools_chars(&w.tools)));
+            self.append(
+                Author::Harness,
+                Event::ModelRequest(ModelRequest {
+                    req_id: req_id.clone(),
+                    step: self.st.step.saturating_add(1),
+                    epoch: w.epoch,
+                    purpose: Purpose::Compact,
+                    n_messages: to_u32(messages.len()),
+                    stable_hash: stable_hash(&w.messages),
+                    hud: None,
+                    est_tokens,
+                }),
+            )?;
+            self.clock_set(false)?;
+            let Some(permit) = self.deps.limiter.acquire(self.deps.priority, token).await else { break };
+            self.clock_set(true)?;
+            let request = ChatRequest {
+                messages: messages.clone(),
+                tools: w.tools.clone(),
+                tool_choice: ToolChoice::Auto,
+                max_tokens: Some(texts::COMPACT_MAX_TOKENS),
+                seed: None,
+                extra: Map::new(),
+                images: ImageResolver::for_model(self.deps.client.profile().vision, &self.deps.ctx.blobs),
+                text_calls: false,
+            };
+            // Its events are not shown to viewers: they would read as the step's reply.
+            let result = self.complete_watched(&request, token, |_| {}).await?;
+            drop(permit);
+            let text = match result {
+                Ok(c) if !c.text.trim().is_empty() => c.text.trim().to_string(),
+                _ => break,
+            };
+            let cites = self.check_cites(&text, ledger_ids.as_ref());
+            let mut unknown: Vec<String> = Vec::new();
+            for c in cites.iter().filter(|c| !c.known) {
+                if !unknown.contains(&c.text) {
+                    unknown.push(c.text.clone());
+                }
+            }
+            out.req = Some(req_id);
+            let again = !unknown.is_empty() && attempt == 0;
+            if again {
+                messages.push(Message::assistant(text.clone()));
+                messages.push(Message::user(texts::compact_unknown_keys(&unknown)));
+            }
+            reply = Some((text, cites));
+            if !again {
+                break;
+            }
+        }
+        if let Some((text, cites)) = reply {
+            let (text, dropped) = drop_unknown(&text, &cites);
+            for c in cites.iter().filter(|c| c.known && c.out) {
+                if !out.keys.contains(&c.key) {
+                    out.keys.push(c.key.clone());
+                }
+            }
+            out.dropped = dropped;
+            out.text = Some(text);
+        }
+        Ok(out)
+    }
+
+    /// Every key the note cites, with whether it exists (K4). An output key is known when it resolves in this
+    /// session's output store (`key` then holds `out:` and 16 hex characters); a ledger id is known when the
+    /// session's ledger has it (every id is taken as known without a ledger).
+    fn check_cites(&self, text: &str, ledger_ids: Option<&HashSet<String>>) -> Vec<Cite> {
+        let mut cites = scan_cites(text);
+        for c in &mut cites {
+            if c.out {
+                if let Ok(id) = self.deps.ctx.blobs.resolve(&c.text) {
+                    c.known = true;
+                    let short: String = id.0.chars().take(compaction::KEY_LEN).collect();
+                    c.key = format!("out:{short}");
+                }
+            } else {
+                c.known = ledger_ids.is_none_or(|ids| ids.contains(&c.text));
+            }
+        }
+        cites
     }
 
     // ---- the reply -----------------------------------------------------------------------------
@@ -3723,10 +4106,12 @@ Name them when you start a new mission instead."
                 return Ok(flow);
             }
         }
+        // Wording names only the tools the role is shown (contract T1), not the registry's hidden ones.
+        let shown: Vec<String> = w_tools.iter().map(|t| t.name.clone()).collect();
         let verdict = gate::on_yield(&YieldCtx {
             termination,
             is_child: shared.is_child(),
-            tools: &names,
+            tools: &shown,
             ledger: ledger.as_ref(),
             reply: &c.text,
             nudges: self.nudges,
@@ -3736,7 +4121,12 @@ Name them when you start a new mission instead."
         });
         match verdict {
             Yield::End => Ok(Flow::End(TurnEndReason::Yielded)),
+            Yield::Nudge(_) if self.text_nudged => {
+                // Contract T2: one "ended without a tool call" nudge per turn; the second such reply ends it.
+                Ok(Flow::End(TurnEndReason::Yielded))
+            }
             Yield::Nudge(text) => {
+                self.text_nudged = true;
                 self.note(Author::Harness, NoteKind::Nudge, text)?;
                 self.nudges = self.nudges.saturating_add(1);
                 Ok(Flow::Next)
@@ -3892,9 +4282,11 @@ Name them when you start a new mission instead."
             let mut ctx = self.deps.ctx.clone();
             ctx.call_id = call.call_id.clone();
             ctx.cancel = self.token.clone();
+            ctx.files.set_step(u64::from(self.st.step));
             let policy = self.admit_policy();
             ctx.view_chars = policy.view_chars(&self.estimator);
             let started = Instant::now();
+            let started_ms = now_ms();
             let mut result = if let Some(first) = &ender {
                 refused(&ctx, &call.name, class, texts::not_run_after(first), started)
             } else if tool.is_none()
@@ -3920,6 +4312,7 @@ Name them when you start a new mission instead."
                 self.claim_early(run, &early, &ctx, call).await
             } else {
                 if class == ToolClass::Exec {
+                    self.deps.shared.traffic.call_started(&call.call_id, now_ms());
                     self.append(Author::Harness, Event::ExecStarted { call_id: call.call_id.clone() })?;
                 }
                 let admission = Admission { policy: &policy, estimator: &self.estimator };
@@ -3927,6 +4320,18 @@ Name them when you start a new mission instead."
             };
             if deferred {
                 result.meta.insert(META_DEFERRED_OBSERVATION.into(), Value::Bool(true));
+            }
+            // Result completeness (Part N1): the egress proxy's denials during the call, from the
+            // session's `net.jsonl`, which the tool layer cannot see.
+            if completeness::reaches_network(&call.name) {
+                let net = self.deps.paths.session_dir(&self.deps.shared.session).join("net.jsonl");
+                let (k, hosts) = completeness::denied_between(&net, started_ms, now_ms());
+                completeness::mark_net_denied(&mut result, k, &hosts);
+            }
+            // N5: the verifier's request lists the limits of each output the finish cites.
+            if let Some(blob) = &result.output {
+                let limits = loom_tools::limits_of(&result.meta);
+                self.deps.shared.note_output_limits(&blob.id, limits);
             }
             let ok = result.status == ToolStatus::Ok;
             let flag_note = self.deps.shared.role.flag_regex.as_ref().and_then(|pattern| {
@@ -3936,7 +4341,14 @@ Name them when you start a new mission instead."
                 }
                 result.output.as_ref().map(|blob| texts::flag_candidate(&blob.handle()))
             });
+            // The exchanges the tool made itself follow its result, each with the call's id (C3).
+            let made = std::mem::take(&mut result.exchanges);
             self.append(Author::Tool, Event::ToolResult(result))?;
+            self.deps.shared.traffic.call_ended(&call.call_id, now_ms());
+            for x in made {
+                self.deps.shared.traffic.count_one();
+                self.append(Author::Tool, Event::Exchange(x))?;
+            }
             if let Some(text) = flag_note {
                 let already = self.own().iter().any(
                     |r| matches!(&r.event, Event::HarnessNote { note: NoteKind::Info, text: old } if old == &text),
@@ -3960,68 +4372,18 @@ Name them when you start a new mission instead."
         early.discard().await;
         // Every call of the reply has its result: a fresh start folds them all.
         if let Some(fresh) = self.deps.shared.take_fresh_start() {
-            self.fresh_start(&fresh)?;
+            self.fresh_start(&fresh).await?;
         }
         Ok(out)
     }
 
-    /// What the brief of a re-weave or a fresh start carries of the mission: the ledger's brief and the
-    /// rendered frontier (with `attempts_run` of the records). Both are empty for a session without a ledger.
-    fn brief_parts(&self) -> (String, Option<String>) {
-        let ledger = self.deps.shared.journal.as_ref().map(|_| self.deps.shared.ledger());
-        match ledger {
-            Some(Ok(l)) => {
-                let mut f = frontier::frontier(&l, now_ms());
-                f.attempts_run = frontier::attempts_run(&self.records);
-                (l.brief(&hud::brief_opts(&self.deps.shared.role.tools)), frontier::render(&f))
-            }
-            _ => (String::new(), None),
-        }
-    }
-
-    /// Start afresh after a `finish` its verifier did not accept (see the contract, *Fresh start*): one
-    /// re-weave that folds the whole window, takes the calls that tried to end the mission out of it and
-    /// carries what was found.
-    fn fresh_start(&mut self, fresh: &FreshStart) -> R<()> {
+    /// Start afresh after a `finish` its verifier did not accept (see the contract, *Fresh start*): a
+    /// compaction with an empty tail whose note request carries what the verifier objected to.
+    async fn fresh_start(&mut self, fresh: &FreshStart) -> R<()> {
         let woven = self.woven();
-        // What was delivered, and what led to it, stays: only the calls that came after it are taken out.
-        let delivered = self
-            .own()
-            .iter()
-            .rev()
-            .find_map(|r| match &r.event {
-                Event::ToolResult(t) if t.name == "finish" && t.status == ToolStatus::Ok => Some(r.seq),
-                _ => None,
-            })
-            .unwrap_or(0);
-        let ending =
-            |seq: Seq, t: &loom_core::event::ToolResult| seq > delivered && ENDING_TOOLS.contains(&t.name.as_str());
-        let Some(plan) = woven.plan_fresh_start(&self.records, &self.estimator, &self.deps.context, &ending) else {
-            return Ok(());
-        };
-        let est = self.estimate(&woven.weave);
-        let size = self.measured_size(&woven.weave).unwrap_or(est);
-        let freed = scaled(plan.before_tokens_est.saturating_sub(plan.after_tokens_est), size, est);
-        let (ledger_brief, frontier_block) = self.brief_parts();
-        self.append(
-            Author::Harness,
-            Event::Reweave(Reweave {
-                epoch: self.st.epoch.saturating_add(1),
-                upto_seq: plan.upto_seq,
-                evictions: plan.evictions,
-                brief: texts::fresh_start_brief(
-                    &fresh.objections,
-                    fresh.reopened,
-                    frontier_block.as_deref(),
-                    &ledger_brief,
-                ),
-                digest: None,
-                reason: texts::FRESH_START_REASON.to_string(),
-                before_tokens: size,
-                after_tokens_est: size.saturating_sub(freed),
-            }),
-        )?;
-        self.publish();
+        let objections: Vec<&str> = fresh.objections.iter().map(|o| o.trim()).filter(|o| !o.is_empty()).collect();
+        let token = self.token.clone();
+        self.compact(&woven, texts::FRESH_START_REASON, Some(objections.join(" ")), &token).await?;
         Ok(())
     }
 
@@ -4098,7 +4460,7 @@ mod tests {
     use super::*;
     use crate::rtools::testkit::{core_role, rig_with, FakeOrch, Rig};
     use loom_core::config::ModelProfile;
-    use loom_core::event::{Brief, EvictAction, Eviction, ModelRef, ReasoningReplay};
+    use loom_core::event::{Brief, ModelRef, ReasoningReplay};
     use loom_core::ids::MissionId;
     use loom_core::log::read_records;
     use loom_model::mock::{Action, MockServer, Reply, Script};
@@ -4184,7 +4546,7 @@ mod tests {
         spare: Vec<tokio::sync::mpsc::UnboundedSender<JobEvent>>,
         paths: Paths,
         agents: AgentsCfg,
-        context: ReweavePolicy,
+        context: ContextCfg,
         window: Option<u64>,
         profile: ModelProfile,
         admit: AdmitPolicy,
@@ -4238,7 +4600,7 @@ mod tests {
                 spare: Vec::new(),
                 paths,
                 agents,
-                context: ReweavePolicy::default(),
+                context: ContextCfg::default(),
                 window: None,
                 profile,
                 admit: policy,
@@ -4298,7 +4660,11 @@ mod tests {
                 budget,
                 unattended: false,
                 schema: loom_core::event::SCHEMA,
+                intercept: false,
+                target: None,
                 title: "test".into(),
+                project_instructions: Vec::new(),
+                mcp: Vec::new(),
             }
         }
 
@@ -4465,15 +4831,20 @@ mod tests {
         assert_eq!(count(rs, "cache_break"), 0, "unexpected cache_break: {:?}", kinds(rs));
     }
 
-    /// A script that answers the digest prompt with `digest` (`None` = a 400) and everything else
-    /// from `actions` in order.
-    fn with_digest(actions: Vec<Action>, digest: Option<&'static str>) -> Script {
+    /// Whether a request is a note request of a compaction (its window ends with `COMPACT_PROMPT`, or with the
+    /// reply to unknown keys after it).
+    fn is_note_request(body: &Value) -> bool {
+        let m = body["messages"].as_array().cloned().unwrap_or_default();
+        m.iter().rev().take(3).any(|x| x["content"].as_str().is_some_and(|c| c.starts_with(texts::COMPACT_PROMPT)))
+    }
+
+    /// A script that answers the note request with `note` (`None` = a 400) and everything else from `actions`
+    /// in order.
+    fn with_note(actions: Vec<Action>, note: Option<&'static str>) -> Script {
         let mut actions = std::collections::VecDeque::from(actions);
         Script::new(move |body, _| {
-            let m = body["messages"].as_array().unwrap();
-            let is_digest = m.last().and_then(|l| l["content"].as_str()).is_some_and(|c| c == texts::DIGEST_PROMPT);
-            if is_digest {
-                return match digest {
+            if is_note_request(body) {
+                return match note {
                     Some(t) => Reply::text(t).into(),
                     None => Action::Status {
                         status: 400,
@@ -4632,27 +5003,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_session_nudges_then_parks_and_a_good_call_resets_the_count() {
+    async fn explicit_session_nudges_once_and_a_second_text_reply_ends_the_turn() {
         let agents = AgentsCfg { max_nudges: 2, verify_finish: false, ..AgentsCfg::default() };
-        let script = seq(vec![
-            Reply::text("one").into(),
-            Reply::text("two").into(),
-            bash("echo ok").into(),
-            Reply::text("three").into(),
-            Reply::text("four").into(),
-            Reply::text("five").into(),
-        ]);
+        let script = seq(vec![Reply::text("one").into(), Reply::text("two").into(), Reply::text("three").into()]);
         let mut fx = Fx::build("lead", false, true, agents, script).await;
         let session = fx.create();
         run_with(session, vec![user("go")]).await;
         let rs = fx.sink.records();
-        assert_eq!(notes(&rs, NoteKind::Nudge).len(), 4);
-        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Parked]);
-        let items = inbox(&rs);
-        assert_eq!(items.len(), 1);
-        assert_eq!((items[0].kind, items[0].blocking), (InboxKind::Parked, true));
-        assert_eq!(fx.server.requests().len(), 6);
-        assert_eq!(fx.sink.last_status().unwrap().open_inbox, 1);
+        assert_eq!(notes(&rs, NoteKind::Nudge).len(), 1);
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Yielded]);
+        assert_eq!(fx.server.requests().len(), 2);
         assert_no_cache_break(&rs);
     }
 
@@ -6181,9 +6541,10 @@ mod tests {
 
     #[tokio::test]
     async fn open_reproduces_the_state_of_the_session_that_wrote_the_log() {
-        let mut fx = Fx::new("chat", false, false, seq(vec![big(), big(), big(), Reply::text("ok").into()])).await;
-        fx.context =
-            ReweavePolicy { target_tokens: 12_000, floor_tokens: 10_000, keep_recent_steps: 1, stub_tail_lines: 3 };
+        let mut fx =
+            Fx::new("chat", false, false, with_note(vec![big(), big(), big(), Reply::text("ok").into()], Some("N")))
+                .await;
+        fx.context = ctx(12_000);
         let session = fx.create();
         run_with(session, vec![user("go")]).await;
         let written = fx.sink.last_status().unwrap();
@@ -6219,7 +6580,7 @@ mod tests {
     async fn a_log_that_renders_differently_after_a_restart_gets_one_cache_break() {
         let mut fx = Fx::new("chat", false, false, seq(vec![Reply::text("after").into()])).await;
         let mut session = fx.create();
-        session.append(Author::User, Event::UserMessage { text: "hi".into() }).unwrap();
+        session.append(Author::User, Event::UserMessage { text: "hi".into(), images: vec![] }).unwrap();
         session.append(Author::Harness, Event::TurnStart { trigger: Trigger::User }).unwrap();
         let sent = weave(session.records()).messages;
         // What an older build sent for these records hashed differently.
@@ -6269,7 +6630,7 @@ mod tests {
     async fn open_on_a_log_cut_mid_turn_adds_the_restart_records_and_the_next_turn_says_so() {
         let mut fx = Fx::new("chat", false, false, seq(vec![Reply::text("welcome back").into()])).await;
         let mut session = fx.create();
-        session.append(Author::User, Event::UserMessage { text: "hi".into() }).unwrap();
+        session.append(Author::User, Event::UserMessage { text: "hi".into(), images: vec![] }).unwrap();
         session.append(Author::Harness, Event::TurnStart { trigger: Trigger::User }).unwrap();
         drop(session);
         // A torn final line as well.
@@ -6402,6 +6763,7 @@ mod tests {
         let c = ToolCall { call_id, req_id: "r-1".into(), name: "bash".into(), args, class };
         session.append(Author::Model, Event::ToolCall(c)).unwrap();
         let result = loom_core::event::ToolResult {
+            exchanges: Vec::new(),
             call_id: CallId::from(call),
             name: "bash".into(),
             status: ToolStatus::Ok,
@@ -6411,8 +6773,47 @@ mod tests {
             class: ToolClass::Exec,
             meta: [(META_JOB.to_string(), json!(id))].into_iter().collect(),
             duration_ms: 1,
+            images: Vec::new(),
         };
         session.append(Author::Tool, Event::ToolResult(result)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn open_restores_the_shell_directory_from_the_last_bash_result_that_names_one() {
+        let mut fx = Fx::new("chat", false, false, seq(vec![])).await;
+        let mut session = fx.create();
+        let (a, b) = (fx.ctx.workspace.join("a"), fx.ctx.workspace.join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        for (i, dir) in [&a, &b].into_iter().enumerate() {
+            let result = loom_core::event::ToolResult {
+                exchanges: Vec::new(),
+                call_id: CallId::from(format!("c{i}")),
+                name: "bash".into(),
+                status: ToolStatus::Ok,
+                text: "ok".into(),
+                output: None,
+                cut: false,
+                class: ToolClass::Exec,
+                meta: [(loom_core::event::META_CWD.to_string(), json!(dir.display().to_string()))]
+                    .into_iter()
+                    .collect(),
+                duration_ms: 1,
+                images: vec![],
+            };
+            session.append(Author::Tool, Event::ToolResult(result)).unwrap();
+        }
+        drop(session);
+        let deps = fx.deps();
+        assert!(deps.ctx.shell.get().is_none());
+        let reopened = Session::open(deps).unwrap();
+        drop(reopened);
+        assert_eq!(fx.ctx.shell.get(), Some(b.clone()));
+        // A directory that is gone is not restored.
+        fx.ctx.shell.set(None);
+        std::fs::remove_dir_all(&b).unwrap();
+        let _again = Session::open(fx.deps()).unwrap();
+        assert!(fx.ctx.shell.get().is_none());
     }
 
     #[tokio::test]
@@ -6601,7 +7002,7 @@ mod tests {
     async fn a_turn_that_begins_during_shutdown_is_cut_without_the_restart_note() {
         let mut fx = Fx::new("chat", false, false, seq(vec![Reply::text("welcome back").into()])).await;
         let mut session = fx.create();
-        session.append(Author::User, Event::UserMessage { text: "hi".into() }).unwrap();
+        session.append(Author::User, Event::UserMessage { text: "hi".into(), images: vec![] }).unwrap();
         session.append(Author::Harness, Event::TurnStart { trigger: Trigger::User }).unwrap();
         drop(session);
         let reopened = Session::open(fx.deps()).unwrap();
@@ -6882,7 +7283,7 @@ mod tests {
         let rs = fx.sink.records();
         assert_eq!(count(&rs, "inbox_resolved"), 1);
         assert!(rs.iter().any(
-            |r| matches!(&r.event, Event::UserMessage { text } if *text == texts::inbox_answer("which branch?", "main"))
+            |r| matches!(&r.event, Event::UserMessage { text, .. } if *text == texts::inbox_answer("which branch?", "main"))
         ));
         assert!(rs.iter().any(|r| matches!(&r.event, Event::TurnStart { trigger: Trigger::InboxAnswer })));
         let ledger = fx.shared.ledger().unwrap();
@@ -7075,6 +7476,157 @@ mod tests {
         finish_task(tx, task).await;
     }
 
+    // ---- queued messages ---------------------------------------------------------------------
+
+    fn user_texts(rs: &[Record]) -> Vec<String> {
+        rs.iter()
+            .filter_map(|r| match &r.event {
+                Event::UserMessage { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn queue_msg(paths: &Paths, id: &SessionId, text: &str) -> QueuedMessage {
+        queue_user_message(paths, id, text, &[], text, &[]).unwrap()
+    }
+
+    #[tokio::test]
+    async fn queued_messages_wait_for_the_turn_to_end_and_arrive_in_order_in_one_next_turn() {
+        let script = seq(vec![Reply::text("one").with_delay_ms(400).into(), Reply::text("two").into()]);
+        let mut fx = Fx::new("chat", false, false, script).await;
+        drop(fx.create());
+        let id = SessionId::from("s-test");
+        let (tx, task) = spawn_run(Session::open(fx.deps()).unwrap());
+        tx.send(user("go")).unwrap();
+        wait_until(&fx.sink, "the first turn", |rs| count(rs, "turn_start") == 1).await;
+        let a = queue_msg(&fx.paths, &id, "first queued");
+        let b = queue_msg(&fx.paths, &id, "second queued");
+        assert_ne!(a.id, b.id);
+        tx.send(Input::DrainQueued).unwrap();
+        assert_eq!(user_texts(&fx.sink.records()), vec!["go"], "nothing is recorded while the turn runs");
+        wait_until(&fx.sink, "the next turn", |rs| count(rs, "turn_end") == 2).await;
+        let rs = fx.sink.records();
+        assert_eq!(user_texts(&rs), vec!["go", "first queued", "second queued"]);
+        assert_eq!(count(&rs, "turn_start"), 2, "the second message arrives with the first, not in a turn of its own");
+        assert!(queued_messages(&fx.paths, &id).is_empty());
+        assert_eq!(std::fs::read_dir(queue_dir(&fx.paths, &id)).unwrap().count(), 0);
+        finish_task(tx, task).await;
+    }
+
+    #[tokio::test]
+    async fn a_queued_message_sent_to_an_idle_lead_starts_a_turn_like_a_message_sent_now() {
+        let mut fx = Fx::new("chat", false, false, seq(vec![Reply::text("ok").into()])).await;
+        drop(fx.create());
+        let id = SessionId::from("s-test");
+        let (tx, task) = spawn_run(Session::open(fx.deps()).unwrap());
+        queue_msg(&fx.paths, &id, "hello");
+        tx.send(Input::DrainQueued).unwrap();
+        wait_until(&fx.sink, "the turn", |rs| count(rs, "turn_end") == 1).await;
+        assert_eq!(user_texts(&fx.sink.records()), vec!["hello"]);
+        assert!(queued_messages(&fx.paths, &id).is_empty());
+        finish_task(tx, task).await;
+    }
+
+    #[tokio::test]
+    async fn a_queued_message_keeps_its_images_through_the_queue_and_records_them() {
+        let mut fx = Fx::new("chat", false, false, seq(vec![Reply::text("ok").into()])).await;
+        drop(fx.create());
+        let id = SessionId::from("s-test");
+        let img = loom_core::ImageRef {
+            blob: "ab".repeat(32),
+            mime: "image/png".into(),
+            bytes: 9,
+            width: 4,
+            height: 3,
+            name: Some("shot.png".into()),
+        };
+        queue_user_message(&fx.paths, &id, "look", &[], "look [file]", std::slice::from_ref(&img)).unwrap();
+        let (tx, task) = spawn_run(Session::open(fx.deps()).unwrap());
+        tx.send(Input::DrainQueued).unwrap();
+        wait_until(&fx.sink, "the turn", |rs| count(rs, "turn_end") == 1).await;
+        let recorded: Vec<_> = fx
+            .sink
+            .records()
+            .into_iter()
+            .filter_map(|r| match r.event {
+                Event::UserMessage { text, images } => Some((text, images)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(recorded, vec![("look [file]".to_string(), vec![img])]);
+        finish_task(tx, task).await;
+    }
+
+    #[test]
+    fn a_queued_message_is_listed_edited_and_removed_and_an_unknown_id_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::at(dir.path().join("home"));
+        let id = SessionId::from("s-test");
+        let a = queue_user_message(&paths, &id, "a", &["/w/.loom/uploads/x.csv".into()], "a [file]", &[]).unwrap();
+        let b = queue_msg(&paths, &id, "b");
+        let c = queue_msg(&paths, &id, "c");
+        let listed = queued_messages(&paths, &id);
+        assert_eq!(listed.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(), ["a", "b", "c"]);
+        assert_eq!(listed[0].attachments, vec!["/w/.loom/uploads/x.csv".to_string()]);
+        // Edit keeps the place, the id and the attachments.
+        let edited = edit_queued_message(&paths, &id, &a.id, "a2", "a2 [file]").unwrap();
+        assert_eq!((edited.id.as_str(), edited.text.as_str()), (a.id.as_str(), "a2"));
+        let listed = queued_messages(&paths, &id);
+        assert_eq!(listed.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(), ["a2", "b", "c"]);
+        assert_eq!(listed[0].attachments.len(), 1);
+        // Remove / send-now take one out and say what it was.
+        let (_, input) = take_queued_message(&paths, &id, &b.id).unwrap();
+        assert!(matches!(input, Input::User(t) if t == "b"));
+        assert!(take_queued_message(&paths, &id, &b.id).unwrap_err().starts_with("There is no queued message"));
+        assert!(edit_queued_message(&paths, &id, &b.id, "x", "x").unwrap_err().starts_with("There is no"));
+        assert_eq!(queued_messages(&paths, &id).len(), 2);
+        assert_eq!(discard_queued_messages(&paths, &id), 2);
+        assert!(queued_messages(&paths, &id).is_empty());
+        let _ = c;
+    }
+
+    #[tokio::test]
+    async fn a_stop_keeps_the_queue_and_the_next_resume_or_message_sends_it() {
+        let script = seq(vec![Reply::text("one").with_delay_ms(5000).into(), Reply::text("two").into()]);
+        let mut fx = Fx::new("chat", false, false, script).await;
+        drop(fx.create());
+        let id = SessionId::from("s-test");
+        let (tx, task) = spawn_run(Session::open(fx.deps()).unwrap());
+        tx.send(user("go")).unwrap();
+        wait_until(&fx.sink, "the turn", |rs| count(rs, "turn_start") == 1).await;
+        queue_msg(&fx.paths, &id, "later");
+        tx.send(Input::DrainQueued).unwrap();
+        fx.control.stop_turn();
+        tx.send(Input::Stop).unwrap();
+        wait_until(&fx.sink, "the stop", |rs| turn_ends(rs).contains(&TurnEndReason::Stopped)).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(user_texts(&fx.sink.records()), vec!["go"]);
+        assert_eq!(queued_messages(&fx.paths, &id).len(), 1, "still queued after the stop");
+        tx.send(Input::Resume).unwrap();
+        wait_until(&fx.sink, "the queued message", |rs| user_texts(rs).len() == 2).await;
+        assert!(queued_messages(&fx.paths, &id).is_empty());
+        finish_task(tx, task).await;
+    }
+
+    #[tokio::test]
+    async fn queued_messages_survive_a_restart_and_a_message_sent_now_goes_first() {
+        let mut fx = Fx::new("chat", false, false, seq(vec![Reply::text("ok").into()])).await;
+        drop(fx.create());
+        let id = SessionId::from("s-test");
+        queue_msg(&fx.paths, &id, "from before the restart");
+        // A new harness opens the session: the queue is still there and is not sent by starting.
+        let (tx, task) = spawn_run(Session::open(fx.deps()).unwrap());
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(fx.sink.records().iter().all(|r| !matches!(r.event, Event::UserMessage { .. })));
+        assert_eq!(queued_messages(&fx.paths, &id).len(), 1);
+        tx.send(user("now")).unwrap();
+        wait_until(&fx.sink, "the turn", |rs| count(rs, "turn_end") == 1).await;
+        assert_eq!(user_texts(&fx.sink.records()), vec!["from before the restart", "now"]);
+        assert!(queued_messages(&fx.paths, &id).is_empty());
+        finish_task(tx, task).await;
+    }
+
     #[test]
     fn a_kept_input_is_private_and_its_directory_is_tightened() {
         use std::os::unix::fs::PermissionsExt;
@@ -7162,7 +7714,7 @@ mod tests {
         finish_task(tx, task).await;
     }
 
-    // ---- re-weave ----------------------------------------------------------------------------
+    // ---- compaction ----------------------------------------------------------------------------
 
     /// About 32,000 characters in 600 lines, shown whole by the default admission policy.
     const BIG: &str = "yes aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa | head -n 600";
@@ -7171,79 +7723,17 @@ mod tests {
         bash(BIG).into()
     }
 
-    fn reweave_records(rs: &[Record]) -> Vec<Reweave> {
+    fn compactions(rs: &[Record]) -> Vec<Compaction> {
         rs.iter()
             .filter_map(|r| match &r.event {
-                Event::Reweave(w) => Some(w.clone()),
+                Event::Compaction(c) => Some(c.clone()),
                 _ => None,
             })
             .collect()
     }
 
-    #[tokio::test]
-    async fn reweave_at_target_raises_the_epoch_and_the_next_request_drops_the_old_output() {
-        let mut fx = Fx::new("chat", false, false, seq(vec![big(), big(), big(), Reply::text("ok").into()])).await;
-        fx.context =
-            ReweavePolicy { target_tokens: 12_000, floor_tokens: 10_000, keep_recent_steps: 1, stub_tail_lines: 3 };
-        let session = fx.create();
-        run_with(session, vec![user("go")]).await;
-        let rs = fx.sink.records();
-        let rw = reweave_records(&rs);
-        assert!(!rw.is_empty(), "{:?}", kinds(&rs));
-        assert_eq!(rw[0].epoch, 1);
-        assert_eq!(rw[0].reason, "target");
-        assert_eq!(rw.iter().map(|w| w.epoch).collect::<Vec<_>>(), (1..=rw.len() as u32).collect::<Vec<_>>());
-        assert!(rw[0].digest.is_none());
-        assert_eq!(count(&rs, "model_request"), 4);
-        assert_eq!(fx.sink.last_status().unwrap().epoch, rw.len() as u32);
-        let reqs = fx.server.requests();
-        let line = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let lines = |n: usize| all_text(&reqs[n]).matches(line).count();
-        assert!(
-            lines(1) >= 600,
-            "the first output is shown whole before the re-weave: lines per request {:?}, re-weaves {:?}",
-            (0..reqs.len()).map(lines).collect::<Vec<_>>(),
-            rw.iter()
-                .map(|w| (w.epoch, w.upto_seq, w.evictions.len(), w.before_tokens, w.after_tokens_est))
-                .collect::<Vec<_>>()
-        );
-        assert!(lines(2) < 700, "after the re-weave only the newest output is whole, got {}", lines(2));
-        assert_no_cache_break(&rs);
-        assert!(all_text(&reqs[2]).contains(&texts::reweave_brief("", None)));
-    }
-
-    #[tokio::test]
-    async fn the_reweave_check_uses_the_prompt_size_the_server_reported() {
-        // The server counts a token per character of the request, more than the estimator can be
-        // calibrated to (it counts at least 1.5 characters a token), so the estimate trails it.
-        let mut answered = 0;
-        let script = Script::new(move |body, _| {
-            let counted = body["messages"].to_string().len() + body["tools"].to_string().len();
-            let usage = Usage { prompt_tokens: counted as u64, completion_tokens: 10, ..Usage::default() };
-            answered += 1;
-            let reply = if answered <= 8 { bash(BIG) } else { Reply::text("ok") };
-            reply.with_usage(usage).into()
-        });
-        let mut fx = Fx::new("chat", false, false, script).await;
-        let target = 150_000;
-        fx.context =
-            ReweavePolicy { target_tokens: target, floor_tokens: 1_000, keep_recent_steps: 1, stub_tail_lines: 3 };
-        let session = fx.create();
-        run_with(session, vec![user("go")]).await;
-        let rs = read_records(&fx.log_path()).unwrap().records;
-        let rw = reweave_records(&rs);
-        assert!(!rw.is_empty(), "{:?}", kinds(&rs));
-        assert_eq!(rw[0].reason, "target");
-        // Started by the size the server counted ...
-        assert!(rw[0].before_tokens > target, "{}", rw[0].before_tokens);
-        assert!(rw[0].after_tokens_est < rw[0].before_tokens);
-        // ... where the estimate, tool specs included, had not reached the target yet.
-        let first = rs.iter().position(|r| matches!(r.event, Event::Reweave(_))).unwrap();
-        let w = weave(&rs[..first]);
-        let most = TokenEstimator::with_ratio(1.5);
-        let estimate = most.tokens_for_messages(&w.messages) + most.tokens(tools_chars(&w.tools));
-        assert!(estimate < target, "{estimate}");
-        assert_no_cache_break(&rs);
+    fn ctx(compact_at_tokens: u64) -> ContextCfg {
+        ContextCfg { compact_at_tokens, ..ContextCfg::default() }
     }
 
     #[tokio::test]
@@ -7251,7 +7741,7 @@ mod tests {
         let mut fx = Fx::new("chat", false, false, seq(vec![Reply::text("first").into()])).await;
         let mut session = fx.create();
         // A long paste, which the server has counted already.
-        session.append(Author::User, Event::UserMessage { text: "u ".repeat(10_000) }).unwrap();
+        session.append(Author::User, Event::UserMessage { text: "u ".repeat(10_000), images: vec![] }).unwrap();
         let w = session.woven().weave;
         let n = w.messages.len();
         let request = ModelRequest {
@@ -7296,466 +7786,206 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_re_weave_the_servers_count_starts_is_planned_and_recorded_in_its_units() {
-        fn answered(session: &mut Session, req_id: &str, text: &str, prompt_tokens: u64) {
-            let w = weave(session.records());
-            let request = ModelRequest {
-                req_id: req_id.into(),
-                step: 1,
-                epoch: 0,
-                purpose: Purpose::Step,
-                n_messages: to_u32(w.messages.len()),
-                stable_hash: stable_hash(&w.messages),
-                hud: None,
-                est_tokens: 0,
-            };
-            session.append(Author::Harness, Event::ModelRequest(request)).unwrap();
-            let reply = ModelResponse {
-                req_id: req_id.into(),
-                text: text.into(),
-                reasoning: String::new(),
-                tool_calls: Vec::new(),
-                finish: FinishReason::Stop,
-                usage: Usage { prompt_tokens, ..Usage::default() },
-                timing: Timing::default(),
-                attempts: 1,
-            };
-            session.append(Author::Model, Event::ModelResponse(reply)).unwrap();
-        }
-        let mut fx = Fx::new("chat", false, false, seq(vec![])).await;
-        fx.context =
-            ReweavePolicy { target_tokens: 400_000, floor_tokens: 300_000, keep_recent_steps: 1, stub_tail_lines: 3 };
-        let mut session = fx.create();
-        // One receipt per child (a replayed delivery is not appended again), so two children report.
-        let report = |kid: &SessionId, text: &str| {
-            let report = text.repeat(30_000);
-            let usage = Usage::default();
-            let settled = ChildSettled {
-                child: kid.clone(),
-                outcome: ChildOutcome::Returned,
-                report,
-                full: None,
-                usage,
-                steps: 1,
-                inline: false,
-            };
-            Event::ChildSettled(settled)
-        };
-        session.append(Author::User, Event::UserMessage { text: "go".into() }).unwrap();
-        answered(&mut session, "r-1", "a", 10_000);
-        let (kid1, kid2) = (SessionId::from("s-kid-1"), SessionId::from("s-kid-2"));
-        session.append(Author::Agent(kid1.clone()), report(&kid1, "first ")).unwrap();
-        answered(&mut session, "r-2", "b", 500_000);
-        session.append(Author::Agent(kid2.clone()), report(&kid2, "second")).unwrap();
-        answered(&mut session, "r-3", "c", 1_000_000);
-        let woven = session.woven();
-        // Counted by the estimator, the log is below the floor: a plan in its units folds nothing ...
-        let est = session.estimate(&woven.weave);
-        assert!(est < 300_000);
-        assert!(woven.plan(session.records(), &session.estimator, &fx.context, true).is_none());
-        // ... while the server counts it far above the target, and the plan is made for that.
-        let size = session.measured_size(&woven.weave).unwrap();
-        assert!(size > 1_000_000);
-        assert!(session.reweave(&woven, "target", false, &CancellationToken::new(), Fold::Normal).await.unwrap());
-        let rw = reweave_records(session.records());
-        assert_eq!(rw.len(), 1);
-        assert_eq!(rw[0].evictions.len(), 2, "both reports are folded");
-        assert_eq!(rw[0].before_tokens, size, "the size that started it");
-        assert!(rw[0].after_tokens_est < 400_000, "{}", rw[0].after_tokens_est);
-    }
-
-    #[tokio::test]
-    async fn reweave_protects_fewer_recent_steps_when_they_are_what_fills_the_context() {
-        // Every step is inside the protected recent region, so nothing could be folded without
-        // shrinking it.
-        let script = seq(vec![big(), big(), big(), big(), big(), big(), Reply::text("ok").into()]);
+    async fn a_size_compaction_replaces_everything_before_the_tail_and_the_next_request_carries_the_item() {
+        let script = with_note(vec![big(), big(), big(), Reply::text("ok").into()], Some("## Goal\nNOTEMARK find it."));
         let mut fx = Fx::new("chat", false, false, script).await;
-        fx.context =
-            ReweavePolicy { target_tokens: 40_000, floor_tokens: 10_000, keep_recent_steps: 64, stub_tail_lines: 3 };
+        fx.context = ctx(12_000);
         let session = fx.create();
         run_with(session, vec![user("go")]).await;
         let rs = fx.sink.records();
-        let rw = reweave_records(&rs);
-        assert!(!rw.is_empty(), "{:?}", kinds(&rs));
-        assert_eq!(rw[0].reason, "target");
-        assert!(!rw[0].evictions.is_empty());
+        let cs = compactions(&rs);
+        assert!(!cs.is_empty(), "{:?}", kinds(&rs));
+        assert_eq!(cs[0].epoch, 1);
+        assert_eq!(cs[0].reason, "size");
+        assert!(cs[0].note.as_deref().is_some_and(|n| n.contains("NOTEMARK")), "{:?}", cs[0].note);
+        assert!(cs[0].table.contains("out:") && cs[0].table.contains("bash"), "{}", cs[0].table);
+        assert!(!cs[0].keys.is_empty());
+        assert_eq!(cs.iter().map(|c| c.epoch).collect::<Vec<_>>(), (1..=cs.len() as u32).collect::<Vec<_>>());
+        let notes = rs.iter().filter(|r| matches!(&r.event, Event::ModelRequest(m) if m.purpose == Purpose::Compact));
+        assert_eq!(notes.count(), cs.len());
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Yielded]);
         let reqs = fx.server.requests();
         let line = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let last = all_text(reqs.last().unwrap()).matches(line).count();
-        assert!(last < 4 * 600, "six outputs were produced; the last request shows {last} lines of them");
-        assert!(last >= 600, "the newest output is still whole, got {last}");
+        let before = reqs.iter().find(|b| is_note_request(b)).unwrap();
+        let after = reqs.iter().find(|b| !is_note_request(b) && all_text(b).contains("Context was compacted")).unwrap();
+        let text = all_text(after);
+        assert!(
+            all_text(before).matches(line).count() >= 3 * text.matches(line).count().max(1),
+            "only the tail is left"
+        );
+        assert!(text.contains("NOTEMARK") && text.contains("Operator, step") && text.contains("go"), "{text}");
         assert_no_cache_break(&rs);
+        // Print one real item for the report.
+        println!("RENDERED ITEM\n{}", text.split("<harness kind=\"compaction\">").nth(1).unwrap_or_default());
     }
 
     #[tokio::test]
-    async fn a_reweave_that_would_free_little_is_not_done() {
-        // Two recent steps alone are larger than the target: folding the rest cannot make room for
-        // long, so the context is left alone rather than re-woven at every step.
-        let mut fx =
-            Fx::new("chat", false, false, seq(vec![big(), big(), big(), big(), Reply::text("ok").into()])).await;
-        fx.context =
-            ReweavePolicy { target_tokens: 12_000, floor_tokens: 10_000, keep_recent_steps: 64, stub_tail_lines: 3 };
-        let session = fx.create();
-        run_with(session, vec![user("go")]).await;
-        let rs = fx.sink.records();
-        assert!(reweave_records(&rs).is_empty(), "{:?}", kinds(&rs));
-        assert_eq!(count(&rs, "model_request"), 5, "no digest request either");
-        assert_eq!(fx.sink.last_status().unwrap().epoch, 0);
-        assert_no_cache_break(&rs);
-    }
-
-    #[tokio::test]
-    async fn reweave_asks_for_a_digest_when_the_plan_is_not_enough_and_survives_its_failure() {
-        for digest in [Some("lead A: check the config"), None] {
-            let long = || Reply::tool("bash", json!({ "command": BIG }).to_string()).with_text("t".repeat(40_000));
-            let script =
-                with_digest(vec![long().into(), long().into(), long().into(), Reply::text("ok").into()], digest);
-            let mut fx = Fx::new("chat", false, false, script).await;
-            // Three steps of long text and output pass the target; folding the old output alone
-            // does not make enough room, folding the old text as well does.
-            fx.context =
-                ReweavePolicy { target_tokens: 60_000, floor_tokens: 1_000, keep_recent_steps: 1, stub_tail_lines: 3 };
-            let session = fx.create();
-            run_with(session, vec![user("go")]).await;
-            let rs = fx.sink.records();
-            let rw = reweave_records(&rs);
-            assert!(!rw.is_empty(), "{:?}", kinds(&rs));
-            assert_eq!(rw[0].digest.as_deref(), digest);
-            assert!(
-                rw[0].evictions.iter().any(|e| matches!(e.action, loom_core::event::EvictAction::Drop)),
-                "text was folded"
-            );
-            let digests = rs
-                .iter()
-                .filter(|r| matches!(&r.event, Event::ModelRequest(m) if m.purpose == Purpose::Digest))
-                .count();
-            assert!(digests >= 1);
-            // The digest request is only a request record: no response record follows it.
-            assert_eq!(count(&rs, "model_response") + digests, count(&rs, "model_request"));
-            let last = fx.server.requests().last().unwrap().clone();
-            assert_eq!(all_text(&last).contains("Leads from earlier work"), digest.is_some());
-            assert_no_cache_break(&rs);
-        }
-    }
-
-    #[tokio::test]
-    async fn the_reweave_brief_carries_the_frontier_only_when_the_session_has_a_ledger() {
-        for mission in [true, false] {
-            let long = || Reply::tool("bash", json!({ "command": BIG }).to_string()).with_text("t".repeat(40_000));
-            let script = with_digest(vec![long().into(), long().into(), long().into(), Reply::text("ok").into()], None);
-            let mut fx = Fx::new("chat", false, mission, script).await;
-            fx.context =
-                ReweavePolicy { target_tokens: 60_000, floor_tokens: 1_000, keep_recent_steps: 1, stub_tail_lines: 3 };
-            if mission {
-                let journal = fx.shared.journal.as_ref().unwrap().clone();
-                use loom_core::ledger::{EvidenceInput, EvidenceKind};
-                let me = SessionId::from("s-lead");
-                let ops = [
-                    LedgerOp::ClaimAdd { text: "the parser drops the last token".into() },
-                    LedgerOp::EvidenceAdd(EvidenceInput {
-                        claim: "c1".into(),
-                        kind: EvidenceKind::Execution,
-                        supports: true,
-                        session: "s-lead".into(),
-                        call_id: "call-0".into(),
-                        blob: None,
-                        lines: None,
-                        quote: None,
-                        note: "ran it".into(),
-                        attested: true,
-                        tool: None,
-                        grade: None,
-                    }),
-                    LedgerOp::ClaimUpdate {
-                        id: "c1".into(),
-                        status: loom_core::ledger::ClaimStatus::Supported,
-                        note: String::new(),
-                    },
-                    LedgerOp::DeadEnd { what: "tried mmap".into(), why: "segfaults".into() },
-                ];
-                for op in ops {
-                    journal.append(&me, true, op, &|_| Ok(())).unwrap();
-                }
-            }
-            let session = fx.create();
-            run_with(session, vec![user("go")]).await;
-            let rw = reweave_records(&fx.sink.records());
-            assert!(!rw.is_empty());
-            let brief = &rw[0].brief;
-            let paragraph = "a failed attempt rules out that attempt, not the approach";
-            assert_eq!(brief.contains(paragraph), mission, "{brief}");
-            assert_eq!(brief.contains("Where the work stands:"), mission, "{brief}");
-            if mission {
-                assert!(brief.contains("- Established: 1 (c1); latest c1: the parser drops the last token"), "{brief}");
-                assert!(brief.contains("- Set aside without evidence: 1 (x1)"), "{brief}");
-                assert!(brief.contains("- Attempts run in this session: "), "{brief}");
-                assert!(brief.contains("The mission ledger at this point:"), "{brief}");
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn a_step_renders_its_weave_once_and_again_only_after_a_reweave() {
-        let long = || Reply::tool("bash", json!({ "command": BIG }).to_string()).with_text("t".repeat(40_000));
-        let script =
-            with_digest(vec![long().into(), long().into(), long().into(), Reply::text("ok").into()], Some("lead A"));
+    async fn a_failed_note_request_still_compacts_with_no_note() {
+        let script = with_note(vec![big(), big(), big(), Reply::text("ok").into()], None);
         let mut fx = Fx::new("chat", false, false, script).await;
-        fx.context =
-            ReweavePolicy { target_tokens: 60_000, floor_tokens: 1_000, keep_recent_steps: 1, stub_tail_lines: 3 };
-        let mut session = fx.create();
-        session.append(Author::User, Event::UserMessage { text: "go".into() }).unwrap();
-        assert!(session.turn(Trigger::User).await.unwrap().is_none());
-        let rs = session.records().to_vec();
-        let requests =
-            |p: Purpose| rs.iter().filter(|r| matches!(&r.event, Event::ModelRequest(m) if m.purpose == p)).count();
-        let (steps, digests, reweaves) =
-            (requests(Purpose::Step), requests(Purpose::Digest), reweave_records(&rs).len());
-        assert!(reweaves >= 1 && digests >= 1, "{:?}", kinds(&rs));
-        // The check, every plan, the digest request and the request share one weave per step; only
-        // a re-weave makes another.
-        assert_eq!(session.weaves as usize, steps + reweaves);
-    }
-
-    #[tokio::test]
-    async fn the_digest_request_waits_at_the_sessions_own_priority() {
-        let mut fx = Fx::new("chat", false, false, seq(vec![Reply::text("leads").into()])).await;
-        let mut session = fx.create();
-        let limiter = Arc::new(Limiter::new(1));
-        session.deps.limiter = limiter.clone();
-        assert_eq!(session.deps.priority, Priority::Lead);
-        let never = CancellationToken::new();
-        let held = limiter.acquire(Priority::Lead, &never).await.unwrap();
-        // A child's request waits for the slot first, and keeps it once it has it.
-        let child = {
-            let limiter = limiter.clone();
-            tokio::spawn(async move {
-                let _permit = limiter.acquire(Priority::Child, &CancellationToken::new()).await;
-                std::future::pending::<()>().await;
-            })
-        };
-        while limiter.waiting() < 1 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        let w = session.woven().weave;
-        let digest = session.ask_digest(&w, &never);
-        tokio::pin!(digest);
-        tokio::select! {
-            _ = &mut digest => panic!("the digest request did not wait for the limiter"),
-            _ = async { while limiter.waiting() < 2 { tokio::time::sleep(Duration::from_millis(5)).await } } => {}
-        }
-        // The lead's own step is waiting for the digest: it goes before the child.
-        drop(held);
-        let got =
-            tokio::time::timeout(Duration::from_secs(10), digest).await.expect("the digest waited behind the child");
-        assert_eq!(got.unwrap().as_deref(), Some("leads"));
-        child.abort();
-    }
-
-    #[tokio::test]
-    async fn a_digest_request_that_keeps_retrying_is_reported_like_a_step_request() {
-        let (script, _) = down_then(3, vec![Reply::text("leads").into()]);
-        let mut fx = retrying_fx(script, 1, 0).await;
-        let mut session = fx.create();
-        let w = session.woven().weave;
-        let got = session.ask_digest(&w, &CancellationToken::new()).await.unwrap();
-        assert_eq!(got.as_deref(), Some("leads"));
-        let rs = session.records().to_vec();
-        assert_eq!(&kinds(&rs)[kinds(&rs).len() - 3..], ["model_request", "inbox_opened", "inbox_resolved"]);
-        assert!(inbox(&rs)[0].text.contains("the model is loading"), "{}", inbox(&rs)[0].text);
-        let answer = &resolutions(&rs)[0].2;
-        assert!(answer.starts_with("Answered automatically: the model server answered again at "), "{answer}");
-        // Its stream is not shown to viewers.
-        assert!(fx.sink.deltas.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn context_overflow_forces_a_reweave_and_a_retry() {
-        let mut fx = Fx::new("chat", false, false, seq(vec![big(), big(), Reply::text("ok").into()])).await;
-        fx.server.set_model("mock", Some(16_000));
-        fx.context =
-            ReweavePolicy { target_tokens: 400_000, floor_tokens: 1_000, keep_recent_steps: 1, stub_tail_lines: 3 };
+        fx.context = ctx(12_000);
         let session = fx.create();
         run_with(session, vec![user("go")]).await;
         let rs = fx.sink.records();
-        let rw = reweave_records(&rs);
-        assert_eq!(rw.len(), 1, "{:?}", kinds(&rs));
-        assert_eq!(rw[0].reason, "overflow");
-        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Yielded]);
-        // The overflowed request and its retry are both recorded; the step count follows requests.
-        assert_eq!(count(&rs, "model_request"), 4);
-        assert_eq!(count(&rs, "model_response"), 3);
-        assert_no_cache_break(&rs);
-    }
-
-    #[tokio::test]
-    async fn unfoldable_overflow_fails_the_turn_with_an_inbox_item() {
-        let mut fx = Fx::new("chat", false, false, seq(vec![Reply::text("ok").into()])).await;
-        fx.server.set_model("mock", Some(10_000));
-        let session = fx.create();
-        // The operator's own message is what does not fit: there is no tool output to fold.
-        run_with(session, vec![user(&"a long message. ".repeat(3_000))]).await;
-        let rs = fx.sink.records();
-        assert_eq!(reweave_records(&rs).len(), 0);
-        let items = inbox(&rs);
-        assert_eq!(items.len(), 1, "{:?}", kinds(&rs));
-        assert_eq!(items[0].text, texts::turn_failed(texts::OVERFLOW_UNFOLDABLE));
-        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Error]);
-    }
-
-    #[tokio::test]
-    async fn an_overflow_from_one_huge_result_of_the_latest_step_is_folded_to_keep_zero() {
-        let mut fx = Fx::new("chat", false, false, seq(vec![big(), Reply::text("ok").into()])).await;
-        // One result of about 10k tokens is more than this window holds, and it is in the protected
-        // recent steps.
-        fx.server.set_model("mock", Some(10_000));
-        fx.context =
-            ReweavePolicy { target_tokens: 400_000, floor_tokens: 1_000, keep_recent_steps: 2, stub_tail_lines: 3 };
-        let session = fx.create();
-        run_with(session, vec![user("go")]).await;
-        let rs = fx.sink.records();
-        let rw = reweave_records(&rs);
-        assert_eq!(rw.len(), 1, "{:?}", kinds(&rs));
-        assert_eq!(rw[0].reason, "overflow");
-        assert!(rw[0].digest.is_none());
-        assert!(matches!(&rw[0].evictions[..], [Eviction { action: EvictAction::Stub { .. }, .. }]), "{rw:?}");
+        let cs = compactions(&rs);
+        assert!(!cs.is_empty(), "{:?}", kinds(&rs));
+        assert!(cs.iter().all(|c| c.note.is_none() && !c.table.is_empty()));
         assert_eq!(turn_ends(&rs), vec![TurnEndReason::Yielded]);
         assert!(inbox(&rs).is_empty());
+    }
+
+    #[tokio::test]
+    async fn unknown_keys_in_a_note_are_retried_once_then_dropped() {
+        let mut actions = std::collections::VecDeque::from(vec![big(), big(), big(), Reply::text("ok").into()]);
+        let script = Script::new(move |body, _| {
+            if is_note_request(body) {
+                return Reply::text("NOTEMARK see out:deadbeefdeadbeef and c99 for it").into();
+            }
+            actions.pop_front().unwrap_or_else(|| Reply::text("(script exhausted)").into())
+        });
+        let mut fx = Fx::new("chat", false, false, script).await;
+        fx.context = ctx(12_000);
+        let session = fx.create();
+        run_with(session, vec![user("go")]).await;
+        let rs = fx.sink.records();
+        let cs = compactions(&rs);
+        assert!(!cs.is_empty(), "{:?}", kinds(&rs));
+        let note = cs[0].note.clone().unwrap_or_default();
+        assert!(note.contains("[unknown key]") && !note.contains("deadbeef"), "{note}");
+        assert_eq!(cs[0].dropped_keys, ["out:deadbeefdeadbeef"], "{:?}", cs[0].dropped_keys);
         let reqs = fx.server.requests();
-        let line = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        assert_eq!(reqs.len(), 3, "the request, the refused one, the retry");
-        assert!(all_text(&reqs[1]).matches(line).count() >= 600);
-        assert!(all_text(&reqs[2]).matches(line).count() < 10, "the retry carries the stub");
-        assert!(all_text(&reqs[2]).contains("out:"));
+        let notes: Vec<_> = reqs.iter().filter(|b| is_note_request(b)).collect();
+        assert_eq!(notes.len(), 2 * cs.len(), "one retry per note");
+        assert!(all_text(notes[1]).contains("These keys do not exist in this session"), "the retry says which");
     }
 
     #[tokio::test]
-    async fn a_small_window_is_folded_at_its_trigger_before_the_server_refuses_it() {
-        // Each output is cut to an eighth of this window (4k tokens), so it takes more of them to fill it.
-        let mut replies: Vec<Action> = (0..12).map(|_| big()).collect();
-        replies.push(Reply::text("ok").into());
-        let mut fx = Fx::new("chat", false, false, seq(replies)).await;
-        fx.server.set_model("mock", Some(32_000));
-        fx.window = Some(32_000);
-        // The configured floor (180k) is far above this window.
-        fx.context =
-            ReweavePolicy { target_tokens: 400_000, floor_tokens: 180_000, keep_recent_steps: 1, stub_tail_lines: 3 };
-        let session = fx.create();
-        run_with(session, vec![user("go")]).await;
-        let rs = fx.sink.records();
-        let rw = reweave_records(&rs);
-        assert!(!rw.is_empty(), "{:?}", kinds(&rs));
-        // The room kept for the reply is a quarter of this window, so the trigger (24k) lies below the
-        // window and the context is folded before the server refuses it.
-        assert_eq!(rw[0].reason, "target");
-        assert_eq!(count(&rs, "model_request"), count(&rs, "model_response"), "no request was refused");
-        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Yielded]);
-        assert!(inbox(&rs).is_empty());
-    }
-
-    #[tokio::test]
-    async fn a_small_window_re_weaves_instead_of_failing_when_it_overflows() {
-        let mut fx =
-            Fx::new("chat", false, false, seq(vec![big(), big(), big(), big(), big(), Reply::text("ok").into()])).await;
-        // The session is told twice the window the server enforces, so the server refuses first.
-        fx.server.set_model("mock", Some(32_000));
-        fx.window = Some(64_000);
-        // The configured floor (180k) is far above both windows.
-        fx.context =
-            ReweavePolicy { target_tokens: 400_000, floor_tokens: 180_000, keep_recent_steps: 1, stub_tail_lines: 3 };
-        let session = fx.create();
-        run_with(session, vec![user("go")]).await;
-        let rs = fx.sink.records();
-        let rw = reweave_records(&rs);
-        assert!(!rw.is_empty(), "{:?}", kinds(&rs));
-        assert!(rw.iter().all(|w| w.reason == "overflow"), "{rw:?}");
-        assert!(count(&rs, "model_request") > count(&rs, "model_response"), "a request was refused");
-        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Yielded]);
-        assert!(inbox(&rs).is_empty());
-    }
-
-    #[test]
-    fn the_reply_reserve_is_at_most_a_quarter_of_the_window() {
-        let policy = ReweavePolicy::default();
-        // 16k: 4k are kept for the reply, so the trigger and the floor stay positive.
-        assert_eq!(reweave_bounds(&policy, Some(16_000), None), (12_000, 8_000));
-        // The default bounds (400k and 180k) are clamped to a 32k window, which `Config::check` accepts.
-        let (limit, floor) = reweave_bounds(&policy, Some(32_768), None);
-        assert!(limit < 32_768 && floor < limit, "{limit} {floor}");
-        // A configured reply length is honoured whole; only the slack after it shrinks.
-        assert_eq!(reweave_bounds(&policy, Some(16_000), Some(4_000)), (8_000, 4_000));
-        // One the window cannot hold is no reply length the session can honour: it counts as none,
-        // not as a trigger of 0 that would re-weave at every step.
-        assert_eq!(reweave_bounds(&policy, Some(16_000), Some(32_768)), (12_000, 8_000));
-        // One the window can hold is kept even when little is left after it: the request still fits.
-        assert_eq!(reweave_bounds(&policy, Some(16_000), Some(14_000)), (1, 0));
-        assert_eq!(reweave_bounds(&policy, Some(32_768), Some(30_000)), (1, 0));
-        for (window, max) in
-            [(16_000, Some(4_000)), (16_000, Some(14_000)), (32_768, Some(30_000)), (65_536, Some(32_768))]
-        {
-            let (limit, _) = reweave_bounds(&policy, Some(window), max);
-            assert!(limit + max.unwrap_or(0) <= window, "window {window} max {max:?}");
-        }
-        // A request at the trigger leaves room for the reply it asks for, and the 4_096 after it.
-        let (limit, floor) = reweave_bounds(&policy, Some(65_536), Some(32_768));
-        assert_eq!((limit, floor), (28_672, 14_336));
-        assert!(limit + 32_768 + 4_096 <= 65_536);
-        // From 81_920 tokens up the whole reserve (the reply or 16_384, plus 4_096) is kept, as it
-        // always was.
-        let whole = |w: u64, reply: u64| {
-            let limit = 400_000u64.min(w - reply - 4_096).min(w / 5 * 4);
-            let floor = 180_000u64.min(w / 2);
-            (limit, if floor >= limit { limit / 2 } else { floor })
-        };
-        for w in [81_920, 82_000, 131_072, 200_000, 1_000_000] {
-            assert_eq!(reweave_bounds(&policy, Some(w), None), whole(w, 16_384), "window {w}");
-            assert_eq!(reweave_bounds(&policy, Some(w), Some(32_768)), whole(w, 32_768), "window {w}");
-        }
-        assert_eq!(reweave_bounds(&policy, Some(131_072), Some(32_768)), (94_208, 65_536));
-        assert_eq!(reweave_bounds(&policy, Some(82_000), Some(32_768)).0, 45_136);
-        assert_eq!(reweave_bounds(&policy, Some(1_000_000), None), (400_000, 180_000));
-        assert_eq!(reweave_bounds(&policy, None, None), (400_000, 180_000));
-        // Below it the reserve shrinks with the window instead of swallowing it.
-        let (limit, floor) = reweave_bounds(&policy, Some(40_000), None);
-        assert_eq!((limit, floor), (30_000, 20_000));
-    }
-
-    #[tokio::test]
-    async fn an_overflow_re_weaves_by_the_servers_limit_when_the_window_is_unknown() {
-        let mut fx =
-            Fx::new("chat", false, false, seq(vec![big(), big(), big(), big(), big(), Reply::text("ok").into()])).await;
-        fx.server.set_model("mock", Some(32_000));
-        // No window known to the session, and the default policy, whose floor (180k) is far above it.
-        fx.window = None;
-        fx.context = ReweavePolicy::default();
-        let session = fx.create();
-        run_with(session, vec![user("go")]).await;
-        let rs = fx.sink.records();
-        let rw = reweave_records(&rs);
-        assert!(!rw.is_empty(), "{:?}", kinds(&rs));
-        assert!(rw.iter().all(|w| w.reason == "overflow" && w.digest.is_none()));
-        // No digest is asked for on a prefix the server has just refused.
-        assert!(!rs.iter().any(|r| matches!(&r.event, Event::ModelRequest(m) if m.purpose == Purpose::Digest)));
-        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Yielded]);
-        assert!(inbox(&rs).is_empty());
-    }
-
-    #[tokio::test]
-    async fn an_operator_reweave_while_idle_and_one_queued_mid_turn() {
-        let mut fx =
-            Fx::new("chat", false, false, seq(vec![big(), big(), Reply::text("ok").into(), Reply::text("ok").into()]))
-                .await;
-        fx.context =
-            ReweavePolicy { target_tokens: 400_000, floor_tokens: 1_000, keep_recent_steps: 1, stub_tail_lines: 3 };
+    async fn an_operator_compaction_on_an_idle_session_starts_no_turn() {
+        let script = with_note(vec![big(), Reply::text("ok").into()], Some("NOTEMARK"));
+        let mut fx = Fx::new("chat", false, false, script).await;
+        fx.context = ctx(400_000);
         let session = fx.create();
         let (tx, task) = spawn_run(session);
         tx.send(user("go")).unwrap();
         wait_until(&fx.sink, "turn end", |rs| count(rs, "turn_end") == 1).await;
-        tx.send(Input::Reweave).unwrap();
-        wait_until(&fx.sink, "reweave", |rs| count(rs, "reweave") == 1).await;
+        tx.send(Input::Compact).unwrap();
+        wait_until(&fx.sink, "compaction", |rs| count(rs, "compaction") == 1).await;
         let rs = fx.sink.records();
-        assert_eq!(reweave_records(&rs)[0].reason, "operator");
+        assert_eq!(compactions(&rs)[0].reason, "operator");
         assert_eq!(count(&rs, "turn_start"), 1);
         finish_task(tx, task).await;
+    }
+
+    #[tokio::test]
+    async fn a_context_overflow_compacts_and_retries() {
+        let mut fx =
+            Fx::new("chat", false, false, with_note(vec![big(), big(), Reply::text("ok").into()], Some("N"))).await;
+        fx.server.set_model("mock", Some(16_000));
+        let session = fx.create();
+        run_with(session, vec![user("go")]).await;
+        let rs = fx.sink.records();
+        let cs = compactions(&rs);
+        assert_eq!(cs.len(), 1, "{:?}", kinds(&rs));
+        assert_eq!(cs[0].reason, "refused");
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Yielded]);
+    }
+
+    #[tokio::test]
+    async fn three_stalls_of_a_large_request_compact_the_window() {
+        let mut n = 0usize;
+        let script = Script::new(move |body, _| {
+            if is_note_request(body) {
+                return Reply::text("NOTEMARK").into();
+            }
+            n += 1;
+            match n {
+                1..=3 => big(),
+                4..=6 => Action::Stall { ms: 600_000 },
+                _ => Reply::text("ok").into(),
+            }
+        });
+        let mut fx = Fx::new("chat", false, false, script).await;
+        fx.profile.stall_timeout_s = 1;
+        fx.profile.retry_window_s = 0;
+        fx.context = ctx(56_000);
+        let session = fx.create();
+        run_with(session, vec![user("go")]).await;
+        let rs = fx.sink.records();
+        let cs = compactions(&rs);
+        assert_eq!(cs.iter().map(|c| c.reason.as_str()).collect::<Vec<_>>(), ["stall"], "{:?}", kinds(&rs));
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Yielded]);
+        // Its note request carried headers only: the outputs' lines are not in it.
+        let reqs = fx.server.requests();
+        let note = reqs.iter().find(|b| is_note_request(b)).unwrap();
+        let line = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        assert!(all_text(note).matches(line).count() < 10);
+    }
+
+    /// The real `read` that answers every call with about 2k tokens of text.
+    struct TwoK;
+
+    #[async_trait::async_trait]
+    impl Tool for TwoK {
+        fn spec(&self) -> ToolSpec {
+            loom_tools::fstools::Read.spec()
+        }
+        fn speculative(&self) -> bool {
+            true
+        }
+        async fn run(&self, _ctx: &ToolCtx, args: &Map<String, Value>) -> loom_tools::ToolOutput {
+            let n = args.get("start").and_then(Value::as_u64).unwrap_or(0);
+            let text: String =
+                (0..100).map(|i| format!("line {n}.{i} aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n")).collect();
+            loom_tools::ToolOutput::ok("ok", loom_tools::Body::Message(text))
+        }
+    }
+
+    #[tokio::test]
+    async fn the_window_stays_bounded_over_five_thousand_steps() {
+        const COMPACT_AT: u64 = 50_000;
+        const STEPS: usize = 5_000;
+        // Each output is about 2k tokens.
+        let mut n = 0usize;
+        let script = Script::new(move |body, _| {
+            if is_note_request(body) {
+                return Reply::text("## Goal\nkeep going\n## Next\nrun the next one").into();
+            }
+            n += 1;
+            if n <= STEPS {
+                Reply::tool("read", json!({ "path": "a.txt", "start": n }).to_string()).into()
+            } else {
+                Reply::text("done").into()
+            }
+        });
+        let mut fx = Fx::new("chat", false, false, script).await;
+        fx.context = ctx(COMPACT_AT);
+        let mut session = fx.create();
+        session.registry.add(Arc::new(TwoK));
+        let (tx, rx) = unbounded_channel();
+        tx.send(user("go")).unwrap();
+        drop(tx);
+        tokio::time::timeout(Duration::from_secs(900), session.run(rx)).await.expect("the session did not finish");
+        let rs = fx.sink.records();
+        let cs = compactions(&rs);
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Yielded]);
+        assert!(cs.len() > 100, "{}", cs.len());
+        // No step request is above the size plus one step; the first one after each compaction is small.
+        let mut since: Option<u32> = None;
+        let mut worst = 0u64;
+        for r in &rs {
+            match &r.event {
+                Event::Compaction(_) => since = Some(0),
+                Event::ModelRequest(m) if m.purpose == Purpose::Step => {
+                    worst = worst.max(m.est_tokens);
+                    if since.take().is_some() {
+                        assert!(m.est_tokens < COMPACT_AT / 100 * 40, "first after a compaction: {}", m.est_tokens);
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(worst <= COMPACT_AT + 6_000, "worst request {worst}");
+        println!("LONGRUN compactions {} worst {worst}", cs.len());
     }
 
     // ---- refusals, and admission scaled to the window --------------------------------------------
@@ -7788,18 +8018,18 @@ mod tests {
         Script::new(move |_, _| first.pop_front().unwrap_or_else(|| refusal(status)))
     }
 
-    fn refuse_context() -> ReweavePolicy {
-        ReweavePolicy { target_tokens: 400_000, floor_tokens: 1_000, keep_recent_steps: 2, stub_tail_lines: 3 }
+    fn refuse_context() -> ContextCfg {
+        ctx(400_000)
     }
 
     /// Append the operator's message and run one turn, in place.
     async fn say(session: &mut Session, text: &str) {
-        session.append(Author::User, Event::UserMessage { text: text.into() }).unwrap();
+        session.append(Author::User, Event::UserMessage { text: text.into(), images: vec![] }).unwrap();
         assert!(session.turn(Trigger::User).await.unwrap().is_none());
     }
 
     #[tokio::test]
-    async fn a_refusal_parks_and_the_same_refusal_again_folds_every_output_out_of_view() {
+    async fn a_refusal_parks_and_the_same_refusal_again_compacts_with_headers_only() {
         let mut fx =
             Fx::new("chat", false, false, filter_over(vec![bash(POISONED).into(), Reply::text("done").into()])).await;
         fx.context = refuse_context();
@@ -7809,27 +8039,28 @@ mod tests {
         assert_eq!(turn_ends(&rs), vec![TurnEndReason::Error]);
         assert_eq!(inbox(&rs).len(), 1);
         assert_eq!(inbox(&rs)[0].text, texts::refused_park(400, FILTER_SAYS, false));
-        assert!(reweave_records(&rs).is_empty(), "the first refusal parks without folding");
+        assert!(compactions(&rs).is_empty(), "the first refusal parks without compacting");
         assert_eq!(session.refused_epoch, Some(0));
 
-        // The answer appends to the same prefix; the server refuses it the same way; the session folds.
+        // The answer appends to the same prefix; the server refuses it the same way; the session compacts.
         say(&mut session, "keep working").await;
         let rs = session.records().to_vec();
-        let rw = reweave_records(&rs);
-        assert_eq!(rw.len(), 1, "{:?}", kinds(&rs));
-        assert_eq!(rw[0].reason, "refused");
-        assert!(rw[0].digest.is_none());
-        assert!(
-            matches!(&rw[0].evictions[..], [Eviction { action: EvictAction::Stub { text }, .. }] if text.contains("out:"))
-        );
+        let cs = compactions(&rs);
+        assert_eq!(cs.len(), 1, "{:?}", kinds(&rs));
+        assert_eq!(cs[0].reason, "refused");
+        assert!(cs[0].table.contains("out:"), "{}", cs[0].table);
         assert_eq!(turn_ends(&rs), vec![TurnEndReason::Error, TurnEndReason::Yielded]);
         assert_eq!(inbox(&rs).len(), 1);
         assert_eq!(session.refused_epoch, None);
         let reqs = fx.server.requests();
-        assert_eq!(reqs.len(), 4, "the call, the refusal, the refusal again, the retry");
-        assert!(body_has(&reqs[2], "POISON") && !body_has(&reqs[3], "POISON"));
-        assert!(all_text(&reqs[3]).contains("out:"), "the stub keeps the handle");
-        assert!(!rs.iter().any(|r| matches!(&r.event, Event::ModelRequest(m) if m.purpose == Purpose::Digest)));
+        assert!(body_has(&reqs[2], "POISON"), "the refused request carried it");
+        assert!(!body_has(reqs.last().unwrap(), "POISON"), "the retry does not");
+        assert!(reqs.iter().any(is_note_request), "a note was asked for");
+        let notes = rs.iter().filter(|r| matches!(&r.event, Event::ModelRequest(m) if m.purpose == Purpose::Compact));
+        assert_eq!(notes.count(), 1);
+        // The note request carried headers only: the 300 lines of filler are cut to the last one.
+        let note_body = reqs.iter().find(|b| is_note_request(b)).unwrap();
+        assert!(all_text(note_body).matches("fillerfillerfillerfiller").count() < 5);
     }
 
     fn body_has(body: &Value, what: &str) -> bool {
@@ -7837,7 +8068,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_refusal_after_the_fold_parks_with_the_folded_texts() {
+    async fn a_refusal_after_the_compaction_parks_with_the_folded_texts() {
         let script = then_refuse(vec![bash(BIG).into()], 400);
         let mut fx = Fx::new("chat", false, false, script).await;
         fx.context = refuse_context();
@@ -7845,14 +8076,15 @@ mod tests {
         say(&mut session, "go").await;
         say(&mut session, "again").await;
         let rs = session.records().to_vec();
-        let rw = reweave_records(&rs);
-        assert_eq!(rw.iter().map(|w| w.reason.as_str()).collect::<Vec<_>>(), ["refused"]);
+        // The note request was refused too: the compaction is recorded without a note.
+        let cs = compactions(&rs);
+        assert_eq!(cs.iter().map(|c| c.reason.as_str()).collect::<Vec<_>>(), ["refused"]);
+        assert!(cs[0].note.is_none());
         let items = inbox(&rs);
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].text, texts::refused_park(400, FILTER_SAYS, false));
         assert_eq!(items[1].text, texts::refused_park(400, FILTER_SAYS, true));
         assert_eq!(turn_ends(&rs), vec![TurnEndReason::Error, TurnEndReason::Error]);
-        // The folded window is what was refused: one fold per step, and a third answer parks again.
         say(&mut session, "once more").await;
         let rs = session.records().to_vec();
         assert_eq!(inbox(&rs).len(), 3);
@@ -7860,27 +8092,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_refusal_after_an_unrelated_reweave_parks_before_it_folds_again() {
+    async fn a_refusal_after_an_unrelated_compaction_parks_before_it_compacts_again() {
         let script = then_refuse(vec![bash(BIG).into()], 400);
         let mut fx = Fx::new("chat", false, false, script).await;
-        fx.context =
-            ReweavePolicy { target_tokens: 400_000, floor_tokens: 1_000, keep_recent_steps: 0, stub_tail_lines: 3 };
+        fx.context = refuse_context();
         let mut session = fx.create();
         say(&mut session, "go").await;
-        // Something else re-weaves in between: what the next request starts with is not what was refused.
+        // Something else compacts in between: what the next request starts with is not what was refused.
         let woven = session.woven();
         let token = CancellationToken::new();
-        assert!(session.reweave(&woven, "target", true, &token, Fold::Normal).await.unwrap());
+        assert!(session.compact(&woven, "operator", None, &token).await.unwrap());
         say(&mut session, "again").await;
         let rs = session.records().to_vec();
-        assert_eq!(reweave_records(&rs).iter().map(|w| w.reason.as_str()).collect::<Vec<_>>(), ["target"]);
+        assert_eq!(compactions(&rs).iter().map(|c| c.reason.as_str()).collect::<Vec<_>>(), ["operator"]);
         let items = inbox(&rs);
         assert_eq!(items.len(), 2);
         assert_eq!(items[1].text, texts::refused_park(400, FILTER_SAYS, false));
     }
 
     #[tokio::test]
-    async fn other_rejections_never_fold_and_a_413_and_a_422_are_refusals() {
+    async fn other_rejections_never_compact_and_a_413_and_a_422_are_refusals() {
         for status in [401, 403] {
             let mut fx = Fx::new("chat", false, false, then_refuse(vec![bash(BIG).into()], status)).await;
             fx.context = refuse_context();
@@ -7889,7 +8120,7 @@ mod tests {
                 say(&mut session, text).await;
             }
             let rs = session.records().to_vec();
-            assert!(reweave_records(&rs).is_empty(), "{status}");
+            assert!(compactions(&rs).is_empty(), "{status}");
             assert_eq!(session.refused_epoch, None, "{status}");
             let items = inbox(&rs);
             assert_eq!(items.len(), 3);
@@ -7902,7 +8133,7 @@ mod tests {
             say(&mut session, "go").await;
             say(&mut session, "again").await;
             let rs = session.records().to_vec();
-            assert_eq!(reweave_records(&rs).iter().map(|w| w.reason.as_str()).collect::<Vec<_>>(), ["refused"]);
+            assert_eq!(compactions(&rs).iter().map(|c| c.reason.as_str()).collect::<Vec<_>>(), ["refused"]);
             assert_eq!(inbox(&rs)[0].text, texts::refused_park(status, FILTER_SAYS, false));
         }
     }
@@ -7917,135 +8148,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_operator_reweave_after_a_refusal_folds_the_latest_steps_results() {
+    async fn an_operator_compaction_after_a_refusal_uses_the_headers_only_window() {
         let script = then_refuse(vec![bash(BIG).into()], 400);
         let mut fx = Fx::new("chat", false, false, script).await;
         fx.context = refuse_context();
         let mut session = fx.create();
         say(&mut session, "go").await;
         let (tx, task) = spawn_run(session);
-        tx.send(Input::Reweave).unwrap();
-        wait_until(&fx.sink, "reweave", |rs| count(rs, "reweave") == 1).await;
-        let rw = reweave_records(&fx.sink.records());
-        assert_eq!(rw[0].reason, "operator");
-        assert!(matches!(&rw[0].evictions[..], [Eviction { action: EvictAction::Stub { .. }, .. }]), "{rw:?}");
-        let rs = fx.sink.records();
-        assert!(
-            !rs.iter().any(|r| matches!(&r.event, Event::ModelRequest(m) if m.purpose == Purpose::Digest)),
-            "no digest request after a refusal"
-        );
+        tx.send(Input::Compact).unwrap();
+        wait_until(&fx.sink, "compaction", |rs| count(rs, "compaction") == 1).await;
+        let cs = compactions(&fx.sink.records());
+        assert_eq!(cs[0].reason, "operator");
         finish_task(tx, task).await;
-    }
-
-    #[tokio::test]
-    async fn a_refusal_fold_never_drops_the_replies_even_when_they_fill_the_window() {
-        // The replies alone (about 19k tokens) stay above the midpoint (15.5k) once every output is folded,
-        // and the whole request stays under the trigger (30k), so no `target` re-weave comes first.
-        let talk = "a reply that goes on at length. ".repeat(1_000);
-        let script = filter_over(vec![
-            bash("echo one").with_text(talk.clone()).into(),
-            bash(POISONED).with_text(talk.clone()).into(),
-            Reply::text("done").into(),
-        ]);
-        let mut fx = Fx::new("chat", false, false, script).await;
-        fx.context =
-            ReweavePolicy { target_tokens: 30_000, floor_tokens: 1_000, keep_recent_steps: 2, stub_tail_lines: 3 };
-        let mut session = fx.create();
-        say(&mut session, "go").await;
-        say(&mut session, "keep working").await;
-        let rs = session.records().to_vec();
-        let rw = reweave_records(&rs);
-        let refused: Vec<_> = rw.iter().filter(|w| w.reason == "refused").collect();
-        assert_eq!(refused.len(), 1, "{:?}", rw.iter().map(|w| w.reason.clone()).collect::<Vec<_>>());
-        assert!(refused[0].evictions.iter().all(|e| e.action != EvictAction::Drop), "{:?}", refused[0].evictions);
-        let reqs = fx.server.requests();
-        assert!(all_text(reqs.last().unwrap()).contains("a reply that goes on at length."), "the replies stay");
-    }
-
-    #[tokio::test]
-    async fn refusal_folds_with_the_default_policy() {
-        let mut fx =
-            Fx::new("chat", false, false, filter_over(vec![bash(POISONED).into(), Reply::text("done").into()])).await;
-        // fx.context is ReweavePolicy::default(): floor 180k, target 400k, keep 60.
-        let mut session = fx.create();
-        say(&mut session, "go").await;
-        say(&mut session, "keep working").await;
-        say(&mut session, "and again").await;
-        let rs = session.records().to_vec();
-        let rw = reweave_records(&rs);
-        assert_eq!(
-            rw.len(),
-            1,
-            "refused re-weaves {:?}; turn ends {:?}; inbox {}",
-            rw.iter().map(|w| w.reason.clone()).collect::<Vec<_>>(),
-            turn_ends(&rs),
-            inbox(&rs).len()
-        );
-    }
-
-    #[tokio::test]
-    async fn refusal_fold_stops_at_the_floor_and_keeps_the_refused_output() {
-        let mut fx = Fx::new(
-            "chat",
-            false,
-            false,
-            filter_over(vec![bash(BIG).into(), bash(POISONED).into(), Reply::text("done").into()]),
-        )
-        .await;
-        fx.context =
-            ReweavePolicy { target_tokens: 400_000, floor_tokens: 6_000, keep_recent_steps: 2, stub_tail_lines: 3 };
-        let mut session = fx.create();
-        say(&mut session, "go").await;
-        say(&mut session, "keep working").await;
-        let rs = session.records().to_vec();
-        let rw = reweave_records(&rs);
-        assert_eq!(rw.iter().map(|w| w.reason.as_str()).collect::<Vec<_>>(), ["refused"]);
-        let reqs = fx.server.requests();
-        let items = inbox(&rs);
-        assert!(
-            !body_has(reqs.last().unwrap(), "POISON"),
-            "the retry after the refused fold still carries the refused output; evictions {}; turn ends {:?}; last inbox: {}",
-            rw[0].evictions.len(),
-            turn_ends(&rs),
-            items.last().map(|i| i.text.clone()).unwrap_or_default()
-        );
-    }
-
-    #[tokio::test]
-    async fn a_new_refusal_long_after_a_successful_fold_says_an_answer_cannot_help() {
-        let script = filter_over(vec![
-            bash(POISONED).into(),
-            bash(POISONED).into(),
-            Reply::text("done").into(),
-            Reply::text("done again").into(),
-        ]);
-        let mut fx = Fx::new("chat", false, false, script).await;
-        fx.context = refuse_context();
-        let mut session = fx.create();
-        say(&mut session, "go").await; // refused: park
-        say(&mut session, "keep working").await; // refused again: fold, retry ok, new poisoned output refused: park
-        say(&mut session, "again").await; // refused again on that prefix: fold, retry ok
-        let rs = session.records().to_vec();
-        let items = inbox(&rs);
-        assert_eq!(reweave_records(&rs).iter().map(|w| w.reason.as_str()).collect::<Vec<_>>(), ["refused", "refused"]);
-        assert_eq!(turn_ends(&rs).last(), Some(&TurnEndReason::Yielded), "the answer alone was enough");
-        assert_eq!(items.len(), 2);
-        assert_eq!(
-            items[1].text,
-            texts::refused_park(400, FILTER_SAYS, false),
-            "the park told the operator an answer cannot help"
-        );
-    }
-
-    #[tokio::test]
-    async fn an_operator_reweave_without_a_refusal_still_protects_the_recent_steps() {
-        let mut fx = Fx::new("chat", false, false, seq(vec![bash(BIG).into(), Reply::text("ok").into()])).await;
-        fx.context = refuse_context();
-        let mut session = fx.create();
-        say(&mut session, "go").await;
-        let woven = session.woven();
-        assert_eq!(session.operator_fold(&woven), Fold::Normal);
-        assert!(!session.reweave(&woven, "operator", true, &CancellationToken::new(), Fold::Normal).await.unwrap());
     }
 
     /// The real `read` that reports the `view_chars` its call was given.
@@ -8128,26 +8242,6 @@ mod tests {
         assert!(results[1].text.contains("2\t{\"k\""), "{}", results[1].text.chars().take(200).collect::<String>());
     }
 
-    // ---- stall -------------------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn stall_note_after_quiet_steps_and_not_again_until_progress() {
-        let agents = AgentsCfg { stall_steps: 3, verify_finish: false, ..AgentsCfg::default() };
-        let mut actions: Vec<Action> = (0..5).map(|_| bash("echo hi").into()).collect();
-        actions.push(finish_call("done").into());
-        // A lead without `conclude`: its closing `finish` is not refused for an unconcluded goal.
-        let mut role = core_role("lead");
-        role.tools.retain(|t| t != "conclude" && t != "request_scope");
-        let mut fx = Fx::build_with(role, "lead", false, true, agents, seq(actions)).await;
-        let session = fx.create();
-        run_with(session, vec![user("go")]).await;
-        let rs = fx.sink.records();
-        let n = notes(&rs, NoteKind::Stall);
-        assert_eq!(n, vec![texts::stall(3)]);
-        let at = rs.iter().position(|r| matches!(&r.event, Event::HarnessNote { note: NoteKind::Stall, .. })).unwrap();
-        let requests_before = rs[..at].iter().filter(|r| matches!(r.event, Event::ModelRequest(_))).count();
-        assert_eq!(requests_before, 3);
-    }
     #[test]
     fn runtime_wrapup_policy_closes_new_work_but_preserves_cleanup() {
         let policy = CallPolicy { wrapup: true };
@@ -8490,26 +8584,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn idle_operator_reweave_digest_pauses_clock_and_excludes_idle_wait() {
+    async fn idle_operator_compaction_pauses_clock_and_excludes_idle_wait() {
         fn long() -> Reply {
             Reply::tool("bash", json!({ "command": BIG }).to_string()).with_text("t".repeat(100_000))
         }
-        let script = with_digest(vec![long().into(), long().into(), Reply::text("ok").into()], Some("lead A"));
+        let script = with_note(vec![long().into(), long().into(), Reply::text("ok").into()], Some("lead A"));
         let mut fx = Fx::new("chat", false, false, script).await;
-        fx.context =
-            ReweavePolicy { target_tokens: 100_000, floor_tokens: 1_000, keep_recent_steps: 1, stub_tail_lines: 3 };
+        fx.context = ctx(100_000);
         let session = fx.create();
         let (tx, task) = spawn_run(session);
         tx.send(user("go")).unwrap();
         wait_until(&fx.sink, "turn end", |rs| count(rs, "turn_end") == 1).await;
-        assert!(reweave_records(&fx.sink.records()).is_empty());
+        assert!(compactions(&fx.sink.records()).is_empty());
 
-        tx.send(Input::Reweave).unwrap();
-        wait_until(&fx.sink, "reweave", |rs| count(rs, "reweave") == 1).await;
+        tx.send(Input::Compact).unwrap();
+        wait_until(&fx.sink, "compaction", |rs| count(rs, "compaction") == 1).await;
         let rs = fx.sink.records();
         assert!(
-            rs.iter().any(|r| matches!(&r.event, Event::ModelRequest(m) if m.purpose == Purpose::Digest)),
-            "idle operator reweave should have requested a digest"
+            rs.iter().any(|r| matches!(&r.event, Event::ModelRequest(m) if m.purpose == Purpose::Compact)),
+            "idle operator compaction should have requested a note"
         );
         let pause_ts = rs
             .iter()
@@ -8522,7 +8615,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(120)).await;
         assert_eq!(finish_task(tx, task).await, End::Closed);
         let after_idle = Session::open(fx.deps()).unwrap().st.clock.unwrap();
-        assert_eq!(after_idle.running_from, None, "clock must be paused after idle reweave");
+        assert_eq!(after_idle.running_from, None, "clock must be paused after idle compaction");
         assert!(now_ms().saturating_sub(pause_ts) >= 100, "idle window should have elapsed");
         assert_eq!(
             after_idle.elapsed(now_ms()),
@@ -8533,7 +8626,7 @@ mod tests {
         // Also check cancellation during an idle digest leaves the clock paused.
         let cancel_script = Script::new(move |body, _| {
             let m = body["messages"].as_array().unwrap();
-            if m.last().and_then(|l| l["content"].as_str()).is_some_and(|c| c == texts::DIGEST_PROMPT) {
+            if is_note_request(body) {
                 return Action::Stall { ms: 600_000 };
             }
             let tools = m.iter().filter(|x| x["role"] == "tool").count();
@@ -8544,15 +8637,14 @@ mod tests {
             }
         });
         let mut fx = Fx::new("chat", false, false, cancel_script).await;
-        fx.context =
-            ReweavePolicy { target_tokens: 100_000, floor_tokens: 1_000, keep_recent_steps: 1, stub_tail_lines: 3 };
+        fx.context = ctx(100_000);
         let session = fx.create();
         let (tx, task) = spawn_run(session);
         tx.send(user("go")).unwrap();
         wait_until(&fx.sink, "turn end", |rs| count(rs, "turn_end") == 1).await;
-        tx.send(Input::Reweave).unwrap();
+        tx.send(Input::Compact).unwrap();
         wait_until(&fx.sink, "digest request", |rs| {
-            rs.iter().any(|r| matches!(&r.event, Event::ModelRequest(m) if m.purpose == Purpose::Digest))
+            rs.iter().any(|r| matches!(&r.event, Event::ModelRequest(m) if m.purpose == Purpose::Compact))
         })
         .await;
         fx.control.stop_turn();
@@ -8646,14 +8738,15 @@ mod tests {
         let mut baseline_session = baseline_fx.create();
         let baseline_wire = baseline_session.woven().weave.tools;
         let baseline_names: Vec<&str> = baseline_wire.iter().map(|t| t.name.as_str()).collect();
-        assert!(baseline_names.contains(&"out_read"));
-        assert!(baseline_names.contains(&"step"));
+        // The pack hides the tools another tool absorbs (TOOL-SHAPES §4.3); `note` is still shown.
+        assert!(!baseline_names.contains(&"out_read"));
+        assert!(!baseline_names.contains(&"step"));
         assert!(baseline_names.contains(&"note"));
 
-        // With compact_tools = true and hidden_tools = ["note"], wire specs shrink statically while
+        // With compact_tools = true and `note` added to the hidden tools, wire specs shrink statically while
         // all tools remain registered, callable directly (even when hidden), and resolvable via aliases.
         let mut role_no_conclude = core_role("lead");
-        role_no_conclude.hidden_tools = vec!["note".into()];
+        role_no_conclude.hidden_tools.push("note".into());
         role_no_conclude.tools.retain(|t| t != "conclude" && t != "request_scope");
         let script = seq(vec![
             Reply::tool("read_file", json!({"path": "Cargo.toml"}).to_string()).into(),
@@ -8808,7 +8901,7 @@ mod tests {
             "lead",
             false,
             true,
-            AgentsCfg { implicit_finish: true, verify_finish: true, ..AgentsCfg::default() },
+            AgentsCfg { implicit_finish: true, verify_finish: true, fresh_start: false, ..AgentsCfg::default() },
             verify_script,
         )
         .await;
@@ -8860,27 +8953,6 @@ mod tests {
         let End::Settled(v_end) = run_with(v_session, vec![]).await else { panic!("expected settlement") };
         assert_eq!(v_end.outcome, ChildOutcome::Failed);
         assert!(!results(&v_fx.sink.records()).iter().any(|r| r.name == "finish"));
-    }
-
-    #[tokio::test]
-    async fn idle_ledger_nudge_false_suppresses_stall_note_while_true_emits_it() {
-        for enabled in [false, true] {
-            let agents =
-                AgentsCfg { stall_steps: 3, idle_ledger_nudge: enabled, verify_finish: false, ..AgentsCfg::default() };
-            let mut actions: Vec<Action> = (0..5).map(|_| bash("echo hi").into()).collect();
-            actions.push(finish_call("done").into());
-            let mut role = core_role("lead");
-            role.tools.retain(|t| t != "conclude" && t != "request_scope");
-            let mut fx = Fx::build_with(role, "lead", false, true, agents, seq(actions)).await;
-            let session = fx.create();
-            run_with(session, vec![user("go")]).await;
-            let n = notes(&fx.sink.records(), NoteKind::Stall);
-            if enabled {
-                assert_eq!(n, vec![texts::stall(3)]);
-            } else {
-                assert!(n.is_empty(), "expected no stall note when idle_ledger_nudge = false, got {n:?}");
-            }
-        }
     }
 
     #[test]

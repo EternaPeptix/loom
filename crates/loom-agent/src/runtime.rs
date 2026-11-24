@@ -204,7 +204,7 @@
 //!   `` `{role}` is not a role this session can start. Roles it can start: {list}. ``
 //! - at most `agents.max_children` unsettled children per parent, not counting the finish gate's
 //!   verifiers (as in `children`): otherwise `{n} agents are already running, which is the most
-//!   allowed at once. Wait for one to finish (`wait`) or stop one (`agent_stop`), then start this
+//!   allowed at once. Wait for one to finish (`job_wait` without `job`) or stop one, then start this
 //!   one.`
 //! - the operator's choice for the mission comes first for a fresh child: the parent's
 //!   `role_models` for the role, else its `*` entry (not for a `harness` request, the finish gate's
@@ -431,9 +431,15 @@
 //!   repeat notice is armed as for a live one.
 //!
 //! ## Operator actions
+//! - `send_message_with(id, text, attachments)`: `send_message` with files attached (`docs/UPLOADS.md`). Each
+//!   path must be a regular file directly in `<workspace>/.loom/uploads/` of the session's workspace, after
+//!   canonicalising and not itself a link (`attached_files`), else `texts::not_an_upload`; the text recorded is
+//!   `texts::with_attachments(text, files)`. Text may be empty when there are attachments. `NewSession.attachments`
+//!   are validated before anything is created and sent with the first message in the same way.
 //! - `send_message(id, text)`: root sessions only (`Messages go to the lead session of a mission;
 //!   {id} is one of its agents.`); empty text refused; ended session refused; activate;
-//!   `Input::User`; then its children that a restart cut are resumed as `resume` does (the lead's
+//!   `Input::User` (`Input::UserImages` when an attachment is an image of at most `max_image_bytes`: it is
+//!   stored in the blob store and named in the `user_message`'s `images`); then its children that a restart cut are resumed as `resume` does (the lead's
 //!   turn starts with `AFTER_RESTART`, which says so).
 //! - `add_rule(id, text)`, `approve(id, text, scope)`, `withdraw_rule(id, rule_id, reason)`: any
 //!   session; the input goes to the lead (root) session of its mission, which owns the ledger.
@@ -485,7 +491,7 @@
 //!   restart leaves a child idle that way: a child that is stopped settles. Unsettled children that
 //!   have no task (the lead could not be opened at start) are first restored as an unarchive does,
 //!   and what children ended with while the lead could not take it is delivered.
-//! - `reweave(id)`: activate; `Input::Reweave`.
+//! - `compact(id)`: activate; `Input::Compact`.
 //! - `rename(id, title)`: root only (an agent is named by its question); blank title refused (`Write
 //!   the new title.`). Trims `title`, sets it in the lead's `meta.json`, updates the titles cached on
 //!   that session's open inbox items, and publishes a `session` event. No turn is started. Allowed in
@@ -674,8 +680,8 @@
 //!   to it exactly, `framing` taking the remainder; without a count, `basis` is `default_ratio` and the
 //!   total is the estimate), `measured_now` (`session`'s size of the request it would send now, `None`
 //!   before the first counted request of the epoch), `last_request` (the latest step request and the
-//!   server's count for its reply, 0 while missing) and `fold_at`/`fold_to` (`reweave_bounds` of the
-//!   configured target and floor for the session's window and profile).
+//!   server's count for its reply, 0 while missing) and `fold_at` (the session's `compact_at`;
+//!   `fold_to` is always `None` now).
 //! - `missions()`: one per root session. `ledger(mission)`: the journal read and folded
 //!   (`No ledger: this mission's lead does not keep one.` when there is no journal file and the
 //!   lead's role keeps none or can no longer be looked up; a lead that keeps one but has no journal
@@ -758,10 +764,15 @@
 
 use crate::pack::{self, Packs, PromptEnv, RoleDef};
 use crate::prior;
+mod target_api;
+mod targets;
 use crate::rtools::{
     self, ChildCopy, ChildInfo, Orchestrator, Producer, Run, Settlement, Shared, SpawnReq, Vote, Workspace,
 };
-use crate::session::{queue_input, Control, Deps, End, Input, Phase, Session, Sink, Status};
+use crate::session::{
+    discard_queued_messages, edit_queued_message, queue_input, queue_user_message, queued_messages,
+    take_queued_message, Control, Deps, End, Input, Phase, QueuedMessage, Session, Sink, Status,
+};
 use crate::texts;
 use async_trait::async_trait;
 use futures_util::FutureExt;
@@ -794,6 +805,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
+pub use target_api::{ca_rotate, ca_show, ExchangeEntry, GraphView, TargetBody, TargetView};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
@@ -801,6 +813,17 @@ use tokio_util::sync::CancellationToken;
 
 /// Events the bus keeps for a slow subscriber before it is told it lagged.
 pub const BUS_CAPACITY: usize = 8_192;
+
+/// Whether a new mission decrypts HTTPS (CONTRACTS-TRAFFIC-TARGETS I1): `[network] intercept` decides
+/// (`always` / `never`), else the mission's own choice, else its pack's flag.
+pub fn decide_intercept(mode: &loom_core::config::InterceptMode, pack: bool, asked: Option<bool>) -> bool {
+    use loom_core::config::InterceptMode;
+    match mode {
+        InterceptMode::Always => true,
+        InterceptMode::Never => false,
+        InterceptMode::Pack => asked.unwrap_or(pack),
+    }
+}
 
 /// What the operator gives to start a session.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -830,6 +853,18 @@ pub struct NewSession {
     /// Make `workspace` (and the folders above it that are missing) when it does not exist. The receipt of
     /// the creation says `created`; nothing is recorded in the log beyond what a session start records.
     pub create_workspace: bool,
+    /// Uploads of the workspace to attach to the first message (absolute paths from `POST /api/uploads`;
+    /// `docs/UPLOADS.md`). Not written when empty, so a request that names none is accepted by an older daemon.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<String>,
+    /// The name of a target (`~/.loom/targets/{name}`) the mission works on (CONTRACTS-TRAFFIC-TARGETS T2).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// Decrypt the mission's HTTPS (CONTRACTS-TRAFFIC-TARGETS I1): `Some(false)` turns it off for a pack that
+    /// asks for it, `Some(true)` turns it on for one that does not. Absent = the pack decides. Fixed for the
+    /// mission; `[network] intercept = "always"|"never"` overrides it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub intercept: Option<bool>,
 }
 
 /// `meta.json`: what a session is, fixed when it is created.
@@ -837,6 +872,9 @@ pub struct NewSession {
 pub struct SessionMeta {
     pub id: SessionId,
     pub mission: MissionId,
+    /// HTTPS interception is on for the mission (I1); decided once at its start, inherited by every agent.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub intercept: bool,
     #[serde(default)]
     pub parent: Option<SessionId>,
     pub workspace: String,
@@ -878,6 +916,10 @@ pub struct SessionMeta {
     /// [`Runtime::set_role_model`]). Empty for an agent.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub role_models: BTreeMap<String, String>,
+    /// The target the mission works on, as it was when the lead started (CONTRACTS-TRAFFIC-TARGETS T2):
+    /// an agent inherits it, and a session restored after a restart uses this record, not the target's file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<loom_core::event::TargetRef>,
 }
 
 /// The key of [`SessionMeta::role_models`] that stands for every role the lead starts (`may_spawn`),
@@ -892,6 +934,11 @@ pub struct SessionInfo {
     /// A task is driving it now.
     pub active: bool,
     pub status: Status,
+    /// When its log was last written (milliseconds since the epoch): the time of its latest record, so a
+    /// list can order and age sessions without reading their records. Set by `Runtime::sessions`; absent
+    /// elsewhere (a session event carries the record itself).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1111,7 +1158,7 @@ pub(crate) fn window_breakdown(
     measured_now: Option<u64>,
     estimator: &TokenEstimator,
 ) -> WindowBreakdown {
-    const PARTS: [&str; 12] = [
+    const PARTS: [&str; 13] = [
         "system",
         "tools",
         "rules",
@@ -1123,6 +1170,7 @@ pub(crate) fn window_breakdown(
         "agent_reports",
         "notes",
         "stubs",
+        "images",
         "other",
     ];
     let mut chars = [0u64; PARTS.len()];
@@ -1147,7 +1195,17 @@ pub(crate) fn window_breakdown(
     }
     let chars_of = |key: &str| slot(key).and_then(|i| chars.get(i).copied()).unwrap_or(0);
     let tokens_of = |c: u64| estimator.tokens(usize::try_from(c).unwrap_or(usize::MAX));
-    let raw: Vec<u64> = PARTS.iter().map(|k| tokens_of(chars_of(k))).collect();
+    // Images are sized in tokens by their pixels, not by characters; only a model that takes images counts them.
+    let image_tokens: u64 = if estimator.vision() {
+        items.iter().filter(|i| i.state != loom_core::weave::ItemState::Dropped).map(|i| i.image_tokens).sum()
+    } else {
+        0
+    };
+    if let Some(n) = slot("images").and_then(|i| counts.get_mut(i)) {
+        *n = if estimator.vision() { items.iter().filter(|i| i.image_tokens > 0).count() as u64 } else { 0 };
+    }
+    let raw: Vec<u64> =
+        PARTS.iter().map(|k| if *k == "images" { image_tokens } else { tokens_of(chars_of(k)) }).collect();
     let raw_hud = estimator.tokens(hud_bytes);
     let raw_sum = raw.iter().sum::<u64>().saturating_add(raw_hud);
     // The estimate for the whole, never smaller than its parts.
@@ -1170,6 +1228,7 @@ pub(crate) fn window_breakdown(
                 | "agent_reports"
                 | "notes"
                 | "stubs"
+                | "images"
                 | "other"
         );
         segments.push(WindowSegment {
@@ -1456,6 +1515,9 @@ pub struct ModelHealth {
     pub detail: String,
     pub context_window: Option<u64>,
     pub max_concurrent: u32,
+    /// The profile's `vision`: the model takes images.
+    #[serde(default)]
+    pub vision: bool,
 }
 
 /// A streamed piece of a model reply, in a form the API can send on.
@@ -1508,6 +1570,15 @@ pub enum BusEvent {
     /// missed `missed` events; the subscriber should fetch what it shows again.
     Lagged {
         missed: u64,
+    },
+    /// The messages queued for `session` changed (one was added, edited, removed or sent): read the
+    /// list again (`Runtime::queued`).
+    Queued {
+        session: SessionId,
+    },
+    /// The graph of a target changed (sent at most once a second per target): read it again.
+    Target {
+        name: String,
     },
 }
 
@@ -1768,6 +1839,91 @@ pub fn plan_workspace(paths: &Paths, raw: &Path, create: bool) -> Result<Workspa
         ));
     }
     Ok(WorkspacePlan::Create { path, ancestor, protected: vec![paths.home.clone(), copies] })
+}
+
+/// The uploads `paths` names, as the message tells the model of them: each a regular file directly in
+/// `<workspace>/.loom/uploads/` (the real path of both, and the path itself not a link), else
+/// `texts::not_an_upload`. A UTF-8 text file of at most `texts::ATTACH_INLINE_MAX` bytes carries its content.
+pub fn attached_files(workspace: &Path, paths: &[String]) -> Result<Vec<texts::AttachedFile>, String> {
+    use std::io::Read;
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let uploads = std::fs::canonicalize(workspace).ok().map(|w| w.join(".loom").join("uploads"));
+    let mut out = Vec::new();
+    for raw in paths {
+        let refuse = || texts::not_an_upload(raw);
+        let written = Path::new(raw);
+        let is_plain = std::fs::symlink_metadata(written).is_ok_and(|m| m.file_type().is_file());
+        let real = std::fs::canonicalize(written).map_err(|_| refuse())?;
+        let in_uploads = match (&uploads, real.parent()) {
+            (Some(dir), Some(parent)) => {
+                parent == dir.as_path() && std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_dir())
+            }
+            _ => false,
+        };
+        if !written.is_absolute() || !is_plain || !in_uploads {
+            return Err(refuse());
+        }
+        let path = real.to_str().ok_or_else(refuse)?.to_string();
+        let file = std::fs::File::open(&real).map_err(|_| refuse())?;
+        let meta = file.metadata().map_err(|_| refuse())?;
+        if !meta.is_file() {
+            return Err(refuse());
+        }
+        let bytes = meta.len();
+        let inline = if bytes <= texts::ATTACH_INLINE_MAX {
+            let mut data = Vec::new();
+            file.take(texts::ATTACH_INLINE_MAX.saturating_add(1)).read_to_end(&mut data).map_err(|_| refuse())?;
+            String::from_utf8(data).ok().filter(|t| !t.contains('\0') && !t.is_empty())
+        } else {
+            None
+        };
+        let name = real.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        out.push(texts::AttachedFile { path, bytes, mime: texts::mime_for(name, None), inline });
+    }
+    Ok(out)
+}
+
+/// The attached files that are images of at most `max` bytes, stored in the blob store, as the message names
+/// them. A file that is not an image, is too large, or cannot be read or stored is left to its path alone.
+fn stored_images(blobs: &BlobStore, files: &[texts::AttachedFile], max: u64) -> Vec<loom_core::ImageRef> {
+    let mut out = Vec::new();
+    for f in files.iter().filter(|f| f.bytes <= max) {
+        let Ok(data) = std::fs::read(&f.path) else { continue };
+        let Some(info) = loom_core::image::detect(&data) else { continue };
+        let Ok(stored) = blobs.put_bytes(&data) else { continue };
+        let name = Path::new(&f.path).file_name().and_then(|n| n.to_str()).map(str::to_string);
+        out.push(loom_core::ImageRef {
+            blob: stored.id.as_str().to_string(),
+            mime: info.mime.to_string(),
+            bytes: data.len() as u64,
+            width: info.width,
+            height: info.height,
+            name,
+        });
+    }
+    out
+}
+
+/// The `images` entry of a record (`{"blob": …, "mime": …}` inside an `images` array) that names `blob`.
+fn find_image(value: &Value, blob: &str) -> Option<loom_core::ImageRef> {
+    match value {
+        Value::Object(map) => {
+            if let Some(Value::Array(list)) = map.get("images") {
+                for entry in list {
+                    if entry.get("blob").and_then(Value::as_str) == Some(blob) {
+                        if let Ok(image) = serde_json::from_value(entry.clone()) {
+                            return Some(image);
+                        }
+                    }
+                }
+            }
+            map.values().find_map(|v| find_image(v, blob))
+        }
+        Value::Array(items) => items.iter().find_map(|v| find_image(v, blob)),
+        _ => None,
+    }
 }
 
 fn no_session(id: &SessionId) -> String {
@@ -2140,6 +2296,17 @@ static PANIC_TITLES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 #[cfg(test)]
 static RESUMES: Mutex<Vec<SessionId>> = Mutex::new(Vec::new());
 
+/// The MCP listing the `session_start` of the log at `path` recorded; empty when there is none.
+fn recorded_mcp(path: &std::path::Path) -> Vec<loom_core::event::McpListing> {
+    match loom_core::log::read_page(path, None, 1) {
+        Ok(page) => match page.into_iter().next().map(|r| r.event) {
+            Some(Event::SessionStart(s)) => s.mcp,
+            _ => Vec::new(),
+        },
+        Err(_) => Vec::new(),
+    }
+}
+
 fn network_text(config: &Config) -> String {
     let mode = match config.network.mode {
         NetworkMode::Open => "open",
@@ -2460,6 +2627,12 @@ struct Inner {
     /// The missions whose box counters could not be read at the last poll and the operator's log was told so,
     /// until a poll works again (`poll_box_counters`).
     box_counters_failed: Mutex<BTreeSet<MissionId>>,
+    /// Where the proxy hands the exchanges it captured (CONTRACTS-TRAFFIC-TARGETS C3).
+    capture_tx: loom_net::CaptureSink,
+    /// Each live session's capture state, by session; dead ones are pruned when a session is built.
+    traffic: Mutex<HashMap<SessionId, Weak<crate::traffic::Traffic>>>,
+    /// Each mission's index of exchanges, shared by its sessions.
+    mission_traffic: Mutex<HashMap<MissionId, Weak<crate::traffic::MissionTraffic>>>,
 }
 
 impl Inner {
@@ -2744,6 +2917,12 @@ impl Sink for SinkImpl {
         }
     }
 
+    fn queued(&self, session: &SessionId) {
+        if let Some(inner) = self.0.upgrade() {
+            inner.publish(BusEvent::Queued { session: session.clone() });
+        }
+    }
+
     fn status(&self, session: &SessionId, status: &Status) {
         if let Some(inner) = self.0.upgrade() {
             inner.on_status(session, status);
@@ -2767,6 +2946,21 @@ const NOT_YOURS: &str = "is not an agent this session started.";
 
 #[async_trait]
 impl Orchestrator for Orch {
+    fn ledger_appended(
+        &self,
+        session: &SessionId,
+        op: &loom_core::ledger::LedgerOp,
+        state: &loom_core::ledger::LedgerState,
+    ) {
+        if let Ok(inner) = self.up() {
+            inner.target_ledger(session, op, state);
+        }
+    }
+
+    fn target_nodes(&self, session: &SessionId) -> Option<Result<(String, Vec<loom_core::target::NodeView>), String>> {
+        self.up().ok()?.target_nodes_of(session)
+    }
+
     async fn spawn(&self, parent: &SessionId, req: SpawnReq) -> Result<SessionId, String> {
         let inner = self.up()?;
         if !req.harness {
@@ -3047,6 +3241,8 @@ impl Orchestrator for Orch {
                 max_tokens: Some(texts::VOTE_MAX_TOKENS),
                 seed: Some(seed),
                 extra: serde_json::Map::new(),
+                images: loom_model::ImageResolver::for_model(rt.client.profile().vision, &inner.blobs),
+                text_calls: false,
             };
             let client = rt.client.clone();
             let limiter = rt.limiter.clone();
@@ -3147,7 +3343,7 @@ impl Inner {
     }
 
     fn info_of(k: &Known) -> SessionInfo {
-        SessionInfo { meta: k.meta.clone(), active: k.active.is_some(), status: k.status.clone() }
+        SessionInfo { meta: k.meta.clone(), active: k.active.is_some(), status: k.status.clone(), last_ms: None }
     }
 
     /// Send `input` to an active session. False when no task drives it.
@@ -3345,6 +3541,9 @@ impl Inner {
             if item.blocking && self.config.notify.repeat_minutes > 0 {
                 self.repeat_notice(&kind, session, &title, &item);
             }
+        }
+        if let Event::Exchange(x) = &record.event {
+            self.target_exchange(session, record.ts_ms, x);
         }
         if let Some(m) = &self.monitor {
             m.wake(Some(session));
@@ -3714,19 +3913,61 @@ impl Inner {
         }
     }
 
+    /// The capture state of a session, registered for the proxy's sink, with its mission's index of exchanges.
+    fn traffic_for(&self, meta: &SessionMeta) -> Arc<crate::traffic::Traffic> {
+        let mission = {
+            let mut missions = self.mission_traffic.lock().unwrap_or_else(|p| p.into_inner());
+            missions.retain(|_, w| w.strong_count() > 0);
+            match missions.get(&meta.mission).and_then(Weak::upgrade) {
+                Some(m) => m,
+                None => {
+                    let m = Arc::new(crate::traffic::MissionTraffic::default());
+                    missions.insert(meta.mission.clone(), Arc::downgrade(&m));
+                    m
+                }
+            }
+        };
+        let traffic =
+            Arc::new(crate::traffic::Traffic::new(mission, meta.intercept, self.config.network.capture_max_exchanges));
+        let mut sessions = self.traffic.lock().unwrap_or_else(|p| p.into_inner());
+        sessions.retain(|_, w| w.strong_count() > 0);
+        sessions.insert(meta.id.clone(), Arc::downgrade(&traffic));
+        traffic
+    }
+
+    /// One exchange from the proxy's sink: store it and wake the session so that it is appended to its log.
+    fn ingest_capture(&self, session: &SessionId, captured: loom_net::Captured) {
+        let traffic = self.traffic.lock().unwrap_or_else(|p| p.into_inner()).get(session).and_then(Weak::upgrade);
+        let Some(traffic) = traffic else { return };
+        if traffic.ingest(&self.blobs, captured) || traffic.has_pending() {
+            self.send_input(session, Input::DrainQueued);
+        }
+    }
+
     /// The proxy policy of a session: the configured network plus the mission's granted hosts. A
     /// granted host that cannot be parsed is left out (with a warning), which only narrows the policy.
     /// The infrastructure that policy refuses to every command, grants or not (E1), is added last.
     fn session_policy(&self, meta: &SessionMeta, explicit: bool) -> Result<Policy, String> {
-        let hosts = self.granted_hosts(meta, explicit);
+        let mut hosts = self.granted_hosts(meta, explicit);
+        // The hosts of the MCP servers this session's role gets (CONTRACTS-MCP M4).
+        for h in self.mcp_hosts(meta) {
+            if !hosts.iter().any(|x| x.eq_ignore_ascii_case(&h)) {
+                hosts.push(h);
+            }
+        }
         let policy = match Policy::with_hosts(&self.config.network, &hosts) {
-            Ok(p) => Ok(p),
+            Ok(p) => p,
             Err(e) if !hosts.is_empty() => {
                 tracing::warn!(session = %meta.id, "granted hosts ignored: {e}");
-                Policy::new(&self.config.network)
+                Policy::new(&self.config.network)?
             }
-            Err(e) => Err(e),
-        }?;
+            Err(e) => return Err(e),
+        };
+        // The mission target's scope joins the policy, from the record made at the lead's start (T2).
+        let policy = match &meta.target {
+            Some(t) => policy.with_target(&t.scope, &t.exclude)?,
+            None => policy,
+        };
         let revoked = self.revoked_hosts(&meta.mission);
         let policy = match policy.clone().with_revoked(&revoked) {
             Ok(p) => p,
@@ -3736,6 +3977,58 @@ impl Inner {
             }
         };
         policy.with_infrastructure(&infra_spec_resolved(&self.infra_config(), &self.infra()))
+    }
+
+    /// The hosts configured MCP servers add for the role of `meta` (M4); empty without `[mcp]`.
+    fn mcp_hosts(&self, meta: &SessionMeta) -> Vec<String> {
+        if self.config.mcp.servers.is_empty() {
+            return Vec::new();
+        }
+        match self.packs.role(Some(&meta.pack), Some(&meta.role)) {
+            Ok(role) => crate::mcp::hosts_for_role(&self.config.mcp, &role.name, role.read_only),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Give a session that is being created its MCP servers (M6) and return the listing for its
+    /// `session_start`. A mission's lead connects to the servers its pack's roles get and lists them;
+    /// every other session takes the listing recorded by its mission's lead.
+    async fn mcp_attach_new(&self, meta: &SessionMeta, deps: &Deps) -> Vec<loom_core::event::McpListing> {
+        let cfg = &self.config.mcp;
+        if cfg.servers.is_empty() {
+            return Vec::new();
+        }
+        let role = &deps.shared.role;
+        let (listings, handles) = if meta.parent.is_none() {
+            let roles: Vec<(&str, bool)> = match self.packs.get(&meta.pack) {
+                Some(p) => p.roles.values().map(|r| (r.name.as_str(), r.read_only)).collect(),
+                None => vec![(role.name.as_str(), role.read_only)],
+            };
+            let names = crate::mcp::pack_servers(cfg, &roles);
+            crate::mcp::list_servers(cfg, &names, &deps.ctx).await
+        } else {
+            let lead = self.mission_lead(&meta.mission).map(|l| self.paths.session_log(&l.id));
+            (lead.map(|p| recorded_mcp(&p)).unwrap_or_default(), BTreeMap::new())
+        };
+        let session = crate::mcp::McpSession::plan(cfg, &role.name, role.read_only, listings.clone(), handles);
+        deps.shared.set_mcp(session);
+        listings
+    }
+
+    /// Give a session reopened from its log the servers its own `session_start` recorded. No server
+    /// is started: each connects on its first call.
+    fn mcp_attach_recorded(&self, meta: &SessionMeta, deps: &Deps) {
+        let cfg = &self.config.mcp;
+        if cfg.servers.is_empty() {
+            return;
+        }
+        let listings = recorded_mcp(&self.paths.session_log(&meta.id));
+        if listings.is_empty() {
+            return;
+        }
+        let role = &deps.shared.role;
+        let session = crate::mcp::McpSession::plan(cfg, &role.name, role.read_only, listings, BTreeMap::new());
+        deps.shared.set_mcp(session);
     }
 
     /// The `Deps` of a session (granting it its proxy credentials).
@@ -3774,11 +4067,32 @@ impl Inner {
         let jobs_dir = self.paths.session_dir(id).join("jobs");
         let built_at = self.scope_generation(&meta.mission);
         let policy = self.session_policy(meta, explicit)?;
+        // Interception needs the CA before anything else is opened: a mission that was promised decrypted
+        // traffic does not start without it (I2).
+        let ca = if meta.intercept {
+            let ca = loom_net::tls::Ca::load_or_create(&self.paths.ca_dir())
+                .map_err(|e| format!("HTTPS interception is on for this mission but the CA cannot be loaded: {e}"))?;
+            Some(ca)
+        } else {
+            None
+        };
+        let traffic = self.traffic_for(meta);
         // The session's own proxy listener comes first: its port is the only one the sandbox allows.
-        let grant = self
-            .proxy
-            .grant(id, policy)
-            .map_err(|e| format!("The egress proxy cannot open a port for this session: {e}"))?;
+        let net = &self.config.network;
+        let capturing = meta.intercept || (net.capture_max_exchanges > 0 && net.capture_max_bytes > 0);
+        let grant = if capturing {
+            let capture = loom_net::CaptureGrant {
+                max_bytes: net.capture_max_bytes,
+                intercept: meta.intercept,
+                passthrough: net.intercept_passthrough.clone(),
+                // The target's `upstream_insecure` joins here when targets are wired (part T).
+                upstream_insecure: Vec::new(),
+            };
+            self.proxy.grant_with_capture(id, policy, capture, self.capture_tx.clone(), ca.clone())
+        } else {
+            self.proxy.grant(id, policy)
+        }
+        .map_err(|e| format!("The egress proxy cannot open a port for this session: {e}"))?;
         // A grant or revoke that ran while the policy was being derived reached no proxy grant of this session.
         self.policy_is_current(meta, explicit, built_at);
         // From here a failure takes the grant, and with it the listener, back.
@@ -3795,6 +4109,22 @@ impl Inner {
             Some(self.proxy.grant_reference(id, &self.config.network)?)
         };
         let pack = self.packs.get(&meta.pack).ok_or_else(|| format!("Pack {} is no longer loaded.", meta.pack))?;
+        // I3: only an intercepting session's commands trust the CA; nothing is added to a trust store.
+        let mut env = grant.env();
+        if let Some(ca) = &ca {
+            let bundle = loom_net::tls::ca_bundle(ca, &tmp)
+                .map_err(|e| format!("The CA bundle for this session cannot be written: {e}"))?;
+            for name in loom_net::tls::BUNDLE_ENV {
+                env.insert(name.to_string(), bundle.to_string_lossy().into_owned());
+            }
+        }
+        let capabilities =
+            Arc::new(loom_tools::capabilities::SessionTools::new(pack.command_guard, pack.target_concurrency));
+        {
+            // C4: replay by `ex-` id reads the mission's recorded exchanges (its sessions' logs, loaded as they open).
+            let index = traffic.mission.clone();
+            let _ = capabilities.exchange_lookup.set(Arc::new(move |id: &str| index.find(id)));
+        }
         let ctx = ToolCtx {
             session: id.clone(),
             call_id: CallId::from(""),
@@ -3804,21 +4134,19 @@ impl Inner {
             outputs: Arc::new(MissionOutputs { runtime: self.me.clone(), mission: meta.mission.clone() }),
             cfg: Arc::new(self.config.tools.clone()),
             sandbox: Arc::new(sandbox),
-            env: Arc::new(grant.env()),
+            env: Arc::new(env),
             reference_proxy,
             files: Arc::new(loom_tools::files::FileTracker::new()),
             jobs: jobs.clone(),
             cancel: CancellationToken::new(),
-            capabilities: Arc::new(loom_tools::capabilities::SessionTools::new(
-                pack.command_guard,
-                pack.target_concurrency,
-            )),
+            capabilities,
             // The session sets it again for every call from its admission of that moment.
             view_chars: self
                 .config
                 .admit
                 .for_window(meta.context_window)
                 .view_chars(&loom_core::estimate::TokenEstimator::default()),
+            shell: Arc::new(loom_tools::bash::ShellState::default()),
         };
         // The mission journal is shared by the lead and all its children; a child is always bound to
         // it, so that it has explicit access to the mission state.
@@ -3830,16 +4158,19 @@ impl Inner {
         if !role.tools.iter().any(|t| matches!(t.as_str(), "note" | "claim" | "evidence")) {
             agents.stall_steps = 0;
         }
-        let shared = Arc::new(Shared::new(
-            id.clone(),
-            Some(meta.mission.clone()),
-            meta.parent.clone(),
-            role,
-            journal,
-            self.paths.session_log(id),
-            self.config.agents.clone(),
-            self.orch.clone(),
-        ));
+        let shared = Arc::new(
+            Shared::new(
+                id.clone(),
+                Some(meta.mission.clone()),
+                meta.parent.clone(),
+                role,
+                journal,
+                self.paths.session_log(id),
+                self.config.agents.clone(),
+                self.orch.clone(),
+            )
+            .with_traffic(traffic),
+        );
         let control = Arc::new(Control::new());
         let deps = Deps {
             paths: self.paths.clone(),
@@ -3876,7 +4207,14 @@ impl Inner {
             workspace: deps.ctx.workspace.display().to_string(),
             platform: format!("{} ({})", std::env::consts::OS, std::env::consts::ARCH),
             sandbox: deps.ctx.sandbox.describe(),
-            network: network_text(&self.config),
+            network: targets::network_with_target(network_text(&self.config), meta.target.as_ref()),
+            target: targets::prompt_target(meta),
+            // Read now, once: the record below carries them, and the prompt is rendered from this value.
+            project_instructions: if self.config.agents.project_instructions {
+                pack::read_project_instructions(&deps.ctx.workspace)
+            } else {
+                Vec::new()
+            },
         };
         let replay = deps.reasoning_replay;
         Ok(SessionStart {
@@ -3904,7 +4242,11 @@ impl Inner {
             budget,
             unattended: meta.unattended,
             schema: loom_core::event::SCHEMA,
+            intercept: meta.intercept,
+            target: meta.target.clone(),
             title: meta.title.clone(),
+            project_instructions: env.project_instructions,
+            mcp: Vec::new(),
         })
     }
 
@@ -3912,6 +4254,7 @@ impl Inner {
     /// held by the caller so that the task cannot end before it is recorded.
     fn launch(self: &Arc<Self>, st: &mut State, id: &SessionId, session: Session, parts: Parts) {
         let Parts { control, shared, jobs } = parts;
+        let mcp_shared = shared.clone();
         let gen = self.next_gen.fetch_add(1, Ordering::SeqCst);
         let (inputs, rx) = unbounded_channel();
         let weak = self.me.clone();
@@ -3925,7 +4268,12 @@ impl Inner {
                 if lock(&PANIC_TITLES).contains(&title) {
                     panic!("test hook: this session's task panics");
                 }
-                session.run(rx).await
+                let end = session.run(rx).await;
+                // The session's MCP connections end with it (CONTRACTS-MCP M3).
+                if let Some(m) = mcp_shared.mcp() {
+                    m.close().await;
+                }
+                end
             };
             // A panic must still reach `on_end`, or the session would stay active and its parent
             // would wait for it for ever.
@@ -3975,6 +4323,7 @@ impl Inner {
         }
         let explicit = self.mission_explicit(&meta)?;
         let (deps, parts) = self.build(&meta, explicit)?;
+        self.mcp_attach_recorded(&meta, &deps);
         let session = match Session::open(deps) {
             Ok(s) => s,
             Err(e) => {
@@ -4272,7 +4621,10 @@ impl Inner {
         req.prerequisite =
             rtools::validate_dispatch_prerequisite(&shared, requires_credential, req.prerequisite.as_ref(), now_ms())?;
         if let Some(p) = &req.prerequisite {
-            let header=format!("Dispatch prerequisite checked by Loom: asset {}; credential {}. This observation does not grant network scope or guarantee the credential remains valid.",p.asset,p.credential);
+            let header = format!(
+                "Dispatch prerequisite checked by Loom: asset {}; credential {}. This observation does not grant network scope or guarantee the credential remains valid.",
+                p.asset, p.credential
+            );
             req.brief.context = Some(match req.brief.context.take() {
                 Some(context) => format!("{header}\n\n{context}"),
                 None => header,
@@ -4402,7 +4754,7 @@ impl Inner {
                 .count();
             if !req.harness && running >= self.config.agents.max_children as usize {
                 return Err(format!(
-                    "{running} agents are already running, which is the most allowed at once. Wait for one to finish (`wait`) or stop one (`agent_stop`), then start this one."
+                    "{running} agents are already running, which is the most allowed at once. Wait for one to finish (`job_wait` without `job`) or stop one, then start this one."
                 ));
             }
             let mut fork_point = None;
@@ -4435,6 +4787,8 @@ impl Inner {
                 // Choices are the lead's, for the mission; an agent has none of its own.
                 role_models: BTreeMap::new(),
                 mission: p.meta.mission.clone(),
+                // Fixed for the mission (I1): children inherit it.
+                intercept: p.meta.intercept,
                 parent: Some(parent.clone()),
                 workspace,
                 copy_of,
@@ -4451,6 +4805,7 @@ impl Inner {
                 archived: false,
                 gate: req.harness.then(|| req.brief.clone()),
                 prior: Vec::new(),
+                target: p.meta.target.clone(),
             };
             let explicit = prole.termination == Termination::Explicit;
             st.known.insert(child_id.clone(), Known::new(meta.clone(), idle_status()));
@@ -4495,6 +4850,7 @@ impl Inner {
                 return Err(e);
             }
         };
+        let mcp = self.mcp_attach_new(&meta, &deps).await;
         let created = match fork_point {
             Some(upto) => {
                 let tools: Vec<String> = crole.tools.iter().filter(|t| t.as_str() != "hand_off").cloned().collect();
@@ -4516,7 +4872,10 @@ impl Inner {
                     },
                 )
             }
-            None => match self.start_record(&meta, &deps, req.budget.clone()) {
+            None => match self.start_record(&meta, &deps, req.budget.clone()).map(|mut s| {
+                s.mcp = mcp;
+                s
+            }) {
                 Ok(start) => Session::create(deps, start, Some((parent.clone(), render_brief(&req.brief)))),
                 Err(e) => Err(e),
             },
@@ -5092,8 +5451,7 @@ pub const LOW_DISK_BYTES: u64 = 5 << 30;
 pub const LOW_DISK_PERCENT: u64 = 5;
 
 /// What the low-disk notification says.
-const LOW_DISK_NOTICE: &str =
-    "The disk that holds the loom home is nearly full, so sessions will fail when it fills. Free space, or run `loom gc`.";
+const LOW_DISK_NOTICE: &str = "The disk that holds the loom home is nearly full, so sessions will fail when it fills. Free space, or run `loom gc`.";
 
 /// How often the disk is checked.
 #[cfg(not(test))]
@@ -5384,6 +5742,7 @@ impl Runtime {
         };
         let (bus, _) = broadcast::channel(BUS_CAPACITY);
         let (net_tx, mut net_rx) = unbounded_channel();
+        let (capture_tx, mut capture_rx) = unbounded_channel::<(SessionId, loom_net::Captured)>();
         let audit = net_audit(paths.clone(), bus.clone());
         let proxy = Proxy::start_with(config.daemon.proxy_port, net_tx, Some(audit), Default::default())
             .await
@@ -5428,6 +5787,9 @@ impl Runtime {
             floor: crate::floor::Floor::new(floor_policy),
             monitor,
             box_counters_failed: Mutex::new(BTreeSet::new()),
+            capture_tx,
+            traffic: Mutex::new(HashMap::new()),
+            mission_traffic: Mutex::new(HashMap::new()),
         });
 
         let weak = Arc::downgrade(&inner);
@@ -5440,6 +5802,16 @@ impl Runtime {
             }
         });
         inner.st().tasks.push(forwarder);
+        let weak = Arc::downgrade(&inner);
+        let captures = tokio::spawn(async move {
+            while let Some((session, captured)) = capture_rx.recv().await {
+                match weak.upgrade() {
+                    Some(inner) => inner.ingest_capture(&session, captured),
+                    None => return,
+                }
+            }
+        });
+        inner.st().tasks.push(captures);
         // Not under test: whether the disk of the machine that runs the tests is low must not change them.
         #[cfg(not(test))]
         {
@@ -5792,6 +6164,30 @@ impl Runtime {
         self.inner.record_egress(Some(report));
     }
 
+    /// The image `blob` (a full blob id) when a record of some session names it in an `images` list: what
+    /// `GET /api/images/{blob}` may serve. Reads the logs of the known sessions for lines that contain the id;
+    /// nothing is cached, because the browser caches the answer. `None` for anything else.
+    pub fn image_named(&self, blob: &str) -> Option<loom_core::ImageRef> {
+        if blob.len() != 64 || !blob.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+            return None;
+        }
+        let ids: Vec<SessionId> = self.inner.st().known.keys().cloned().collect();
+        let needle = format!("\"{blob}\"");
+        for id in ids {
+            let Ok(file) = std::fs::File::open(self.inner.paths.session_log(&id)) else { continue };
+            for line in std::io::BufRead::lines(std::io::BufReader::new(file)).map_while(Result::ok) {
+                if !line.contains(&needle) {
+                    continue;
+                }
+                let Ok(value) = serde_json::from_str::<Value>(&line) else { continue };
+                if let Some(image) = find_image(&value, blob) {
+                    return Some(image);
+                }
+            }
+        }
+        None
+    }
+
     /// Port of the egress proxy on 127.0.0.1.
     pub fn proxy_port(&self) -> u16 {
         self.inner.proxy.port()
@@ -5812,6 +6208,14 @@ impl Runtime {
         inner.check_open()?;
         // Checked before anything else; the folder itself is made only once the rest of the request is accepted.
         let plan = plan_workspace(&inner.paths, &new.workspace, new.create_workspace)?;
+        if !new.attachments.is_empty() {
+            // A workspace that is yet to be made holds no uploads.
+            let root = match &plan {
+                WorkspacePlan::Existing(p) => p.as_path(),
+                WorkspacePlan::Create { path, .. } => path.as_path(),
+            };
+            attached_files(root, &new.attachments)?;
+        }
         let role = inner.packs.role(new.pack.as_deref(), new.role.as_deref())?.clone();
         inner.check_network(&role.pack)?;
         let profile_name = inner.models().resolve(new.model.as_deref().or(role.model.as_deref()))?;
@@ -5829,6 +6233,8 @@ impl Runtime {
                 check_role_choice(&role, &profile_name, &models, r, p)?;
             }
         }
+        // The target is read once, here: the lead records it (scope and summary) and the agents inherit it.
+        let target = inner.target_ref(new.target.as_deref())?;
         let (model, window, from_config) = inner.facts(&profile_name).await?;
         // The earlier missions to recall can refuse the request too, so they are read before the folder is made.
         let (prior_ids, recalled) = self.recall_earlier(&new.prior).await?;
@@ -5852,6 +6258,7 @@ impl Runtime {
             let meta = SessionMeta {
                 id: id.clone(),
                 mission: MissionId::generate(),
+                intercept: decide_intercept(&inner.config.network.intercept, role.intercept, new.intercept),
                 parent: None,
                 workspace: workspace.display().to_string(),
                 copy_of: None,
@@ -5869,6 +6276,7 @@ impl Runtime {
                 gate: None,
                 prior: prior_ids,
                 role_models,
+                target,
             };
             inner.st().known.insert(id.clone(), Known::new(meta.clone(), idle_status()));
             (made, workspace, created, id, meta)
@@ -5898,8 +6306,12 @@ impl Runtime {
                 return Err(e);
             }
         };
+        let mcp = inner.mcp_attach_new(&meta, &deps).await;
         let start = match inner.start_record(&meta, &deps, new.budget.clone()) {
-            Ok(s) => s,
+            Ok(mut s) => {
+                s.mcp = mcp;
+                s
+            }
             Err(e) => {
                 forget(inner);
                 return Err(e);
@@ -5940,8 +6352,9 @@ impl Runtime {
         };
         let info = info.ok_or_else(|| no_session(&id))?;
         inner.publish(BusEvent::Session { info: Box::new(info) });
-        if let Some(message) = new.message.as_deref().filter(|m| !m.trim().is_empty()) {
-            self.send_message(&id, message).await?;
+        let message = new.message.as_deref().filter(|m| !m.trim().is_empty());
+        if message.is_some() || !new.attachments.is_empty() {
+            self.send_message_with(&id, message.unwrap_or(""), &new.attachments).await?;
         }
         self.session(&id).map(|info| (info, created)).ok_or_else(|| no_session(&id))
     }
@@ -5996,9 +6409,19 @@ impl Runtime {
     }
 
     pub fn sessions(&self, include_archived: bool) -> Vec<SessionInfo> {
-        let st = self.inner.st();
-        let mut out: Vec<SessionInfo> =
-            st.known.values().filter(|k| include_archived || !k.meta.archived).map(Inner::info_of).collect();
+        let mut out: Vec<SessionInfo> = {
+            let st = self.inner.st();
+            st.known.values().filter(|k| include_archived || !k.meta.archived).map(Inner::info_of).collect()
+        };
+        // One stat per session, outside the lock: the log's modification time is its latest record's.
+        for info in &mut out {
+            let log = self.inner.paths.session_dir(&info.meta.id).join("log.jsonl");
+            info.last_ms = std::fs::metadata(&log)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        }
         out.sort_by(|a, b| b.meta.created_ms.cmp(&a.meta.created_ms).then_with(|| b.meta.id.cmp(&a.meta.id)));
         out
     }
@@ -6033,20 +6456,138 @@ impl Runtime {
     }
 
     pub async fn send_message(&self, id: &SessionId, text: &str) -> Result<(), String> {
+        self.send_message_with(id, text, &[]).await
+    }
+
+    /// [`Runtime::send_message`] with uploads of the session's workspace attached.
+    pub async fn send_message_with(&self, id: &SessionId, text: &str, attachments: &[String]) -> Result<(), String> {
         let meta = self.operable(id, Some("message"))?;
-        if text.trim().is_empty() {
+        if text.trim().is_empty() && attachments.is_empty() {
             return Err("Write a message to send.".to_string());
         }
         if meta.archived {
             return Err("This session is archived; unarchive it first.".to_string());
         }
+        let files = attached_files(Path::new(&meta.workspace), attachments)?;
+        let composed;
+        let text = if files.is_empty() {
+            text
+        } else {
+            composed = texts::with_attachments(text, &files);
+            composed.as_str()
+        };
         self.inner.activate(id)?;
         self.inner.box_reopen_for(id);
-        if !self.inner.send_input(id, Input::User(text.to_string())) {
+        let images = stored_images(&self.inner.blobs, &files, self.inner.config.tools.max_image_bytes);
+        let input = if images.is_empty() {
+            Input::User(text.to_string())
+        } else {
+            Input::UserImages { text: text.to_string(), images }
+        };
+        if !self.inner.send_input(id, input) {
             return Err(format!("Session {} is not accepting input.", id.as_str()));
         }
         // The lead works again, so its agents do: after a restart its turn starts with a note
         // saying they were resumed.
+        self.inner.resume_cut_children(id);
+        Ok(())
+    }
+
+    /// Send a message after the lead's current turn ends (`when: "after_turn"`). When the lead is idle this
+    /// is `send_message_with` and the answer is `None`. Otherwise the message is validated as `send_message_with`
+    /// does (so an attachment that is not an upload is refused now), kept on disk in the session's `queued/`
+    /// directory and answered with its [`QueuedMessage`]; the lead records it, in the order queued, as
+    /// `user_message`s when the turn ends and starts the next turn with the first (the rest arrive with it).
+    /// A turn that ends `Stopped` sends none: they stay queued until the operator messages or resumes the
+    /// lead, and survive a daemon restart.
+    pub async fn queue_message(
+        &self,
+        id: &SessionId,
+        text: &str,
+        attachments: &[String],
+    ) -> Result<Option<QueuedMessage>, String> {
+        let meta = self.operable(id, Some("message"))?;
+        let running = self.inner.st().known.get(id).is_some_and(|k| k.status.phase == Phase::Running);
+        if !running {
+            return self.send_message_with(id, text, attachments).await.map(|()| None);
+        }
+        if text.trim().is_empty() && attachments.is_empty() {
+            return Err("Write a message to send.".to_string());
+        }
+        if meta.archived {
+            return Err("This session is archived; unarchive it first.".to_string());
+        }
+        let files = attached_files(Path::new(&meta.workspace), attachments)?;
+        let composed = texts::with_attachments(text, &files);
+        self.inner.activate(id)?;
+        // Images are stored now, as a message sent at once stores them, so the queued one carries them.
+        let images = stored_images(&self.inner.blobs, &files, self.inner.config.tools.max_image_bytes);
+        let message = queue_user_message(&self.inner.paths, id, text, attachments, &composed, &images)?;
+        // The turn may have ended since the phase was read: the session looks at its queue again.
+        if !self.inner.send_input(id, Input::DrainQueued) {
+            let _ = take_queued_message(&self.inner.paths, id, &message.id);
+            return Err(format!("Session {} is not accepting input.", id.as_str()));
+        }
+        self.inner.publish(BusEvent::Queued { session: id.clone() });
+        Ok(Some(message))
+    }
+
+    /// The messages queued for the lead `id`, oldest first (`queue_message`).
+    pub fn queued(&self, id: &SessionId) -> Result<Vec<QueuedMessage>, String> {
+        self.operable(id, Some("message"))?;
+        Ok(queued_messages(&self.inner.paths, id))
+    }
+
+    /// Replace the text of queued message `qid`; its attachments stay. `There is no queued message {qid}`
+    /// when it was sent or removed meanwhile.
+    pub async fn edit_queued(&self, id: &SessionId, qid: &str, text: &str) -> Result<QueuedMessage, String> {
+        let meta = self.operable(id, Some("message"))?;
+        let current = queued_messages(&self.inner.paths, id)
+            .into_iter()
+            .find(|m| m.id == qid)
+            .ok_or_else(|| format!("There is no queued message {qid}; it may have just been sent."))?;
+        if text.trim().is_empty() && current.attachments.is_empty() {
+            return Err("Write a message to send.".to_string());
+        }
+        let files = attached_files(Path::new(&meta.workspace), &current.attachments)?;
+        let composed = texts::with_attachments(text, &files);
+        let message = edit_queued_message(&self.inner.paths, id, qid, text, &composed)?;
+        self.inner.publish(BusEvent::Queued { session: id.clone() });
+        Ok(message)
+    }
+
+    /// Remove queued message `qid` without sending it.
+    pub async fn remove_queued(&self, id: &SessionId, qid: &str) -> Result<(), String> {
+        self.operable(id, Some("message"))?;
+        take_queued_message(&self.inner.paths, id, qid)?;
+        self.inner.publish(BusEvent::Queued { session: id.clone() });
+        Ok(())
+    }
+
+    /// Send queued message `qid` now, as a message sent to a running lead is (at its next step; a turn
+    /// when it is idle), and take it off the queue.
+    pub async fn send_queued_now(&self, id: &SessionId, qid: &str) -> Result<(), String> {
+        let meta = self.operable(id, Some("message"))?;
+        if meta.archived {
+            return Err("This session is archived; unarchive it first.".to_string());
+        }
+        let (message, input) = take_queued_message(&self.inner.paths, id, qid)?;
+        self.inner.publish(BusEvent::Queued { session: id.clone() });
+        let (composed, images) = match &input {
+            Input::UserImages { text, images } => (text.clone(), images.clone()),
+            Input::User(text) => (text.clone(), Vec::new()),
+            _ => (message.text.clone(), Vec::new()),
+        };
+        let sent = self.inner.activate(id).is_ok() && {
+            self.inner.box_reopen_for(id);
+            self.inner.send_input(id, input)
+        };
+        if !sent {
+            // Not lost: it goes back on the queue (at the end).
+            let _ = queue_user_message(&self.inner.paths, id, &message.text, &message.attachments, &composed, &images);
+            self.inner.publish(BusEvent::Queued { session: id.clone() });
+            return Err(format!("Session {} is not accepting input.", id.as_str()));
+        }
         self.inner.resume_cut_children(id);
         Ok(())
     }
@@ -6887,14 +7428,14 @@ impl Runtime {
         Ok(())
     }
 
-    pub async fn reweave(&self, id: &SessionId) -> Result<(), String> {
+    pub async fn compact(&self, id: &SessionId) -> Result<(), String> {
         self.inner.check_open()?;
         if !self.inner.st().known.contains_key(id) {
             return Err(no_session(id));
         }
         self.inner.activate(id)?;
         self.inner.box_reopen_for(id);
-        self.inner.send_input(id, Input::Reweave);
+        self.inner.send_input(id, Input::Compact);
         Ok(())
     }
 
@@ -6946,6 +7487,10 @@ impl Runtime {
             let ids = family.clone();
             let leftovers = tokio::spawn(async move { inner.stop_leftovers(&ids).await });
             self.inner.st().tasks.push(leftovers);
+            // Messages queued for after a turn are not sent to an archived session.
+            if discard_queued_messages(&self.inner.paths, id) > 0 {
+                self.inner.publish(BusEvent::Queued { session: id.clone() });
+            }
             // The operator is done with this mission, so its open inbox items stop waiting: they are
             // dropped from the index and stop notifying (the repeat notice ends when the item leaves the
             // index). Archived sessions are not activated at the next start, so the items do not come
@@ -7162,10 +7707,10 @@ impl Runtime {
 
     pub fn window(&self, id: &SessionId) -> Result<WindowView, String> {
         self.inner.check_open()?;
-        let (context_window, status, profile) = {
+        let (context_window, status) = {
             let st = self.inner.st();
             let k = st.known.get(id).ok_or_else(|| no_session(id))?;
-            (k.meta.context_window, k.status.clone(), k.meta.profile.clone())
+            (k.meta.context_window, k.status.clone())
         };
         let records = read_records(&self.inner.paths.session_log(id)).map_err(|e| e.to_string())?.records;
         let w = weave(&records);
@@ -7186,23 +7731,21 @@ impl Runtime {
             measured_now,
             &estimator,
         );
-        let max_output = self.inner.models().get(&profile).and_then(|p| p.client.profile().max_output_tokens);
-        let policy = &self.inner.config.context;
-        let (fold_at, fold_to) = crate::session::reweave_bounds(policy, context_window, max_output);
+        let compact_at = self.inner.config.context.compact_at(context_window);
         Ok(WindowView {
             epoch: w.epoch,
             items: w.items,
             est_tokens,
-            target_tokens: policy.target_tokens,
-            floor_tokens: policy.floor_tokens,
+            target_tokens: compact_at,
+            floor_tokens: 0,
             context_window,
             prompt_tokens: status.prompt_tokens,
             cached_tokens: status.cached_tokens,
             breakdown,
             measured_now,
             last_request,
-            fold_at: Some(fold_at),
-            fold_to: Some(fold_to),
+            fold_at: Some(compact_at),
+            fold_to: None,
         })
     }
 
@@ -7291,6 +7834,151 @@ impl Runtime {
         Ok(ScoreView { mission, sessions: scored, total })
     }
 
+    /// The MCP servers of a session: its tools from each, the state of its connection (CONTRACTS-MCP M7).
+    pub fn mcp_views(&self, id: &SessionId) -> Result<Vec<crate::mcp::McpServerView>, String> {
+        self.inner.check_open()?;
+        let (meta, shared) = {
+            let st = self.inner.st();
+            let k = st.known.get(id).ok_or_else(|| no_session(id))?;
+            (k.meta.clone(), k.active.as_ref().map(|a| a.shared.clone()))
+        };
+        if let Some(m) = shared.as_ref().and_then(|s| s.mcp()) {
+            return Ok(crate::mcp::views(m));
+        }
+        // Not running: what its record says, with no connection.
+        let cfg = &self.inner.config.mcp;
+        if cfg.servers.is_empty() {
+            return Ok(Vec::new());
+        }
+        let listings = recorded_mcp(&self.inner.paths.session_log(id));
+        let role = self.inner.packs.role(Some(&meta.pack), Some(&meta.role))?;
+        let plan = crate::mcp::McpSession::plan(cfg, &role.name, role.read_only, listings, BTreeMap::new());
+        Ok(crate::mcp::views(&plan))
+    }
+
+    /// The configured servers, for `loom mcp list`.
+    pub fn mcp_configured(&self) -> Vec<crate::mcp::McpConfigured> {
+        crate::mcp::configured(&self.inner.config.mcp)
+    }
+
+    /// Start `server` in a scratch sandbox for `workspace` (the rules of a session: egress proxy,
+    /// policy, sandbox), list its tools and close it (CONTRACTS-MCP M7).
+    pub async fn mcp_check(&self, server: &str, workspace: &Path) -> Result<crate::mcp::McpCheckView, String> {
+        self.inner.check_open()?;
+        let cfg = &self.inner.config;
+        let scfg = cfg
+            .mcp
+            .servers
+            .get(server)
+            .ok_or_else(|| format!("There is no MCP server \"{server}\" in the configuration."))?;
+        let workspace = match plan_workspace(&self.inner.paths, workspace, false)? {
+            WorkspacePlan::Existing(p) => p,
+            WorkspacePlan::Create { path, .. } => {
+                return Err(format!("The workspace {} does not exist.", path.display()));
+            }
+        };
+        let resolved = loom_tools::mcp::McpServer::resolve(server, scfg)?;
+        let transport = resolved.transport().to_string();
+        let role = self.inner.packs.role(None, None)?.clone();
+        let id = SessionId::from(format!("mcp-check-{}", SessionId::generate().as_str()));
+        let tmp = self.inner.paths.session_tmp(&id);
+        loom_core::config::ensure_private_dir(&tmp).map_err(|e| format!("cannot create {}: {e}", tmp.display()))?;
+        let tmp = std::fs::canonicalize(&tmp).map_err(|e| format!("cannot resolve {}: {e}", tmp.display()))?;
+        let result = self.mcp_check_in(&id, &role, resolved, scfg, &workspace, &tmp).await;
+        self.inner.proxy.revoke(&id);
+        let _ = std::fs::remove_dir_all(self.inner.paths.session_dir(&id));
+        let (listing, stderr_tail) = result?;
+        let mut view =
+            crate::mcp::McpCheckView { server: server.to_string(), transport, stderr_tail, ..Default::default() };
+        match listing {
+            Ok(l) => {
+                view.protocol = l.protocol;
+                view.server_name = l.server_name;
+                view.server_version = l.server_version;
+                view.tools = l
+                    .tools
+                    .into_iter()
+                    .map(|t| crate::mcp::McpCheckTool {
+                        name: t.name,
+                        description: t.description,
+                        read_only_hint: t.read_only_hint,
+                    })
+                    .collect();
+            }
+            Err(e) => view.error = Some(e),
+        }
+        Ok(view)
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    async fn mcp_check_in(
+        &self,
+        id: &SessionId,
+        role: &RoleDef,
+        resolved: loom_tools::mcp::McpServer,
+        scfg: &loom_core::config::McpServerCfg,
+        workspace: &Path,
+        tmp: &Path,
+    ) -> Result<(Result<loom_core::event::McpListing, String>, Vec<String>), String> {
+        let cfg = &self.inner.config;
+        // The profiles every session's sandbox withholds (E1): the live set, the start-up one and those a reload made
+        // live since the start.
+        let sandbox_cfg = sandbox_cfg_for(&cfg.sandbox, role, workspace, &self.inner.infra_config().models);
+        let bubblewrap = sandbox_cfg.mode == loom_core::config::SandboxMode::Bubblewrap;
+        if bubblewrap && cfg.network.mode != loom_core::config::NetworkMode::DenyAll {
+            return Err("Bubblewrap requires network.mode = deny_all. Explicit mission grants apply only to trusted in-process HTTP tools; subprocess proxy bridges are unsupported.".into());
+        }
+        let hosts: Vec<String> = scfg.hosts.clone();
+        let policy = match Policy::with_hosts(&cfg.network, &hosts) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("the hosts of an MCP server do not make a policy ({e}); the check runs without them");
+                Policy::new(&cfg.network)?
+            }
+        };
+        // The infrastructure every session's policy refuses (E1) is refused to the check as well.
+        let policy =
+            policy.with_infrastructure(&infra_spec_resolved(&self.inner.infra_config(), &self.inner.infra()))?;
+        let grant = self
+            .inner
+            .proxy
+            .grant(id, policy)
+            .map_err(|e| format!("The egress proxy cannot open a port for this check: {e}"))?;
+        let sandbox =
+            Sandbox::new(&sandbox_cfg, workspace, tmp, &self.inner.paths.home, (!bubblewrap).then_some(grant.port))
+                .map_err(|e| format!("The sandbox for this check cannot be set up: {e}"))?;
+        let jobs_dir = tmp.join("jobs");
+        let (events_tx, _events) = unbounded_channel();
+        let jobs = Arc::new(JobTable::new(jobs_dir, self.inner.blobs.clone(), events_tx, cfg.tools.max_output_bytes));
+        let pack = self.inner.packs.get("core").ok_or_else(|| "Pack core is not loaded.".to_string())?;
+        let ctx = ToolCtx {
+            session: id.clone(),
+            call_id: CallId::from(""),
+            workspace: workspace.to_path_buf(),
+            tmp_dir: tmp.to_path_buf(),
+            blobs: self.inner.blobs.clone(),
+            outputs: Arc::new(MissionOutputs { runtime: self.inner.me.clone(), mission: MissionId::generate() }),
+            cfg: Arc::new(cfg.tools.clone()),
+            sandbox: Arc::new(sandbox),
+            env: Arc::new(grant.env()),
+            reference_proxy: None,
+            files: Arc::new(loom_tools::files::FileTracker::new()),
+            jobs,
+            cancel: CancellationToken::new(),
+            capabilities: Arc::new(loom_tools::capabilities::SessionTools::new(
+                pack.command_guard,
+                pack.target_concurrency,
+            )),
+            view_chars: cfg.admit.for_window(None).view_chars(&loom_core::estimate::TokenEstimator::default()),
+            shell: Arc::new(loom_tools::bash::ShellState::default()),
+        };
+        let handle = loom_tools::mcp::McpHandle::new(resolved, std::time::Duration::from_secs(cfg.mcp.idle_close_s));
+        let listing = handle.list(&ctx).await;
+        let tail = handle.status().stderr_tail;
+        handle.close().await;
+        Ok((listing, tail))
+    }
+
     pub fn net(&self, id: &SessionId, limit: usize) -> Result<Vec<NetEntry>, String> {
         self.inner.check_open()?;
         if !self.inner.st().known.contains_key(id) {
@@ -7347,6 +8035,7 @@ impl Runtime {
                 },
                 context_window: window,
                 max_concurrent: rt.limiter.capacity(),
+                vision: profile.vision,
             });
         }
         out
@@ -7697,6 +8386,8 @@ mod tests {
 
     fn config_for(server: &MockServer, notify_file: Option<&Path>) -> Config {
         let mut c = Config::default();
+        // These tests do not look at traffic; `0` keeps the plain relay path.
+        c.network.capture_max_exchanges = 0;
         c.models.clear();
         c.models.insert(
             "mock".into(),
@@ -7730,7 +8421,9 @@ mod tests {
     fn plain_core_pack(packs: &Path) {
         let core = packs.join("core");
         std::fs::create_dir_all(core.join("roles")).unwrap();
-        let toml = include_str!("../../../packs/core/pack.toml").replacen("\"request_scope\", \"conclude\", ", "", 1);
+        let toml = include_str!("../../../packs/core/pack.toml")
+            .replacen("\"request_scope\", \"conclude\", ", "", 1)
+            .replace("\"conclude\", ", "");
         assert!(!toml.contains("\"conclude\""), "the lead's tool list changed shape");
         std::fs::write(core.join("pack.toml"), toml).unwrap();
         std::fs::write(core.join("harness.md"), include_str!("../../../packs/core/harness.md")).unwrap();
@@ -7882,6 +8575,7 @@ mod tests {
             class: None,
             preview: String::new(),
             note: None,
+            image_tokens: 0,
         }
     }
 
@@ -7964,13 +8658,14 @@ mod tests {
                 "agent_reports",
                 "notes",
                 "stubs",
+                "images",
                 "other",
                 "framing",
                 "hud"
             ]
         );
         let empty = window_breakdown(&[], (0, 0), 0, 0, 0, None, &est);
-        assert_eq!((empty.total_tokens, empty.segments.len()), (0, 14));
+        assert_eq!((empty.total_tokens, empty.segments.len()), (0, 15));
     }
 
     #[test]
@@ -8026,7 +8721,7 @@ mod tests {
         assert_eq!(w.breakdown.segments.iter().map(|s| s.tokens).sum::<u64>(), w.breakdown.total_tokens);
         assert!(by_key("system").tokens > 0 && by_key("tools").tokens > 0 && by_key("tools").count.unwrap() > 0);
         assert!(w.last_request.as_ref().is_some_and(|r| r.step >= 1 && r.n_messages > 0));
-        assert!(w.fold_at.is_some_and(|at| at > 0) && w.fold_to.is_some_and(|to| to > 0));
+        assert!(w.fold_at.is_some_and(|at| at > 0));
         assert_eq!(e.rt.missions().len(), 1);
         e.rt.shutdown().await;
         assert_eq!(e.rt.send_message(&id, "x").await.unwrap_err(), "The harness is shutting down.");
@@ -8935,6 +9630,83 @@ mod tests {
         assert_eq!(loom_net::netlog::verify(&text), Ok(()));
     }
 
+    fn captured(host: &str) -> loom_net::Captured {
+        loom_net::Captured {
+            ts_ms: now_ms(),
+            transport: loom_net::Transport::Plain,
+            method: "GET".into(),
+            host: host.into(),
+            port: 80,
+            target: "/a?b=1".into(),
+            status: Some(200),
+            error: None,
+            request: b"GET /a?b=1 HTTP/1.1\r\nHost: x\r\n\r\n".to_vec(),
+            response: Some(b"HTTP/1.1 200 OK\r\n\r\nhi".to_vec()),
+            request_bytes: 30,
+            response_bytes: 24,
+            truncated: false,
+            upstream_unverified: false,
+            duration_ms: 3,
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "needs CONTRACTS-TRAFFIC-TARGETS I4 (merged separately)"]
+    async fn a_captured_exchange_reaches_the_session_log_with_its_blobs_and_survives_a_reopen() {
+        let e = env_with(Script::new(|_, _| finish("ok")), false, |c| c.network.capture_max_exchanges = 1000).await;
+        let info = e.rt.create_session(e.new_session(Some("cap"))).await.unwrap();
+        let id = info.meta.id.clone();
+        until("turn end", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { .. }))).await;
+        e.rt.inner.capture_tx.send((id.clone(), captured("one.test"))).unwrap();
+        until("exchange", || e.has(&id, |ev| matches!(ev, Event::Exchange(x) if x.host == "one.test"))).await;
+        let log = std::fs::read_to_string(e.rt.paths().session_log(&id)).unwrap();
+        let line = log.lines().find(|l| l.contains("\"one.test\"") && l.contains("\"exchange\"")).expect("record");
+        let rec: serde_json::Value = serde_json::from_str(line).unwrap();
+        eprintln!("{rec}");
+        let x = &rec["event"];
+        assert_eq!(x["source"], "proxy");
+        assert_eq!(x["tls"], "plain");
+        assert!(x["id"].as_str().unwrap().starts_with("ex-"));
+        assert!(x["call_id"].is_null(), "no call was running: {x}");
+        let req = x["request"]["id"].as_str().unwrap();
+        let bytes = e.rt.inner.blobs.read_all(&loom_core::BlobId::from(req)).unwrap();
+        assert!(bytes.starts_with(b"GET /a?b=1"));
+        e.rt.shutdown().await;
+    }
+
+    #[test]
+    fn the_intercept_switch_follows_the_config_the_pack_and_the_mission_override() {
+        use loom_core::config::InterceptMode::{Always, Never, Pack};
+        assert!(decide_intercept(&Pack, true, None));
+        assert!(!decide_intercept(&Pack, false, None));
+        assert!(!decide_intercept(&Pack, true, Some(false)));
+        assert!(decide_intercept(&Pack, false, Some(true)));
+        assert!(decide_intercept(&Always, false, Some(false)));
+        assert!(!decide_intercept(&Never, true, Some(true)));
+    }
+
+    #[test]
+    fn the_security_packs_intercept_and_others_do_not() {
+        let packs = Packs::load(std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../packs"))).unwrap();
+        for (pack, role) in [("ctf", "dispatcher"), ("redteam", "commander"), ("vr", "researcher")] {
+            let r = packs.role(Some(pack), Some(role)).unwrap();
+            assert!(r.intercept, "{pack}");
+            assert!(r.require_traffic, "{pack}/{role}");
+        }
+        assert!(!packs.role(None, Some("lead")).unwrap().intercept);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs CONTRACTS-TRAFFIC-TARGETS I4 (merged separately)"]
+    async fn an_intercepting_mission_records_it_in_session_start_hands_children_the_bundle_and_stays_in_the_tmp_dir() {
+        let mut e = env(Script::new(|_, _| finish("ok"))).await;
+        e.config.network.intercept = loom_core::config::InterceptMode::Always;
+        let info = e.rt.create_session(e.new_session(Some("i"))).await.unwrap();
+        assert!(info.meta.intercept);
+        let tmp = e.rt.paths().session_tmp(&info.meta.id);
+        assert!(tmp.join("ca-bundle.pem").exists());
+    }
+
     /// Standard base64, for a Basic credential in a test.
     fn base64(s: &str) -> String {
         const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -9069,51 +9841,6 @@ mod tests {
         assert!(hud.contains("CONSTRAINTMARK"), "the child's state block lacks the mission constraints: {hud}");
         e.rt.shutdown().await;
     }
-
-    #[tokio::test]
-    async fn the_stall_note_goes_to_a_child_that_can_record_and_not_to_a_verifier() {
-        let script = Script::new(|body, _| {
-            if !has_tool(body, "agent_spawn") && tool_msgs(body) < 4 {
-                call("ledger", json!({}))
-            } else {
-                Action::Stall { ms: 600_000 }
-            }
-        });
-        let e = env_with(script, false, |c| c.agents.stall_steps = 2).await;
-        let id = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
-        until("request", || !e.server.requests().is_empty()).await;
-        let req = |role: &str| SpawnReq {
-            role: role.into(),
-            mode: SpawnMode::Fresh,
-            brief: Default::default(),
-            budget: Budget::default(),
-            call_id: CallId::from("c1"),
-            title: role.into(),
-            awaited: false,
-            harness: false,
-            prerequisite: None,
-            workspace: Workspace::Shared,
-        };
-        let worker = e.rt.inner.orch.spawn(&id, req("worker")).await.unwrap();
-        let verifier = e.rt.inner.orch.spawn(&id, req("verifier")).await.unwrap();
-        let steps = |c: &SessionId| e.records(c).iter().filter(|r| matches!(r.event, Event::ModelRequest(_))).count();
-        until("five steps each", || steps(&worker) >= 5 && steps(&verifier) >= 5).await;
-        let stall_notes = |c: &SessionId| -> Vec<String> {
-            e.records(c)
-                .into_iter()
-                .filter_map(|r| match r.event {
-                    Event::HarnessNote { note: loom_core::event::NoteKind::Stall, text } => Some(text),
-                    _ => None,
-                })
-                .collect()
-        };
-        // Both share the journal, so both are watched; only the one with `note` is asked to use it.
-        let given = stall_notes(&worker);
-        assert!(!given.is_empty() && given.iter().all(|t| *t == texts::stall(2)), "{given:?}");
-        assert!(stall_notes(&verifier).is_empty(), "{:?}", stall_notes(&verifier));
-        e.rt.shutdown().await;
-    }
-
     #[tokio::test]
     async fn fork_child_starts_with_the_parents_messages() {
         let e = env(Script::new(|body, _| {
@@ -9269,7 +9996,9 @@ mod tests {
         assert!(e.rt.inner.orch.spawn(&parent, request(None)).await.unwrap_err().contains("requires explicit"));
         assert!(e.children(&parent).is_empty());
         let shared = e.rt.inner.st().known.get(&parent).unwrap().active.as_ref().unwrap().shared.clone();
-        shared.ledger_append(false, LedgerOp::ClaimAdd { text: "credential observed".into() }).unwrap();
+        shared
+            .ledger_append(false, LedgerOp::ClaimAdd { text: "credential observed".into(), assets: Vec::new() })
+            .unwrap();
         shared
             .ledger_append(
                 false,
@@ -9487,11 +10216,19 @@ mod tests {
     async fn rejected_finish_with_real_children_starts_the_lead_afresh_on_what_the_check_found() {
         let e = env_with(
             Script::new(move |body, _| {
+                if body["messages"]
+                    .as_array()
+                    .and_then(|m| m.last())
+                    .and_then(|l| l["content"].as_str())
+                    .is_some_and(|c| c.starts_with(texts::COMPACT_PROMPT))
+                {
+                    return Action::Reply(Reply::text("NOTEMARK: the check found that no test ran."));
+                }
                 if has_tool(body, "verdict") {
                     return verifier_turn(body, false);
                 }
                 // The lead works, gives up in a finish, and, started afresh, goes on working.
-                if mentions(body, "What the check found") {
+                if mentions(body, "Context was compacted") {
                     return Action::Stall { ms: 600_000 };
                 }
                 match tool_msgs(body) {
@@ -9512,18 +10249,19 @@ mod tests {
         .await;
         let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
         let id = info.meta.id.clone();
-        let afresh = |b: &Value| has_tool(b, "finish") && mentions(b, "What the check found");
+        let afresh = |b: &Value| has_tool(b, "finish") && mentions(b, "Context was compacted");
         until("the lead was started afresh", || e.server.requests().iter().any(afresh)).await;
         let request = e.server.requests().into_iter().find(afresh).unwrap();
-        // What the check found is there, as a brief; the run the lead made is still in view.
+        // What the check found is there, in the note and in the ledger's obligation; the run the lead made is
+        // a row of the key table.
+        assert!(mentions(&request, "NOTEMARK"), "{request}");
         assert!(mentions(&request, "no test ran"), "{request}");
-        assert!(mentions(&request, "treat the goal as unsolved"), "{request}");
         assert!(mentions(&request, "WORKMARK"), "{request}");
         // Nothing of the attempt is: not the call, not its result, not what the lead said or thought around it.
         for gone in ["GIVEUPMARK", "DESPAIRMARK", "PLANMARK", "REASONMARK", "did not accept it"] {
             assert!(!mentions(&request, gone), "{gone} is still in view: {request}");
         }
-        assert_eq!(tool_msgs(&request), 1, "the finish call left the window with its result: {request}");
+        assert_eq!(tool_msgs(&request), 0, "the fresh start keeps no tail: {request}");
         let hud = hud_of(&request);
         assert!(hud.contains("Finish: the check raised an objection"), "{hud}");
         assert!(!hud.contains("GIVEUPMARK") && !hud.contains("reject"), "{hud}");
@@ -9536,18 +10274,17 @@ mod tests {
             &id,
             |ev| matches!(ev, Event::ToolCall(c) if c.name == "finish" && c.args.to_string().contains("GIVEUPMARK"))
         ));
-        let folds: Vec<loom_core::event::Reweave> = e
+        let folds: Vec<loom_core::event::Compaction> = e
             .records(&id)
             .into_iter()
-            .filter_map(|r| if let Event::Reweave(w) = r.event { Some(w) } else { None })
+            .filter_map(|r| if let Event::Compaction(c) = r.event { Some(c) } else { None })
             .collect();
         assert_eq!(folds.len(), 1, "one rejection, one fresh start");
         assert_eq!(folds[0].reason, texts::FRESH_START_REASON);
-        // The brief carries the frontier picture, as a re-weave brief does, and no count of anything refused.
-        assert!(folds[0].brief.contains("ground covered"), "{}", folds[0].brief);
-        assert!(folds[0].brief.contains("Where the work stands:"), "{}", folds[0].brief);
-        assert!(folds[0].brief.contains("a failed attempt rules out that attempt, not the approach"));
-        assert!(folds[0].evictions.iter().any(|x| x.action == loom_core::event::EvictAction::Remove));
+        assert!(folds[0].note.as_deref().is_some_and(|n| n.contains("NOTEMARK")), "{:?}", folds[0].note);
+        assert!(folds[0].objections.as_deref().is_some_and(|o| o.contains("no test ran")), "{:?}", folds[0].objections);
+        assert!(folds[0].table.contains("echo WORKMARK"), "{}", folds[0].table);
+        assert!(folds[0].brief.contains("no test ran"), "{}", folds[0].brief);
         let ledger = e.rt.ledger(&info.meta.mission).unwrap();
         let verdicts: Vec<Option<bool>> = ledger.state.finishes.iter().map(|f| f.accepted).collect();
         assert_eq!(verdicts, vec![Some(false)]);
@@ -9567,10 +10304,18 @@ mod tests {
     async fn a_fresh_start_leaves_no_harness_note_about_the_attempt_in_view() {
         let e = env_with(
             Script::new(move |body, _| {
+                if body["messages"]
+                    .as_array()
+                    .and_then(|m| m.last())
+                    .and_then(|l| l["content"].as_str())
+                    .is_some_and(|c| c.starts_with(texts::COMPACT_PROMPT))
+                {
+                    return Action::Reply(Reply::text("NOTEMARK: the check found that no test ran."));
+                }
                 if has_tool(body, "verdict") {
                     return verifier_turn(body, false);
                 }
-                if mentions(body, "What the check found") {
+                if mentions(body, "Context was compacted") {
                     return Action::Stall { ms: 600_000 };
                 }
                 let replies =
@@ -9587,7 +10332,7 @@ mod tests {
         )
         .await;
         let _info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
-        let afresh = |b: &Value| has_tool(b, "finish") && mentions(b, "What the check found");
+        let afresh = |b: &Value| has_tool(b, "finish") && mentions(b, "Context was compacted");
         until("the lead was started afresh", || e.server.requests().iter().any(afresh)).await;
         // Before the fold the note was in view.
         let before = e.server.requests().into_iter().find(|b| mentions(b, "WORKMARK") && !afresh(b)).unwrap();
@@ -9604,14 +10349,22 @@ mod tests {
     async fn a_fresh_start_keeps_what_was_delivered_and_leaves_the_attempt_reachable() {
         let e = env_with(
             Script::new(move |body, _| {
+                if body["messages"]
+                    .as_array()
+                    .and_then(|m| m.last())
+                    .and_then(|l| l["content"].as_str())
+                    .is_some_and(|c| c.starts_with(texts::COMPACT_PROMPT))
+                {
+                    return Action::Reply(Reply::text("NOTEMARK: the check found that no test ran."));
+                }
                 if has_tool(body, "verdict") {
                     // The first result is accepted, the one after it is not.
                     return verifier_turn(body, !mentions(body, "SECONDANSWER"));
                 }
-                if mentions(body, "What the check found") {
+                if mentions(body, "Context was compacted") {
                     // Started afresh, the lead looks its attempt up in the record, then works on.
                     return match tool_msgs(body) {
-                        1 => call("log_search", json!({"pattern": "SECONDANSWER", "in": "calls"})),
+                        0 => call("log_search", json!({"pattern": "SECONDANSWER", "in": "calls"})),
                         _ => Action::Stall { ms: 600_000 },
                     };
                 }
@@ -9629,22 +10382,22 @@ mod tests {
         let id = info.meta.id.clone();
         until("the first result was delivered", || inbox_kinds(&e).contains(&InboxKind::Finished)).await;
         e.rt.send_message(&id, "MOREMARK: now the second part").await.unwrap();
-        let afresh = |b: &Value| has_tool(b, "finish") && mentions(b, "What the check found");
+        let afresh = |b: &Value| has_tool(b, "finish") && mentions(b, "Context was compacted");
         until("the lead was started afresh", || e.server.requests().iter().any(afresh)).await;
         let request = e.server.requests().into_iter().find(afresh).unwrap();
-        // The delivered result and its call are not an attempt: they stay. The rejected one is gone.
-        assert!(mentions(&request, "FIRSTANSWER"), "{request}");
+        // The operator's message stays whole; the delivered result and the rejected one are out of view, and
+        // both stay in the record.
         assert!(mentions(&request, "MOREMARK"), "{request}");
         assert!(!mentions(&request, "SECONDANSWER"), "{request}");
         assert!(!mentions(&request, "did not accept it"), "{request}");
-        assert_eq!(tool_msgs(&request), 1, "{request}");
+        assert_eq!(tool_msgs(&request), 0, "{request}");
         // The record still has the attempt: a search of the session finds the call.
         until("the search answered", || {
-            e.server.requests().iter().any(|b| afresh(b) && tool_msgs(b) == 2 && mentions(b, "SECONDANSWER"))
+            e.server.requests().iter().any(|b| afresh(b) && tool_msgs(b) == 1 && mentions(b, "SECONDANSWER"))
         })
         .await;
         let kinds = e.kinds(&id);
-        assert_eq!(kinds.iter().filter(|k| *k == "reweave").count(), 1, "{kinds:?}");
+        assert_eq!(kinds.iter().filter(|k| *k == "compaction").count(), 1, "{kinds:?}");
         assert!(!kinds.iter().any(|k| k == "cache_break"), "a fresh start is a new epoch, not a break: {kinds:?}");
         e.rt.shutdown().await;
     }
@@ -9679,8 +10432,8 @@ mod tests {
                 .any(|b| has_tool(b, "finish") && mentions(b, "did not accept it") && mentions(b, "no test ran"))
         })
         .await;
-        assert!(!e.has(&id, |ev| matches!(ev, Event::Reweave(_))));
-        assert!(e.server.requests().iter().all(|b| !mentions(b, "What the check found")));
+        assert!(!e.has(&id, |ev| matches!(ev, Event::Compaction(_))));
+        assert!(e.server.requests().iter().all(|b| !mentions(b, "Context was compacted")));
         let ledger = e.rt.ledger(&info.meta.mission).unwrap();
         assert_eq!(ledger.state.obligations.len(), 1);
         e.rt.shutdown().await;
@@ -10131,6 +10884,7 @@ mod tests {
 
     fn named_result(call_id: &str, name: &str, output: Option<&BlobRef>, meta: Value) -> Event {
         Event::ToolResult(loom_core::event::ToolResult {
+            exchanges: Vec::new(),
             call_id: call_id.into(),
             name: name.into(),
             status: ToolStatus::Ok,
@@ -10140,6 +10894,7 @@ mod tests {
             class: ToolClass::Exec,
             meta: meta.as_object().cloned().unwrap_or_default(),
             duration_ms: 1,
+            images: Vec::new(),
         })
     }
 
@@ -10465,6 +11220,7 @@ mod tests {
 
     fn tool_result(call_id: &str, name: &str, class: ToolClass, output: Option<&str>, meta: Value) -> Event {
         Event::ToolResult(loom_core::event::ToolResult {
+            exchanges: Vec::new(),
             call_id: CallId::from(call_id),
             name: name.into(),
             status: ToolStatus::Ok,
@@ -10474,6 +11230,7 @@ mod tests {
             class,
             meta: meta.as_object().cloned().unwrap_or_default(),
             duration_ms: 0,
+            images: Vec::new(),
         })
     }
 
@@ -10605,7 +11362,7 @@ mod tests {
             .collect();
         assert_eq!(triggers, vec![loom_core::event::Trigger::User; 2]);
         let answered =
-            |r: &Record| matches!(&r.event, Event::UserMessage { text } if text.starts_with("[The operator's"));
+            |r: &Record| matches!(&r.event, Event::UserMessage { text, .. } if text.starts_with("[The operator's"));
         assert!(!records.iter().any(answered));
         assert!(e.rt.answer("i-nothing", "x").await.is_err());
         e.rt.shutdown().await;
@@ -11213,6 +11970,258 @@ mod tests {
         rt2.shutdown().await;
     }
 
+    #[tokio::test]
+    async fn project_instructions_go_into_the_prompt_are_recorded_and_survive_a_restart_unchanged() {
+        let stall = Arc::new(AtomicBool::new(true));
+        let flag = stall.clone();
+        let e = env(Script::new(move |_, _| {
+            if flag.load(Ordering::SeqCst) {
+                Action::Stall { ms: 600_000 }
+            } else {
+                finish("after restart")
+            }
+        }))
+        .await;
+        std::fs::write(e.ws.join("AGENTS.md"), "old agents rules\n").unwrap();
+        std::fs::write(e.ws.join("CLAUDE.md"), "old claude rules\n").unwrap();
+        let id = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
+        until("request", || !e.server.requests().is_empty()).await;
+        let start = match &e.records(&id)[0].event {
+            Event::SessionStart(s) => s.clone(),
+            other => panic!("first record is {other:?}"),
+        };
+        let names: Vec<_> = start.project_instructions.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["AGENTS.md", "CLAUDE.md"]);
+        let section = start.system_prompt.split("# Project instructions").nth(1).unwrap();
+        assert!(section.starts_with("\n\nFrom the workspace's AGENTS.md and CLAUDE.md."), "{section}");
+        assert!(
+            section.contains("## AGENTS.md\n\nold agents rules\n\n## CLAUDE.md\n\nold claude rules\n\n# Environment")
+        );
+        assert!(start.system_prompt.find("# Project instructions") < start.system_prompt.find("# Environment"));
+        e.rt.shutdown().await;
+
+        // The files change; the restarted session still sends what was recorded.
+        std::fs::write(e.ws.join("AGENTS.md"), "new agents rules\n").unwrap();
+        stall.store(false, Ordering::SeqCst);
+        let before = e.server.requests().len();
+        let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
+        until("resumed", || e.server.requests().len() > before).await;
+        let last = e.server.requests().pop().unwrap();
+        assert!(mentions(&last, "old agents rules") && !mentions(&last, "new agents rules"));
+        rt2.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn project_instructions_off_by_config_reads_nothing() {
+        let e = env_with(Script::new(|_, _| finish("ok")), false, |c| c.agents.project_instructions = false).await;
+        std::fs::write(e.ws.join("AGENTS.md"), "rules\n").unwrap();
+        let id = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
+        match &e.records(&id)[0].event {
+            Event::SessionStart(s) => {
+                assert!(s.project_instructions.is_empty());
+                assert!(!s.system_prompt.contains("# Project instructions"));
+            }
+            other => panic!("first record is {other:?}"),
+        }
+        e.rt.shutdown().await;
+    }
+
+    // ---- MCP servers (CONTRACTS-MCP M4, M6) ---------------------------------------------------
+
+    /// A server that answers `initialize`, `tools/list` (the tools in `tools`, space separated) and
+    /// `tools/call` by the id of each request it reads.
+    fn fake_mcp_script(dir: &Path, tools: &str) -> PathBuf {
+        let list: Vec<String> = tools
+            .split_whitespace()
+            .map(|t| format!(r#"{{"name":"{t}","description":"the {t} tool","inputSchema":{{"type":"object","properties":{{"q":{{"type":"string"}}}}}}}}"#))
+            .collect();
+        let script = format!(
+            r#"while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*) printf '{{"jsonrpc":"2.0","id":%s,"result":{{"protocolVersion":"2025-06-18","capabilities":{{"tools":{{}}}},"serverInfo":{{"name":"fake","version":"1.0"}}}}}}\n' "$id";;
+    *'"method":"tools/list"'*) printf '{{"jsonrpc":"2.0","id":%s,"result":{{"tools":[{}]}}}}\n' "$id";;
+    *'"method":"tools/call"'*) printf '{{"jsonrpc":"2.0","id":%s,"result":{{"content":[{{"type":"text","text":"pong"}}]}}}}\n' "$id";;
+  esac
+done
+"#,
+            list.join(",")
+        );
+        let path = dir.join("fake-mcp.sh");
+        std::fs::write(&path, script).unwrap();
+        path
+    }
+
+    fn fake_mcp_cfg(
+        script: &Path,
+        tweak: impl FnOnce(&mut loom_core::config::McpServerCfg),
+    ) -> loom_core::config::McpCfg {
+        let mut server = loom_core::config::McpServerCfg {
+            command: Some(vec!["/bin/sh".into(), script.display().to_string()]),
+            ..Default::default()
+        };
+        tweak(&mut server);
+        let mut cfg = loom_core::config::McpCfg::default();
+        cfg.servers.insert("fake".into(), server);
+        cfg
+    }
+
+    fn mcp_start(e: &Env, id: &SessionId) -> SessionStart {
+        match &e.records(id)[0].event {
+            Event::SessionStart(s) => s.clone(),
+            other => panic!("first record is {other:?}"),
+        }
+    }
+
+    /// A session of a config without `[mcp]`, and one whose only server gets no role of the pack,
+    /// send the same requests: no tool, no note, no listing.
+    #[tokio::test]
+    async fn a_session_no_server_applies_to_sends_the_same_requests_as_one_without_mcp() {
+        // The first request of the session as text, with the temporary directory and the session id of
+        // the run taken out.
+        async fn run(unmatched: bool) -> (String, SessionStart, bool) {
+            let e = env_with(Script::new(|_, _| finish("ok")), false, |c| {
+                if unmatched {
+                    let s = loom_core::config::McpServerCfg {
+                        command: Some(vec!["/bin/sh".into(), "-c".into(), "exit 1".into()]),
+                        roles: Some(vec!["nobody".into()]),
+                        hosts: vec!["mcp.example.test".into()],
+                        ..Default::default()
+                    };
+                    c.mcp.servers.insert("idle".into(), s);
+                }
+            })
+            .await;
+            let id = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
+            until("request", || !e.server.requests().is_empty()).await;
+            let start = mcp_start(&e, &id);
+            let noted = e
+                .records(&id)
+                .iter()
+                .any(|r| matches!(&r.event, Event::HarnessNote { text, .. } if text.contains("MCP servers")));
+            let dir = std::fs::canonicalize(e.dir.path()).unwrap().display().to_string();
+            let reqs = serde_json::to_string(&e.server.requests()[0]).unwrap();
+            let reqs = reqs.replace(&dir, "<dir>").replace(id.as_str(), "<session>");
+            e.rt.shutdown().await;
+            (reqs, start, noted)
+        }
+        let (base, base_start, _) = run(false).await;
+        let (with, start, noted) = run(true).await;
+        assert!(start.mcp.is_empty() && base_start.mcp.is_empty());
+        assert!(!noted);
+        assert_eq!(start.tools, base_start.tools);
+        assert_eq!(with, base);
+        assert!(!with.contains("mcp__"));
+    }
+
+    #[tokio::test]
+    async fn a_servers_hosts_reach_only_the_policy_of_the_roles_that_get_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = fake_mcp_script(dir.path(), "echo");
+        let e = env_with(Script::new(|_, _| finish("ok")), false, |c| {
+            c.mcp = fake_mcp_cfg(&script, |s| {
+                s.hosts = vec!["api.example.test".into()];
+                s.roles = Some(vec!["nobody".into()]);
+            });
+        })
+        .await;
+        let id = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
+        let meta = e.rt.session(&id).unwrap().meta;
+        assert!(e.rt.inner.mcp_hosts(&meta).is_empty());
+        let mut roles = e.config.mcp.clone();
+        roles.servers.get_mut("fake").unwrap().roles = Some(vec![meta.role.clone()]);
+        assert_eq!(crate::mcp::hosts_for_role(&roles, &meta.role, false), ["api.example.test"]);
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_lead_records_the_listing_and_the_note_once_and_a_child_and_a_reopened_session_reuse_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = fake_mcp_script(dir.path(), "echo other");
+        let seen_in_request = |reqs: &[Value], name: &str| reqs.iter().any(|b| has_tool(b, name));
+        let e = env_with(lead_script(json!({"question": "CHILDMARK find it"})), false, |c| {
+            c.mcp = fake_mcp_cfg(&script, |s| {
+                s.tools = Some(vec!["echo".into()]);
+                s.hosts = vec!["api.example.test".into()];
+            });
+        })
+        .await;
+        let id = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
+        // A new session is idle before its first turn starts: wait for the turn to end, then for idle.
+        until("lead turn end", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { .. }))).await;
+        until("lead idle", || e.rt.session(&id).is_some_and(|s| s.status.phase == Phase::Idle)).await;
+        let start = mcp_start(&e, &id);
+        assert_eq!(start.mcp.len(), 1);
+        assert_eq!((start.mcp[0].server.as_str(), start.mcp[0].transport.as_str()), ("fake", "stdio"));
+        assert_eq!(start.mcp[0].tools.len(), 2, "the record keeps every tool the server listed");
+        assert!(start.tools.iter().any(|t| t.name == "mcp__fake__echo"));
+        assert!(!start.tools.iter().any(|t| t.name == "mcp__fake__other"));
+        let notes: Vec<String> = e
+            .records(&id)
+            .iter()
+            .filter_map(|r| match &r.event {
+                Event::HarnessNote { text, .. } if text.contains("MCP servers") => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("fake") && notes[0].contains("api.example.test"), "{}", notes[0]);
+
+        // The child takes the lead's listing, not a new one.
+        let child = e.children(&id)[0].meta.id.clone();
+        assert_eq!(mcp_start(&e, &child).mcp, start.mcp);
+        e.rt.shutdown().await;
+
+        // The server now lists something else; the reopened lead keeps what it recorded.
+        fake_mcp_script(dir.path(), "changed");
+        let rt2 = Runtime::start(e.config.clone(), Paths::at(e.dir.path().join("home"))).await.unwrap();
+        let before = e.server.requests().len();
+        rt2.send_message(&id, "again").await.unwrap();
+        until("request after reopen", || e.server.requests().len() > before).await;
+        let reqs = e.server.requests();
+        let last = &reqs[reqs.len() - 1..];
+        assert!(seen_in_request(last, "mcp__fake__echo"));
+        assert!(!seen_in_request(last, "mcp__fake__changed"));
+        rt2.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_server_is_recorded_with_its_error_and_no_tools() {
+        let e = env_with(Script::new(|_, _| finish("ok")), false, |c| {
+            let s = loom_core::config::McpServerCfg {
+                command: Some(vec!["/nonexistent/mcp-server".into()]),
+                ..Default::default()
+            };
+            c.mcp.servers.insert("broken".into(), s);
+        })
+        .await;
+        let id = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
+        let start = mcp_start(&e, &id);
+        assert_eq!(start.mcp.len(), 1);
+        assert!(start.mcp[0].tools.is_empty() && start.mcp[0].error.is_some());
+        assert!(!start.tools.iter().any(|t| t.name.starts_with("mcp__")));
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_resolved_secret_is_in_no_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = fake_mcp_script(dir.path(), "echo");
+        std::env::set_var("LOOM_TEST_MCP_SECRET", "s3cr3t-value-9f8e7d");
+        let e = env_with(Script::new(|_, _| finish("ok")), false, |c| {
+            c.mcp = fake_mcp_cfg(&script, |s| {
+                s.env.insert("TOKEN".into(), "env:LOOM_TEST_MCP_SECRET".into());
+            });
+        })
+        .await;
+        let id = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
+        until("turn end", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { .. }))).await;
+        let all = serde_json::to_string(&e.records(&id)).unwrap();
+        assert!(all.contains("mcp__fake__echo"));
+        assert!(!all.contains("s3cr3t-value-9f8e7d"));
+        e.rt.shutdown().await;
+    }
+
     /// A lead with a sealed ledger of its own that holds the goal `goal`; returns its mission.
     async fn mission_with_goal(e: &Env, title: &str, goal: &str) -> MissionId {
         let mut new = e.new_session(None);
@@ -11507,12 +12516,11 @@ mod tests {
                 finish("seen it")
             } else if first.swap(false, Ordering::SeqCst) {
                 // The job and the wait in one reply: the turn ends before the job's registration is recorded.
-                let bash = json!({"command": "make all", "background": true}).to_string();
+                let bash = json!({"command": "sleep 600; make all", "background": true}).to_string();
                 Action::Reply(Reply::tools([("bash", bash), ("wait", "{}".to_string())]))
             } else {
-                // The job may end at once on a fast host and wake the session before the restart: the turn then
-                // yields, so that the session settles idle instead of starting the job again and again.
-                Action::Reply(Reply::text("waiting"))
+                // Not reached while the job runs; a text-only reply here would end the turn as yielded.
+                call("wait", json!({}))
             }
         }))
         .await;
@@ -11543,7 +12551,7 @@ mod tests {
         let rs = rt2.records(&id, None, 2_000).unwrap();
         let registered = rs.iter().position(|r| {
             matches!(&r.event, Event::JobRegistered { job_id, call_id: c, command }
-                if job_id == "j1" && *c == call_id && command == "make all")
+                if job_id == "j1" && *c == call_id && command == "sleep 600; make all")
         });
         let settled = rs.iter().position(|r| {
             matches!(&r.event, Event::JobSettled { job_id, exit_code: Some(0), output: Some(_), detail }
@@ -11922,6 +12930,7 @@ mod tests {
             });
             let (mut log, _) = SessionLog::open(&path, Durability::Always).unwrap();
             let result = loom_core::event::ToolResult {
+                exchanges: Vec::new(),
                 call_id: call_id.unwrap(),
                 name: "agent_spawn".into(),
                 status: loom_core::event::ToolStatus::Error,
@@ -11931,6 +12940,7 @@ mod tests {
                 class: loom_core::event::ToolClass::State,
                 meta: Default::default(),
                 duration_ms: 0,
+                images: Vec::new(),
             };
             log.append(Author::Tool, Event::ToolResult(result)).unwrap();
         };
@@ -14693,6 +15703,96 @@ mod tests {
         assert!(!later.exists());
     }
 
+    fn upload(ws: &Path, name: &str, bytes: &[u8]) -> String {
+        let dir = ws.join(".loom/uploads");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(name), bytes).unwrap();
+        std::fs::canonicalize(dir.join(name)).unwrap().display().to_string()
+    }
+
+    fn user_texts(e: &Env, id: &SessionId) -> Vec<String> {
+        e.records(id)
+            .into_iter()
+            .filter_map(|r| match r.event {
+                Event::UserMessage { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_message_with_uploads_records_the_attachment_block_and_refuses_what_is_not_an_upload() {
+        let e = env(Script::new(|_, _| Action::Stall { ms: 600_000 })).await;
+        let info = e.rt.create_session(e.new_session(None)).await.unwrap();
+        let id = info.meta.id.clone();
+        let csv = upload(&e.ws, "report.csv", b"a,b\n1,2\n");
+        let png = upload(&e.ws, "screen.png", &[0x89, b'P', b'N', b'G', 0, 1, 2]);
+
+        // Empty text is allowed with attachments, and refused without.
+        assert_eq!(e.rt.send_message_with(&id, "  ", &[]).await.unwrap_err(), "Write a message to send.");
+        e.rt.send_message_with(&id, "Look.", &[csv.clone(), png.clone()]).await.unwrap();
+        e.rt.send_message_with(&id, "", std::slice::from_ref(&csv)).await.unwrap();
+        until("both messages", || user_texts(&e, &id).len() >= 2).await;
+        let texts = user_texts(&e, &id);
+        assert_eq!(
+            texts[0],
+            format!(
+                "Look.\n\nAttached files (saved read-only; read them with `read`):\n- {csv} (8 B, text/csv)\n\
+                 - {png} (7 B, image/png)\n\n`{csv}`:\n```csv\na,b\n1,2\n```"
+            )
+        );
+        assert!(texts[1].starts_with("Attached files (saved read-only;"), "{}", texts[1]);
+
+        // Not uploads: a file elsewhere in the workspace, one outside, a missing one, a folder, a relative path,
+        // a link to an upload, and a path that climbs out of the folder.
+        std::fs::write(e.ws.join("plain.txt"), "x").unwrap();
+        let outside = e.dir.path().join("outside.txt");
+        std::fs::write(&outside, "x").unwrap();
+        let link = e.ws.join(".loom/uploads/link.csv");
+        std::os::unix::fs::symlink(&csv, &link).unwrap();
+        let dir = e.ws.join(".loom/uploads/sub");
+        std::fs::create_dir_all(&dir).unwrap();
+        let nested = upload(&e.ws, "sub/inner.txt", b"x");
+        let climb = format!("{}/../../plain.txt", e.ws.join(".loom/uploads").display());
+        for bad in [
+            e.ws.join("plain.txt").display().to_string(),
+            outside.display().to_string(),
+            e.ws.join(".loom/uploads/missing").display().to_string(),
+            dir.display().to_string(),
+            "report.csv".to_string(),
+            link.display().to_string(),
+            nested,
+            climb,
+        ] {
+            let err = e.rt.send_message_with(&id, "x", std::slice::from_ref(&bad)).await.unwrap_err();
+            assert_eq!(err, texts::not_an_upload(&bad), "{bad}");
+        }
+        assert_eq!(user_texts(&e, &id).len(), 2, "nothing was recorded for a refused message");
+        tokio::time::timeout(Duration::from_secs(30), e.rt.shutdown()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_new_session_checks_its_attachments_before_anything_is_made_and_sends_them_with_the_message() {
+        let e = env(Script::new(|_, _| Action::Stall { ms: 600_000 })).await;
+        let before = e.rt.sessions(true).len();
+        let bad =
+            NewSession { attachments: vec![e.ws.join("nope").display().to_string()], ..e.new_session(Some("go")) };
+        let err = e.rt.create_session_receipt(bad).await.unwrap_err();
+        assert!(err.starts_with("Attach files with POST /api/uploads first;"), "{err}");
+        assert_eq!(e.rt.sessions(true).len(), before);
+
+        let note = upload(&e.ws, "note.txt", b"hello");
+        let new = NewSession { attachments: vec![note.clone()], ..e.new_session(None) };
+        let (info, _) = e.rt.create_session_receipt(new).await.unwrap();
+        until("the first message", || !user_texts(&e, &info.meta.id).is_empty()).await;
+        let first = user_texts(&e, &info.meta.id).remove(0);
+        assert!(
+            first.starts_with("Attached files (") && first.contains(&format!("- {note} (5 B, text/plain)")),
+            "{first}"
+        );
+        tokio::time::timeout(Duration::from_secs(30), e.rt.shutdown()).await.unwrap();
+    }
+
     #[tokio::test]
     async fn earlier_missions_that_cannot_be_recalled_refuse_before_a_missing_workspace_is_made() {
         let e = env(Script::new(|_, _| finish("ok"))).await;
@@ -15032,6 +16132,154 @@ mod tests {
         a.unwrap();
         b.unwrap();
         assert!(ws_shared.join(".loom").is_dir());
+        e.rt.shutdown().await;
+    }
+
+    // --- Targets (CONTRACTS-TRAFFIC-TARGETS T) ---
+
+    fn target_body(scope: &[&str], exclude: &[&str]) -> TargetBody {
+        let v = |x: &[&str]| Some(x.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        TargetBody { name: Some("acme".into()), scope: v(scope), exclude: v(exclude), ..Default::default() }
+    }
+
+    fn start_of(e: &Env, id: &SessionId) -> loom_core::event::SessionStart {
+        e.records(id)
+            .into_iter()
+            .find_map(|r| match r.event {
+                Event::SessionStart(s) => Some(s),
+                _ => None,
+            })
+            .expect("session_start")
+    }
+
+    fn exchange(host: &str, method: &str, path: &str) -> loom_core::event::Exchange {
+        serde_json::from_value(json!({
+            "id": "ex-aaaaaaaaaaaa", "source": "tool", "scheme": "https", "tls": "tool", "method": method,
+            "host": host, "port": 443, "target": path,
+            "request": {"id": "b-1", "bytes": 1, "lines": 1}, "request_bytes": 1, "response_bytes": 0,
+            "duration_ms": 1
+        }))
+        .unwrap()
+    }
+
+    fn locators(e: &Env) -> Vec<(String, String)> {
+        let g = e.rt.target_graph("acme", None, None, None).unwrap();
+        g.nodes
+            .iter()
+            .map(|n| (serde_json::to_value(n.status).unwrap().as_str().unwrap().to_string(), n.locator.clone()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_mission_with_a_target_reaches_its_scope_in_deny_all_and_never_its_exclusions() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        e.rt.target_create(&target_body(&["*.acme.test", "acme.test"], &["vpn.acme.test"])).unwrap();
+        let mut new = e.new_session(Some("go"));
+        new.target = Some("acme".into());
+        let info = e.rt.create_session(new).await.unwrap();
+        let id = info.meta.id.clone();
+        let rule = |host: &str| e.rt.inner.proxy.check_name(&id, host, 443).map(|v| (v.allowed, v.rule));
+        assert!(rule("www.acme.test").unwrap().0);
+        assert!(!rule("vpn.acme.test").unwrap().0);
+        assert!(!rule("other.test").unwrap().0);
+        let start = start_of(&e, &id);
+        let t = start.target.expect("target recorded");
+        assert_eq!(t.name, "acme");
+        assert_eq!(t.exclude, vec!["vpn.acme.test"]);
+        assert!(start.system_prompt.contains("\n\n# Target acme\n"), "{}", start.system_prompt);
+        // A mission without a target is unchanged: no section, nothing allowed.
+        let plain = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
+        let ps = start_of(&e, &plain.meta.id);
+        assert!(ps.target.is_none() && !ps.system_prompt.contains("# Target"));
+        assert!(!e.rt.inner.proxy.check_name(&plain.meta.id, "www.acme.test", 443).unwrap().allowed);
+        // An unknown target or an invalid name is refused with a sentence.
+        let mut bad = e.new_session(None);
+        bad.target = Some("nope".into());
+        assert!(e.rt.create_session(bad).await.unwrap_err().contains("no target"));
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn target_graph_is_written_from_exchanges_assets_coverage_and_claims_in_scope_only() {
+        use loom_core::ledger::{Claim, ClaimStatus, LedgerOp, LedgerState};
+        use loom_core::security_state::SecurityOp;
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        e.rt.target_create(&target_body(&["*.acme.test", "acme.test"], &["vpn.acme.test"])).unwrap();
+        let mut new = e.new_session(Some("go"));
+        new.target = Some("acme".into());
+        let one = e.rt.create_session(new).await.unwrap().meta.id;
+        let inner = &e.rt.inner;
+
+        // An exchange: host, service, endpoint with a path template; out of scope and excluded: nothing.
+        inner.target_exchange(&one, 5, &exchange("WWW.acme.test", "get", "/users/42/orders?x=1"));
+        inner.target_exchange(&one, 6, &exchange("evil.example", "GET", "/"));
+        inner.target_exchange(&one, 7, &exchange("vpn.acme.test", "GET", "/"));
+        let seen = locators(&e);
+        let has = |l: &str| seen.iter().any(|(_, x)| x == l);
+        assert!(has("www.acme.test") && has("www.acme.test:443/tcp"), "{seen:?}");
+        assert!(has("GET https://www.acme.test:443/users/{id}/orders"), "{seen:?}");
+        assert!(!seen.iter().any(|(_, x)| x.contains("evil") || x.contains("vpn")), "{seen:?}");
+
+        // An asset_upsert and a coverage_set of the security state, as the ledger took them.
+        let mut state = LedgerState::default();
+        let ops: Vec<SecurityOp> = vec![
+            serde_json::from_value(
+                json!({"action":"asset_upsert","asset":{"kind":"host","locator":"api.acme.test","evidence":[]}}),
+            )
+            .unwrap(),
+            serde_json::from_value(
+                json!({"action":"asset_upsert","asset":{"kind":"host","locator":"evil.example","evidence":[]}}),
+            )
+            .unwrap(),
+        ];
+        for (i, op) in ops.iter().enumerate() {
+            state.security.apply(op, i as u64 + 1, &one);
+            inner.target_ledger(&one, &LedgerOp::Security(op.clone()), &state);
+        }
+        let api = state.security.assets.values().find(|a| a.locator == "api.acme.test").unwrap().id.clone();
+        let cov: SecurityOp = serde_json::from_value(
+            json!({"action":"coverage_set","asset":api,"disposition":{"status":"deferred","reason":"later"}}),
+        )
+        .unwrap();
+        state.security.apply(&cov, 3, &one);
+        inner.target_ledger(&one, &LedgerOp::Security(cov), &state);
+        let g = e.rt.target_graph("acme", None, None, None).unwrap();
+        let api_node = g.nodes.iter().find(|n| n.locator == "api.acme.test").expect("asset written");
+        assert_eq!(serde_json::to_value(api_node.status).unwrap(), "deferred");
+        assert!(!g.nodes.iter().any(|n| n.locator.contains("evil")));
+
+        // A supported claim naming an in-scope host becomes a finding; withdrawn, it stops counting.
+        state.claims.push(Claim {
+            id: "c1".into(),
+            text: "api.acme.test accepts any token".into(),
+            status: ClaimStatus::Supported,
+            note: String::new(),
+            evidence: vec![],
+            assets: vec![],
+        });
+        let upd = |status| LedgerOp::ClaimUpdate { id: "c1".into(), status, note: String::new() };
+        inner.target_ledger(&one, &upd(ClaimStatus::Supported), &state);
+        let status_of = || {
+            let g = e.rt.target_graph("acme", None, None, None).unwrap();
+            serde_json::to_value(g.nodes.iter().find(|n| n.locator == "api.acme.test").unwrap().status).unwrap()
+        };
+        assert_eq!(status_of(), "finding");
+        state.claims[0].status = ClaimStatus::Withdrawn;
+        inner.target_ledger(&one, &upd(ClaimStatus::Withdrawn), &state);
+        assert_eq!(status_of(), "deferred");
+        assert!(inner.target_store().verify("acme").unwrap());
+
+        // A second mission of the target sees the first one's work at its start, and the first one's
+        // recorded summary does not change.
+        let before = start_of(&e, &one).target.unwrap().summary;
+        let mut new = e.new_session(Some("go"));
+        new.target = Some("acme".into());
+        let two = e.rt.create_session(new).await.unwrap().meta.id;
+        let s2 = start_of(&e, &two).target.unwrap().summary;
+        assert!(s2.contains("GET https://www.acme.test:443/users/{id}/orders"), "{s2}");
+        assert!(s2.contains("Known: 1 domain, 2 hosts"), "{s2}");
+        assert_ne!(before, s2);
+        assert_eq!(start_of(&e, &one).target.unwrap().summary, before);
         e.rt.shutdown().await;
     }
 }

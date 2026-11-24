@@ -424,6 +424,9 @@ impl ModelClient {
         let mut body = encode(&model)?;
         let url = self.url("chat/completions");
         let key = self.api_key();
+        // Calls written into the text are taken only where the request asks for them.
+        let text_calls =
+            if request.text_calls { self.profile.text_tool_calls } else { loom_core::config::TextToolCalls::Off };
 
         let mut attempts: u32 = 0;
         let mut first_failure: Option<Instant> = None;
@@ -437,7 +440,7 @@ impl ModelClient {
             }
             attempts = attempts.saturating_add(1);
             let (reason, retry_after, sticky) = match self
-                .attempt(&url, &body, key.as_deref(), attempts, events, cancel)
+                .attempt(&url, &body, key.as_deref(), attempts, text_calls, events, cancel)
                 .await
             {
                 Ok(mut done) => {
@@ -532,12 +535,14 @@ impl ModelClient {
     }
 
     /// One request/response cycle.
+    #[allow(clippy::too_many_arguments)]
     async fn attempt(
         &self,
         url: &str,
         body: &Bytes,
         key: Option<&str>,
         attempt: u32,
+        text_calls: loom_core::config::TextToolCalls,
         events: Option<&UnboundedSender<StreamEvent>>,
         cancel: &CancellationToken,
     ) -> Result<Completion, Fail> {
@@ -601,7 +606,7 @@ impl ModelClient {
         let content_type = resp_content_type(&resp);
         let mut stream = Box::pin(resp.bytes_stream());
         let mut parser = SseParser::new();
-        let mut asm = Assembler::new();
+        let mut asm = Assembler::with_text_calls(text_calls);
         let mut partial = Partial::default();
         let mut ttft: Option<u64> = None;
         let mut finished = false;

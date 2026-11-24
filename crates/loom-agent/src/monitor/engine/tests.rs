@@ -140,6 +140,8 @@ impl T {
                 class,
                 meta: Default::default(),
                 duration_ms: after,
+                images: Vec::new(),
+                exchanges: Vec::new(),
             }));
             r.ts_ms = call.ts_ms + after;
             self.ts = r.ts_ms;
@@ -513,6 +515,8 @@ fn tw11_detachment_persistence_and_a_plist_that_exists() {
         class: ToolClass::Write,
         meta,
         duration_ms: 1,
+        images: Vec::new(),
+        exchanges: Vec::new(),
     }));
     let hits = w.e.record(&w.ctx.clone(), &res, &w.auth, &w.fold);
     assert_eq!(sev(&hits, 11), Some(Severity::S4), "a launch plist exists");
@@ -806,6 +810,8 @@ fn tw21_idle_session_egress_with_the_grace() {
         class: ToolClass::Exec,
         meta: Default::default(),
         duration_ms: 1,
+        images: Vec::new(),
+        exchanges: Vec::new(),
     }));
     t.e.record(&t.ctx.clone(), &res, &t.auth, &t.fold);
     let within = t.e.net(&t.ctx.clone(), res.ts_ms + 1_500, &d, &t.auth, &t.fold);
@@ -1040,6 +1046,8 @@ impl T {
             class: ToolClass::Exec,
             meta: meta.as_object().cloned().unwrap_or_default(),
             duration_ms: after_ms,
+            images: Vec::new(),
+            exchanges: Vec::new(),
         }));
         r.ts_ms = call.ts_ms + after_ms;
         self.ts = r.ts_ms;
@@ -1264,6 +1272,8 @@ fn a_session_freed_for_being_quiet_keeps_its_long_job_and_a_result_without_its_c
         class: ToolClass::Exec,
         meta: Default::default(),
         duration_ms: 20_000,
+        images: Vec::new(),
+        exchanges: Vec::new(),
     }));
     res.ts_ms = 100_000;
     r.e.record(&r.ctx.clone(), &res, &r.auth, &r.fold);
@@ -1307,4 +1317,22 @@ fn a_repaired_call_is_read_as_the_executor_runs_it() {
     // The repaired form only adds: a key the monitor already read is still read after its rename to `new`.
     let v = CallView::of("str_replace", ToolClass::Write, &json!({ "path": "a", "new_string": "body" }));
     assert_eq!(v.content, "body");
+    // A Codex `apply_patch` names its files only inside the patch; the executor runs one call per file.
+    let patch =
+        format!("*** Begin Patch\n*** Update File: a.txt\n@@\n-x\n+y\n*** Add File: {hook}\n+#!/bin/sh\n*** End Patch");
+    for args in [json!({ "input": patch }), Value::String(patch.clone())] {
+        let mut t = T::new();
+        let h = t.tool("apply_patch", ToolClass::Write, args.clone());
+        assert!(!of(&h, 9).is_empty(), "a hook added through `apply_patch` {args}");
+        let v = CallView::of("apply_patch", ToolClass::Write, &args);
+        assert_eq!(v.paths, ["a.txt", hook]);
+        assert!(v.content.contains("#!/bin/sh"), "{}", v.content);
+    }
+    // A fetch that names its page only in `prompt` fetches that page: its URL is read as the destination.
+    let meta = "http://169.254.169.254/latest/meta-data";
+    let args = json!({ "prompt": format!("summarize {meta}") });
+    assert_eq!(CallView::of("WebFetch", ToolClass::Read, &args).urls, [meta]);
+    let mut t = T::new();
+    let h = t.tool("WebFetch", ToolClass::Read, args);
+    assert_eq!(sev(&h, 2), Some(Severity::S3), "a metadata page fetched through `prompt`");
 }

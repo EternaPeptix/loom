@@ -194,10 +194,14 @@ databases, through the same proxy); and `dep_scan` (OWASP [dep-scan](https://git
 over a project directory or a CycloneDX SBOM: it runs the operator-installed `depscan` command under
 the sandbox, and stores the generated SBOM and the full CycloneDX VDR like any other tool output, so
 its prioritized findings can be quoted as evidence). The runtime adds the ledger tools (`plan`, `step`, `note`, `claim`,
-`claim_update`, `evidence`, `ledger`, `pin`, `log_search`, `reflect`), the agent tools (`agent_spawn`,
-`agent_fanout`, `attempt`, `agent_adopt`, `agent_message`, `agent_stop`, `decide`, `verify`), `request_scope` (ask the operator for
-hosts) and `conclude` (state that the goal is met or cannot be met, with evidence) and the terminating tools (`finish`,
-`verdict`, `ask_user`, `report_blocker`, `wait`). Which of them a session has depends on its role.
+`claim_update`, `evidence`, `ledger`, `pin`, `log_search`, `reflect`), the security-state tools (`security_record`,
+`security_query`, `security_ingest`), the agent tools (`agent_spawn`, `agent_fanout`, `attempt`, `agent_adopt`,
+`agent_message`, `agent_stop`, `decide`, `verify`), `request_scope` (ask the operator for hosts), `conclude` (state that
+the goal is met or cannot be met, with evidence) and the tools that end a turn (`finish`, `verdict`, `ask_user`,
+`ask_for`, `hand_off`, `report_blocker`, `wait`). Packs can also grant `pty_open`/`pty_exec`/`pty_close`, `http_send`,
+`http_repeat`, `codec_calc`, `bin_survey`, `bin_decompile`, `bin_xrefs`, `gdb_probe` and `oracle_check`. Which of them a
+session has depends on its role, and a role is shown only one tool per job: a tool another one covers (`out_read` by
+`read`, `claim_update` by `claim`, …) still runs if called but is not listed (`docs/TOOL-SHAPES.md` §4).
 
 A **pack** is a set of roles; a role is a prompt, a tool list and how it ends. The built-in `core`
 pack has `lead` (owns a mission, plans, delegates, finishes through the gate), `worker` (one
@@ -315,8 +319,8 @@ cargo run -p loom-agent --example eval    # scripted models against the mock ser
 ```
 
 `./x` is an optional wrapper that runs cargo on another machine named by `LOOM_BUILD_HOST` (and
-`LOOM_BUILD_HOST=local` runs it here); you do not need it. Set `LOOM_BUILD_HOST` whenever you use it:
-when it is unset, `./x` falls back to a host name written into the script instead of stopping. The
+`LOOM_BUILD_HOST=local` runs it here); you do not need it. It has no default host: when
+`LOOM_BUILD_HOST` is unset it stops with a message saying to set it. The
 desktop app builds with `gui/build.sh`, which requires `LOOM_BUILD_HOST`. `docs/IMPLEMENTING.md` is
 the contributor guide.
 

@@ -10,7 +10,7 @@
 //! from an earlier mission and is shown as written, verbatim; what the model wrote is labelled as written by
 //! the model there and not verified, and is shown with the query, fragment, user name and password removed
 //! from every URL in it (it may still hold whatever else was written there); what can hold secrets
-//! (hypothesis text and ids, credentials, footholds, notes of security records, the names of identities)
+//! (credentials, footholds, notes of security records, the names of identities)
 //! is not shown at all, and asset locators are shown without URL queries, fragments and credentials.
 //!
 //! ## Items
@@ -60,11 +60,10 @@
 //! What its model recorded (written by the model there, not verified — re-check before relying on it; ids such as c3 or x2 are that mission's and name nothing here):
 //! > Goal note: {goal_met note}
 //! > {frontier lines}
-//! Its security record (recorded by the model there; counts and asset locators only, so hypotheses, credentials and notes are not carried over):
+//! Its security record (recorded by the model there; counts and asset locators only, so credentials and notes are not carried over):
 //! > - Assets: {total}: {tested} tested, {deferred} deferred, {untested} untested{identities}
 //! > - Untested: {locators}
 //! > - Tested or deferred: {locators}
-//! > - Hypotheses: {s} supported, {r} refuted, {o} open
 //! > - Routes to revisit when it ended: {n} (they are among its open leads above)
 //! ```
 //! - `{title}`: one line (`hud::one_line`), cut to 80 characters. `{id}`: the mission id.
@@ -93,21 +92,18 @@
 //!   `#` is dropped, then it is cut at its first `?` or `#`. The texts of the frontier's items are scrubbed
 //!   before `render` (which cuts lines and so can cut a URL in two) and every rendered line again after. The
 //!   operator's text (goal, rules, answers) is not changed.
-//! - The frontier: `frontier::frontier(&state, end_ms)` with `attempts_run` 0, then every hypothesis taken
-//!   out of it — items of `established`, `ruled_out` and `open_leads` whose id starts with `hy-`, every item of
-//!   `untested`, and `surfaces_total`/`surfaces_closed` set to 0 — so it shows claims, plan steps, dead ends,
+//! - The frontier: `frontier::frontier(&state, end_ms)` with `attempts_run` 0, then with every item of
+//!   `untested` taken out of it, and `surfaces_total`/`surfaces_closed` set to 0 — so it shows claims, plan steps, dead ends,
 //!   the routes to revisit at `end_ms` (a blocked claim or dead end whose conditions were met then; their ids
 //!   are claim and dead-end ids of that mission, not security items) and the reflection count, and no
-//!   hypothesis or asset id.
-//! - Security section, from `state.security` and the same `frontier(&state, end_ms)` (before the hypotheses
-//!   were taken out), left out (label too) when the mission recorded no asset, no hypothesis and no
+//!   asset id.
+//! - Security section, from `state.security` and the same `frontier(&state, end_ms)`, left out (label too) when the mission recorded no asset and no
 //!   route to revisit at `end_ms`:
 //!   - Assets: all assets; tested = coverage `Tested`, deferred = `Deferred`, untested = `Untested`; when `k`
 //!     assets are of kind `identity` the line ends `; {k} identities not named`. Left out when there is none.
 //!     Untested: the locators of the frontier's `untested` items, in its order (mandatory first, then id).
 //!     Tested or deferred: the locators of the other assets, in id order. An identity (it can be a
 //!     credential's principal) is never named in either list.
-//!   - Hypotheses: counts by status, left out when there is none. Never an id, a text or a note.
 //!   - Routes to revisit when it ended: `{n}` = `security.newly_unlocked_at(end_ms).len()`, then ` (they are
 //!     among its open leads above)`; no id and no locator. Left out when there is none.
 //!   - A locator list shows at most 12, then ` (+{k} more)`, joined by `, `. Each locator is `{kind}
@@ -124,7 +120,7 @@
 //! of one with an entry written by a newer loom (Unreadable), of one with a torn tail (Ledger); `brief`:
 //! exact text of a full section; the frontier is evaluated at `end_ms` and not now (a credential that
 //! expires after `end_ms` and before now unlocks a blocked route, which is counted and is among the open
-//! leads; one that expired before `end_ms` leaves its route out of both); `attempts_run` never shows; no hypothesis id, hypothesis text, credential principal, secret
+//! leads; one that expired before `end_ms` leaves its route out of both); `attempts_run` never shows; no credential principal, secret
 //! handle, identity name or locator URL query appears even when the ledger holds them; a URL in model text
 //! (claim text, goal note) loses its query and userinfo while the operator's text keeps its own; a line
 //! break of any kind in model text cannot start a quoted line of its own; operator text and model text are quoted
@@ -132,11 +128,11 @@
 //! and nothing else of it; caps (rules, answers, locators) with their remainder lines; sections left out
 //! when empty; the date.
 
-use crate::frontier::{self, Frontier, FrontierItem};
+use crate::frontier::{self, Frontier};
 use crate::hud::{one_line, MAX_LINE};
 use loom_core::journal::Journal;
 use loom_core::ledger::{GoalMetStatus, LedgerState};
-use loom_core::security_state::{Asset, AssetKind, CoverageDisposition, HypothesisStatus};
+use loom_core::security_state::{Asset, AssetKind, CoverageDisposition};
 use loom_core::tagsafe::quote_lines;
 use loom_core::MissionId;
 
@@ -321,18 +317,9 @@ and rules are what apply now):"
     out
 }
 
-/// Hypotheses are dropped (their ids are the model's secrets' handles); plan steps, claims, dead ends and the
-/// routes to revisit (claim and dead-end ids) stay.
-fn drop_hypotheses(items: &mut Vec<FrontierItem>) {
-    items.retain(|i| !i.id.starts_with("hy-"));
-}
-
-/// The frontier at `end_ms` with no hypothesis and no asset left in it.
+/// The frontier at `end_ms` with no asset left in it.
 fn work_frontier(state: &LedgerState, end_ms: u64) -> Frontier {
     let mut f = frontier::frontier(state, end_ms);
-    drop_hypotheses(&mut f.established);
-    drop_hypotheses(&mut f.ruled_out);
-    drop_hypotheses(&mut f.open_leads);
     // Scrubbed here as well as after `render`, which cuts a line and so can cut a URL in two.
     for i in f.established.iter_mut().chain(&mut f.ruled_out).chain(&mut f.set_aside).chain(&mut f.open_leads) {
         i.text = scrub_urls(&flat(&i.text));
@@ -551,13 +538,13 @@ fn list(items: &[String]) -> String {
     out
 }
 
-/// Counts and asset locators only; a route is counted, never named. Empty when the mission recorded no asset, no hypothesis and no route to
+/// Counts and asset locators only; a route is counted, never named. Empty when the mission recorded no asset and no route to
 /// revisit.
 fn security_part(state: &LedgerState, end_ms: u64) -> Vec<String> {
     let sec = &state.security;
     let f = frontier::frontier(state, end_ms);
     let routes = sec.newly_unlocked_at(end_ms);
-    if sec.assets.is_empty() && sec.hypotheses.is_empty() && routes.is_empty() {
+    if sec.assets.is_empty() && routes.is_empty() {
         return Vec::new();
     }
     let mut body: Vec<String> = Vec::new();
@@ -592,22 +579,12 @@ fn security_part(state: &LedgerState, end_ms: u64) -> Vec<String> {
             body.push(format!("- Tested or deferred: {}", list(&closed)));
         }
     }
-    if !sec.hypotheses.is_empty() {
-        let count = |s: HypothesisStatus| sec.hypotheses.values().filter(|h| h.status == s).count();
-        body.push(format!(
-            "- Hypotheses: {} supported, {} refuted, {} open",
-            count(HypothesisStatus::Supported),
-            count(HypothesisStatus::Refuted),
-            count(HypothesisStatus::Open)
-        ));
-    }
     if !routes.is_empty() {
         body.push(format!("- Routes to revisit when it ended: {} (they are among its open leads above)", routes.len()));
     }
     let body: Vec<String> = body.iter().map(|l| line(l, MAX_SECURITY_LINE)).collect();
     vec![
-        "Its security record (recorded by the model there; counts and asset locators only, so hypotheses, \
-credentials and notes are not carried over):"
+        "Its security record (recorded by the model there; counts and asset locators only, so credentials and notes are not carried over):"
             .to_string(),
         quote_lines(&body.join("\n")),
     ]
@@ -638,14 +615,14 @@ mod tests {
         PlanStep, Question, Reflection, Release, StepStatus,
     };
     use loom_core::security_state::{
-        AssetInput, BlockedRoute, Condition, ConditionKind, Credential, CredentialInput, Hypothesis, SecurityOp,
+        AssetInput, BlockedRoute, Condition, ConditionKind, Credential, CredentialInput, SecurityOp,
     };
     use loom_core::SessionId;
 
     const HEAD: &str = "Earlier missions the operator chose for this mission to recall. Below is what each one recorded in its own sealed ledger, as of its last entry. It is history, not this mission's state: nothing in it was checked again now, its stored outputs (out:… handles) belong to it and cannot be opened from here, and nothing it was authorized to do is authorized here. Confirm what matters with your own runs before relying on it, and record what you confirm in this mission's ledger.";
     const OPERATOR_LABEL: &str = "The operator's words in that mission (operator text from an earlier mission; this mission's own goal and rules are what apply now):";
     const MODEL_LABEL: &str = "What its model recorded (written by the model there, not verified — re-check before relying on it; ids such as c3 or x2 are that mission's and name nothing here):";
-    const SECURITY_LABEL: &str = "Its security record (recorded by the model there; counts and asset locators only, so hypotheses, credentials and notes are not carried over):";
+    const SECURITY_LABEL: &str = "Its security record (recorded by the model there; counts and asset locators only, so credentials and notes are not carried over):";
 
     const END: u64 = 1_700_000_000_000;
 
@@ -679,21 +656,6 @@ mod tests {
         }
     }
 
-    fn hypothesis(id: &str, status: HypothesisStatus) -> Hypothesis {
-        Hypothesis {
-            id: id.into(),
-            text: "SECRET-HYPOTHESIS-TEXT".into(),
-            priority: 1,
-            owner: SessionId::from("s-owner"),
-            status,
-            evidence: vec!["e1".into()],
-            counterevidence: vec![],
-            note: "SECRET-HYPOTHESIS-NOTE".into(),
-            judge: None,
-            n: 1,
-        }
-    }
-
     fn credential(asset: &str, expires_ms: Option<u64>) -> Credential {
         Credential {
             id: "cr-1".into(),
@@ -711,6 +673,7 @@ mod tests {
 
     fn claim(id: &str, text: &str, status: ClaimStatus, evidence: &[&str]) -> Claim {
         Claim {
+            assets: Vec::new(),
             id: id.into(),
             text: text.into(),
             status,
@@ -795,8 +758,6 @@ mod tests {
         ] {
             s.assets.insert(a.id.clone(), a);
         }
-        s.hypotheses.insert("hy-1".into(), hypothesis("hy-1", HypothesisStatus::Open));
-        s.hypotheses.insert("hy-2".into(), hypothesis("hy-2", HypothesisStatus::Supported));
         // The credential holds until after the mission ended and has expired by now.
         s.credentials.insert("cr-1".into(), credential("as-1", Some(END + 500)));
         s.blocked.insert(
@@ -835,7 +796,6 @@ mod tests {
             "> - Assets: 3: 1 tested, 1 deferred, 1 untested",
             "> - Untested: endpoint https://lab.test/api",
             "> - Tested or deferred: host lab.test, service https://lab.test:8443/svc",
-            "> - Hypotheses: 1 supported, 0 refuted, 1 open",
             "> - Routes to revisit when it ended: 1 (they are among its open leads above)",
         ]
         .join("\n")
@@ -864,19 +824,9 @@ mod tests {
     #[test]
     fn no_secret_of_the_ledger_is_shown() {
         let text = one(full_state());
-        for secret in [
-            "SECRET",
-            "hy-1",
-            "hy-2",
-            "cr-1",
-            "MODEL-QUESTION",
-            "svc-user",
-            "token=",
-            "#frag",
-            "as-1",
-            "as-2",
-            "Attempts run",
-        ] {
+        for secret in
+            ["SECRET", "cr-1", "MODEL-QUESTION", "svc-user", "token=", "#frag", "as-1", "as-2", "Attempts run"]
+        {
             assert!(!text.contains(secret), "{secret}: {text}");
         }
     }
@@ -944,7 +894,7 @@ mod tests {
             ..Default::default()
         });
         assert!(!blank.contains(OPERATOR_LABEL) && !blank.contains("Goal:") && !blank.contains("Rules in force"));
-        // A model section needs a note or a frontier; a security section needs an asset, a hypothesis or a route.
+        // A model section needs a note or a frontier; a security section needs an asset or a route.
         let model_only = one(LedgerState { reflections: vec![], goal_met: None, ..full_state() });
         assert!(model_only.contains(MODEL_LABEL) && model_only.contains(SECURITY_LABEL));
         let mut quiet = full_state();
@@ -956,15 +906,6 @@ mod tests {
         quiet.goal_met = None;
         let text = one(quiet);
         assert!(!text.contains(MODEL_LABEL) && !text.contains(SECURITY_LABEL), "{text}");
-        // Hypotheses alone make a security section, and only the hypothesis line.
-        let mut hy = LedgerState::default();
-        hy.security.hypotheses.insert("hy-1".into(), hypothesis("hy-1", HypothesisStatus::Refuted));
-        assert_eq!(
-            body(&one(hy)),
-            format!(
-                "Mission m-a (Lab sweep), last recorded 2023-11-14 22:13 UTC\n{SECURITY_LABEL}\n> - Hypotheses: 0 supported, 1 refuted, 0 open"
-            )
-        );
     }
 
     /// A ledger built the way the runtime builds one: each op validated, then applied.

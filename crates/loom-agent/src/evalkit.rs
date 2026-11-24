@@ -555,6 +555,11 @@ fn script(scenario: &Scenario) -> Script {
     let (lead, worker, verdicts) = (scenario.lead, scenario.worker, scenario.verdicts);
     let (mut lead_at, mut worker_at, mut given) = (0usize, 0usize, 0usize);
     Script::new(move |body, _| {
+        // The note request of a compaction (a fresh start): it is not one of the session's moves.
+        let last = body["messages"].as_array().and_then(|m| m.last()).and_then(|l| l["content"].as_str());
+        if last.is_some_and(|c| c.starts_with(crate::texts::COMPACT_PROMPT)) {
+            return Action::Reply(Reply::text("## Goal\nThe task.\n## Next\nRun the target again."));
+        }
         if has_tool(body, "verdict") {
             return verify(body, verdicts, &mut given);
         }
@@ -574,6 +579,8 @@ fn script(scenario: &Scenario) -> Script {
 /// The configuration a scenario starts from: see `run` in the module contract.
 fn base_config(base_url: String) -> Config {
     let mut config = Config::default();
+    // Scenarios judge the agent, not the traffic: no proxy capture.
+    config.network.capture_max_exchanges = 0;
     config.models.clear();
     config.models.insert(
         "mock".into(),
@@ -833,10 +840,10 @@ mod tests {
     #[tokio::test]
     async fn a_model_that_gives_up_is_parked_and_its_run_is_not_a_fast_one() {
         let o = played_named("gives_up").await;
-        assert_eq!((o.end, o.solved, o.sessions), (TurnEndReason::Parked, false, 1));
-        // One look, then four replies without a call: three nudged, the fourth parked.
-        let mut expected = card(5, None, 1, 0, (0, 0), 0, (0, 0), 0);
-        expected.text_only_nudges = 3;
+        assert_eq!((o.end, o.solved, o.sessions), (TurnEndReason::Yielded, false, 1));
+        // One look, then two replies without a call: the first nudged, the second ends the turn.
+        let mut expected = card(3, None, 1, 0, (0, 0), 0, (0, 0), 0);
+        expected.text_only_nudges = 1;
         assert_eq!(o.lead, expected);
         assert_eq!(o.lead.verifier_accept_rate(), None);
         assert_eq!(o.mission, o.lead);
@@ -854,9 +861,9 @@ mod tests {
         };
         let o = played(&scenario).await;
         // The work was done, and nothing was delivered: solved by the outside check, not finished.
-        assert_eq!((o.end, o.solved, o.sessions), (TurnEndReason::Parked, true, 1));
-        let mut expected = card(5, None, 1, 0, (0, 0), 0, (0, 0), 0);
-        expected.text_only_nudges = 3;
+        assert_eq!((o.end, o.solved, o.sessions), (TurnEndReason::Yielded, true, 1));
+        let mut expected = card(3, None, 1, 0, (0, 0), 0, (0, 0), 0);
+        expected.text_only_nudges = 1;
         assert_eq!(o.lead, expected);
     }
 

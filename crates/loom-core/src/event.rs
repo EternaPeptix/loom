@@ -6,6 +6,7 @@
 
 use crate::blob::BlobRef;
 use crate::ids::{CallId, MissionId, SessionId};
+use crate::image::ImageRef;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -30,6 +31,8 @@ pub const META_RAW_BLOB: &str = "raw_blob";
 /// its header, beside `output` and `META_RAW_BLOB` (dep-scan's further reports). They are outputs of the
 /// session's mission like the others (`loom_tools::outputs`).
 pub const META_ALSO_STORED: &str = "also_stored";
+/// `ToolResult::meta` key: absolute directory a `bash` call left the session's shell in (see `loom_tools::bash`).
+pub const META_CWD: &str = "cwd";
 /// `ToolResult::meta` key: id of the background job a call turned into or started.
 pub const META_JOB: &str = "job";
 /// Output was admitted for a stored action; coverage awaits an actual actor callback.
@@ -167,6 +170,8 @@ pub struct Record {
     pub event: Event,
 }
 
+// `SessionStart` is the largest variant (the model's lineage, the target, the MCP listing), and there is one per log.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Event {
@@ -176,6 +181,9 @@ pub enum Event {
     Forked(Forked),
     UserMessage {
         text: String,
+        /// Images the operator attached, stored in the blob store. Skipped when empty.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ImageRef>,
     },
     /// Text from the harness that the model must see and that stays in the window.
     HarnessNote {
@@ -217,7 +225,12 @@ pub enum Event {
     /// Intent to run a tool. Appended and synced before the tool starts.
     ToolCall(ToolCall),
     ToolResult(ToolResult),
+    /// Superseded by [`Event::Compaction`]; no new one is written, old ones still render.
     Reweave(Reweave),
+    /// The window was compacted: a note with a key table replaces what came before. See [`Compaction`].
+    Compaction(Compaction),
+    /// One captured HTTP request and its response (CONTRACTS-TRAFFIC-TARGETS C1).
+    Exchange(Exchange),
     /// Keep this call's output verbatim through evictions until unpinned.
     Pin {
         call_id: CallId,
@@ -308,6 +321,108 @@ pub struct ModelSwitched {
     pub reason: String,
 }
 
+/// What one MCP server offered when a mission started (docs/CONTRACTS-MCP.md M6). Recorded in the lead's
+/// `session_start` so every session of the mission, and a session opened from its log, presents the same
+/// tools for its whole life.
+/// One captured HTTP request and its response (CONTRACTS-TRAFFIC-TARGETS C1). The messages are whole HTTP/1.1
+/// messages (head and body) in the blob store, readable as outputs by their keys.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Exchange {
+    /// `ex-` and 12 base32 characters.
+    pub id: String,
+    /// The call it was made in: the tool's own call, or for proxy traffic the call running when it started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<CallId>,
+    /// `tool` (an in-process client: http_send, web_fetch, MCP over HTTP) or `proxy` (a command's traffic).
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    /// `http` or `https`.
+    pub scheme: String,
+    /// `plain`, `intercepted` or `tool`.
+    pub tls: String,
+    pub method: String,
+    pub host: String,
+    pub port: u16,
+    /// Path and query as sent.
+    pub target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub request: BlobRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response: Option<BlobRef>,
+    pub request_bytes: u64,
+    pub response_bytes: u64,
+    /// A body passed `capture_max_bytes` and was cut there (the byte counts are the true sizes).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
+    /// Intercepted HTTPS to a host listed in the target's `upstream_insecure`: its certificate was not checked.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub upstream_unverified: bool,
+    pub duration_ms: u64,
+}
+
+/// The named target a mission works on, as recorded at its start (CONTRACTS-TRAFFIC-TARGETS T2, T5).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TargetRef {
+    pub name: String,
+    pub scope: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub upstream_insecure: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub intercept_passthrough: Vec<String>,
+    /// The graph summary that went into the lead's system prompt (T5).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub summary: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpListing {
+    /// The server's name in `[mcp.servers]`.
+    pub server: String,
+    /// `stdio` or `http`.
+    pub transport: String,
+    /// The protocol version the server answered (empty when it did not start).
+    #[serde(default)]
+    pub protocol: String,
+    #[serde(default)]
+    pub server_name: String,
+    #[serde(default)]
+    pub server_version: String,
+    #[serde(default)]
+    pub tools: Vec<McpToolDef>,
+    /// Why the server could not be started or listed; it then has no tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// One tool as an MCP server listed it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpToolDef {
+    /// The server's own name for it (not the `mcp__…` name the model sees).
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    /// The server's `inputSchema`, as listed.
+    #[serde(default)]
+    pub input_schema: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_only_hint: Option<bool>,
+}
+
+/// One project instruction file as it went into a session's system prompt.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectInstruction {
+    /// The file name, `AGENTS.md` or `CLAUDE.md`.
+    pub name: String,
+    /// Its text as the prompt has it (cut at the size limit, with the cut marker).
+    pub text: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SessionStart {
     pub session: SessionId,
@@ -333,6 +448,21 @@ pub struct SessionStart {
     pub unattended: bool,
     #[serde(default)]
     pub title: String,
+    /// The project instruction files (`AGENTS.md`, `CLAUDE.md`) read from the workspace root when the
+    /// session was created, as they went into `system_prompt` (cut, if long). Kept so the prompt is
+    /// never rebuilt from a file that has changed since, and so the UI can list the names.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub project_instructions: Vec<ProjectInstruction>,
+    /// The MCP servers' listings (CONTRACTS-MCP M6): set on a mission lead's start; empty for a child
+    /// (it takes its lead's) and when no server is configured.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp: Vec<McpListing>,
+    /// HTTPS through the proxy is decrypted and captured for this mission (CONTRACTS-TRAFFIC-TARGETS I1).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub intercept: bool,
+    /// The named target the mission works on, as it was at the start (T2, T5); a child takes its lead's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<TargetRef>,
     /// Log format version; absent in logs written before the field existed (version 1). A log with
     /// a higher number is read-only for this build.
     #[serde(default = "schema_v1")]
@@ -527,6 +657,8 @@ pub enum Purpose {
     Step,
     /// A digest request made on the existing prefix before a re-weave.
     Digest,
+    /// The note request of a compaction.
+    Compact,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -677,6 +809,13 @@ pub struct ToolResult {
     pub meta: Map<String, Value>,
     #[serde(default)]
     pub duration_ms: u64,
+    /// Images the result carries (`read` of an image file). Skipped when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImageRef>,
+    /// The exchanges the tool made itself (`http_send`, `web_fetch`, MCP over HTTP): the session records one
+    /// `exchange` right after this result. Never serialized here: each is its own record.
+    #[serde(skip)]
+    pub exchanges: Vec<Exchange>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -695,6 +834,47 @@ pub struct Reweave {
     pub reason: String,
     pub before_tokens: u64,
     pub after_tokens_est: u64,
+}
+
+/// A compaction of the window (CONTRACTS-COMPACTION Part K). Records at or before `upto_seq` leave the
+/// window; nothing is deleted from the log. The weave renders the compaction item, then the records after
+/// `upto_seq`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Compaction {
+    /// Previous epoch + 1 (re-weaves count as epochs).
+    pub epoch: u32,
+    /// Records at or before this seq leave the window.
+    pub upto_seq: Seq,
+    /// `size`, `refused`, `stall`, `operator` or `fresh_start`.
+    pub reason: String,
+    /// The request size that triggered it (measured, else estimated).
+    pub before_tokens: u64,
+    /// Estimate of the first request after it.
+    pub after_tokens_est: u64,
+    /// The model's note; `None` when the note request failed.
+    #[serde(default)]
+    pub note: Option<String>,
+    #[serde(default)]
+    pub note_req: Option<String>,
+    /// The key table, rendered by the harness.
+    pub table: String,
+    /// Every key listed in `table`, in order.
+    #[serde(default)]
+    pub keys: Vec<String>,
+    /// Keys the note cited that do not exist; removed from it.
+    #[serde(default)]
+    pub dropped_keys: Vec<String>,
+    /// `fresh_start`: what the verifier objected to.
+    #[serde(default)]
+    pub objections: Option<String>,
+    /// The ledger brief (and frontier) at the time, as the session rendered it. Not in the contract's field
+    /// list: the weave is a pure function of the log and cannot reach the ledger.
+    #[serde(default)]
+    pub brief: String,
+    /// The size the session compacts at, which bounds the operator messages and pins the item carries.
+    /// `0` (an old or hand-written record) reads as 400 000.
+    #[serde(default)]
+    pub compact_at: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -893,9 +1073,57 @@ mod tests {
         Record { seq: 3, ts_ms: 1, author: Author::Harness, prev: "0".repeat(64), event }
     }
 
+    fn image() -> ImageRef {
+        ImageRef {
+            blob: "cd".repeat(32),
+            mime: "image/png".into(),
+            bytes: 9,
+            width: 4,
+            height: 3,
+            name: Some("a.png".into()),
+        }
+    }
+
+    #[test]
+    fn images_ride_a_user_message_and_a_tool_result_and_empty_ones_leave_no_trace() {
+        let plain = serde_json::to_string(&record(Event::UserMessage { text: "hi".into(), images: vec![] })).unwrap();
+        assert!(!plain.contains("images"), "{plain}");
+        // A line written before images existed reads, with none.
+        let back: Record = serde_json::from_str(&plain).unwrap();
+        assert_eq!(back.event, Event::UserMessage { text: "hi".into(), images: vec![] });
+        assert_eq!(serde_json::to_string(&back).unwrap(), plain, "old lines re-serialise byte for byte");
+
+        let r = record(Event::UserMessage { text: "hi".into(), images: vec![image()] });
+        let v: Value = serde_json::to_value(&r).unwrap();
+        assert_eq!(
+            v["images"],
+            json!([{"blob":"cd".repeat(32),"mime":"image/png","bytes":9,"width":4,"height":3,"name":"a.png"}])
+        );
+        assert_eq!(serde_json::from_value::<Record>(v).unwrap(), r);
+
+        let t = ToolResult {
+            exchanges: Vec::new(),
+            call_id: CallId::from("c1"),
+            name: "read".into(),
+            status: ToolStatus::Ok,
+            text: "x".into(),
+            output: None,
+            cut: false,
+            class: ToolClass::Read,
+            meta: Default::default(),
+            duration_ms: 1,
+            images: vec![image()],
+        };
+        let r = record(Event::ToolResult(t.clone()));
+        let s = serde_json::to_string(&r).unwrap();
+        assert_eq!(serde_json::from_str::<Record>(&s).unwrap(), r);
+        let none = serde_json::to_string(&record(Event::ToolResult(ToolResult { images: vec![], ..t }))).unwrap();
+        assert!(!none.contains("images"), "{none}");
+    }
+
     #[test]
     fn record_is_flat_and_tagged() {
-        let r = record(Event::UserMessage { text: "hi".into() });
+        let r = record(Event::UserMessage { text: "hi".into(), images: vec![] });
         let v: Value = serde_json::to_value(&r).unwrap();
         assert_eq!(v["kind"], "user_message");
         assert_eq!(v["text"], "hi");
@@ -957,7 +1185,11 @@ mod tests {
                     budget: budget(),
                     unattended: true,
                     schema: SCHEMA,
+                    intercept: false,
+                    target: None,
                     title: "t".into(),
+                    project_instructions: Vec::new(),
+                    mcp: Vec::new(),
                 }),
             ),
             (
@@ -975,7 +1207,7 @@ mod tests {
                     title: "t".into(),
                 }),
             ),
-            ("user_message", Event::UserMessage { text: "hi".into() }),
+            ("user_message", Event::UserMessage { text: "hi".into(), images: vec![] }),
             ("harness_note", Event::HarnessNote { note: NoteKind::Nudge, text: "n".into() }),
             ("turn_start", Event::TurnStart { trigger: Trigger::User }),
             (
@@ -1051,6 +1283,7 @@ mod tests {
             (
                 "tool_result",
                 Event::ToolResult(ToolResult {
+                    exchanges: Vec::new(),
                     call_id: c(),
                     name: "bash".into(),
                     status: ToolStatus::Ok,
@@ -1060,6 +1293,7 @@ mod tests {
                     class: ToolClass::Exec,
                     meta: Map::new(),
                     duration_ms: 5,
+                    images: Vec::new(),
                 }),
             ),
             (
@@ -1078,6 +1312,24 @@ mod tests {
                     reason: "target".into(),
                     before_tokens: 9,
                     after_tokens_est: 4,
+                }),
+            ),
+            (
+                "compaction",
+                Event::Compaction(Compaction {
+                    epoch: 2,
+                    upto_seq: 7,
+                    reason: "size".into(),
+                    before_tokens: 9,
+                    after_tokens_est: 4,
+                    note: Some("n".into()),
+                    note_req: Some("r-9".into()),
+                    table: "t".into(),
+                    keys: vec!["out:0123456789abcdef".into()],
+                    dropped_keys: vec!["out:ffffffffffffffff".into()],
+                    objections: None,
+                    brief: "b".into(),
+                    compact_at: 50_000,
                 }),
             ),
             ("pin", Event::Pin { call_id: c(), reason: "r".into() }),
@@ -1195,6 +1447,7 @@ mod tests {
     #[test]
     fn struct_variants_round_trip() {
         let r = record(Event::ToolResult(ToolResult {
+            exchanges: Vec::new(),
             call_id: CallId::from("c1"),
             name: "bash".into(),
             status: ToolStatus::Ok,
@@ -1204,6 +1457,7 @@ mod tests {
             class: ToolClass::Exec,
             meta: Map::new(),
             duration_ms: 5,
+            images: Vec::new(),
         }));
         let s = serde_json::to_string(&r).unwrap();
         assert_eq!(serde_json::from_str::<Record>(&s).unwrap(), r);

@@ -910,7 +910,7 @@ impl Core {
             let text = match &rec.event {
                 // The echo of an answered item carries the agent's own text in its header; only the operator's
                 // answer is authorization (the answer itself is in `InboxResolved`).
-                Event::UserMessage { text } => Some(crate::texts::without_inbox_echo(text).to_string()),
+                Event::UserMessage { text, .. } => Some(crate::texts::without_inbox_echo(text).to_string()),
                 Event::InboxResolved { answer, .. } => Some(answer.clone()),
                 _ => None,
             };

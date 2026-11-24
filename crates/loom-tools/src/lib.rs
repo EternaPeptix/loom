@@ -27,6 +27,16 @@
 //!   bytes would be (handle, line count, cut marker), so it is cut explicitly with a handle;
 //! - anything within `budget` is unchanged, byte for byte.
 //!
+//! Step 1 goes through [`dialect::adapt`] (`docs/TOOL-SHAPES.md`): the call's name and arguments are
+//! converted into loom's internal shape first, its notes lead `notes`, and a refusal lists the tool's
+//! parameters (and names them in its problem lines) as the session's `ToolsCfg::dialect` presents them.
+//! `adapt` can answer without a tool (`think` -> an ok result "Noted.", returned as the `Err` record),
+//! refuse, or return a batch: a Codex `apply_patch` over several files is several checked steps in one
+//! [`Prepared`]. All steps are checked before any runs (one failure refuses all, naming each file),
+//! then they run in order, stopping at the first that does not succeed; the one result joins the
+//! steps' texts under `` `tool` path `` lines, its status is the worst step's, and a batch is never
+//! started early ([`Prepared::speculative`]).
+//!
 //! The three steps are also public on their own ([`prepare`], [`Prepared::run`], [`Ran::finish`]), so
 //! that a call of a [`Tool::speculative`] tool can run before its turn and be finished — stored and
 //! admitted with the admission of that moment — only when the session claims it.
@@ -52,10 +62,12 @@ pub mod capabilities;
 pub mod codec;
 pub mod cve;
 pub mod depscan;
+pub mod dialect;
 pub mod files;
 pub mod fstools;
 pub mod http;
 pub mod jobs;
+pub mod mcp;
 pub mod oracle;
 pub mod outputs;
 pub mod outview;
@@ -66,6 +78,7 @@ pub mod pty;
 pub mod sandbox;
 pub mod schema;
 pub mod search;
+pub mod traffic;
 pub mod view;
 pub mod web;
 pub mod workcopy;
@@ -112,6 +125,46 @@ pub struct ToolCtx {
     /// The most characters the text of a view (`read`, `out_read`, `out_grep`, other numbered views)
     /// may hold: `AdmitPolicy::view_chars` of the session's admission when the call was started.
     pub view_chars: usize,
+    /// The session's shell directory: where `bash` runs when it is given no `cwd`. Clones of the context
+    /// share it; a child agent or fork starts with its own, empty one.
+    pub shell: Arc<bash::ShellState>,
+}
+
+/// Reserved meta key: the exchanges a tool made itself (`Vec<loom_core::event::Exchange>`). `finalize` moves
+/// them to `ToolResult::exchanges`; they never reach the record's meta.
+pub const META_EXCHANGES: &str = "\u{0}exchanges";
+
+/// Reserved `ToolOutput::meta` key that carries a tool's images to `finalize`; never written to a record.
+pub const META_IMAGES: &str = "\u{0}images";
+
+/// Meta `complete`: `false` when the result did not cover everything it was asked about; absent otherwise.
+pub const META_COMPLETE: &str = "complete";
+/// Meta `limits`: the short words (`cut`, `timeout`, `idle stop`, `output limit`, `net denied`,
+/// `unreadable skipped`, `search cap`, `child incomplete`) that say how. A tool may put its own words here;
+/// [`finalize`] adds the ones it can tell from the result and sets `complete`.
+pub const META_LIMITS: &str = "limits";
+/// Meta `net_denied`: how many proxy connections were denied during a `bash`/`box_exec` call.
+pub const META_NET_DENIED: &str = "net_denied";
+
+/// Add `word` to the `limits` of `meta` (once) and mark the result `complete: false`.
+pub fn add_limit(meta: &mut Map<String, Value>, word: &str) {
+    let mut list: Vec<Value> = match meta.remove(META_LIMITS) {
+        Some(Value::Array(a)) => a,
+        _ => Vec::new(),
+    };
+    if !list.iter().any(|v| v.as_str() == Some(word)) {
+        list.push(json!(word));
+    }
+    meta.insert(META_LIMITS.into(), Value::Array(list));
+    meta.insert(META_COMPLETE.into(), json!(false));
+}
+
+/// The limits recorded in a result's meta.
+pub fn limits_of(meta: &Map<String, Value>) -> Vec<String> {
+    match meta.get(META_LIMITS) {
+        Some(Value::Array(a)) => a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// What a tool hands back.
@@ -174,6 +227,29 @@ impl ToolOutput {
 
     pub fn with_meta(mut self, key: &str, value: Value) -> ToolOutput {
         self.meta.insert(key.to_string(), value);
+        self
+    }
+
+    /// Say that this result did not cover everything, by one of the words of [`META_LIMITS`].
+    pub fn with_limit(mut self, word: &str) -> ToolOutput {
+        add_limit(&mut self.meta, word);
+        self
+    }
+
+    /// Images the result carries (already stored in the blob store). `finalize` moves them out of `meta`
+    /// (the reserved key [`META_IMAGES`]) into `ToolResult::images`, so they never reach the record's meta.
+    /// Attach the exchanges this call made (C3). The tool stored the messages as blobs already.
+    pub fn with_exchanges(mut self, exchanges: &[loom_core::event::Exchange]) -> ToolOutput {
+        if !exchanges.is_empty() {
+            self.meta.insert(META_EXCHANGES.to_string(), json!(exchanges));
+        }
+        self
+    }
+
+    pub fn with_images(mut self, images: &[loom_core::ImageRef]) -> ToolOutput {
+        if !images.is_empty() {
+            self.meta.insert(META_IMAGES.to_string(), json!(images));
+        }
         self
     }
 }
@@ -276,20 +352,10 @@ impl Registry {
     }
 }
 
-/// Map common model training tool-name aliases to Loom's canonical tool name.
-/// Callers must still verify the canonical tool exists in [`Registry`] before running it.
+/// Map a tool-call name that is not a loom tool name to the loom tool it stands for (the table is
+/// `dialect`'s, `docs/TOOL-SHAPES.md` section 2). Callers must still verify the tool is in the [`Registry`].
 pub fn canonical_tool_alias(name: &str) -> Option<&'static str> {
-    match name {
-        "read_file" | "view_file" | "open_file" => Some("read"),
-        "write_file" | "create_file" => Some("write"),
-        "edit_file" | "str_replace" | "str_replace_editor" | "replace_in_file" | "apply_patch" => Some("edit"),
-        "shell" | "run_command" | "execute_command" | "exec" | "terminal" => Some("bash"),
-        "search_files" | "ripgrep" | "rg" | "grep_search" => Some("grep"),
-        "find_files" | "list_files" | "list_dir" => Some("glob"),
-        "todo_write" | "update_plan" => Some("plan"),
-        "task" | "subagent" | "spawn_agent" => Some("agent_spawn"),
-        _ => None,
-    }
+    dialect::alias_tool(name)
 }
 
 /// How output is admitted for this call.
@@ -316,11 +382,19 @@ pub async fn execute(
     }
 }
 
-/// A call whose tool was found and whose arguments passed checking: [`execute`] up to running it.
-pub struct Prepared {
+/// One checked call inside a [`Prepared`].
+struct Step {
     tool: Arc<dyn Tool>,
     spec: ToolSpec,
     checked: schema::Checked,
+}
+
+/// A call whose tool was found and whose arguments passed checking: [`execute`] up to running it.
+/// It holds one step, or several when one model call stands for many (a Codex `apply_patch` over
+/// several files): every step was checked before any runs, the steps run in order, and the result is
+/// one combined result ([`Prepared::run`]).
+pub struct Prepared {
+    steps: Vec<Step>,
     started: Instant,
 }
 
@@ -333,48 +407,195 @@ pub struct Ran {
 }
 
 /// Look the tool up and check the arguments: the first part of [`execute`]. `Err` is the record of
-/// the refused call, exactly as `execute` returns it.
+/// the refused call (or of a call that needs no tool, such as `think`), exactly as `execute` returns it.
 pub fn prepare(registry: &Registry, ctx: &ToolCtx, name: &str, arguments: &str) -> Result<Prepared, Box<ToolResult>> {
+    use dialect::Adapt;
     let started = Instant::now();
-    let Some((tool, alias)) = registry.resolve(name) else {
-        let message = unknown_tool_message(name, &registry.names());
-        return Err(Box::new(refused(ctx, name, ToolClass::State, message, started)));
+    let dialect = ctx.cfg.dialect;
+    let parsed: Value = match serde_json::from_str(if arguments.trim().is_empty() { "{}" } else { arguments }) {
+        Ok(v) => v,
+        Err(e) => {
+            // The tool the name stands for, when there is one, gives the refusal its class and wording.
+            let tool = registry.resolve(name).map(|(t, _)| t);
+            let (shown, class) = tool.map_or((name.to_string(), ToolClass::State), |t| {
+                let s = t.spec();
+                (s.name, s.class)
+            });
+            return Err(Box::new(refused(ctx, name, class, not_json_message(&shown, &e, arguments), started)));
+        }
+    };
+    match dialect::adapt(name, parsed, dialect, &|t| registry.get(t).is_some()) {
+        Adapt::Unknown => {
+            let message = unknown_tool_message(name, &registry.names());
+            Err(Box::new(refused(ctx, name, ToolClass::State, message, started)))
+        }
+        Adapt::Refuse(message) => Err(Box::new(refused(ctx, name, ToolClass::State, message, started))),
+        Adapt::Noop(text) => {
+            let facts = Facts { tool: name.to_string(), outcome: "ok".into(), more: Vec::new(), notes: None };
+            Err(Box::new(ToolResult {
+                call_id: ctx.call_id.clone(),
+                name: name.to_string(),
+                status: ToolStatus::Ok,
+                text: envelope_plain(&facts, &text),
+                output: None,
+                cut: false,
+                class: ToolClass::State,
+                meta: Map::new(),
+                duration_ms: started.elapsed().as_millis() as u64,
+                images: Vec::new(),
+                exchanges: Vec::new(),
+            }))
+        }
+        Adapt::Run(call) => {
+            let step = check_step(registry, call, dialect)
+                .map_err(|(class, msg)| Box::new(refused(ctx, name, class, msg, started)))?;
+            Ok(Prepared { steps: vec![step], started })
+        }
+        Adapt::Batch(calls) => {
+            let mut steps = Vec::new();
+            let mut class = ToolClass::State;
+            let mut problems = Vec::new();
+            for call in calls {
+                let label = batch_label(&call);
+                match check_step(registry, call, dialect) {
+                    Ok(step) => steps.push(step),
+                    Err((c, msg)) => {
+                        class = c;
+                        problems.push(format!("{label}: {msg}"));
+                    }
+                }
+            }
+            if !problems.is_empty() {
+                let message = format!(
+                    "This call changes several files and one of them cannot be applied, so none was changed.\n{}",
+                    problems.join("\n")
+                );
+                return Err(Box::new(refused(ctx, name, class, message, started)));
+            }
+            Ok(Prepared { steps, started })
+        }
+    }
+}
+
+/// The file a batch entry is about, for the lines that name it.
+fn batch_label(call: &dialect::Adapted) -> String {
+    let path = call.args.get("path").and_then(Value::as_str).unwrap_or("?");
+    format!("`{}` {path}", call.tool)
+}
+
+/// Normalise and check one adapted call against its tool. `Err` is the class and refusal message.
+fn check_step(
+    registry: &Registry,
+    call: dialect::Adapted,
+    dialect: loom_core::config::Dialect,
+) -> Result<Step, (ToolClass, String)> {
+    let Some(tool) = registry.get(&call.tool) else {
+        return Err((ToolClass::State, unknown_tool_message(&call.tool, &registry.names())));
     };
     let spec = tool.spec();
-    match check_arguments(&spec, arguments) {
+    match check_value(&spec, call.args, dialect) {
         Ok(mut checked) => {
-            if let Some(canon) = alias {
-                checked.notes.insert(0, format!("tool alias: called `{name}`, ran `{canon}`"));
-            }
-            Ok(Prepared { tool, spec, checked, started })
+            checked.notes.splice(0..0, call.notes);
+            Ok(Step { tool, spec, checked })
         }
-        Err(msg) => Err(Box::new(refused(ctx, name, spec.class, msg, started))),
+        Err(msg) => Err((spec.class, msg)),
     }
 }
 
 impl Prepared {
-    /// See [`Tool::speculative`].
+    /// See [`Tool::speculative`]. A call of several steps is never started early.
     pub fn speculative(&self) -> bool {
-        self.tool.speculative()
+        matches!(self.steps.as_slice(), [only] if only.tool.speculative())
     }
 
-    /// Run the tool. A panic inside it becomes an error output.
+    /// Run the tool. A panic inside it becomes an error output. Several steps run in order and stop at
+    /// the first that does not succeed; their results are joined under the file each is about, the
+    /// status is the worst one, and the steps after a failure are named as not run.
     pub async fn run(self, ctx: &ToolCtx) -> Ran {
-        let Prepared { tool, spec, checked, started } = self;
-        let ran = std::panic::AssertUnwindSafe(tool.run(ctx, &checked.args)).catch_unwind().await;
-        let mut output = match ran {
-            Ok(o) => o,
-            Err(_) => ToolOutput::error(format!(
-                "The `{}` tool failed internally while handling this call (a harness fault, not a problem with the arguments). Its effects, if any, are unknown — check the state it would have changed before repeating the call.",
-                spec.name
-            )),
-        };
-        if !checked.notes.is_empty() {
-            output.meta.insert(META_REPAIRED.into(), json!(true));
-            output.more.extend(checked.notes);
+        let Prepared { steps, started } = self;
+        if steps.len() == 1 {
+            let Some(step) = steps.into_iter().next() else { unreachable!("one step") };
+            let (spec, output) = run_step(ctx, step).await;
+            return Ran { spec, output, took: started.elapsed() };
         }
+        let total = steps.len();
+        let mut spec = None;
+        let mut parts: Vec<String> = Vec::new();
+        let mut worst = ToolStatus::Ok;
+        let mut done = 0;
+        let mut failed = false;
+        for step in steps {
+            let path = step.checked.args.get("path").and_then(Value::as_str).unwrap_or("?").to_string();
+            let label = format!("`{}` {path}", step.spec.name);
+            if failed {
+                parts.push(format!("{label}: not run (an earlier file failed)."));
+                continue;
+            }
+            let (s, output) = run_step(ctx, step).await;
+            spec.get_or_insert(s);
+            if output.status == ToolStatus::Ok {
+                done += 1;
+            } else {
+                failed = true;
+            }
+            if status_rank(output.status) > status_rank(worst) {
+                worst = output.status;
+            }
+            let body = match &output.body {
+                Body::Message(t) => t.clone(),
+                Body::Raw(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+                Body::View { text, .. } | Body::ProducedView { text, .. } => text.clone(),
+            };
+            let head = if output.more.is_empty() {
+                output.outcome.clone()
+            } else {
+                format!("{} ({})", output.outcome, output.more.join(", "))
+            };
+            parts.push(format!("{label}: {head}\n{}", body.trim_end()));
+        }
+        let Some(spec) = spec else { unreachable!("several steps ran at least one") };
+        let outcome = if failed {
+            format!("{done} of {total} applied, then stopped")
+        } else {
+            format!("{done} of {total} applied")
+        };
+        let output = ToolOutput {
+            status: worst,
+            outcome,
+            more: Vec::new(),
+            body: Body::Message(parts.join("\n\n")),
+            meta: Map::new(),
+        };
         Ran { spec, output, took: started.elapsed() }
     }
+}
+
+fn status_rank(s: ToolStatus) -> u8 {
+    match s {
+        ToolStatus::Ok => 0,
+        ToolStatus::Error => 1,
+        ToolStatus::Invalid => 2,
+        ToolStatus::Denied => 3,
+        ToolStatus::Timeout => 4,
+        ToolStatus::Interrupted => 5,
+    }
+}
+
+async fn run_step(ctx: &ToolCtx, step: Step) -> (ToolSpec, ToolOutput) {
+    let Step { tool, spec, checked } = step;
+    let ran = std::panic::AssertUnwindSafe(tool.run(ctx, &checked.args)).catch_unwind().await;
+    let mut output = match ran {
+        Ok(o) => o,
+        Err(_) => ToolOutput::error(format!(
+            "The `{}` tool failed internally while handling this call (a harness fault, not a problem with the arguments). Its effects, if any, are unknown — check the state it would have changed before repeating the call.",
+            spec.name
+        )),
+    };
+    if !checked.notes.is_empty() {
+        output.meta.insert(META_REPAIRED.into(), json!(true));
+        output.more.extend(checked.notes);
+    }
+    (spec, output)
 }
 
 impl Ran {
@@ -385,31 +606,60 @@ impl Ran {
     }
 }
 
+fn not_json_message(name: &str, e: &serde_json::Error, arguments: &str) -> String {
+    format!(
+        "The arguments were not valid JSON ({e}).\nWhat was received:\n{}\nNothing was executed. Call `{name}` again with a JSON object as arguments.",
+        preview(arguments, 600)
+    )
+}
+
 /// Parse a call's raw arguments text and check it against the tool's parameters. The error is the
 /// complete refusal message for the model. Public so that runtime-owned tools share the same path.
+/// Arguments are checked as given (no dialect): runtime tools are shown in their own names.
 pub fn check_arguments(spec: &ToolSpec, arguments: &str) -> Result<schema::Checked, String> {
     let name = &spec.name;
-    let mut parsed: Value = match serde_json::from_str(if arguments.trim().is_empty() { "{}" } else { arguments }) {
+    let parsed: Value = match serde_json::from_str(if arguments.trim().is_empty() { "{}" } else { arguments }) {
         Ok(v) => v,
-        Err(e) => {
-            return Err(format!(
-                "The arguments were not valid JSON ({e}).\nWhat was received:\n{}\nNothing was executed. Call `{name}` again with a JSON object as arguments.",
-                preview(arguments, 600)
-            ));
-        }
+        Err(e) => return Err(not_json_message(name, &e, arguments)),
     };
+    check_value(spec, parsed, loom_core::config::Dialect::Loom)
+}
+
+/// Normalise and check parsed arguments against `spec`. When the model is shown the `dialect`'s
+/// presentation of the tool, the refusal lists the parameters as the model was shown them.
+fn check_value(
+    spec: &ToolSpec,
+    mut parsed: Value,
+    dialect: loom_core::config::Dialect,
+) -> Result<schema::Checked, String> {
+    let name = &spec.name;
     let mut notes = schema::normalize_for_tool(name, &mut parsed);
     notes.extend(schema::prepare_for_spec(&spec.parameters, &mut parsed));
-    let mut checked = schema::check(&spec.parameters, &parsed).map_err(|problems| {
+    let checker = if name.starts_with("mcp__") { schema::check_mcp } else { schema::check };
+    let mut checked = checker(&spec.parameters, &parsed).map_err(|problems| {
         let mut msg = String::from("The arguments do not fit this tool:\n");
+        let internal: Vec<&str> = spec
+            .parameters
+            .get("properties")
+            .and_then(Value::as_object)
+            .map(|m| m.keys().map(String::as_str).collect())
+            .unwrap_or_default();
         for p in &problems {
+            let mut line = p.clone();
+            for key in &internal {
+                let shown = dialect::presented_arg(name, key, dialect);
+                if shown != *key {
+                    line = line.replace(&format!("`{key}`"), &format!("`{shown}`"));
+                }
+            }
             msg.push_str("- ");
-            msg.push_str(p);
+            msg.push_str(&line);
             msg.push('\n');
         }
+        let shown = dialect::present(spec, dialect);
         msg.push_str(&format!(
             "Nothing was executed. Call `{name}` again with corrected arguments. Its parameters are:\n{}",
-            schema::describe(&spec.parameters)
+            schema::describe(&shown.parameters)
         ));
         msg
     })?;
@@ -429,18 +679,43 @@ pub fn finalize(
     started: Instant,
 ) -> ToolResult {
     let ToolOutput { status, outcome, more, body, mut meta } = output;
+    let outcome_text = outcome.clone();
     let mut facts = Facts { tool: spec.name.clone(), outcome, more, notes: None };
     let duration_ms = started.elapsed().as_millis() as u64;
-    let base = |status, text, output, cut, meta| ToolResult {
-        call_id: ctx.call_id.clone(),
-        name: spec.name.clone(),
-        status,
-        text,
-        output,
-        cut,
-        class: spec.class,
-        meta,
-        duration_ms,
+    let exchanges: Vec<loom_core::event::Exchange> =
+        meta.remove(META_EXCHANGES).and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
+    let images: Vec<loom_core::ImageRef> =
+        meta.remove(META_IMAGES).and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
+    let derived: Vec<&str> = {
+        let mut d = Vec::new();
+        if status == ToolStatus::Timeout {
+            d.push(if outcome_text.contains("no output during idle") { "idle stop" } else { "timeout" });
+        }
+        if outcome_text.starts_with("stopped: output passed") {
+            d.push("output limit");
+        }
+        d
+    };
+    let base = |status, text, output, cut: bool, mut meta: Map<String, Value>| {
+        for word in &derived {
+            add_limit(&mut meta, word);
+        }
+        if cut {
+            add_limit(&mut meta, "cut");
+        }
+        ToolResult {
+            call_id: ctx.call_id.clone(),
+            name: spec.name.clone(),
+            status,
+            text,
+            output,
+            cut,
+            class: spec.class,
+            meta,
+            duration_ms,
+            images: images.clone(),
+            exchanges: exchanges.clone(),
+        }
     };
     // A view sized for the bound the call ran with is not cut for a lower one that came after it.
     let budget = ctx.view_chars.max(admission.policy.view_chars(admission.estimator));
@@ -484,7 +759,7 @@ pub fn finalize(
             let stored = match ctx.blobs.put_bytes(normalized.text.as_bytes()) {
                 Ok(b) => b,
                 Err(e) => {
-                    return base(ToolStatus::Error, storage_failure(&facts, &normalized.text, &e), None, true, meta)
+                    return base(ToolStatus::Error, storage_failure(&facts, &normalized.text, &e), None, true, meta);
                 }
             };
             if normalized.changed {
@@ -547,6 +822,8 @@ pub fn refused(ctx: &ToolCtx, name: &str, class: ToolClass, message: String, sta
         class,
         meta: Map::new(),
         duration_ms: started.elapsed().as_millis() as u64,
+        images: Vec::new(),
+        exchanges: Vec::new(),
     }
 }
 
@@ -614,7 +891,10 @@ pub mod testutil {
 
     /// Workspace `<dir>/ws`, temp `<dir>/tmp`, loom home `<dir>/home`; sandbox mode `none`.
     pub fn env() -> TestEnv {
-        env_with(ToolsCfg::default(), SandboxCfg { mode: SandboxMode::None, ..SandboxCfg::default() })
+        env_with(
+            ToolsCfg { dialect: loom_core::config::Dialect::Loom, ..ToolsCfg::default() },
+            SandboxCfg { mode: SandboxMode::None, ..SandboxCfg::default() },
+        )
     }
 
     pub fn env_with(cfg: ToolsCfg, sandbox_cfg: SandboxCfg) -> TestEnv {
@@ -662,6 +942,7 @@ pub mod testutil {
             cancel: CancellationToken::new(),
             capabilities: Arc::new(capabilities::SessionTools::default()),
             view_chars: AdmitPolicy::default().view_chars(&TokenEstimator::default()),
+            shell: Arc::new(bash::ShellState::default()),
         };
         TestEnv {
             dir,
@@ -920,7 +1201,7 @@ mod tests {
         let unregistered = e.call("todo_write", json!({"action": "list"})).await;
         assert_eq!(unregistered.status, ToolStatus::Invalid);
         assert!(unregistered.meta.get("repaired").is_none());
-        assert_eq!(body_of(&unregistered.text), unknown_tool_message("todo_write", &registered));
+        assert_eq!(body_of(&unregistered.text), "`todo_write` runs `plan`, which this role does not have.");
 
         let unknown = e.call("reed", json!({})).await;
         assert_eq!(unknown.status, ToolStatus::Invalid);

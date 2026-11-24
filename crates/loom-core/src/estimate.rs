@@ -2,6 +2,11 @@
 //!
 //! Sizes inside loom are estimates (characters divided by a ratio). After every request the agent
 //! layer feeds back the server's `prompt_tokens` for the characters it sent, and the ratio follows.
+//!
+//! An image costs `ImageRef::est_tokens`, not characters: `tokens_for_messages` adds the images of its messages
+//! while the estimator is told the model takes images (`set_vision(true)`; a model that does not gets a sentence
+//! in the text instead, which the characters already count). `image_tokens` is that sum, for taking it out of
+//! the server's count before `calibrate`.
 
 use crate::message::Message;
 use serde::{Deserialize, Serialize};
@@ -18,17 +23,19 @@ const PER_MESSAGE: u64 = 4;
 pub struct TokenEstimator {
     chars_per_token: f64,
     samples: u32,
+    #[serde(default)]
+    vision: bool,
 }
 
 impl Default for TokenEstimator {
     fn default() -> Self {
-        Self { chars_per_token: START_RATIO, samples: 0 }
+        Self { chars_per_token: START_RATIO, samples: 0, vision: false }
     }
 }
 
 impl TokenEstimator {
     pub fn with_ratio(chars_per_token: f64) -> Self {
-        Self { chars_per_token: chars_per_token.clamp(MIN_RATIO, MAX_RATIO), samples: 0 }
+        Self { chars_per_token: chars_per_token.clamp(MIN_RATIO, MAX_RATIO), samples: 0, vision: false }
     }
 
     pub fn ratio(&self) -> f64 {
@@ -49,8 +56,26 @@ impl TokenEstimator {
         (tokens as f64 * self.chars_per_token).floor() as usize
     }
 
+    /// Count the images of messages (the model takes images) or not.
+    pub fn set_vision(&mut self, vision: bool) {
+        self.vision = vision;
+    }
+
+    pub fn vision(&self) -> bool {
+        self.vision
+    }
+
+    /// Tokens of the images of `messages` (0 while the model does not take images).
+    pub fn image_tokens(&self, messages: &[Message]) -> u64 {
+        if !self.vision {
+            return 0;
+        }
+        messages.iter().flat_map(|m| m.images.iter()).map(crate::image::ImageRef::est_tokens).sum()
+    }
+
     pub fn tokens_for_messages(&self, messages: &[Message]) -> u64 {
-        messages.iter().map(|m| self.tokens(m.chars()) + PER_MESSAGE).sum()
+        let text: u64 = messages.iter().map(|m| self.tokens(m.chars()) + PER_MESSAGE).sum();
+        text.saturating_add(self.image_tokens(messages))
     }
 
     /// Feed back one observation: `chars` characters were sent and the server counted `prompt_tokens`.
@@ -97,6 +122,27 @@ mod tests {
         assert!((e.ratio() - 3.0).abs() < 0.01);
         e.calibrate(1_000_000, 2_000);
         assert!(e.ratio() <= MAX_RATIO);
+    }
+
+    #[test]
+    fn images_cost_their_pixels_only_for_a_vision_model() {
+        use crate::image::ImageRef;
+        let img = |w: u32, h: u32| ImageRef {
+            blob: "ab".repeat(32),
+            mime: "image/png".into(),
+            bytes: 1,
+            width: w,
+            height: h,
+            name: None,
+        };
+        let mut m = Message::user("");
+        m.images = vec![img(300, 300), img(10, 10), img(4000, 4000)];
+        let mut e = TokenEstimator::with_ratio(4.0);
+        assert_eq!(e.image_tokens(std::slice::from_ref(&m)), 0);
+        e.set_vision(true);
+        // ceil(90000 / 750) = 120; the floor is 85; the ceiling is 2000.
+        assert_eq!(e.image_tokens(std::slice::from_ref(&m)), 120 + 85 + 2000);
+        assert_eq!(e.tokens_for_messages(std::slice::from_ref(&m)), e.tokens(m.chars()) + PER_MESSAGE + 2205);
     }
 
     #[test]

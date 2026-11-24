@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### Monitor and main (604e342) together
+
+- **An intercepted tunnel is bound and cut like an opaque one.** The first flight of a tunnel is read and its server name
+  bound to the `CONNECT` host (E4c) before interception takes the client's handshake, so a hello the binding refuses is
+  never intercepted; a cut or a shutdown ends an intercepted tunnel at once (main's interception watched only the
+  shutdown). A captured `http://` request that a cut ends is captured with the cut's reason.
+- **The policies of new paths keep the floor.** A session's policy is its grants, its MCP servers' hosts and its
+  target's scope, then the revoked hosts, then the infrastructure deny (E1), which still comes first in every check; the
+  grant of the daemon's MCP check has the infrastructure deny too, and its sandbox withholds the model profiles a
+  session's sandbox withholds (every profile since the start, reloaded ones included). A stdio MCP server starts under
+  the session's process limit (E3), as every sandboxed command does.
+- **The monitor reads calls as the tool dialect runs them.** The path, URL and content tripwires read what
+  `dialect::adapt` makes of a call (a Codex `apply_patch` becomes one call per file it names; a fetch that names its
+  page only in `prompt` fetches that page), so a git hook added through `apply_patch` and a metadata page fetched
+  through `prompt` are seen. A claim's `assets` are read as ledger prose.
+
 ### Monitor and tolerant tool calls together
 
 - **The monitor reads a repaired call as it runs.** The executor accepts other spellings of tool and argument names
@@ -261,6 +277,126 @@
   parameters and limits; canaries; fleet joins; and the fixed sentences an agent may ever see. Nothing calls it; every
   function a later phase fills returns `MonitorError::NotBuilt`, so a premature caller fails closed. No serialized shape,
   route, command, configuration key or session record changed.
+
+### Captured exchanges and HTTPS interception (loom-net)
+
+- `Proxy::grant_with_capture` captures a session's forwarded `http://` requests (head as the destination saw it,
+  bodies up to `max_bytes`, true sizes) and sends them to a sink. With `intercept` and a loom CA (`tls::Ca`,
+  ECDSA P-256, key mode 0600, per-host 24 h leaves, `ca_bundle`), an allowed `CONNECT` is TLS-terminated, relayed
+  to a verified (or `upstream_insecure`) upstream and captured request by request; a non-HTTP stream is recorded as
+  `TLS`. A session granted with `grant` is relayed exactly as before.
+- Every HTTP exchange of a session is an `exchange` record in its log (CONTRACTS-TRAFFIC-TARGETS C): the proxy's
+  captures (stored as blobs, attributed to the running call) and the exchanges of `http_send`, `http_repeat`,
+  `web_fetch` and MCP over HTTP, which exist even when the proxy does not capture. `http_repeat` accepts an `ex-`
+  id and replays from the log after a restart. The compaction key table lists the newest exchanges.
+- `[network] intercept = "pack" | "always" | "never"`, pack key `intercept = true` (ctf, redteam, vr),
+  `intercept` on a new session, `loom run --no-intercept`; recorded in `session_start`, inherited by children.
+  An intercepting session gets a CA bundle in its tmp dir and the trust environment variables; the CA key under
+  the loom home is never readable from the sandbox. New `[network]` keys: `capture_max_bytes`,
+  `capture_max_exchanges`, `intercept_passthrough`, `upstream_roots`.
+- `require_traffic` roles (the finishing roles of ctf, redteam, vr) cannot `finish` or `conclude` `met` while a
+  claim names a host no supporting evidence reached; `claim` takes optional `assets`.
+
+### Targets
+
+- A target (`~/.loom/targets/{name}`) is a named scope shared across missions with a hash-chained `graph.jsonl`
+  of hosts, services and endpoints, their coverage and findings (CONTRACTS-TRAFFIC-TARGETS T1 to T7).
+  `loom run --target`, the `target` field of `POST /api/sessions`, `loom target list|add|show|scope`,
+  `loom ca show|rotate`, `/api/targets*` and `/api/exchanges/{session}`. The scope joins the mission's network
+  policy (reachable in `deny_all`, exclusions always refused); the lead's prompt gets a `# Target` section and
+  `security_query` has a `target` view. A mission without a target is unchanged.
+
+### MCP client
+
+- `loom-tools` has an MCP client (CONTRACTS-MCP M2, M3, M5): stdio servers run as sandboxed children and
+  Streamable HTTP servers go through the session's egress proxy; `McpTool` presents a server tool as
+  `mcp__{server}__{tool}` and maps its result (text, images, resources, `structuredContent`, `isError`, JSON-RPC
+  errors, timeouts) to a tool output. `mcp.servers.*` config is checked, and a literal `env`/`headers` value is
+  warned about. Resolved secrets never reach an output, error or `Debug` text.
+### MCP servers become tools
+
+- New `[mcp]` configuration: stdio (`command`) and Streamable HTTP (`url`) servers whose tools are offered as
+  `mcp__{server}__{tool}`. A mission's lead lists each server whose `roles` match once and records the listing in
+  `session_start.mcp`; children and reopened sessions reuse it. Role selection (`roles`, `read_only`, `tools`), a
+  `max_schema_tokens` budget per role and a start note saying what each server gave and what was left out.
+- A server's `hosts` are added to the allowed hosts of sessions whose role gets it (they reach `bash` too).
+- `GET /api/sessions/{id}/mcp`, `POST /api/mcp/{server}/check`, `loom mcp list`, `loom mcp check`.
+- A session without `[mcp]` sends the same requests as before. Secret values are never recorded or logged.
+
+### Hypotheses and the rule engine leave the harness
+
+- `security_record` no longer takes `hypothesis_open`, `hypothesis_priority`, `hypothesis_evidence`,
+  `hypothesis_verdict`, `rule_install` or `rule_retract`; a call is refused with "Hypotheses are not recorded in
+  the security state any more: write the idea as a note (`note` with kind `decision`) or test it and record what
+  the run showed." `security_query` no longer has `hypotheses`, `facts`, `why`, `what_if` or `path_suggest`. The
+  Datalog module, `projection()` and `path_suggest()` are gone with their tests; the HUD, the prior-mission brief
+  and the frontier no longer carry hypotheses or derived facts.
+- Older logs stay readable: the six operations keep their serde variants and change nothing when applied; a
+  snapshot with `hypotheses`, `rules`, `died` or `retraction_limitation` loads and drops them. `SecurityState`
+  lost those fields (nothing is renamed; nothing new is serialized).
+- Repairs instead of refusals: a host given with a scheme, port, path or credentials is recorded as the host;
+  a service or endpoint URL without a scheme gets `https://` for port 443 and `http://` otherwise; `ops` is read
+  as `operations` (also when `action` is missing). Each is said under `normalized`.
+### Compaction replaces re-weave
+
+- A session's window is bounded by compaction (CONTRACTS-COMPACTION Part K). When a request reaches `compact_at`
+  (`[context] compact_at_tokens`, 0 = 40% of the model's window, at most 400 000), when the server refuses a request,
+  when a large request stalls three times, when the operator asks (`POST /api/sessions/{id}/compact`, `loom compact`;
+  `/reweave` and `loom reweave` stay as aliases) or when a lead's finish is not accepted, the model writes a note
+  (`model_request` purpose `compact`, same window and tools as the last step), the harness builds a table of keys for
+  every output, file, agent and job, and a `compaction` record is appended. The next request is the system message,
+  one `<harness kind="compaction">` item (operator messages, ledger, pins, key table, note) and the records after
+  `upto_seq`. Nothing is deleted from the log. A failed note request still compacts, with no note.
+- The weave starts at the latest compaction, so its cost no longer grows with the age of the session.
+- New event `compaction`; `reweave` records of old logs still load and render as they did until the first compaction;
+  no new `reweave` record is written. New purpose `compact` (`digest` stays readable). No more stubs, evictions or
+  digest request for new records.
+- `[context]` keys `target_tokens`, `floor_tokens`, `keep_recent_steps` and `stub_tail_lines` are accepted, ignored and
+  warned about at startup; `target_tokens` is read as `compact_at_tokens` when that is absent.
+- `GET /api/sessions/{id}/records?before=<seq>&limit=n` pages backward and answers `prev_before`; `after` and
+  `before` together are a 400. `WindowView.fold_at` is `compact_at`.
+
+### The shell directory persists between `bash` calls
+
+- A session has one shell directory (`ToolCtx::shell`, new field): a `bash` call without `cwd` runs where the last
+  call left the shell, so `cd dir` carries over (variables still do not). The result says `cwd now {dir}` and
+  carries the new `ToolResult::meta` key `cwd` (`META_CWD`); a removed directory resets to the workspace with a
+  fact; a reopened session restores it from the last such result. Older logs stay readable. The tool descriptions
+  no longer tell the model to `cd` in every command.
+
+### Queued messages
+
+- `POST /api/sessions/{id}/messages` takes `when: "now" | "after_turn"`. A message sent `after_turn` while the lead
+  is in a turn is kept on disk (`queued/`) and recorded as a `user_message` when the turn ends; the first starts the
+  next turn and the rest arrive with it. `GET /api/sessions/{id}/queued`, `PUT`/`DELETE .../queued/{qid}` and
+  `POST .../queued/{qid}/send` list, edit, remove and send one now; the event streams send `{type:"queued",session}`
+  on every change. A stop keeps the queue; archiving discards it. `loom send --after-turn`.
+
+### Evidence quotes by text; project instructions
+
+- `evidence` and `claim` lead with quoting by text: copy the exact text from an output you were shown; line numbers
+  are not needed. A quote that occurs more than once is refused with every place listed (`line {n}: {line}`, at most
+  10) and `start` picks one. A quote that matches in one place once spacing and line ends are ignored is taken, and
+  the result says which lines.
+- The workspace's `AGENTS.md` and `CLAUDE.md` go into each new session's system prompt (`# Project instructions`),
+  recorded in `session_start.project_instructions`. `[agents] project_instructions = false` turns it off.
+
+### Images
+
+- `user_message` and `tool_result` records can carry `images` (`{blob, mime, bytes, width, height, name}`). Image
+  attachments and `read` of a PNG, JPEG, GIF or WebP file (up to `[tools] max_image_bytes`, 5 MiB) are stored in the
+  blob store and, for a profile with `vision = true`, sent as `image_url` parts (tool images in one user message after
+  the run of tool messages); other models get a sentence naming the image. `GET /api/images/{blob}` serves them;
+  `loom models` and `GET /api/models` list `vision`; the Context breakdown has an "Images" part.
+
+### File uploads
+
+- `POST /api/uploads?workspace=&name=` (raw body, at most 32 MiB) stores a file in `<workspace>/.loom/uploads/` (name
+  cleaned, numbered when taken, written atomically). `MessageBody` and `NewSession` take `attachments`, absolute paths of
+  uploads of the session's workspace; the runtime appends an attachment block (list, and an inline copy of small text
+  files) to the recorded message. The Files routes serve `.loom/uploads` and nothing else under `.loom`; under
+  Bubblewrap `.loom/uploads` is bound read-only inside the hidden `.loom`. `loom send` and `loom run` take
+  `--file PATH` (repeatable). See `docs/UPLOADS.md`.
 
 ### Stored outputs are the mission's own
 

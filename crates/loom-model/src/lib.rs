@@ -17,4 +17,4 @@ pub mod request;
 pub use assemble::{Completion, StreamEvent};
 pub use client::{Discovered, ModelClient, ModelError, WindowSource};
 pub use limit::{Limiter, Permit, Priority};
-pub use request::{ChatRequest, ToolChoice};
+pub use request::{ChatRequest, ImageResolver, ToolChoice};

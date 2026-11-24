@@ -64,14 +64,16 @@
 //! and the client prints `unverified_warning` to stderr, once. `Client::new` alone does not ask.
 
 use crate::wire::{
-    AnswerBody, ApprovalBody, ArchiveBody, CreatedSession, DaemonFile, ErrorBody, GcBody, LinesView, MessageBody,
-    ModelBody, ModelsView, RecordsPage, ReleaseBody, RenameBody, RoleModelBody, RuleBody, ScopeBody, ScopeReceipt,
-    ScopeRevokeBody, ScopeRevokeReceipt, SessionDetail, StatusView, WithdrawBody,
+    AnswerBody, ApprovalBody, ArchiveBody, CreatedSession, DaemonFile, ErrorBody, GcBody, LinesView, McpCheckBody,
+    McpCheckView, McpServerView, MessageBody, MessageWhen, ModelBody, ModelsView, RecordsPage, ReleaseBody, RenameBody,
+    RoleModelBody, RuleBody, ScopeBody, ScopeReceipt, ScopeRevokeBody, ScopeRevokeReceipt, SessionDetail, StatusView,
+    UploadView, WithdrawBody,
 };
 use loom_agent::runtime::{
     BusEvent, InboxEntry, LedgerView, MissionInfo, MissionModels, ModelSwitchReceipt, ModelsReload, NetEntry,
     NewSession, RoleModelReceipt, RuleReceipt, ScoreView, SessionInfo, WindowView,
 };
+use loom_agent::runtime::{GraphView, TargetBody, TargetView};
 use loom_core::config::{Config, Paths};
 use loom_core::event::Seq;
 use loom_core::log::record_from_value;
@@ -258,6 +260,9 @@ fn segment(text: &str) -> String {
     }
     out
 }
+
+/// A server's start, its listing and its close, over the network if it is a remote one.
+const MCP_CHECK_TIMEOUT: Duration = Duration::from_secs(180);
 
 impl Client {
     pub fn new(base: &str, token: &str) -> Client {
@@ -461,9 +466,58 @@ impl Client {
     }
 
     pub async fn send(&self, id: &SessionId, text: &str) -> Result<(), String> {
-        let body = serde_json::to_value(MessageBody { text: text.to_string() })
-            .map_err(|e| format!("The message cannot be encoded ({e})."))?;
+        self.send_with_files(id, text, &[]).await
+    }
+
+    /// [`Client::send`] with uploads attached (`paths` are the `path`s `upload` returned).
+    pub async fn send_with_files(&self, id: &SessionId, text: &str, paths: &[String]) -> Result<(), String> {
+        let body = serde_json::to_value(MessageBody {
+            text: text.to_string(),
+            attachments: paths.to_vec(),
+            when: Default::default(),
+        })
+        .map_err(|e| format!("The message cannot be encoded ({e})."))?;
         self.call_unit(Method::POST, &format!("/api/sessions/{}/messages", segment(id.as_str())), Some(body)).await
+    }
+
+    /// [`Client::send_with_files`] with `when: "after_turn"`: the message that was held until the lead's turn
+    /// ends, or `None` when the lead was idle and it was sent at once.
+    pub async fn send_after_turn(
+        &self,
+        id: &SessionId,
+        text: &str,
+        paths: &[String],
+    ) -> Result<Option<loom_agent::session::QueuedMessage>, String> {
+        let body = serde_json::to_value(MessageBody {
+            text: text.to_string(),
+            attachments: paths.to_vec(),
+            when: MessageWhen::AfterTurn,
+        })
+        .map_err(|e| format!("The message cannot be encoded ({e})."))?;
+        let path = format!("/api/sessions/{}/messages", segment(id.as_str()));
+        let answer: serde_json::Value = self.call(Method::POST, &path, &[], Some(body)).await?;
+        Ok(answer.get("queued").and_then(|q| serde_json::from_value(q.clone()).ok()))
+    }
+
+    /// `POST /api/uploads`: store `bytes` as `name` in `workspace`'s uploads folder (`docs/UPLOADS.md`).
+    pub async fn upload(&self, workspace: &str, name: &str, bytes: Vec<u8>) -> Result<UploadView, String> {
+        self.ensure_proven().await?;
+        let path = "/api/uploads";
+        let url = format!("{}{}", self.base, path);
+        let query = [("workspace", workspace.to_string()), ("name", name.to_string())];
+        let req = self.http.post(url).bearer_auth(&self.token).query(&query).body(bytes);
+        let response = req.send().await.map_err(|e| self.transport_error(&Method::POST, path, e))?;
+        let status = response.status();
+        let raw = response.bytes().await.map_err(|e| self.transport_error(&Method::POST, path, e))?;
+        if status.is_success() {
+            return serde_json::from_slice(&raw).map_err(|e| {
+                format!("The daemon's answer to POST {path} was not understood ({e}); the `loom` command and the daemon may be different versions.")
+            });
+        }
+        match serde_json::from_slice::<ErrorBody>(&raw) {
+            Ok(e) => Err(e.error),
+            Err(_) => Err(format!("The daemon answered {status} to POST {path}.")),
+        }
     }
 
     /// The receipt says which lead the rule went to and whether it is recorded yet (`queued`).
@@ -526,8 +580,8 @@ impl Client {
         self.call_unit(Method::POST, &format!("/api/sessions/{}/resume", segment(id.as_str())), None).await
     }
 
-    pub async fn reweave(&self, id: &SessionId) -> Result<(), String> {
-        self.call_unit(Method::POST, &format!("/api/sessions/{}/reweave", segment(id.as_str())), None).await
+    pub async fn compact(&self, id: &SessionId) -> Result<(), String> {
+        self.call_unit(Method::POST, &format!("/api/sessions/{}/compact", segment(id.as_str())), None).await
     }
 
     pub async fn archive(&self, id: &SessionId, archived: bool) -> Result<(), String> {
@@ -550,6 +604,26 @@ impl Client {
     /// Read `[models]` from the configuration file again (`loom models reload`).
     pub async fn reload_models(&self) -> Result<ModelsReload, String> {
         self.call(Method::POST, "/api/models/reload", &[], None).await
+    }
+
+    /// The MCP servers of a session, with the state of each connection.
+    pub async fn mcp_servers(&self, id: &SessionId) -> Result<Vec<McpServerView>, String> {
+        self.call(Method::GET, &format!("/api/sessions/{}/mcp", segment(id.as_str())), &[], None).await
+    }
+
+    /// Start a configured server in a scratch sandbox for `workspace`, list its tools, close it
+    /// (`loom mcp check`). It may start a program, so it waits longer than an ordinary request.
+    pub async fn mcp_check(&self, server: &str, workspace: &str) -> Result<McpCheckView, String> {
+        let body = serde_json::to_value(McpCheckBody { workspace: workspace.to_string() })
+            .map_err(|e| format!("The request cannot be encoded ({e})."))?;
+        self.call_with_timeout(
+            Method::POST,
+            &format!("/api/mcp/{}/check", segment(server)),
+            &[],
+            Some(body),
+            MCP_CHECK_TIMEOUT,
+        )
+        .await
     }
 
     /// The models of a mission (`loom models show`).
@@ -575,6 +649,12 @@ impl Client {
         let body = serde_json::to_value(ModelBody { profile: profile.to_string() })
             .map_err(|e| format!("The request cannot be encoded ({e})."))?;
         self.call(Method::POST, &format!("/api/sessions/{}/model", segment(id.as_str())), &[], Some(body)).await
+    }
+
+    /// The `limit` records before `before`, oldest first (`prev_before` pages further back).
+    pub async fn records_before(&self, id: &SessionId, before: Seq, limit: usize) -> Result<RecordsPage, String> {
+        let query = vec![("limit", limit.to_string()), ("before", before.to_string())];
+        self.call(Method::GET, &format!("/api/sessions/{}/records", segment(id.as_str())), &query, None).await
     }
 
     pub async fn records(&self, id: &SessionId, after: Option<Seq>, limit: usize) -> Result<RecordsPage, String> {
@@ -609,6 +689,28 @@ impl Client {
     ) -> Result<loom_agent::monitor::LogPage, String> {
         let query = [("after", after.to_string()), ("limit", limit.to_string()), ("quiet", quiet.to_string())];
         self.call(Method::GET, &format!("/api/missions/{}/monitor", segment(mission.as_str())), &query, None).await
+    }
+
+    pub async fn targets(&self) -> Result<Vec<TargetView>, String> {
+        self.call(Method::GET, "/api/targets", &[], None).await
+    }
+
+    pub async fn target(&self, name: &str) -> Result<TargetView, String> {
+        self.call(Method::GET, &format!("/api/targets/{}", segment(name)), &[], None).await
+    }
+
+    pub async fn target_create(&self, body: &TargetBody) -> Result<TargetView, String> {
+        let body = serde_json::to_value(body).map_err(|e| format!("The target cannot be encoded ({e})."))?;
+        self.call(Method::POST, "/api/targets", &[], Some(body)).await
+    }
+
+    pub async fn target_update(&self, name: &str, body: &TargetBody) -> Result<TargetView, String> {
+        let body = serde_json::to_value(body).map_err(|e| format!("The target cannot be encoded ({e})."))?;
+        self.call(Method::PUT, &format!("/api/targets/{}", segment(name)), &[], Some(body)).await
+    }
+
+    pub async fn target_graph(&self, name: &str) -> Result<GraphView, String> {
+        self.call(Method::GET, &format!("/api/targets/{}/graph", segment(name)), &[], None).await
     }
 
     pub async fn missions(&self) -> Result<Vec<MissionInfo>, String> {
@@ -872,7 +974,7 @@ pub(crate) mod testkit {
             let records: Vec<Record> =
                 log.iter().filter(|r| param("after").is_none_or(|a| r.seq > a)).take(limit).cloned().collect();
             let next_after = if records.len() == limit { records.last().map(|r| r.seq) } else { None };
-            return reply(200, json(&RecordsPage { records, next_after }));
+            return reply(200, json(&RecordsPage { records, next_after, prev_before: None }));
         }
         if let (Some(total), true) = (script.blob_total, path.ends_with("/lines")) {
             let start = param("start").unwrap_or(1);
@@ -928,6 +1030,7 @@ pub(crate) mod testkit {
             meta: SessionMeta {
                 id: SessionId::from(id),
                 mission: MissionId::from(format!("m-of-{id}")),
+                intercept: false,
                 parent: None,
                 workspace: "/w".into(),
                 copy_of: None,
@@ -945,9 +1048,11 @@ pub(crate) mod testkit {
                 gate: None,
                 prior: Vec::new(),
                 role_models: Default::default(),
+                target: None,
             },
             active: false,
             status: status(Phase::Idle),
+            last_ms: None,
         }
     }
 
@@ -989,6 +1094,7 @@ mod tests {
                 detail: String::new(),
                 context_window: Some(1000),
                 max_concurrent: 4,
+                vision: false,
             }],
             sessions_total: 2,
             sessions_active: 1,
@@ -1028,7 +1134,7 @@ mod tests {
         let ledger = loom_agent::runtime::LedgerView { markdown: "# ledger".into(), ..Default::default() };
         let blob = BlobRef { id: BlobId("ab".into()), bytes: 9, lines: 3 };
         let lines = LinesView { text: "a\nb\n".into(), first: 1, last: 2, total: 3 };
-        let page = RecordsPage { records: vec![], next_after: Some(7) };
+        let page = RecordsPage { records: vec![], next_after: Some(7), prev_before: None };
         let script = Script::default()
             .route("GET", "/api/status", 200, json(&status_view()))
             .route("GET", "/api/sessions", 200, json(&vec![one.clone()]))
@@ -1037,7 +1143,7 @@ mod tests {
             .route("POST", "/api/sessions/s-1/messages", 202, "{}")
             .route("POST", "/api/sessions/s-1/stop", 202, "{}")
             .route("POST", "/api/sessions/s-1/resume", 202, "{}")
-            .route("POST", "/api/sessions/s-1/reweave", 202, "{}")
+            .route("POST", "/api/sessions/s-1/compact", 202, "{}")
             .route("POST", "/api/sessions/s-1/archive", 200, "{}")
             .route("GET", "/api/sessions/s-1/records", 200, json(&page))
             .route("GET", "/api/sessions/s-1/window", 200, json(&window))
@@ -1067,7 +1173,7 @@ mod tests {
         client.send(&sid, "hello").await.unwrap();
         client.stop(&sid).await.unwrap();
         client.resume(&sid).await.unwrap();
-        client.reweave(&sid).await.unwrap();
+        client.compact(&sid).await.unwrap();
         client.archive(&sid, true).await.unwrap();
         assert_eq!(client.records(&sid, Some(3), 500).await.unwrap(), page);
         assert_eq!(client.window(&sid).await.unwrap(), window);
@@ -1091,7 +1197,7 @@ mod tests {
             ("POST", "/api/sessions/s-1/messages"),
             ("POST", "/api/sessions/s-1/stop"),
             ("POST", "/api/sessions/s-1/resume"),
-            ("POST", "/api/sessions/s-1/reweave"),
+            ("POST", "/api/sessions/s-1/compact"),
             ("POST", "/api/sessions/s-1/archive"),
             ("GET", "/api/sessions/s-1/records?limit=500&after=3"),
             ("GET", "/api/sessions/s-1/window"),
@@ -1186,7 +1292,12 @@ mod tests {
     #[tokio::test]
     async fn records_without_after_sends_only_the_limit_and_events_asks_for_deltas() {
         let script = Script::default()
-            .route("GET", "/api/sessions/s-1/records", 200, json(&RecordsPage { records: vec![], next_after: None }))
+            .route(
+                "GET",
+                "/api/sessions/s-1/records",
+                200,
+                json(&RecordsPage { records: vec![], next_after: None, prev_before: None }),
+            )
             .stream(vec![])
             .stream(vec![]);
         let (client, shared) = start(script).await;

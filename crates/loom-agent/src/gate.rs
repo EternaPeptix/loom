@@ -297,27 +297,6 @@ pub fn goal_unconcluded_ignoring_release(ledger: &LedgerState) -> bool {
     ledger.goal.is_some() && ledger.goal_met.as_ref().is_none_or(|g| g.status == GoalMetStatus::Open)
 }
 
-/// The nudge paragraph for a lead that stopped while the goal claim is open and no plan step is: with
-/// nothing planned, an idle reply would be a silent way out. `None` in every other case.
-fn idle_goal_paragraph(ctx: &YieldCtx<'_>) -> Option<String> {
-    let ledger = ctx.ledger?;
-    if !has(ctx.tools, "conclude") || !goal_unconcluded(ledger) || !ledger.open_items().plan.is_empty() {
-        return None;
-    }
-    let mut p = String::from(
-        "The goal is not concluded and no plan step is open, so stopping here is not an exit — but this is not a judgment of the mission either: the record does not show one of the two honest outcomes yet. Add a plan step for the next route and take it, or run the target again.",
-    );
-    if has(ctx.tools, "conclude") {
-        p.push_str(
-            " Call conclude once a run shows the goal met, or once you have established that it cannot be met as stated (every route closed, with execution evidence) — a well-evidenced negative conclusion is a reportable outcome, not a failure.",
-        );
-    }
-    if has(ctx.tools, "report_blocker") {
-        p.push_str(" If something only the operator can supply is blocking you, call report_blocker.");
-    }
-    Some(p)
-}
-
 pub fn on_yield(ctx: &YieldCtx<'_>) -> Yield {
     if ctx.termination == Termination::Free {
         return Yield::End;
@@ -346,11 +325,6 @@ pub fn on_yield(ctx: &YieldCtx<'_>) -> Yield {
     let mut paragraphs = vec![first];
     if let Some(block) = open {
         paragraphs.push(block);
-    }
-    if !ctx.is_child {
-        if let Some(p) = idle_goal_paragraph(ctx) {
-            paragraphs.push(p);
-        }
     }
     if ctx.running_jobs + ctx.running_children > 0 {
         let mut what = Vec::new();
@@ -423,7 +397,7 @@ pub fn check_finish_lead(ledger: &LedgerState, answer: &str) -> Result<(), Strin
         text.push_str("\n\nHow to close them:");
         if !open.plan.is_empty() {
             text.push_str(
-                "\n- Plan steps: call `step` with status done (say in the note what showed it) or dropped (say why).",
+                "\n- Plan steps: call `plan` with status done (say in the note what showed it) or dropped (say why).",
             );
         }
         let objections = ledger.obligations.iter().any(|o| o.outcome.is_none() && o.kind == ObligationKind::Objection);
@@ -437,7 +411,7 @@ pub fn check_finish_lead(ledger: &LedgerState, answer: &str) -> Result<(), Strin
         }
         if !open.claims.is_empty() {
             text.push_str(
-                "\n- Claims: attach evidence with `evidence` and set the status with `claim_update`, or withdraw the claim.",
+                "\n- Claims: attach evidence with `evidence` and set the status with `claim` and `id`, or withdraw the claim.",
             );
         }
         if !open.questions.is_empty() {
@@ -461,6 +435,15 @@ pub fn check_finish_lead(ledger: &LedgerState, answer: &str) -> Result<(), Strin
 }
 
 pub async fn check_quotes(ctx: &ToolCtx, quotes: &[Quote]) -> Result<Vec<VerifiedQuote>, String> {
+    check_quotes_noted(ctx, quotes).await.map(|v| v.into_iter().map(|(q, _)| q).collect())
+}
+
+/// [`check_quotes`], also giving, per quote, the sentence saying which lines were taken when the text was
+/// matched ignoring spacing (`None` for a quote that matched exactly).
+pub async fn check_quotes_noted(
+    ctx: &ToolCtx,
+    quotes: &[Quote],
+) -> Result<Vec<(VerifiedQuote, Option<String>)>, String> {
     let mut verified = Vec::new();
     let mut problems: Vec<String> = Vec::new();
     for (idx, q) in quotes.iter().enumerate() {
@@ -508,8 +491,18 @@ fn inside_token_error(i: usize, handle: &str, line: u64) -> String {
 }
 
 /// The checks on one quote whose handle opened as `id`.
-fn check_one(blobs: &BlobStore, q: &Quote, i: usize, id: BlobId) -> Result<VerifiedQuote, String> {
+fn check_one(blobs: &BlobStore, q: &Quote, i: usize, id: BlobId) -> Result<(VerifiedQuote, Option<String>), String> {
     let handle = &q.handle;
+    // A text with only `start` (the answer to an ambiguity refusal): the text begins on that line, so the
+    // range is as many lines as the text has.
+    let widened;
+    let q = if q.start > 0 && q.end == 0 && !q.text.trim().is_empty() {
+        let n = q.text.trim_matches('\n').lines().count().max(1) as u64;
+        widened = Quote { end: q.start.saturating_add(n - 1), ..q.clone() };
+        &widened
+    } else {
+        q
+    };
     let total = blobs
         .meta(&id)
         .map_err(|e| format!("quote {i}: the stored output {handle} could not be read ({e}); try again."))?
@@ -530,7 +523,7 @@ fn check_one(blobs: &BlobStore, q: &Quote, i: usize, id: BlobId) -> Result<Verif
         }
     }
     if q.text.trim().is_empty() {
-        return by_lines(blobs, q, &id, total, i);
+        return by_lines(blobs, q, &id, total, i).map(|v| (v, None));
     }
     let read_full = || -> Result<String, String> {
         if total == 0 {
@@ -545,7 +538,7 @@ fn check_one(blobs: &BlobStore, q: &Quote, i: usize, id: BlobId) -> Result<Verif
         let full_text = read_full()?;
         return match observe::find_unique_quote(&full_text, &q.text) {
             Ok(Some((actual_start, actual_end, recorded))) => {
-                Ok(VerifiedQuote { blob: id, start: actual_start, end: actual_end, text: recorded })
+                Ok((VerifiedQuote { blob: id, start: actual_start, end: actual_end, text: recorded }, None))
             }
             Err(observe::QuoteError::TooShort) => Err(too_short_error(i)),
             Err(observe::QuoteError::InsideToken { line }) => Err(inside_token_error(i, handle, line)),
@@ -556,15 +549,23 @@ fn check_one(blobs: &BlobStore, q: &Quote, i: usize, id: BlobId) -> Result<Verif
                     ));
                 }
                 match observe::check_quote_at(&full_text, &q.text, 1) {
-                    Ok(_) => Err(format!(
-                        "quote {i}: the text occurs more than once in {handle}; give `start` and `end` line numbers to name which occurrence you mean."
-                    )),
+                    Ok(_) => {
+                        let places = observe::quote_places(&full_text, &q.text, MAX_LISTED_MATCHES + 1);
+                        Err(ambiguous_error(i, handle, &places, None))
+                    }
                     Err(observe::QuoteError::WrongLine { quoted, actual }) => {
                         Err(wrong_line_error(i, handle, quoted, actual))
                     }
                     Err(observe::QuoteError::TooShort) => Err(too_short_error(i)),
                     Err(observe::QuoteError::InsideToken { line }) => Err(inside_token_error(i, handle, line)),
                     Err(observe::QuoteError::NotFound) => {
+                        let places = observe::quote_places(&full_text, &q.text, MAX_LISTED_MATCHES + 1);
+                        if places.len() >= 2 {
+                            return Err(ambiguous_error(i, handle, &places, None));
+                        }
+                        if let Some(done) = spaced(&full_text, q, i, &id)? {
+                            return Ok(done);
+                        }
                         let mut msg = format!("quote {i}: the text does not occur in {handle} lines 1-{total}.");
                         if let Some((n, line)) = observe::nearest_line(&full_text, &q.text) {
                             msg.push_str(&format!(" The closest line there is {n}: {}", cut_chars(&line, 200)));
@@ -584,7 +585,7 @@ fn check_one(blobs: &BlobStore, q: &Quote, i: usize, id: BlobId) -> Result<Verif
         Ok((text, first)) => {
             // What is recorded is the line or lines the accepted text lies on (a window of them when long).
             let last = first.saturating_add((text.split('\n').count() as u64).saturating_sub(1));
-            return Ok(VerifiedQuote { blob: id, start: first, end: last, text });
+            return Ok((VerifiedQuote { blob: id, start: first, end: last, text }, None));
         }
         Err(observe::QuoteError::WrongLine { quoted, actual }) => {
             return Err(wrong_line_error(i, handle, quoted, actual));
@@ -600,11 +601,18 @@ fn check_one(blobs: &BlobStore, q: &Quote, i: usize, id: BlobId) -> Result<Verif
     let full_text = read_full()?;
     match observe::find_unique_quote(&full_text, &q.text) {
         Ok(Some((actual_start, actual_end, recorded))) => {
-            return Ok(VerifiedQuote { blob: id, start: actual_start, end: actual_end, text: recorded });
+            return Ok((VerifiedQuote { blob: id, start: actual_start, end: actual_end, text: recorded }, None));
         }
         Err(observe::QuoteError::TooShort) => return Err(too_short_error(i)),
         Err(observe::QuoteError::InsideToken { line }) => return Err(inside_token_error(i, handle, line)),
         Ok(None) | Err(observe::QuoteError::NotFound | observe::QuoteError::WrongLine { .. }) => {}
+    }
+    let places = observe::quote_places(&full_text, &q.text, MAX_LISTED_MATCHES + 1);
+    if places.len() >= 2 {
+        return Err(ambiguous_error(i, handle, &places, Some((q.start, end))));
+    }
+    if let Some(done) = spaced(&full_text, q, i, &id)? {
+        return Ok(done);
     }
     let mut msg = format!("quote {i}: the text does not occur in {handle} lines {}-{end}.", q.start);
     if let Some((n, line)) = observe::nearest_line(&slice.text, &q.text) {
@@ -613,6 +621,65 @@ fn check_one(blobs: &BlobStore, q: &Quote, i: usize, id: BlobId) -> Result<Verif
     }
     msg.push_str(" Copy the text exactly from the output.");
     Err(msg)
+}
+
+/// Most matches an ambiguous quote's refusal lists.
+const MAX_LISTED_MATCHES: usize = 10;
+
+/// The refusal of a quote that occurs in more than one place: every place (at most
+/// [`MAX_LISTED_MATCHES`]; `places` holds one more to tell whether there are others) as `line {n}: {line}`.
+/// `range` is the range the model named, when the text is not in it.
+fn ambiguous_error(i: usize, handle: &str, places: &[(u64, String)], range: Option<(u64, u64)>) -> String {
+    let n = places.len();
+    let count = if n > MAX_LISTED_MATCHES {
+        format!("occurs in more than {MAX_LISTED_MATCHES} places (the first {MAX_LISTED_MATCHES} follow)")
+    } else {
+        format!("occurs {n} times")
+    };
+    let mut out = match range {
+        Some((a, b)) => {
+            format!("quote {i}: the text does not occur in {handle} lines {a}-{b}, but it {count} elsewhere in it:")
+        }
+        None => format!("quote {i}: the text {count} in {handle}:"),
+    };
+    for (at, line) in places.iter().take(MAX_LISTED_MATCHES) {
+        out.push_str(&format!("\nline {at}: {}", cut_chars(line, 200)));
+    }
+    out.push_str("\nAdd `start` to say which.");
+    out
+}
+
+/// The unique place where the quote occurs once runs of whitespace are collapsed and line ends ignored,
+/// recorded as the whole lines it lies on, with the sentence saying which lines were taken. `Ok(None)` when
+/// it is not there; an ambiguity is refused with the places listed.
+fn spaced(
+    full_text: &str,
+    q: &Quote,
+    i: usize,
+    id: &BlobId,
+) -> Result<Option<(VerifiedQuote, Option<String>)>, String> {
+    let spans = observe::spaced_quote_spans(full_text, &q.text, MAX_LISTED_MATCHES + 1);
+    match spans.as_slice() {
+        [] => Ok(None),
+        [(first, last)] => {
+            let text = observe::whole_lines(full_text, *first, *last);
+            if text.chars().count() > observe::REF_QUOTE_MAX_CHARS {
+                return Ok(None);
+            }
+            let which = if first == last { format!("line {first}") } else { format!("lines {first}-{last}") };
+            let note = format!("matched {which} ignoring spacing");
+            Ok(Some((VerifiedQuote { blob: id.clone(), start: *first, end: *last, text }, Some(note))))
+        }
+        many => {
+            let places: Vec<(u64, String)> =
+                many.iter().map(|(first, _)| (*first, observe::whole_lines(full_text, *first, *first))).collect();
+            Err(ambiguous_error(i, &q.handle, &places, None).replacen(
+                "the text occurs",
+                "the text, ignoring spacing, occurs",
+                1,
+            ))
+        }
+    }
 }
 
 /// A quote given without its text: the lines it names, taken from the stored output (see the contract).
@@ -788,6 +855,7 @@ mod tests {
             }],
             claims: vec![
                 Claim {
+                    assets: Vec::new(),
                     id: "c1".into(),
                     text: "settled".into(),
                     status: ClaimStatus::Supported,
@@ -795,6 +863,7 @@ mod tests {
                     evidence: vec!["e1".into()],
                 },
                 Claim {
+                    assets: Vec::new(),
                     id: "c3".into(),
                     text: "Parser handles nesting".into(),
                     status: ClaimStatus::Open,
@@ -975,38 +1044,11 @@ To keep working, call a tool. To deliver your result, call finish; if the assign
     }
 
     #[test]
-    fn an_open_goal_claim_with_no_open_step_is_named_at_the_stop_gate() {
+    fn an_open_goal_claim_adds_no_paragraph_to_the_stop_gate() {
         let t = tools(&["finish", "conclude", "report_blocker"]);
         let l = with_goal(false);
         let text = nudge(&ctx(&t, Some(&l), "I am done."));
-        assert!(
-            text.contains("The goal is not concluded and no plan step is open, so stopping here is not an exit — but this is not a judgment of the mission either:"),
-            "{text}"
-        );
-        assert!(text.contains("Call conclude once a run shows the goal met"), "{text}");
-        assert!(text.contains("call report_blocker"), "{text}");
-        // Without report_blocker that sentence is left out; without conclude the session is not gated at all.
-        let no_blocker = tools(&["finish", "conclude"]);
-        let text = nudge(&ctx(&no_blocker, Some(&l), "x"));
-        assert!(
-            text.contains("no plan step is open") && text.contains("Call conclude") && !text.contains("report_blocker"),
-            "{text}"
-        );
-        let bare = tools(&["finish"]);
-        assert!(!nudge(&ctx(&bare, Some(&l), "x")).contains("not an exit"));
-        // An open plan step, a concluded goal, a released mission, no goal and a child: not mentioned.
-        let open = with_goal(true);
-        assert!(!nudge(&ctx(&t, Some(&open), "x")).contains("not an exit"));
-        let mut met = with_goal(false);
-        met.goal_met = met.goal_met.map(|g| loom_core::ledger::GoalMet { status: GoalMetStatus::Supported, ..g });
-        assert!(!nudge(&ctx(&t, Some(&met), "x")).contains("not an exit"));
-        let mut released = with_goal(false);
-        released.release = Some(loom_core::ledger::Release { reason: "stop".into(), n: 3 });
-        assert!(!nudge(&ctx(&t, Some(&released), "x")).contains("not an exit"));
-        assert!(!nudge(&ctx(&t, Some(&LedgerState::default()), "x")).contains("not an exit"));
-        let mut c = ctx(&t, Some(&l), "x");
-        c.is_child = true;
-        assert!(!nudge(&c).contains("not an exit"));
+        assert!(!text.contains("not an exit") && !text.contains("Call conclude"), "{text}");
         // A free-termination session just ends.
         let mut c = ctx(&t, Some(&l), "x");
         c.termination = Termination::Free;
@@ -1063,9 +1105,9 @@ To keep working, call a tool. To deliver your result, call finish; if the assign
         assert!(text.contains("obligation o1 (job): cargo test running"));
         assert!(text.contains("claim c3 (no evidence attached): Parser handles nesting"));
         assert!(text.contains("question q1 (waiting for the operator): Which branch?"));
-        assert!(text.contains("call `step` with status done (say in the note what showed it) or dropped (say why)"));
+        assert!(text.contains("call `plan` with status done (say in the note what showed it) or dropped (say why)"));
         assert!(text.contains("wait for the job or agent to report, or stop it"));
-        assert!(text.contains("attach evidence with `evidence` and set the status with `claim_update`, or withdraw"));
+        assert!(text.contains("attach evidence with `evidence` and set the status with `claim` and `id`, or withdraw"));
         assert!(text.contains("`ask_user` ends the turn until they are answered"));
         assert!(!text.contains("The answer is empty"));
     }
@@ -1081,7 +1123,7 @@ To keep working, call a tool. To deliver your result, call finish; if the assign
             evidence: vec![],
         });
         let Err(text) = check_finish_lead(&l, "ok") else { panic!("expected refusal") };
-        assert!(text.contains("`step`"));
+        assert!(text.contains("`plan`"));
         assert!(!text.contains("Obligations:") && !text.contains("Claims:") && !text.contains("Questions:"));
         let clean = LedgerState::default();
         assert_eq!(check_finish_lead(&clean, "fixed it"), Ok(()));
@@ -1203,7 +1245,9 @@ To keep working, call a tool. To deliver your result, call finish; if the assign
         let e = check_quotes(&ctx, &[q(&h, 2, 2, "")]).await.err().unwrap_or_default();
         assert_eq!(
             e,
-            format!("quote 1: lines 2-2 of {h} have 4001 characters; a quote without its text takes at most 4000. Name fewer lines, or give the text of the part that shows the point, copied exactly.")
+            format!(
+                "quote 1: lines 2-2 of {h} have 4001 characters; a quote without its text takes at most 4000. Name fewer lines, or give the text of the part that shows the point, copied exactly."
+            )
         );
         assert!(check_quotes(&ctx, &[q(&h, 1, 1, "")]).await.is_ok());
     }
@@ -1219,7 +1263,9 @@ To keep working, call a tool. To deliver your result, call finish; if the assign
         let e = check_quotes(&ctx, &[q(&h, 2, 3, "7: beta line two")]).await.err().unwrap_or_default();
         assert_eq!(
             e,
-            format!("quote 1: the text is on line 2 of {h}, not line 7. Fix the line number, or quote the text without line numbers.")
+            format!(
+                "quote 1: the text is on line 2 of {h}, not line 7. Fix the line number, or quote the text without line numbers."
+            )
         );
         let e = check_quotes(&ctx, &[q(&h, 1, 4, "line")]).await.err().unwrap_or_default();
         assert_eq!(
@@ -1241,7 +1287,9 @@ To keep working, call a tool. To deliver your result, call finish; if the assign
         let e = check_quotes(&ctx, &[q(&h, 1, 2, "0 failed; 0 ignored")]).await.err().unwrap_or_default();
         assert_eq!(
             e,
-            format!("quote 1: the text occurs on line 2 of {h} only inside a longer word or number. Quote from the start of that word or number to its end, or quote the whole line.")
+            format!(
+                "quote 1: the text occurs on line 2 of {h} only inside a longer word or number. Quote from the start of that word or number to its end, or quote the whole line."
+            )
         );
         // Quoted from the start of the number, it is accepted, and recorded as its whole line.
         let ok = check_quotes(&ctx, &[q(&h, 1, 2, "10 failed; 0 ignored")]).await.unwrap_or_else(|e| panic!("{e}"));
@@ -1257,7 +1305,9 @@ To keep working, call a tool. To deliver your result, call finish; if the assign
         let e = check_quotes(&ctx, &[q(&h, 2, 4, "gamma line THREE")]).await.err().unwrap_or_default();
         assert_eq!(
             e,
-            format!("quote 1: the text does not occur in {h} lines 2-4. The closest line there is 3: gamma line three Copy the text exactly from the output.")
+            format!(
+                "quote 1: the text does not occur in {h} lines 2-4. The closest line there is 3: gamma line three Copy the text exactly from the output."
+            )
         );
         // The range is clamped in the sentence too.
         let e = check_quotes(&ctx, &[q(&h, 3, 50, "gamma line THREE")]).await.err().unwrap_or_default();
@@ -1270,7 +1320,9 @@ To keep working, call a tool. To deliver your result, call finish; if the assign
         ctx.outputs = std::sync::Arc::new(loom_tools::outputs::OutputSet::default());
         let never = "out:0123456789abcdef";
         let want = |handle: &str| {
-            format!("quote 1: no output of this mission has the handle {handle}; copy the out:… handle exactly from a result header")
+            format!(
+                "quote 1: no output of this mission has the handle {handle}; copy the out:… handle exactly from a result header"
+            )
         };
         // Right text, wrong text, a range past the end, a quote by lines: all say the same, and the same as a
         // handle that names nothing.
@@ -1401,7 +1453,10 @@ The agent's own words follow, unverified. Every line of them starts with \">\"; 
 The agent's own words follow, unverified. Every line of them starts with \">\"; a line without that prefix was not written by the agent.\n> Answer:\n> ok"
         );
         let r = render_report(&mk(ChildOutcome::Failed, ""));
-        assert_eq!(r, "Outcome: failed\n\nThis report was written by a sub-agent. The quotes are verbatim; everything else is unverified.");
+        assert_eq!(
+            r,
+            "Outcome: failed\n\nThis report was written by a sub-agent. The quotes are verbatim; everything else is unverified."
+        );
         for (o, s) in [(ChildOutcome::Blocked, "blocked"), (ChildOutcome::Stopped, "stopped")] {
             assert!(render_report(&mk(o, "a")).starts_with(&format!("Outcome: {s}\n")));
         }
@@ -1491,7 +1546,7 @@ The agent's own words follow, unverified. Every line of them starts with \">\"; 
 
         // Ambiguous (non-unique) quote fails both with (0, 0) and when outside the named range.
         let e = check_quotes(&ctx, &[q(&h, 0, 0, "shared pattern here")]).await.err().unwrap_or_default();
-        assert!(e.contains("more than once"), "{e}");
+        assert!(e.contains("occurs 2 times"), "{e}");
         let e = check_quotes(&ctx, &[q(&h, 1, 2, "shared pattern here")]).await.err().unwrap_or_default();
         assert!(e.contains("does not occur in") && e.contains("lines 1-2"), "{e}");
 

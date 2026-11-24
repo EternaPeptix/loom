@@ -184,6 +184,9 @@ pub struct RecordsPage {
     pub records: Vec<Record>,
     /// Pass as `after` to get the next page; `null` when this page reached the end of the log.
     pub next_after: Option<Seq>,
+    /// With `before`: pass it as `before` to get the page before this one; `null` at the start of the log.
+    #[serde(default)]
+    pub prev_before: Option<Seq>,
 }
 
 fn records_as_stored<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<Record>, D::Error> {
@@ -207,7 +210,56 @@ pub struct LinesView {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MessageBody {
+    /// May be empty when `attachments` is not.
     pub text: String,
+    /// Uploads of the session's workspace (`POST /api/uploads`), absolute paths; `docs/UPLOADS.md`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<String>,
+    /// `now` (the default): the lead takes it at its next step, or starts a turn when idle. `after_turn`:
+    /// held until the lead's turn ends, then sent as the start of the next one (the same as `now` while the
+    /// lead is idle). Any other value is a `400`.
+    #[serde(default, skip_serializing_if = "MessageWhen::is_now")]
+    pub when: MessageWhen,
+}
+
+/// When a message is sent (`MessageBody.when`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageWhen {
+    #[default]
+    Now,
+    AfterTurn,
+}
+
+impl MessageWhen {
+    fn is_now(&self) -> bool {
+        *self == MessageWhen::Now
+    }
+}
+
+/// Body of `PUT /api/sessions/{id}/queued/{qid}`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QueuedEditBody {
+    pub text: String,
+}
+
+/// Answer of `POST /api/sessions/{id}/messages` (`202`) when the message was queued: `{"queued": {id, text,
+/// attachments, created_ms}}`. A message sent at once is answered `{}`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueuedReceipt {
+    pub queued: loom_agent::session::QueuedMessage,
+}
+
+/// Answer of `POST /api/uploads` (`201`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UploadView {
+    /// Absolute path of the stored file, `<workspace>/.loom/uploads/<name>`.
+    pub path: String,
+    /// The stored name (sanitised, and numbered when the name was taken).
+    pub name: String,
+    pub bytes: u64,
+    pub mime: String,
 }
 
 /// Body of `POST /api/sessions/{id}/rules`.
@@ -263,6 +315,19 @@ pub struct ScopeRevokeBody {
 
 /// The answer to `POST /api/missions/{id}/scope/revoke`.
 pub use loom_agent::runtime::ScopeRevokeReceipt;
+
+/// What `GET /api/sessions/{id}/mcp` answers per server, and what the check route and `loom mcp list`
+/// show (the types live with the runtime's MCP wiring).
+pub use loom_agent::mcp::{McpCheckTool, McpCheckView, McpConfigured, McpServerView};
+
+/// Body of `POST /api/mcp/{server}/check`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpCheckBody {
+    /// The absolute path of an existing workspace folder: the check runs the server the way a session
+    /// there would.
+    pub workspace: String,
+}
 
 /// Body of `POST /api/sessions/{id}/release`: the operator closes the mission without the goal established.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

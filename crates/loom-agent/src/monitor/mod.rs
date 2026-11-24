@@ -455,6 +455,10 @@ mod tests {
                 budget: Default::default(),
                 unattended: false,
                 title: String::new(),
+                project_instructions: Vec::new(),
+                mcp: Vec::new(),
+                intercept: false,
+                target: None,
                 schema: loom_core::event::SCHEMA,
             }),
         )
@@ -482,6 +486,8 @@ mod tests {
                 class: ToolClass::Exec,
                 meta: Default::default(),
                 duration_ms: 1,
+                images: Vec::new(),
+                exchanges: Vec::new(),
             }),
         )
         .expect("result");

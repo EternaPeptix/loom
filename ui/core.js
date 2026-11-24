@@ -63,6 +63,57 @@ export function pct(part, whole) {
 }
 
 /** First `max` lines of `text`: {text, total, clipped}. A trailing newline does not add a line. */
+// Tool output is shown raw; these only choose a look for each line, never change its text.
+// Every stored result starts "[tool · facts]" and ends "[end of tool output · outcome]" (crates/loom-core admit.rs).
+const ENVELOPE_HEAD = /^\[[a-z][a-z0-9_]* · .*\]$/;
+const ENVELOPE_FOOT = /^\[end of [a-z][a-z0-9_]* output · .*\]$/;
+
+/** Where a unified diff starts in `lines`: a "--- " line directly followed by "+++ " and then "@@ " (-1 when none). */
+function diffStart(lines) {
+  for (let i = 0; i + 2 < lines.length; i++) {
+    if (lines[i].startsWith("--- ") && lines[i + 1].startsWith("+++ ") && lines[i + 2].startsWith("@@ ")) return i;
+  }
+  return -1;
+}
+
+/**
+ * The look of each line of a tool output, parallel to `text.split("\n")`: "meta" for the harness's own first and last
+ * lines, and inside a unified diff "file", "hunk", "add", "del" or "ctx"; "" for anything else.
+ */
+export function outputLineKinds(text) {
+  const lines = String(text ?? "").split("\n");
+  const kinds = lines.map(() => "");
+  let last = lines.length - 1;
+  while (last > 0 && lines[last] === "") last--;
+  if (lines.length > 1 && ENVELOPE_HEAD.test(lines[0])) kinds[0] = "meta";
+  if (last > 0 && ENVELOPE_FOOT.test(lines[last])) kinds[last] = "meta";
+  const start = diffStart(lines);
+  if (start < 0) return kinds;
+  let inHunk = false;
+  for (let i = start; i < lines.length; i++) {
+    if (kinds[i] === "meta") continue;
+    const l = lines[i];
+    if ((l.startsWith("--- ") && i + 1 < lines.length && lines[i + 1].startsWith("+++ ")) || (l.startsWith("+++ ") && i > 0 && lines[i - 1].startsWith("--- "))) { kinds[i] = "file"; inHunk = false; }
+    else if (l.startsWith("@@ ")) { kinds[i] = "hunk"; inHunk = true; }
+    else if (!inHunk) continue;
+    else if (l.startsWith("+")) kinds[i] = "add";
+    else if (l.startsWith("-")) kinds[i] = "del";
+    else if (l.startsWith(" ") || l === "") kinds[i] = "ctx";
+    else if (l.startsWith("\\")) kinds[i] = "meta";
+    else inHunk = false;
+  }
+  return kinds;
+}
+
+/** Lines added and removed by the unified diff in a tool output, or null when it holds none. */
+export function diffStat(text) {
+  const kinds = outputLineKinds(text);
+  if (!kinds.includes("hunk")) return null;
+  let added = 0, removed = 0;
+  for (const k of kinds) { if (k === "add") added++; else if (k === "del") removed++; }
+  return { added, removed, text: `+${added} −${removed}`, words: `${count(added, "line")} added, ${count(removed, "line")} removed` };
+}
+
 export function clip(text, max) {
   const s = String(text ?? "");
   let total = 0;
@@ -90,18 +141,27 @@ export function oneLine(text, max = 160) {
 }
 
 const FILE_TOOLS = new Set(["read", "write", "edit", "multi_edit", "patch", "ls"]);
+const PATH_KEYS = ["path", "file_path", "absolute_path", "target_file", "file"];
+const firstString = (args, keys) => { for (const k of keys) if (typeof args[k] === "string" && args[k]) return args[k]; return ""; };
 
-/** The arguments of a tool call on one line: bash shows its command, file tools their path. */
+/** The arguments of a tool call on one line: bash shows its command, file tools their path, search tools their
+ *  pattern (and where), web_fetch its URL, job tools their job. `name` is the tool that ran (see `tool_result`). */
 export function argsLine(name, args, max = 240) {
   if (args === null || args === undefined) return "";
   if (typeof args === "string") return oneLine(args, max);
   if (typeof args === "object" && !Array.isArray(args)) {
     if (name === "bash" && typeof args.command === "string") return oneLine(args.command, max);
     if (FILE_TOOLS.has(name)) {
-      for (const k of ["path", "file_path", "file"]) {
-        if (typeof args[k] === "string") return oneLine(args[k], max);
-      }
+      const p = firstString(args, PATH_KEYS);
+      if (p) return oneLine(p, max);
     }
+    if (name === "grep" || name === "glob" || name === "out_grep") {
+      const pat = firstString(args, ["pattern", "query", "regex", "glob"]);
+      const where = firstString(args, [...PATH_KEYS, "dir", "directory", "handle"]);
+      if (pat) return oneLine(where ? `${pat} in ${where}` : pat, max);
+    }
+    if (name === "web_fetch" && typeof args.url === "string") return oneLine(args.url, max);
+    if ((name === "job_wait" || name === "job_kill") && typeof args.job === "string") return oneLine(args.job, max);
   }
   let json;
   try {
@@ -163,6 +223,45 @@ export function shownOfTotal(result) {
     words = "Stored-action output: initially deferred; actor exposure is recorded separately in outputs_observed receipts.";
   }
   return { blob, shown, total, cut, ranges, ofBlob: !!ofBlob, words, complete };
+}
+
+/**
+ * Where "open full output" starts reading, given the ranges the model was shown (1-based, inclusive) and the stored line count
+ * (null when unknown). A tail-only or middle view opens at its first line; a head plus tail (a cut) opens at the start of the
+ * omitted middle; a head alone opens just after it when the stored output is known to go on. Otherwise line 1.
+ */
+export function openAtLine(ranges, total) {
+  const rs = mergeRanges(ranges);
+  if (!rs.length) return 1;
+  if (rs[0][0] > 1) return rs[0][0];
+  if (rs.length > 1) return rs[0][1] + 1;
+  const end = rs[0][1];
+  return Number.isInteger(total) && end < total ? end + 1 : 1;
+}
+
+/** Is line `n` inside one of `ranges` ([[start, end], ...], inclusive)? */
+export function lineInRanges(ranges, n) {
+  for (const r of ranges || []) if (n >= r[0] && n <= r[1]) return true;
+  return false;
+}
+
+/**
+ * How the viewer opens a tool result's stored output: {start, seenRanges}. `start` is openAtLine; `seenRanges` are the lines the
+ * model was shown, marked in the viewer, and empty when it was shown everything or the ranges are unknown.
+ */
+export function viewerPlan(shown) {
+  const ranges = (shown && shown.ranges) || [];
+  const partial = ranges.length > 0 && !(shown && shown.complete);
+  return { start: openAtLine(ranges, shown ? shown.total : null), seenRanges: partial ? ranges : [] };
+}
+
+/** The standing sentence of the viewer: evidence wording for a cited range, and a note on the marked lines when there are any. */
+export function viewerStanding(source) {
+  const s = source || {};
+  const base = s.citeStart
+    ? "Opening this stored snapshot is an operator action. It does not change what the model has observed, and it does not verify the claim."
+    : "This is a stored output snapshot. Opening it here does not change what the model has observed.";
+  return s.seenRanges && s.seenRanges.length ? base + " Lines the model was shown are marked." : base;
 }
 
 /** Generation speed of a reply in tokens per second: the tokens after the first, over the time from
@@ -285,14 +384,180 @@ export function evictionWords(e) {
 
 export const REWEAVE_NOTE = "Folded items stay in the record above and can be read back by the model.";
 
+// ---- compaction (docs/CONTRACTS-COMPACTION.md Part K and U)
+
+const COMPACT_REASONS = { size: "size", refused: "refused", stall: "stall", operator: "operator", fresh_start: "fresh start" };
+export function compactionReasonWords(reason) {
+  return COMPACT_REASONS[reason] || String(reason || "unknown").replace(/_/g, " ");
+}
+
+/** An `out:` key in text: 8 to 64 hex characters after `out:` (the handle, or a prefix of one). */
+const OUT_KEY = /\bout:([0-9a-f]{8,64})(?![0-9a-zA-Z])/g;
+
+/** Every distinct `out:` key in the texts, in the order first seen, without the `out:` prefix. */
+export function extractOutKeys(...texts) {
+  const seen = new Set();
+  const keys = [];
+  for (const t of texts) {
+    if (typeof t !== "string") continue;
+    for (const m of t.matchAll(OUT_KEY)) if (!seen.has(m[1])) { seen.add(m[1]); keys.push(m[1]); }
+  }
+  return keys;
+}
+
+/** Text cut into [{text}] and [{key, text}] parts, so each `out:` key can be a button. The parts join back to the text. */
+export function splitOutKeys(text) {
+  const s = String(text ?? "");
+  const out = [];
+  let at = 0;
+  for (const m of s.matchAll(OUT_KEY)) {
+    if (m.index > at) out.push({ text: s.slice(at, m.index) });
+    out.push({ key: m[1], text: m[0] });
+    at = m.index + m[0].length;
+  }
+  if (at < s.length) out.push({ text: s.slice(at) });
+  return out;
+}
+
+/** The divider's head line: "Context compacted · step 412 · 305k → 41k tokens · size". */
+export function compactionHead(rec, step) {
+  const bits = ["Context compacted"];
+  if (Number.isInteger(step)) bits.push(`step ${num(step)}`);
+  if (rec.before_tokens > 0 || rec.after_tokens_est > 0) bits.push(`${tokens(rec.before_tokens || 0)} → ${tokens(rec.after_tokens_est || 0)} tokens`);
+  bits.push(compactionReasonWords(rec.reason));
+  return bits.join(" · ");
+}
+
+/**
+ * The card model of a `compaction` record: the head, the note (null when the note request failed), the key table, the keys each cites
+ * (every key a button), the keys the daemon dropped from the note, and for a fresh start what the verifier objected to.
+ */
+export function compactionBlock(rec, step) {
+  const note = typeof rec.note === "string" && rec.note.trim() ? rec.note : null;
+  const table = typeof rec.table === "string" ? rec.table : "";
+  return {
+    kind: "compaction",
+    head: compactionHead(rec, step),
+    epoch: rec.epoch,
+    upto_seq: rec.upto_seq,
+    reason: rec.reason,
+    note,
+    noteKeys: extractOutKeys(note),
+    table,
+    tableKeys: extractOutKeys(table),
+    droppedKeys: Array.isArray(rec.dropped_keys) ? rec.dropped_keys.map(String) : [],
+    objections: typeof rec.objections === "string" && rec.objections.trim() ? rec.objections : null,
+  };
+}
+
+export const COMPACT_NO_NOTE = "No note was written (the note request failed). The key table below is still exact.";
+export const COMPACT_NOTE_LABEL = "Written by the model, not verified: check a key before relying on it.";
+export const COMPACT_DROPPED_LABEL = "Keys the note cited that do not exist in this session; they were removed from it:";
+
+// ---- loading a long session from the end (U4)
+
+export const TAIL_LIMIT = 1000;
+export const TAIL_BEFORE = Number.MAX_SAFE_INTEGER;
+
+/** The latest `compaction` record among `recs`, or null. */
+export function latestCompaction(recs) {
+  let best = null;
+  for (const r of recs || []) if (r && r.kind === "compaction" && (!best || r.seq > best.seq)) best = r;
+  return best;
+}
+
+/**
+ * After a page from the end: the request for the next earlier page when the records after the latest compaction's `upto_seq` are
+ * not all in `recs` yet, else null. Without a compaction in view the last page is all that loads (a log that was never compacted
+ * pages backward on request).
+ */
+export function tailNeedsMore(recs, prevBefore) {
+  if (prevBefore === null || prevBefore === undefined || !recs || !recs.length) return null;
+  const c = latestCompaction(recs);
+  if (!c || !Number.isInteger(c.upto_seq)) return null;
+  return recs[0].seq > c.upto_seq + 1 ? { before: prevBefore, limit: TAIL_LIMIT } : null;
+}
+
+/** True when the page answer comes from a daemon that pages backward (it carries `prev_before`, null or a seq). */
+export function pagesBackward(page) {
+  return !!page && Object.hasOwn(page, "prev_before");
+}
+
+const PRELUDE_KINDS = new Set(["session_start", "forked"]);
+
+/**
+ * The store starts at the first record of the tail: `recs` are the last pages oldest first, `prevBefore` the seq to ask for the
+ * records before them (null when there are none), `prelude` the session's first records (their start facts fill the Session tab).
+ */
+export function startTailStore(store, recs, prevBefore, prelude = []) {
+  const first = recs.length ? recs[0].seq : 0;
+  store.next = first;
+  store.prevBefore = prevBefore === undefined ? null : prevBefore;
+  store.prelude = [];
+  if (first > 0) for (const r of prelude) if (r && PRELUDE_KINDS.has(r.kind) && r.seq < first) applyPrelude(store, r);
+  applyRecords(store, recs);
+  return store;
+}
+
+function applyPrelude(store, rec) {
+  store.prelude.push(rec);
+  step(store, rec);
+  store.records.delete(rec.seq);
+}
+
+/** Whether records before the loaded ones remain on the daemon. */
+export function hasEarlier(store) {
+  return !!store && store.prevBefore !== null && store.prevBefore !== undefined;
+}
+
+/** The next request for earlier records, {before, limit}, or null. */
+export function earlierRequest(store) {
+  return hasEarlier(store) ? { before: store.prevBefore, limit: TAIL_LIMIT } : null;
+}
+
+/**
+ * Put earlier records (oldest first) in front of the store's. The blocks are built again from the first record, in place (the store
+ * object stays); a streaming reply and each block's open/closed state are kept. Returns how many blocks were added in front.
+ */
+export function prependRecords(store, older, prevBefore) {
+  const all = new Map();
+  for (const r of older || []) if (r && Number.isInteger(r.seq)) all.set(r.seq, r);
+  for (const [seq, r] of store.records) all.set(seq, r);
+  const sorted = [...all.values()].sort((a, b) => a.seq - b.seq);
+  const fresh = createRecordStore(store.session);
+  fresh.next = sorted.length ? sorted[0].seq : store.next;
+  fresh.prelude = [];
+  if (fresh.next > 0) for (const r of store.prelude || []) if (r.seq < fresh.next) applyPrelude(fresh, r);
+  applyRecords(fresh, sorted);
+  for (const r of store.ahead.values()) applyRecord(fresh, r);
+  const ui = new Map();
+  for (const b of store.blocks) if (b.ui && Object.keys(b.ui).length && Number.isInteger(b.seq)) ui.set(b.kind + ":" + b.seq, b.ui);
+  for (const b of fresh.blocks) { const u = ui.get(b.kind + ":" + b.seq); if (u) b.ui = u; }
+  const added = fresh.blocks.length - store.blocks.length;
+  const pending = store.pending;
+  const rev = store.pendingRev;
+  Object.assign(store, fresh);
+  store.pending = pending;
+  store.pendingRev = rev + 1;
+  store.prevBefore = prevBefore === undefined ? null : prevBefore;
+  return Math.max(0, added);
+}
+
+/** One line on the Overview of a session whose earlier records are not loaded. */
+export const OVERVIEW_PARTIAL_WORDS = "This summary reads the records loaded so far. Load earlier records in the Chat tab to include the rest.";
+
+/** The words under Find when records before the loaded ones are not searched yet. */
+export const FIND_EARLIER_WORDS = "Earlier records are not loaded. Press Enter to load and search them.";
+
 /** Where blob lines are read from. */
 export function linesUrl(blob, start, end) {
   return `/api/blobs/${encodeURIComponent(blob)}/lines?start=${start}&end=${end}`;
 }
-export function recordsUrl(session, after, limit) {
+export function recordsUrl(session, after, limit, before = null) {
   let u = `/api/sessions/${encodeURIComponent(session)}/records`;
   const q = [];
   if (after !== null && after !== undefined) q.push(`after=${after}`);
+  if (before !== null && before !== undefined) q.push(`before=${before}`);
   if (limit) q.push(`limit=${limit}`);
   return q.length ? `${u}?${q.join("&")}` : u;
 }
@@ -333,7 +598,9 @@ function sessionChanged(store, id) {
 /** A `session` event: {type:"session", info}. */
 export function applySessionEvent(store, info) {
   if (info && info.id) {
-    store.byId.set(info.id, info);
+    // A session event carries no `last_ms` (the list does): keep the one the list gave.
+    const prev = store.byId.get(info.id);
+    store.byId.set(info.id, prev && prev.last_ms && !info.last_ms ? { ...info, last_ms: prev.last_ms } : info);
     sessionChanged(store, info.id);
   }
   return store;
@@ -543,7 +810,7 @@ export function sessionActions(info) {
 /** Human-readable activity from one recorded event; null for background bookkeeping. */
 export function recordActivity(record) {
   if (!record) return null;
-  const name = oneLine(record.name || "tool", 50);
+  const name = oneLine(toolShownName(record.name || "tool"), 50);
   switch (record.kind) {
     case "user_message": return "Operator message received";
     case "model_request": return "Model request started";
@@ -645,7 +912,7 @@ export function missionOverview(records, ledgerState, inboxEntries, sinceSeq = n
     if (record.kind === "tool_result" && record.status !== "ok") {
       failedChecks++;
       tone = "bad";
-      text = `${oneLine(record.name || "Tool", 50)} returned ${oneLine(record.status || "an unknown status", 50)}`;
+      text = `${oneLine(toolShownName(record.name || "Tool"), 50)} returned ${oneLine(record.status || "an unknown status", 50)}`;
     } else if (record.kind === "tool_result" && record.status === "ok" && record.class === "write") {
       text = `Write tool completed${record.meta && record.meta.path ? ": " + oneLine(record.meta.path, 100) : ""}`;
     } else if (record.kind === "ledger") {
@@ -753,6 +1020,9 @@ export function sendFailure(state, message, { rejected = false } = {}) {
 
 const SESSION_SECTIONS = new Set(["chat", "overview", "agents", "evidence"]);
 /** Hash of a session view: `#/s/<id>/<chat|overview|agents|evidence>`; "record" (the old name of chat) and unknown sections give chat. */
+export function targetHash(name) {
+  return name ? `#/t/${encodeURIComponent(name)}` : "#/targets";
+}
 export function sessionHash(session, section = "chat") {
   return `#/s/${encodeURIComponent(session)}/${SESSION_SECTIONS.has(section) ? section : "chat"}`;
 }
@@ -761,6 +1031,10 @@ export function parseRoute(hash) {
   const parts = String(hash || "").replace(/^#/, "").split("/");
   if (parts[1] === "inbox" && parts.length === 2) return { view: "inbox" };
   if (parts[1] === "new" && parts.length === 2) return { view: "new" };
+  if (parts[1] === "targets" && parts.length === 2) return { view: "targets" };
+  if (parts[1] === "t" && parts[2] && parts.length === 3) {
+    try { return { view: "target", name: decodeURIComponent(parts[2]) }; } catch { return { view: "empty" }; }
+  }
   if (parts[1] !== "s" || !parts[2] || parts.length > 4) return { view: "empty" };
   try {
     const session = decodeURIComponent(parts[2]);
@@ -1017,6 +1291,7 @@ export function createRecordStore(session) {
     start: null, // facts from session_start / forked, for the Session tab
     models: [], // the model in effect over time: {seq, ts, profile, model, context_window}, ascending by seq
     turn: null, // {seq, ts} of the turn running now (latest turn_start with no turn_end/interrupt/end after it)
+    exchanges: [], // the captured exchanges recorded so far, in record order (CONTRACTS-TRAFFIC-TARGETS C1)
   };
 }
 
@@ -1138,7 +1413,7 @@ function step(store, rec) {
   trackBudget(store, rec);
   switch (rec.kind) {
     case "user_message":
-      push(store, { ...base(rec), kind: "user", text: rec.text || "" });
+      push(store, { ...base(rec), kind: "user", text: rec.text || "", images: imageList(rec.images) });
       break;
     case "harness_note":
       push(store, { ...base(rec), kind: "note", note: rec.note, text: rec.text || "", open: rec.note === "assignment" });
@@ -1204,7 +1479,14 @@ function step(store, rec) {
         shown: shownOfTotal(rec),
         lines: lineCount(rec.text || ""),
         ts: rec.ts_ms,
+        images: imageList(rec.images),
       };
+      // A call sent under another harness's name (`Read`, `shell`, …) runs as a loom tool; the result names that
+      // tool. The row shows the tool that ran and keeps the sent name for its tooltip (TOOL-SHAPES §3).
+      if (rec.name && b.name && rec.name !== b.name) {
+        b.ran = rec.name;
+        if (b.args && typeof b.args === "object") b.argsLine = argsLine(rec.name, b.args);
+      }
       b.state = "done";
       store.openCalls.delete(b);
       touch(store, b);
@@ -1243,6 +1525,9 @@ function step(store, rec) {
         brief: rec.brief || "",
         digest: rec.digest || null,
       });
+      break;
+    case "compaction":
+      push(store, { ...base(rec), ...compactionBlock(rec, store.lastStep) });
       break;
     case "inbox_opened": {
       const item = {};
@@ -1305,10 +1590,11 @@ function step(store, rec) {
       clearPending(store);
       break;
     case "model_request":
+      if ((!rec.purpose || rec.purpose === "step") && Number.isInteger(rec.step)) store.lastStep = rec.step;
       push(store, { ...base(rec), kind: "line", sub: "request", detail: true, tone: "dim", text: `request ${rec.req_id}: step ${rec.step}, epoch ${rec.epoch}, about ${tokens(rec.est_tokens)} tokens${rec.purpose && rec.purpose !== "step" ? " (" + rec.purpose + ")" : ""}` });
       break;
     case "session_start":
-      store.start = { budget: rec.budget || {}, tools: (rec.tools || []).length, termination: rec.termination, reasoning_replay: rec.reasoning_replay, model: rec.model ? modelEntry(rec, rec.model) : null };
+      store.start = { target: rec.target || null, budget: rec.budget || {}, tools: (rec.tools || []).length, mcpTools: countMcpTools(rec.tools), termination: rec.termination, reasoning_replay: rec.reasoning_replay, model: rec.model ? modelEntry(rec, rec.model) : null };
       if (rec.model) store.models.push(modelEntry(rec, rec.model));
       break;
     case "turn_start":
@@ -1317,6 +1603,18 @@ function step(store, rec) {
     case "forked":
       store.start = { ...(store.start || {}), budget: rec.budget || {}, termination: rec.termination, forked_from: rec.parent, upto_seq: rec.upto_seq };
       break;
+    case "exchange": {
+      const ex = exchangeOf(rec);
+      if (!ex || store.exchanges.some((x) => x.id === ex.id)) break;
+      store.exchanges.push(ex);
+      // A call's requests are shown on its row: the one named by call_id, which the daemon also sets for a command's proxied traffic.
+      const call = ex.call_id ? store.calls.get(ex.call_id) : null;
+      if (call) {
+        (call.exchanges ||= []).push(ex);
+        touch(store, call);
+      }
+      break;
+    }
     default:
       // pin, unpin, net and kinds this build does not know.
       break;
@@ -1421,30 +1719,35 @@ export function atEnd(scrollTop, clientHeight, scrollHeight, slack = 48) {
  * What a key press in the composer does. Ctrl/Cmd+Enter (`mod`) sends everywhere. A plain Enter sends with a fine pointer and
  * adds a line with a coarse one (a phone's Return key), where Send is the button.
  */
-export function composerAction({ key, shiftKey, isComposing, text, coarse = false, mod = false }) {
+export function composerAction({ key, shiftKey, isComposing, text, coarse = false, mod = false, alt = false, running = false }) {
   if (key !== "Enter" || isComposing) return "none";
   if (!mod && (shiftKey || coarse)) return "none";
-  return String(text ?? "").trim() ? "send" : "ignore";
+  if (!String(text ?? "").trim()) return "ignore";
+  // Alt+Enter holds the message until the lead's turn ends; with nothing running there is no turn to wait for.
+  return alt && running ? "queue" : "send";
 }
 
 /**
  * The help under the message box: {keys, note}. `keys` names the keys and is empty on a coarse pointer, which has no
- * Enter-to-send to teach; `note` says what a message does and is kept whole.
+ * Enter-to-send to teach; `note` says what a message does and is kept whole. While a turn runs the keys also name the queue key
+ * (`mac` says ⌥ for Alt).
  */
-export function composerHelp({ coarse = false, paused = false, running = false, lead = false } = {}) {
+export function composerHelp({ coarse = false, paused = false, running = false, lead = false, mac = false } = {}) {
   const note = [];
   if (paused) note.push("A message does not answer the open question.");
   if (running) note.push(lead ? "It reaches the lead between steps." : "It is read between steps.");
-  return { keys: coarse ? "" : "Enter sends · Shift+Enter adds a line.", note: note.join(" ") };
+  const keys = running ? `Enter sends now · ${mac ? "⌥Enter" : "Alt+Enter"} queues it for after this turn · Shift+Enter adds a line.` : "Enter sends · Shift+Enter adds a line.";
+  return { keys: coarse ? "" : keys, note: note.join(" ") };
 }
 
 /**
  * The one-line caption on the phone composer: {text, label}. `line` is progressLine() output and `stats` sessionStats(); the
  * text is "Plan 1 of 3 · context 9% · cache 98%" (ellipsized by the page), the label the full sentence for its button.
  */
-export function composerCaption({ line, stats } = {}) {
+export function composerCaption({ line, stats, queued = 0 } = {}) {
   const parts = [];
   const spoken = [];
+  if (queued > 0) { parts.push(queuedLabel(queued)); spoken.push(queuedLabel(queued)); }
   const plan = line && line.parts.find((p) => p.key === "plan");
   if (plan) { parts.push(plan.text.replace(/ done$/, "")); spoken.push(plan.text); }
   const context = stats && stats.context;
@@ -1589,6 +1892,93 @@ export function rawUrl(blob) {
   return `/api/blobs/${encodeURIComponent(blob)}/raw`;
 }
 
+// ---- Images (docs/CONTRACTS-2026-11-23.md D7) and queued messages (E5)
+
+/** The images of a record, as the page uses them: only well-formed refs whose blob is a hex id (the route's key). */
+export function imageList(images) {
+  if (!Array.isArray(images)) return [];
+  return images.filter((i) => i && typeof i === "object" && /^[0-9a-f]{8,128}$/i.test(String(i.blob || ""))).map((i) => ({
+    blob: String(i.blob).toLowerCase(), mime: typeof i.mime === "string" ? i.mime : "", bytes: Number(i.bytes) || 0,
+    width: Number(i.width) || 0, height: Number(i.height) || 0, name: typeof i.name === "string" && i.name ? i.name : "",
+  }));
+}
+
+/** Where an image's bytes are read from: the daemon's images route, nowhere else. Null for anything but a hex blob id. */
+export function imageUrl(blob) {
+  return /^[0-9a-f]{8,128}$/i.test(String(blob || "")) ? `/api/images/${String(blob).toLowerCase()}` : null;
+}
+
+/** A thumbnail's size: the image scaled to fit `max` x `max`, never enlarged; unknown sizes give a square placeholder. */
+export function thumbSize(width, height, max = 240) {
+  const w = Number(width), h = Number(height);
+  if (!(w > 0) || !(h > 0)) return { width: max, height: max };
+  const k = Math.min(1, max / w, max / h);
+  return { width: Math.max(1, Math.round(w * k)), height: Math.max(1, Math.round(h * k)) };
+}
+
+/** The words that name an image: its alt text and its facts line. `tool` is the tool of a result's row. */
+export function imageAlt(img, tool) {
+  return img.name || (tool ? `image from ${tool}` : "attached image");
+}
+export function imageFacts(img) {
+  const dims = img.width > 0 && img.height > 0 ? `${img.width}×${img.height}` : "";
+  return [dims, img.bytes > 0 ? byteSize(img.bytes) : "", img.mime].filter(Boolean).join(" · ");
+}
+
+/** The path of an image's file: the attachment list entry of the same name, else the call's path argument; null if unknown. */
+export function imagePath(img, { files = [], args = null } = {}) {
+  const hit = img.name ? files.find((f) => f.name === img.name) : files.length === 1 ? files[0] : null;
+  if (hit) return hit.path;
+  return toolPathArg(args);
+}
+
+/** How the head of a collapsed tool row says it carries images: "1 image" / "2 images". */
+export function imageCountLabel(n) {
+  return `${n} ${n === 1 ? "image" : "images"}`;
+}
+
+const IMAGE_EXT = /\.(png|jpe?g|gif|webp)$/i;
+/** Whether a file the operator attached is an image (by its type, else its name). */
+export function isImageFile(file) {
+  if (!file) return false;
+  if (typeof file.type === "string" && file.type) return /^image\/(png|jpeg|gif|webp)$/.test(file.type);
+  return IMAGE_EXT.test(String(file.name || ""));
+}
+
+/** The vision flag of the session's profile: true, false, or null when the profile list does not say. */
+export function modelVision(models, current) {
+  const m = (Array.isArray(models) ? models : []).find((x) => x && current && x.profile === current.profile);
+  return m && typeof m.vision === "boolean" ? m.vision : null;
+}
+export const NO_VISION_NOTE = "This model does not take images; it gets the file path.";
+
+/** "1 queued" / "3 queued". */
+export function queuedLabel(n) {
+  return `${Number(n) || 0} queued`;
+}
+
+/** A queued message in one line for the list: spaces collapsed, cut at `max` with an ellipsis. */
+export function queuedPreview(text, max = 140) {
+  const one = String(text ?? "").replace(/\s+/g, " ").trim();
+  return one.length > max ? one.slice(0, max - 1).trimEnd() + "…" : one;
+}
+
+/** The queue as the page keeps it: oldest first, only well-formed entries. */
+export function queuedList(items) {
+  return (Array.isArray(items) ? items : []).filter((q) => q && typeof q.id === "string")
+    .map((q) => ({ id: q.id, text: String(q.text ?? ""), attachments: Array.isArray(q.attachments) ? q.attachments : [], created_ms: Number(q.created_ms) || 0 }))
+    .sort((a, b) => a.created_ms - b.created_ms);
+}
+
+/** The route of one queued message (no id: the list); `action` "send" sends it now. */
+export function queuedUrl(session, qid, action) {
+  const base = `/api/sessions/${encodeURIComponent(session)}/queued`;
+  return qid ? `${base}/${encodeURIComponent(qid)}${action ? "/" + action : ""}` : base;
+}
+
+/** What the send button's menu offers while a turn runs. The plain button is the first. */
+export const SEND_CHOICES = [{ when: "now", label: "Send now" }, { when: "after_turn", label: "Queue for after this turn" }];
+
 const copyText = (value) => (typeof value === "string" && value !== "" ? value : null);
 
 /** "Copy reply": the exact raw text of a model reply, the same text the raw response shows. Null when it has none. */
@@ -1597,7 +1987,37 @@ export function replyCopyText(block) {
 }
 /** "Copy message": an operator or agent message as it was written. */
 export function messageCopyText(block) {
-  return block && block.kind === "user" ? copyText(block.text) : null;
+  return block && block.kind === "user" && typeof block.text === "string" ? copyText(splitAttachments(block.text).text) : null;
+}
+
+const ATTACH_HEAD = "Attached files (saved read-only; read them with `read`):";
+const ATTACH_ITEM = /^- (.+) \(([^()]*?), ([^(),]*)\)$/;
+/**
+ * The attachment block the runtime appends to an operator message (docs/UPLOADS.md), taken apart:
+ * {text, files:[{path, name, size, mime}], inline}. `text` is what the operator wrote (above the block); `size` is the words
+ * the block gives ("12.1 KiB"); `inline` is the text after the list (the inline copies), "" when there is none. A text with
+ * no such block comes back whole, with no files.
+ */
+export function splitAttachments(text) {
+  const whole = { text: String(text ?? ""), files: [], inline: "" };
+  const src = whole.text;
+  let from = 0;
+  for (;;) {
+    const at = src.indexOf(ATTACH_HEAD + "\n", from);
+    if (at < 0) return whole;
+    from = at + 1;
+    if (at !== 0 && src[at - 1] !== "\n") continue;
+    const lines = src.slice(at + ATTACH_HEAD.length + 1).split("\n");
+    const files = [];
+    let i = 0;
+    for (; i < lines.length; i++) {
+      const m = ATTACH_ITEM.exec(lines[i]);
+      if (!m) break;
+      files.push({ path: m[1], name: m[1].split("/").filter(Boolean).pop() || m[1], size: m[2], mime: m[3] });
+    }
+    if (!files.length) continue;
+    return { text: src.slice(0, at).replace(/\s+$/, ""), files, inline: lines.slice(i).join("\n").trim() };
+  }
 }
 /** "Copy reasoning": the reasoning of a reply, as recorded. */
 export function reasoningCopyText(block) {
@@ -1802,6 +2222,7 @@ export function ledgerModel(view) {
       text: c.text,
       status: c.status,
       note: c.note || "",
+      assets: (c.assets || []).map(String),
       evidence: (c.evidence || []).map((id) => evById.get(id)).filter(Boolean).map((e) => ({
         id: e.id,
         supports: !!e.supports,
@@ -2020,7 +2441,7 @@ export function planEvent(ev, ctx) {
       if (r.kind === "inbox_opened" || r.kind === "inbox_resolved") out.push({ fx: "inbox_record", session: ev.session, record: r });
       if (ev.session === ctx.openId) {
         out.push({ fx: "apply_record", record: r });
-        if (r.kind === "turn_end" || r.kind === "reweave") out.push({ fx: "refetch_window" });
+        if (r.kind === "turn_end" || r.kind === "reweave" || r.kind === "compaction") out.push({ fx: "refetch_window" });
       }
       if (r.kind === "ledger" && ctx.ledgerMission && ctx.missionOf(ev.session) === ctx.ledgerMission) {
         out.push({ fx: "refetch_ledger", mission: ctx.ledgerMission });
@@ -2032,6 +2453,9 @@ export function planEvent(ev, ctx) {
       break;
     case "net":
       if (ev.session === ctx.openId) out.push({ fx: "net", entry: ev.entry });
+      break;
+    case "target":
+      if (ev.name) out.push({ fx: "target_changed", name: String(ev.name) });
       break;
     case "settled":
       break;
@@ -2073,6 +2497,9 @@ export function buildNewSession(form) {
   const role = form.role || "lead";
   const body = { workspace, message, role, unattended: !!form.unattended };
   if (form.model) body.model = form.model;
+  // A target (CONTRACTS-TRAFFIC-TARGETS T2) is named by its name; none means a mission with its own security state.
+  const target = String(form.target || "").trim();
+  if (target) body.target = target;
   // Only a lead starts agents: the choice for every role goes with it, before its first agent.
   if (form.agentModel && role === "lead") body.role_models = { "*": form.agentModel };
   const title = String(form.title || "").trim();
@@ -2298,6 +2725,141 @@ export function partialView(result) {
   return part && v.words ? { words: v.words, shown: v.shown, total: v.total, cut: !!v.cut } : null;
 }
 
+// ---- repeated calls and paging of a group's rows
+
+/** A run of this many identical consecutive calls is collapsed into one row; fewer stay as they are. */
+export const RUN_MIN = 3;
+/** A run this long marks its group with a loop warning. */
+export const LOOP_MIN = 10;
+/** Rows an open group (or an open run) renders before "Show more". */
+export const GROUP_PAGE = 50;
+
+function canonicalJson(v) {
+  if (Array.isArray(v)) return "[" + v.map(canonicalJson).join(",") + "]";
+  if (v && typeof v === "object") return "{" + Object.keys(v).sort().map((k) => JSON.stringify(k) + ":" + canonicalJson(v[k])).join(",") + "}";
+  const j = JSON.stringify(v);
+  return j === undefined ? "null" : j;
+}
+
+const sigCache = new WeakMap();
+/** What makes two calls "the same call": the tool name and the arguments' canonical JSON (the result may differ). Null for a call whose arguments are unknown. */
+export function callSignature(b) {
+  if (!b || b.kind !== "tool") return null;
+  const hit = sigCache.get(b);
+  if (hit && hit.args === b.args && hit.name === b.name) return hit.sig;
+  let sig = null;
+  if (b.args !== undefined && b.args !== null) sig = (b.name || "") + "\u0000" + canonicalJson(b.args);
+  else if (b.argsInvalid && typeof b.rawArgs === "string") sig = (b.name || "") + "\u0000raw:" + b.rawArgs;
+  sigCache.set(b, { args: b.args, name: b.name, sig });
+  return sig;
+}
+
+// Between two calls of a run only the steps' own text-less replies and request-detail lines may stand; anything that says something breaks it.
+const isPassive = (b) => !!b && (b.detail || (isTextless(b) && !isWarningBlock(b)));
+
+/**
+ * The rows of a group's `blocks`: {type:"block", block} for a block shown as itself, and {type:"run", key, name, count, entries,
+ * first, last} for RUN_MIN or more consecutive calls of one tool with identical arguments. `entries` is [{call, before}] where
+ * `before` are the passive blocks (text-less replies, detail lines) that stood in front of that call.
+ */
+export function groupRows(blocks) {
+  const rows = [];
+  const list = blocks || [];
+  let i = 0;
+  while (i < list.length) {
+    const b = list[i];
+    const sig = callSignature(b);
+    if (sig === null) { rows.push({ type: "block", block: b }); i++; continue; }
+    const entries = [{ call: b, before: [] }];
+    let j = i + 1, pending = [], end = i;
+    while (j < list.length) {
+      const c = list[j];
+      if (c.kind === "tool") {
+        if (callSignature(c) !== sig) break;
+        entries.push({ call: c, before: pending });
+        pending = [];
+        end = j;
+      } else if (isPassive(c)) pending.push(c);
+      else break;
+      j++;
+    }
+    if (entries.length >= RUN_MIN) {
+      rows.push({ type: "run", key: "run" + b.id, name: b.ran || b.name, count: entries.length, entries, first: b, last: entries[entries.length - 1].call });
+      i = end + 1;
+    } else {
+      rows.push({ type: "block", block: b });
+      i++;
+    }
+  }
+  return rows;
+}
+
+/** The longest run among a group's blocks when it is LOOP_MIN or more, else 0. */
+export function longestLoop(blocks) {
+  let best = 0;
+  for (const r of groupRows(blocks)) if (r.type === "run" && r.count > best) best = r.count;
+  return best >= LOOP_MIN ? best : 0;
+}
+
+/** The rows of a group item (`it.shown`), computed once per shown list. */
+export function rowsOf(it) {
+  if (it._rowsFor !== it.shown) { it._rows = groupRows(it.shown); it._rowsFor = it.shown; }
+  return it._rows;
+}
+
+/** The first `pages` pages of `list`: {visible, hidden, more} where `more` is how many the next page adds. */
+export function pageOf(list, pages = 1, size = GROUP_PAGE) {
+  const n = Math.max(1, pages) * size;
+  const hidden = Math.max(0, list.length - n);
+  return { visible: hidden ? list.slice(0, n) : list, hidden, more: Math.min(size, hidden) };
+}
+
+/** "Show 50 more (120 hidden)". */
+export function showMoreLabel(page) {
+  return `Show ${num(page.more)} more (${num(page.hidden)} hidden)`;
+}
+
+/**
+ * Where block `id` sits in the rows of group `it`: {row, runKey, entry, groupPages, runPages}, or null. `groupPages` is the page
+ * count of the group that shows its row, and `runPages` that of the run (0 for a row of its own) that shows the call.
+ */
+export function locateInGroup(it, id, size = GROUP_PAGE) {
+  const rows = rowsOf(it);
+  for (let r = 0; r < rows.length; r++) {
+    const row = rows[r];
+    if (row.type === "block") {
+      if (row.block.id === id) return { row: r, runKey: null, entry: null, groupPages: Math.floor(r / size) + 1, runPages: 0 };
+    } else {
+      for (let e = 0; e < row.entries.length; e++) {
+        const en = row.entries[e];
+        if (en.call.id === id || en.before.some((x) => x.id === id)) return { row: r, runKey: row.key, entry: e, groupPages: Math.floor(r / size) + 1, runPages: Math.floor(e / size) + 1 };
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * How many member rows an item list renders: for each open group the rows of its visible pages plus its "Show more" button; an
+ * open run adds its visible calls. `state` is {groupPages: Map, openRuns: Set, runPages: Map}.
+ */
+export function renderedRowCount(items, state = {}) {
+  const gp = state.groupPages || new Map(), openRuns = state.openRuns || new Set(), rp = state.runPages || new Map();
+  let total = 0;
+  for (const it of items) {
+    if (it.type !== "group" || !it.open) continue;
+    const page = pageOf(rowsOf(it), gp.get(it.key) || 1);
+    total += page.visible.length + (page.hidden ? 1 : 0);
+    for (const row of page.visible) {
+      if (row.type === "run" && openRuns.has(row.key)) {
+        const inner = pageOf(row.entries, rp.get(row.key) || 1);
+        total += inner.visible.length + (inner.hidden ? 1 : 0);
+      }
+    }
+  }
+  return total;
+}
+
 function makeGroup(blocks) {
   let toolCount = 0, exited = 0, failed = 0, denied = 0, invalid = 0, timedOut = 0, interrupted = 0, partial = 0;
   let missing = 0, warnings = 0, records = 0, running = false;
@@ -2328,7 +2890,7 @@ function makeGroup(blocks) {
     }
     if (b.result && Number.isFinite(b.result.ts) && b.result.ts > endTs) endTs = b.result.ts;
   }
-  return { type: "group", key: groupKey(blocks[0]), blocks, shown: blocks, earlier: 0, records, toolCount, exited, failed, denied, invalid, timedOut, interrupted, partial, missing, warnings, running, startTs, endTs, open: false, last: false };
+  return { type: "group", key: groupKey(blocks[0]), blocks, shown: blocks, earlier: 0, records, toolCount, exited, failed, denied, invalid, timedOut, interrupted, partial, missing, warnings, running, startTs, endTs, open: false, last: false, loop: longestLoop(blocks) };
 }
 
 /**
@@ -2497,7 +3059,7 @@ export function groupKeyForSeq(items, seq) {
   return null;
 }
 
-/** The header words of a work group: {text, spoken, duration, tools, exited, failed, denied, invalid, timedOut, interrupted, partial,
+/** The header words of a work group: {text, head, spoken, duration, tools, exited, failed, denied, invalid, timedOut, interrupted, partial,
  *  missing, warnings, running} where text is "Worked for 4m · 12 calls · 2 exited non-zero · 1 denied by policy · 1 without a result ·
  *  running" (each non-ok ToolStatus counted on its own; the running group's duration runs to `now`). `spoken` is the
  *  accessible name: the same without the duration while the group runs, so a ticking clock is not read out every second. */
@@ -2515,8 +3077,11 @@ export function groupLabel(group, now) {
   if (group.missing) rest.push(`${group.missing} without a result`);
   if (group.warnings) rest.push(count(group.warnings, "warning"));
   if (group.running) rest.push("running");
+  // The header's visible words when the outcome counts are drawn as their own marks beside it: no count said twice.
+  const head = [`Worked for ${duration}`, count(group.toolCount, "tool call"), ...(group.missing ? [`${group.missing} without a result`] : []), ...(group.running ? ["running"] : [])];
   return {
     text: [`Worked for ${duration}`, ...rest].join(" · "),
+    head: head.join(" · "),
     spoken: [group.running ? "Work in progress" : `Worked for ${duration}`, ...rest].join(" · "),
     short: [`Worked ${duration}`, count(group.toolCount, "call"), ...(group.running ? ["running"] : [])].join(" · "),
     duration, tools: group.toolCount, failed: group.failed || 0, exited: group.exited || 0, denied: group.denied || 0, invalid: group.invalid || 0,
@@ -2572,6 +3137,28 @@ export function toolIcon(block) {
   }
 }
 
+/** An MCP tool is named `mcp__{server}__{tool}`. Returns {server, tool} (split at the first `__` after the prefix; `server` is "" when
+ *  there is none) for such a name, else null. */
+export function mcpToolName(name) {
+  const s = String(name || "");
+  if (!s.startsWith("mcp__")) return null;
+  const rest = s.slice(5);
+  const at = rest.indexOf("__");
+  return at > 0 && at + 2 < rest.length ? { server: rest.slice(0, at), tool: rest.slice(at + 2) } : { server: "", tool: rest };
+}
+
+/** What a tool name reads as on screen: "github · search_issues" for an MCP tool, the name itself for any other. */
+export function toolShownName(name) {
+  const m = mcpToolName(name);
+  if (!m) return String(name || "");
+  return m.server ? `${m.server} · ${m.tool}` : m.tool;
+}
+
+/** How many of the tool definitions (names or {name} objects) are MCP tools. */
+export function countMcpTools(tools) {
+  return (Array.isArray(tools) ? tools : []).filter((t) => mcpToolName(typeof t === "string" ? t : t && t.name)).length;
+}
+
 /** The look of each way a call can end: its capsule words are `text`, `tone` "ok" | "neutral" | "bad" | "warn" | "running", `icon` a
  *  template name with its own shape per outcome (check, exit, cross, lock, invalid, clock, interrupted, alert, dot). */
 export const TOOL_OUTCOME_LOOK = {
@@ -2591,8 +3178,8 @@ const TOOL_OUTCOME_WORDS = {
   interrupted: () => "Cut off; its effects are unknown.",
 };
 
-/** One tool row in a group: {icon, name, argsLine, capsule, duration, state, outcome, words, partial}. `capsule` is {text, tone, icon}
- *  or null (see TOOL_OUTCOME_LOOK); `outcome` is toolOutcome().kind ("running" / "missing" while there is no result), `words` the
+/** One tool row in a group: {icon, name, calledAs, label, argsLine, capsule, duration, state, outcome, words, partial}. `capsule` is {text, tone, icon}
+ *  or null (see TOOL_OUTCOME_LOOK); `shown` the name as the row reads it and `mcp` whether it is an MCP tool (the badge); `outcome` is toolOutcome().kind ("running" / "missing" while there is no result), `words` the
  *  sentence for its tooltip, `partial` {words, shown, total, cut} when the model saw only part of the output, else null. */
 export function toolRow(block) {
   const r = block.result;
@@ -2613,7 +3200,14 @@ export function toolRow(block) {
     }
   }
   const duration = r && r.duration_ms ? seconds(r.duration_ms) : "";
-  return { icon: toolIcon(block), name: block.name, argsLine: block.argsLine || "", capsule, duration, state: block.state, outcome, words, partial: partialView(r) };
+  const d = block.args && typeof block.args === "object" && !Array.isArray(block.args) ? block.args.description : null;
+  const label = typeof d === "string" && d.trim() ? oneLine(d, 160) : "";
+  const calledAs = block.ran ? block.name : "";
+  const fullName = block.ran || block.name;
+  // `name` stays the full name (keys, viewer titles); `shown` is what the row reads, `mcp` says whether it carries the MCP badge.
+  const mcp = mcpToolName(fullName);
+  const exchanges = block.exchanges || [];
+  return { exchanges, requests: exchanges.length ? requestsWords(exchanges.length) : "", icon: toolIcon(block.ran ? { ...block, name: block.ran } : block), name: fullName, shown: toolShownName(fullName), mcp: !!mcp, calledAs, label, argsLine: block.argsLine || "", capsule, duration, state: block.state, outcome, words, partial: partialView(r) };
 }
 
 /** Footer of a reply, quiet: [profile ·] tok/s · seconds · cache N%. Pass `profile` only when the reply's model differs
@@ -2697,16 +3291,18 @@ export function waitingReason(waiting, now) {
 export const ACTIVITY_UNKNOWN = "activity not loaded";
 
 /**
- * The identity line of a row. `activityMs` is the time of the latest RECORD seen (null when none has been loaded: then the
- * line says so, a creation time is never shown as an age). Returns {text, parts, age, waiting}: `parts` is
- * [profile, role, tail] where tail is the age, or ACTIVITY_UNKNOWN; `text` is "profile · role · tail", or just
- * "profile · role" while something waits (the waiting reason `waiting` is then its own line, so the model stays readable).
+ * The identity line of a row. `activityMs` is the time of the latest RECORD seen (null when none has been loaded: a
+ * creation time is never shown as an age). Returns {text, parts, age, waiting, known}: `parts` is [profile, role, tail]
+ * where tail is the age, or null when unknown; `age` is the age or ACTIVITY_UNKNOWN (for a tooltip); `text` is
+ * "profile · role · age", or just "profile · role" while something waits (the waiting reason `waiting` is then its own
+ * line, so the model stays readable) or while the age is unknown (repeating "not loaded" on every row is noise).
  */
 export function identityLine(info, activityMs, waiting, now) {
   const reason = waitingReason(waiting, now);
-  const when = Number.isFinite(activityMs) ? age(now, activityMs) : ACTIVITY_UNKNOWN;
+  const known = Number.isFinite(activityMs);
+  const when = known ? age(now, activityMs) : ACTIVITY_UNKNOWN;
   const head = [info.profile || "?", info.role || "session"];
-  return { text: (reason ? head : [...head, when]).join(" · "), parts: [...head, when], age: when, waiting: reason };
+  return { text: (reason || !known ? head : [...head, when]).join(" · "), parts: [...head, known ? when : null], age: when, waiting: reason, known };
 }
 
 /**
@@ -2721,10 +3317,14 @@ export function identityLine(info, activityMs, waiting, now) {
  */
 export function workspaceGroups(store, inbox, watermarks, now, opts = {}) {
   const { showArchived = false, expanded = new Set(), activity = new Map() } = opts;
-  // `recorded`: the time of the latest record seen, or null. The creation time only orders rows that have none; it is never shown.
+  // `recorded`: the time of the latest record seen, or the daemon's `last_ms` (its log's last write, sent with the
+  // list so rows are ordered and aged before they are opened), whichever is later; null when neither is known. The
+  // creation time only orders rows that have neither; it is never shown.
   const recorded = (info) => {
     const a = activity.get(info.id);
-    return a && Number.isFinite(a.ts) ? a.ts : null;
+    const seen = a && Number.isFinite(a.ts) ? a.ts : null;
+    const listed = Number.isFinite(info.last_ms) && info.last_ms > 0 ? info.last_ms : null;
+    return seen === null ? listed : listed === null ? seen : Math.max(seen, listed);
   };
   const lastMs = (info) => recorded(info) ?? (Number(info.created_ms) || 0);
   const isFresh = (info) => {
@@ -2825,18 +3425,21 @@ export function runWords(info, opts = {}) {
   const step = st.step > 0 ? ` · step ${st.step}` : "";
   const shape = (STANDING[mark] || STANDING.idle);
   let text;
+  let short = null; // the words for a narrow place (the phone bar): no step number, the state alone
   let running = false;
   switch (mark) {
-    case "needs_you": text = "Waiting for you"; break;
+    case "needs_you": text = "Waiting for you"; short = "Needs you"; break;
     case "running": {
       running = true;
       const ms = Number.isFinite(opts.startMs) && Number.isFinite(opts.now) ? Math.max(0, opts.now - opts.startMs) : null;
       const whole = ms === null ? 0 : Math.floor(ms / 1000);
-      text = `Running${step}${ms === null ? "" : " · " + (whole < 10 ? whole + "s" : seconds(whole * 1000))}`;
+      const clock = ms === null ? "" : " · " + (whole < 10 ? whole + "s" : seconds(whole * 1000));
+      text = `Running${step}${clock}`;
+      short = `Running${clock}`;
       break;
     }
-    case "waiting": text = `Waiting for jobs or agents${step}`; break;
-    case "stopped": text = st.phase === "ended" ? "Ended · stopped" : `Stopped${step}`; break;
+    case "waiting": text = `Waiting for jobs or agents${step}`; short = "Waiting on jobs"; break;
+    case "stopped": text = st.phase === "ended" ? "Ended · stopped" : `Stopped${step}`; short = st.phase === "ended" ? "Ended" : "Stopped"; break;
     case "finished":
     case "failed":
     case "result_ready": {
@@ -2846,10 +3449,11 @@ export function runWords(info, opts = {}) {
         : mark === "failed" ? `Failed${step}` : `Idle${step}${mark === "result_ready" ? " · result ready" : ""}`;
       break;
     }
-    case "question": text = `Idle${step} · question open`; break;
-    default: text = `Idle${step}`;
+    case "question": text = `Idle${step} · question open`; short = "Question open"; break;
+    default: text = `Idle${step}`; short = "Idle";
   }
-  return { text, mark, icon: shape.icon, tone: shape.tone, running };
+  if (short === null) short = st.phase === "ended" ? text.replace(/ · result ready$/, "") : mark === "result_ready" ? "Result ready" : text.replace(step, "");
+  return { text, short, mark, icon: shape.icon, tone: shape.tone, running };
 }
 
 /**
@@ -3190,6 +3794,21 @@ export function shortcutFor(e, opts = {}) {
   }
   if (e.key === "?") return "keys";
   if (e.key === "/") return "find"; // on layouts where / needs Shift the key is still "/"
+  if (e.key === "[") return "mine-prev";
+  if (e.key === "]") return "mine-next";
+  return null;
+}
+
+/**
+ * mineStep(blocks, fromSeq, dir): the seq of the operator's own message one step from `fromSeq` (the record nearest the top of
+ * the view) in `dir` (1 later, -1 earlier), or null at an end. Long records are read prompt by prompt this way.
+ */
+export function mineStep(blocks, fromSeq, dir) {
+  const mine = (blocks || []).filter((b) => b.kind === "user" && Number.isFinite(b.seq)).map((b) => b.seq);
+  if (!mine.length) return null;
+  if (!Number.isFinite(fromSeq)) return dir > 0 ? mine[0] : mine[mine.length - 1];
+  if (dir > 0) return mine.find((q) => q > fromSeq) ?? null;
+  for (let i = mine.length - 1; i >= 0; i--) if (mine[i] < fromSeq) return mine[i];
   return null;
 }
 
@@ -3222,6 +3841,8 @@ export function keySheet(mac = false) {
     ] },
     { title: "In a record", rows: [
       { keys: ["/"], text: "Find in this record" },
+      { keys: ["["], text: "Your previous message in this record" },
+      { keys: ["]"], text: "Your next message in this record" },
       { keys: ["Enter"], text: "In Find: next match" },
       { keys: ["Shift", "Enter"], text: "In Find: previous match" },
       { keys: ["Enter"], text: "In the message box: send" },
@@ -3381,7 +4002,7 @@ const SCORE_CELLS = [
   ["finish_refusals", "finish refusal", "finish refusals"], ["verifier_accepts", "verifier accept", "verifier accepts"],
   ["verifier_rejections", "verifier reject", "verifier rejects"], ["hand_offs", "hand-off", "hand-offs"], ["asks", "ask", "asks"],
 ];
-export const SCORE_TOTAL_LABEL = "Mission total: the result is the lead's, the effort everyone's";
+export const SCORE_TOTAL_LABEL = "Mission total, every session";
 export const SCORE_FINEPRINT = "Run numbers describe effort, not completion.";
 
 function scoreCard(card) {
@@ -3481,7 +4102,14 @@ export function agentGroups(store, inbox, missionId, opts = {}) {
       spawnSeq: opts.spawns && opts.spawns.has(info.id) ? opts.spawns.get(info.id) : null,
     });
   }
-  return { groups: [...groups.values()].filter((g) => g.rows.length), total: members.length, running, badge: running ? `${running} running` : "" };
+  // `agents` and `agentsRunning` leave the lead out, as the sidebar's "12 agents · 4 running" does; `total` and `running`
+  // count every session of the mission.
+  const agents = members.filter((s) => s.parent).length;
+  const agentsRunning = members.filter((s) => s.parent && s.status && s.status.phase === "running").length;
+  const leadRunning = running - agentsRunning > 0;
+  const summary = agents === 0 ? "No agents yet" + (leadRunning ? " · the lead is running" : "")
+    : count(agents, "agent") + (agentsRunning ? ` · ${agentsRunning} running` : "") + (leadRunning ? " · the lead is running" : "");
+  return { groups: [...groups.values()].filter((g) => g.rows.length), total: members.length, running, agents, agentsRunning, summary, badge: running ? `${running} running` : "" };
 }
 
 // ---- find in the record
@@ -3505,8 +4133,9 @@ export function findFields(b, kind = "all") {
     case "inbox": return [["text", b.item && b.item.text, b.seq], ["answer", b.resolved && b.resolved.answer, b.resolved && b.resolved.seq]];
     case "child_settled": return [["text", b.report, b.seq]];
     case "child_spawned": return [["text", typeof b.brief === "string" ? b.brief : b.brief && (b.brief.task || b.brief.text || b.brief.goal), b.seq]];
-    case "tool": return [["call", `${b.name || ""} ${b.argsLine || ""}`, Number.isInteger(b.callSeq) ? b.callSeq : b.seq], ["result", b.result && b.result.text, b.result && b.result.seq]];
+    case "tool": return [["call", `${toolShownName(b.name || "")} ${b.argsLine || ""}`, Number.isInteger(b.callSeq) ? b.callSeq : b.seq], ["result", b.result && b.result.text, b.result && b.result.seq]];
     case "reweave": return [["text", b.summary, b.seq]];
+    case "compaction": return [["text", b.head, b.seq], ["note", b.note, b.seq], ["table", b.table, b.seq]];
     case "line": case "divider": case "end": return [["text", b.text, b.seq]];
     default: return [];
   }
@@ -3625,20 +4254,20 @@ export function progressLine({ plan, step, budget, minutes } = {}) {
 // Pass 2, part 4: ways out, inbox triage
 
 /**
- * foldConfirm(title): the question before folding a session's context, {text, yes, no}. One wording for the Context tab and for the
- * "Ways out" row of a parked or blocker card; `title` is the session's name (omit it for "this session").
+ * compactConfirm(title): the question before compacting a session's context, {text, yes, no}. One wording for the Context tab, the
+ * session sheet and the "Ways out" row of a parked or blocker card; `title` is the session's name (omit it for "this session").
  */
-export function foldConfirm(title) {
+export function compactConfirm(title) {
   const who = title ? `${oneLine(title, 80)}'s context` : "the context of this session";
   return {
-    text: `Fold ${who} now? Older outputs become stubs that keep their out: handles; the next request re-reads the whole prompt once.`,
-    yes: "Fold now",
+    text: `Compact ${who} now? The model writes a note and everything before the last few steps leaves its view; nothing is deleted.`,
+    yes: "Compact now",
     no: "Keep as it is",
   };
 }
 
-/** The receipt line after a fold was asked for. */
-export const FOLD_RECEIPT = "Folding now. The view updates when it is done.";
+/** The receipt line after a compaction was asked for. */
+export const COMPACT_RECEIPT = "Compacting now. The view updates when it is done.";
 
 /**
  * lastRecordedError(blocks): the error sentence of the latest failed request or turn of a session, as the daemon recorded it, or null.
@@ -3941,10 +4570,34 @@ export function workspaceRelative(workspace, text) {
   return parts ? parts.join("/") : null;
 }
 
-/** The path a tool call names, from its arguments (`path`, `file_path` or `file`), or null. */
+/**
+ * fileChanges(blocks, workspace): the files this session's edit and write tools changed, most recent first, one row per path:
+ * {path, rel, edits, added, removed, created, lastSeq, lastId, lastTs}. Counts come from the diffs in the recorded results, so a
+ * result without a diff ("(new file)") counts as an edit with `created` set and no line counts. Only calls that succeeded are
+ * counted; shell commands and agents' edits are not seen here (the caller says so).
+ */
+export function fileChanges(blocks, workspace = "") {
+  const rows = new Map();
+  for (const b of blocks || []) {
+    if (!b || b.kind !== "tool" || b.cls !== "write" || !b.result || b.result.status !== "ok") continue;
+    const path = (b.result.meta && typeof b.result.meta.path === "string" && b.result.meta.path) || toolPathArg(b.args);
+    if (!path) continue;
+    const stat = diffStat(b.result.text);
+    const row = rows.get(path) || { path, rel: workspaceRelative(workspace, path), edits: 0, added: 0, removed: 0, created: false, lastSeq: 0, lastId: null, lastTs: 0 };
+    row.edits++;
+    if (stat) { row.added += stat.added; row.removed += stat.removed; }
+    if (/\n\(new file\)\n|^\(new file\)$/m.test(b.result.text || "")) row.created = true;
+    const seq = b.result.seq ?? b.seq ?? 0;
+    if (seq >= row.lastSeq) { row.lastSeq = seq; row.lastId = b.id; row.lastTs = b.result.ts || b.ts || 0; }
+    rows.set(path, row);
+  }
+  return [...rows.values()].sort((a, b) => b.lastSeq - a.lastSeq);
+}
+
+/** The path a tool call names, from its arguments (`path`, `file_path`, `absolute_path`, `target_file` or `file`), or null. */
 export function toolPathArg(args) {
   if (!args || typeof args !== "object" || Array.isArray(args)) return null;
-  for (const k of ["path", "file_path", "file"]) if (typeof args[k] === "string" && args[k].trim()) return args[k];
+  for (const k of ["path", "file_path", "absolute_path", "target_file", "file"]) if (typeof args[k] === "string" && args[k].trim()) return args[k];
   return null;
 }
 
@@ -4093,12 +4746,14 @@ export const CTX_PARTS = [
   { key: "tools", label: "Tool definitions", family: "setup", pattern: "hatch", group: "setup", counted: true },
   { key: "rules", label: "Rules and approvals", family: "setup", pattern: "dots", group: "setup", note: "Yours, verbatim; never folded." },
   { key: "assignment", label: "Assignment from parent", family: "setup", pattern: "outline", group: "setup" },
+  { key: "compaction", label: "Compaction", family: "carry", pattern: "cross", group: "carry", note: "What replaced everything before the last few steps: the head, your messages, the ledger, pins, the key table and the model's note. The note is written by the model and is not verified." },
   { key: "resume", label: "Re-weave brief", family: "carry", pattern: "hatch", group: "carry", note: "Written when older context was folded; may include leads written by the model, not verified." },
   { key: "notes", label: "Harness notes", family: "carry", pattern: "dots", group: "carry", counted: true },
   { key: "conversation", label: "Messages and replies", family: "conv", pattern: "solid", group: "conv", always: true },
   { key: "tool_output", label: "Tool output", family: "conv", pattern: "hatch", group: "conv", counted: true },
   { key: "pinned", label: "Pinned output", family: "conv", pattern: "dots", group: "conv", counted: true },
   { key: "agent_reports", label: "Agent reports", family: "conv", pattern: "cross", group: "conv", counted: true },
+  { key: "images", label: "Images", family: "conv", pattern: "outline", group: "conv", counted: true, note: "Estimated from each image's size; only a model that takes images is sent them." },
   { key: "stubs", label: "Folded-out stubs", family: "fold", pattern: "dashed", group: "fold", counted: true, note: "The full output stays in the record." },
   { key: "other", label: "Other records", family: "fold", pattern: "light", group: "fold" },
   { key: "framing", label: "Message framing", family: "fold", pattern: "light", group: "fold" },
@@ -4162,7 +4817,7 @@ export function percentWords(share) {
  *   cache {cached, fresh, of, text, none} of the last counted request, or null
  *   notes [{label, note}] the row notes, behind one disclosure
  */
-export function contextCardModel(w) {
+export function contextCardModel(w, opts = {}) {
   const win = Number(w && w.context_window) || 0;
   const b = w && w.breakdown;
   const segs = b && Array.isArray(b.segments) ? b.segments : [];
@@ -4202,17 +4857,25 @@ export function contextCardModel(w) {
   const byKey = new Map(segs.map((s) => [s.key, s]));
   const rows = [];
   const barParts = [];
+  // A session that has been compacted shows the Compaction part; the re-weave parts stay for sessions that have none.
+  const compacted = Number(byKey.get("compaction") && byKey.get("compaction").tokens) > 0;
   for (const def of parts ? CTX_PARTS : []) {
+    if (compacted && (def.key === "resume" || def.key === "stubs")) continue;
     const seg = byKey.get(def.key);
     const t = seg ? Number(seg.tokens) || 0 : 0;
     if (!(t > 0) && !def.always) continue;
     const n = seg && Number.isFinite(seg.count) && def.counted ? seg.count : null;
-    const label = n === null ? def.label : `${def.label} · ${num(n)}`;
+    // The daemon's window view does not say which tool definitions are MCP tools; the caller counts them from the session's own
+    // `session_start` tool names (opts.mcpTools) and the label says so.
+    const mcp = def.key === "tools" && n !== null ? Math.min(Math.max(0, Number(opts.mcpTools) || 0), n) : 0;
+    const label = n === null ? def.label : `${def.label} · ${num(n)}${mcp ? ` (${mcp} MCP)` : ""}`;
     rows.push({ key: def.key, label, count: n, value: "~" + tokens(t), tokens: t, share: ctxPercent(t, total), family: def.family, pattern: def.pattern, group: def.group, note: def.note || "" });
     barParts.push({ key: def.key, tokens: t });
   }
-  const foldAt = Number(w && w.fold_at) || 0;
-  const foldTo = Number(w && w.fold_to) || 0;
+  // `compact_at` (the compaction threshold) replaces the fold bounds when the daemon sends it.
+  const compactAt = Number(w && w.compact_at) || 0;
+  const foldAt = compactAt || Number(w && w.fold_at) || 0;
+  const foldTo = compactAt ? 0 : Number(w && w.fold_to) || 0;
   const known = win > 0;
   const scale = known ? win : Math.max(foldAt * 1.25, total * 1.1, 1);
   const layout = segmentLayout(barParts, scale);
@@ -4233,8 +4896,9 @@ export function contextCardModel(w) {
   const inside = (v) => v > 0 && v <= scale;
   const foldInfo = foldAt > 0 && inside(foldAt) ? {
     at: foldAt, to: foldTo, atPct: ctxPercent(foldAt, scale), toPct: foldTo > 0 && inside(foldTo) ? ctxPercent(foldTo, scale) : null,
-    text: foldTo > 0 ? `▼ folds at ${tokens(foldAt)} · ▽ down to ${tokens(foldTo)}` : `▼ folds at ${tokens(foldAt)}`,
-    past: total > foldAt ? { text: "Past the fold mark: older output folds at the next step." } : null,
+    word: compactAt ? "compacts" : "folds",
+    text: foldTo > 0 ? `▼ folds at ${tokens(foldAt)} · ▽ down to ${tokens(foldTo)}` : `▼ ${compactAt ? "compacts" : "folds"} at ${tokens(foldAt)}`,
+    past: total > foldAt ? { text: compactAt ? "Past the compaction mark: the context compacts at the next step." : "Past the fold mark: older output folds at the next step." } : null,
   } : null;
   let cache = null;
   if (last && counted > 0) {
@@ -4251,4 +4915,558 @@ export function contextCardModel(w) {
     rows, fold: foldInfo, cache,
     notes: [...rows.filter((r) => r.note).map((r) => ({ label: r.label.replace(/ · \d.*$/, ""), note: r.note }))],
   };
+}
+
+// ---------------------------------------------------------------------------------------------
+// MCP servers of a session (GET /api/sessions/{id}/mcp)
+
+const MCP_STATE_TONE = { running: "ok", "not started": "neutral", closed: "neutral", failed: "bad" };
+
+/**
+ * The Session tab's server list from the route's answer: null when there is nothing to show (not an array, or empty), else
+ * [{name, transport, state, tone, toolCount, toolsWords, tools, error, stderr, hasDetail, changed, callsWords}]. `tools` and `stderr`
+ * are plain arrays of text; `hasDetail` says whether the collapsed error/stderr block has anything in it.
+ */
+export function mcpServersModel(list) {
+  if (!Array.isArray(list) || !list.length) return null;
+  return list.filter((s) => s && typeof s === "object").map((s) => {
+    const tools = (Array.isArray(s.tools) ? s.tools : []).map(String);
+    const stderr = (Array.isArray(s.stderr_tail) ? s.stderr_tail : []).map(String);
+    const error = typeof s.error === "string" ? s.error : "";
+    const state = String(s.state || "not started");
+    const calls = Number(s.calls) || 0;
+    return {
+      name: String(s.server || ""), transport: String(s.transport || ""), state, tone: MCP_STATE_TONE[state] || "neutral",
+      toolCount: tools.length, toolsWords: count(tools.length, "tool"), tools,
+      error, stderr, hasDetail: !!error || stderr.length > 0,
+      changed: s.list_changed === true,
+      callsWords: calls ? count(calls, "call") : "",
+    };
+  });
+}
+
+// ---------------------------------------------------------------------------------------------
+// Captured exchanges (docs/CONTRACTS-TRAFFIC-TARGETS.md C and U1-U3)
+
+const blobRefOf = (r) => (r && typeof r === "object" && typeof r.id === "string" && r.id ? { id: r.id, bytes: Number(r.bytes) || 0, lines: Number(r.lines) || 0 } : null);
+
+/** An `exchange` record (or one row of GET /api/exchanges/{session}) as the UI holds it; null when it is not one. */
+export function exchangeOf(rec) {
+  if (!rec || typeof rec !== "object" || typeof rec.id !== "string" || !rec.id) return null;
+  const status = Number.isInteger(rec.status) ? rec.status : null;
+  return {
+    id: rec.id,
+    seq: Number.isInteger(rec.seq) ? rec.seq : null,
+    call_id: typeof rec.call_id === "string" && rec.call_id ? rec.call_id : null,
+    session: typeof rec.session === "string" && rec.session ? rec.session : null,
+    ts: Number(rec.ts_ms) || 0,
+    source: rec.source === "proxy" ? "proxy" : "tool",
+    tool: typeof rec.tool === "string" && rec.tool ? rec.tool : null,
+    scheme: rec.scheme === "https" ? "https" : "http",
+    tls: rec.tls === "intercepted" || rec.tls === "tool" ? rec.tls : "plain",
+    method: String(rec.method || "").toUpperCase(),
+    host: String(rec.host || ""),
+    port: Number(rec.port) || 0,
+    target: String(rec.target || "/"),
+    status,
+    error: typeof rec.error === "string" && rec.error ? rec.error : null,
+    request: blobRefOf(rec.request),
+    response: blobRefOf(rec.response),
+    request_bytes: Number(rec.request_bytes) || 0,
+    response_bytes: Number(rec.response_bytes) || 0,
+    truncated: !!rec.truncated,
+    upstream_unverified: !!rec.upstream_unverified,
+    duration_ms: Number(rec.duration_ms) || 0,
+  };
+}
+
+/** Add `ex` to `list` unless one with its id is there; the list stays oldest first (newest last). Returns whether it was added. */
+export function mergeExchange(list, ex) {
+  if (!ex || list.some((x) => x.id === ex.id)) return false;
+  let i = list.length;
+  while (i > 0 && list[i - 1].ts > ex.ts) i--;
+  list.splice(i, 0, ex);
+  return true;
+}
+
+/** "1 request", "3 requests". */
+export function requestsWords(n) {
+  return count(n, "request");
+}
+
+const bracketed = (host) => (host.includes(":") && !host.startsWith("[") ? `[${host}]` : host);
+
+/** What an exchange is called: `host/target`, with the port when it is not the scheme's own. */
+export function exchangeWhere(ex) {
+  const port = ex.port && ex.port !== (ex.scheme === "https" ? 443 : 80) ? ":" + ex.port : "";
+  const target = ex.target.startsWith("/") ? ex.target : "/" + ex.target;
+  return `${bracketed(ex.host)}${port}${target}`;
+}
+
+/** The status class used to filter and to colour: "ok" 2xx and 1xx, "redirect" 3xx, "client" 4xx, "server" 5xx, "none" without a response. */
+export function statusClass(ex) {
+  if (ex.status === null) return "none";
+  if (ex.status >= 500) return "server";
+  if (ex.status >= 400) return "client";
+  if (ex.status >= 300) return "redirect";
+  return "ok";
+}
+const STATUS_CLASS_WORDS = { ok: "2xx", redirect: "3xx", client: "4xx", server: "5xx", none: "no response" };
+const STATUS_CLASS_TONE = { ok: "ok", redirect: "ok", client: "warn", server: "bad", none: "bad" };
+
+/** One line of an exchange list: `METHOD host/target · status · size · time`, its colour and its small marks. */
+export function exchangeRow(ex) {
+  const cls = statusClass(ex);
+  const status = ex.status === null ? "no response" : String(ex.status);
+  const size = ex.status === null ? "" : ex.response_bytes ? byteSize(ex.response_bytes) : "empty";
+  const time = ex.duration_ms ? seconds(ex.duration_ms) : "";
+  const marks = [];
+  if (ex.tls === "intercepted") marks.push({ key: "intercepted", text: "intercepted", tip: "HTTPS that loom's proxy opened to record it (interception is on for this mission)." });
+  if (ex.upstream_unverified) marks.push({ key: "unverified", text: "server not verified", tip: "loom did not verify this server's certificate: the target lists it as upstream_insecure." });
+  if (ex.truncated) marks.push({ key: "cut", text: "cut", tip: "A body passed the capture limit and was stored only up to it; the sizes are the true ones." });
+  const head = `${ex.method} ${exchangeWhere(ex)}`;
+  return {
+    id: ex.id, head, method: ex.method, where: exchangeWhere(ex), status, tone: STATUS_CLASS_TONE[cls], cls, size, time, marks,
+    text: [head, status, size, time].filter(Boolean).join(" · "),
+    words: ex.error && ex.status === null ? ex.error : "",
+  };
+}
+
+/** The exchanges of one call, in order. */
+export function exchangesForCall(list, callId) {
+  return callId ? list.filter((x) => x.call_id === callId) : [];
+}
+
+/** The choices of the two filters of an exchange list: the hosts seen and the status classes present. */
+export function exchangeFilterOptions(list) {
+  const hosts = [...new Set(list.map((x) => x.host.toLowerCase()))].sort();
+  const present = new Set(list.map(statusClass));
+  const statuses = ["ok", "redirect", "client", "server", "none"].filter((k) => present.has(k)).map((k) => ({ key: k, label: STATUS_CLASS_WORDS[k] }));
+  return { hosts, statuses };
+}
+
+/** The exchanges that pass the filters (`host` and `status` are "" or "all" for no filter); order is kept. */
+export function filterExchanges(list, { host = "", status = "" } = {}) {
+  const h = host && host !== "all" ? host.toLowerCase() : "";
+  const st = status && status !== "all" ? status : "";
+  return list.filter((x) => (!h || x.host.toLowerCase() === h) && (!st || statusClass(x) === st));
+}
+
+/** The words above an exchange list: how many are shown of how many. */
+export function exchangeCountLine(shown, total) {
+  if (!total) return "No requests were captured for this session.";
+  return shown === total ? count(total, "request") : `${count(shown, "request")} of ${total}`;
+}
+
+// -- headers and messages (C5)
+
+export const HEADER_MASK = "•••••••• hidden";
+const SENSITIVE_HEADERS = new Set(["authorization", "cookie", "set-cookie", "proxy-authorization", "x-api-key"]);
+
+/** Whether a header's value is a secret that is hidden until revealed (CONTRACTS-TRAFFIC-TARGETS C5). */
+export function isSensitiveHeader(name) {
+  return SENSITIVE_HEADERS.has(String(name).trim().toLowerCase());
+}
+
+/** Split one whole HTTP/1.1 message (head and body) into its start line, header list and body text. */
+export function parseHttpMessage(text) {
+  const t = String(text ?? "");
+  const m = /\r?\n\r?\n/.exec(t);
+  const head = m ? t.slice(0, m.index) : t;
+  const body = m ? t.slice(m.index + m[0].length) : "";
+  const lines = head.split(/\r?\n/);
+  const start = lines.shift() || "";
+  const headers = [];
+  for (const line of lines) {
+    if (/^[ \t]/.test(line) && headers.length) { headers[headers.length - 1].value += " " + line.trim(); continue; }
+    const i = line.indexOf(":");
+    if (i > 0) headers.push({ name: line.slice(0, i).trim(), value: line.slice(i + 1).trim() });
+  }
+  return { start, headers, body };
+}
+
+/** The header table's rows: a secret's value is the mask until `revealed`. */
+export function maskHeaders(headers, revealed = false) {
+  return headers.map((h) => {
+    const sensitive = isSensitiveHeader(h.name);
+    return { name: h.name, value: h.value, sensitive, shown: sensitive && !revealed ? HEADER_MASK : h.value };
+  });
+}
+
+/** How much of a body the viewer draws; the rest is one Open as output away. */
+export const EXCHANGE_BODY_CAP = 64 * 1024;
+
+/** One side of the exchange viewer: the message split, its rows masked, its body cut for the screen. */
+export function messageView(text, { revealed = false } = {}) {
+  const m = parseHttpMessage(text);
+  const rows = maskHeaders(m.headers, revealed);
+  const cut = m.body.length > EXCHANGE_BODY_CAP;
+  return { start: m.start, rows, hasSecrets: rows.some((r) => r.sensitive), body: cut ? m.body.slice(0, EXCHANGE_BODY_CAP) : m.body, fullBody: m.body, cut, bodyWords: m.body ? byteSize(new TextEncoder().encode(m.body).length) : "no body" };
+}
+
+// -- hosts of a claim (a port of claim_hosts in crates/loom-core/src/target.rs)
+
+function normHost(h) {
+  let s = String(h).trim().replace(/\.+$/, "").replace(/[A-Z]/g, (c) => c.toLowerCase());
+  if (s.startsWith("[") && s.endsWith("]")) s = s.slice(1, -1);
+  return s;
+}
+
+function validName(n) {
+  return n !== "" && n.length <= 253 && n.split(".").every((l) => l !== "" && l.length <= 63 && /^[A-Za-z0-9_-]+$/.test(l) && !l.startsWith("-"));
+}
+
+/** An IP address as {v: 4 | 6, n: BigInt}, or null. */
+function parseIp(s) {
+  if (/^[0-9.]+$/.test(s) && s.includes(".")) {
+    const p = s.split(".");
+    if (p.length !== 4 || p.some((x) => !/^(0|[1-9][0-9]{0,2})$/.test(x) || Number(x) > 255)) return null;
+    return { v: 4, n: p.reduce((a, x) => (a << 8n) | BigInt(x), 0n) };
+  }
+  if (!s.includes(":") || !/^[0-9a-fA-F:.]+$/.test(s)) return null;
+  let str = s;
+  const dot = str.lastIndexOf(":") + 1;
+  if (str.slice(dot).includes(".")) {
+    const v4 = parseIp(str.slice(dot));
+    if (!v4 || v4.v !== 4) return null;
+    str = str.slice(0, dot) + (v4.n >> 16n).toString(16) + ":" + (v4.n & 0xffffn).toString(16);
+  }
+  const halves = str.split("::");
+  if (halves.length > 2) return null;
+  const groups = (x) => (x === "" ? [] : x.split(":"));
+  const head = groups(halves[0]);
+  const tail = halves.length === 2 ? groups(halves[1]) : [];
+  const fill = 8 - head.length - tail.length;
+  if (halves.length === 1 ? head.length !== 8 : fill < 1) return null;
+  const all = [...head, ...(halves.length === 2 ? Array(fill).fill("0") : []), ...tail];
+  if (all.length !== 8 || all.some((g) => !/^[0-9a-fA-F]{1,4}$/.test(g))) return null;
+  return { v: 6, n: all.reduce((a, g) => (a << 16n) | BigInt("0x" + g), 0n) };
+}
+
+const inCidr = (ip, net, bits) => ip.v === net.v && ip.n >> BigInt((ip.v === 4 ? 32 : 128) - bits) === net.n >> BigInt((ip.v === 4 ? 32 : 128) - bits);
+
+/** One scope entry parsed: {entry} or {error} with the sentence the daemon would give. */
+export function parseScopeEntry(raw) {
+  const e = String(raw ?? "").trim();
+  if (!e) return { error: "An empty scope entry: give a host name, `*.domain`, an IP address or a CIDR." };
+  const slash = e.indexOf("/");
+  if (slash >= 0) {
+    const addr = e.slice(0, slash);
+    const bits = e.slice(slash + 1);
+    const ip = parseIp(addr);
+    if (!ip) return { error: `\`${e}\` is not a CIDR: \`${addr}\` is not an IP address.` };
+    const max = ip.v === 4 ? 32 : 128;
+    if (!/^[0-9]+$/.test(bits) || Number(bits) > max) return { error: `\`${e}\` is not a CIDR: the prefix length must be 0 to ${max}.` };
+    return { entry: { kind: "cidr", ip, bits: Number(bits) } };
+  }
+  const lower = normHost(e);
+  const ip = parseIp(lower);
+  if (ip) return { entry: { kind: "ip", ip } };
+  if (lower.startsWith("*.")) {
+    const rest = lower.slice(2);
+    if (validName(rest)) return { entry: { kind: "glob", suffix: "." + rest } };
+    return { error: `\`${e}\` is not a scope entry: after \`*.\` give a domain name such as \`acme.test\`.` };
+  }
+  if (validName(lower)) return { entry: { kind: "host", name: lower } };
+  return { error: `\`${e}\` is not a scope entry: give a host name (\`acme.test\`), \`*.acme.test\`, an IP address or a CIDR (\`10.0.0.0/24\`), without a scheme, port or path.` };
+}
+
+function entryMatches(entry, host) {
+  const h = normHost(host);
+  switch (entry.kind) {
+    case "host": return h === entry.name;
+    case "glob": return h.length > entry.suffix.length && h.endsWith(entry.suffix);
+    case "ip": { const a = parseIp(h); return !!a && a.v === entry.ip.v && a.n === entry.ip.n; }
+    default: { const a = parseIp(h); return !!a && inCidr(a, entry.ip, entry.bits); }
+  }
+}
+
+/** A scope from its two lists; entries that do not parse are skipped (the daemon has already refused them) and named in `errors`. */
+export function parseScope(include, exclude = []) {
+  const errors = [];
+  const take = (list) => (list || []).flatMap((raw) => { const r = parseScopeEntry(raw); if (r.error) errors.push(r.error); return r.entry ? [r.entry] : []; });
+  const inc = take(include);
+  const exc = take(exclude);
+  return {
+    include: inc, exclude: exc, errors,
+    excluded: (host) => exc.some((e) => entryMatches(e, host)),
+    contains(host) { return inc.some((e) => entryMatches(e, host)) && !this.excluded(host); },
+  };
+}
+
+/** The hosts a claim names: its asset hosts, the host of every http(s) URL in its text, and (with a scope) every in-scope name or IP in it. */
+export function claimHosts(text, assetHosts = [], scope = null) {
+  const out = [];
+  const push = (h) => { if (h && !out.includes(h)) out.push(h); };
+  const t = String(text ?? "");
+  for (const h of assetHosts) push(normHost(h));
+  for (let at = t.indexOf("://"); at >= 0; at = t.indexOf("://", at + 3)) {
+    const scheme = /[A-Za-z]*$/.exec(t.slice(0, at))[0].toLowerCase();
+    if (scheme !== "http" && scheme !== "https") continue;
+    const rest = t.slice(at + 3);
+    const end = rest.search(/[/?#\s"'`)>,]/);
+    const authority = end < 0 ? rest : rest.slice(0, end);
+    const hostport = authority.includes("@") ? authority.slice(authority.lastIndexOf("@") + 1) : authority;
+    let host;
+    if (hostport.startsWith("[")) {
+      const close = hostport.indexOf("]");
+      host = close < 0 ? hostport.slice(1) : hostport.slice(1, close);
+    } else {
+      const colon = hostport.indexOf(":");
+      host = colon < 0 ? hostport : hostport.slice(0, colon);
+    }
+    push(normHost(host));
+  }
+  if (scope) {
+    for (const word of t.split(/[\s"'`()<>,;/]/)) {
+      let w = word.replace(/[.:]+$/, "");
+      const colon = w.indexOf(":");
+      if (colon >= 0) {
+        const h = w.slice(0, colon);
+        const p = w.slice(colon + 1);
+        if (!h.includes(":") && /^[0-9]*$/.test(p)) w = h;
+      }
+      w = normHost(w);
+      if (!w || !(parseIp(w) || (w.includes(".") && validName(w)))) continue;
+      if (scope.contains(w)) push(w);
+    }
+  }
+  return out;
+}
+
+/** The host an asset locator names: `host`, `host:port`, `host:port/proto` or a URL; "" for a file, an identity or an id. */
+export function assetHost(locator) {
+  const s = String(locator ?? "").trim().replace(/^[A-Z]+\s+(?=\S)/, "");
+  if (!s || /^(file|identity):/i.test(s)) return "";
+  const url = /^[A-Za-z][A-Za-z0-9+.-]*:\/\/([^/?#\s]+)/.exec(s);
+  const auth = (url ? url[1] : s.split(/[/\s]/)[0]).replace(/^.*@/, "");
+  if (!auth) return "";
+  let host = auth;
+  if (auth.startsWith("[")) host = auth.slice(1, auth.indexOf("]") < 0 ? undefined : auth.indexOf("]"));
+  else if ((auth.match(/:/g) || []).length === 1) host = auth.slice(0, auth.indexOf(":"));
+  host = normHost(host);
+  return parseIp(host) || (host.includes(".") && validName(host)) ? host : "";
+}
+
+/**
+ * What each host a claim names was reached by. A host is reached when some evidence of the claim that is attested and supports it
+ * cites a call during which an exchange with that host (any port) got a response, or quotes the stored message of such an exchange
+ * (F1). Returns [{host, reached, ids}] in the order claimHosts gives them; ids are the `ex-` ids that did it.
+ */
+export function claimReach(claim, exchanges, scope = null) {
+  const hosts = claimHosts(claim.text, (claim.assets || []).map(assetHost).filter(Boolean), scope);
+  const proof = (claim.evidence || []).filter((e) => e.attested && e.supports);
+  return hosts.map((host) => {
+    const ids = [];
+    for (const x of exchanges) {
+      if (x.status === null || normHost(x.host) !== host) continue;
+      const viaCall = proof.some((e) => e.call_id && e.call_id === x.call_id && (!e.session || !x.session || e.session === x.session));
+      const viaBlob = proof.some((e) => e.blob && ((x.request && x.request.id === e.blob) || (x.response && x.response.id === e.blob)));
+      if ((viaCall || viaBlob) && !ids.includes(x.id)) ids.push(x.id);
+    }
+    return { host, reached: ids.length > 0, ids };
+  });
+}
+
+/** The words of a claim's reach line for screen readers and tooltips. */
+export function reachWords(r) {
+  return r.reached ? `${r.host}: reached by ${r.ids.join(", ")}` : `${r.host}: not reached by any of its evidence`;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Targets (docs/CONTRACTS-TRAFFIC-TARGETS.md T and U4)
+
+export const NODE_STATUSES = ["finding", "tested", "deferred", "untested", "not_seen"];
+const STATUS_WORDS = { finding: "finding", tested: "tested", deferred: "deferred", untested: "not tested yet", not_seen: "in scope, not seen" };
+const STATUS_RANK = { finding: 0, untested: 1, deferred: 2, tested: 3, not_seen: 4 };
+export const NODE_KINDS = ["domain", "host", "ip", "service", "endpoint"];
+const KIND_ORDER = { domain: 0, host: 1, ip: 2, service: 3, endpoint: 4 };
+
+/** The words of a node status. */
+export function nodeStatusWords(status) {
+  return STATUS_WORDS[status] || String(status || "unknown");
+}
+
+/** A node as the page holds it, from a node of GET /api/targets/{name}/graph. */
+export function nodeOf(n) {
+  return {
+    id: String(n.id), kind: NODE_KINDS.includes(n.kind) ? n.kind : "host", locator: String(n.locator ?? n.id),
+    status: STATUS_WORDS[n.status] ? n.status : "untested", parent: n.parent || null,
+    missions: Array.isArray(n.missions) ? n.missions.map(String) : [], evidence: Array.isArray(n.evidence) ? n.evidence.map(String) : [],
+    findings: (Array.isArray(n.findings) ? n.findings : []).map((f) => ({ claim: String(f.claim ?? ""), text: String(f.text ?? ""), status: String(f.status ?? "open"), mission: String(f.mission ?? ""), evidence: Array.isArray(f.evidence) ? f.evidence.map(String) : [] })),
+  };
+}
+
+/** How many nodes have each status. */
+export function targetCounts(nodes) {
+  const c = { finding: 0, tested: 0, deferred: 0, untested: 0, not_seen: 0 };
+  for (const n of nodes) if (n.status in c) c[n.status]++;
+  return c;
+}
+
+/** The counts as one sentence: "2 findings · 3 tested · 1 deferred · 4 not tested yet · 1 in scope, not seen" (zeros left out). */
+export function countsWords(counts) {
+  const parts = [];
+  if (counts.finding) parts.push(count(counts.finding, "finding"));
+  if (counts.tested) parts.push(`${counts.tested} tested`);
+  if (counts.deferred) parts.push(`${counts.deferred} deferred`);
+  if (counts.untested) parts.push(`${counts.untested} not tested yet`);
+  if (counts.not_seen) parts.push(`${counts.not_seen} in scope, not seen`);
+  return parts.length ? parts.join(" · ") : "nothing seen yet";
+}
+
+/** Whether a node passes the filters {status, kind, text}: "" or "all" means any; text is a case-insensitive part of the locator. */
+export function nodeMatches(n, { status = "", kind = "", text = "" } = {}) {
+  if (status && status !== "all" && n.status !== status) return false;
+  if (kind && kind !== "all" && n.kind !== kind) return false;
+  const q = String(text).trim().toLowerCase();
+  return !q || n.locator.toLowerCase().includes(q);
+}
+
+const natural = new Intl.Collator("en", { numeric: true, sensitivity: "base" });
+
+/**
+ * The rows of the tree, domain → host → ip → service → endpoint, by each node's `parent`. A node that passes the filters is
+ * shown with the path above it (those rows are `context`: they do not pass themselves); siblings go by kind, then finding
+ * first, then name. `collapsed` holds the ids the operator folded; a filter opens every path it needs. A parent that is not
+ * among the nodes (or a loop) makes the node a root.
+ */
+export function targetTree(nodes, filters = {}, collapsed = new Set()) {
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const kids = new Map();
+  const roots = [];
+  const parentOf = (n) => {
+    if (!n.parent || n.parent === n.id || !byId.has(n.parent)) return null;
+    let p = byId.get(n.parent);
+    for (let hops = 0; p; hops++) {
+      if (p.id === n.id || hops > nodes.length) return null;
+      p = p.parent ? byId.get(p.parent) : null;
+    }
+    return n.parent;
+  };
+  for (const n of nodes) {
+    const p = parentOf(n);
+    if (p) (kids.get(p) || kids.set(p, []).get(p)).push(n); else roots.push(n);
+  }
+  const order = (a, b) => KIND_ORDER[a.kind] - KIND_ORDER[b.kind] || STATUS_RANK[a.status] - STATUS_RANK[b.status] || natural.compare(a.locator, b.locator);
+  const filtering = ["status", "kind", "text"].some((k) => filters[k] && filters[k] !== "all" && String(filters[k]).trim());
+  const rows = [];
+  let shown = 0;
+  const walk = (n, depth) => {
+    const own = nodeMatches(n, filters);
+    const sub = (kids.get(n.id) || []).slice().sort(order);
+    const at = rows.length;
+    const row = { id: n.id, node: n, depth, context: false, hasKids: sub.length > 0, open: false, kids: sub.length };
+    rows.push(row);
+    let any = own;
+    for (const k of sub) if (walk(k, depth + 1)) any = true;
+    if (!any) { rows.length = at; return false; }
+    row.context = !own;
+    row.open = (filtering || !collapsed.has(n.id)) && sub.length > 0;
+    if (!row.open) rows.length = at + 1;
+    if (own) shown++;
+    return true;
+  };
+  for (const r of roots.sort(order)) walk(r, 0);
+  return { rows, shown, total: nodes.length, filtering };
+}
+
+/** Rows of a long tree to draw (past `VIRTUAL_ROWS`): the slice for a scroll position, with the space above and below it. */
+export const VIRTUAL_ROWS = 2000;
+export function treeWindow(total, scrollTop, viewHeight, rowHeight = 40, overscan = 20) {
+  if (total <= VIRTUAL_ROWS) return { start: 0, end: total, before: 0, after: 0, virtual: false };
+  const first = Math.max(0, Math.floor(scrollTop / rowHeight) - overscan);
+  const last = Math.min(total, Math.ceil((scrollTop + viewHeight) / rowHeight) + overscan);
+  return { start: first, end: last, before: first * rowHeight, after: (total - last) * rowHeight, virtual: true };
+}
+
+const FINDING_CLOSED = new Set(["withdrawn", "refuted"]);
+
+/** Every finding on the nodes, open ones first, each with the node it sits on; `open` is false once withdrawn or refuted. */
+export function targetFindings(nodes) {
+  const out = [];
+  for (const n of nodes) for (const f of n.findings) out.push({ ...f, node: n.id, locator: n.locator, open: !FINDING_CLOSED.has(f.status) });
+  return out.sort((a, b) => Number(b.open) - Number(a.open) || natural.compare(a.locator, b.locator) || natural.compare(a.claim, b.claim));
+}
+
+/**
+ * The missions that touched a target: every mission named on a node, with what it did there, and the session that leads it
+ * (to link to). `byId` is the session store's map.
+ */
+export function targetMissions(nodes, byId = new Map(), targetName = "") {
+  const m = new Map();
+  const get = (id) => m.get(id) || m.set(id, { id, seen: 0, tested: 0, findings: 0 }).get(id);
+  for (const n of nodes) {
+    for (const id of n.missions) {
+      const x = get(id);
+      x.seen++;
+      if (n.status === "tested") x.tested++;
+    }
+    for (const f of n.findings) if (f.mission && !FINDING_CLOSED.has(f.status)) get(f.mission).findings++;
+  }
+  if (targetName) for (const info of byId.values()) if (!info.parent && info.target === targetName) get(info.mission || info.id);
+  const out = [];
+  for (const x of m.values()) {
+    let lead = null;
+    for (const info of byId.values()) if (!info.parent && (info.mission === x.id || info.id === x.id)) { lead = info; break; }
+    out.push({ ...x, session: lead ? lead.id : null, title: lead ? lead.title || lead.id : x.id, words: [`saw ${count(x.seen, "node")}`, x.tested ? `tested ${x.tested}` : "", x.findings ? count(x.findings, "open finding") : ""].filter(Boolean).join(" · ") });
+  }
+  return out.sort((a, b) => natural.compare(a.title, b.title));
+}
+
+/** The scope as the operator edits it: one entry per line. */
+export function scopeText(list) {
+  return (list || []).join("\n");
+}
+
+/** The entries of an edited scope box (lines or commas); the first one that does not parse comes back as `error`. */
+export function scopeFromText(text) {
+  const entries = [];
+  for (const raw of String(text ?? "").split(/[\n,]/)) {
+    const e = raw.trim();
+    if (!e) continue;
+    const r = parseScopeEntry(e);
+    if (r.error) return { error: r.error };
+    if (!entries.includes(e)) entries.push(e);
+  }
+  return { entries };
+}
+
+/** The body of PUT /api/targets/{name} for an edited scope: the whole configuration, the other lists as loaded. */
+export function targetPut(cfg, scope, exclude) {
+  const s = scopeFromText(scope);
+  if (s.error) return { error: s.error };
+  const x = scopeFromText(exclude);
+  if (x.error) return { error: x.error };
+  if (!s.entries.length) return { error: "A target needs at least one scope entry." };
+  return { body: { scope: s.entries, exclude: x.entries, upstream_insecure: cfg.upstream_insecure || [], intercept_passthrough: cfg.intercept_passthrough || [], notes: cfg.notes || "" } };
+}
+
+/** A target of GET /api/targets as the list shows it. */
+export function targetOf(t) {
+  const counts = { finding: 0, tested: 0, deferred: 0, untested: 0, not_seen: 0, ...(t.counts || {}) };
+  return {
+    name: String(t.name), scope: Array.isArray(t.scope) ? t.scope.map(String) : [], exclude: Array.isArray(t.exclude) ? t.exclude.map(String) : [],
+    upstream_insecure: Array.isArray(t.upstream_insecure) ? t.upstream_insecure.map(String) : [], intercept_passthrough: Array.isArray(t.intercept_passthrough) ? t.intercept_passthrough.map(String) : [],
+    notes: String(t.notes || ""), counts, words: countsWords(counts),
+  };
+}
+
+/** The nodes of GET /api/targets/{name}/graph: `{nodes, edges}` or a bare list; a node without a `parent` takes it from the edges (T3). */
+export function graphNodes(g) {
+  const list = Array.isArray(g) ? g : Array.isArray(g?.nodes) ? g.nodes : [];
+  const edges = Array.isArray(g?.edges) ? g.edges : [];
+  const parents = new Map();
+  for (const e of edges) {
+    if (!e || !e.from || !e.to) continue;
+    if (e.kind === "parent") parents.set(String(e.from), String(e.to));
+    else if (["resolves", "runs", "serves"].includes(e.kind) && !parents.has(String(e.to))) parents.set(String(e.to), String(e.from));
+  }
+  return list.map((n) => nodeOf({ ...n, parent: n.parent || parents.get(String(n.id)) || null }));
+}
+
+/** The exchanges of a `bash` row that has none by call id: the proxy's own, with no call, recorded between its call and its result. */
+export function callWindowExchanges(block, list) {
+  if (!block || (block.ran || block.name) !== "bash" || !block.result || !Number.isFinite(block.ts) || !Number.isFinite(block.result.ts)) return [];
+  return list.filter((x) => !x.call_id && x.source === "proxy" && x.ts >= block.ts && x.ts <= block.result.ts);
 }

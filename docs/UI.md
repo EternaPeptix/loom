@@ -58,8 +58,9 @@ line drops the age and the reason is a line of its own below it (for example "Ap
 a question mark in blue) and an available result ("Result ready 10m", an outline diamond in green) are
 said the same way, without the urgent treatment. The age is the time of the latest recorded event the
 page has seen, kept in tab storage beside the watermarks so it survives a reload; for a session whose
-records have not been loaded it reads "activity not loaded". The creation time orders such rows but is
-never shown as an age. The
+records have not been loaded the line leaves the age out ("qwen · lead") and its tooltip says the activity
+is not loaded yet; repeating "not loaded" on every row was noise. The creation time orders such rows but is
+never shown as an age. An agent row in the Agents tab likewise leaves out "last record" until one is known. The
 earlier row summary (what waits and for how long, how the root stands, recorded activity) remains the
 row's tooltip and description, so nothing it said is lost. Blocking requests, nonblocking questions
 and available results have different labels, and only blocking requests use the urgent attention
@@ -178,7 +179,7 @@ reference opens its cited range with surrounding context.
 Chat is the whole record presented as a conversation, oldest first, in a column centred at
 `clamp(640px, 70%, 920px)`; the composer is the same width. It retains all previous event
 presentation: native tool call/result pairing, explicit missing results and output cuts, child
-reports, re-weaves, inbox resolutions, request details, reasoning and live output. Folding is
+reports, compactions (and the re-weaves of old logs), inbox resolutions, request details, reasoning and live output. Folding is
 presentation only. Scrolling up stops following new output and reveals Jump to latest. Activity links
 open their corresponding chat blocks.
 
@@ -218,6 +219,17 @@ open their corresponding chat blocks.
   `exit N`, failed with a cross, "no result" with an alert, running with a dot) and duration. Clicking
   the row or pressing Enter opens its output as before: 24-line clip with show all, the cut note with
   “open full output”, the arguments toggle, "no result recorded" and "running…".
+  An expanded row labels its boxes: "Output" above the output, and "Arguments" above the arguments when
+  "Show arguments" is on, so the two are not mistaken for each other.
+- **Repeated calls**: three or more consecutive calls of one tool with identical arguments (canonical
+  JSON; result status may differ; text-less replies between them do not break the run) collapse to
+  one row, "bash cargo build · same call ×40", with a "repeated 40×" chip and the last call's
+  outcome. Opening it lists the calls. A run of 10 or more puts a "loop" warning on the group head
+  ("The same call was made N times in a row. The model may be stuck."). Two identical calls stay as is.
+- **Bounded rendering**: an open group renders at most 50 rows (a collapsed run counts as one), then
+  "Show 50 more (N hidden)"; an open run pages its calls the same way. Expand all opens the group
+  heads only; each still renders its first page. Jump-to-record and search results reveal the page
+  (and open the run) that holds their target first.
 - The live reply is shown at the bottom as a reply in progress with its model chip.
 
 ### Copying
@@ -343,6 +355,48 @@ lost and an open question keeps its focus. "What these mean" keeps its open stat
 after a redraw, and Stop's confirmation says only a root can be resumed (an agent ends; its lead can start a new one). The
 MODEL row shows the session's own context limit; if only the profile reports one, it says so.
 
+### Attachments
+
+The composer and the new-mission form take files (the contract is `docs/UPLOADS.md`). A paperclip button opens a
+multi-file picker; files can also be dropped on the composer card or the transcript (a dashed highlight shows the zone)
+and pasted into the message box, clipboard images included. Text on the clipboard wins over a file that comes with it.
+Each file uploads at once with `POST /api/uploads?workspace=&name=` (same bearer header, no cookies as `api()`) and shows
+as a chip above the text: name, size (`byteSize`), "Uploading…", and × to remove. A failed upload shows the daemon's
+`error` sentence on its chip and Send stays disabled until it is removed; Send also waits for uploads in flight. Send is
+enabled with attachments and no text, posts `attachments: [path…]` with the message, and clears the chips once the
+daemon accepts it. Chips are drafts: they are kept per session with the message draft for as long as the page is open.
+
+The new-mission form has the same button and drop zone, disabled (tooltip: enter a workspace first) until the workspace
+field has a value. Changing the workspace after files are attached clears the chips and says so. `attachments` goes in
+`POST /api/sessions`.
+
+In the transcript, an operator message whose text holds the runtime's block (first line exactly
+``Attached files (saved read-only; read them with `read`):``, `splitAttachments` in `core.js`) shows the text above the
+block as before, the list as file chips (name, size) that open the file in the Files tab (path made workspace-relative
+with `workspaceRelative`), and the inline copies in one collapsed "Inline copies" disclosure. Copy message copies only
+the text above the block.
+
+Tool rows (`docs/TOOL-SHAPES.md` section 3): `toolPathArg` also reads `absolute_path` and `target_file`. A call whose
+arguments have a string `description` (bash) is labelled with it; the command stays on the row, dimmer, beside the label.
+
+### Images
+
+Records of kind `user_message` and `tool_result` may carry `images: [{blob, mime, bytes, width, height, name?}]` (`imageList` drops anything whose blob is not hex). The bytes come only from `GET /api/images/{blob}` (`imageUrl`), fetched with the bearer header like every other route and shown as data URLs, so the CSP needs `img-src 'self' data:` and nothing else.
+
+- A thumbnail is a button with an `img` of at most 240 by 240 (`thumbSize` scales down, never up), loaded lazily when it nears the viewport. Its alt text is the image's name, else "image from {tool}", else "attached image". A failed load leaves a dashed box and the daemon's sentence in the title.
+- In an operator message the thumbnails sit under the text and the file chips. In a tool row they sit inside the expanded body, above the output; the collapsed head shows a small image icon with the count ("2 images").
+- A click opens the image dialog (same modal pattern as the stored output viewer: focus moves to Close, Escape closes, focus returns to the thumbnail). It shows the full image scaled to fit, the name, "WxH · size · mime", the path and Copy path. The path is the matching attachment file, else the tool's path argument; with neither, Copy path is hidden.
+- Composer and new-mission chips for image files show a 20 px thumbnail read from the local File (never from a URL). When the session's current model has `vision: false` in `GET /api/models`, each image chip is followed by "This model does not take images; it gets the file path." The file is still attached and the path is still sent.
+
+### Queued messages
+
+While the open session's lead is running the composer has two ways to send. Enter sends now, as always. Alt+Enter (Option+Enter on a Mac) queues the message with `when: "after_turn"`; the help line under the box names both keys. The send button has a small menu button beside it ("More ways to send") with "Send now" and "Queue for after this turn"; it is not shown when the lead is not running or when the open session is an agent. On a phone there is no Enter key to rely on, so the menu is the way to queue.
+
+- Queued messages list above the composer, one row each: a one-line preview of the text and Edit, Send now, Remove. The list is the daemon's (`GET /api/sessions/{id}/queued`); the page re-reads it on load and on every `{type:"queued", session}` event, so two tabs agree.
+- Edit swaps the preview for a textarea with Save and Cancel (Escape cancels); Save is `PUT .../queued/{qid}`. Send now is `POST .../queued/{qid}/send`; Remove is `DELETE`. A 404 means it was sent or removed elsewhere: the row goes and the notice says so.
+- The composer caption shows "N queued" first when any are waiting, and the session details label says it too. Stopping a session keeps its queued messages.
+- On a phone (699px and under) the list takes the width of the composer, the preview wraps to two lines, and the buttons are 44 px tall.
+
 ## Drafts, submissions and updates
 
 Drafts are keyed by session ID for messages and item ID for inbox answers. They survive mission/view
@@ -373,7 +427,8 @@ The composer's toolbar holds the model seat, `#model-seat`: a select listing the
 open session's current profile. An unreachable profile is labelled "(not reachable)", and a current
 profile that is no longer configured is still listed as "(not configured)". It is disabled, with the
 reason ("This session has ended; its model no longer changes.") as its tooltip and accessible
-description, for an ended session, which the daemon refuses to re-seat; archived sessions can still be
+description, for an ended session, which the daemon refuses to re-seat; on an ended session's closed
+composer it is hidden altogether (the model stays in the header chip). Archived sessions can still be
 re-seated. A switch in flight holds only its own session's seat. Until a session is known to the page the
 seat is disabled and the identity chips are empty rather than showing the previous session.
 
@@ -446,10 +501,12 @@ light/dark appearance and reduced-motion support. Avoid dependence on color or h
   takes the remainder). Fold marks use the effective bounds `fold_at` and `fold_to` (not the raw target and floor), drawn as
   two shapes (a solid tick with a filled triangle: folds at; a dashed tick with an outline triangle: down to) and said in a
   line ("▼ folds at 210k · ▽ down to 131k"; only the first mark and half of the line when the floor is 0), with "Past the fold mark: older output folds at the next step." in neutral
-  words; no amber. Under the bar a two-part bar says how much of the last request came from the cache and how much was read
+  words; no amber. When the window carries `compact_at` the one mark is "▼ compacts at 104k" ("Past the compaction mark: the context
+  compacts at the next step."). A `compaction` segment shows the **Compaction** part (head, operator messages, ledger, pins, key
+  table, note; the note is the model's and unverified); "Re-weave brief" and "Folded-out stubs" show only for a session that has none. Under the bar a two-part bar says how much of the last request came from the cache and how much was read
   anew (server numbers, no "~"), or that none was reported. "What these mean" holds one-line notes (rules are yours,
   verbatim; the re-weave brief may hold unverified leads; stubs keep the output in the record; harness state is sent fresh
-  each request). **Fold now…** asks first (focus on "Keep as it is") and **Refresh** reads the window again. In the inspector
+  each request). **Compact now…** asks first (focus on "Keep as it is"; `compactConfirm()`: "The model writes a note and everything before the last few steps leaves its view; nothing is deleted."), then sends `POST /api/sessions/{id}/compact`; it and **Refresh** reads the window again. In the inspector
   the card is followed by the counts and the list of what is in the window. An unknown window draws against the fold mark plus
   25% and says so; an answer from an older daemon (no `breakdown`) shows the hero and says the parts are not reported.
 - **Network** (`GET /api/sessions/{id}/net`, plus live `net` events): the newest 500 decisions,
@@ -491,6 +548,11 @@ keys scroll them at once and Enter never rests on Close. Loading earlier lines k
 being read where they are. A cited line, the line gone to and a search match are marked
 differently, since all three can meet on one line.
 
+"Open full output" from a tool row opens at the first line the model saw other than line 1 (for a
+head-and-tail cut, at the start of the omitted middle) and marks the lines the model was shown
+(`seenRanges`, a blue left edge), with the sentence "Lines the model was shown are marked." This
+is separate from a citation: only `citeStart` switches the standing sentence to evidence wording.
+
 ## Validation
 
 Run the pure regressions and safety checks with:
@@ -506,7 +568,7 @@ For browser checks without a model or real daemon:
 node tools/ui-preview.mjs
 ```
 
-Open the printed loopback URL, `/#code=fixture`: the fixture answers `POST /api/web-sessions` for
+Open the printed loopback URL, `/#code=facefeedfacefeed`: the fixture answers `POST /api/web-sessions` for
 that code, so the page signs in as it would from `loom open` (alternatively set the `sessionStorage`
 secret `fixture-secret` and open `/#/s/s-audit`). The fixture contains three workspaces
 (`/fixture/loom`, `/fixture/indexer`, `/fixture/docs`) and three model profiles with different
@@ -541,7 +603,7 @@ sessions are counted and scaled; `s-quiet` has no counted request (the default-r
 and dark, with touch emulation where the browser offers it: no horizontal scroll of the page, exactly one vertical scroller in
 the session view (`#view-session`, besides the message box), the composer's height (`--composer-h`) at most about 130px with
 an empty draft, the `s-audit` question visible on landing with Jump hidden while it is, Find at about 100px, the sheet
-from both openers, Stop's confirmation, Fold now's confirmation, Change model…, the copy buttons, and a narrow window with
+from both openers, Stop's confirmation, Compact now's confirmation, Change model…, the copy buttons, and a narrow window with
 a mouse still sending on Enter. Chrome's mobile emulation is what was checked; the keyboard above the composer, the safe
 areas, Android Back and a real iOS keyboard were not.
 
@@ -552,7 +614,7 @@ rendered window, tool results with denied, invalid, timeout and non-zero exit, a
 which ends a mission to exercise notifications (a root goes idle with `last_end`, as the daemon does; an
 agent settles with `session_end`). Check also: Ctrl/Cmd+K and the shortcut sheet, Agents
 groups and refresh, Find across a folded group and a cut output, a notification stub batching one result
-and one ending, Fold now and Switch model from a parked card, inbox triage with Ctrl/Cmd+Enter and Refuse,
+and one ending, Compact now and Switch model from a parked card, inbox triage with Ctrl/Cmd+Enter and Refuse,
 and 320px, 800px and desktop in light and dark with no horizontal scroll. Not checked in a real browser: the
 notification permission prompt, 44px coarse-pointer sizes and screen-reader output.
 
@@ -580,7 +642,7 @@ in `docs/IMPLEMENTING.md` and `gui/DESIGN.md`.
   before the first newer record. While the chat is scrolled away from the end, "Jump to latest · N new"
   counts the records recorded since.
 - **Ledger and confirmations.** The ledger is read again after a reconnect or `lagged`, and once the open
-  session becomes known. Fold now and the Models-tab selects ask first, with the re-read cost, inline.
+  session becomes known. Compact now and the Models-tab selects ask first, with the re-read cost, inline.
   An approved scope request is said as "Approved · hosts granted: …", not "Dismissed": the tab's own receipt
   wins over the record's empty-answer resolution, and after a reload the hosts are matched against the
   mission's granted hosts (the Evidence ledger); when that is not known the card says "Closed". A held or
@@ -663,11 +725,39 @@ session.
   limit). Budget is a limit, not completion, and its accessible name says so. The line is hidden when nothing
   is known.
 
+### Compaction
+
+A `compaction` record (docs/CONTRACTS-COMPACTION.md K1) is a divider card, `compactionBlock()` in core.js: the head
+"Context compacted · step 412 · 312k → 38k tokens · size" (reasons in words: size, refused, stall, operator, fresh start) and two
+collapsed parts. **Note** is the model's note rendered like a reply (`prose()`, so model text is never HTML), labelled "Written
+by the model, not verified"; `dropped_keys` are listed under it as "Keys the note cited that do not exist in this session"; no
+note says so and still shows the table. **Key table** is the harness's table in monospace. For `fresh_start` the verifier's
+`objections` show under the head. Every `out:<hex>` (8 to 64 hex characters) in the note and the table is a button
+(`.keylink`, `splitOutKeys()`) that opens the stored-output dialog on that handle (`openViewer`; the daemon accepts a handle prefix).
+Find searches the head, note and table. `reweave` records of old logs keep rendering as before; no new one is written.
+Compact now (Context tab, session sheet, parked/blocker "Ways out") posts to `/compact`; the fixture also keeps `/reweave`.
+
+### Long sessions load from the end
+
+Opening a session no longer reads the log from seq 0. `loadRecords()` asks `GET /api/sessions/{id}/records?before=<max>&limit=1000`
+(the last 1,000 oldest first, with `prev_before`). While the latest `compaction` in the page has an `upto_seq` before the page's first
+record (`tailNeedsMore()`), the next earlier page is read; records after the tail then arrive by `after` as before, and
+live events and watermarks work unchanged. Send is enabled as soon as the tail is in (`initialComplete`). The first records
+of the session (start facts) are read once so the Session tab is complete. A daemon whose answer has no `prev_before` (an
+older one) is read from the start as before. A log with no compaction in the last page loads that page only, so the latest compaction
+may be older than what is shown; the earlier records are one click away.
+
+While `prev_before` is not null the transcript top shows **Load earlier records** (`#btn-earlier`); it reads one page and
+keeps the reader where they were (`loadEarlier()`, `prependRecords()` rebuilds the blocks and keeps each block's open state). Find
+and the jump to a record that is not loaded read every earlier page first; the Find hint says "Earlier records are not loaded.
+Press Enter to load and search them." and the count says it covers loaded records. The Overview says its summary reads the loaded
+records. Fixture: `s-big` (5,002 records) pages backward; `s-compacted` has a size compaction and a fresh start.
+
 ### Ways out
 
 A parked item (a turn that ended parked for the operator) and a blocker card carry a
-"Ways out" group. **Fold the context…** opens an inline confirmation with the re-read cost (the same wording
-as Fold now on the Context tab, `foldConfirm()`); "Fold now" sends `POST /api/sessions/{id}/reweave` and
+"Ways out" group. **Compact the context…** opens an inline confirmation with the re-read cost (the same wording
+as Compact now on the Context tab, `compactConfirm()`); "Compact now" sends `POST /api/sessions/{id}/compact` and
 shows a receipt or an alert, "Keep as it is" closes it. **Switch model…** goes to the session and focuses the
 model seat `#model-seat`; a disabled seat shows its reason. When the card's session is the open one, "Last
 recorded error" shows the failure the daemon recorded as plain text: the reason in the latest parked item
@@ -702,7 +792,8 @@ request reads "Approved · hosts granted: …", a refused one "Refused".
   breadcrumbs and a list read one folder at a time, on opening and on **Refresh** only (no polling). Keys as in the picker (in an empty folder focus is on the current crumb, and Backspace, Left and Alt+Up go up from there); a
   filter over the loaded entries; Show hidden (the daemon's `hidden` flag); links, non-files and the root's `.loom` (the
   entry the daemon marks with a `note`) are listed but closed, each with its reason; a folder the daemon cannot list
-  shows the daemon's sentence (409) in the status line. The tab's DOM is built once per session, so a redraw never loses the filter or the focus.
+  shows the daemon's sentence (409) in the status line. The root's `.loom` stays closed, but `.loom/uploads` and what lies
+  under it can be typed as a path, listed and read (`docs/UPLOADS.md`). The tab's DOM is built once per session, so a redraw never loses the filter or the focus.
 - **A file in the viewer** (`GET …/files/lines?path=&start=&count=`): the stored-output dialog in file mode: the relative path,
   size and age in the header, "File in the workspace now — it may have changed since the agent read it", Go to line and Find
   in loaded lines, **Copy path** (the absolute path), no citation marks. A binary file says so and shows no lines; a refusal
@@ -710,3 +801,55 @@ request reads "Approved · hosts granted: …", a refused one "Refused".
   missing path or session, 409 for every other refusal, 400 for a bad query.
 - **Open file** on a tool row (inside the expanded row) shows the Files tab at that path when the call's `path`, `file_path`
   or `file` is inside the workspace; the entry is selected, and a missing one is said.
+
+## Pass 3: changes, plan and stop where the eyes are
+
+Compared against the other agent GUIs (Claude Code, Codex, Cursor, Devin, Copilot, OpenHands, Cline, Kilo, Zed, Amp, Antigravity,
+Goose, Warp, Factory) in November 2026; these are the patterns most of them share that loom lacked.
+
+- An edit or write row says how much it changed ("+3 −2") in its head, and its expanded output colours the unified diff the tool
+  returned: added lines green, removed red, hunk headers blue, the tool's own `[...]` header and footer dim. Only the look
+  changes; the text is the stored output, byte for byte, and copying it copies that text.
+- The Overview has a "Files changed" section: one row per path this session's edit and write calls changed (newest first), its
+  total "+N −M" (or "new"), and how many edits. The path jumps to the latest change in the chat; Open shows the file in the Files
+  tab. It says what it leaves out: changes made by shell commands or by agents.
+- A call still running counts its time up in its row ("running · 41s"), so a long build reads as working, not stuck.
+- While the session runs, a Stop button sits beside Send. It asks first, as the header's Stop does.
+- "Plan 2 of 6 done" in the progress line is a button: it opens the plan's steps as a short checklist above the message box.
+- `[` and `]` jump to your previous and next message in the record (not while typing), for reading a long record prompt by
+  prompt.
+- A tool row's arguments are behind "Show arguments", not a bare "args" link.
+
+## MCP tools
+
+A tool named `mcp__{server}__{tool}` is an MCP tool (`docs/CONTRACTS-MCP.md`, M8). The row reads `{server} · {tool}` with a small "MCP" badge (`.mcp-badge`); the full name is in the tooltip. Its output label, keys, copy actions and viewer are those of any tool. The Overview's recent activity and the Find bar use the same `{server} · {tool}` form (Find matches what the row shows, so `mcp__` does not match).
+
+The Session tab lists the session's servers (`section.mcp-servers`, one `.mcp-server` card each) from `GET /api/sessions/{id}/mcp`: name, transport, state, the tool count (expands to the names), "tools changed since start" when `list_changed`, and the last error and stderr tail in a collapsed block. It loads when the tab opens and on a `session` or `status` event for that session. An empty list or a 404 (an older daemon) leaves the section out without a message.
+
+The Context tab labels the tool definitions `Tool definitions · 26 (4 MCP)`. The daemon's window view does not tag MCP tools, so the page counts the `mcp__` names in the session's `session_start` tool list.
+
+Fixture: session `s-mcp` (`#/s/s-mcp/chat`) has one call with a text result and one `isError` call; its route answers two servers, every other session `[]`.
+
+## Captured exchanges (CONTRACTS-TRAFFIC-TARGETS U1-U3)
+
+An `exchange` record is one captured request and its response. The record store keeps them in `store.exchanges` and also hangs each on the tool row with the same `call_id`; the daemon's `GET /api/exchanges/{session}` fills in the rest of the mission's sessions.
+
+- A tool row with exchanges shows a `N requests` badge (`.req-count`) and lists them in its body, one `button.exrow` each: method, host and path, status, size, time, and marks for `intercepted`, `upstream not verified` and `cut`. A `bash` row has none by `call_id`, so it owns the proxy's own exchanges (no call, source `proxy`) recorded between its call and its result.
+- Opening an exchange shows `dialog#exview`: the request on one side and the response on the other, each fetched from its stored message. A call with no response says why (the error) instead of showing an empty side.
+- Headers named in C5 (`Authorization`, `Cookie`, `Set-Cookie`, `Proxy-Authorization`, `X-Api-Key`) show `•••••••• hidden`. The Reveal secrets button (`#exview-reveal`, `aria-pressed`) shows them for that viewer only; closing the dialog hides them again. Bodies over 64 KiB show their first part with a sentence saying so.
+- The inspector's Network tab lists the session's exchanges under the allow and refuse decisions, with a host filter and a status filter and a line saying how many of how many are shown.
+- A claim in the Claims view lists the hosts it names (the same rule as `claim_hosts` in `crates/loom-core/src/target.rs`, in `core.js` as `claimHosts`): `reached · ex-…` when attested supporting evidence cites a call (or quotes a stored message) that got a response from that host, the id being a link that opens the exchange; `not reached`, in amber, when none did.
+
+Fixture: `#/s/s-fl-web/chat` has one `http_send` with two exchanges (a redirect and its target), a `curl` the proxy captured over plain HTTP, one intercepted HTTPS `curl` (`tls: intercepted`), and one request whose upstream refused. Its mission's claims `c2` (reached) and `c3` (admin.acme.test not reached) are on the Evidence section.
+
+## Targets (CONTRACTS-TRAFFIC-TARGETS U4)
+
+The sidebar shows a Targets entry (`#btn-targets`) when `GET /api/targets` answers. A 404 from an older daemon hides it without a message.
+
+- `#/targets` lists the targets with their counts in words. `#/t/{name}` is the target page: the scope (included and excluded entries, editable, saved with `PUT /api/targets/{name}`; a bad entry shows the daemon's sentence), the tree of assets (`.ttree`), the findings and the missions that worked on it.
+- The tree nests nodes under their parent (a node's `parent`, or the graph's edges when it names none), orders siblings by kind and name, and shows each node's status as words and a mark, never by colour alone: finding, tested, deferred, not tested yet, in scope, not seen. Filters by status and kind keep the path to a match open. Past 2 000 rows the tree draws only the rows in view.
+- Choosing a node shows its findings and the exchanges that touched its host (`GET /api/targets/{name}/exchanges?node=`).
+- The new-mission form has a Target field when there is at least one target; the mission's identity chip links to its target.
+- Live: a `target` event reloads the page that shows it.
+
+Fixture: target `acme` (scope `*.acme.test`, `10.20.0.0/24`; excluded `pay.acme.test`) with eleven nodes of every kind and status, two missions and one open finding: `#/t/acme`.

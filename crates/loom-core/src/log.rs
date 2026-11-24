@@ -773,7 +773,7 @@ mod tests {
     use crate::event::{Trigger, TurnEndReason};
 
     fn msg(i: usize) -> Event {
-        Event::UserMessage { text: format!("message {i}") }
+        Event::UserMessage { text: format!("message {i}"), images: vec![] }
     }
 
     fn fill(log: &mut SessionLog, n: usize) -> Vec<Record> {
@@ -1315,7 +1315,7 @@ mod tests {
         assert_eq!((report.records.len(), report.opaque), (5, 1));
         assert_eq!(report.records[2].event, Event::Unknown);
         assert_eq!(report.records[2].seq, 2);
-        assert_eq!(report.records[4].event, Event::UserMessage { text: "hi".into() });
+        assert_eq!(report.records[4].event, Event::UserMessage { text: "hi".into(), images: vec![] });
         // The weave behaves as if the record were not there.
         let without: Vec<Record> = report.records.iter().filter(|r| r.seq != 2).cloned().collect();
         assert_eq!(crate::weave::weave(&report.records), crate::weave::weave(&without));
@@ -1438,6 +1438,10 @@ mod tests {
             budget: Budget::default(),
             unattended: false,
             title: String::new(),
+            project_instructions: Vec::new(),
+            mcp: Vec::new(),
+            intercept: false,
+            target: None,
             schema,
         })
     }
@@ -1529,11 +1533,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (path, mut log) = new_log(&dir);
         let big = "x".repeat(3_000_000);
-        log.append(Author::Tool, Event::UserMessage { text: big.clone() }).unwrap();
+        log.append(Author::Tool, Event::UserMessage { text: big.clone(), images: vec![] }).unwrap();
         log.append(Author::Tool, msg(1)).unwrap();
         let report = read_records(&path).unwrap();
         assert_eq!(report.records.len(), 2);
-        assert_eq!(report.records[0].event, Event::UserMessage { text: big });
+        assert_eq!(report.records[0].event, Event::UserMessage { text: big, images: vec![] });
     }
 
     #[test]

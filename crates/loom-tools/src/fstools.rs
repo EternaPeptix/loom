@@ -79,6 +79,11 @@
 //! ## `edit`
 //! Freshness as for `write`, and `Missing` is an error. `old` empty, or `old == new` → error.
 //! A file above `READ_CAP` → error sentence (use `bash`).
+//! `edits` (a non-empty list of `{old, new, all?}`; unknown keys in an entry are refused; not combined
+//! with `old`/`new` or `patch`) applies the entries in order, each to the text the one before it left
+//! (so a later entry may match text an earlier one wrote), by the rules below for each; one write, one
+//! diff, outcome `edited`, fact `{n} replacements` counting every entry. If any entry fails nothing is
+//! written and the error names it (`Edit 2 of 3: ...`).
 //! Count occurrences of `old` in the file text:
 //! - exactly one, or `all` → replace, write atomically, record. Outcome `edited`; facts: path,
 //!   `{n} replacement(s)`; body: the unified diff (3 lines of context) as `Body::Raw`.
@@ -835,8 +840,26 @@ fn open_to_read(given: &str, path: &Path, readable: Readable<'_>) -> Result<(Fil
     Err(Box::new(refusal))
 }
 
-/// The blocking part of `read`. A file above `limits.whole` is read only by line range, streamed.
+/// The blocking part of `read`: [`read_content`], and the fact that the file changed since this session
+/// last saw it, with the step of that sight.
 fn read_file(
+    ctx: &ToolCtx,
+    given: &str,
+    path: &Path,
+    start: Option<u64>,
+    end: Option<u64>,
+    limits: ReadLimits,
+) -> Worked {
+    let mut worked = read_content(ctx, given, path, start, end, limits);
+    let changed = worked.seen.as_ref().and_then(|now| ctx.files.changed_since(path, now));
+    if let Some(step) = changed {
+        worked.out = worked.out.with_more(format!("changed since your last read (step {step})"));
+    }
+    worked
+}
+
+/// The blocking part of `read`. A file above `limits.whole` is read only by line range, streamed.
+fn read_content(
     ctx: &ToolCtx,
     given: &str,
     path: &Path,
@@ -848,6 +871,9 @@ fn read_file(
         Ok(x) => x,
         Err(refusal) => return (*refusal).into(),
     };
+    if let Some(image) = read_image(ctx, given, &file, &meta) {
+        return image;
+    }
     if meta.len() > limits.whole {
         if start.is_none() && end.is_none() {
             return ToolOutput::error(format!(
@@ -865,6 +891,51 @@ fn read_file(
         Err(f) => return fail_output(f, given, "read", &too_large_advice(given)).into(),
     };
     Worked { out: show_whole(ctx, given, &bytes, start, end), seen: Some(Seen::of_bytes(&bytes)) }
+}
+
+/// An image file is attached, not shown as text: its bytes go to the blob store and the result's images.
+/// `None` when the file is not an image (the head does not carry a known magic or header).
+fn read_image(ctx: &ToolCtx, given: &str, file: &File, meta: &Metadata) -> Option<Worked> {
+    use std::io::{Seek, SeekFrom};
+    const HEAD: usize = 64 * 1024;
+    let mut head = Vec::with_capacity(512);
+    let mut f = file;
+    std::io::Read::take(&mut f, HEAD as u64).read_to_end(&mut head).ok()?;
+    // The handle's offset is shared with the caller's reads: put it back whatever the answer is.
+    if !loom_core::image::has_magic(&head) {
+        f.seek(SeekFrom::Start(0)).ok()?;
+        return None;
+    }
+    let max = ctx.cfg.max_image_bytes;
+    let size = meta.len();
+    let (info, bytes) = if size <= max {
+        // The whole file: the header may lie beyond the head (a JPEG with a long EXIF block).
+        f.seek(SeekFrom::Start(0)).ok()?;
+        let all = read_open(file.try_clone().ok()?, size, max, &ctx.cancel).ok()?;
+        (loom_core::image::detect(&all)?, Some(all))
+    } else {
+        (loom_core::image::detect(&head)?, None)
+    };
+    let Some(bytes) = bytes else {
+        let text = loom_core::image::too_large(given, &info, size, max);
+        return Some(ToolOutput::ok("ok", Body::Message(text)).into());
+    };
+    let stored = match ctx.blobs.put_bytes(&bytes) {
+        Ok(b) => b,
+        Err(e) => {
+            return Some(ToolOutput::error(format!("{given} could not be stored for display ({e}). Try again.")).into())
+        }
+    };
+    let image = loom_core::ImageRef {
+        blob: stored.id.as_str().to_string(),
+        mime: info.mime.to_string(),
+        bytes: bytes.len() as u64,
+        width: info.width,
+        height: info.height,
+        name: Some(given.to_string()),
+    };
+    let text = loom_core::image::read_header(given, &info, bytes.len() as u64);
+    Some(ToolOutput::ok("ok", Body::Message(text)).with_images(&[image]).into())
 }
 
 /// What `read` returns for the content of a file that was loaded whole.
@@ -1297,6 +1368,19 @@ impl Tool for Edit {
                 params::opt("new", "string", "The text to put in its place (required unless `patch` is given)."),
                 params::opt("all", "boolean", "Replace every occurrence of `old` (default false)."),
                 params::opt("patch", "string", "Unified diff (or *** Update File) patch hunk(s) to apply instead of old/new."),
+                params::opt("edits", "array", "Several replacements to the same file, applied in order, each to the text the one before it left; all or none are applied. Each is {old, new, all?} with the meaning above. Use instead of `old`/`new` and `patch`.").with(
+                    "items",
+                    json!({
+                        "type": "object",
+                        "properties": {
+                            "old": {"type": "string", "description": "The exact text to replace."},
+                            "new": {"type": "string", "description": "The text to put in its place."},
+                            "all": {"type": "boolean", "description": "Replace every occurrence of `old` (default false)."}
+                        },
+                        "required": ["old", "new"],
+                        "additionalProperties": false
+                    }),
+                ),
             ],
         )
     }
@@ -1310,11 +1394,23 @@ impl Tool for Edit {
         let has_old = args.get("old").and_then(Value::as_str).map(str::to_string);
         let has_new = args.get("new").and_then(Value::as_str).map(str::to_string);
         let has_patch = args.get("patch").and_then(Value::as_str).map(str::to_string);
+        let has_edits = args.get("edits");
+        if has_edits.is_some() && (has_patch.is_some() || has_old.is_some() || has_new.is_some()) {
+            return ToolOutput::error("Give `edits`, or `old` and `new`, or `patch`; not a mix.");
+        }
         if has_patch.is_some() && (has_old.is_some() || has_new.is_some()) {
             return ToolOutput::error("Give either `old` and `new`, or `patch`, not both.");
         }
         let given = given.to_string();
         let target = path.clone();
+        if let Some(list) = has_edits {
+            let edits = match parse_edits(list) {
+                Ok(e) => e,
+                Err(sentence) => return ToolOutput::error(sentence),
+            };
+            let out = off_thread(ctx, "edit", &path, move |c| edit_many(&c, &given, &target, &edits, true)).await;
+            return with_path(out, &path);
+        }
         if let Some(patch) = has_patch {
             let out = off_thread(ctx, "edit", &path, move |c| patch_file(&c, &given, &target, &patch)).await;
             return with_path(out, &path);
@@ -1335,6 +1431,37 @@ impl Tool for Edit {
         let out = off_thread(ctx, "edit", &path, move |c| edit_file(&c, &given, &target, &old, &new, all)).await;
         with_path(out, &path)
     }
+}
+
+/// The `edits` argument: a non-empty list of {old, new, all?}.
+fn parse_edits(value: &Value) -> Result<Vec<Replacement>, String> {
+    let Some(list) = value.as_array().filter(|l| !l.is_empty()) else {
+        return Err("`edits` must be a list of {`old`, `new`} objects with at least one entry.".to_string());
+    };
+    list.iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let n = i + 1;
+            let Some(map) = item.as_object() else {
+                return Err(format!("Entry {n} of `edits` is not an object with `old` and `new`."));
+            };
+            if let Some(extra) = map.keys().find(|k| !matches!(k.as_str(), "old" | "new" | "all")) {
+                return Err(format!(
+                    "Entry {n} of `edits` has an unknown key `{extra}`; an entry takes `old`, `new` and `all`."
+                ));
+            }
+            let (Some(old), Some(new)) =
+                (map.get("old").and_then(Value::as_str), map.get("new").and_then(Value::as_str))
+            else {
+                return Err(format!("Entry {n} of `edits` needs `old` and `new`, both strings."));
+            };
+            Ok(Replacement {
+                old: old.to_string(),
+                new: new.to_string(),
+                all: map.get("all").and_then(Value::as_bool).unwrap_or(false),
+            })
+        })
+        .collect()
 }
 
 fn line_list(text: &str, positions: &[usize]) -> String {
@@ -1449,15 +1576,33 @@ fn fuzzy_find(text: &str, old: &str) -> Option<Vec<FuzzyMatch>> {
 }
 
 /// The blocking part of `edit`.
+/// One `old` -> `new` replacement.
+struct Replacement {
+    old: String,
+    new: String,
+    all: bool,
+}
+
 fn edit_file(ctx: &ToolCtx, given: &str, path: &Path, old: &str, new: &str, all: bool) -> Worked {
-    if old.is_empty() {
-        return ToolOutput::error("`old` is empty, so there is nothing to find. Give the exact text to replace; to add text to an empty or new file use `write`.").into();
-    }
-    if old == new {
-        return ToolOutput::error(
-            "`old` and `new` are identical, so the edit would change nothing. Give a `new` that differs from `old`.",
-        )
-        .into();
+    let one = Replacement { old: old.to_string(), new: new.to_string(), all };
+    edit_many(ctx, given, path, std::slice::from_ref(&one), false)
+}
+
+/// Replacements applied in order, each to the text the one before it left; none is written unless all
+/// apply (`several` makes the sentences name the entry that failed).
+fn edit_many(ctx: &ToolCtx, given: &str, path: &Path, edits: &[Replacement], several: bool) -> Worked {
+    let at = |i: usize| if several { format!("Edit {} of {}: ", i + 1, edits.len()) } else { String::new() };
+    for (i, r) in edits.iter().enumerate() {
+        if r.old.is_empty() {
+            return ToolOutput::error(format!("{}`old` is empty, so there is nothing to find. Give the exact text to replace; to add text to an empty or new file use `write`.", at(i))).into();
+        }
+        if r.old == r.new {
+            return ToolOutput::error(format!(
+                "{}`old` and `new` are identical, so the edit would change nothing. Give a `new` that differs from `old`.",
+                at(i)
+            ))
+            .into();
+        }
     }
     if path.is_dir() {
         return ToolOutput::error(format!("{given} is a directory. Give the path of a file to edit.")).into();
@@ -1477,7 +1622,7 @@ fn edit_file(ctx: &ToolCtx, given: &str, path: &Path, old: &str, new: &str, all:
         Ok(b) => b,
         Err(f) => return fail_output(f, given, "edit", "Use `bash` for a change to a file this large.").into(),
     };
-    let text = match String::from_utf8(bytes) {
+    let original = match String::from_utf8(bytes) {
         Ok(t) => t,
         Err(_) => {
             return ToolOutput::error(format!(
@@ -1487,49 +1632,23 @@ fn edit_file(ctx: &ToolCtx, given: &str, path: &Path, old: &str, new: &str, all:
         }
     };
 
-    // A file that uses CRLF throughout shows the model lines without the CRs; the text it gives is
-    // matched, and what it puts in, with the file's own line endings.
-    let crlf = text.contains("\r\n")
-        && text.matches('\n').count() == text.matches("\r\n").count()
-        && !old.contains('\r')
-        && !new.contains('\r');
-    let (old, new) =
-        if crlf { (old.replace('\n', "\r\n"), new.replace('\n', "\r\n")) } else { (old.to_string(), new.to_string()) };
-
-    let positions: Vec<usize> = text.match_indices(old.as_str()).map(|(i, _)| i).collect();
-    let (updated, n, used_fuzzy) = if !positions.is_empty() {
-        if positions.len() > 1 && !all {
-            let lines = line_list(&text, &positions);
-            let more = more_count(positions.len());
-            return ToolOutput::error(format!(
-                "`old` occurs {} times in {given}, at lines {lines}{more}. Nothing was changed. Extend `old` with the surrounding lines so it matches exactly once, or set `all` to true to replace every occurrence.",
-                positions.len(),
-            ))
-            .into();
+    let mut text = original.clone();
+    let (mut n, mut used_fuzzy) = (0usize, false);
+    for (i, r) in edits.iter().enumerate() {
+        match replace_one(&text, given, r) {
+            Ok((updated, count, fuzzy)) => {
+                text = updated;
+                n += count;
+                used_fuzzy |= fuzzy;
+            }
+            Err(sentence) => {
+                let applied = if several && i > 0 { " None of the edits was applied." } else { "" };
+                return ToolOutput::error(format!("{}{sentence}{applied}", at(i))).into();
+            }
         }
-        (text.replace(old.as_str(), &new), positions.len(), false)
-    } else if let Some(fuzzy) = fuzzy_find(&text, &old) {
-        if fuzzy.len() > 1 {
-            let line_nums: Vec<String> = fuzzy.iter().take(10).map(|m| m.line.to_string()).collect();
-            let more = more_count(fuzzy.len());
-            return ToolOutput::error(format!(
-                "`old` (with whitespace normalization) occurs {} times in {given}, at lines {}{more}. Nothing was changed. Extend `old` with the surrounding lines so it matches exactly once.",
-                fuzzy.len(),
-                line_nums.join(", "),
-            ))
-            .into();
-        }
-        let Some(m) = fuzzy.first() else {
-            return ToolOutput::error(no_match_message(given, &text, &old)).into();
-        };
-        let mut out = String::with_capacity(text.len() + new.len());
-        out.push_str(text.get(..m.start).unwrap_or(""));
-        out.push_str(&new);
-        out.push_str(text.get(m.end..).unwrap_or(""));
-        (out, 1, true)
-    } else {
-        return ToolOutput::error(no_match_message(given, &text, &old)).into();
-    };
+    }
+    let updated = text;
+    let text = original;
     // As for `write`: nothing is written by a call that has been reported as interrupted.
     if ctx.cancel.is_cancelled() {
         return cancelled("edit").into();
@@ -1545,6 +1664,52 @@ fn edit_file(ctx: &ToolCtx, given: &str, path: &Path, old: &str, new: &str, all:
         out = out.with_more("matched old with whitespace normalization");
     }
     Worked { out, seen: Some(Seen::of_bytes(updated.as_bytes())) }
+}
+
+/// Apply one replacement to `text`: the new text, how many replacements, and whether the match needed
+/// whitespace normalization. `Err` is the sentence for the model.
+fn replace_one(text: &str, given: &str, r: &Replacement) -> Result<(String, usize, bool), String> {
+    // A file that uses CRLF throughout shows the model lines without the CRs; the text it gives is
+    // matched, and what it puts in, with the file's own line endings.
+    let crlf = text.contains("\r\n")
+        && text.matches('\n').count() == text.matches("\r\n").count()
+        && !r.old.contains('\r')
+        && !r.new.contains('\r');
+    let (old, new) =
+        if crlf { (r.old.replace('\n', "\r\n"), r.new.replace('\n', "\r\n")) } else { (r.old.clone(), r.new.clone()) };
+
+    let positions: Vec<usize> = text.match_indices(old.as_str()).map(|(i, _)| i).collect();
+    if !positions.is_empty() {
+        if positions.len() > 1 && !r.all {
+            let lines = line_list(text, &positions);
+            let more = more_count(positions.len());
+            return Err(format!(
+                "`old` occurs {} times in {given}, at lines {lines}{more}. Nothing was changed. Extend `old` with the surrounding lines so it matches exactly once, or set `all` to true to replace every occurrence.",
+                positions.len(),
+            ));
+        }
+        return Ok((text.replace(old.as_str(), &new), positions.len(), false));
+    }
+    let Some(fuzzy) = fuzzy_find(text, &old) else {
+        return Err(no_match_message(given, text, &old));
+    };
+    if fuzzy.len() > 1 {
+        let line_nums: Vec<String> = fuzzy.iter().take(10).map(|m| m.line.to_string()).collect();
+        let more = more_count(fuzzy.len());
+        return Err(format!(
+            "`old` (with whitespace normalization) occurs {} times in {given}, at lines {}{more}. Nothing was changed. Extend `old` with the surrounding lines so it matches exactly once.",
+            fuzzy.len(),
+            line_nums.join(", "),
+        ));
+    }
+    let Some(m) = fuzzy.first() else {
+        return Err(no_match_message(given, text, &old));
+    };
+    let mut out = String::with_capacity(text.len() + new.len());
+    out.push_str(text.get(..m.start).unwrap_or(""));
+    out.push_str(&new);
+    out.push_str(text.get(m.end..).unwrap_or(""));
+    Ok((out, 1, true))
 }
 
 enum HunkOp {
@@ -2123,6 +2288,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_read_says_when_the_file_changed_since_the_last_read() {
+        let e = env_with(ToolsCfg::default(), SandboxCfg { mode: SandboxMode::None, ..SandboxCfg::default() });
+        put(&e, "f.txt", b"one\n");
+        e.ctx.files.set_step(3);
+        let r = e.call("read", json!({"path": "f.txt"})).await;
+        assert!(!r.text.contains("changed since your last read"), "{}", r.text);
+        e.ctx.files.set_step(7);
+        let r = e.call("read", json!({"path": "f.txt"})).await;
+        assert!(!r.text.contains("changed since your last read"), "{}", r.text);
+        put(&e, "f.txt", b"two\n");
+        e.ctx.files.set_step(9);
+        let r = e.call("read", json!({"path": "f.txt"})).await;
+        assert!(
+            r.text.lines().next().unwrap_or_default().contains("changed since your last read (step 7)"),
+            "{}",
+            r.text
+        );
+        let r = e.call("read", json!({"path": "f.txt"})).await;
+        assert!(!r.text.contains("changed since your last read"), "{}", r.text);
+    }
+
+    #[tokio::test]
     async fn read_empty_directory_missing_and_binary() {
         let e = env();
         put(&e, "empty.txt", b"");
@@ -2147,6 +2334,31 @@ mod tests {
         let r = e.call("read", json!({"path": "bin.dat"})).await;
         assert!(r.text.contains("binary data, 7 bytes") && r.text.contains("binary"), "{}", r.text);
         assert_eq!(shown(&r), json!([[1, 1]]));
+    }
+
+    #[tokio::test]
+    async fn read_of_an_image_attaches_it_and_a_large_one_is_only_described() {
+        let e = env();
+        let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        png.extend_from_slice(&[0, 0, 0, 4, 0, 0, 0, 3, 8, 6, 0, 0, 0]);
+        put(&e, "a.png", &png);
+        let r = e.call("read", json!({"path": "a.png"})).await;
+        assert_eq!(r.status, ToolStatus::Ok, "{}", r.text);
+        assert!(r.text.contains("[read \u{b7} image \u{b7} "), "{}", r.text);
+        assert!(r.text.contains("4x3 PNG"), "{}", r.text);
+        assert_eq!(r.images.len(), 1);
+        assert_eq!((r.images[0].mime.as_str(), r.images[0].width, r.images[0].height), ("image/png", 4, 3));
+        assert_eq!(e.ctx.blobs.read_all(&loom_core::BlobId::from(r.images[0].blob.clone())).unwrap(), png);
+
+        let mut big = png.clone();
+        big.resize(6 * 1024 * 1024, 0);
+        put(&e, "big.png", &big);
+        let r = e.call("read", json!({"path": "big.png"})).await;
+        assert!(
+            r.images.is_empty() && r.text.contains("Not attached") && r.text.contains("max_image_bytes"),
+            "{}",
+            r.text
+        );
     }
 
     fn message(o: &ToolOutput) -> String {

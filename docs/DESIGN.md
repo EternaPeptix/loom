@@ -18,7 +18,7 @@ That inverts the usual cloud trade-offs:
 
 - **Tokens cost nothing; rebuilding the prefix costs latency.** A cached prefix is free, an edited one
   is re-read from the edit point. So the request prefix is append-only except at explicit, logged
-  re-weaves, and nothing is ever trimmed "to save tokens".
+  compactions, and nothing is ever trimmed "to save tokens".
 - **Forking is free.** A child that starts from its parent's exact prefix gets a full cache hit, so
   delegation and voting can start with everything the parent knows.
 - **The model is the weakest component, so it gets the smallest job.** The harness owns process,
@@ -105,7 +105,7 @@ tools/         import-dsh.py: imports DSH sessions as ended, read-only loom sess
 ```
 
 The command line (`loom --help`): `daemon`, `up`, `down`, `status`, `open`, `run`, `chat`, `ls`,
-`tail`, `send`, `stop`, `resume`, `reweave`, `archive`, `rule`, `approve`, `gc`, `inbox`, `answer`,
+`tail`, `send`, `stop`, `resume`, `compact`, `archive`, `rule`, `approve`, `gc`, `inbox`, `answer`,
 `ledger`, `window`, `net`, `out`, `config`, `service` (the module documentation of
 `loom_daemon::cli` is its specification).
 
@@ -231,95 +231,59 @@ open another. Attribute values have `"`, `<` and `>` escaped and line breaks wri
 harness-built report, text the harness did not write is fenced line by line: `>` before each line, or
 `  | ` before each further line of a list item (§9).
 
-**Re-weave.** A `reweave` record changes the projection for everything at or before `upto_seq`: it
-lists evictions (`stub` with replacement text, `drop`, `drop_reasoning`, or `remove`) and carries a brief (the
-ledger snapshot and resume instructions) that is rendered as a `<harness kind="resume">` block
-directly after the last item at or before `upto_seq`. Evictions accumulate across re-weaves (a later
-one wins for the same record); only the latest brief is rendered. The epoch increments. Everything
-after `upto_seq` renders normally. Because the record is in the log, the projection stays a pure
-function of the log. `drop` on a tool result renders `[evicted from view; the call and its result
-remain in the session record]`; on a model response it removes the text and reasoning and keeps the
-calls, so pairing holds. `remove` on a tool result takes the call out of the window together with its
-result: the assistant message no longer lists that call and no `tool` message is rendered for it (the
-calls that stay keep their pairing; a response left with no text and no call renders nothing). Only a
-fresh start plans one (below). Evictions that name a protected item are ignored.
+**Compaction.** The window of a long session is bounded by compaction, not by trimming. When a step's
+request would reach `compact_at` (`[context] compact_at_tokens`; 0 = 40% of the model's window, never above
+400 000), the session asks the model for a note, builds a table of keys for every output, file, agent and job
+the log holds, and appends one `compaction` record. From then on the weave renders, after the system message,
+one `<harness kind="compaction">` item and then only the records after the compaction's `upto_seq`. Nothing is
+deleted: every output stays readable by its key (`read` with `out:<key>`) and `log_search` searches the whole
+log. A compaction replaces the previous one; the epoch increments. Because the record is in the log, the
+projection stays a pure function of the log, and the weave starts at the latest compaction, so its cost does
+not grow with the age of the session.
 
-**Eviction order** (`plan_reweave`), applied until the estimate is at or below the floor, stopping as
-soon as it is:
+The item holds, in order: a head (`Context was compacted at step N (reason)...`); the operator's messages up to
+`upto_seq`, verbatim (the oldest cut to one line each when together they pass 20% of `compact_at`); the ledger
+brief and frontier as they stood; pinned outputs, newest first, verbatim up to 10% of `compact_at`; the key
+table; and the model's note, labelled as written by the model and not verified.
 
-1. replayed reasoning of model responses (the calls and their results stay);
-2. harness notes of kind `nudge`, `stall`, `verdict`, `output_cut`, `budget` and `interrupted`, oldest
-   first (what the harness said about a step long past);
-3. navigation output (`ToolClass::Nav`: listings, searches), oldest first;
-4. file reads and other lookups (`ToolClass::Read`), largest first;
-5. every other unpinned tool output and agent report, largest first;
-6. every other harness note that is not protected (`arrival`, `info`, the messages of other agents),
-   oldest first — its words stay in the log, where `log_search` finds them;
-7. assistant text, only in the second plan the session makes when the first cannot free enough
-   (see below);
-8. never: the system message, user messages, the `forked` record, harness notes of kind
-   `constraint`, `approval` and `assignment`, pinned output, and the protected recent region — the
-   last `keep_recent_steps` model responses (rendered or not) and everything after the first of them.
-   Without the note classes, arrival notes, nudges and verdicts piled up for the life of a long
-   mission and no re-weave could take them out.
+**Reasons.** `size` (the request is at or above `compact_at`; the size is the server's prompt count for the
+latest request of the epoch plus what was added since), `refused` (the server refused the request for what it
+carries or for its size: empty tail, headers-only note request), `stall` (the same step request hit the
+profile's `stall_timeout_s` three times and its prompt is at least `compact_at / 2`), `operator` (`POST
+/api/sessions/{id}/compact`, alias `/reweave`; `loom compact`, alias `loom reweave`; on an idle session it
+compacts without starting a turn) and `fresh_start` (a lead's `finish` its verifier did not accept; empty tail,
+the note request carries the verifier's objections). A compaction never fails the session and is never
+skipped for being small.
 
-**Fresh start** (`plan_fresh_start`). The fold made when a verifier did not accept a lead's finish (§8)
-is another plan: it is not driven by size and protects no recent region (`upto_seq` is the last record,
-so the brief renders after everything). It drops the text and reasoning of every model response,
-removes every tool result the caller names as an attempt (the session names the `finish` and `conclude`
-calls since the last delivered result; a pin does not keep one), stubs every other unpinned result and
-agent report, and drops the harness notes of kind `nudge`, `stall` and `verdict` (what the harness said
-about the attempt). User messages, constraints, approvals, the assignment and pinned output stay.
+**Tail.** `upto_seq` is the seq just before the first record of the recent tail: the last whole steps whose
+estimated size together is at most 15% of `compact_at`, at least the last whole step when that alone is within
+50%, else empty. The tail is empty for `refused`, `fresh_start` and an operator compaction right after a
+refusal (what the server refuses may be the newest output).
 
-A stub is the evicted result's first line (its envelope header: call, outcome, size, handle); for an
-execution, the last `stub_tail_lines` (12) lines follow under `[last N lines as first shown]`; then
-`[evicted from view, not from the record: {lines} lines / {bytes} bytes. Full output: out:… — read it
-again with out_read or out_grep before relying on it.]`; for a view (`read`, `out_read`, `out_grep`),
-which stores nothing of its own, `[evicted from view, not from the record. It showed lines of out:… —
-read them again with out_read or out_grep before relying on it.]`; and when there is neither, `[evicted
-from view, not from the record. Run it again if the result matters.]`. Tool call/result pairs always stay
-paired (a stub is still a `tool` message).
+**The note request.** The window exactly as the last step request sent it (so the server's cache serves it),
+plus one user message (`texts::COMPACT_PROMPT`; for a fresh start also the objections), the same tools,
+`max_tokens` 12 000, recorded as `model_request{purpose: compact}`. For `refused` and `stall` the window is first
+reduced to headers only (each tool result to its first and last line, each agent report to 2 000 characters).
+Keys the note cites are checked: an `out:` handle must belong to a stored output of the session, a ledger id
+must exist. Unknown ones get one retry; still unknown, they are replaced by `[unknown key]` and listed in
+`dropped_keys`. A failed, cancelled or empty note request gives `note: None` and the compaction goes ahead.
 
-**When and how much.** `target_tokens`, `floor_tokens` and `keep_recent_steps` (defaults 400 000,
-180 000 and 60) are absolute numbers per configuration, not shares of the window: the working set is
-sized by latency and quality, and the rest of the window is burst capacity. Before each step request
-the session compares the size of the request it is about to send, as the server counts it, with a
-limit. The size is the `prompt_tokens` the server reported for the latest answered step request of
-the current epoch plus the estimated tokens of what has been added since (before the first answer of
-an epoch, the estimate alone). The limit is `target_tokens`, lowered when the window is known to
-`window − reserve` and to four fifths of the window; `reserve` is `max_output_tokens` plus
-min(4 096, window/4), or min(20 480, window/4) when no reply length is configured or the window cannot
-hold it. The floor is `floor_tokens`, lowered to half the window, and to half the limit when it is not
-below it. A 1M window keeps 400 000 / 180 000, and windows of 81 920 tokens and more keep the full
-reserve. When the server refuses a prompt as too long (`overflow`), the window used is the smaller of
-the known one and the limit stated in the error.
+**The key table** is built by the harness, deterministically, from the log, the ledger and the previous
+compaction's table (`loom-core::compaction`): outputs (the ones the ledger cites, the note cites, the last 40
+calls before the tail and the previous table's rows; at most 400 rows, 800 with cited ones; the rest are counted
+in a "not listed" line), files changed by `edit`/`write` (shell commands are not tracked), agents, and jobs
+still running.
 
-A re-weave that nobody asked for (`target`) happens only when it is worth it: every re-weave starts a
-new epoch and loses the server's cache, so one that frees little would be needed again a step later.
-The plan must bring the size to the midpoint between floor and limit; if it cannot, the session halves
-`keep_recent_steps` (down to 2, and down to 0 for an `overflow`, since one output of the latest step can
-be what overflows) and plans again, then plans once more allowing assistant text to go.
-When even that is not enough, nothing is recorded and the context grows until the window forces an
-`overflow` re-weave. Forced re-weaves (`overflow`, `refused`, and `operator` from `POST …/reweave` or
-`loom reweave`) take what the plan can free. A `refused` re-weave (§10: a provider refusing what the
-request carries, refused twice on the same prefix) protects no recent step and folds everything it
-can whatever the size, and so does an `operator` one made while the current prefix is the one refused:
-what the server refuses may be the newest output, and is not a matter of size; each stub keeps its
-handle. Neither asks for a digest. Re-weaves happen only between steps (or while idle, on
-operator request), never while a tool call is outstanding. The model can `pin` a result it wants
-kept.
+**Old logs.** `reweave` records written before compaction existed still deserialize and render exactly as they
+did (evictions, brief, digest) until the session's first compaction; no new `reweave` record is written, and a
+config's old `[context]` keys (`target_tokens`, `floor_tokens`, `keep_recent_steps`, `stub_tail_lines`) are
+accepted, ignored and warned about at startup (`target_tokens` is read as `compact_at_tokens` when that is
+absent).
 
-**Digest (cache-friendly).** Before a re-weave that evicts assistant text, unless it is for an
-overflow or a refusal (the server has just refused that prefix), the session sends the *existing* stable prefix
-plus one appended instruction asking for a digest. That request is a full cache hit; it is recorded as
-a `model_request` with purpose `digest` (its reply is not a record), capped at 8 000 tokens, and waits
-for a request slot at the session's own priority. A non-empty reply is stored in the `reweave` record
-and rendered in the resume block under `Leads from earlier work (written by the model, not verified —
-re-check before relying on them):`. The digest asks for a map of the work (established, ruled out with its boundary, tried but not
-ruled out, open leads, next), not a retelling. The resume brief adds, for a session with a ledger, the
-frontier block (`Where the work stands:`) and a paragraph saying a failed attempt rules out that attempt, not
-the approach. Without a digest the re-weave goes ahead all the same: the ledger
-brief is the durable state.
+The log can be paged backward: `GET /api/sessions/{id}/records?before=<seq>&limit=n` returns the n records
+before `seq`, oldest first, with `prev_before` (null at the start); `after` and `before` together are a 400.
+Compactions happen only between steps (or while idle, on operator request), never while a tool call is
+outstanding. The model can `pin` a result it wants kept in view.
 
 **HUD (ephemeral tail).** Not part of the weave. Each step request ends with one `user`-role message
 `<harness-state>…</harness-state>` (`loom-agent::hud`) that is never part of the stable prefix, so the
@@ -501,7 +465,13 @@ default to empty.
 output by handle, a line range and a note, and either a quote or nothing more (a quote by lines, below).
 The harness:
 
-1. checks the quote against those lines of the stored text, or takes the lines themselves (below);
+1. finds the quote in the stored text by its text, with no line numbers (`start` only picks one place when
+   the text occurs more than once: the call is refused with every place listed as `line {n}: {line}`, at most
+   10, and "Add `start` to say which."). A quote that does not match exactly but matches in exactly one place
+   once runs of whitespace are collapsed and line ends count as one space is taken, as the whole lines it
+   lies on, and the result says "matched lines 12-14 ignoring spacing". A quote with `start` and `end` is
+   still checked against those lines, and with neither quote nor lines the harness takes the lines
+   themselves (below);
 2. finds the producer of the output among the mission's sessions (a session's own records only):
    the tool call whose result stored it; for a `read`, the call that stored the file text its header
    names; for the complete output of a background job, the call that started the job. A view
@@ -587,7 +557,7 @@ with its text is checked as before.
 **Views.** `LedgerState::render_markdown()` is the full Markdown view (the `ledger` tool, the API's
 `markdown`, `loom ledger`). A mission whose lead keeps a ledger but has written nothing yet has an
 empty one; for a mission whose lead keeps none the API answers `No ledger: this mission's lead does
-not keep one.` `LedgerState::brief()` is the compact text of the HUD and of the re-weave
+not keep one.` `LedgerState::brief()` is the compact text of the HUD and of the compaction
 brief: goal, constraints and approvals are the operator's words and never cut; every other line is
 cut at 400 characters; it shows the last 12 decisions and the last 20 dead ends, each list starting
 with `(N older not shown: d1–d3; call `ledger` to read them)` when older ones are left out. The HUD is
@@ -612,14 +582,14 @@ The module documentation of `session.rs` is the precise specification of the loo
 
 ```
 idle: wait for an input (user message, inbox answer, agent report, job end, agent message,
-      resume, operator rule / approval / withdrawal, reweave, stop)
+      resume, operator rule / approval / withdrawal, compact, stop)
 turn (turn_start{trigger}):
   step:
     cancellation check
     drain arrivals (anything queued is recorded now; nothing starts a turn)
     budget check → note, then park / settle after 2 more steps
     stall check → note
-    re-weave check (§5)
+    compaction check (§5)
     request = weave(log) + HUD → request slot → stream (lookups may start early, below)
     reply:
       ended with an error                → the turn fails
@@ -629,6 +599,12 @@ turn (turn_start{trigger}):
       no tool calls                      → stop gate
 turn_end{reason}   yielded | finished | asked | blocked | waiting | stopped | parked | budget_exhausted | error
 ```
+
+**Queued messages.** A user message sent `after_turn` while the lead runs is kept in the session's `queued/`
+directory (not in the log). When the turn ends the session records the queued messages in order as `user_message`s;
+the first starts the next turn and the rest arrive in its first request. They can be listed, edited, removed or sent
+now (as a steering message) until then. A stop leaves them queued until the next resume or message; archiving
+discards them.
 
 **Idle inputs.** A user message is recorded and starts a turn. An inbox answer resolves the item
 (answers to questions and blockers are also recorded in the ledger) and, when not blank, starts a turn
@@ -734,6 +710,17 @@ only when every check passes and, where verification is required, a verifier acc
   confirm impossibility. A mission the operator released (`OperatorRelease`) may finish without a
   conclusion; it is delivered as `[closed by operator, goal not established]` and is not verified. Free
   termination roles are not gated.
+- Findings tied to traffic. A role with `require_traffic = true` (the finishing roles of `ctf`, `redteam` and
+  `vr`) cannot `finish`, or `conclude` with `met`, while a claim the answer relies on (the supported claims the
+  `finish` evidence cites, or every supported claim when it cites none) names a network host that none of the
+  claim's attested, supporting evidence reached. The hosts a claim names come from `loom_core::target::claim_hosts`:
+  its `assets` (new optional field of `claim`; host, service and endpoint assets count, file and identity do not),
+  URLs in its text, and, once a mission has a target, hosts of its text inside the target's scope. A host is reached
+  when that evidence cites a call during which an exchange with the host (any port) was recorded with a status, or
+  quotes the blob of such an exchange. The refusal names only the tools the role is shown:
+  `finish cannot be accepted yet: c3 names api.acme.test, but none of its supporting evidence reached it. Cite the
+  evidence of a call that did (http_send, web_fetch, or a command while interception is on for this mission;
+  interception is off), or take the host out of the claim.` A mission the operator released is not gated.
 - A lead's `finish` is refused while the ledger has open items (§7); otherwise a finish claim `f{n}` is
   recorded. Verification is required when the role has `verify_finish` and the config's
   `agents.verify_finish` is on (default). Without it the result is delivered marked `[not verified]`.
@@ -760,16 +747,12 @@ only when every check passes and, where verification is required, a verifier acc
     reasoning that led there, replayed at every step) tends to defend that account or to give up again.
     So every rejection also (a) reopens the goal: a concluded goal-met claim goes back to open
     (`GoalReopen`, not after an operator's release), and the ledger accepts a new `conclude` only on
-    execution evidence recorded after the reopening; and (b) folds the lead's window once the reply's
-    calls have their results: one `reweave` with the reason `finish not accepted`, not driven by size
-    and without a digest (a digest would be that account again), which drops the text and reasoning of
-    every response, takes every `finish` and `conclude` call made since the last delivered result out
-    of the window together with its result (`EvictAction::Remove`, §5), stubs the other results and
-    drops the nudge, stall and verdict notes. The next request ends with a brief
-    (`texts::fresh_start_brief`): what the check found, in the verifier's words, how to go on (the goal
-    is unsolved, not decided either way; a route is closed only by a recorded run that shows it fails),
-    the `Where the work stands:` block of the frontier (the one a re-weave brief carries, with the
-    sentence that a failed attempt rules out that attempt, not the approach), and the ledger. The brief and the HUD's finish line never say that a finish was made or rejected.
+    execution evidence recorded after the reopening; and (b) compacts the lead's window once the reply's
+    calls have their results: one `compaction` with the reason `fresh_start`, an empty tail, and a note request that
+    carries what the verifier objected to (`texts::compact_objections`: the rejected result is not listed under
+    Established). The next request starts from the compaction item: the note, the key table (the attempt's outputs
+    are rows in it) and the ledger, where each objection stands as an open obligation. The item never says that a
+    finish was made or rejected beyond the objections.
     Nothing leaves the record: the attempt stays in the log and its outputs in the store, so
     `log_search`, `out_read` and `out_grep` reach them, and the operator sees all of it. With the option
     off the conclusion stands and the rejection stays in view as the result of the call;
@@ -803,10 +786,9 @@ bounded waiting/stopping and delivery. Probes, writes, new plans/claims and dele
 including speculative starts. A finish requiring fresh execution may still refuse; report the blocker
 and partial result rather than claiming verification. See [runtime controls](RUNTIME-CONTROLS.md).
 
-**Stall.** In a session with a ledger whose role has `note`, `claim` or `evidence`, when the last
-`agents.stall_steps` (30) steps recorded nothing in the ledger, changed no file and started or received
-no agent, a note asks the model to record what it learned or change its approach (at most once in that
-span).
+**Stall.** There is no stall note: it was advice the harness gave on its own (166 times in the
+logs of 2026-11) and a model is left to manage its own pace. `agents.stall_steps` and
+`agents.idle_ledger_nudge` are still accepted in the config, so older configs load, and are ignored.
 
 **Repetition and staleness** (HUD, over the session's own records, `loom_core::observe`): the same tool
 called with the same arguments and the same output at least 3 times (navigation, reads and commands);
@@ -908,14 +890,14 @@ the precise specification.
   outputs: its title and the time of its last ledger entry; the operator's goal, rules in force and
   answers to questions, labelled as operator text from an earlier mission; its goal status; where its
   work stood (the frontier evaluated at that last entry's time, not now, with no attempt count and no
-  hypothesis or asset), labelled as written by the model there and not verified; and its security record as
-  counts and asset locators only (no hypothesis id or text, no credential, no identity named, no URL query,
+  asset), labelled as written by the model there and not verified; and its security record as
+  counts and asset locators only (no credential, no identity named, no URL query,
   fragment or password in a locator). The operator's words are shown as written; what the model wrote is
   shown with the query, fragment and userinfo removed from every URL in it, but may still hold whatever
   was written there. Every line
   taken from an old ledger is quoted with `>`. A journal that fails verification or holds an entry
   written by a newer loom is named unreadable and nothing from it is shown. The note says that the old
-  mission's outputs cannot be opened and its authorizations do not apply, and a re-weave may drop it
+  mission's outputs cannot be opened and its authorizations do not apply, and a compaction may take it out of view
   like any `info` note.
 - **Stop** cascades from a lead to its agents (§8). An archive settles a mission's agents `stopped`;
   unarchiving delivers what they settled with and restores those that had not settled.
@@ -977,7 +959,7 @@ The module documentation of `client.rs`, `assemble.rs` and `request.rs` is the p
   again. Delays are 0.5 s doubling to `retry_max_delay_s` (30) with ±10% jitter; a larger
   `Retry-After` (up to 600 s) wins. Viewers see each retry as a `retrying` delta. A partial attempt
   is never committed, and a cancellation returns promptly with the text streamed so far.
-- **Unavailable notice.** When one model request of a session (a step's or a digest's) is retrying
+- **Unavailable notice.** When one model request of a session (a step's or a note's) is retrying
   and its outage began `agents.unavailable_notice_s` ago (default 300; 0 = never), the session
   opens a non-blocking `blocker` inbox item, notified like every other: the server's
   address, since when it has been unavailable, the last error, and until when the request is retried
@@ -1007,17 +989,26 @@ The module documentation of `client.rs`, `assemble.rs` and `request.rs` is the p
   `exceed_context_size_error` or `context_length_exceeded`, a 422 of the same kind, and an error object
   with such a message inside a 200 stream, is reported with the limit and request size: the error's
   `n_ctx` and `n_prompt_tokens` when present, else the smaller and the larger of the numbers in the message
-  (servers name them in either order). The session then re-weaves (`overflow`, protecting no recent
-  step when it must) and sends again, once per step, and fails the step when nothing can be folded.
+  (servers name them in either order). The session then compacts (`refused`: empty tail, headers-only
+  note request) and sends again, once per step.
 - **Refusals** (400, 413 or 422 that is not an overflow): a provider refusing what the request carries,
   a content filter refusing a scraped page or a payload, for instance, refuses the same window every
   time. The first refusal fails the step (§8) with an item that says so; when the next request on the
-  same prefix (an answer, a resume) is refused again, the session re-weaves (`refused`: every tool
-  output out of view, each stub keeping its handle) and sends once more before parking again, now
+  same prefix (an answer, a resume) is refused again, the session compacts (`refused`: empty tail, every
+  output reachable by its key in the table) and sends once more before parking again, now
   saying that what is refused is still in view or is the request itself, and that the session must
   move to another model or change its settings. One mission was parked 17 times, about 27 hours of
   waiting, by such a loop before this rule.
 - **Other 4xx** are refused with the server's message; the step fails (§8).
+- **Tool calls written as text.** Some servers return a model's calls inside the reply's text (a
+  `<tool_call>` block, DeepSeek's DSML, `<function_calls>`/`<invoke>`, or a fenced JSON object with
+  `name` and `arguments`) rather than as `tool_calls`. Such calls are taken only when (1) the request
+  asks for them: a step of a role that ends by calling a tool, never a free-form role's step, a
+  digest, a vote or a compaction; (2) they are in the profile's `text_tool_calls` format (`any`, the
+  default, or one of `tool_call`, `dsml`, `invoke`, `fenced_json`; `off` takes none); and (3) they
+  end the reply: only a run of calls with nothing but whitespace after the last and between them is
+  taken. A call shown as an example, with words after it, is text and is never run. A taken call gets
+  a fresh `call-` id like any other call, and its text is removed from the reply.
 - **Discovery and the window.** The first session created for a profile asks `GET {base_url}/models`
   (the first success is remembered for the process). The window is the first positive integer of
   `max_model_len`, `context_window`, `context_length`, `max_context_length` in the model's entry; a
@@ -1062,14 +1053,43 @@ The module documentation of `client.rs`, `assemble.rs` and `request.rs` is the p
   `session_start` does. The endpoint of every live profile is infrastructure (E1): a reload that adds or
   changes one has every session's proxy policy derived again at once.
 
+### Images
+
+A record can name images: `user_message` and `tool_result` carry `images`, a list of `{blob, mime, bytes, width,
+height, name?}` (`loom_core::ImageRef`; `blob` is the full 64-hex blob id; the key is left out when the list is empty,
+so logs of sessions without images are byte-identical to before). PNG, JPEG, GIF and WebP are recognised by magic
+bytes and sized from the header (`loom_core::image`, no dependency). An image attachment of at most
+`[tools] max_image_bytes` (5 MiB) is stored in the blob store and named in the user message besides its line in the
+attachment list; `read` of such a file returns a one-line text and the image in the result's `images` (tools hand
+them back with `ToolOutput::with_images`, carried to `finalize` in a reserved meta key); a larger image is only
+described.
+
+What the model sees depends on the profile's `vision` (default false). With `vision = true` the request builder
+(`ChatRequest::images`, an `ImageResolver` over the blob store) reads each blob at build time and sends it as an
+`image_url` part with a `data:` URL: a user message with images has array `content`; tool messages stay text, and
+the images of the tool results that answer one assistant message follow the run of tool messages in a single
+`user` message (`Images from the tool results above:`, then `[tool call_id: name]` and the part per image), so the
+call/result pairing stays valid. The weave keeps `Message::images` and the placement is done when the body is
+built (`message::render_request`), not in the log or the weave. Without `vision` the messages get a sentence
+(`[image not shown: this model does not take images ...]`) and no parts. An unreadable blob becomes a sentence too.
+
+An image counts `min(2000, max(85, ceil(w*h/750)))` tokens for a vision model (none otherwise, the sentence being
+text), is taken out of the server's prompt count before the characters-per-token ratio is calibrated, and shows
+as the "Images" part of the Context breakdown. A folded tool result gives its images up
+(`[image folded - read {path} again to see it]`); user images are never folded. `GET /api/images/{blob}` serves an
+image blob that some session's log names in an `images` entry (the logs are searched; anything else, tool output
+included, is 404), inline, with its mime type and `Cache-Control: private, max-age=31536000, immutable`.
+
 ## 11. Tools, sandbox, network (`loom-tools`, `loom-net`)
 
 **Tools.** Built in (`Registry::builtin`): `bash`, `job_wait`, `job_kill`, `job_list`, `read`,
 `write`, `edit`, `glob`, `grep`, `out_read`, `out_grep`, `web_fetch`, `cve_lookup`, `cve_search`,
-`advisory_lookup`, `dep_scan`. Box tools (`rtools::BOX_NAMES`, `[box]` only): `box_exec`, `box_get`, `box_reset`. Runtime-owned (`loom-agent::rtools`, `NAMES`): `plan`, `step`, `note`, `claim`,
-`claim_update`, `evidence`, `ledger`, `pin`, `log_search`, `reflect`, `finish`, `verdict`, `ask_user`,
-`report_blocker`, `wait`, `agent_spawn`, `agent_fanout`, `attempt`, `agent_adopt`, `agent_message`,
-`agent_stop`, `decide`, `verify`. A role lists the tools it has, in request order; a name in neither set is a pack error. The
+`advisory_lookup`, `dep_scan`, and for the packs that list them `pty_open`, `pty_exec`, `pty_close`, `http_send`,
+`http_repeat`, `codec_calc`, `bin_survey`, `bin_decompile`, `bin_xrefs`, `gdb_probe`, `oracle_check`. Box tools (`rtools::BOX_NAMES`, `[box]` only): `box_exec`, `box_get`, `box_reset`. Runtime-owned (`loom-agent::rtools`, `NAMES`): `plan`, `step`, `note`, `claim`,
+`claim_update`, `evidence`, `ledger`, `pin`, `log_search`, `reflect`, `security_record`, `security_query`,
+`security_ingest`, `finish`, `verdict`, `ask_user`, `ask_for`, `hand_off`, `report_blocker`, `wait`, `conclude`,
+`agent_spawn`, `agent_fanout`, `attempt`, `agent_adopt`, `agent_message`, `agent_stop`, `decide`, `verify`,
+`request_scope`, and `guarded_plan` (harnessmm). A role's `hidden_tools` are run when called but not listed to the model (`docs/TOOL-SHAPES.md` §4). A role lists the tools it has, in request order; a name in neither set is a pack error. The
 set is frozen in `session_start`. Every call goes through one pipeline (`loom_tools::prepare` → `run`
 → `finish`): lookup, argument check, run (a panic becomes an error result), store and admit. Each tool
 has a class — `Nav`, `Read`, `Exec`, `Write`, `State`, `Terminal` — which drives eviction order,
@@ -1113,6 +1133,13 @@ the default evidence grade (§7) and staleness. Each module's documentation is t
 - `bash` runs the command with `/bin/bash -c` under the sandbox, in its own process group, stdin
   `/dev/null`, stdout and stderr interleaved into one output file. It is over only when its whole
   process group is empty.
+  - The shell directory persists: a call without `cwd` runs where the last call left the shell (at
+    first the workspace), so `cd dir` carries over; environment variables do not. The script runs
+    behind an `EXIT` trap that writes `pwd -P` to `$LOOM_SHELL_CWD` (a file in the session temp dir);
+    a foreground call that ended by status or signal and finished elsewhere than it started says
+    `cwd now {dir}` and records it as meta `cwd`. A timeout, a job and `background` do not move it;
+    a directory that has been removed resets it to the workspace with a fact; a session reopened from
+    its log restores the last recorded `cwd`. Children and forks start in the workspace.
   - A foreground command still running after `tools.bash_foreground_s` (300) is not killed: it
     becomes a background job, and the result says so with the output so far. With `timeout_s` it is
     stopped instead (status `timeout`). `background: true` starts a job at once.
@@ -1200,7 +1227,7 @@ the default evidence grade (§7) and staleness. Each module's documentation is t
   VDR, the generated SBOM and the scanner console are stored as blobs. dep-scan's
   prioritized/reachable labels are its static analysis, stated as such, not execution evidence: its
   results are graded `analysis` (§7), so a quote of a scan never counts as a run.
-- `pin {handle, reason, unpin?}` keeps a stored output and every view of it in view through re-weaves;
+- `pin {handle, reason, unpin?}` keeps a stored output and every view of it in view through compactions;
   `log_search {pattern, in?, max?}` searches the session's own record.
 
 **Sandbox** (`loom-tools::sandbox`; its module documentation holds the exact seatbelt profile). Mode
@@ -1499,6 +1526,47 @@ is an ordinary job, and killing it signals the process group in the container th
 (`proc::RemoteStop`). Not done: a box for an agent that has its own workspace copy; wildcard grants; IPv6;
 a remote stop for a box job adopted after a daemon restart (its record does not keep one).
 
+**Captured exchanges** (`loom-agent::traffic`, `loom-tools::traffic`). Every HTTP exchange of a session is a record
+in its log: `Event::Exchange` with `id` (`ex-` and 12 base32 characters), `call_id`, `source` (`tool` or
+`proxy`), `tool`, `scheme`, `tls` (`plain`, `intercepted` or `tool`), `method`, `host`, `port`, `target`,
+`status`, `error`, `request` and `response` (blobs holding the HTTP/1.1 messages), byte counts, `truncated` and
+`duration_ms`. The in-process tools (`http_send`, `http_repeat`, `web_fetch`, MCP over HTTP) store the messages they
+sent and received and hand the exchanges back through the reserved `META_EXCHANGES` meta key; `finalize` moves
+them to `ToolResult::exchanges` and the session appends one `exchange` right after the call's `tool_result`, with
+the call's id. They are recorded whether or not the proxy captures. The proxy's exchanges arrive on the runtime's
+capture sink; the runtime stores both messages as blobs and attributes each to the call running when it started
+(between `exec_started` and `tool_result`); a background job's exchange has no call id. `[network]
+capture_max_bytes` (1 MiB) bounds each body; `capture_max_exchanges` (100 000) bounds a session, after which one
+note says capture stopped and traffic is still relayed. `Authorization`, `Cookie`, `Set-Cookie`,
+`Proxy-Authorization` and `X-Api-Key` stay in the stored messages (they are the evidence) and are masked only by
+views. `http_send`'s result names the `ex-` id beside each `rq` id, and `http_repeat` accepts an `ex-` id: the
+request is read back from the log's blobs, so it works after a restart (cookie jar and captured variables are not
+restored). The compaction key table lists the newest 40 exchanges under "Traffic" as `ex-… · METHOD host/target ·
+status` with the keys of both messages.
+
+**HTTPS interception** (opt-in; `Runtime::decide_intercept`). `[network] intercept` is `"pack"` (default),
+`"always"` or `"never"`. With `"pack"` a mission intercepts when its pack says `intercept = true` (ctf, redteam,
+vr) unless it was started with `intercept: false` (API body, `loom run --no-intercept`); another pack's mission may
+be started with `intercept: true`. The choice is recorded in `session_start.intercept` and `SessionMeta.intercept`
+and every child inherits it. An intercepting session is granted with `Proxy::grant_with_capture`; the CA is
+`~/.loom/ca/loom-ca.{pem,key}` (`Ca::load_or_create`), created on first use, and a mission that was promised
+decrypted traffic does not start when it cannot be loaded. The session's tmp dir gets `ca-bundle.pem` (system roots
+plus the loom CA) and the session's command environment sets `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`,
+`CURL_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`, `GIT_SSL_CAINFO`, `PIP_CERT` and `AWS_CA_BUNDLE` to it; nothing is added
+to any trust store. The loom home, CA key included, is never readable from the sandbox (`check_read`). A session
+with interception off and no capture is granted and run exactly as before.
+
+**Tool shapes.** Models are not fine-tuned for loom, so `read`, `write`, `edit`, `bash`, `grep` and `glob` are shown in Claude Code's argument names (`ToolsCfg.dialect`, default `trained`; `loom` shows loom's own), and calls in the shapes other widely trained harnesses use (Codex `apply_patch`, Cline `replace_in_file`, `str_replace_editor`, Gemini and Cursor names, `TodoWrite`, and so on) are converted to loom's tools before checking, with the repair named in the result. The tables and rules are in `TOOL-SHAPES.md`; the code is `loom-tools/src/dialect.rs`, called from `prepare`.
+
+**MCP servers.** A configured MCP server (`[mcp.servers.NAME]`) is offered to the model as ordinary tools named `mcp__{server}__{tool}`; its protocol is `loom-tools/src/mcp.rs`, its session wiring `loom-agent/src/mcp.rs`.
+
+- *Configuration (M1).* A server has exactly one of `command` (stdio) and `url` (Streamable HTTP); the name matches `[a-z0-9_-]{1,32}` and unknown keys are refused. Secret values in `env` and `headers` are `env:NAME` (the daemon's environment at session start), `file:/path` (trimmed) or a literal (allowed, and the daemon warns at start that a secret is written in the config). A source that is missing fails that server's start, not the daemon's. Values are never written to a log, a record or an API answer: records and routes carry names only. With no `[mcp]` or no servers, nothing below happens and no request changes.
+- *Where it runs (M3).* A stdio server is a child of the session's sandbox (argv run through `ctx.sandbox`, new process group, killed with the group), so a read-only session's server is read-only too. An HTTP server is reached the way `web_fetch` is, through the session's egress proxy, so the network policy decides and every connection is in `net.jsonl`. There is one connection per session per server, opened by the first call or the listing, closed after `idle_close_s` without a call, when the session ends or when it is archived; a call that finds the server dead restarts it once and its result says `server restarted`.
+- *Network (M4).* The `hosts` of a server are added to the allowed hosts of every session whose role gets that server, on top of `[network]` and mission grants (in `deny_all` too). **Threat note:** the proxy cannot tell the server's connections from the agent's, so a host granted for a server is reachable by that session's `bash` and `web_fetch` as well. Grant only hosts you would grant the agent.
+- *A call (M5).* The tool's class is `Read` when the server's `readOnlyHint` is true, else `Exec`, never speculative. The arguments are checked by `schema::check` only when the schema uses keywords it supports; otherwise the server validates. The content blocks become the body in order; an `isError` result or a JSON-RPC error is an `Error` outcome; a timeout is `Timeout`. The result is an ordinary stored output: admitted, cut, keyed (`out:`), readable with `read` and `grep`, quotable as evidence and readable by the verifier.
+- *Which session gets what (M6).* When a mission's lead starts, the runtime connects to every configured server whose `roles` match a role of the mission's pack, lists its tools and records the listings in `session_start.mcp` (a server that fails is recorded with its `error` and no tools). Children use their lead's listing and a reopened session its own record's, so a session's tool list and request prefix never change while it lives; changes on the server reach the next mission. A role gets the tools of each server whose `roles` name it (default: every role that is not read-only; a read-only role such as the verifier only when `read_only = true`), filtered by `tools`, after its own tools, in the server's order; once their definitions pass `max_schema_tokens` the rest are left out. A session with MCP tools gets one harness note at its start: per server the tool count, the hosts it added, what was left out (by `tools`, by the budget, by a name collision) and any start error. `hidden_tools`, the dialect layer and the tool-shape aliases do not apply to MCP tools.
+- *Daemon (M7).* `GET /api/sessions/{id}/mcp` shows the state of the session's servers; `POST /api/mcp/{server}/check` starts one in a scratch sandbox for a workspace, lists its tools and closes it; `loom mcp list` and `loom mcp check` use them.
+
 ## 12. Daemon API (`loom-daemon`)
 
 The module documentation of `api.rs`, `auth.rs`, `serve.rs` and `client.rs` is the precise
@@ -1559,6 +1627,7 @@ POST /api/sessions                            NewSession → 201 SessionInfo + c
                                               `created: true` in the answer says it was (409 otherwise, with the sentence)
 GET  /api/sessions/{id}                       → SessionDetail (SessionInfo + children, oldest first)
 GET  /api/sessions/{id}/records?after=&limit= → {records, next_after}   (limit: default 500, at most 2000)
+GET  /api/sessions/{id}/records?before=&limit= → {records, next_after: null, prev_before}   (oldest first; after+before is a 400)
 GET  /api/sessions/{id}/stream?after=         SSE, below (Last-Event-ID when after is absent)
 POST /api/sessions/{id}/messages              {text} → 202 {}
 POST /api/sessions/{id}/rules                 {text} → 202 RuleReceipt
@@ -1569,9 +1638,9 @@ POST /api/missions/{id}/scope/revoke          {host, reason} → 202 ScopeRevoke
 POST /api/sessions/{id}/release               {reason} → 202 RuleReceipt
 POST /api/sessions/{id}/stop                  → 202 {}
 POST /api/sessions/{id}/resume                → 202 {}
-POST /api/sessions/{id}/reweave               → 202 {}
+POST /api/sessions/{id}/compact               → 202 {}   (alias: /reweave)
 POST /api/sessions/{id}/archive               {archived} → 200 {}
-GET  /api/sessions/{id}/window                → WindowView (+ breakdown, measured_now, last_request, fold_at, fold_to)
+GET  /api/sessions/{id}/window                → WindowView (+ breakdown, measured_now, last_request, fold_at = compact_at)
 GET  /api/sessions/{id}/files?path=           → FilesView {root, path, entries: [{name, kind: dir|file|link|other, size, mtime_ms,
                                               hidden, note?, error?}], more}   (read-only, inside the session's workspace)
 GET  /api/sessions/{id}/files/lines?path=&start=&count=
@@ -1693,7 +1762,7 @@ the mission keeps a ledger (without one a rule is a note with no id), and the st
 recorded for a blank one. A withdrawal names a rule id the ledger has in force. `stop` reaches any
 session; `resume` and `archive` roots only; archiving is refused while the mission is running a turn.
 The same actions exist in the CLI (`loom send`, `rule`, `approve`, `rule --withdraw`, `stop`,
-`resume`, `reweave`, `archive`, `answer`) and in the web UI.
+`resume`, `compact`, `archive`, `answer`) and in the web UI.
 
 **Scope and release.** `POST /scope` (`loom scope`) is the only way a session's reachable hosts grow
 while it runs, and only the operator can call it: it goes to the mission's lead like a rule and is
@@ -1796,8 +1865,11 @@ replaces it. A role that needs a verifier (`verify_finish`, or an explicit `veri
 of the same pack that is `read_only` and has `verdict` and `out_read` or `out_grep`. A pack with
 `requires_restricted_network = true` says in its prompts that the network is restricted, so its sessions
 are refused at creation and at every activation while the network mode is `open`. The system prompt is
-the preamble, the role prompt and an `# Environment` section, joined by blank lines and identical for
-identical inputs.
+the preamble, the role prompt, a `# Project instructions` section when the workspace root has an
+`AGENTS.md` or `CLAUDE.md` (read once when the session is created, 32 KiB at most, recorded in
+`session_start.project_instructions` and rendered from that record, so a resumed session sends the same bytes;
+`[agents] project_instructions = false` turns it off) and an `# Environment` section, joined by blank lines and
+identical for identical inputs.
 
 Two tools belong to roles that may need them. `request_scope {hosts, why}` asks the operator for hosts
 (see section 12); `core` `lead` and `chat` and `vr` `researcher`, `scout` and `chat` have it. `conclude
@@ -1912,12 +1984,43 @@ and canaries (§6), records, routes, commands and UI (§7), evaluation (§8), an
 decisions and the residual risks (§9). The `CONTRACT` comments of `crates/loom-agent/src/monitor/` are the precise form of
 each part, with signatures.
 
+## Targets (`loom-core::target`, `loom-agent::runtime::targets`)
+
+A target is a named scope that missions share, with a graph of what they found (CONTRACTS-TRAFFIC-TARGETS T).
+
+- **Files (T1).** `~/.loom/targets/{name}/` (name `[a-z0-9][a-z0-9_-]{0,63}`) holds `target.toml` (`scope`,
+  `exclude`, `upstream_insecure`, `intercept_passthrough`, `notes`) and `graph.jsonl`, append-only and
+  hash-chained like the session log (`prev` is the SHA-256 of the previous line), written under an exclusive
+  lock (`graph.lock`) so several missions can append. A scope entry is a host, a `*.` glob, an IP or a CIDR;
+  `exclude` wins. Entries are validated when a target is written; a bad one is refused by name.
+- **Naming it (T2).** A mission names one target at start (`target` in the `POST /api/sessions` body,
+  `loom run --target NAME`). The lead's `session_start.target` records the scope, settings and the summary as of
+  that start; children inherit it; a restored session uses its record, never the file. The scope joins the
+  mission's network policy in every mode but `open`: scope hosts, IPs and CIDR blocks are reachable even in
+  `deny_all`, and `exclude` is refused whatever else would allow it (`open` included). The start note's network
+  sentence says so. A mission without a target is unchanged, byte for byte.
+- **Graph (T3).** Nodes `domain`, `host`, `ip`, `service` (`host:port/proto`), `endpoint`
+  (`METHOD scheme://host:port/path-template`; numeric, UUID-like and long hex segments become `{id}`); edges
+  `parent`, `resolves`, `runs`, `serves`. Node ids are the security state's asset ids of the same kind and
+  locator. Lines are `node_seen`, `edge`, `coverage`, `finding`.
+- **Writes (T4).** From the runtime, synchronously with the record that caused them: an `exchange` record of a
+  bound mission, a security `asset_upsert` (host, service, endpoint), a `coverage_set` (tested or deferred), and a
+  claim update to supported, withdrawn or refuted that names hosts (`claim_hosts`). Out-of-scope and excluded
+  hosts are never written.
+- **Reading (T5, T6).** Status of a node: `finding` if any open finding, else `tested`, else `deferred`, else
+  `untested`; scope entries with no node are `not_seen`. The lead's system prompt gets `# Target {name}` with the
+  scope and a deterministic summary of at most 8 KiB (counts, untested services and endpoints most recent first,
+  at most 40; findings, at most 20), computed once at the start and recorded. `security_query` view `target`
+  (filters `kind`, `status`, `under`, `max`) reads the live graph.
+- **API (T7).** `GET/POST /api/targets`, `GET/PUT /api/targets/{name}`, `GET /api/targets/{name}/graph`,
+  `GET /api/targets/{name}/exchanges`, `GET /api/exchanges/{session}`; `loom target list|add|show|scope`,
+  `loom ca show|rotate`. The SSE stream sends `{type:"target", name}` at most once a second per target.
+
 ## Security workflow extensions
 
-Typed asset/credential/foothold records, coverage, revisit triggers, hypothesis ownership and bounded
-causal projections live in the sealed mission journal; see `docs/SECURITY_STATE.md`. They are
+Typed asset/credential/foothold records, coverage, revisit triggers and facts live in the sealed mission journal; see `docs/SECURITY_STATE.md`. They are
 observations and investigation hints, not network authorization or automatic vulnerability verdicts.
-The HUD renders bounded derived state without copying credentials or untrusted observation prose.
+The HUD renders bounded state without copying credentials or untrusted observation prose.
 
 Roles may opt into structured HTTP/PTY/calculation/binary tools, credential prerequisites and hard
 child step slices. Execution tools retain normal sandboxing, cancellation and output provenance.
@@ -1959,7 +2062,7 @@ relied on.
   paths that changed on both sides.
 - Merging an agent's copy into a workspace that changed in the same files, and adopting through Git
   (a branch or a patch) rather than by files.
-- Background request priority for digests and titles (`Priority::Background` exists and nothing uses
+- Background request priority for notes and titles (`Priority::Background` exists and nothing uses
   it; titles are not written by a model).
 - A warning when a configured context window is larger than the one the server reports
   (`Discovered::server_window` is computed and not reported).

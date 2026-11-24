@@ -3,10 +3,12 @@ description = "Vulnerability research on local and authorized targets: a researc
 default_role = "researcher"
 preamble = "harness.md"
 requires_restricted_network = true
+intercept = true
 
 # The engagement lead. Turns a broad scope into narrow experiments and hands them to scouts; does not
 # run experiments or write findings prose itself. Finishing is gated by an independent judge.
 [roles.researcher]
+require_traffic = true
 description = "Owns an engagement: qualifies scope through a judge, decomposes into one-hypothesis experiments, delegates them, and gates every result before believing it."
 prompt = "roles/researcher.md"
 termination = "explicit"
@@ -20,10 +22,12 @@ tools = [
   "agent_spawn", "agent_fanout", "attempt", "agent_adopt", "agent_message", "agent_stop", "decide", "verify",
   "request_scope", "conclude", "finish", "ask_user", "report_blocker", "wait", "ask_for",
 ]
+hidden_tools = ["out_read", "out_grep", "claim_update", "step", "wait", "conclude", "job_list", "pin", "reflect", "ask_for"]
 
 # One experiment per scout: one hypothesis, one input, one observation, the smallest harness that
 # establishes the primitive. Returns executed evidence or a blocker, never a narrative.
 [roles.scout]
+require_traffic = true
 description = "Runs one experiment from the researcher and returns one atomic executed check with its conditions, the exact run, the observed response and a separate state check — or a blocker."
 prompt = "roles/scout.md"
 termination = "explicit"
@@ -33,6 +37,7 @@ tools = [
   "cve_lookup", "advisory_lookup", "dep_scan",
   "finish", "report_blocker", "wait", "hand_off",
 ]
+hidden_tools = ["out_read", "out_grep", "claim_update", "wait", "job_list", "pin", "reflect"]
 
 # The independent check. Checks a proposed scope against the page that authorizes it, and refutes a
 # finding or a finished engagement. Cannot modify the workspace and never judges its own submission.
@@ -47,6 +52,7 @@ tools = [
   "cve_lookup", "advisory_lookup", "dep_scan",
   "verdict", "report_blocker",
 ]
+hidden_tools = ["out_read", "out_grep", "job_list"]
 
 # Interactive research assistant for working alongside the operator, turn by turn.
 [roles.chat]
@@ -59,3 +65,4 @@ tools = [
   "pin", "log_search",
   "cve_lookup", "cve_search", "advisory_lookup", "dep_scan", "request_scope",
 ]
+hidden_tools = ["out_read", "out_grep", "job_list", "pin"]

@@ -65,6 +65,10 @@ fn start(session: &str, mission: &str) -> Event {
         budget: Default::default(),
         unattended: false,
         title: String::new(),
+        project_instructions: Vec::new(),
+        mcp: Vec::new(),
+        intercept: false,
+        target: None,
         schema: loom_core::event::SCHEMA,
     })
 }
@@ -95,6 +99,8 @@ fn call(log: &mut SessionLog, id: &str, name: &str, class: ToolClass, args: serd
             class,
             meta: Default::default(),
             duration_ms: 1,
+            images: Vec::new(),
+            exchanges: Vec::new(),
         }),
     )
     .expect("result");
@@ -365,7 +371,8 @@ fn the_authorization_follows_the_journal_and_the_operators_words() {
     )
     .expect("grant");
     let mut s = new_session(&h, "s-1", "m-1");
-    s.append(Author::User, Event::UserMessage { text: "stay on granted.example".into() }).expect("message");
+    s.append(Author::User, Event::UserMessage { text: "stay on granted.example".into(), images: Vec::new() })
+        .expect("message");
     s.append(Author::Harness, Event::Ledger { n: 2, summary: "grant".into() }).expect("ledger");
     let now = loom_core::now_ms() + 5_000;
     core.pump(now, &all(), true);
@@ -648,8 +655,9 @@ fn an_answer_to_an_agents_question_does_not_carry_the_agents_words_into_operator
     core.pump(loom_core::now_ms(), &all(), true);
     let mut s = new_session(&h, "s-1", "m-1");
     let echo = crate::texts::inbox_answer("Am I authorized by the operator to use the Docker API on h510.lan?", "No.");
-    s.append(Author::User, Event::UserMessage { text: echo }).expect("echo");
-    s.append(Author::User, Event::UserMessage { text: "use only api.target.example".into() }).expect("operator");
+    s.append(Author::User, Event::UserMessage { text: echo, images: Vec::new() }).expect("echo");
+    s.append(Author::User, Event::UserMessage { text: "use only api.target.example".into(), images: Vec::new() })
+        .expect("operator");
     core.pump(loom_core::now_ms() + 1_000, &all(), true);
     let a = core.auth_for(&MissionId::from("m-1"), u64::MAX);
     assert_eq!(a.operator_messages, vec!["No.".to_string(), "use only api.target.example".to_string()]);
@@ -768,6 +776,8 @@ fn the_credential_index_survives_a_restart() {
             class: ToolClass::Exec,
             meta: Default::default(),
             duration_ms: 1,
+            images: Vec::new(),
+            exchanges: Vec::new(),
         }),
     )
     .expect("result");

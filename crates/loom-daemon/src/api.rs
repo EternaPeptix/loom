@@ -11,10 +11,10 @@
 //!    `403` `{"error": "Requests from other origins are refused."}`.
 //! 3. Token: `auth::bearer_token(Authorization)` must match `state.token` (`auth::token_matches`)
 //!    or be a live web-session secret (`state.logins`); there are no cookies. Exceptions: `GET /`,
-//!    `GET /healthz`, the three static assets and `POST /api/web-sessions`. Otherwise `401`
+//!    `GET /healthz`, the static assets (page, scripts, style, icon) and `POST /api/web-sessions`. Otherwise `401`
 //!    `{"error": "Missing or wrong access token. Run `loom open`, or send the token in ~/.loom/token as a Bearer token."}`.
 //!
-//! Every response carries `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`.
+//! Every response carries `Cache-Control: no-store` (except `GET /api/images/{blob}`, which sets its own) and `X-Content-Type-Options: nosniff`.
 //! Errors are `ErrorBody` JSON: a runtime error (`Err(sentence)`) is `404` when the sentence starts
 //! with `There is no` or `No `, otherwise `409`; a body or query that does not parse is `400`
 //! (`{"error": "The request body is not valid: {why}"}`); an unknown path is `404`. No handler
@@ -43,8 +43,15 @@
 //! | `POST /sessions` (`NewSession`; `prior` may be left out; `create_workspace` makes a missing workspace folder) | `runtime.create_session_receipt` (`404` for a `prior` mission that does not exist, `409` for too many) | `201` `CreatedSession` (a `SessionInfo` plus `created`: the folder was made) |
 //! | `GET /sessions/{id}` | the session and its children (sessions whose `parent` is it) | `SessionDetail` |
 //! | `GET /sessions/{id}/records?after={seq}&limit={n}` | `runtime.stored_records` (`limit` default 500, at most 2000) | `RecordsPage` (`next_after` = last seq of the page when the page is full, else `null`); a record that comes with its stored line (read as `Event::Unknown`) is that line, verbatim |
+//! | `GET /images/{blob}` | `runtime.image_named`: the blob (a full id) must be named in the `images` of some session's record | the bytes, `Content-Type` the image's mime, `Content-Disposition: inline`, `Cache-Control: private, max-age=31536000, immutable` (this route only); `404` for any other blob |
 //! | `GET /sessions/{id}/stream?after={seq}` | see *Streams* | SSE |
-//! | `POST /sessions/{id}/messages` (`MessageBody`) | `runtime.send_message` | `202` `{}` |
+//! | `POST /sessions/{id}/messages` (`MessageBody`; `attachments` may be left out, and `text` empty when there are some) | `runtime.send_message_with` (`400` with the sentence `texts::not_an_upload` for a path that is not an upload of the workspace) | `202` `{}` |
+//! | `POST /sessions/{id}/messages` with `"when": "after_turn"` (default `"now"`; any other value is `400`) | `runtime.queue_message`: while the lead runs, the message is kept and sent when its turn ends; otherwise as `now` | `202` `{"queued": {id, text, attachments, created_ms}}` when held, `{}` when sent at once |
+//! | `GET /sessions/{id}/queued` | `runtime.queued` (the lead only) | `[{id, text, attachments, created_ms}]`, oldest first |
+//! | `PUT /sessions/{id}/queued/{qid}` (`{text}`) | `runtime.edit_queued` | `200` `{id, text, attachments, created_ms}`; `404` when it is no longer queued |
+//! | `DELETE /sessions/{id}/queued/{qid}` | `runtime.remove_queued` | `200` `{}`; `404` when it is no longer queued |
+//! | `POST /sessions/{id}/queued/{qid}/send` | `runtime.send_queued_now` (as `now`, then removed) | `202` `{}`; `404` when it is no longer queued |
+//! | `POST /uploads?workspace=<abs path>&name=<file name>` (raw body, at most `UPLOAD_MAX_BYTES` = 32 MiB; `Content-Type` is the file's type when it says one) | `upload::store` into `<workspace>/.loom/uploads/` (`docs/UPLOADS.md`); the workspace is judged as `POST /sessions` does (`plan_workspace`, nothing made) | `201` `UploadView`; `400` no or bad `workspace`/`name` (a name with nothing left after cleaning), `404` workspace missing, `409` workspace inside the loom home or not a folder, `413` body over the cap |
 //! | `POST /sessions/{id}/rules` (`RuleBody`) | `runtime.add_rule` (a child's id goes to its lead) | `202` `RuleReceipt` (`queued`: the lead is in a turn and records it at its next step) |
 //! | `POST /sessions/{id}/approvals` (`ApprovalBody`; `scope` may be left out) | `runtime.approve` | `202` `RuleReceipt` |
 //! | `POST /sessions/{id}/rules/{rule_id}/withdraw` (`WithdrawBody`; `reason` may be left out) | `runtime.withdraw_rule` (`404` when the mission has no such rule, `409` when it is already withdrawn) | `202` `RuleReceipt` |
@@ -53,7 +60,7 @@
 //! | `POST /sessions/{id}/release` (`ReleaseBody`; `reason` required) | `runtime.release` (operator only; closes the mission without the goal established; `409` for a blank reason) | `202` `RuleReceipt` |
 //! | `POST /sessions/{id}/stop` | `runtime.stop` | `202` `{}` |
 //! | `POST /sessions/{id}/resume` | `runtime.resume` | `202` `{}` |
-//! | `POST /sessions/{id}/reweave` | `runtime.reweave` | `202` `{}` |
+//! | `POST /sessions/{id}/compact` (alias `/reweave`) | `runtime.compact` | `202` `{}` |
 //! | `POST /sessions/{id}/archive` (`ArchiveBody`) | `runtime.archive` | `200` `{}` |
 //! | `POST /sessions/{id}/rename` (`RenameBody`) | `runtime.rename` | `200` `{}` |
 //! | `POST /sessions/{id}/model` (`ModelBody`) | `runtime.set_session_model` | `ModelSwitchReceipt` |
@@ -67,7 +74,16 @@
 //! | `GET /census` | `runtime.census()`: the last process and listener census of the sessions, found by sandbox identity (`null` until the first has finished; `?now=true` takes one first) | `CensusView` or `null` |
 //! | `POST /sessions/{id}/census/kill` | `runtime.census_kill`: SIGSTOP then SIGKILL of every process the census finds for the session (`404` for an id that is not a session) | `200` `Killed` (`rounds`, `killed`, `left`) |
 //! | `GET /sessions/{id}/window` | `runtime.window` | `WindowView` |
+//! | `GET /sessions/{id}/mcp` | `runtime.mcp_views` | `[McpServerView]` |
+//! | `POST /mcp/{server}/check` (`McpCheckBody`) | `runtime.mcp_check` | `McpCheckView` |
 //! | `GET /sessions/{id}/net?limit={n}` | `runtime.net` (default 200, at most 2000) | `[NetEntry]` |
+//! | `GET /exchanges/{session}?host=&after={seq}&limit={n}` | `runtime.exchanges`: the session's `exchange` records, newest last (default 200, at most 2000; `after` is a record seq) | `[ExchangeEntry]` |
+//! | `GET /targets` | `runtime.target_list` | `[TargetView]` (name, scope, exclude, settings, `counts` by status) |
+//! | `POST /targets` (`TargetBody`; `name` required) | `runtime.target_create` (`409` for a name in use or a scope entry that is not valid) | `201` `TargetView` |
+//! | `GET /targets/{name}` | `runtime.target_show` (`404` for no such target) | `TargetView` |
+//! | `PUT /targets/{name}` (`TargetBody`; what is left out stays) | `runtime.target_update` | `TargetView` |
+//! | `GET /targets/{name}/graph?status=&kind=&under=` | `runtime.target_graph`: nodes with status, missions and evidence keys; the edges between them | `GraphView` |
+//! | `GET /targets/{name}/exchanges?node=&limit={n}` | `runtime.target_exchanges`: the exchanges of every mission of the target with that node (id or locator), newest last | `[ExchangeEntry]` |
 //! | `GET /missions` | `runtime.missions` | `[MissionInfo]` |
 //! | `GET /missions/{id}/ledger` | `runtime.ledger` | `LedgerView` |
 //! | `GET /missions/{id}/score` | `runtime.score` | `ScoreView` |
@@ -105,6 +121,9 @@
 //!   records this build has just written, which it always reads in full.)
 //! - A carriage return in a data line (whitespace between the tokens of a stored line) is sent as a
 //!   space: an SSE line cannot hold one.
+//! - `{"type": "queued", "session": id}` is sent on the events stream and on that session's stream whenever its
+//!   queued messages change (added, edited, removed, sent now, recorded when a turn ends, discarded by an
+//!   archive); read `GET /sessions/{id}/queued` again.
 //! - A subscriber that falls behind (`RecvError::Lagged(n)`) is sent `{"type": "lagged", "missed":
 //!   n}` and the stream goes on. A stream ends when the client goes away or the daemon shuts down.
 //!
@@ -140,19 +159,21 @@ use crate::fsview;
 use crate::ui;
 use crate::wire::{
     AnswerBody, ApprovalBody, ArchiveBody, CreatedSession, DirsView, DiskSpace, ErrorBody, FileLinesView, FilesView,
-    GcBody, LinesView, MessageBody, ModelBody, ModelsView, ReleaseBody, RenameBody, RoleModelBody, RuleBody, ScopeBody,
-    ScopeRevokeBody, SessionDetail, StatusView, WithdrawBody,
+    GcBody, LinesView, McpCheckBody, MessageBody, MessageWhen, ModelBody, ModelsView, QueuedEditBody, QueuedReceipt,
+    ReleaseBody, RenameBody, RoleModelBody, RuleBody, ScopeBody, ScopeRevokeBody, SessionDetail, StatusView,
+    UploadView, WithdrawBody,
 };
 use axum::body::{Body, Bytes};
+use axum::extract::rejection::BytesRejection;
 use axum::extract::rejection::QueryRejection;
-use axum::extract::{Path, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
-use loom_agent::runtime::{BusEvent, NewSession, Runtime, SessionInfo};
+use loom_agent::runtime::{BusEvent, NewSession, Runtime, SessionInfo, TargetBody};
 use loom_agent::session::Phase;
 use loom_core::event::{Event as LogEvent, Seq};
 use loom_core::log::StoredRecord;
@@ -192,6 +213,8 @@ const NET_DEFAULT: usize = 200;
 const NET_MAX: usize = 2_000;
 const MONITOR_LOG_DEFAULT: usize = 200;
 const MONITOR_LOG_MAX: usize = 2_000;
+const EXCHANGES_DEFAULT: usize = 200;
+const EXCHANGES_MAX: usize = 2_000;
 const LINES_DEFAULT_END: u64 = 2_000;
 const LINES_MAX: u64 = 5_000;
 const KEEP_ALIVE: Duration = Duration::from_secs(15);
@@ -207,6 +230,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/app.js", get(|| async { asset("text/javascript; charset=utf-8", ui::APP_JS) }))
         .route("/core.js", get(|| async { asset("text/javascript; charset=utf-8", ui::CORE_JS) }))
         .route("/style.css", get(|| async { asset("text/css; charset=utf-8", ui::STYLE_CSS) }))
+        .route("/favicon.svg", get(|| async { asset("image/svg+xml", ui::FAVICON_SVG) }))
         .route("/healthz", get(healthz))
         .route("/api/login-codes", post(login_code))
         .route("/api/web-sessions", post(web_session))
@@ -216,6 +240,9 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/sessions/{id}/records", get(records))
         .route("/api/sessions/{id}/stream", get(session_stream))
         .route("/api/sessions/{id}/messages", post(message))
+        .route("/api/sessions/{id}/queued", get(queued_list))
+        .route("/api/sessions/{id}/queued/{qid}", put(queued_edit).delete(queued_remove))
+        .route("/api/sessions/{id}/queued/{qid}/send", post(queued_send))
         .route("/api/sessions/{id}/rules", post(add_rule))
         .route("/api/sessions/{id}/approvals", post(approve))
         .route("/api/sessions/{id}/rules/{rule_id}/withdraw", post(withdraw_rule))
@@ -223,7 +250,8 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/sessions/{id}/release", post(release))
         .route("/api/sessions/{id}/stop", post(stop))
         .route("/api/sessions/{id}/resume", post(resume))
-        .route("/api/sessions/{id}/reweave", post(reweave))
+        .route("/api/sessions/{id}/compact", post(compact))
+        .route("/api/sessions/{id}/reweave", post(compact))
         .route("/api/sessions/{id}/archive", post(archive))
         .route("/api/sessions/{id}/rename", post(rename))
         .route("/api/sessions/{id}/model", post(set_model))
@@ -237,7 +265,14 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/census", get(census))
         .route("/api/sessions/{id}/census/kill", post(census_kill))
         .route("/api/sessions/{id}/window", get(window))
+        .route("/api/sessions/{id}/mcp", get(mcp_servers))
+        .route("/api/mcp/{server}/check", post(mcp_check))
         .route("/api/sessions/{id}/net", get(net))
+        .route("/api/exchanges/{session}", get(session_exchanges))
+        .route("/api/targets", get(targets).post(target_create))
+        .route("/api/targets/{name}", get(target_show).put(target_update))
+        .route("/api/targets/{name}/graph", get(target_graph))
+        .route("/api/targets/{name}/exchanges", get(target_exchanges))
         .route("/api/missions", get(missions))
         .route("/api/missions/{id}/ledger", get(ledger))
         .route("/api/missions/{id}/score", get(score))
@@ -247,9 +282,11 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/blobs/{handle}", get(blob_meta))
         .route("/api/blobs/{handle}/raw", get(blob_raw))
         .route("/api/blobs/{handle}/lines", get(blob_lines))
+        .route("/api/images/{blob}", get(image))
         .route("/api/fs/dirs", get(fs_dirs))
         .route("/api/sessions/{id}/files", get(session_files))
         .route("/api/sessions/{id}/files/lines", get(session_file_lines))
+        .route("/api/uploads", post(upload).layer(DefaultBodyLimit::max(UPLOAD_MAX_BYTES)))
         .route("/api/events", get(events))
         .route("/api/gc", post(gc))
         .route("/api/shutdown", post(shutdown))
@@ -323,6 +360,8 @@ type Res<T> = Result<T, ApiError>;
 fn rt_err(sentence: String) -> ApiError {
     let status = if sentence.starts_with("There is no") || sentence.starts_with("No ") {
         StatusCode::NOT_FOUND
+    } else if sentence.starts_with("Attach files with POST /api/uploads first") {
+        StatusCode::BAD_REQUEST
     } else {
         StatusCode::CONFLICT
     };
@@ -444,7 +483,8 @@ async fn admit(state: &ApiState, req: Request, next: Next) -> Response {
     }
     // The page and its scripts hold no secret; a login code is its own credential.
     let path = req.uri().path();
-    let exempt = (method == Method::GET && matches!(path, "/" | "/healthz" | "/app.js" | "/core.js" | "/style.css"))
+    let exempt = (method == Method::GET
+        && matches!(path, "/" | "/healthz" | "/app.js" | "/core.js" | "/style.css" | "/favicon.svg"))
         || (method == Method::POST && path == "/api/web-sessions");
     if !exempt && !bearer_ok(state, headers) {
         return refusal(StatusCode::UNAUTHORIZED, UNAUTHORIZED);
@@ -462,7 +502,11 @@ fn seal(mut response: Response) -> Response {
         }
     }
     let headers = response.headers_mut();
-    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    // The one route that sets its own policy is the immutable image; everything else is never stored.
+    let immutable = headers.get(header::CACHE_CONTROL).is_some_and(|v| v.as_bytes().starts_with(b"private, max-age="));
+    if !immutable {
+        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    }
     headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
     response
 }
@@ -636,6 +680,7 @@ enum Served {
 struct ServedPage {
     records: Vec<Served>,
     next_after: Option<Seq>,
+    prev_before: Option<Seq>,
 }
 
 /// The stored line of a record read as `Event::Unknown`, as JSON to send as it is.
@@ -653,18 +698,120 @@ fn served(mut stored: StoredRecord) -> Served {
 async fn records(State(s): State<ApiState>, Path(id): Path<String>, q: RawQuery) -> Res<Json<ServedPage>> {
     let q = params(q)?;
     let after = number(&q, "after")?;
+    let before = number(&q, "before")?;
     let limit = clamp_limit(number(&q, "limit")?, RECORDS_DEFAULT, RECORDS_MAX);
+    if after.is_some() && before.is_some() {
+        return Err(ApiError::bad_query("after and before cannot be asked together: pick the direction to page in."));
+    }
     // The log is read from disk; keep that off the async workers.
     let runtime = s.runtime.clone();
+    if let Some(before) = before {
+        // The `limit` records before `before`, oldest first: sequence numbers are dense from 0.
+        let first = before.saturating_sub(u64::try_from(limit).unwrap_or(u64::MAX));
+        let count = usize::try_from(before.saturating_sub(first)).unwrap_or(limit);
+        let from = first.checked_sub(1);
+        let records =
+            blocking(move || runtime.stored_records(&SessionId::from(id), from, count).map_err(rt_err)).await?;
+        let prev_before = if first > 0 && !records.is_empty() { Some(first) } else { None };
+        return Ok(Json(ServedPage {
+            records: records.into_iter().map(served).collect(),
+            next_after: None,
+            prev_before,
+        }));
+    }
     let records = blocking(move || runtime.stored_records(&SessionId::from(id), after, limit).map_err(rt_err)).await?;
     let next_after = if records.len() >= limit { records.last().map(|r| r.record.seq) } else { None };
-    Ok(Json(ServedPage { records: records.into_iter().map(served).collect(), next_after }))
+    Ok(Json(ServedPage { records: records.into_iter().map(served).collect(), next_after, prev_before: None }))
 }
 
 async fn message(State(s): State<ApiState>, Path(id): Path<String>, body: Bytes) -> Res<Response> {
     let body: MessageBody = json_body(&body)?;
-    s.runtime.send_message(&SessionId::from(id), &body.text).await.map_err(rt_err)?;
+    let id = SessionId::from(id);
+    if body.when == MessageWhen::AfterTurn {
+        return match s.runtime.queue_message(&id, &body.text, &body.attachments).await.map_err(rt_err)? {
+            Some(queued) => Ok((StatusCode::ACCEPTED, Json(QueuedReceipt { queued })).into_response()),
+            None => Ok(accepted()),
+        };
+    }
+    s.runtime.send_message_with(&id, &body.text, &body.attachments).await.map_err(rt_err)?;
     Ok(accepted())
+}
+
+async fn queued_list(State(s): State<ApiState>, Path(id): Path<String>) -> Res<Response> {
+    let queued = s.runtime.queued(&SessionId::from(id)).map_err(rt_err)?;
+    Ok(Json(queued).into_response())
+}
+
+async fn queued_edit(State(s): State<ApiState>, Path((id, qid)): Path<(String, String)>, body: Bytes) -> Res<Response> {
+    let body: QueuedEditBody = json_body(&body)?;
+    let queued = s.runtime.edit_queued(&SessionId::from(id), &qid, &body.text).await.map_err(rt_err)?;
+    Ok(Json(queued).into_response())
+}
+
+async fn queued_remove(State(s): State<ApiState>, Path((id, qid)): Path<(String, String)>) -> Res<Response> {
+    s.runtime.remove_queued(&SessionId::from(id), &qid).await.map_err(rt_err)?;
+    Ok(ok_empty())
+}
+
+async fn queued_send(State(s): State<ApiState>, Path((id, qid)): Path<(String, String)>) -> Res<Response> {
+    s.runtime.send_queued_now(&SessionId::from(id), &qid).await.map_err(rt_err)?;
+    Ok(accepted())
+}
+
+/// The most an upload may hold: the Files viewer's read cap.
+const UPLOAD_MAX_BYTES: usize = fsview::READ_CAP as usize;
+
+/// `POST /api/uploads?workspace=&name=`: the raw body becomes `<workspace>/.loom/uploads/<name>`.
+async fn upload(
+    State(s): State<ApiState>,
+    q: RawQuery,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Res<Response> {
+    let q = params(q)?;
+    let Some(workspace) = q.get("workspace").filter(|w| !w.trim().is_empty()) else {
+        return Err(ApiError::bad_query("workspace is required: the absolute path of the workspace folder"));
+    };
+    let Some(name) = q.get("name").filter(|n| !n.trim().is_empty()) else {
+        return Err(ApiError::bad_query("name is required: the file's name"));
+    };
+    if !(workspace.starts_with('/') || workspace.starts_with('~')) {
+        return Err(ApiError::bad_query(format!("workspace must be an absolute path, not \"{workspace}\".")));
+    }
+    let body = body.map_err(|e| {
+        if e.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            ApiError::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "The upload is larger than {} MiB, the most the daemon stores. Send a smaller file.",
+                    UPLOAD_MAX_BYTES >> 20
+                ),
+            )
+        } else {
+            ApiError::bad_body(e.body_text())
+        }
+    })?;
+    let given = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).map(str::to_string);
+    let (paths, workspace, name) = (s.runtime.paths().clone(), workspace.clone(), name.clone());
+    let view: UploadView = blocking(move || {
+        let root = match loom_agent::runtime::plan_workspace(&paths, std::path::Path::new(&workspace), false) {
+            Ok(loom_agent::runtime::WorkspacePlan::Existing(root)) => root,
+            Ok(_) => {
+                return Err(ApiError::new(StatusCode::NOT_FOUND, format!("The workspace {workspace} does not exist.")));
+            }
+            Err(e) if e.contains("does not exist") => return Err(ApiError::new(StatusCode::NOT_FOUND, e)),
+            Err(e) => return Err(ApiError::new(StatusCode::CONFLICT, e)),
+        };
+        crate::upload::store(&root, &name, &body, given.as_deref()).map_err(|e| {
+            if e.contains("file name") {
+                ApiError::bad_query(e)
+            } else {
+                ApiError::new(StatusCode::CONFLICT, e)
+            }
+        })
+    })
+    .await?;
+    Ok((StatusCode::CREATED, Json(view)).into_response())
 }
 
 async fn add_rule(State(s): State<ApiState>, Path(id): Path<String>, body: Bytes) -> Res<Response> {
@@ -768,8 +915,8 @@ async fn resume(State(s): State<ApiState>, Path(id): Path<String>) -> Res<Respon
     Ok(accepted())
 }
 
-async fn reweave(State(s): State<ApiState>, Path(id): Path<String>) -> Res<Response> {
-    s.runtime.reweave(&SessionId::from(id)).await.map_err(rt_err)?;
+async fn compact(State(s): State<ApiState>, Path(id): Path<String>) -> Res<Response> {
+    s.runtime.compact(&SessionId::from(id)).await.map_err(rt_err)?;
     Ok(accepted())
 }
 
@@ -820,9 +967,83 @@ async fn window(State(s): State<ApiState>, Path(id): Path<String>) -> Res<Respon
     Ok(Json(view).into_response())
 }
 
+async fn mcp_servers(State(s): State<ApiState>, Path(id): Path<String>) -> Res<Response> {
+    let runtime = s.runtime.clone();
+    let views = blocking(move || runtime.mcp_views(&SessionId::from(id)).map_err(rt_err)).await?;
+    Ok(Json(views).into_response())
+}
+
+async fn mcp_check(State(s): State<ApiState>, Path(server): Path<String>, body: Bytes) -> Res<Response> {
+    let body: McpCheckBody = json_body(&body)?;
+    if !(body.workspace.starts_with('/') || body.workspace.starts_with('~')) {
+        return Err(ApiError::bad_body(format!("workspace must be an absolute path, not \"{}\".", body.workspace)));
+    }
+    let view = s.runtime.mcp_check(&server, std::path::Path::new(&body.workspace)).await.map_err(rt_err)?;
+    Ok(Json(view).into_response())
+}
+
 async fn net(State(s): State<ApiState>, Path(id): Path<String>, q: RawQuery) -> Res<Response> {
     let limit = clamp_limit(number(&params(q)?, "limit")?, NET_DEFAULT, NET_MAX);
     let entries = s.runtime.net(&SessionId::from(id), limit).map_err(rt_err)?;
+    Ok(Json(entries).into_response())
+}
+
+async fn session_exchanges(State(s): State<ApiState>, Path(id): Path<String>, q: RawQuery) -> Res<Response> {
+    let q = params(q)?;
+    let limit = clamp_limit(number(&q, "limit")?, EXCHANGES_DEFAULT, EXCHANGES_MAX);
+    let after = number(&q, "after")?;
+    let host = q.get("host").cloned();
+    let rt = s.runtime.clone();
+    let entries =
+        blocking(move || rt.exchanges(&SessionId::from(id), host.as_deref(), after, limit).map_err(rt_err)).await?;
+    Ok(Json(entries).into_response())
+}
+
+async fn targets(State(s): State<ApiState>) -> Res<Response> {
+    let rt = s.runtime.clone();
+    Ok(Json(blocking(move || rt.target_list().map_err(rt_err)).await?).into_response())
+}
+
+async fn target_show(State(s): State<ApiState>, Path(name): Path<String>) -> Res<Response> {
+    let rt = s.runtime.clone();
+    Ok(Json(blocking(move || rt.target_show(&name).map_err(rt_err)).await?).into_response())
+}
+
+async fn target_create(State(s): State<ApiState>, body: Bytes) -> Res<Response> {
+    let body: TargetBody = json_body(&body)?;
+    let rt = s.runtime.clone();
+    let view = blocking(move || rt.target_create(&body).map_err(rt_err)).await?;
+    Ok((StatusCode::CREATED, Json(view)).into_response())
+}
+
+async fn target_update(State(s): State<ApiState>, Path(name): Path<String>, body: Bytes) -> Res<Response> {
+    let body: TargetBody = json_body(&body)?;
+    let rt = s.runtime.clone();
+    Ok(Json(blocking(move || rt.target_update(&name, &body).map_err(rt_err)).await?).into_response())
+}
+
+async fn target_graph(State(s): State<ApiState>, Path(name): Path<String>, q: RawQuery) -> Res<Response> {
+    let q = params(q)?;
+    let rt = s.runtime.clone();
+    let view = blocking(move || {
+        rt.target_graph(
+            &name,
+            q.get("status").map(String::as_str),
+            q.get("kind").map(String::as_str),
+            q.get("under").map(String::as_str),
+        )
+        .map_err(rt_err)
+    })
+    .await?;
+    Ok(Json(view).into_response())
+}
+
+async fn target_exchanges(State(s): State<ApiState>, Path(name): Path<String>, q: RawQuery) -> Res<Response> {
+    let q = params(q)?;
+    let limit = clamp_limit(number(&q, "limit")?, EXCHANGES_DEFAULT, EXCHANGES_MAX);
+    let node = q.get("node").cloned();
+    let rt = s.runtime.clone();
+    let entries = blocking(move || rt.target_exchanges(&name, node.as_deref(), limit).map_err(rt_err)).await?;
     Ok(Json(entries).into_response())
 }
 
@@ -889,6 +1110,31 @@ async fn blob_raw(State(s): State<ApiState>, Path(handle): Path<String>) -> Res<
     if let Ok(value) = HeaderValue::from_str(&disposition) {
         headers.insert(header::CONTENT_DISPOSITION, value);
     }
+    Ok(response)
+}
+
+/// `GET /api/images/{blob}`: an image blob that a record of some session names in `images`, inline with its mime
+/// type; `404` for any other blob (so the route is no way to read arbitrary tool output).
+async fn image(State(s): State<ApiState>, Path(blob): Path<String>) -> Res<Response> {
+    let rt = s.runtime.clone();
+    let blobs = rt.blobs().clone();
+    let (image, bytes) = blocking(move || {
+        let image = rt
+            .image_named(&blob)
+            .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "There is no image with that id."))?;
+        let bytes = blobs
+            .read_all(&loom_core::BlobId::from(image.blob.clone()))
+            .map_err(|e| ApiError::unreadable_blob(&image.blob, e))?;
+        Ok((image, bytes))
+    })
+    .await?;
+    let mut response = Response::new(Body::from(bytes));
+    let headers = response.headers_mut();
+    if let Ok(v) = HeaderValue::from_str(&image.mime) {
+        headers.insert(header::CONTENT_TYPE, v);
+    }
+    headers.insert(header::CONTENT_DISPOSITION, HeaderValue::from_static("inline"));
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("private, max-age=31536000, immutable"));
     Ok(response)
 }
 
@@ -1081,10 +1327,8 @@ struct ReplayReqs {
 impl ReplayReqs {
     fn note(&mut self, event: &LogEvent) {
         match event {
-            LogEvent::ModelRequest(m) => {
-                if !self.completed.contains(&m.req_id) {
-                    self.pending.insert(m.req_id.clone());
-                }
+            LogEvent::ModelRequest(m) if !self.completed.contains(&m.req_id) => {
+                self.pending.insert(m.req_id.clone());
             }
             LogEvent::ModelResponse(m) => {
                 self.pending.remove(&m.req_id);
@@ -1185,7 +1429,7 @@ async fn pump_session(
                 }
             }
             BusEvent::Delta { session, req_id, .. } => *session == id && !reqs.completed.contains(req_id),
-            BusEvent::Status { session, .. } => *session == id,
+            BusEvent::Status { session, .. } | BusEvent::Queued { session } => *session == id,
             _ => false,
         };
         if wanted && !push(&tx, &event).await {
@@ -1259,7 +1503,9 @@ mod tests {
     fn plain_core_pack(packs: &std::path::Path) {
         let core = packs.join("core");
         std::fs::create_dir_all(core.join("roles")).unwrap();
-        let toml = include_str!("../../../packs/core/pack.toml").replacen("\"request_scope\", \"conclude\", ", "", 1);
+        let toml = include_str!("../../../packs/core/pack.toml")
+            .replacen("\"request_scope\", \"conclude\", ", "", 1)
+            .replace("\"conclude\", ", "");
         assert!(!toml.contains("\"conclude\""), "the lead's tool list changed shape");
         std::fs::write(core.join("pack.toml"), toml).unwrap();
         std::fs::write(core.join("harness.md"), include_str!("../../../packs/core/harness.md")).unwrap();
@@ -1274,6 +1520,10 @@ mod tests {
     }
 
     async fn env(script: Script) -> Env {
+        env_cfg(script, |_| {}).await
+    }
+
+    async fn env_cfg(script: Script, tweak: impl FnOnce(&mut Config)) -> Env {
         let dir = tempfile::tempdir().unwrap();
         let ws = dir.path().join("ws");
         std::fs::create_dir_all(&ws).unwrap();
@@ -1295,8 +1545,10 @@ mod tests {
         config.default_model = "mock".into();
         config.sandbox.mode = SandboxMode::None;
         config.network.mode = NetworkMode::DenyAll;
+        config.network.capture_max_exchanges = 0;
         config.agents.verify_finish = false;
         config.tools.kill_grace_s = 1;
+        tweak(&mut config);
         let paths = Paths::at(dir.path().join("home"));
         plain_core_pack(&paths.packs_dir());
         let rt = Runtime::start(config, paths).await.unwrap();
@@ -1584,7 +1836,7 @@ mod tests {
         let e = env(Script::new(|_, _| finish("x"))).await;
         let anon = |p: &str| e.http.get(e.url(p));
 
-        for path in ["/", "/app.js", "/core.js", "/style.css"] {
+        for path in ["/", "/app.js", "/core.js", "/style.css", "/favicon.svg"] {
             let r = anon(path).send().await.unwrap();
             assert_eq!(r.status(), 200, "{path}");
             assert!(r.headers().get("set-cookie").is_none(), "{path}");
@@ -1770,6 +2022,7 @@ mod tests {
             ("/app.js", "text/javascript; charset=utf-8", ui::APP_JS),
             ("/core.js", "text/javascript; charset=utf-8", ui::CORE_JS),
             ("/style.css", "text/css; charset=utf-8", ui::STYLE_CSS),
+            ("/favicon.svg", "image/svg+xml", ui::FAVICON_SVG),
         ] {
             let r = e.rq(Method::GET, path).send().await.unwrap();
             assert_eq!(r.status(), 200, "{path}");
@@ -1851,6 +2104,26 @@ mod tests {
         }
         assert_eq!(seen, all);
         assert_eq!(all[0]["seq"], 0);
+
+        // Paging backward: `before` gives the records before a seq, oldest first, and `prev_before` goes on.
+        let last = all.last().unwrap()["seq"].as_u64().unwrap();
+        let (s, page) = e.get(&format!("/api/sessions/{id}/records?limit=3&before={}", last + 1)).await;
+        assert_eq!(s, 200);
+        let got = page["records"].as_array().unwrap().clone();
+        assert_eq!(got, all[all.len() - 3..].to_vec());
+        assert_eq!(page["prev_before"].as_u64(), Some(last + 1 - 3));
+        let mut back: Vec<Value> = got;
+        let mut before = page["prev_before"].as_u64();
+        while let Some(b) = before {
+            let (_, page) = e.get(&format!("/api/sessions/{id}/records?limit=3&before={b}")).await;
+            let mut older = page["records"].as_array().unwrap().clone();
+            older.extend(back);
+            back = older;
+            before = page["prev_before"].as_u64();
+        }
+        assert_eq!(back, all);
+        let (s, b) = e.get(&format!("/api/sessions/{id}/records?before=3&after=1")).await;
+        assert_eq!(s, 400, "{b}");
         assert_eq!(all[0]["kind"], "session_start");
 
         let (s, w) = e.get(&format!("/api/sessions/{id}/window")).await;
@@ -1858,9 +2131,9 @@ mod tests {
         assert!(w["est_tokens"].as_u64().unwrap() > 0 && !w["items"].as_array().unwrap().is_empty());
         // The additive fields: the parts of the request add up to its total, the fold bounds are given.
         let parts = w["breakdown"]["segments"].as_array().unwrap();
-        assert_eq!(parts.len(), 14);
+        assert_eq!(parts.len(), 15);
         assert_eq!(parts.iter().map(|p| p["tokens"].as_u64().unwrap()).sum::<u64>(), w["breakdown"]["total_tokens"]);
-        assert!(w["fold_at"].as_u64().unwrap() > w["fold_to"].as_u64().unwrap());
+        assert!(w["fold_at"].as_u64().unwrap() > 0);
         assert!(w.get("measured_now").is_some() && w.get("last_request").is_some());
 
         let (s, net) = e.get(&format!("/api/sessions/{id}/net?limit=5")).await;
@@ -2209,7 +2482,9 @@ mod tests {
         // Added to the file and reloaded: usable at once, without a restart.
         let url = e.rt.config().models["mock"].base_url.clone();
         let profile = |name: &str| {
-            format!("[models.{name}]\nbase_url = \"{url}\"\nmodel = \"mock\"\ncontext_window = 1000000\nretry_window_s = 1\nretry_max_delay_s = 1\nstall_timeout_s = 30\n")
+            format!(
+                "[models.{name}]\nbase_url = \"{url}\"\nmodel = \"mock\"\ncontext_window = 1000000\nretry_window_s = 1\nretry_max_delay_s = 1\nstall_timeout_s = 30\n"
+            )
         };
         let text = format!("default_model = \"mock\"\n\n{}\n{}", profile("mock"), profile("other"));
         std::fs::write(e.rt.paths().config_file(), text).unwrap();
@@ -2243,6 +2518,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queued_messages_are_listed_edited_removed_sent_now_and_sent_when_the_turn_ends() {
+        let script = Script::new(|_, n| if n == 0 { slow_finish("one", 1500) } else { finish("more") });
+        let e = env(script).await;
+        let id = e.create("first").await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let q = format!("/api/sessions/{id}/queued");
+        let msg = format!("/api/sessions/{id}/messages");
+        let texts = |v: &Value| -> Vec<String> {
+            v.as_array().unwrap().iter().map(|m| m["text"].as_str().unwrap().to_string()).collect()
+        };
+        assert_eq!(e.get(&q).await, (200, json!([])));
+        let (s, b) = e.post_text(&msg, "{\"text\": \"x\", \"when\": \"later\"}").await;
+        assert_eq!(s, 400, "{b}");
+        let (s, a) = e.post(&msg, json!({"text": "a", "when": "after_turn"})).await;
+        assert_eq!(s, 202, "{a}");
+        let aid = a["queued"]["id"].as_str().unwrap().to_string();
+        assert_eq!((a["queued"]["text"].as_str(), a["queued"]["attachments"].clone()), (Some("a"), json!([])));
+        assert!(a["queued"]["created_ms"].as_u64().unwrap() > 0);
+        let (_, b) = e.post(&msg, json!({"text": "b", "when": "after_turn"})).await;
+        let bid = b["queued"]["id"].as_str().unwrap().to_string();
+        let (_, c) = e.post(&msg, json!({"text": "c", "when": "after_turn"})).await;
+        let cid = c["queued"]["id"].as_str().unwrap().to_string();
+        assert_eq!(texts(&e.get(&q).await.1), ["a", "b", "c"]);
+        // Edit keeps the place; remove drops one; both then answer 404.
+        let r = e.rq(Method::PUT, &format!("{q}/{aid}")).json(&json!({"text": "a2"})).send().await.unwrap();
+        let (s, edited) = json_of(r).await;
+        assert_eq!((s, edited["id"].as_str(), edited["text"].as_str()), (200, Some(aid.as_str()), Some("a2")));
+        let r = e.rq(Method::DELETE, &format!("{q}/{bid}")).send().await.unwrap();
+        assert_eq!(json_of(r).await, (200, json!({})));
+        let r = e.rq(Method::DELETE, &format!("{q}/{bid}")).send().await.unwrap();
+        assert_eq!(json_of(r).await.0, 404);
+        let r = e.rq(Method::PUT, &format!("{q}/{bid}")).json(&json!({"text": "z"})).send().await.unwrap();
+        assert_eq!(json_of(r).await.0, 404);
+        let r = e.rq(Method::PUT, &format!("{q}/{aid}")).json(&json!({"text": "z", "x": 1})).send().await.unwrap();
+        assert_eq!(json_of(r).await.0, 400);
+        assert_eq!(texts(&e.get(&q).await.1), ["a2", "c"]);
+        // Send now: steered into the running lead, off the queue.
+        let (s, b) = e.post(&format!("{q}/{cid}/send"), json!({})).await;
+        assert_eq!((s, b), (202, json!({})));
+        assert_eq!(texts(&e.get(&q).await.1), ["a2"]);
+        let (s, _) = e.post(&format!("{q}/{cid}/send"), json!({})).await;
+        assert_eq!(s, 404);
+        // The rest is sent when the turn ends and starts the next one.
+        e.wait_turn_ends(&id, 2).await;
+        assert_eq!(e.get(&q).await, (200, json!([])));
+        let records = e.records(&id).await;
+        let users: Vec<&str> =
+            records.iter().filter(|r| r["kind"] == "user_message").filter_map(|r| r["text"].as_str()).collect();
+        assert!(users.contains(&"a2") && users.contains(&"c"), "{users:?}");
+        // Idle: after_turn is the same as now.
+        let (s, b) = e.post(&msg, json!({"text": "idle", "when": "after_turn"})).await;
+        assert_eq!((s, b), (202, json!({})));
+        e.wait_turn_ends(&id, 3).await;
+        // Unknown session: 404.
+        assert_eq!(e.get("/api/sessions/s-nope/queued").await.0, 404);
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn operations_round_trip_and_refusals_carry_the_runtimes_sentence() {
         let e = env(Script::new(|_, _| finish("done"))).await;
         let id = e.create("first").await;
@@ -2260,7 +2594,7 @@ mod tests {
         assert_eq!((s, b), (202, json!({})));
         let (s, b) = e.post(&format!("/api/sessions/{id}/resume"), json!({})).await;
         assert_eq!((s, b), (202, json!({})));
-        let (s, b) = e.post(&format!("/api/sessions/{id}/reweave"), Value::Null).await;
+        let (s, b) = e.post(&format!("/api/sessions/{id}/compact"), Value::Null).await;
         assert_eq!((s, b), (202, json!({})));
         e.wait_turn_ends(&id, 3).await;
 
@@ -2333,7 +2667,7 @@ mod tests {
             let (s, b) = e.get(path).await;
             assert_eq!((s, b["error"].as_str().unwrap()), (404, missing), "{path}");
         }
-        for path in ["stop", "resume", "reweave"] {
+        for path in ["stop", "resume", "compact", "reweave"] {
             let (s, b) = e.post(&format!("/api/sessions/s-nope/{path}"), json!({})).await;
             assert_eq!((s, b["error"].as_str().unwrap()), (404, missing), "{path}");
         }
@@ -3066,6 +3400,193 @@ mod tests {
         e.rt.shutdown().await;
     }
 
+    fn pct(s: &str) -> String {
+        s.bytes()
+            .map(|b| {
+                if b.is_ascii_alphanumeric() || b"-_.~/".contains(&b) {
+                    (b as char).to_string()
+                } else {
+                    format!("%{b:02X}")
+                }
+            })
+            .collect()
+    }
+
+    impl Env {
+        async fn upload(
+            &self,
+            workspace: &std::path::Path,
+            name: &str,
+            body: Vec<u8>,
+            ctype: Option<&str>,
+        ) -> (u16, Value) {
+            let url = format!("/api/uploads?workspace={}&name={}", pct(&workspace.to_string_lossy()), pct(name));
+            let mut r = self.rq(Method::POST, &url).body(body);
+            if let Some(c) = ctype {
+                r = r.header("content-type", c);
+            }
+            json_of(r.send().await.unwrap()).await
+        }
+    }
+
+    #[tokio::test]
+    async fn uploads_are_stored_named_safely_numbered_and_judged_like_a_new_session() {
+        let e = env(Script::new(|_, _| finish("done"))).await;
+        let canon = std::fs::canonicalize(e.dir.path()).unwrap();
+        let ws = canon.join("ws");
+        let (s, v) = e.upload(&ws, "report.csv", b"a,b\n1,2\n".to_vec(), None).await;
+        let stored = ws.join(".loom/uploads/report.csv");
+        assert_eq!(
+            (s, v["path"].as_str(), v["name"].as_str(), v["bytes"].as_u64(), v["mime"].as_str()),
+            (201, stored.to_str(), Some("report.csv"), Some(8), Some("text/csv")),
+            "{v}"
+        );
+        assert_eq!(std::fs::read(&stored).unwrap(), b"a,b\n1,2\n");
+        let (s, v) = e.upload(&ws, "report.csv", b"x".to_vec(), Some("application/json")).await;
+        assert_eq!(
+            (s, v["name"].as_str(), v["mime"].as_str()),
+            (201, Some("report-2.csv"), Some("application/json")),
+            "{v}"
+        );
+        let (s, v) = e.upload(&ws, "../../..//.ssh/id\\rsa", b"k".to_vec(), None).await;
+        assert_eq!((s, v["name"].as_str()), (201, Some("_.._..__.ssh_id_rsa")), "{v}");
+        assert!(ws.join(".loom/uploads/_.._..__.ssh_id_rsa").is_file());
+        let (s, v) = e.upload(&ws, "...", b"k".to_vec(), None).await;
+        assert_eq!(s, 400, "{v}");
+        let (s, v) = e.get(&format!("/api/uploads?workspace={}", pct(&ws.to_string_lossy()))).await;
+        assert_eq!(s, 405, "{v}");
+        let r = e.rq(Method::POST, "/api/uploads?name=x").body("x").send().await.unwrap();
+        assert_eq!(r.status().as_u16(), 400, "no workspace");
+        let r = e
+            .rq(Method::POST, &format!("/api/uploads?workspace={}", pct(&ws.to_string_lossy())))
+            .body("x")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 400, "no name");
+        let r = e.rq(Method::POST, "/api/uploads?workspace=rel&name=x").body("x").send().await.unwrap();
+        assert_eq!(r.status().as_u16(), 400, "relative workspace");
+
+        // The cap: exactly the cap is stored, one byte more is 413 and leaves nothing.
+        let cap = UPLOAD_MAX_BYTES;
+        let (s, v) = e.upload(&ws, "big.bin", vec![7u8; cap + 1], None).await;
+        assert_eq!(s, 413, "{v}");
+        assert!(v["error"].as_str().unwrap().contains("32 MiB"), "{v}");
+        assert!(!ws.join(".loom/uploads/big.bin").exists());
+        let (s, v) = e.upload(&ws, "big.bin", vec![7u8; cap], None).await;
+        assert_eq!((s, v["bytes"].as_u64()), (201, Some(cap as u64)), "{v}");
+
+        // Refused workspaces: missing is 404, inside the loom home 409, a file 409.
+        let (s, v) = e.upload(&canon.join("nope"), "x.txt", b"x".to_vec(), None).await;
+        assert_eq!(s, 404, "{v}");
+        assert!(!canon.join("nope").exists());
+        std::fs::create_dir_all(canon.join("home/keys")).unwrap();
+        let (s, v) = e.upload(&canon.join("home/keys"), "x.txt", b"x".to_vec(), None).await;
+        assert!(s == 409 && v["error"].as_str().unwrap().contains("inside the loom home"), "{s} {v}");
+        assert!(!canon.join("home/keys/.loom").exists());
+        std::fs::write(canon.join("plain.txt"), "p").unwrap();
+        let (s, _) = e.upload(&canon.join("plain.txt"), "x.txt", b"x".to_vec(), None).await;
+        assert_eq!(s, 409);
+        let r = e.http.post(e.url("/api/uploads?workspace=/x&name=y")).body("x").send().await.unwrap();
+        assert_eq!(r.status().as_u16(), 401);
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_image_attachment_is_named_in_the_record_and_served_only_when_a_record_names_it() {
+        let e = env(Script::new(|_, _| finish("done"))).await;
+        let canon = std::fs::canonicalize(e.dir.path()).unwrap();
+        let ws = canon.join("ws");
+        let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        png.extend_from_slice(&[0, 0, 0, 3, 0, 0, 0, 2, 8, 6, 0, 0, 0]);
+        let (s, up) = e.upload(&ws, "dot.png", png.clone(), Some("image/png")).await;
+        assert_eq!(s, 201, "{up}");
+        let path = up["path"].as_str().unwrap().to_string();
+        let (s, v) = e.post("/api/sessions", json!({"workspace": ws, "message": "look", "attachments": [path]})).await;
+        assert_eq!(s, 201, "{v}");
+        let id = v["id"].as_str().unwrap().to_string();
+        e.wait_turn_ends(&id, 1).await;
+        let first = e.records(&id).await.into_iter().find(|r| r["kind"] == "user_message").unwrap();
+        let image = first["images"][0].clone();
+        assert_eq!(
+            (image["mime"].as_str(), image["width"].as_u64(), image["height"].as_u64(), image["name"].as_str()),
+            (Some("image/png"), Some(3), Some(2), Some("dot.png")),
+            "{first}"
+        );
+        let blob = image["blob"].as_str().unwrap().to_string();
+
+        let r = e.rq(Method::GET, &format!("/api/images/{blob}")).send().await.unwrap();
+        assert_eq!(r.status(), 200);
+        assert_eq!(r.headers()["content-type"], "image/png");
+        assert_eq!(r.headers()["content-disposition"], "inline");
+        assert_eq!(r.headers()["cache-control"], "private, max-age=31536000, immutable");
+        assert_eq!(r.bytes().await.unwrap().to_vec(), png);
+
+        // A stored blob that no record names (tool output, say), a handle, a short id and junk are all 404.
+        let other = e.rt.blobs().put_bytes(b"secret tool output").unwrap().id.as_str().to_string();
+        for path in [other.as_str(), &blob[..16], "out:abcdef01", "..%2f..%2fetc", &"0".repeat(64)] {
+            let (s, b) = e.get(&format!("/api/images/{path}")).await;
+            assert_eq!(s, 404, "{path}: {b}");
+        }
+    }
+
+    #[tokio::test]
+    async fn attachments_ride_a_message_and_a_new_session_and_uploads_are_readable_in_the_files_routes() {
+        let e = env(Script::new(|_, _| finish("done"))).await;
+        let canon = std::fs::canonicalize(e.dir.path()).unwrap();
+        let ws = canon.join("ws");
+        let (_, up) = e.upload(&ws, "report.csv", b"a,b\n1,2\n".to_vec(), None).await;
+        let path = up["path"].as_str().unwrap().to_string();
+        std::fs::write(ws.join("plain.txt"), "p").unwrap();
+        let (s, v) = e.post("/api/sessions", json!({"workspace": ws, "attachments": [path]})).await;
+        assert_eq!(s, 201, "{v}");
+        let id = v["id"].as_str().unwrap().to_string();
+        e.wait_turn_ends(&id, 1).await;
+        let first = e.records(&id).await.into_iter().find(|r| r["kind"] == "user_message").unwrap();
+        let text = first["text"].as_str().unwrap().to_string();
+        assert!(text.starts_with("Attached files (saved read-only; read them with `read`):\n"), "{text}");
+        assert!(text.contains(&format!("- {path} (8 B, text/csv)")), "{text}");
+
+        let (s, _) = e.post(&format!("/api/sessions/{id}/messages"), json!({"text": "", "attachments": [path]})).await;
+        assert_eq!(s, 202);
+        e.wait_turn_ends(&id, 2).await;
+        let (s, v) = e.post(&format!("/api/sessions/{id}/messages"), json!({"text": "hi"})).await;
+        assert_eq!(s, 202, "{v}");
+        let (s, v) = e.post(&format!("/api/sessions/{id}/messages"), json!({"text": ""})).await;
+        assert_eq!((s, v["error"].as_str()), (409, Some("Write a message to send.")), "{v}");
+        let bad = ws.join("plain.txt").to_string_lossy().into_owned();
+        let (s, v) = e.post(&format!("/api/sessions/{id}/messages"), json!({"text": "x", "attachments": [bad]})).await;
+        assert_eq!(
+            (s, v["error"].as_str()),
+            (
+                400,
+                Some(
+                    format!("Attach files with POST /api/uploads first; {bad} is not an upload of this workspace.")
+                        .as_str()
+                )
+            ),
+            "{v}"
+        );
+        let (s, _) = e.post("/api/sessions", json!({"workspace": ws, "attachments": [bad]})).await;
+        assert_eq!(s, 400);
+        let (s, _) = e.post(&format!("/api/sessions/{id}/messages"), json!({"text": "x", "files": []})).await;
+        assert_eq!(s, 400, "unknown fields stay refused");
+
+        // Files routes: the uploads folder, and nothing else under .loom.
+        let files = |q: &str| format!("/api/sessions/{id}/files{q}");
+        let (s, v) = e.get(&files("?path=.loom/uploads")).await;
+        assert_eq!(s, 200, "{v}");
+        assert_eq!(v["entries"][0]["name"], "report.csv");
+        let (s, v) = e.get(&format!("/api/sessions/{id}/files/lines?path=.loom/uploads/report.csv")).await;
+        assert_eq!((s, v["text"].as_str()), (200, Some("a,b\n1,2\n")), "{v}");
+        let (s, v) = e.get(&files("?path=.loom")).await;
+        assert_eq!(s, 409, "{v}");
+        let (_, root) = e.get(&files("")).await;
+        let loom = root["entries"].as_array().unwrap().iter().find(|x| x["name"] == ".loom").unwrap().clone();
+        assert!(loom["note"].is_string(), "{loom}");
+        e.rt.shutdown().await;
+    }
+
     #[tokio::test]
     async fn blob_lines_defaults_end_relative_to_start() {
         let e = env(Script::new(|_, _| finish("x"))).await;
@@ -3126,6 +3647,79 @@ mod tests {
         let deltas: Vec<&str> =
             events.iter().filter(|v| v["type"] == "delta").filter_map(|v| v["delta"]["text"].as_str()).collect();
         assert_eq!(deltas, vec!["fresh"]);
+        e.rt.shutdown().await;
+    }
+
+    /// A `/bin/sh` MCP server: answers by the id it reads, so the script needs no state.
+    fn fake_mcp(dir: &std::path::Path) -> String {
+        let path = dir.join("fake-mcp.sh");
+        std::fs::write(
+            &path,
+            r#"while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"fake","version":"1.0"}}}\n' "$id";;
+    *'"method":"tools/list"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","description":"Echo.","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":true}}]}}\n' "$id";;
+    *'"method":"tools/call"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"pong"}]}}\n' "$id";;
+  esac
+done
+"#,
+        )
+        .unwrap();
+        path.display().to_string()
+    }
+
+    fn mcp_cfg(script: String) -> impl FnOnce(&mut Config) {
+        move |c| {
+            let s =
+                loom_core::config::McpServerCfg { command: Some(vec!["/bin/sh".into(), script]), ..Default::default() };
+            c.mcp.servers.insert("fake".into(), s);
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_routes_without_servers_are_empty_and_refuse_unknown_ones() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let id = e.create("go").await;
+        let (s, b) = e.get(&format!("/api/sessions/{id}/mcp")).await;
+        assert_eq!((s, b), (200, json!([])));
+        let (s, b) = e.get("/api/sessions/s-nope/mcp").await;
+        assert_eq!((s, b["error"].as_str().unwrap()), (404, "There is no session s-nope."));
+        let (s, b) = e.post("/api/mcp/nope/check", json!({"workspace": e.ws})).await;
+        assert_eq!(s, 404, "{b}");
+        assert_eq!(b["error"], "There is no MCP server \"nope\" in the configuration.");
+        let (s, _) = e.post("/api/mcp/nope/check", json!({})).await;
+        assert_eq!(s, 400);
+        let (s, _) = e.post("/api/mcp/nope/check", json!({"workspace": "relative"})).await;
+        assert_eq!(s, 400);
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn mcp_session_route_lists_the_servers_of_a_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = fake_mcp(tmp.path());
+        let e = env_cfg(Script::new(|_, _| finish("ok")), mcp_cfg(script)).await;
+        let id = e.create("go").await;
+        let (s, b) = e.get(&format!("/api/sessions/{id}/mcp")).await;
+        assert_eq!(s, 200, "{b}");
+        assert_eq!(b[0]["server"], "fake");
+        assert_eq!(b[0]["transport"], "stdio");
+        assert_eq!(b[0]["tools"], json!(["mcp__fake__echo"]));
+        assert!(b[0]["error"].is_null());
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn mcp_check_route_lists_the_tools_of_a_server() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = fake_mcp(tmp.path());
+        let e = env_cfg(Script::new(|_, _| finish("ok")), mcp_cfg(script)).await;
+        let (s, b) = e.post("/api/mcp/fake/check", json!({"workspace": e.ws})).await;
+        assert_eq!(s, 200, "{b}");
+        assert_eq!(b["server_name"], "fake");
+        assert_eq!(b["tools"][0]["name"], "echo");
+        assert_eq!(b["tools"][0]["read_only_hint"], true);
         e.rt.shutdown().await;
     }
 }

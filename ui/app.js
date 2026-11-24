@@ -38,12 +38,17 @@ const S = {
   actionState: new Map(),
   stopAsked: new Set(), // sessions this tab asked to stop: their ending is not announced
   notes: { pending: [], shown: new Map(), timer: 0 },
-  requests: { ledger: 0, window: 0, net: 0, inbox: 0, status: 0, models: 0 },
+  requests: { ledger: 0, window: 0, net: 0, inbox: 0, status: 0, models: 0, mcp: 0, exch: 0, target: 0 },
+  exch: { session: null, list: [], error: null, loaded: false }, // the open mission's captured exchanges (C1), from the daemon
+  exFilter: { host: "all", status: "all" },
+  exview: null, // the exchange open in its viewer
+  targets: { supported: null, list: [], error: null }, // null until asked; false when the daemon has no targets (404)
+  tp: null, // the target page: its configuration, nodes, filters and the node chosen
   inboxRevision: 0,
   inboxTouched: new Map(), // item id -> {rev, entry|null}: what inbox records changed, kept over an older snapshot
   sinceSeq: null,
   jumpFrom: null, // the last record seq held when the operator scrolled away from the end (the count behind Jump to latest)
-  ask: null, // an inline confirmation waiting in the inspector: {kind:"fold"} | {kind:"lead", lead, value} | {kind:"role", lead, role, value}
+  ask: null, // an inline confirmation waiting in the inspector: {kind:"compact"} | {kind:"lead", lead, value} | {kind:"role", lead, role, value}
   headAsk: null, // an inline confirmation waiting in the session header: {kind:"stop"|"archive", session}
   section: "chat",
   profiles: null, // GET /api/models for the model seat: {default_model, models: [...]} (null until fetched)
@@ -54,6 +59,9 @@ const S = {
   attempts: 0, // failed attempts to open the event stream in a row
   workState: new Map(), // work group key -> true (operator opened it) | false (operator folded it)
   openGroups: new Set(), // work groups kept expanded while scrolled away from the end
+  groupPages: new Map(), // work group key -> pages of rows revealed (default 1; a page is C.GROUP_PAGE rows)
+  openRuns: new Set(), // keys of collapsed runs of repeated calls that the operator opened
+  runPages: new Map(), // run key -> pages of its calls revealed
   expandAll: false,
   details: false,
   activity: new Map(), // session id -> {seq, ts} of the latest record seen on the stream
@@ -83,6 +91,7 @@ const S = {
   win: { data: null, error: null, stale: true, hideFolded: false, from: null, notesOpen: false },
   rules: null, // the rules form of the open session: {session, box, note, hint, lists, reason, asking, shown}
   net: [],
+  mcp: { id: null, list: null }, // the open session's MCP servers (GET /api/sessions/{id}/mcp); list null = nothing to show or no route
   netError: null,
   viewer: null,
   copyOnSelect: false, // the "Copy on select" preference (localStorage, off until turned on)
@@ -182,6 +191,32 @@ function setDraft(key, text, origin) {
   }
 }
 
+/** Every `out:<hex>` in the text nodes under `root` becomes a button that opens that stored output. */
+function linkOutKeys(root) {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  const nodes = [];
+  for (let n = walker.nextNode(); n; n = walker.nextNode()) if (n.nodeValue.includes("out:")) nodes.push(n);
+  for (const node of nodes) {
+    const parts = C.splitOutKeys(node.nodeValue);
+    if (!parts.some((p) => p.key)) continue;
+    node.replaceWith(...parts.map((p) => (p.key ? outKeyButton(p.key) : document.createTextNode(p.text))));
+  }
+  return root;
+}
+
+function outKeyButton(key) {
+  const b = btn("out:" + key, "link mono keylink", (e) => openViewer(key, "Output out:" + key, null, {}, e.currentTarget));
+  b.title = "Open the stored output out:" + key;
+  return b;
+}
+
+/** Monospace text whose `out:` keys are buttons. */
+function keyedText(text, cls = "txt out") {
+  const box = el("pre", cls);
+  box.append(...C.splitOutKeys(text).map((p) => (p.key ? outKeyButton(p.key) : document.createTextNode(p.text))));
+  return box;
+}
+
 function prose(text) {
   const root = el("div", "prose");
   const inline = (target, parts) => {
@@ -268,7 +303,14 @@ function lost() {
   streamStopped = true;
   if (streamCtl) streamCtl.abort();
   keepSecret(null);
-  document.body.replaceChildren(el("p", "pad", C.LOST_TOKEN));
+  // A page of its own, not a bare line: what happened, and the one command that opens a signed-in page.
+  const card = add(el("main", "lost-card"),
+    el("h1", "", "This tab is not signed in"),
+    el("p", "", "Its sign-in lasts as long as the tab, and it has ended (or the daemon was restarted with a new token). Nothing in your missions changed."),
+    add(el("p", ""), document.createTextNode("Run "), el("code", "", "loom open"), document.createTextNode(" in a terminal: it opens a signed-in page.")));
+  card.setAttribute("aria-label", C.LOST_TOKEN);
+  document.body.replaceChildren(add(el("div", "lost-page"), card));
+  document.title = "loom · not signed in";
 }
 
 async function api(method, path, body) {
@@ -364,8 +406,11 @@ function persistActivity(session) {
 function identityEl(identity) {
   const line = el("span", "ident");
   const [profile, role, tail] = identity.parts;
-  const rest = identity.waiting ? role : `${role} · ${tail}`;
-  add(line, add(el("span", "ident-line"), el("span", "ident-profile", profile), el("span", "ident-text", " · " + rest)));
+  const rest = identity.waiting || !tail ? role : `${role} · ${tail}`;
+  const head = add(el("span", "ident-line"), el("span", "ident-profile", profile), el("span", "ident-text", " · " + rest));
+  // An unknown age is left out of the line; the tooltip says why there is none.
+  if (!identity.known && !identity.waiting) head.title = "Last activity: not loaded yet (open the mission to load its records)";
+  add(line, head);
   if (identity.waiting) {
     const w = identity.waiting;
     const note = add(el("span", "ident-wait tone-" + (w.tone || "quiet")), icon(w.icon), el("span", "ident-text", w.text));
@@ -511,6 +556,8 @@ function route() {
   }
   if (r.view === "inbox") return showInbox();
   if (r.view === "new") return showNew();
+  if (r.view === "targets") return showTargets();
+  if (r.view === "target") return showTargetPage(r.name);
   setView("empty");
 }
 
@@ -527,6 +574,8 @@ function setView(v) {
   $("view-session").hidden = v !== "session";
   $("view-inbox").hidden = v !== "inbox";
   $("view-new").hidden = v !== "new";
+  $("view-targets").hidden = v !== "targets";
+  $("view-target").hidden = v !== "target";
   if (v === "session") {
     markRead();
     if (was !== "session" && !matchMedia("(max-width: 1099px)").matches && S.inspectorPref && !document.body.classList.contains("show-right")) {
@@ -565,12 +614,17 @@ function openSession(id) {
   S.r = { from: 0, end: 0, nodes: new Map(), items: [], forced: new Set(), fresh: true, landed: false };
   S.workState = new Map();
   S.openGroups = new Set();
+  S.groupPages = new Map();
+  S.openRuns = new Set();
+  S.runPages = new Map();
   S.scrollAt = {};
   S.seat = null;
   S.follow = true;
   S.goalOpen = false;
   S.net = [];
   S.netError = null;
+  S.exch = { session: id, list: [], error: null, loaded: false };
+  S.exFilter = { host: "all", status: "all" };
   S.liveEl = null;
   S.win = { ...S.win, data: null, error: null, stale: true, from: null, notesOpen: false };
   S.ledger = { mission: null, model: null, state: null, error: null, stale: true };
@@ -594,18 +648,62 @@ function openSession(id) {
   S.agentsActive = null;
   $("msg").value = C.getDraft(S.drafts, "message:" + id);
   $("msg").dataset.draftKey = "message:" + id;
+  renderChips(attachCtx.composer);
   want("header", "blocks", "live", "right", "overview");
   loadProfiles();
+  S.queued = { session: null, items: [], error: "", editing: null, editText: "", busy: new Set() };
+  renderQueue();
+  loadQueued();
   loadRecords(S.rec, 0);
   loadNet();
   loadLedger();
   if (S.tab !== "ledger") loadTab();
 }
 
+/**
+ * Loads the tail of a long session first: the records after the latest compaction (or the last 1,000), then whatever arrived since by
+ * `after`. Records before them load on "Load earlier records" or when Find asks. A daemon without `before` paging is read from the start.
+ */
+async function loadTail(store) {
+  const page = await api("GET", C.recordsUrl(store.session, null, C.TAIL_LIMIT, C.TAIL_BEFORE));
+  if (S.rec !== store) return;
+  if (!C.pagesBackward(page)) {
+    // An older daemon ignores `before` and answers the first page: apply it and let the forward loop go on.
+    C.applyRecords(store, page.records);
+    for (const record of page.records) noteActivity(store.session, record);
+    store.prevBefore = null;
+    return;
+  }
+  let recs = page.records;
+  let prev = page.prev_before ?? null;
+  for (let more = C.tailNeedsMore(recs, prev); more; more = C.tailNeedsMore(recs, prev)) {
+    const earlier = await api("GET", C.recordsUrl(store.session, null, more.limit, more.before));
+    if (S.rec !== store) return;
+    recs = [...earlier.records, ...recs];
+    prev = earlier.prev_before ?? null;
+  }
+  let prelude = [];
+  if (recs.length && recs[0].seq > 0) {
+    // The session's own first records carry the start facts of the Session tab.
+    const head = await api("GET", C.recordsUrl(store.session, null, 3));
+    if (S.rec !== store) return;
+    prelude = head.records || [];
+  }
+  C.startTailStore(store, recs, prev, prelude);
+  for (const record of recs) noteActivity(store.session, record);
+}
+
 async function loadRecords(store, tries) {
   if (store.loading) return;
   store.loading = true;
   try {
+    if (!store.tailed) {
+      await loadTail(store);
+      if (S.rec !== store) return;
+      store.tailed = true;
+      updateDelivery(store.session);
+      want("blocks", "header", "overview", "list");
+    }
     let after = C.lastSeq(store);
     for (;;) {
       const page = await api("GET", C.recordsUrl(store.session, after, 500));
@@ -640,6 +738,44 @@ async function loadRecords(store, tries) {
   store.loading = false;
   want("header", "overview");
   if (S.rec === store && C.missing(store) && tries < 5) loadRecords(store, tries + 1);
+}
+
+/**
+ * Load the records before the loaded ones: one page, or every page with `all` (Find). The blocks are built again with the earlier ones in
+ * front and the transcript keeps the reader where they were.
+ */
+async function loadEarlier(store, { all = false } = {}) {
+  if (store.earlierLoading) return store.earlierLoading;
+  if (!C.hasEarlier(store)) return;
+  const run = (async () => {
+    $("btn-earlier").disabled = true;
+    $("btn-earlier").textContent = "Loading earlier records…";
+    try {
+      do {
+        const req = C.earlierRequest(store);
+        const page = await api("GET", C.recordsUrl(store.session, null, req.limit, req.before));
+        if (S.rec !== store) return;
+        const scroller = chatScroller();
+        const bottom = scroller.scrollHeight - scroller.scrollTop;
+        const added = C.prependRecords(store, page.records, page.prev_before ?? null);
+        for (const entry of S.r.nodes.values()) entry.node.remove();
+        S.r.nodes.clear();
+        S.r.from = C.earlierFrom(added);
+        S.r.forced.clear();
+        syncChat();
+        if (!S.follow) scroller.scrollTop = scroller.scrollHeight - bottom;
+        want("overview");
+      } while (all && C.hasEarlier(store));
+    } catch (e) {
+      toast("Could not load earlier records: " + e.message);
+    } finally {
+      store.earlierLoading = null;
+      $("btn-earlier").disabled = false;
+      if (S.rec === store) syncChat();
+    }
+  })();
+  store.earlierLoading = run;
+  return run;
 }
 
 /** The open session is being read: its watermark moves to the latest record, so its row is not "new". */
@@ -715,6 +851,7 @@ function ctx() {
 
 function handleEvent(ev) {
   S.lastUpdate = Date.now();
+  if (ev.type === "queued") { if (ev.session === S.openId) loadQueued(); return; }
   if (ev.type === "record" && ev.record) noteActivity(ev.session, ev.record);
   for (const f of C.planEvent(ev, ctx())) {
     switch (f.fx) {
@@ -724,6 +861,7 @@ function handleEvent(ev) {
         C.applySessionEvent(S.sessions, f.info);
         if (was) announceEnding(was, f.info);
         want("list", "header", "overview");
+        if (f.info && f.info.id === S.openId && S.tab === "session") loadMcp();
         // A model switched, a choice made, or an agent started in the mission the Models tab shows.
         if (S.tab === "models" && S.models.view && f.info && f.info.mission === S.models.view.mission) loadModels();
         break;
@@ -734,6 +872,7 @@ function handleEvent(ev) {
         C.applyStatus(S.sessions, f.session, f.status);
         if (was) announceEnding(was, { ...was, status: f.status });
         want("list", "header", "overview");
+        if (f.session === S.openId && S.tab === "session") loadMcp();
         break;
       }
       case "header":
@@ -766,6 +905,7 @@ function handleEvent(ev) {
       case "apply_record":
         if (C.applyRecord(S.rec, f.record)) {
           want("blocks", "live", "header", "overview");
+          if (f.record.kind === "exchange") want("right");
           updateDelivery(ev.session);
           if (!S.rec.loading && C.missing(S.rec)) loadRecords(S.rec, 0);
         }
@@ -785,6 +925,9 @@ function handleEvent(ev) {
       case "net":
         C.applyNet(S.net, f.entry);
         if (S.tab === "network") want("right");
+        break;
+      case "target_changed":
+        targetChanged(f.name);
         break;
       case "notice":
         notice(f.text);
@@ -1009,7 +1152,7 @@ function renderStats() {
 function renderCaption(info, stats) {
   const node = $("s-caption");
   if (!info || S.view !== "session") { node.hidden = true; return; }
-  const cap = C.composerCaption({ line: progressLineFor(info), stats: stats || C.sessionStats(info, S.rec ? S.rec.blocks : []) });
+  const cap = C.composerCaption({ line: progressLineFor(info), stats: stats || C.sessionStats(info, S.rec ? S.rec.blocks : []), queued: queuedCount() });
   const text = $("s-caption-text");
   if (text.textContent !== cap.text) text.textContent = cap.text;
   node.setAttribute("aria-label", cap.label);
@@ -1028,10 +1171,13 @@ function renderRun(info) {
   // A running session with no new record for a while says so, as a fact and in neutral words; nothing while the age is unknown or the stream is down.
   const quiet = live && run.running ? C.quietFor(info, S.activity.get(info.id), Date.now(), S.connectedSince) : null;
   const text = live ? run.text + (quiet ? " · " + quiet.text : "") : "Last known · " + run.text;
+  // The phone bar is narrow: it says the state alone ("Waiting on jobs"), the whole line is its tooltip.
+  const shortText = live ? run.short : "Last known · " + run.short;
   for (const node of [$("s-run"), $("bar-run")]) {
-    node.title = quiet ? quiet.tip : "";
-    node.className = (node.id === "s-run" ? "id-chip id-run" : "id-chip id-run bar-chip") + (run.tone ? " tone-" + run.tone : "");
-    chipContent(node, icon(run.icon), document.createTextNode(text));
+    const bar = node.id === "bar-run";
+    node.title = quiet ? quiet.tip : bar ? text : "";
+    node.className = (bar ? "id-chip id-run bar-chip" : "id-chip id-run") + (run.tone ? " tone-" + run.tone : "");
+    chipContent(node, icon(run.icon), document.createTextNode(bar ? shortText : text));
     node.hidden = node.id === "bar-run" && S.view !== "session";
   }
   if (run.running && live && !S.runTimer) S.runTimer = setInterval(() => {
@@ -1123,6 +1269,10 @@ function renderIdentity(info) {
   const kids = [document.createTextNode(m.text)];
   if (m.warn) kids.push(add(el("span", "id-warn"), icon(m.warn.icon), document.createTextNode(m.warn.word)));
   chipContent(model, ...kids);
+  const tgt = S.rec && S.rec.start && S.rec.start.target;
+  const tchip = $("s-target");
+  tchip.hidden = !tgt;
+  if (tgt) { tchip.textContent = "target " + tgt.name; tchip.setAttribute("href", C.targetHash(tgt.name)); tchip.title = "Open the target's page"; }
   $("s-role").textContent = chips.role.text;
   $("s-role").title = chips.role.tip;
   const id = $("s-id");
@@ -1499,13 +1649,17 @@ function renderHeader() {
   const openClaims = (S.ledger.state?.claims || []).filter(claim => claim.status === "open").length;
   $("evidence-count").textContent = `${openClaims} open`;
   $("evidence-count").hidden = openClaims === 0;
-  const running = [...S.sessions.byId.values()].filter(s => s.mission === info.mission && s.status?.phase === "running").length;
+  // Agents only, as the sidebar counts them: the lead's own state is the run chip in the header.
+  const running = [...S.sessions.byId.values()].filter(s => s.mission === info.mission && s.parent && s.status?.phase === "running").length;
   $("agents-count").textContent = `${running} running`;
+  $("agents-count").title = `${C.count(running, "agent")} running (the lead is not counted)`;
   $("agents-count").hidden = running === 0;
   renderProgress(info);
   renderStats();
   const a = C.sessionActions(info);
   $("b-stop").hidden = !a.stop;
+  // While it runs, Stop also sits beside Send, where the eyes are when it goes wrong; it asks in the header like the header button.
+  $("c-stop").hidden = !(a.stop && a.running && a.send);
   $("b-resume").hidden = !a.resume;
   $("b-archive").hidden = !a.archive;
   $("b-unarchive").hidden = !a.unarchive;
@@ -1524,11 +1678,14 @@ function renderHeader() {
   $("agent-go-lead").dataset.lead = leadSession ? leadSession.id : "";
   const closed = $("closed-note");
   closed.hidden = !!info.parent || a.send;
-  closed.textContent = info.archived ? "This session is archived; unarchive it to send messages." : "This session has ended.";
+  closed.textContent = info.archived ? "This session is archived; unarchive it to send messages." : "This session has ended. Its record, ledger and files stay as they are.";
+  // An ended session's model no longer changes: the seat would only offer a choice that cannot be made.
+  const seatLabel = $("model-seat").closest(".seat");
+  if (seatLabel) seatLabel.hidden = !a.send && !info.archived && info.status?.phase === "ended";
   // A message is not an answer: say so while a question of this mission waits on the operator.
   const paused = missionEntries().some(entry => entry.item.blocking);
   const lead = C.rootNoun(info) === "lead";
-  const help = C.composerHelp({ coarse: COARSE.matches, paused, running: a.running, lead });
+  const help = C.composerHelp({ coarse: COARSE.matches, paused, running: a.running && lead, lead, mac: MAC });
   $("composer-help").textContent = [help.keys, help.note].filter(Boolean).join(" ");
   $("composer-help").hidden = !a.send;
   $("msg").enterKeyHint = COARSE.matches ? "enter" : "send";
@@ -1548,14 +1705,25 @@ function renderHeader() {
   $("composer-recipient").textContent = a.send ? `Message to ${lead ? "the lead of " : ""}${info.title || info.id}` : "";
   const sending = S.sending.has(info.id);
   const message = S.messageState.get(info.id);
-  const pendingReceipt = message?.accepted && message.recordedSeq === undefined && message.state !== "failed";
+  // A message held for after the turn is on disk and listed above; it must not lock Send until the turn ends.
+  const pendingReceipt = message?.accepted && message.recordedSeq === undefined && message.state !== "failed" && message.state !== "held";
   $("msg").disabled = sending;
-  $("send").disabled = sending || pendingReceipt || !S.rec?.initialComplete || !$("msg").value.trim();
+  const att = attachState("message:" + info.id);
+  $("attach-bar").hidden = !a.send;
+  $("attach-btn").hidden = !a.send;
+  $("attach-btn").disabled = sending;
+  $("send").disabled = sending || pendingReceipt || !S.rec?.initialComplete || (!$("msg").value.trim() && !att.paths.length) || att.busy || att.failed;
   // The button is an icon; its accessible name says the state, and send-state (live) says it in words.
   const sendLabel = sending ? "Sending…" : pendingReceipt ? "Awaiting receipt…" : "Send";
   $("send").setAttribute("aria-label", sendLabel);
-  $("send").title = sendLabel === "Send" ? (COARSE.matches ? "Send" : "Send (Enter)") : sendLabel;
+  $("send").title = att.busy ? "Waiting for the uploads to finish" : att.failed ? "Remove the attachment that failed to upload first" : sendLabel === "Send" ? (COARSE.matches ? "Send" : "Send (Enter)") : sendLabel;
   $("send").setAttribute("aria-busy", String(sending || !!pendingReceipt));
+  const canQueue = a.send && a.running && lead;
+  $("send-more").hidden = !canQueue;
+  $("send-more").disabled = $("send").disabled;
+  if (!canQueue) closeSendMenu();
+  if (canQueue && !COARSE.matches && sendLabel === "Send" && !att.busy && !att.failed) $("send").title = "Send now (Enter) · Queue for after this turn (" + (MAC ? "⌥Enter" : "Alt+Enter") + ")";
+  renderQueue();
   const question = renderSeat(info);
   $("send-state").textContent = question ? "" : C.sendStateText({ loaded: !!S.rec?.initialComplete, seat: S.seatNote.get(info.id), message });
   updateChildBlocker();
@@ -1582,15 +1750,20 @@ function renderOverview() {
   if (S.section !== "overview" && S.section !== "evidence") return;
   const panel = $("mission-overview");
   if (!panel.firstElementChild) {
-    const main = add(el("div", "overview-main"), el("div", "overview-decisions"), el("section", "overview-section overview-plan"), el("section", "overview-section overview-changes"));
+    const main = add(el("div", "overview-main"), el("div", "overview-decisions"), el("section", "overview-section overview-plan"), el("section", "overview-section overview-files"), el("section", "overview-section overview-changes"));
     const rail = el("aside", "overview-rail");
     rail.setAttribute("aria-label", "Mission standing");
     panel.append(add(el("div", "overview-layout"), main, rail));
   }
   const entries = missionEntries();
   const model = C.missionOverview(S.rec.records.values(), S.ledger.state, entries, S.sinceSeq);
+  // A long session loads from the end: what the overview reads is the loaded records, and it says so.
+  let partial = panel.querySelector(".overview-partial");
+  if (C.hasEarlier(S.rec)) {
+    if (!partial) { partial = el("p", "dim overview-partial", C.OVERVIEW_PARTIAL_WORDS); panel.querySelector(".overview-main").prepend(partial); }
+  } else if (partial) partial.remove();
   reconcileInbox(panel.querySelector(".overview-decisions"), entries.filter(e => e.item.item_kind !== "finished"), "overview");
-  for (const [selector, build] of [[".overview-plan", planSection], [".overview-changes", changesSection], [".overview-rail", railSection]]) {
+  for (const [selector, build] of [[".overview-plan", planSection], [".overview-files", filesSection], [".overview-changes", changesSection], [".overview-rail", railSection]]) {
     const box = panel.querySelector(selector);
     const body = build(model);
     preserveFocus(box, () => box.replaceChildren(body));
@@ -1656,6 +1829,44 @@ function changesSection(model) {
   group(recent.fresh.length && recent.earlier.length ? "Earlier" : null, recent.earlier);
   if (recent.total > recent.shown) body.append(el("p", "dim fineprint", `Showing the latest ${recent.shown} of ${C.num(recent.total)} recorded changes.`));
   body.append(el("p", "dim fineprint", "Activity is derived from recorded events. Completed steps and matching quotes do not by themselves establish a claim."));
+  return body;
+}
+
+// Files this session changed through its edit and write tools: what a reviewer looks at first. Each row jumps to the latest
+// change in the chat and opens the file as it is now. Commands and agents can change files too; the note says so.
+function filesSection() {
+  const body = document.createDocumentFragment();
+  const info = S.sessions.byId.get(S.openId);
+  const rows = S.rec && !S.rec.loading ? C.fileChanges(S.rec.blocks, info ? info.workspace : "") : [];
+  if (!rows.length) return body; // the section is empty, and an empty section is not shown
+  const added = rows.reduce((n, r) => n + r.added, 0), removed = rows.reduce((n, r) => n + r.removed, 0);
+  const total = el("span", "diffstat");
+  add(total, el("span", "ds-add", "+" + C.num(added)), el("span", "ds-del", "−" + C.num(removed)));
+  total.title = `${C.count(added, "line")} added, ${C.count(removed, "line")} removed, from the recorded diffs`;
+  body.append(heading("h2", "Files changed", add(el("span", "dim files-count", C.count(rows.length, "file") + " · "), total)));
+  const list = el("ul", "file-list");
+  for (const r of rows.slice(0, 50)) {
+    const shown = r.rel !== null && r.rel !== "" ? r.rel : r.path;
+    const jump = btn("", "link mono file-jump", () => jumpToRecord(r.lastSeq));
+    jump.textContent = shown;
+    jump.title = `Show the latest change to ${shown} in the chat`;
+    jump.dataset.focusKey = "file:" + r.path;
+    const stat = el("span", "diffstat");
+    if (r.created) add(stat, el("span", "ds-new", "new"));
+    if (r.added || r.removed) add(stat, el("span", "ds-add", "+" + C.num(r.added)), el("span", "ds-del", "−" + C.num(r.removed)));
+    const meta = el("span", "dim", r.edits > 1 ? `${r.edits} edits` : "");
+    const li = add(el("li", "file-item"), jump, stat, meta);
+    if (r.rel !== null) {
+      const open = btn("Open", "small ghost", (e) => showFiles(e.currentTarget, r.rel));
+      open.title = "Show the file as it is in the workspace now";
+      open.dataset.focusKey = "file-open:" + r.path;
+      li.append(open);
+    }
+    list.append(li);
+  }
+  body.append(list);
+  if (rows.length > 50) body.append(el("p", "dim fineprint", `Showing the 50 most recent of ${C.num(rows.length)} files.`));
+  body.append(el("p", "dim fineprint", "From this session's edit and write calls. Changes made by shell commands or by agents are not listed here."));
   return body;
 }
 
@@ -1976,7 +2187,7 @@ function agentRow(row, active) {
   const text = el("span", "agent-text");
   text.append(el("span", "agent-title", row.title));
   const meta = [row.roleLine, `step ${C.num(row.step)}`];
-  meta.push(row.ageText ? `last record ${row.ageText}` : "last record not loaded");
+  if (row.ageText) meta.push(`last record ${row.ageText}`);
   if (row.generated) meta.push(row.generated);
   text.append(el("span", "dim agent-meta", meta.join(" · ")));
   if (row.crumbs.length) text.append(el("span", "dim agent-meta", "Under " + row.crumbs.join(" › ")));
@@ -2009,14 +2220,24 @@ function renderAgents() {
   const refresh = btn(score && score.loading ? "Refreshing…" : "Refresh scores", "small", () => loadScore(true));
   refresh.dataset.focusKey = "agents-refresh";
   if (score && score.loading) refresh.setAttribute("aria-disabled", "true");
-  frag.append(heading("h2", "Agents", el("span", "dim", `${C.num(model.total)} in this mission${model.running ? " · " + model.badge : ""}`), refresh));
+  frag.append(heading("h2", "Agents", el("span", "dim", model.summary), refresh));
   const note = score && score.error ? el("p", "error", "Scores could not be read: " + score.error)
     : score && score.lastMs && !score.view ? el("p", "dim", "Reading the scores…")
-    : score && score.view ? el("p", "dim", `Scores read ${ago(score.lastMs)}. They refresh when this tab opens, on Refresh, and at most every 2 minutes while an agent runs.`) : null;
+    : null;
   if (note) frag.append(note);
   if (score && score.view) {
     const total = score.view.total;
-    frag.append(add(el("section", "agents-total"), el("h3", "", score.view.label), el("p", "", `${C.num(total.steps)} steps · ${total.text}${total.unrecorded ? " · verifier counts not recorded for some logs" : ""}`), el("p", "dim fineprint", score.view.fineprint)));
+    // A grid of numbers: the steps, then every count that is not zero. The sentence form is the section's label.
+    const grid = el("dl", "score-grid");
+    const cell = (value, label, tone = "") => add(grid, add(el("div", "score-cell" + (tone ? " tone-" + tone : "")), el("dt", "", label), el("dd", "", C.num(value))));
+    cell(total.steps, "steps");
+    for (const c of total.cells) if (c.value > 0) cell(c.value, c.label, /malformed|refusal|reject/.test(c.key) ? "warn" : "");
+    const section = add(el("section", "agents-total"), add(el("h3", "", score.view.label), el("span", "dim score-age", ` · read ${ago(score.lastMs)}`)), grid);
+    section.setAttribute("aria-label", `${score.view.label}: ${C.num(total.steps)} steps · ${total.text}`);
+    section.title = "Scores refresh when this tab opens, on Refresh, and at most every 2 minutes while an agent runs.";
+    if (total.unrecorded) section.append(el("p", "dim fineprint", "Verifier counts were not recorded for some logs."));
+    section.append(el("p", "dim fineprint", score.view.fineprint));
+    frag.append(section);
   }
   if (!model.groups.length) frag.append(el("p", "dim", "No agents in this mission yet."));
   const first = model.groups[0] && model.groups[0].rows[0];
@@ -2091,8 +2312,32 @@ function renderProgress(info) {
   node.dataset.sig = sig;
   node.hidden = !line;
   renderCaption(info);
-  if (!line) { node.replaceChildren(); return; }
-  node.replaceChildren(...line.parts.map(p => el("span", "progress-part progress-" + p.key, p.text)), el("span", "sr-only", line.parts.some(p => p.key === "budget") ? ". The budget is a limit, not a measure of progress." : ""));
+  if (!line) { node.replaceChildren(); renderMiniPlan(info); return; }
+  const parts = line.parts.map(p => {
+    if (p.key !== "plan") return el("span", "progress-part progress-" + p.key, p.text);
+    // The plan count opens the steps above the composer, so the plan can be read without leaving the chat.
+    const b = btn(p.text, "progress-part progress-plan link", () => { S.planOpen = !S.planOpen; renderMiniPlan(info); });
+    b.setAttribute("aria-controls", "s-plan");
+    b.setAttribute("aria-expanded", String(!!S.planOpen));
+    b.title = S.planOpen ? "Hide the plan" : "Show the plan's steps";
+    return b;
+  });
+  node.replaceChildren(...parts, el("span", "sr-only", line.parts.some(p => p.key === "budget") ? ". The budget is a limit, not a measure of progress." : ""));
+  renderMiniPlan(info);
+}
+
+/** The plan's steps above the composer, open while S.planOpen; the Overview tab keeps the full view with notes. */
+function renderMiniPlan(info) {
+  const list = $("s-plan");
+  const steps = info && !info.parent ? (S.ledger.model?.plan || []).filter(st => st.status !== "dropped") : [];
+  const open = !!S.planOpen && steps.length > 0;
+  const toggle = $("s-progress").querySelector(".progress-plan");
+  if (toggle) { toggle.setAttribute("aria-expanded", String(open)); toggle.title = open ? "Hide the plan" : "Show the plan's steps"; }
+  const sig = open ? JSON.stringify(steps.map(st => [st.status, st.text])) : "";
+  if (list.dataset.sig === sig && list.hidden === !open) return;
+  list.dataset.sig = sig;
+  list.hidden = !open;
+  list.replaceChildren(...(open ? steps.map(st => add(el("li", "mini-step step-" + st.status), stepMarkEl(st.status), el("span", "step-text", st.text))) : []));
 }
 
 /**
@@ -2105,6 +2350,12 @@ function jumpToRecord(seq, { focus = false, highlight = true, done = null } = {}
   S.jumping = true;
   requestAnimationFrame(() => {
     const block = S.rec?.blocks.find(b => b.seq === seq || b.callSeq === seq || b.result?.seq === seq || b.resolved?.seq === seq);
+    if (!block && S.rec && C.hasEarlier(S.rec)) {
+      // The record is before the loaded ones: load them, then go there.
+      S.jumping = false;
+      loadEarlier(S.rec, { all: true }).then(() => jumpToRecord(seq, { focus, highlight, done }));
+      return;
+    }
     if (!block || !S.r) { S.jumping = false; return; }
     S.follow = false;
     while (block.id < S.r.from && S.r.from > 0) showEarlier();
@@ -2112,7 +2363,18 @@ function jumpToRecord(seq, { focus = false, highlight = true, done = null } = {}
     const key = C.groupKeyForSeq(S.r.items, block.seq);
     if (key) S.workState.set(key, true);
     if (block.kind === "tool") block.ui = { ...(block.ui || {}), open: true };
-    if (key || block.kind === "tool") { S.r.forced.add(block.id); syncChat(); }
+    // A record on a page that is not rendered yet: reveal that page (and open the run holding it) first.
+    const holder = key && S.r.items.find((x) => x.type === "group" && x.key === key);
+    const at = holder && C.locateInGroup(holder, block.id);
+    let revealed = false;
+    if (at) {
+      if ((S.groupPages.get(key) || 1) < at.groupPages) { S.groupPages.set(key, at.groupPages); revealed = true; }
+      if (at.runKey) {
+        if (!S.openRuns.has(at.runKey)) { S.openRuns.add(at.runKey); revealed = true; }
+        if ((S.runPages.get(at.runKey) || 1) < at.runPages) { S.runPages.set(at.runKey, at.runPages); revealed = true; }
+      }
+    }
+    if (key || block.kind === "tool" || revealed) { S.r.forced.add(block.id); syncChat(); }
     // One more frame: a pending render may still replace the node.
     requestAnimationFrame(() => {
       const node = $("blocks").querySelector(`[data-bid="${block.id}"]`);
@@ -2175,6 +2437,7 @@ function renderEvidence(panel) {
       chip(C.claimStatusWords(claim.status), "status-" + claim.status), el("span", "mono dim", claim.id), el("span", "dim", "status recorded by the agent")));
     section.append(el("h3", "", claim.text));
     if (claim.note) section.append(el("p", "claim-note", claim.note));
+    add(section, reachLine(claim));
     if (!claim.evidence.length) section.append(el("p", "dim", "No source evidence attached."));
     for (const evidence of claim.evidence) section.append(evidenceCard(evidence));
     frag.append(section);
@@ -2234,6 +2497,30 @@ function textBox(text, cls) {
   return el("pre", cls || "txt", text);
 }
 
+/**
+ * Tool output, raw, with a look per line (C.outputLineKinds): the harness's own first and last lines muted, a unified
+ * diff in green and red. Only spans are added; the text, and what a selection copies, stay exactly as recorded.
+ * `kinds` may cover more lines than `text` (a clipped view of a longer output).
+ */
+function outputBox(text, kinds) {
+  if (!kinds || !kinds.some(Boolean)) return textBox(text, "txt out");
+  const pre = el("pre", "txt out");
+  const lines = text.split("\n");
+  let plain = "";
+  const flush = () => { if (plain) { pre.append(document.createTextNode(plain)); plain = ""; } };
+  lines.forEach((line, i) => {
+    const nl = i < lines.length - 1 ? "\n" : "";
+    if (!kinds[i]) { plain += line + nl; return; }
+    flush();
+    // The line break stays outside the span, so a full-width diff line never carries an extra blank line.
+    pre.append(el("span", "ol ol-" + kinds[i], line));
+    plain = nl;
+  });
+  flush();
+  if (kinds.includes("hunk")) pre.classList.add("has-diff");
+  return pre;
+}
+
 const modelChip = (m, extra = "") => {
   const chip = el("span", "model-chip" + extra, m.profile || "model");
   chip.title = [m.model, m.context_window ? C.formatWindow(m.context_window) + " context" : ""].filter(Boolean).join(" · ") || "model";
@@ -2250,6 +2537,153 @@ function remembered(details, b, key) {
 }
 
 /** `ctx` carries the chat item a block is shown as: {differs, model}. */
+/** A link to an agent: its title when the page knows it (the id stays the tooltip), else the id. */
+function childLink(id) {
+  const info = S.sessions.byId.get(id);
+  const a = link(info && info.title ? info.title : id, "#/s/" + encodeURIComponent(id));
+  a.title = id;
+  return a;
+}
+
+/** The attachment block of an operator message (docs/UPLOADS.md): file chips that open in the Files tab, the inline copies folded. */
+function attachedFiles(b, sp) {
+  const box = el("div", "attached");
+  const list = el("ul", "attach-chips");
+  list.setAttribute("aria-label", "Attached files");
+  const ws = (S.sessions.byId.get(S.openId) || {}).workspace || "";
+  for (const f of sp.files) {
+    const chip = el("button", "attach-chip attach-open");
+    chip.type = "button";
+    chip.title = "Open " + f.path + " in the Files tab";
+    add(chip, icon("source"), el("span", "attach-name", f.name), el("span", "attach-size", f.size));
+    chip.addEventListener("click", () => {
+      const rel = C.workspaceRelative(ws, f.path);
+      if (rel === null) toast(f.path + " is outside this session's workspace.");
+      else showFiles(chip, rel);
+    });
+    add(list, add(el("li"), chip));
+  }
+  add(box, list);
+  if (sp.inline) {
+    const d = el("details", "attach-inline");
+    add(d, el("summary", "", "Inline copies"));
+    remembered(d, b, "inline");
+    add(d, textBox(sp.inline, "txt out"));
+    add(box, d);
+  }
+  return box;
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// Images (docs/CONTRACTS-2026-11-23.md D7): thumbnails, the viewer dialog, composer chip thumbnails
+
+const imageCache = new Map(); // blob id -> Promise<data URL>; the bytes come only from /api/images/ and are cached for the page
+const lazyImages = typeof IntersectionObserver === "function"
+  ? new IntersectionObserver((entries) => {
+    for (const e of entries) if (e.isIntersecting) { lazyImages.unobserve(e.target); fillImage(e.target); }
+  }, { rootMargin: "200px" })
+  : null;
+
+/** The image bytes need the bearer header, which an img tag cannot send: fetch them, then show them as a data URL (the CSP allows data:). */
+function imageData(blob) {
+  if (!imageCache.has(blob)) {
+    const p = (async () => {
+      const r = await fetch(C.imageUrl(blob), { credentials: "omit", headers: authHeaders() });
+      if (r.status === 401) { lost(); throw new Error(C.LOST_TOKEN); }
+      if (!r.ok) throw new Error("The image could not be loaded (" + r.status + ").");
+      const data = await r.blob();
+      return await new Promise((resolve, reject) => {
+        const fr = new FileReader();
+        fr.addEventListener("load", () => resolve(String(fr.result)));
+        fr.addEventListener("error", () => reject(new Error("The image could not be read.")));
+        fr.readAsDataURL(data);
+      });
+    })();
+    p.catch(() => imageCache.delete(blob));
+    imageCache.set(blob, p);
+  }
+  return imageCache.get(blob);
+}
+
+function fillImage(img) {
+  imageData(img.dataset.blob).then(
+    (url) => { img.src = url; img.classList.add("loaded"); },
+    (e) => { img.closest(".thumb")?.classList.add("broken"); img.alt = img.alt + " (not loaded: " + e.message + ")"; img.title = e.message; },
+  );
+}
+
+/** One thumbnail button (max 240x240) that opens the viewer. `tool` is the tool name for a tool result's image. */
+function thumb(image, { tool = "", files = [], args = null } = {}) {
+  if (!C.imageUrl(image.blob)) return null;
+  const size = C.thumbSize(image.width, image.height);
+  const alt = C.imageAlt(image, tool);
+  const b = el("button", "thumb");
+  b.type = "button";
+  b.setAttribute("aria-label", "Open image: " + alt + (C.imageFacts(image) ? ", " + C.imageFacts(image) : ""));
+  b.title = alt;
+  const img = el("img");
+  img.alt = alt;
+  img.loading = "lazy";
+  img.decoding = "async";
+  img.width = size.width;
+  img.height = size.height;
+  img.dataset.blob = image.blob;
+  add(b, img);
+  b.addEventListener("click", () => openImage(image, { tool, files, args, opener: b }));
+  if (lazyImages) lazyImages.observe(img); else fillImage(img);
+  return b;
+}
+
+function thumbRow(images, opts) {
+  const list = el("ul", "thumbs");
+  list.setAttribute("aria-label", C.imageCountLabel(images.length));
+  for (const image of images) { const t = thumb(image, opts); if (t) add(list, add(el("li"), t)); }
+  return list.children.length ? list : null;
+}
+
+let imageOpener = null;
+function openImage(image, { tool = "", files = [], args = null, opener = document.activeElement } = {}) {
+  const dialog = $("imgview");
+  imageOpener = opener;
+  const alt = C.imageAlt(image, tool);
+  $("imgview-title").textContent = image.name || alt;
+  $("imgview-info").textContent = C.imageFacts(image);
+  const big = $("imgview-img");
+  big.alt = alt;
+  big.removeAttribute("src");
+  imageData(image.blob).then((url) => { if (imageOpener === opener) big.src = url; }, (e) => { $("imgview-error").textContent = e.message; $("imgview-error").hidden = false; });
+  $("imgview-error").hidden = true;
+  const path = C.imagePath(image, { files, args });
+  const copy = $("imgview-copy");
+  copy.hidden = !path;
+  copy.dataset.path = path || "";
+  $("imgview-path").textContent = path || "";
+  if (!dialog.open) dialog.showModal();
+  $("imgview-close").focus({ preventScroll: true });
+}
+function closeImage() {
+  const dialog = $("imgview");
+  if (dialog.open) dialog.close();
+}
+
+/** A small thumbnail of a local image file for a composer chip, read from the File itself (never from a URL). */
+function chipThumb(file, name) {
+  const img = el("img", "chip-thumb");
+  img.alt = "";
+  img.width = 20;
+  img.height = 20;
+  // A file named .png that is not a decodable image keeps the plain file icon, never a broken-image glyph.
+  const wrap = el("span", "chip-thumb-wrap");
+  wrap.append(icon("source"));
+  img.addEventListener("load", () => wrap.replaceChildren(img));
+  const fr = new FileReader();
+  fr.addEventListener("load", () => { img.src = String(fr.result); });
+  fr.readAsDataURL(file);
+  img.title = name;
+  return wrap;
+}
+
 function buildBlock(b, ctx = {}) {
   const root = el("div", "block " + b.kind + (b.detail ? " detail" : ""));
   b.ui = b.ui || {};
@@ -2257,9 +2691,14 @@ function buildBlock(b, ctx = {}) {
   switch (b.kind) {
     case "user": {
       if (b.author !== "user") add(root, el("div", "label", C.authorLabel(b.author)));
-      const bubble = textBox(b.text, "txt bubble");
-      root.classList.add("reveal-copy");
-      add(root, bubble, copyButton("Copy message", () => C.messageCopyText(b), { what: "Message", source: bubble, key: "copy-msg:" + b.id }));
+      const sp = C.splitAttachments(b.text);
+      if (sp.text || !sp.files.length) {
+        const bubble = textBox(sp.text, "txt bubble");
+        root.classList.add("reveal-copy");
+        add(root, bubble, copyButton("Copy message", () => C.messageCopyText(b), { what: "Message", source: bubble, key: "copy-msg:" + b.id }));
+      }
+      if (sp.files.length) add(root, attachedFiles(b, sp));
+      if (b.images && b.images.length) add(root, thumbRow(b.images, { files: sp.files }));
       break;
     }
     case "note": {
@@ -2279,6 +2718,9 @@ function buildBlock(b, ctx = {}) {
     }
     case "response": {
       const thought = C.thoughtLabel(b);
+      // A step that only called tools has nothing to read but its speed line; inside work it is request detail, shown
+      // with "Show request details" (the tool rows keep their own durations).
+      if (ctx.inGroup && !b.text && !b.reasoning && !(b.cutCalls || []).length && !b.warning) root.classList.add("detail", "step-stats");
       if (b.reasoning) {
         const d = el("details", "reasoning thought");
         const sum = el("summary", "", thought || "Thought");
@@ -2316,7 +2758,10 @@ function buildBlock(b, ctx = {}) {
     case "child_spawned": {
       root.classList.add("card");
       const h = el("div", "ch");
-      add(h, icon("tool-agent"), el("strong", "", `agent started: ${b.role}`), el("span", "dim", b.mode), link(b.child, "#/s/" + encodeURIComponent(b.child)));
+      const modeEl = el("span", "dim", b.mode === "fork" ? "forked" : b.mode);
+      if (b.mode === "fresh") modeEl.title = "Starts from its brief alone, without the lead's conversation.";
+      else if (b.mode === "fork") modeEl.title = "Starts from a copy of the lead's conversation.";
+      add(h, icon("tool-agent"), el("strong", "", `agent started: ${b.role}`), modeEl, childLink(b.child));
       add(root, h, textBox(b.brief.question || "", "txt"));
       break;
     }
@@ -2328,9 +2773,10 @@ function buildBlock(b, ctx = {}) {
       }
       root.classList.add("card");
       const h = el("div", "ch");
-      add(h, icon("tool-agent"), el("strong", "", `agent ${C.outcomeWords(b.outcome)}`), link(b.child, "#/s/" + encodeURIComponent(b.child)), el("span", "dim", `${b.steps} steps`));
+      add(h, icon("tool-agent"), el("strong", "", `agent ${C.outcomeWords(b.outcome)}`), childLink(b.child), el("span", "dim", `${b.steps} steps`));
       add(root, h);
-      add(root, collapsible(b, "report", b.report, 24));
+      // A report is the agent's written reply: shown as formatted text, like a reply, clipped until asked for.
+      add(root, collapsible(b, "report", b.report, 24, { prose: true }));
       if (b.full) add(root, keyed(btn("open full report", "link", (e) => openViewer(b.full.id, "Full report", null, {}, e.currentTarget)), "report:" + b.id));
       break;
     }
@@ -2343,6 +2789,32 @@ function buildBlock(b, ctx = {}) {
         root.textContent = b.text;
       }
       if (b.blob) add(root, keyed(btn("open output", "link", (e) => openViewer(b.blob.id, "Job output", null, {}, e.currentTarget)), "output:" + b.id));
+      break;
+    }
+    case "compaction": {
+      root.classList.add("card");
+      const h = el("div", "ch compaction-head");
+      add(h, icon("diamond-outline"), el("strong", "", b.head));
+      add(root, h);
+      if (b.objections) add(root, el("div", "dim compaction-objections", "The verifier objected to: " + b.objections));
+      const note = el("details", "compaction-part compaction-note");
+      add(note, el("summary", "", b.note ? "Note" : "Note (none written)"));
+      remembered(note, b, "note");
+      if (b.note) {
+        add(note, el("div", "dim", C.COMPACT_NOTE_LABEL), add(el("div", "report-prose"), linkOutKeys(prose(b.note))));
+        if (b.droppedKeys.length) {
+          const dropped = el("div", "compaction-dropped");
+          add(dropped, el("div", "dim", C.COMPACT_DROPPED_LABEL));
+          add(dropped, el("code", "", b.droppedKeys.join(" ")));
+          add(note, dropped);
+        }
+      } else add(note, el("div", "dim", C.COMPACT_NO_NOTE));
+      add(root, note);
+      const table = el("details", "compaction-part compaction-table");
+      add(table, el("summary", "", b.table ? `Key table · ${C.count(b.tableKeys.length, "output", "outputs")}` : "Key table (empty)"));
+      remembered(table, b, "table");
+      if (b.table) add(table, keyedText(b.table));
+      add(root, table);
       break;
     }
     case "reweave": {
@@ -2383,11 +2855,12 @@ function keyed(node, key) {
   return node;
 }
 
-function collapsible(b, key, text, max) {
+function collapsible(b, key, text, max, opts = {}) {
   const wrap = el("div");
   const all = !!b.ui[key];
   const c = C.clip(text, max);
-  add(wrap, textBox(all ? text : c.text, "txt out"));
+  const shown = all ? text : c.text;
+  add(wrap, opts.prose ? add(el("div", "report-prose"), prose(shown)) : opts.styled ? outputBox(shown, C.outputLineKinds(text)) : textBox(shown, "txt out"));
   if (c.clipped) {
     add(wrap, keyed(btn(all ? "show less" : `show all ${C.num(c.total)} lines`, "link", () => {
       b.ui[key] = !all;
@@ -2409,8 +2882,18 @@ function buildTool(root, b) {
   head.type = "button";
   head.setAttribute("aria-expanded", String(open));
   head.dataset.focusKey = "tool:" + b.id;
-  add(head, icon("chevron"), icon(row.icon), el("span", "name", b.name));
-  const args = el("span", "args", row.argsLine);
+  const nameEl = el("span", "name", row.shown);
+  if (row.calledAs) nameEl.title = `Called as ${row.calledAs}; ran ${row.name}`;
+  else if (row.mcp) nameEl.title = row.name;
+  add(head, icon("chevron"), icon(row.icon), nameEl);
+  if (row.mcp) {
+    const badge = el("span", "mcp-badge", "MCP");
+    badge.title = `MCP tool: ${row.name}`;
+    add(head, badge);
+  }
+  // A call that says what it is for (bash's `description`) leads with that; the command stays beside it, dimmer.
+  if (row.label) add(head, el("span", "tlabel", row.label));
+  const args = el("span", row.label ? "args sub" : "args", row.argsLine);
   if (b.argsInvalid) args.title = "The model's arguments were not valid JSON; this is what it wrote.";
   add(head, args);
   if (row.capsule) {
@@ -2426,7 +2909,35 @@ function buildTool(root, b) {
     mark.title = row.partial.words;
     add(head, mark);
   }
+  // A file change says how big it was, as the diff it returned counts it.
+  const stat = res && b.cls === "write" ? C.diffStat(res.text) : null;
+  if (stat) {
+    const chip = el("span", "diffstat");
+    add(chip, el("span", "ds-add", "+" + C.num(stat.added)), el("span", "ds-del", "−" + C.num(stat.removed)));
+    chip.title = stat.words;
+    add(head, chip);
+  }
+  if (res && res.images && res.images.length) {
+    const n = el("span", "img-count");
+    add(n, icon("image"), document.createTextNode(String(res.images.length)));
+    n.title = C.imageCountLabel(res.images.length);
+    n.setAttribute("aria-label", C.imageCountLabel(res.images.length));
+    add(head, n);
+  }
+  const calls = toolExchanges(b);
+  if (calls.length) {
+    const n = el("span", "req-count", C.requestsWords(calls.length));
+    n.title = "Requests captured during this call. Open the row to see them.";
+    add(head, n);
+  }
   if (row.duration) add(head, el("span", "dur", row.duration));
+  else if (row.state === "running" && Number.isFinite(b.ts)) {
+    // A call still out counts up, so a long build reads as working, not stuck (tickGroups moves it each second).
+    const live = el("span", "dur live-dur", C.seconds(Math.max(0, Date.now() - b.ts)));
+    live.dataset.since = String(b.ts);
+    live.title = "Running for this long so far";
+    add(head, live);
+  }
   head.addEventListener("click", () => {
     b.ui.open = !open;
     refresh(b);
@@ -2436,20 +2947,26 @@ function buildTool(root, b) {
   const body = el("div", "tbody");
   add(body, toolOpenRow(b), toolCopyRow(b));
   if (b.args !== undefined && b.args !== null) {
-    add(body, keyed(btn(b.ui.args ? "hide args" : "args", "link", () => {
+    add(body, keyed(btn(b.ui.args ? "Hide arguments" : "Show arguments", "small link targs", () => {
       b.ui.args = !b.ui.args;
       refresh(b);
     }), "args:" + b.id));
   }
-  if (b.ui.args) add(body, textBox(JSON.stringify(b.args, null, 2), "txt out"));
+  if (b.ui.args) add(body, el("div", "label", "Arguments"), textBox(JSON.stringify(b.args, null, 2), "txt out args-box"));
+  if (calls.length) add(body, el("div", "label", C.requestsWords(calls.length)), exchangeList(calls, "tool-" + b.id + ":"));
   if (res) {
+    add(body, el("div", "label", "Output"));
+    if (res.images && res.images.length) add(body, thumbRow(res.images, { tool: b.ran || b.name, args: b.args }));
     if (res.text === "") add(body, el("div", "dim", "(no output)"));
-    else add(body, collapsible(b, "all", res.text, 24));
+    else add(body, collapsible(b, "all", res.text, 24, { styled: true }));
     const s = res.shown;
     if (s.words || s.blob) {
       const note = el("div", "tnote" + (s.cut ? " cutline" : ""));
       add(note, document.createTextNode(s.words ? s.words + " " : ""));
-      if (s.blob) add(note, keyed(btn("open full output", "link", (e) => openViewer(s.blob, `Full output of ${b.name}`, s.total, {}, e.currentTarget)), "full:" + b.id));
+      if (s.blob) add(note, keyed(btn("open full output", "link", (e) => {
+        const plan = C.viewerPlan(s);
+        openViewer(s.blob, `Full output of ${b.ran || b.name}`, s.total, { start: plan.start, seenRanges: plan.seenRanges }, e.currentTarget);
+      }), "full:" + b.id));
       add(body, note);
     }
   } else if (b.state === "missing") {
@@ -2458,6 +2975,13 @@ function buildTool(root, b) {
     add(body, el("div", "tnote", "running…"));
   }
   add(root, body);
+}
+
+/** The exchanges of a tool row: those recorded with its call id, or (a `bash` row) the proxy's own made while it ran. */
+function toolExchanges(b) {
+  const own = b.exchanges || [];
+  if (own.length || !S.rec) return own;
+  return C.callWindowExchanges(b, S.rec.exchanges);
 }
 
 /** The copy buttons of an open tool row: its command (or path, or arguments), its recorded output, and the full stored output. */
@@ -2511,7 +3035,9 @@ function groupHeadText(it) {
   if (!it.toolCount) {
     return `Activity · ${C.count(it.records, "record")}` + (it.warnings ? ` · ${C.count(it.warnings, "warning")}` : "") + (it.running ? " · running" : "");
   }
-  return C.groupLabel(it, Date.now()).text;
+  const words = C.groupLabel(it, Date.now());
+  // The outcome counts and warnings are drawn as labelled marks after the words, so the words leave them out.
+  return words.head;
 }
 
 /** The header's words in both lengths: the sentence, and on a phone the short form ("Worked 2m43s · 8 calls"). Both are hidden from assistive technology; the button's own name is the long sentence. */
@@ -2545,9 +3071,10 @@ function pinOpenGroups() {
 }
 
 // The group's counts, in the order the header words say them: [field, outcome kind, words].
+// The fourth entry is the mark's visible word (left out on a phone, where the mark is its shape and number).
 const GROUP_MARKS = [
-  ["exited", "exit", "exited non-zero"], ["failed", "failed", "failed"], ["denied", "denied", "denied by policy"],
-  ["invalid", "invalid", "invalid"], ["timedOut", "timeout", "timed out"], ["interrupted", "interrupted", "interrupted"],
+  ["exited", "exit", "exited non-zero", "exited"], ["failed", "failed", "failed", "failed"], ["denied", "denied", "denied by policy", "denied"],
+  ["invalid", "invalid", "invalid", "invalid"], ["timedOut", "timeout", "timed out", "timed out"], ["interrupted", "interrupted", "interrupted", "interrupted"],
 ];
 
 /** The frame of a work group: its header button and, while it is open, its body. Members are kept between updates. */
@@ -2557,7 +3084,7 @@ function newGroupEntry(it) {
   const head = el("button", "group-head");
   head.type = "button";
   head.dataset.focusKey = "group:" + it.key;
-  const entry = { group: true, node: root, head, label: null, body: null, members: new Map(), earlierRow: null, headSig: "", item: it, sig: "" };
+  const entry = { group: true, node: root, head, label: null, body: null, members: new Map(), sigs: new Map(), earlierRow: null, moreRow: null, headSig: "", item: it, sig: "" };
   head.addEventListener("click", () => toggleGroup(entry.item));
   add(root, head);
   return entry;
@@ -2570,7 +3097,7 @@ function updateGroup(entry, it, dirty) {
   const counts = GROUP_MARKS.map(([field]) => it[field] || 0);
   head.setAttribute("aria-expanded", String(it.open));
   head.title = it.open ? "Fold this work away; every call stays in the record." : "Show the calls in this work.";
-  const headSig = [it.toolCount, ...counts, it.partial || 0, it.missing, it.warnings, it.running, it.records, it.running ? "" : it.endTs].join("|");
+  const headSig = [it.toolCount, ...counts, it.partial || 0, it.missing, it.warnings, it.loop || 0, it.running, it.records, it.running ? "" : it.endTs].join("|");
   if (entry.headSig !== headSig) {
     entry.headSig = headSig;
     const label = el("span", "group-label");
@@ -2582,28 +3109,42 @@ function updateGroup(entry, it, dirty) {
     head.setAttribute("aria-label", groupSpoken(it));
     head.replaceChildren(icon("chevron"), label);
     // Each way a call can end has its own small shape and number, so a refusal is not read as a failure.
-    GROUP_MARKS.forEach(([, kind, noun], i) => {
+    const marks = el("span", "group-marks");
+    marks.setAttribute("aria-hidden", "true");
+    GROUP_MARKS.forEach(([, kind, noun, word], i) => {
       if (!counts[i]) return;
       const look = C.TOOL_OUTCOME_LOOK[kind];
       const mark = el("span", "group-mark tone-" + look.tone);
       mark.title = `${counts[i]} ${noun}`;
-      add(mark, icon(look.icon), el("span", "group-mark-n", String(counts[i])));
-      head.append(mark);
+      add(mark, icon(look.icon), el("span", "group-mark-n", String(counts[i])), el("span", "group-mark-w", word));
+      marks.append(mark);
     });
     if (it.warnings) {
-      const warn = el("span", "group-warn");
+      const warn = el("span", "group-mark group-warn");
       warn.title = C.count(it.warnings, "warning");
-      add(warn, icon("alert"));
-      head.append(warn);
+      add(warn, icon("alert"), el("span", "group-mark-n", String(it.warnings)), el("span", "group-mark-w", it.warnings === 1 ? "warning" : "warnings"));
+      marks.append(warn);
     }
+    if (it.loop) {
+      // The same call many times in a row: a warning, because a stuck model looks like a long, busy log.
+      const loop = el("span", "group-mark group-warn group-loop");
+      loop.title = `The same call was made ${it.loop} times in a row. The model may be stuck.`;
+      add(loop, icon("alert"), el("span", "group-mark-w", "loop"));
+      marks.append(loop);
+    }
+    if (marks.childElementCount) head.append(marks);
   }
   if (!it.open) {
-    if (entry.body) { entry.body.remove(); entry.body = null; entry.members.clear(); entry.earlierRow = null; }
+    if (entry.body) { entry.body.remove(); entry.body = null; entry.members.clear(); entry.sigs.clear(); entry.earlierRow = null; entry.moreRow = null; }
     return;
   }
   if (!entry.body) { entry.body = el("div", "group-body"); node.append(entry.body); }
-  const keep = new Set(it.shown.map((b) => b.id));
-  for (const [id, member] of entry.members) if (!keep.has(id)) { member.remove(); entry.members.delete(id); }
+  // Only the first pages of rows exist as nodes: a log of thousands of calls stays a few hundred elements even with Expand all.
+  const rows = C.rowsOf(it);
+  const page = C.pageOf(rows, S.groupPages.get(it.key) || 1);
+  const rowKey = (row) => row.type === "run" ? row.key : String(row.block.id);
+  const keep = new Set(page.visible.map(rowKey));
+  for (const [key, member] of entry.members) if (!keep.has(key)) { member.remove(); entry.members.delete(key); entry.sigs.delete(key); }
   const order = [];
   if (it.earlier > 0) {
     if (!entry.earlierRow) {
@@ -2616,17 +3157,84 @@ function updateGroup(entry, it, dirty) {
     entry.earlierRow.remove();
     entry.earlierRow = null;
   }
-  for (const b of it.shown) {
-    let member = entry.members.get(b.id);
-    if (!member || dirty.has(b.id)) {
-      const built = buildBlock(b);
+  for (const row of page.visible) {
+    const key = rowKey(row);
+    let member = entry.members.get(key);
+    const sig = row.type === "run" ? runSig(row) : "";
+    const stale = row.type === "run"
+      ? entry.sigs.get(key) !== sig || (dirty.size > 0 && row.entries.some((e) => dirty.has(e.call.id)))
+      : dirty.has(row.block.id);
+    if (!member || stale) {
+      const built = row.type === "run" ? buildRun(row, it) : buildBlock(row.block, { inGroup: true });
       if (member && member.parentNode === entry.body) member.replaceWith(built);
       member = built;
-      entry.members.set(b.id, member);
+      entry.members.set(key, member);
+      entry.sigs.set(key, sig);
     }
     order.push(member);
   }
+  if (page.hidden) {
+    if (!entry.moreRow) {
+      entry.moreRow = btn("", "link group-more", () => { S.groupPages.set(it.key, (S.groupPages.get(it.key) || 1) + 1); syncChat(); });
+      entry.moreRow.dataset.focusKey = "more:" + it.key;
+    }
+    entry.moreRow.textContent = C.showMoreLabel(page);
+    order.push(entry.moreRow);
+  } else if (entry.moreRow) {
+    entry.moreRow.remove();
+    entry.moreRow = null;
+  }
   placeInOrder(entry.body, order);
+}
+
+/** What a run row looks like now: its length, whether it is open, how many calls it shows and how its last call stands. */
+function runSig(row) {
+  const last = row.last;
+  return [row.count, S.openRuns.has(row.key) ? "o" + (S.runPages.get(row.key) || 1) : "c", last.state, last.result ? last.result.status : "", last.result ? last.result.seq : ""].join("|");
+}
+
+/** A run of repeated identical calls: one row, "bash ls dir5 · same call ×40", opening to its calls a page at a time. */
+function buildRun(row, group) {
+  const open = S.openRuns.has(row.key);
+  const root = el("div", "block run-row");
+  root.dataset.run = row.key;
+  const t = C.toolRow(row.last);
+  const head = el("button", "thead run-head");
+  head.type = "button";
+  head.setAttribute("aria-expanded", String(open));
+  head.dataset.focusKey = "run:" + row.key;
+  head.title = open ? "Fold these calls away." : `Show the ${C.num(row.count)} calls.`;
+  const first = C.toolRow(row.first);
+  add(head, icon("chevron"), icon(first.icon), el("span", "name", first.shown), ...(first.mcp ? [el("span", "mcp-badge", "MCP")] : []), el("span", "args", first.argsLine), el("span", "dim run-same", `same call ×${C.num(row.count)}`));
+  const chipEl = el("span", "run-chip");
+  add(chipEl, icon("alert"), document.createTextNode(`repeated ${C.num(row.count)}×`));
+  chipEl.title = `The same call, with the same arguments, ${C.num(row.count)} times in a row.`;
+  add(head, chipEl);
+  if (t.capsule) {
+    const cap = el("span", "capsule tone-" + t.capsule.tone);
+    add(cap, icon(t.capsule.icon), document.createTextNode(t.capsule.text));
+    cap.title = "The last call's result" + (t.words ? ": " + t.words : "");
+    add(head, cap);
+  }
+  head.addEventListener("click", () => {
+    if (open) S.openRuns.delete(row.key); else S.openRuns.add(row.key);
+    syncChat();
+  });
+  add(root, head);
+  if (!open) return root;
+  const body = el("div", "run-body");
+  const page = C.pageOf(row.entries, S.runPages.get(row.key) || 1);
+  for (const e of page.visible) {
+    for (const x of e.before) add(body, buildBlock(x, { inGroup: true }));
+    add(body, buildBlock(e.call, { inGroup: true }));
+  }
+  if (page.hidden) {
+    const more = btn(C.showMoreLabel(page), "link group-more", () => { S.runPages.set(row.key, (S.runPages.get(row.key) || 1) + 1); syncChat(); });
+    more.dataset.focusKey = "more:" + row.key;
+    add(body, more);
+  }
+  add(root, body);
+  return root;
 }
 
 /** Put `nodes` under `parent` in that order, moving only what is out of place. */
@@ -2718,8 +3326,8 @@ function syncChat() {
     }
     placeInOrder(holder, order);
   });
-  $("earlier").hidden = R.from === 0;
-  $("btn-earlier").textContent = `Show earlier (${C.num(R.from)} more)`;
+  $("earlier").hidden = R.from === 0 && !C.hasEarlier(S.rec);
+  if (!S.rec.earlierLoading) $("btn-earlier").textContent = R.from > 0 ? `Show earlier (${C.num(R.from)} more)` : "Load earlier records";
   tickGroups();
 }
 
@@ -2727,6 +3335,8 @@ function syncChat() {
 function tickGroups() {
   const R = S.r;
   if (!R) return;
+  const now = Date.now();
+  for (const n of document.querySelectorAll("#blocks .live-dur[data-since]")) n.textContent = C.seconds(Math.max(0, now - Number(n.dataset.since)));
   for (const [, entry] of R.nodes) {
     const it = entry.item;
     if (it.type !== "group" || !it.running || !entry.label) continue;
@@ -2822,7 +3432,8 @@ function updateJump() {
 function showEarlier() {
   const store = S.rec;
   const R = S.r;
-  if (!store || R.from === 0) return;
+  if (!store) return;
+  if (R.from === 0) { loadEarlier(store); return; }
   const scroller = chatScroller();
   const before = scroller.scrollHeight;
   R.from = C.earlierFrom(R.from);
@@ -2938,7 +3549,7 @@ function waysOut(entry, context) {
   const confirm = el("div", "model-confirm");
   confirm.setAttribute("role", "group");
   confirm.hidden = true;
-  const q = C.foldConfirm(title);
+  const q = C.compactConfirm(title);
   const qid = "fold-q-" + entry.item.item_id;
   const text = el("p", "model-confirm-text", q.text);
   text.id = qid;
@@ -2948,7 +3559,7 @@ function waysOut(entry, context) {
   const failure = el("p", "error");
   failure.setAttribute("role", "alert");
   failure.hidden = true;
-  const fold = btn("Fold the context…", "", () => {
+  const fold = btn("Compact the context…", "", () => {
     confirm.hidden = !confirm.hidden;
     fold.setAttribute("aria-expanded", String(!confirm.hidden));
     receipt.textContent = "";
@@ -2961,10 +3572,10 @@ function waysOut(entry, context) {
     yes.disabled = true;
     failure.hidden = true;
     try {
-      await api("POST", "/api/sessions/" + encodeURIComponent(entry.session) + "/reweave");
+      await api("POST", "/api/sessions/" + encodeURIComponent(entry.session) + "/compact");
       confirm.hidden = true;
       fold.setAttribute("aria-expanded", "false");
-      receipt.textContent = C.FOLD_RECEIPT;
+      receipt.textContent = C.COMPACT_RECEIPT;
       fold.focus();
     } catch (e) {
       fail(failure, e.message);
@@ -3420,6 +4031,7 @@ function showNew() {
   $("f-error").hidden = true;
   hideCreateAsk();
   $("f-receipt").hidden = true;
+  renderNewTarget();
   workspaceNote();
 }
 
@@ -3435,6 +4047,7 @@ async function submitNew(ev, create = false) {
     title: $("f-title").value,
     prior: $("f-prior").value,
     unattended: $("f-unattended").checked,
+    target: $("f-target").value,
     // Only for a folder the operator chose to make: the picker's New folder, or the answer to the question below.
     createWorkspace: create || (pickerCreate !== null && workspace === pickerCreate),
   });
@@ -3445,6 +4058,13 @@ async function submitNew(ev, create = false) {
     err.hidden = false;
     return;
   }
+  const att = attachState("new");
+  if (att.busy || att.failed) {
+    err.textContent = att.busy ? "Wait for the attached files to finish uploading." : "Remove the attached file that failed to upload, then start the mission.";
+    err.hidden = false;
+    return;
+  }
+  if (att.paths.length) r.body.attachments = att.paths;
   err.hidden = true;
   $("f-submit").disabled = true;
   $("f-create-yes").disabled = true;
@@ -3454,6 +4074,8 @@ async function submitNew(ev, create = false) {
     const { created, ...info } = answer;
     C.applySessionEvent(S.sessions, info);
     $("f-message").value = "";
+    attachments.delete("new");
+    renderChips(attachCtx.start);
     $("f-title").value = "";
     $("f-prior").value = "";
     pickerCreate = null;
@@ -3491,8 +4113,10 @@ function loadTab() {
   if (S.tab === "ledger") loadLedger();
   else if (S.tab === "models") loadModels();
   else if (S.tab === "context") loadWindow();
+  else if (S.tab === "session") loadMcp();
   else if (S.tab === "network") {
     if (S.net.length === 0) loadNet();
+    if (!S.exch.loaded) loadExchanges();
     if (S.ledger.stale || !S.ledger.model) loadLedger();
   }
 }
@@ -3532,6 +4156,22 @@ async function loadWindow() {
   }
   if (S.tab === "context") want("right");
   if (S.sheet.open) want("sheet");
+}
+
+/** The open session's MCP servers. A 404 (an older daemon), any other failure or an empty list leaves the section out. */
+async function loadMcp() {
+  const id = S.openId;
+  if (!id) return;
+  const request = ++S.requests.mcp;
+  let list = null;
+  try {
+    list = C.mcpServersModel(await api("GET", "/api/sessions/" + encodeURIComponent(id) + "/mcp"));
+  } catch (e) {
+    list = null;
+  }
+  if (S.openId !== id || request !== S.requests.mcp) return;
+  S.mcp = { id, list };
+  if (S.tab === "session") want("right");
 }
 
 async function loadNet() {
@@ -3644,9 +4284,9 @@ async function changeModels(work) {
 
 /** The inline question before a Models-tab change; the same words as the model seat, and nothing is sent until the operator answers. */
 function modelAsk(ask) {
-  if (ask.kind === "fold") {
+  if (ask.kind === "compact") {
     const open = S.sessions.byId.get(S.openId);
-    return C.foldConfirm(open && open.title);
+    return C.compactConfirm(open && open.title);
   }
   const models = seatModels();
   if (ask.kind === "lead") {
@@ -3735,7 +4375,7 @@ function renderModels(p, info) {
     }
   };
   const lead = m.lead_model;
-  const ask = S.ask && S.ask.kind !== "fold" && S.ask.lead === m.lead ? S.ask : null;
+  const ask = S.ask && S.ask.kind !== "compact" && S.ask.lead === m.lead ? S.ask : null;
   const q = ask ? modelAsk(ask) : null;
   if (ask && !q) S.ask = null;
   const pending = (kind, role) => q && ask.kind === kind && ask.role === role ? ask.value : null;
@@ -3917,9 +4557,11 @@ function showLedger(p, ...nodes) {
   const form = rulesForm();
   form.hint.textContent = C.rulesHint(S.ledger.error);
   renderRuleLists(form, S.ledger.model);
-  if (p.firstChild !== form.box) p.replaceChildren(form.box);
-  while (form.box.nextSibling) form.box.nextSibling.remove();
-  p.append(...nodes);
+  // The ledger itself (goal, plan, claims) comes first; the rules and approvals form follows it. The form node is kept
+  // across renders (so a half-typed rule keeps its text and focus) and the ledger is re-drawn before it.
+  if (p.lastChild !== form.box) p.replaceChildren(form.box);
+  while (form.box.previousSibling) form.box.previousSibling.remove();
+  form.box.before(...nodes);
 }
 
 function renderLedger(p) {
@@ -3951,6 +4593,7 @@ function renderLedger(p) {
     for (const c of m.claims) {
       const item = li(el("span", "k", c.id), el("strong", "", c.status + " "), document.createTextNode(c.text));
       if (c.note) add(item, el("div", "dim", c.note));
+      add(item, reachLine(c));
       for (const e of c.evidence) {
         add(item, evidenceCard(e));
       }
@@ -3972,7 +4615,8 @@ function renderLedger(p) {
  * apart); `ask` is the open question of that place, if any. Text nodes only; the fills are classes.
  */
 function contextCard(w, where, ask) {
-  const m = C.contextCardModel(w);
+  // MCP tool definitions are counted from this session's own start record (the window view does not tag them).
+  const m = C.contextCardModel(w, { mcpTools: S.rec && S.rec.start ? S.rec.start.mcpTools : 0 });
   const box = el("div", "ctx");
   const hero = el("div", "ctx-hero");
   const figure = el("span", "ctx-figure");
@@ -4018,7 +4662,7 @@ function contextCard(w, where, ask) {
     box.append(wrap, labels);
     if (m.bar.scaleNote) box.append(el("p", "ctx-scale", m.bar.scaleNote));
     if (m.fold) box.append(el("p", "ctx-foldline", m.fold.text + (m.fold.past ? " · " + m.fold.past.text : "")));
-    else if (m.parts && w.fold_at) box.append(el("p", "ctx-foldline", `Folds at ${C.tokens(w.fold_at)}, beyond this scale.`));
+    else if (m.parts && (w.compact_at || w.fold_at)) box.append(el("p", "ctx-foldline", w.compact_at ? `Compacts at ${C.tokens(w.compact_at)}, beyond this scale.` : `Folds at ${C.tokens(w.fold_at)}, beyond this scale.`));
     let group = "";
     let list = null;
     for (const r of m.rows) {
@@ -4070,21 +4714,21 @@ function contextCard(w, where, ask) {
   }
   const actions = el("div", "ctx-actions");
   const prefix = where === "sheet" ? "sheet:" : "";
-  const fold = btn("Fold now…", "", () => {
-    if (where === "sheet") { S.sheet.ask = { kind: "fold", focus: true }; want("sheet"); } else { S.ask = { kind: "fold", focus: true }; want("right"); }
+  const fold = btn("Compact now…", "", () => {
+    if (where === "sheet") { S.sheet.ask = { kind: "compact", focus: true }; want("sheet"); } else { S.ask = { kind: "compact", focus: true }; want("right"); }
   });
   fold.dataset.focusKey = prefix + "ask:fold";
-  fold.setAttribute("aria-label", "Fold now");
-  fold.title = "Fold older output out of view now. Asks first.";
+  fold.setAttribute("aria-label", "Compact now");
+  fold.title = "Compact the context now: the model writes a note and everything before the last few steps leaves its view. Asks first.";
   const refresh = btn("Refresh", "", loadWindow);
   refresh.dataset.focusKey = prefix + "ctx-refresh";
   add(actions, fold, refresh);
-  if (ask && ask.kind === "fold") {
-    // Folding is silent until a later record lands, so say it was asked for and pull the view.
+  if (ask && ask.kind === "compact") {
+    // Compacting is silent until a later record lands, so say it was asked for and pull the view.
     actions.append(confirmRow(modelAsk(ask), async () => {
       if (where === "sheet") { S.sheet.ask = null; want("sheet"); requestAnimationFrame(() => focusKey("sheet:ask:fold")); } else askClose("ask:fold");
-      if (await act(api("POST", "/api/sessions/" + encodeURIComponent(S.openId) + "/reweave")) !== undefined) {
-        toast(C.FOLD_RECEIPT);
+      if (await act(api("POST", "/api/sessions/" + encodeURIComponent(S.openId) + "/compact")) !== undefined) {
+        toast(C.COMPACT_RECEIPT);
         loadWindow();
       }
     }, () => { if (where === "sheet") { S.sheet.ask = null; want("sheet"); requestAnimationFrame(() => focusKey("sheet:ask:fold")); } else askClose("ask:fold"); }, prefix));
@@ -4150,17 +4794,49 @@ function renderNetwork(p) {
   // A failed load (a damaged audit log among them) stays in view next to the decisions that arrive live.
   const error = S.netError ? [el("p", "error", S.netError)] : [];
   const granted = S.ledger.model ? [el("p", "dim", C.scopeLine(S.ledger.model))] : [];
-  if (S.net.length === 0) {
-    preserveFocus(p, () => p.replaceChildren(...granted, ...(error.length ? error : [el("p", "dim", "No network decisions recorded for this session.")])));
-    return;
+  const parts = [...granted];
+  if (S.net.length === 0) parts.push(...(error.length ? error : [el("p", "dim", "No network decisions recorded for this session.")]));
+  else {
+    const t = el("table", "net");
+    for (const e of S.net.slice(-500).reverse().map(C.netRow)) {
+      const tr = el("tr", e.verdict);
+      add(tr, el("td", "", clock(e.ts)), el("td", "", e.verdict), el("td", "", e.method), el("td", "", e.target), el("td", "", e.rule));
+      t.append(tr);
+    }
+    parts.push(...error, t);
   }
-  const t = el("table", "net");
-  for (const e of S.net.slice(-500).reverse().map(C.netRow)) {
-    const tr = el("tr", e.verdict);
-    add(tr, el("td", "", clock(e.ts)), el("td", "", e.verdict), el("td", "", e.method), el("td", "", e.target), el("td", "", e.rule));
-    t.append(tr);
-  }
-  preserveFocus(p, () => p.replaceChildren(...granted, ...error, t));
+  parts.push(requestsSection());
+  preserveFocus(p, () => p.replaceChildren(...parts));
+}
+
+/** The session's captured requests under its decisions: filterable by host and status, newest first (U2). */
+function requestsSection() {
+  const box = el("section", "net-requests");
+  box.setAttribute("aria-label", "Requests");
+  box.append(el("h3", "", "Requests"));
+  const all = allExchanges();
+  if (S.exch.error) box.append(el("p", "error", S.exch.error));
+  if (!all.length) { box.append(el("p", "dim", S.exch.loaded ? C.exchangeCountLine(0, 0) : "Loading requests…")); return box; }
+  const opts = C.exchangeFilterOptions(all);
+  if (!opts.hosts.includes(S.exFilter.host)) S.exFilter.host = "all";
+  if (S.exFilter.status !== "all" && !opts.statuses.some((o) => o.key === S.exFilter.status)) S.exFilter.status = "all";
+  const bar = el("div", "tfilters");
+  bar.setAttribute("role", "group");
+  bar.setAttribute("aria-label", "Filter requests");
+  const select = (label, key, options) => {
+    const s = el("select");
+    for (const [value, text] of options) s.append(new Option(text, value));
+    s.value = S.exFilter[key];
+    s.dataset.focusKey = "ex-filter:" + key;
+    s.addEventListener("change", () => { S.exFilter[key] = s.value; want("right"); });
+    const l = el("label", "", label + " ");
+    l.append(s);
+    return l;
+  };
+  add(bar, select("Host", "host", [["all", "Any"], ...opts.hosts.map((h) => [h, h])]), select("Status", "status", [["all", "Any"], ...opts.statuses.map((o) => [o.key, o.label])]));
+  const shown = C.filterExchanges(all, S.exFilter).reverse();
+  box.append(bar, el("p", "dim ex-count", C.exchangeCountLine(shown.length, all.length)), exchangeList(shown.slice(0, 500), "net-"));
+  return box;
 }
 
 function budgetWords(b) {
@@ -4201,6 +4877,7 @@ function renderSessionTab(p, info) {
     }
     row("agents", d);
   }
+  const mcp = S.mcp.id === info.id ? mcpSection(S.mcp.list) : null;
   const pref = el("div", "copy-pref");
   const label = el("label", "check");
   const box = el("input");
@@ -4212,8 +4889,42 @@ function renderSessionTab(p, info) {
   add(label, box, document.createTextNode(" Copy on select"));
   add(pref, label, el("p", "dim", "Off by default. When on, text you select in the chat, a tool output or the viewer is copied as you let go of the mouse or key, and a short note says how much. Nothing is copied while you type in a field."));
   pref.lastChild.id = "copy-on-select-note";
-  p.replaceChildren(kv, pref);
+  p.replaceChildren(...[kv, mcp, pref].filter(Boolean));
 }
+
+/** The MCP servers of a session: one card each (name, transport, state, tools expandable, a collapsed error and stderr block). */
+function mcpSection(servers) {
+  if (!servers || !servers.length) return null;
+  const box = el("section", "mcp-servers");
+  box.setAttribute("aria-label", "MCP servers");
+  add(box, el("h2", "", "MCP servers"));
+  for (const m of servers) {
+    const card = el("div", "mcp-server mcp-" + m.tone);
+    card.dataset.server = m.name;
+    const head = el("div", "mcp-head");
+    const state = el("span", m.tone === "neutral" ? "capsule" : "capsule tone-" + m.tone, m.state);
+    add(head, el("span", "name", m.name), el("span", "dim", m.transport), state);
+    if (m.callsWords) add(head, el("span", "dim", m.callsWords));
+    add(card, head);
+    if (m.toolCount) {
+      const d = el("details", "mcp-tools");
+      d.append(el("summary", "", m.toolsWords));
+      d.append(ul(...m.tools.map((t) => li(el("code", "", t)))));
+      add(card, d);
+    } else add(card, el("div", "dim", "no tools"));
+    if (m.changed) add(card, el("div", "tnote warn", "tools changed since start"));
+    if (m.hasDetail) {
+      const d = el("details", "mcp-detail");
+      d.append(el("summary", "", m.error ? "last error" : "stderr"));
+      if (m.error) d.append(el("div", "mcp-error", m.error));
+      if (m.stderr.length) d.append(textBox(m.stderr.join("\n"), "txt out mcp-stderr"));
+      add(card, d);
+    }
+    add(box, card);
+  }
+  return box;
+}
+
 
 // ---------------------------------------------------------------------------------------------
 // Copy on select: a preference kept in this browser, off until the operator turns it on.
@@ -4278,7 +4989,8 @@ const viewerStatus = (text) => { $("viewer-error").textContent = text; };
 
 /**
  * Open the dialog on a stored output. `source` may carry where to start (`start`, `end`), the
- * cited lines (`citeStart`, `citeEnd`) and where the output came from (`session`, `call`, `tool`,
+ * cited lines (`citeStart`, `citeEnd`), the lines the model was shown (`seenRanges`, marked without changing the standing
+ * sentence's evidence wording) and where the output came from (`session`, `call`, `tool`,
  * `producer`). Focus goes to the lines themselves, so the keyboard scrolls them at once and Enter
  * is not sitting on Close. `opener` is the control that asked, which gets focus back on close; a
  * click does not focus a button in every browser, so callers pass it.
@@ -4296,9 +5008,7 @@ function openViewer(blob, title, total, source = {}, opener = document.activeEle
       document.createTextNode(" in "), producer, document.createTextNode((source.call ? " · call " + source.call : "") + " · snapshot "));
   } else provenance.append(document.createTextNode("Snapshot "));
   provenance.append(el("span", "mono", "out:" + blob));
-  $("viewer-standing").textContent = source.citeStart
-    ? "Opening this stored snapshot is an operator action. It does not change what the model has observed, and it does not verify the claim."
-    : "This is a stored output snapshot. Opening it here does not change what the model has observed.";
+  $("viewer-standing").textContent = C.viewerStanding(source);
   $("viewer-find").value = "";
   $("viewer-start").value = String(source.citeStart || Math.max(1, source.start || 1));
   if (!dialog.open) dialog.showModal();
@@ -4325,7 +5035,8 @@ function loadViewer(blob, total, source, { opener = null, target = null } = {}) 
 
 function sourceLine(v, number, text) {
   const cited = !!v.source.citeStart && number >= v.source.citeStart && number <= (v.source.citeEnd || v.source.citeStart);
-  const row = el("span", "source-line" + (cited ? " cited-line" : "") + (number === v.target ? " target-line" : ""));
+  const seen = !cited && C.lineInRanges(v.source.seenRanges, number);
+  const row = el("span", "source-line" + (cited ? " cited-line" : "") + (seen ? " seen" : "") + (number === v.target ? " target-line" : ""));
   row.dataset.line = String(number);
   return add(row, el("span", "line-number", String(number)), el("span", "line-text", text), document.createTextNode("\n"));
 }
@@ -4537,7 +5248,7 @@ function updateDelivery(id) {
   const state = S.messageState.get(id);
   if (!state || !S.rec || S.rec.session !== id || state.state === "failed") return;
   const records = [...S.rec.records.values()];
-  const user = records.find(r => r.seq > state.afterSeq && r.kind === "user_message" && r.text === state.sentText);
+  const user = records.find(r => r.seq > state.afterSeq && r.kind === "user_message" && (r.text === state.sentText || (state.attached && C.splitAttachments(r.text).text === state.sentText.trimEnd())));
   if (!user) return;
   state.recordedSeq = user.seq;
   const request = records.find(r => r.seq > user.seq && r.kind === "model_request" && (!r.purpose || r.purpose === "step"));
@@ -4547,12 +5258,160 @@ function updateDelivery(id) {
   state.text = text;
 }
 
-async function sendMessage() {
+// ---------------------------------------------------------------------------------------------
+// Attachments (docs/UPLOADS.md): each file uploads at once and shows as a chip; Send carries the saved paths.
+
+/** Kept in memory with the drafts: draft key -> [{id, name, size, state: "uploading"|"done"|"failed", path, error, ws}]. */
+const attachments = new Map();
+let attachSeq = 0;
+const attachCtx = {
+  composer: {
+    chips: "attach-chips",
+    key: () => (S.openId ? "message:" + S.openId : null),
+    workspace: () => (S.sessions.byId.get(S.openId) || {}).workspace || "",
+    changed: () => renderHeader(),
+  },
+  start: {
+    chips: "f-attach-chips",
+    key: () => "new",
+    workspace: () => $("f-workspace").value.trim(),
+    changed: () => {},
+  },
+};
+const attachList = (key) => attachments.get(key) || [];
+/** What Send needs to know: the saved paths, and whether an upload is still going or has failed. */
+function attachState(key) {
+  const list = attachList(key);
+  return {
+    paths: list.filter(a => a.state === "done").map(a => a.path),
+    busy: list.some(a => a.state === "uploading"),
+    failed: list.some(a => a.state === "failed"),
+  };
+}
+
+function renderChips(c) {
+  const key = c.key();
+  const list = key ? attachList(key) : [];
+  const box = $(c.chips);
+  box.replaceChildren();
+  box.hidden = !list.length;
+  for (const a of list) {
+    const chip = el("li", "attach-chip " + a.state);
+    add(chip, a.file && a.state !== "failed" && C.isImageFile(a.file) ? chipThumb(a.file, a.name) : icon(a.state === "failed" ? "alert" : "source"), el("span", "attach-name", a.name));
+    if (a.state === "uploading") add(chip, el("span", "attach-size", "Uploading…"));
+    else if (a.state === "failed") add(chip, el("span", "attach-error", a.error));
+    else add(chip, el("span", "attach-size", C.byteSize(a.size)));
+    const x = btn("×", "attach-x", () => {
+      attachments.set(key, attachList(key).filter(o => o !== a));
+      if (!attachList(key).length) attachments.delete(key);
+      renderChips(c);
+    });
+    x.setAttribute("aria-label", "Remove " + a.name);
+    x.title = "Remove " + a.name;
+    add(chip, x);
+    if (a.state === "failed") chip.setAttribute("role", "alert");
+    add(box, chip);
+    if (a.state !== "failed" && a.file && C.isImageFile(a.file) && c.key() && c.key() !== "new" && visionOff()) {
+      const note = el("li", "attach-note dim", C.NO_VISION_NOTE);
+      add(box, note);
+    } else if (a.state !== "failed" && a.file && C.isImageFile(a.file) && c.key() === "new" && newVisionOff()) {
+      add(box, el("li", "attach-note dim", C.NO_VISION_NOTE));
+    }
+  }
+  c.changed();
+}
+
+function addFiles(c, files) {
+  const key = c.key();
+  const ws = c.workspace();
+  if (!key || !files.length) return;
+  if (!ws) { toast("Enter a workspace first: attached files are saved in it."); return; }
+  const list = attachList(key);
+  attachments.set(key, list);
+  for (const file of files) {
+    const a = { id: ++attachSeq, name: file.name || "pasted-file", size: file.size, state: "uploading", path: "", error: "", ws, file };
+    list.push(a);
+    uploadOne(c, key, a, file);
+  }
+  renderChips(c);
+}
+
+async function uploadOne(c, key, a, file) {
+  try {
+    const r = await fetch("/api/uploads?workspace=" + encodeURIComponent(a.ws) + "&name=" + encodeURIComponent(a.name), {
+      method: "POST",
+      credentials: "omit",
+      headers: authHeaders({ "Content-Type": file.type || "application/octet-stream" }),
+      body: file,
+    });
+    if (r.status === 401) { lost(); return; }
+    const text = await r.text();
+    if (!r.ok) throw new Error(C.errorSentence(r.status, text));
+    const v = JSON.parse(text);
+    a.path = v.path;
+    a.name = v.name || a.name;
+    a.size = Number.isFinite(v.bytes) ? v.bytes : a.size;
+    a.state = "done";
+  } catch (e) {
+    a.state = "failed";
+    a.error = e.message;
+  }
+  if (attachList(key).includes(a) && c.key() === key) renderChips(c);
+}
+
+/** Wire one attach button, file input, drop zones and paste target to a context. */
+function wireAttach(c, { button, input, drops, paste, canDrop = () => true }) {
+  $(button).addEventListener("click", () => $(input).click());
+  $(input).addEventListener("change", () => { addFiles(c, [...$(input).files]); $(input).value = ""; });
+  const hasFiles = (e) => e.dataTransfer && [...(e.dataTransfer.types || [])].includes("Files");
+  for (const id of drops) {
+    const zone = $(id);
+    zone.addEventListener("dragover", (e) => {
+      if (!hasFiles(e) || !canDrop()) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = "copy";
+      zone.classList.add("drop-on");
+    });
+    zone.addEventListener("dragleave", (e) => { if (!zone.contains(e.relatedTarget)) zone.classList.remove("drop-on"); });
+    zone.addEventListener("drop", (e) => {
+      zone.classList.remove("drop-on");
+      if (!hasFiles(e) || !canDrop()) return;
+      e.preventDefault();
+      addFiles(c, [...e.dataTransfer.files]);
+    });
+  }
+  $(paste).addEventListener("paste", (e) => {
+    const files = [...((e.clipboardData && e.clipboardData.files) || [])];
+    // Text that arrives with a file (a copied cell also brings its picture) pastes as text.
+    if (!files.length || (e.clipboardData.getData("text/plain") || "") !== "") return;
+    e.preventDefault();
+    addFiles(c, files);
+  });
+}
+
+/** The new-mission form: attaching waits for a workspace, and a changed workspace drops the files saved in the old one. */
+function syncNewAttach() {
+  const ws = $("f-workspace").value.trim();
+  $("f-attach").disabled = !ws;
+  $("f-attach").title = ws ? "Attach files; they are saved in the workspace" : "Enter a workspace first: attached files are saved in it.";
+  const list = attachList("new");
+  const note = $("f-attach-note");
+  if (list.some(a => a.ws !== ws)) {
+    attachments.delete("new");
+    renderChips(attachCtx.start);
+    note.textContent = "The workspace changed, so the attached files were cleared. Attach them again.";
+    note.hidden = false;
+  } else if (!list.length && ws) note.hidden = true;
+}
+
+async function sendMessage(when = S.sendWhen || "now") {
+  S.sendWhen = "now";
   const id = S.openId;
   const key = "message:" + id;
   const text = $("msg").value;
   const previous = S.messageState.get(id);
-  if (!id || !text.trim() || S.sending.has(id)) return;
+  const att = attachState(key);
+  if (!id || (!text.trim() && !att.paths.length) || att.busy || att.failed || S.sending.has(id)) return;
   if (!S.rec?.initialComplete) {
     toast("Wait for the session record to finish loading before sending.");
     return;
@@ -4566,13 +5425,19 @@ async function sendMessage() {
   C.setDraft(S.drafts, key, text);
   S.seatNote.delete(id);
   S.sending.add(id);
-  S.messageState.set(id, { state: "sending", accepted: false, sentText: text, afterSeq: C.lastSeq(S.rec) ?? -1, text: "Sending to " + (info.title || id) + "…", at: ++S.stamp });
+  S.messageState.set(id, { state: "sending", accepted: false, sentText: text, attached: att.paths.length > 0, afterSeq: C.lastSeq(S.rec) ?? -1, text: "Sending to " + (info.title || id) + "…", at: ++S.stamp });
   renderHeader();
   try {
-    await api("POST", "/api/sessions/" + encodeURIComponent(id) + "/messages", { text });
+    const reply = await api("POST", "/api/sessions/" + encodeURIComponent(id) + "/messages", { ...(att.paths.length ? { text, attachments: att.paths } : { text }), ...(queueNow(id, when) ? { when: "after_turn" } : {}) });
+    const sent = new Set(att.paths);
+    const rest = attachList(key).filter(a => !sent.has(a.path));
+    if (rest.length) attachments.set(key, rest); else attachments.delete(key);
+    renderChips(attachCtx.composer);
     const state = S.messageState.get(id);
     state.accepted = true;
-    if (state.state !== "delivered") { state.state = "queued"; state.text = "Message accepted · awaiting its recorded delivery."; state.at = ++S.stamp; }
+    // A message held for after the turn answers {queued: {...}}; an idle lead took it at once and answers {}.
+    if (reply && reply.queued) { state.state = "held"; state.text = "Queued for after this turn; edit or send it now above."; state.at = ++S.stamp; }
+    else if (state.state !== "delivered") { state.state = "queued"; state.text = "Message accepted · awaiting its recorded delivery."; state.at = ++S.stamp; }
     if (C.clearDraftIfUnchanged(S.drafts, key, text)) setDraft(key, "");
     if (S.openId === id) { updateDelivery(id); S.follow = true; }
   } catch (e) {
@@ -4595,6 +5460,163 @@ function seatModels() {
 async function loadProfiles() {
   try { S.profiles = await api("GET", "/api/models"); } catch { /* /api/status still names the profiles */ }
   if (S.view === "session") want("header");
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// Queued messages (docs/CONTRACTS-2026-11-23.md E5)
+
+S.queued = { session: null, items: [], error: "", editing: null, editText: "", busy: new Set() };
+
+async function loadQueued() {
+  const id = S.openId;
+  if (!id) return;
+  try {
+    const items = C.queuedList(await api("GET", C.queuedUrl(id)));
+    if (S.openId !== id) return;
+    S.queued.session = id;
+    S.queued.items = items;
+    S.queued.error = "";
+    if (S.queued.editing && !items.some(i => i.id === S.queued.editing)) S.queued.editing = null;
+  } catch (e) {
+    if (S.openId !== id) return;
+    // A daemon without the route says nothing: the list stays empty and the composer keeps working.
+    S.queued.session = id;
+    S.queued.items = [];
+    S.queued.error = e.status === 404 ? "" : e.message;
+  }
+  renderQueue();
+  renderCaption(S.sessions.byId.get(id));
+}
+
+function queuedCount() {
+  return S.queued.session === S.openId ? S.queued.items.length : 0;
+}
+
+async function queueAct(item, what) {
+  const id = S.openId;
+  const busy = S.queued.busy;
+  if (busy.has(item.id)) return;
+  busy.add(item.id);
+  S.queued.error = "";
+  try {
+    if (what === "remove") await api("DELETE", C.queuedUrl(id, item.id));
+    else if (what === "send") await api("POST", C.queuedUrl(id, item.id, "send"));
+    else if (what === "save") {
+      await api("PUT", C.queuedUrl(id, item.id), { text: S.queued.editText });
+      S.queued.editing = null;
+    }
+  } catch (e) {
+    // 404: it was just sent or removed elsewhere; the list below is the truth.
+    S.queued.error = e.status === 404 ? "That message is no longer queued; it may have just been sent." : e.message;
+    if (e.status === 404 && S.queued.editing === item.id) S.queued.editing = null;
+  } finally {
+    busy.delete(item.id);
+  }
+  await loadQueued();
+}
+
+function renderQueue() {
+  const box = $("queue-box");
+  const items = S.queued.session === S.openId && S.view === "session" ? S.queued.items : [];
+  const editing = S.queued.editing;
+  // An edit in progress keeps its textarea (and focus) while the list refreshes around it.
+  const keep = editing && box.querySelector("textarea.queue-edit");
+  if (keep && items.some(i => i.id === editing) && !S.queued.error) {
+    return;
+  }
+  const hadFocus = box.contains(document.activeElement) ? document.activeElement.dataset.focusKey : null;
+  box.replaceChildren();
+  box.hidden = !items.length && !S.queued.error;
+  if (!items.length && !S.queued.error) return;
+  const head = el("h2", "queue-head", "Queued for after this turn · " + items.length);
+  head.id = "queue-head";
+  add(box, head);
+  if (S.queued.error) {
+    const err = el("p", "error", S.queued.error);
+    err.setAttribute("role", "alert");
+    add(box, err);
+  }
+  const list = el("ul", "queue-list");
+  list.setAttribute("aria-labelledby", "queue-head");
+  for (const item of items) {
+    const li = el("li", "queue-item");
+    const busy = S.queued.busy.has(item.id);
+    if (S.queued.editing === item.id) {
+      const ta = el("textarea", "queue-edit");
+      ta.value = S.queued.editText;
+      ta.rows = 3;
+      ta.setAttribute("aria-label", "Edit queued message");
+      ta.dataset.focusKey = "q-edit:" + item.id;
+      ta.addEventListener("input", () => { S.queued.editText = ta.value; });
+      ta.addEventListener("keydown", (e) => {
+        if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); S.queued.editing = null; renderQueue(); focusQueue("q-editbtn:" + item.id); }
+      });
+      const save = btn("Save", "small primary", () => queueAct(item, "save"));
+      save.disabled = busy || !S.queued.editText.trim();
+      const cancel = btn("Cancel", "small", () => { S.queued.editing = null; renderQueue(); focusQueue("q-editbtn:" + item.id); });
+      add(li, ta, add(el("div", "queue-actions"), save, cancel));
+    } else {
+      const preview = el("p", "queue-text", C.queuedPreview(item.text) || "(files only)");
+      preview.title = item.text;
+      if (item.attachments.length) add(preview, el("span", "dim", " · " + item.attachments.length + (item.attachments.length === 1 ? " file" : " files")));
+      const edit = btn("Edit", "small", () => { S.queued.editing = item.id; S.queued.editText = item.text; renderQueue(); focusQueue("q-edit:" + item.id); });
+      edit.dataset.focusKey = "q-editbtn:" + item.id;
+      edit.setAttribute("aria-label", "Edit queued message: " + C.queuedPreview(item.text, 40));
+      const now = btn("Send now", "small", () => queueAct(item, "send"));
+      now.dataset.focusKey = "q-send:" + item.id;
+      now.setAttribute("aria-label", "Send now: " + C.queuedPreview(item.text, 40));
+      const rm = btn("Remove", "small", () => queueAct(item, "remove"));
+      rm.dataset.focusKey = "q-rm:" + item.id;
+      rm.setAttribute("aria-label", "Remove queued message: " + C.queuedPreview(item.text, 40));
+      for (const b of [edit, now, rm]) b.disabled = busy;
+      add(li, preview, add(el("div", "queue-actions"), edit, now, rm));
+    }
+    add(list, li);
+  }
+  add(box, list);
+  if (hadFocus) focusQueue(hadFocus);
+}
+function focusQueue(key) {
+  const node = [...$("queue-box").querySelectorAll("[data-focus-key]")].find(n => n.dataset.focusKey === key);
+  if (node) node.focus({ preventScroll: true });
+}
+
+/** Send now (the default) or queue for after the turn: only a running lead can queue. */
+async function sendChoice(when) {
+  S.sendWhen = when;
+  closeSendMenu();
+  await sendMessage();
+}
+function closeSendMenu(refocus = false) {
+  const menu = $("send-menu");
+  if (menu.hidden) return;
+  menu.hidden = true;
+  $("send-more").setAttribute("aria-expanded", "false");
+  if (refocus) $("send-more").focus({ preventScroll: true });
+}
+function openSendMenu() {
+  const menu = $("send-menu");
+  menu.hidden = false;
+  $("send-more").setAttribute("aria-expanded", "true");
+  menu.querySelector("button").focus({ preventScroll: true });
+}
+
+/** Does the open session's model take no images (its profile says vision: false)? Unknown counts as "takes them". */
+function visionOff() {
+  const info = S.sessions.byId.get(S.openId);
+  return !!info && C.modelVision(seatModels(), C.currentModel(S.rec, info)) === false;
+}
+function newVisionOff() {
+  const want = S.newForm && S.newForm.model;
+  const models = seatModels();
+  const profile = want || (S.profiles && S.profiles.default_model) || "";
+  return !!profile && C.modelVision(models, { profile }) === false;
+}
+/** Queue only a running lead's message that was asked to wait; anything else is sent now. */
+function queueNow(id, when) {
+  const info = S.sessions.byId.get(id);
+  return when === "after_turn" && !!info && C.sessionActions(info).running && C.rootNoun(info) === "lead";
 }
 
 /** The select shows the session's profile; another choice waits behind an inline confirmation. */
@@ -4973,6 +5995,26 @@ function keyboard(e) {
   else if (action === "needs-prev") stepNeeds(-1);
   else if (action === "keys") openKeys();
   else if (action === "find") openFind();
+  else if (action === "mine-next") stepMine(1);
+  else if (action === "mine-prev") stepMine(-1);
+}
+
+/** [ and ]: the operator's own previous or next message, from the record nearest the top of the transcript. */
+function stepMine(dir) {
+  if (S.view !== "session" || !S.rec) return;
+  if (S.section !== "chat") setSection("chat");
+  // The record at the top of the visible transcript: the first rendered block whose bottom is below the scroller's top edge.
+  const edge = chatScroller().getBoundingClientRect().top + 8;
+  const byId = new Map(S.rec.blocks.map(b => [String(b.id), b]));
+  let top = null;
+  for (const n of $("blocks").querySelectorAll("[data-bid]")) {
+    if (n.getBoundingClientRect().bottom <= edge) continue;
+    const b = byId.get(n.dataset.bid);
+    if (b && Number.isFinite(b.seq)) { top = b.seq; break; }
+  }
+  const seq = C.mineStep(S.rec.blocks, top, dir);
+  if (seq === null) { toast(dir > 0 ? "No later message of yours" : "No earlier message of yours"); return; }
+  jumpToRecord(seq, { highlight: true });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -5018,7 +6060,8 @@ function renderFind() {
   if (text && S.rec && !S.rec.initialComplete) text += " (the record is still loading)";
   // The live region is written only when its words change, so typing does not repeat itself.
   if (text !== findSaid) { findSaid = text; $("find-count").textContent = text; }
-  const hint = r ? C.findHint(r) : "";
+  const unloaded = S.rec && C.hasEarlier(S.rec) && $("find-q").value.trim() ? C.FIND_EARLIER_WORDS : "";
+  const hint = [r ? C.findHint(r) : "", unloaded].filter(Boolean).join(" ");
   if ($("find-hint").textContent !== hint) $("find-hint").textContent = hint;
   $("find-go").disabled = !hit;
 }
@@ -5036,8 +6079,9 @@ function findRun(jump) {
   if (jump && cur >= 0) jumpToRecord(result.hits[cur].seq, { done: (node) => { FIND.node = node; } });
 }
 
-function findStep(dir) {
+async function findStep(dir) {
   if (!$("find-q").value.trim()) return;
+  if (S.rec && C.hasEarlier(S.rec)) { await loadEarlier(S.rec, { all: true }); if (!S.rec || $("find-bar").hidden) return; }
   findRun(false); // the record may have grown since the last search
   const r = FIND.result;
   if (!r || !r.count) return;
@@ -5065,7 +6109,10 @@ function wireFind() {
     // Typing only counts (after a pause); Enter, Next and Previous go to a match.
     FIND.timer = setTimeout(() => findRun(false), 350);
   });
-  $("find-kind").addEventListener("change", () => findRun(true));
+  $("find-kind").addEventListener("change", async () => {
+    if (S.rec && C.hasEarlier(S.rec) && $("find-q").value.trim()) await loadEarlier(S.rec, { all: true });
+    findRun(true);
+  });
   $("find-bar").addEventListener("keydown", (e) => {
     if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); closeFind(); }
     else if (e.key === "Enter" && e.target === $("find-q")) { e.preventDefault(); clearTimeout(FIND.timer); findStep(e.shiftKey ? -1 : 1); }
@@ -5113,6 +6160,7 @@ function workspaceNote() {
   if (!pending) pickerCreate = null;
   note.textContent = pending ? "This folder does not exist yet. It is created when the mission starts." : "";
   note.hidden = !pending;
+  syncNewAttach();
 }
 
 function hideCreateAsk() {
@@ -5601,6 +6649,16 @@ function wire() {
     if (location.hash === "#/inbox") route();
     else location.hash = "#/inbox";
   });
+  $("btn-targets").addEventListener("click", () => { location.hash = C.targetHash(""); });
+  $("exview-close").addEventListener("click", closeExchange);
+  $("exview-reveal").addEventListener("click", () => { if (S.exview) { S.exview.revealed = !S.exview.revealed; renderExchange(); } });
+  $("exview").addEventListener("close", () => {
+    S.exview = null;
+    const o = exOpener;
+    exOpener = null;
+    if (o && document.contains(o)) o.focus({ preventScroll: true });
+  });
+  $("exview").addEventListener("click", (e) => { if (e.target === $("exview")) closeExchange(); });
   $("btn-new").addEventListener("click", () => {
     if (location.hash === "#/new") route();
     else location.hash = "#/new";
@@ -5710,6 +6768,7 @@ function wire() {
   $("b-rename").addEventListener("click", renameSession);
   $("b-rename").title = "Rename this mission.";
   $("b-stop").addEventListener("click", (e) => askHeaderConfirm("stop", S.sessions.byId.get(S.openId), e.currentTarget));
+  $("c-stop").addEventListener("click", (e) => askHeaderConfirm("stop", S.sessions.byId.get(S.openId), e.currentTarget));
   $("b-stop").title = "Stop this session and cancel its descendant agents and tracked jobs.";
   $("b-resume").addEventListener("click", () => sessionAction("resume"));
   $("b-archive").addEventListener("click", (e) => askHeaderConfirm("archive", S.sessions.byId.get(S.openId), e.currentTarget));
@@ -5752,14 +6811,48 @@ function wire() {
   });
   $("model-confirm-yes").addEventListener("click", applySeat);
   $("model-confirm-no").addEventListener("click", cancelSeat);
+  if (!MAC) $("f-message-note").textContent = "Ctrl+Enter starts the mission.";
+  // ⌘Enter (Ctrl+Enter elsewhere) starts the mission from the message box; Enter alone adds a line.
+  $("f-message").addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && !e.isComposing) { e.preventDefault(); $("new-form").requestSubmit(); }
+  });
   $("composer").addEventListener("keydown", (e) => { if (e.key === "Escape" && S.seat && !S.seatBusy.has(S.seat.session)) { e.preventDefault(); cancelSeat(); } });
   const msg = $("msg");
   msg.addEventListener("input", () => { if (S.openId) C.setDraft(S.drafts, "message:" + S.openId, msg.value); renderHeader(); });
-  $("send").addEventListener("click", sendMessage);
+  $("send").addEventListener("click", () => sendMessage("now"));
+  $("send-more").addEventListener("click", () => ($("send-menu").hidden ? openSendMenu() : closeSendMenu(true)));
+  for (const choice of C.SEND_CHOICES) {
+    const item = $("send-menu").querySelector(`[data-when="${choice.when}"]`);
+    item.textContent = choice.label;
+    item.addEventListener("click", () => { closeSendMenu(); sendMessage(choice.when); });
+  }
+  $("send-menu").addEventListener("keydown", (e) => {
+    const items = [...$("send-menu").querySelectorAll("button")];
+    const at = items.indexOf(document.activeElement);
+    if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); closeSendMenu(true); }
+    else if (e.key === "ArrowDown") { e.preventDefault(); items[(at + 1) % items.length].focus(); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); items[(at + items.length - 1) % items.length].focus(); }
+    else if (e.key === "Tab") closeSendMenu();
+  });
+  document.addEventListener("click", (e) => { if (!$("send-menu").hidden && !e.target.closest("#send-group")) closeSendMenu(); });
+  $("imgview-close").addEventListener("click", closeImage);
+  $("imgview-copy").addEventListener("click", async () => {
+    const path = $("imgview-copy").dataset.path;
+    await copyText(path, { label: "Path" });
+  });
+  $("imgview").addEventListener("close", () => { const o = imageOpener; imageOpener = null; if (o && document.contains(o)) o.focus({ preventScroll: true }); $("imgview-img").removeAttribute("src"); });
+  $("imgview").addEventListener("click", (e) => { if (e.target === $("imgview")) closeImage(); });
+  wireAttach(attachCtx.composer, {
+    button: "attach-btn", input: "attach-file", drops: ["composer", "scroller"], paste: "msg",
+    canDrop: () => !$("attach-btn").hidden && !$("msg").disabled,
+  });
+  wireAttach(attachCtx.start, { button: "f-attach", input: "f-file", drops: ["new-form"], paste: "f-message" });
   msg.addEventListener("keydown", (e) => {
-    if (C.composerAction({ key: e.key, shiftKey: e.shiftKey, isComposing: e.isComposing, text: msg.value, coarse: COARSE.matches, mod: e.ctrlKey || e.metaKey }) !== "none") {
+    const info = S.sessions.byId.get(S.openId);
+    const act = C.composerAction({ key: e.key, shiftKey: e.shiftKey, isComposing: e.isComposing, text: msg.value || (attachState("message:" + S.openId).paths.length ? "attached" : ""), coarse: COARSE.matches, mod: e.ctrlKey || e.metaKey, alt: e.altKey, running: !!info && C.sessionActions(info).running && C.rootNoun(info) === "lead" });
+    if (act !== "none") {
       e.preventDefault();
-      sendMessage();
+      if (act !== "ignore") sendMessage(act === "queue" ? "after_turn" : "now");
     }
   });
 
@@ -5880,6 +6973,527 @@ $("picker").addEventListener("keydown", pickerEmptyKeys);
   });
 }
 
+// ---------------------------------------------------------------------------------------------
+// Captured exchanges (docs/CONTRACTS-TRAFFIC-TARGETS.md C, U1-U3)
+
+/** The session's exchanges: what the daemon listed (the whole mission's sessions) with the ones the open record holds, oldest first. */
+function allExchanges() {
+  const list = S.exch.list.slice();
+  if (S.rec) for (const x of S.rec.exchanges) C.mergeExchange(list, { ...x, session: x.session || S.openId });
+  return list;
+}
+
+/** One exchange as a row that opens the viewer. */
+function exchangeButton(x, key) {
+  const row = C.exchangeRow(x);
+  const b = el("button", "exrow tone-" + row.tone);
+  b.type = "button";
+  b.dataset.focusKey = key || "ex:" + x.id;
+  b.dataset.exchange = x.id;
+  add(b, el("span", "ex-method", x.method), el("span", "ex-where mono", row.where), el("span", "ex-status", row.status), el("span", "ex-size dim", row.size), el("span", "ex-time dim", row.time));
+  for (const m of row.marks) { const mark = el("span", "ex-mark", m.text); mark.title = m.tip; b.append(mark); }
+  if (row.words) b.append(el("span", "ex-error dim", row.words));
+  b.setAttribute("aria-label", `${row.text}${row.marks.length ? " · " + row.marks.map((m) => m.text).join(", ") : ""}`);
+  b.addEventListener("click", (e) => openExchange(x, e.currentTarget));
+  return b;
+}
+
+function exchangeList(list, keyPrefix) {
+  const ul = el("ul", "ex-list");
+  for (const x of list) add(ul, add(el("li"), exchangeButton(x, keyPrefix + x.id)));
+  return ul;
+}
+
+async function loadExchanges() {
+  const id = S.openId;
+  const info = id && S.sessions.byId.get(id);
+  if (!info) return;
+  const request = ++S.requests.exch;
+  const ids = [...S.sessions.byId.values()].filter((s) => s.id === id || (info.mission && s.mission === info.mission)).map((s) => s.id);
+  const list = [];
+  let error = null;
+  await Promise.all(ids.map(async (sid) => {
+    try {
+      const rows = await api("GET", "/api/exchanges/" + encodeURIComponent(sid) + "?limit=2000");
+      for (const r of Array.isArray(rows) ? rows : []) { const x = C.exchangeOf({ ...r, session: r.session || sid }); if (x) C.mergeExchange(list, x); }
+    } catch (e) {
+      // An older daemon has no such route: there is simply nothing to list.
+      if (e.status !== 404) error = e.message;
+    }
+  }));
+  if (S.openId !== id || request !== S.requests.exch) return;
+  S.exch = { session: id, list, error, loaded: true };
+  want("right", "overview", "blocks");
+}
+
+/** The claim's hosts, each `reached · ex-…` (links) or `not reached`, under the claim; null when it names no host. */
+function reachLine(claim) {
+  const target = S.rec && S.rec.start && S.rec.start.target;
+  const scope = target ? C.parseScope(target.scope, target.exclude) : null;
+  const list = allExchanges();
+  const reach = C.claimReach(claim, list, scope);
+  if (!reach.length) return null;
+  const box = el("ul", "reach");
+  box.setAttribute("aria-label", "Hosts this claim names");
+  for (const r of reach) {
+    const item = el("li", "reach-item " + (r.reached ? "reached" : "not-reached"));
+    item.title = C.reachWords(r);
+    add(item, el("span", "reach-host mono", r.host));
+    if (r.reached) {
+      add(item, el("span", "reach-state", "reached"), document.createTextNode(" · "));
+      r.ids.forEach((id, i) => {
+        if (i) item.append(document.createTextNode(" "));
+        const x = list.find((e) => e.id === id);
+        item.append(btn(id, "link mono keylink", (e) => openExchange(x, e.currentTarget)));
+      });
+    } else {
+      add(item, el("span", "reach-state", "not reached"));
+    }
+    box.append(item);
+  }
+  return box;
+}
+
+// -- the exchange viewer
+
+let exOpener = null;
+
+async function openExchange(x, opener = document.activeElement) {
+  if (!x) return;
+  exOpener = opener;
+  S.exview = { ex: x, revealed: false, req: null, res: null, reqError: null, resError: null, loading: true };
+  const v = S.exview;
+  renderExchange();
+  const dialog = $("exview");
+  if (!dialog.open) dialog.showModal();
+  $("exview-close").focus({ preventScroll: true });
+  const read = async (ref, key) => {
+    if (!ref) return;
+    try { v[key] = await fetchStoredText(ref.id); } catch (e) { v[key + "Error"] = e.message; }
+  };
+  await Promise.all([read(x.request, "req"), read(x.response, "res")]);
+  if (S.exview !== v) return;
+  v.loading = false;
+  renderExchange();
+}
+
+function closeExchange() {
+  S.exview = null;
+  if ($("exview").open) $("exview").close();
+}
+
+function messagePane(title, ref, text, error, v, label) {
+  const pane = el("section", "ex-side");
+  pane.setAttribute("aria-label", label);
+  const head = el("div", "ex-side-head");
+  add(head, el("h3", "", title));
+  pane.append(head);
+  if (!ref) { pane.append(el("p", "dim", title === "Response" ? (v.ex.error ? "No response: " + v.ex.error : "No response was received.") : "No request was stored.")); return pane; }
+  if (error) {
+    pane.append(el("p", "error", error));
+    add(pane, openAsOutput(ref, `${title} of ${v.ex.id}`));
+    return pane;
+  }
+  if (text === null) { pane.append(el("p", "dim", "Loading…")); return pane; }
+  const m = C.messageView(text, { revealed: v.revealed });
+  pane.append(el("pre", "ex-start mono", m.start));
+  if (m.rows.length) {
+    const t = el("table", "ex-headers");
+    for (const r of m.rows) {
+      const val = el("td", "ex-hval mono" + (r.sensitive && !v.revealed ? " masked" : ""), r.shown);
+      add(t, add(el("tr"), el("th", "mono", r.name), val));
+    }
+    pane.append(t);
+  } else pane.append(el("p", "dim", "No headers."));
+  const bodyNote = m.cut ? `${m.bodyWords} · first ${C.byteSize(C.EXCHANGE_BODY_CAP)} shown` : m.bodyWords;
+  pane.append(el("div", "label", "Body"), el("div", "dim ex-body-note", bodyNote));
+  if (m.body) pane.append(el("pre", "txt out ex-body", m.body));
+  const actions = el("div", "copy-row");
+  if (m.body) add(actions, copyButton("Copy body", () => m.fullBody, { what: "Body", text: true, cls: "ghost", key: "ex-copy:" + title }));
+  add(actions, openAsOutput(ref, `${title} of ${v.ex.id}`));
+  pane.append(actions);
+  return pane;
+}
+
+function openAsOutput(ref, title) {
+  const b = btn("Open as output", "small ghost", (e) => openViewer(ref.id, title, ref.lines || null, {}, e.currentTarget));
+  b.title = "Open the stored message in the output viewer, line by line.";
+  return b;
+}
+
+function renderExchange() {
+  const v = S.exview;
+  if (!v) return;
+  const x = v.ex;
+  const row = C.exchangeRow(x);
+  $("exview-title").textContent = `${x.method} ${row.where}`;
+  const info = [x.id, row.status, row.size, row.time].filter(Boolean).join(" · ");
+  $("exview-info").textContent = info;
+  const marks = $("exview-marks");
+  marks.replaceChildren(...row.marks.map((m) => { const c = chip(m.text, "dim"); c.title = m.tip; return c; }));
+  const how = x.source === "proxy" ? "Captured by loom's proxy" : `Sent by ${x.tool || "a tool"}`;
+  $("exview-how").textContent = how + (x.call_id ? ` · call ${x.call_id}` : "");
+  const reveal = $("exview-reveal");
+  const secrets = v.req !== null && C.messageView(v.req).hasSecrets || v.res !== null && C.messageView(v.res).hasSecrets;
+  reveal.hidden = !secrets;
+  reveal.textContent = v.revealed ? "Hide secrets" : "Reveal secrets";
+  reveal.setAttribute("aria-pressed", String(v.revealed));
+  $("exview-note").hidden = !secrets;
+  $("exview-note").textContent = v.revealed ? "Secret header values are showing. They are never stored in a copy of this page." : "Authorization, cookie and API-key values are hidden. Reveal shows them on this screen only.";
+  $("exview-sides").replaceChildren(
+    messagePane("Request", x.request, v.req, v.reqError, v, "Request"),
+    messagePane("Response", x.response, v.res, v.resError, v, "Response"),
+  );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Targets (docs/CONTRACTS-TRAFFIC-TARGETS.md T, U4)
+
+async function loadTargets() {
+  try {
+    const list = await api("GET", "/api/targets");
+    S.targets = { supported: true, list: (Array.isArray(list) ? list : []).map(C.targetOf), error: null };
+  } catch (e) {
+    // An older daemon has no targets: the entry is not shown, and nothing says why.
+    S.targets = { supported: e.status === 404 ? false : S.targets.supported, list: S.targets.list, error: e.status === 404 ? null : e.message };
+  }
+  $("btn-targets").hidden = S.targets.supported !== true;
+  renderNewTarget();
+  if (S.view === "targets") renderTargets();
+}
+
+function renderNewTarget() {
+  const field = $("f-target-field");
+  const sel = $("f-target");
+  const names = S.targets.supported === true ? S.targets.list.map((t) => t.name) : [];
+  field.hidden = names.length === 0;
+  const keep = sel.options.length ? sel.value : "";
+  sel.replaceChildren(new Option("None: a private security state", ""), ...names.map((n) => new Option(n, n)));
+  if (names.includes(keep)) sel.value = keep;
+}
+
+function showTargets() {
+  setView("targets");
+  renderTargets();
+  loadTargets();
+}
+
+function renderTargets() {
+  const box = $("targets-body");
+  const frag = document.createDocumentFragment();
+  if (S.targets.error) frag.append(el("p", "error", S.targets.error));
+  if (S.targets.supported === false) frag.append(el("p", "dim", "This daemon does not keep targets."));
+  else if (S.targets.supported === null) frag.append(el("p", "dim", "Loading targets…"));
+  else if (!S.targets.list.length) frag.append(el("p", "dim", "No target yet. Create one with loom target add, then name it when you start a mission."));
+  else {
+    const ul = el("ul", "target-list");
+    for (const t of S.targets.list) {
+      const a = link("", C.targetHash(t.name));
+      a.className = "target-card";
+      add(a, el("strong", "", t.name), el("span", "dim", t.scope.join(", ")), el("span", "dim", t.words));
+      add(ul, add(el("li"), a));
+    }
+    frag.append(ul);
+  }
+  box.replaceChildren(frag);
+}
+
+const TP_FILTERS = () => ({ status: "all", kind: "all", text: "" });
+
+async function showTargetPage(name) {
+  setView("target");
+  if (!S.tp || S.tp.name !== name) S.tp = { name, cfg: null, nodes: [], error: null, loaded: false, filters: TP_FILTERS(), collapsed: new Set(), sel: null, ex: { node: null, list: [], error: null }, edit: null, saved: "", scroll: 0 };
+  renderTargetPage();
+  await loadTargetPage();
+}
+
+async function loadTargetPage() {
+  const tp = S.tp;
+  if (!tp) return;
+  const request = ++S.requests.target;
+  try {
+    const [list, graph] = await Promise.all([api("GET", "/api/targets"), api("GET", "/api/targets/" + encodeURIComponent(tp.name) + "/graph")]);
+    if (S.tp !== tp || request !== S.requests.target) return;
+    S.targets = { supported: true, list: (Array.isArray(list) ? list : []).map(C.targetOf), error: null };
+    tp.cfg = S.targets.list.find((t) => t.name === tp.name) || null;
+    tp.nodes = C.graphNodes(graph);
+    tp.error = tp.cfg ? null : `There is no target named ${tp.name}.`;
+  } catch (e) {
+    if (S.tp !== tp || request !== S.requests.target) return;
+    tp.error = e.status === 404 ? `There is no target named ${tp.name}.` : e.message;
+  }
+  tp.loaded = true;
+  if (S.view === "target" && S.tp === tp) renderTargetPage();
+}
+
+function targetFilterBar(tp) {
+  const bar = el("div", "tfilters");
+  bar.setAttribute("role", "group");
+  bar.setAttribute("aria-label", "Filter the tree");
+  const select = (label, key, options) => {
+    const s = el("select");
+    for (const [value, text] of options) s.append(new Option(text, value));
+    s.value = tp.filters[key];
+    s.addEventListener("change", () => { tp.filters[key] = s.value; tp.scroll = 0; renderTargetTree(); });
+    const l = el("label", "", label + " ");
+    l.append(s);
+    return l;
+  };
+  const text = el("input");
+  text.type = "search";
+  text.placeholder = "Part of a name";
+  text.value = tp.filters.text;
+  text.setAttribute("aria-label", "Filter by name");
+  text.addEventListener("input", () => { tp.filters.text = text.value; tp.scroll = 0; renderTargetTree(); });
+  add(bar,
+    select("Status", "status", [["all", "Any"], ...C.NODE_STATUSES.map((s) => [s, C.nodeStatusWords(s)])]),
+    select("Kind", "kind", [["all", "Any"], ...C.NODE_KINDS.map((k) => [k, k])]),
+    add(el("label", "", "Name "), text));
+  return bar;
+}
+
+function scopeEditor(tp) {
+  const box = el("section", "tscope");
+  box.setAttribute("aria-label", "Scope");
+  const head = heading("h2", "Scope");
+  box.append(head);
+  const list = (title, entries) => add(el("div", "tscope-col"), el("div", "label", title), entries.length ? el("ul", "tscope-list mono", "") : el("p", "dim", "none"));
+  if (!tp.edit) {
+    const cols = el("div", "tscope-cols");
+    for (const [title, entries] of [["In scope", tp.cfg.scope], ["Left out", tp.cfg.exclude]]) {
+      const col = list(title, entries);
+      const ul = col.querySelector("ul");
+      if (ul) for (const e of entries) ul.append(el("li", "", e));
+      cols.append(col);
+    }
+    box.append(cols);
+    if (tp.cfg.notes) box.append(el("p", "dim tnotes", tp.cfg.notes));
+    head.append(btn("Edit scope", "small", () => { tp.edit = { scope: C.scopeText(tp.cfg.scope), exclude: C.scopeText(tp.cfg.exclude), error: null, busy: false }; renderTargetPage(); }));
+    return box;
+  }
+  const f = el("form", "form tscope-form");
+  const area = (id, label, value, key) => {
+    const t = el("textarea", "mono");
+    t.id = id;
+    t.rows = 4;
+    t.value = value;
+    t.addEventListener("input", () => { tp.edit[key] = t.value; });
+    const l = el("label", "field");
+    l.htmlFor = id;
+    add(l, el("span", "", label));
+    return add(el("div", "field"), l, t);
+  };
+  add(f,
+    area("t-scope", "In scope: one entry per line (a name, *.name, an IP or a CIDR)", tp.edit.scope, "scope"),
+    area("t-exclude", "Left out: these win over the scope", tp.edit.exclude, "exclude"));
+  const err = el("p", "error", tp.edit.error || "");
+  err.setAttribute("role", "alert");
+  err.hidden = !tp.edit.error;
+  const save = btn(tp.edit.busy ? "Saving…" : "Save scope", "primary", () => {});
+  save.type = "submit";
+  save.disabled = tp.edit.busy;
+  add(f, err, add(el("div", "form-row"), save, btn("Cancel", "", () => { tp.edit = null; renderTargetPage(); })));
+  f.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const put = C.targetPut(tp.cfg, tp.edit.scope, tp.edit.exclude);
+    if (put.error) { tp.edit.error = put.error; renderTargetPage(); return; }
+    tp.edit.busy = true;
+    tp.edit.error = null;
+    renderTargetPage();
+    try {
+      await api("PUT", "/api/targets/" + encodeURIComponent(tp.name), put.body);
+      tp.edit = null;
+      await loadTargetPage();
+      loadTargets();
+    } catch (e) {
+      tp.edit = { ...tp.edit, busy: false, error: e.message };
+      renderTargetPage();
+    }
+  });
+  box.append(f);
+  return box;
+}
+
+function renderTargetPage() {
+  const tp = S.tp;
+  const box = $("target-body");
+  if (!tp) { box.replaceChildren(); return; }
+  $("target-title").textContent = tp.name;
+  const frag = document.createDocumentFragment();
+  if (tp.error) frag.append(el("p", "error", tp.error));
+  if (!tp.loaded) frag.append(el("p", "dim", "Loading the target…"));
+  if (tp.cfg) {
+    frag.append(scopeEditor(tp));
+    frag.append(el("p", "tcounts", C.countsWords(C.targetCounts(tp.nodes))));
+    const tree = el("section", "ttree-wrap");
+    tree.setAttribute("aria-label", "Assets");
+    add(tree, heading("h2", "Assets"), targetFilterBar(tp), el("p", "dim tshown", ""), el("div", "ttree"));
+    const layout = el("div", "tlayout");
+    add(layout, tree, el("aside", "tnode-panel"));
+    frag.append(layout);
+    const findings = C.targetFindings(tp.nodes);
+    const fs = el("section", "tfindings");
+    fs.setAttribute("aria-label", "Findings");
+    fs.append(heading("h2", "Findings"));
+    if (!findings.length) fs.append(el("p", "dim", "No findings on this target yet."));
+    else {
+      const ul = el("ul", "tfinding-list");
+      for (const f of findings) {
+        const li = el("li", "tfinding" + (f.open ? "" : " closed"));
+        const lead = [...S.sessions.byId.values()].find((s) => !s.parent && s.mission === f.mission);
+        add(li, chip(f.open ? "open" : f.status, f.open ? "bad" : "dim"), el("span", "mono dim", f.claim), el("strong", "", f.text), el("span", "dim", "on " + f.locator),
+          lead ? link("claim in its mission", C.sessionHash(lead.id, "evidence")) : null);
+        ul.append(li);
+      }
+      fs.append(ul);
+    }
+    frag.append(fs);
+    const ms = el("section", "tmissions");
+    ms.setAttribute("aria-label", "Missions");
+    ms.append(heading("h2", "Missions"));
+    const missions = C.targetMissions(tp.nodes, S.sessions.byId, tp.name);
+    if (!missions.length) ms.append(el("p", "dim", "No mission has worked on this target yet."));
+    else {
+      const ul = el("ul", "tmission-list");
+      for (const m of missions) add(ul, add(el("li"), m.session ? link(m.title, C.sessionHash(m.session, "chat")) : el("span", "", m.title), el("span", "dim", " · " + m.words)));
+      ms.append(ul);
+    }
+    frag.append(ms);
+  }
+  box.replaceChildren(frag);
+  renderTargetTree();
+}
+
+const TREE_ROW_PX = 40;
+
+function renderTargetTree() {
+  const tp = S.tp;
+  const host = $("target-body").querySelector(".ttree");
+  if (!tp || !host) return;
+  const res = C.targetTree(tp.nodes, tp.filters, tp.collapsed);
+  tp.rows = res.rows;
+  const shown = $("target-body").querySelector(".tshown");
+  shown.textContent = res.filtering ? `${C.count(res.shown, "asset")} match, of ${tp.nodes.length}` : tp.nodes.length ? C.count(tp.nodes.length, "asset") : "No assets seen yet.";
+  host.setAttribute("role", "tree");
+  host.setAttribute("aria-label", "Assets of " + tp.name);
+  const draw = () => {
+    const w = C.treeWindow(res.rows.length, host.scrollTop, host.clientHeight || 600, TREE_ROW_PX);
+    const frag = document.createDocumentFragment();
+    host.classList.toggle("virtual", w.virtual);
+    host.style.setProperty("padding-top", w.before + "px");
+    host.style.setProperty("padding-bottom", w.after + "px");
+    for (const row of res.rows.slice(w.start, w.end)) frag.append(treeRow(tp, row, res));
+    host.replaceChildren(frag);
+  };
+  tp.redraw = res.rows.length > C.VIRTUAL_ROWS ? draw : null;
+  if (!host.dataset.scrollWired) {
+    host.dataset.scrollWired = "1";
+    host.addEventListener("scroll", () => { if (S.tp && S.tp.redraw) { S.tp.scroll = host.scrollTop; S.tp.redraw(); } });
+  }
+  draw();
+  if (res.rows.length > C.VIRTUAL_ROWS) host.scrollTop = tp.scroll;
+  renderNodePanel();
+}
+
+function treeRow(tp, row, res) {
+  const n = row.node;
+  const li = el("div", "tnode" + (row.context ? " context" : "") + (tp.sel === n.id ? " sel" : ""));
+  li.setAttribute("role", "treeitem");
+  li.setAttribute("aria-level", String(row.depth + 1));
+  if (row.hasKids) li.setAttribute("aria-expanded", String(row.open));
+  li.dataset.node = n.id;
+  li.dataset.status = n.status;
+  li.style.setProperty("padding-left", 8 + row.depth * 18 + "px");
+  if (row.hasKids) {
+    const f = el("button", "tfold");
+    f.type = "button";
+    f.setAttribute("aria-label", (row.open ? "Fold " : "Unfold ") + n.locator);
+    f.disabled = res.filtering;
+    f.append(icon("chevron"));
+    if (row.open) f.classList.add("open");
+    f.addEventListener("click", () => { if (tp.collapsed.has(n.id)) tp.collapsed.delete(n.id); else tp.collapsed.add(n.id); renderTargetTree(); });
+    li.append(f);
+  } else li.append(el("span", "tfold-gap"));
+  const dot = el("span", "nstat nstat-" + n.status);
+  dot.setAttribute("role", "img");
+  dot.setAttribute("aria-label", C.nodeStatusWords(n.status));
+  dot.title = C.nodeStatusWords(n.status);
+  const pick = el("button", "tpick");
+  pick.type = "button";
+  pick.dataset.focusKey = "node:" + n.id;
+  add(pick, dot, el("span", "tkind dim", n.kind), el("span", "tloc mono", n.locator), el("span", "tstatus dim", C.nodeStatusWords(n.status)));
+  pick.addEventListener("click", () => { tp.sel = n.id; tp.ex = { node: n.id, list: [], error: null, loading: true }; renderTargetTree(); loadNodeExchanges(); });
+  li.append(pick);
+  return li;
+}
+
+async function loadNodeExchanges() {
+  const tp = S.tp;
+  const id = tp && tp.sel;
+  if (!id) return;
+  try {
+    const rows = await api("GET", "/api/targets/" + encodeURIComponent(tp.name) + "/exchanges?node=" + encodeURIComponent(id));
+    if (S.tp !== tp || tp.sel !== id) return;
+    const list = [];
+    for (const r of Array.isArray(rows) ? rows : []) { const x = C.exchangeOf(r); if (x) C.mergeExchange(list, x); }
+    tp.ex = { node: id, list, error: null, loading: false };
+  } catch (e) {
+    if (S.tp !== tp || tp.sel !== id) return;
+    tp.ex = { node: id, list: [], error: e.status === 404 ? null : e.message, loading: false };
+  }
+  renderNodePanel();
+}
+
+function renderNodePanel() {
+  const tp = S.tp;
+  const panel = $("target-body").querySelector(".tnode-panel");
+  if (!tp || !panel) return;
+  const n = tp.nodes.find((x) => x.id === tp.sel);
+  if (!n) { panel.replaceChildren(el("p", "dim", "Choose an asset to see what is known about it.")); return; }
+  const frag = document.createDocumentFragment();
+  const dot = el("span", "nstat nstat-" + n.status);
+  dot.setAttribute("aria-hidden", "true");
+  add(frag, add(el("h3", "tnode-title"), dot, el("span", "mono", n.locator)));
+  frag.append(el("p", "", `${n.kind} · ${C.nodeStatusWords(n.status)}`));
+  const byId = S.sessions.byId;
+  const missionLink = (id) => {
+    const lead = [...byId.values()].find((s) => !s.parent && s.mission === id);
+    return lead ? link(lead.title || id, C.sessionHash(lead.id, "chat")) : document.createTextNode(id);
+  };
+  frag.append(el("div", "label", "Missions that set it"));
+  if (!n.missions.length) frag.append(el("p", "dim", "None recorded."));
+  else { const ul = el("ul"); for (const m of n.missions) add(ul, add(el("li"), missionLink(m))); frag.append(ul); }
+  frag.append(el("div", "label", "Findings"));
+  if (!n.findings.length) frag.append(el("p", "dim", "None."));
+  else {
+    const ul = el("ul");
+    for (const f of n.findings) {
+      const lead = [...byId.values()].find((s) => !s.parent && s.mission === f.mission);
+      add(ul, add(el("li"), chip(f.status, f.status === "open" ? "bad" : "dim"), el("strong", "", " " + f.text + " "), lead ? link(f.claim, C.sessionHash(lead.id, "evidence")) : el("span", "mono dim", f.claim)));
+    }
+    frag.append(ul);
+  }
+  frag.append(el("div", "label", "Evidence"));
+  if (!n.evidence.length) frag.append(el("p", "dim", "None attached."));
+  else {
+    const ul = el("ul", "tkeys");
+    for (const k of n.evidence) add(ul, add(el("li"), outKeyButton(String(k).replace(/^out:/, ""))));
+    frag.append(ul);
+  }
+  frag.append(el("div", "label", "Requests with it"));
+  if (tp.ex.loading) frag.append(el("p", "dim", "Loading…"));
+  else if (tp.ex.error) frag.append(el("p", "error", tp.ex.error));
+  else if (!tp.ex.list.length) frag.append(el("p", "dim", "No captured request names this asset."));
+  else frag.append(exchangeList(tp.ex.list, "tx:"));
+  preserveFocus(panel, () => panel.replaceChildren(frag));
+}
+
+/** The graph changed (an event, at most once a second): read it again when the page is open. */
+function targetChanged(name) {
+  if (S.view === "target" && S.tp && S.tp.name === name) loadTargetPage();
+  if (S.targets.supported === true) loadTargets();
+}
+
 async function start() {
   // A login address opened in a tab that already has the page changes only the fragment: load the
   // page again, so that the code is exchanged and leaves the address bar. Also on the lost() page.
@@ -5898,7 +7512,7 @@ async function start() {
   resizeInspector(Number(recalled("inspector-width", 396)) || 396);
   renderDot();
   connect();
-  await Promise.all([loadSessions(), loadInbox(), loadStatus()]);
+  await Promise.all([loadSessions(), loadInbox(), loadStatus(), loadTargets()]);
   route();
   setInterval(() => {
     S.now = Date.now();

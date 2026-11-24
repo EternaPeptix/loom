@@ -327,6 +327,9 @@
 //! until the destination closes is cut: the relay ends with the bytes that carried its head, or at once
 //! when they have already been relayed.
 
+mod intercept;
+
+use self::intercept::{CaptureCfg, Tap};
 use crate::clienthello::{self, Hello};
 use crate::policy::{is_local_literal, normalize_host, Policy, Verdict};
 use base64::Engine as _;
@@ -524,6 +527,8 @@ struct Entry {
     permits: Arc<Semaphore>,
     /// One permit per name lookup of the session in progress.
     lookups: Arc<Semaphore>,
+    /// What the session's traffic is captured with; `None` for a session granted without capture.
+    capture: Option<Arc<CaptureCfg>>,
 }
 
 /// A pending connection: its id, the token that closes it and its connection permit.
@@ -584,6 +589,8 @@ struct Shared {
     local_addrs: Mutex<Vec<IpAddr>>,
     /// Lab-listener scans in flight (a scan reads the process table).
     scans: Arc<Semaphore>,
+    /// The TLS client configs used towards destinations of intercepted tunnels.
+    upstream_tls: Mutex<intercept::UpstreamTls>,
 }
 
 #[derive(Default)]
@@ -885,6 +892,7 @@ impl Proxy {
             canaries: Mutex::new(HashMap::new()),
             local_addrs: Mutex::new(Vec::new()),
             scans: semaphore(MAX_SCANS),
+            upstream_tls: Mutex::new(intercept::UpstreamTls::default()),
         });
         let cancel = CancellationToken::new();
         tokio::spawn(accept_loop(listener, shared.clone(), cancel.clone(), cancel.clone(), Origin::Shared));
@@ -928,7 +936,38 @@ impl Proxy {
         Ok(port)
     }
 
+    /// As [`Proxy::grant`], with the session's traffic captured to `sink` as `capture` says
+    /// (CONTRACTS-TRAFFIC-TARGETS C3, I4).
+    pub fn grant_with_capture(
+        &self,
+        session: &SessionId,
+        policy: Policy,
+        capture: crate::capture::CaptureGrant,
+        sink: crate::capture::CaptureSink,
+        ca: Option<std::sync::Arc<crate::tls::Ca>>,
+    ) -> Result<SessionGrant, ProxyError> {
+        self.grant_inner(session, policy, Some(Arc::new(CaptureCfg { grant: capture, sink, ca })))
+    }
+
+    /// Extra PEM root files that intercepted tunnels trust for destinations, beside the Mozilla roots
+    /// (`[network] upstream_roots`, I4). Replaces the earlier list; an unreadable file is an error and
+    /// leaves the list as it was.
+    pub fn set_upstream_roots(&self, files: &[String]) -> Result<(), String> {
+        let roots = crate::tls::read_pem_roots(files)?;
+        lock(&self.inner.shared.upstream_tls).set_extra(roots);
+        Ok(())
+    }
+
     pub fn grant(&self, session: &SessionId, policy: Policy) -> Result<SessionGrant, ProxyError> {
+        self.grant_inner(session, policy, None)
+    }
+
+    fn grant_inner(
+        &self,
+        session: &SessionId,
+        policy: Policy,
+        capture: Option<Arc<CaptureCfg>>,
+    ) -> Result<SessionGrant, ProxyError> {
         let port = self.session_listener(session)?;
         let password = format!("{:032x}", rand::rng().random::<u128>());
         let limits = &self.inner.shared.limits;
@@ -939,6 +978,7 @@ impl Proxy {
             policy: Arc::new(policy),
             permits: semaphore(limits.max_per_session),
             lookups: semaphore(limits.max_lookups_per_session),
+            capture,
         };
         lock(&self.inner.shared.sessions).insert(session.as_str().to_string(), entry);
         Ok(SessionGrant { port, user: session.as_str().to_string(), password })
@@ -962,6 +1002,7 @@ impl Proxy {
             policy: Arc::new(policy),
             permits: semaphore(limits.max_per_session),
             lookups: semaphore(limits.max_lookups_per_session),
+            capture: None,
         };
         let mut sessions = lock(&self.inner.shared.sessions);
         sessions.retain(|_, entry| !(entry.reference && &entry.session == session));
@@ -1480,6 +1521,7 @@ struct Authed {
     policy: Arc<Policy>,
     permits: Arc<Semaphore>,
     lookups: Arc<Semaphore>,
+    capture: Option<Arc<CaptureCfg>>,
 }
 
 /// Why a request carries no usable credentials.
@@ -1515,7 +1557,14 @@ fn authenticate(shared: &Shared, head: &Head) -> Result<Authed, AuthError> {
     let Some(e) = sessions.get(user) else { return Err(failed("unknown user")) };
     if constant_time_eq(e.password.as_bytes(), password.as_bytes()) {
         let (session, policy) = (e.session.clone(), e.policy.clone());
-        Ok(Authed { reference: e.reference, session, policy, permits: e.permits.clone(), lookups: e.lookups.clone() })
+        Ok(Authed {
+            reference: e.reference,
+            session,
+            policy,
+            permits: e.permits.clone(),
+            lookups: e.lookups.clone(),
+            capture: e.capture.clone(),
+        })
     } else {
         Err(AuthError::Failed(format!("wrong password for session {}", e.session.as_str())))
     }
@@ -1974,7 +2023,7 @@ async fn handle(
     };
     // Cuts made from here on end the connection once it is registered (see `Proxy::cut`).
     let seen = shared.cut_seq.load(Ordering::SeqCst);
-    let Authed { reference, session, policy, permits, lookups } = auth;
+    let Authed { reference, session, policy, permits, lookups, capture } = auth;
     // Command credentials count only on their own session's listener, reference ones only on the shared
     // one; nothing else of the request is acted on before this.
     let wrong_port = match (&origin, reference) {
@@ -2031,7 +2080,7 @@ async fn handle(
                 if connect {
                     let live = LiveGuard::register(shared, session, &host, port, seen);
                     let policy = current_policy(shared, session, reference, policy);
-                    tunnel(client, extra, &cx, &policy, slot, cancel, live.cut.clone()).await;
+                    tunnel(client, extra, &cx, &policy, capture.as_deref(), slot, cancel, live.cut.clone()).await;
                 } else {
                     check(&mut client, &cx, &policy, slot).await;
                 }
@@ -2056,7 +2105,8 @@ async fn handle(
             let live = LiveGuard::register(shared, session, &host, port, seen);
             let cut = live.cut.clone();
             let policy = current_policy(shared, session, reference, policy);
-            forward(client, extra, &head, &cx, &policy, &authority, &path, reference, slot, cancel, cut).await;
+            let capture = capture.as_deref();
+            forward(client, extra, &head, &cx, &policy, capture, &authority, &path, reference, slot, cancel, cut).await;
         }
         Err(m) => reject(&mut client, &shared, slot, &session, &head, &m).await,
     }
@@ -2175,13 +2225,17 @@ enum Phase {
     Refused(String, Option<String>),
     Idle(Duration),
     UpstreamWrite,
+    /// The tunnel was intercepted (I4); the interception recorded how it ended.
+    Intercepted,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn tunnel(
     mut client: TcpStream,
     extra: Vec<u8>,
     cx: &Ctx<'_>,
     policy: &Policy,
+    capture: Option<&CaptureCfg>,
     slot: OwnedSemaphorePermit,
     cancel: CancellationToken,
     cut: Cut,
@@ -2198,6 +2252,10 @@ async fn tunnel(
     if client.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await.is_err() {
         return cx.failed_after_allow(&allowed, "the client closed the connection before the tunnel was open").await;
     }
+    // Interception (I4): a tunnel the session captures is decrypted and relayed as HTTP once its first flight is
+    // a ClientHello bound to the destination; bytes the client sent ahead of the 200 are not TLS the proxy could
+    // take over, so such a tunnel stays opaque.
+    let intercept = capture.filter(|c| extra.is_empty() && c.intercepts(cx.host, cx.port));
     let phase = tokio::select! {
         phase = async {
             let first = match bind_sni(&mut client, &up, extra, cx, policy).await {
@@ -2211,16 +2269,26 @@ async fn tunnel(
                 Bound::Refused(rule, sni) => return Phase::Refused(rule, sni),
                 Bound::Idle(after) => return Phase::Idle(after),
             };
+            let first = match intercept {
+                Some(cap) if matches!(clienthello::parse(&first), Hello::Tls { .. }) => {
+                    match intercept::run(&mut client, first, &mut up, cx, &allowed, cap).await {
+                        intercept::Ended::Done => return Phase::Intercepted,
+                        intercept::Ended::Opaque(first) => first,
+                    }
+                }
+                _ => first,
+            };
             if !first.is_empty() && !write_within(&mut up, &first, idle).await {
                 return Phase::UpstreamWrite;
             }
-            Phase::Relayed(relay(&mut client, &mut up, idle, None).await)
+            Phase::Relayed(relay(&mut client, &mut up, idle, None, None).await)
         } => phase,
         _ = cancel.cancelled() => return cx.failed_after_allow(&allowed, SHUTDOWN).await,
         _ = cut.cancelled() => return cx.failed_after_allow(&allowed, cut.why()).await,
     };
     let end = match phase {
         Phase::Relayed(end) => end,
+        Phase::Intercepted => return,
         Phase::Refused(rule, sni) => {
             // Nothing was sent upstream. The refusal follows the allow, so the trail never ends at a bare allow.
             cx.record_best_effort_sni(false, rule, Some(allowed.ip), sni).await;
@@ -2385,6 +2453,15 @@ enum Owed {
 }
 
 impl Owed {
+    /// Nothing more of the body is owed (a body that runs until the client stops sending never is).
+    fn finished(&self) -> bool {
+        match self {
+            Owed::Bytes(left) => *left == 0,
+            Owed::Chunked(c) => c.done(),
+            Owed::Stream => false,
+        }
+    }
+
     /// How many of `data`, the client's next bytes, belong to the body; the rest come after it.
     fn take(&mut self, data: &[u8]) -> usize {
         match self {
@@ -2415,6 +2492,12 @@ struct HeadFilter {
     head_request: bool,
     /// How the body after the final head is framed; `None` until that head has been read.
     body: Option<Framing>,
+    /// Bytes handed out so far (for capture).
+    emitted: usize,
+    /// Where the body starts in the bytes handed out, once the final head is out (for capture).
+    head_end: Option<usize>,
+    /// The status of the final head (for capture).
+    status: Option<u16>,
 }
 
 /// How the body of a response is framed.
@@ -2428,7 +2511,7 @@ enum Framing {
 
 impl HeadFilter {
     fn new(head_request: bool) -> Self {
-        Self { buf: Vec::new(), head_request, body: None }
+        Self { buf: Vec::new(), head_request, body: None, emitted: 0, head_end: None, status: None }
     }
 
     /// The final head has been read.
@@ -2452,6 +2535,12 @@ impl HeadFilter {
 
     /// Takes the next bytes from the destination; returns what may be sent to the client now.
     fn push(&mut self, data: &[u8]) -> Result<Vec<u8>, String> {
+        let out = self.push_inner(data)?;
+        self.emitted = self.emitted.saturating_add(out.len());
+        Ok(out)
+    }
+
+    fn push_inner(&mut self, data: &[u8]) -> Result<Vec<u8>, String> {
         if self.body.is_some() {
             return self.pass(data);
         }
@@ -2461,6 +2550,8 @@ impl HeadFilter {
             out.extend_from_slice(&h.head);
             self.buf.drain(..h.len.min(self.buf.len()));
             if let Some(framing) = h.body {
+                self.head_end = Some(self.emitted.saturating_add(out.len()));
+                self.status = Some(h.code);
                 self.body = Some(framing);
                 let rest = std::mem::take(&mut self.buf);
                 out.append(&mut self.pass(&rest)?);
@@ -2500,6 +2591,8 @@ struct RespHead {
     len: usize,
     /// For a final head, how the body after it is framed; `None` for an interim (1xx) head.
     body: Option<Framing>,
+    /// The status code.
+    code: u16,
 }
 
 /// The body length that the `Content-Length` headers give, read as hyper reads them: `None` when
@@ -2588,7 +2681,7 @@ fn response_head(buf: &[u8], head_request: bool) -> Result<Option<RespHead>, Str
         head.extend_from_slice(b"Connection: close\r\n");
     }
     head.extend_from_slice(b"\r\n");
-    Ok(Some(RespHead { head, len: n, body }))
+    Ok(Some(RespHead { head, len: n, body, code }))
 }
 
 /// What the relay of a forwarded request needs.
@@ -2686,7 +2779,13 @@ async fn write_counted(w: &mut WriteHalf<'_>, mut bytes: &[u8], flow: &Flow) -> 
 /// Client to destination. A tunnel passes the client's end on. With `forward` (what the client of a
 /// forwarded request still owes of its body) bytes past the body are discarded and noted in `flow`,
 /// the client's end is noted in `flow`, and a destination that stops reading does not end the relay.
-async fn upload(r: &mut ReadHalf<'_>, w: &mut WriteHalf<'_>, flow: &Flow, mut forward: Option<Owed>) -> Pump {
+async fn upload(
+    r: &mut ReadHalf<'_>,
+    w: &mut WriteHalf<'_>,
+    flow: &Flow,
+    mut forward: Option<Owed>,
+    tap: Option<&Tap>,
+) -> Pump {
     let mut buf = vec![0u8; 16 * 1024];
     let mut sending = true;
     let mut discarded = 0usize;
@@ -2712,12 +2811,16 @@ async fn upload(r: &mut ReadHalf<'_>, w: &mut WriteHalf<'_>, flow: &Flow, mut fo
         if discarded > MAX_DISCARD {
             return Pump::Stop("the client sent more than 1 MiB past the request body");
         }
-        if take > 0 && write_counted(w, data.get(..take).unwrap_or(&[]), flow).await.is_err() {
-            if forward.is_none() {
-                return Pump::Stop("writing to the destination failed");
+        if take > 0 {
+            if write_counted(w, data.get(..take).unwrap_or(&[]), flow).await.is_err() {
+                if forward.is_none() {
+                    return Pump::Stop("writing to the destination failed");
+                }
+                // The destination stopped reading; its answer may still come.
+                sending = false;
+            } else if let Some(t) = tap {
+                t.request_body(data.get(..take).unwrap_or(&[]));
             }
-            // The destination stopped reading; its answer may still come.
-            sending = false;
         }
         // A further request on a connection that carries one: no later destination bytes may be read as
         // its answer.
@@ -2731,7 +2834,13 @@ async fn upload(r: &mut ReadHalf<'_>, w: &mut WriteHalf<'_>, flow: &Flow, mut fo
 /// request) the response head is filtered, an end before the head is complete is `Bad`, and the
 /// relay ends at the end of the response, or after its head when the response runs until the
 /// destination closes and the client has sent more than its request.
-async fn download(r: &mut ReadHalf<'_>, w: &mut WriteHalf<'_>, flow: &Flow, mut filter: Option<HeadFilter>) -> Pump {
+async fn download(
+    r: &mut ReadHalf<'_>,
+    w: &mut WriteHalf<'_>,
+    flow: &Flow,
+    mut filter: Option<HeadFilter>,
+    tap: Option<&Tap>,
+) -> Pump {
     let mut buf = vec![0u8; 16 * 1024];
     loop {
         let read = r.read(&mut buf).await;
@@ -2760,6 +2869,9 @@ async fn download(r: &mut ReadHalf<'_>, w: &mut WriteHalf<'_>, flow: &Flow, mut 
             flow.wrote.store(true, Ordering::Relaxed);
             if write_counted(w, &out, flow).await.is_err() {
                 return Pump::Stop("writing to the client failed");
+            }
+            if let (Some(t), Some(f)) = (tap, filter.as_ref()) {
+                t.response(&out, f.head_end.map(|h| h as u64), f.status);
             }
         }
         // One request, one response: what follows its end is not relayed.
@@ -2797,7 +2909,13 @@ async fn watchdog(flow: &Flow, idle: Duration, grace: Option<Duration>) -> Durat
 /// the client past the body are discarded, and the relay ends when the response ends (see
 /// *Forwarded requests*); after the client has ended its side it also ends when the destination is
 /// silent for the grace period.
-async fn relay(client: &mut TcpStream, up: &mut TcpStream, idle: Duration, forward: Option<Fwd>) -> RelayEnd {
+async fn relay(
+    client: &mut TcpStream,
+    up: &mut TcpStream,
+    idle: Duration,
+    forward: Option<Fwd>,
+    tap: Option<&Tap>,
+) -> RelayEnd {
     let (mut cr, mut cw) = client.split();
     let (mut ur, mut uw) = up.split();
     let flow = Flow {
@@ -2813,8 +2931,8 @@ async fn relay(client: &mut TcpStream, up: &mut TcpStream, idle: Duration, forwa
         Some(f) => (Some(f.owed), Some(HeadFilter::new(f.head_request)), Some(f.grace.min(idle))),
         None => (None, None, None),
     };
-    let to_up = upload(&mut cr, &mut uw, &flow, owed);
-    let to_client = download(&mut ur, &mut cw, &flow, filter);
+    let to_up = upload(&mut cr, &mut uw, &flow, owed, tap);
+    let to_client = download(&mut ur, &mut cw, &flow, filter, tap);
     let quiet = watchdog(&flow, idle, grace);
     tokio::pin!(to_up, to_client, quiet);
     let wrote = || flow.wrote.load(Ordering::Relaxed);
@@ -2845,6 +2963,7 @@ async fn forward(
     head: &Head,
     cx: &Ctx<'_>,
     policy: &Policy,
+    capture: Option<&CaptureCfg>,
     authority: &str,
     path: &str,
     reference: bool,
@@ -2883,6 +3002,12 @@ async fn forward(
         out.extend_from_slice(b"\r\n");
     }
     out.extend_from_slice(b"Connection: close\r\n\r\n");
+    let tap = capture.map(|c| Tap::new(c.grant.max_bytes, out.clone()));
+    let finish = |error: Option<String>| {
+        if let (Some(c), Some(t)) = (capture, &tap) {
+            c.send(cx, t.finish(crate::capture::Transport::Plain, &head.method, path, error, false));
+        }
+    };
     // The bytes of the body that arrived with the head, what the client still owes, and what it sent
     // after its request.
     let mut owed = match body {
@@ -2893,8 +3018,12 @@ async fn forward(
     };
     let (already, past) = extra.split_at(owed.take(&extra).min(extra.len()));
     out.extend_from_slice(already);
+    if let Some(t) = &tap {
+        t.request_body(already);
+    }
     if !write_within(&mut up, &out, idle).await {
         let why = "sending the request to the destination failed";
+        finish(Some(why.to_string()));
         cx.failed_after_allow(&allowed, why).await;
         let (status, text) = cx.unreachable(why);
         return answer(&mut client, cx.shared, slot, status, "", &text).await;
@@ -2907,12 +3036,18 @@ async fn forward(
         head_request: head.method.eq_ignore_ascii_case("HEAD"),
     };
     let end = tokio::select! {
-        r = relay(&mut client, &mut up, idle, Some(fwd)) => r,
-        _ = cancel.cancelled() => return cx.failed_after_allow(&allowed, SHUTDOWN).await,
-        _ = cut.cancelled() => return cx.failed_after_allow(&allowed, cut.why()).await,
+        r = relay(&mut client, &mut up, idle, Some(fwd), tap.as_ref()) => r,
+        _ = cancel.cancelled() => {
+            finish(Some(SHUTDOWN.to_string()));
+            return cx.failed_after_allow(&allowed, SHUTDOWN).await;
+        }
+        _ = cut.cancelled() => {
+            finish(Some(cut.why().to_string()));
+            return cx.failed_after_allow(&allowed, cut.why()).await;
+        }
     };
     let (why, reply) = match end {
-        RelayEnd::Done(_) => return,
+        RelayEnd::Done(_) => return finish(None),
         RelayEnd::Failed(why, wrote) => {
             let when = if wrote { "while the response was relayed" } else { "before the destination answered" };
             (format!("{why} {when}"), None)
@@ -2923,11 +3058,15 @@ async fn forward(
         }
         RelayEnd::Idle(true, after) => (format!("the destination's response stalled for {}", human(after)), None),
     };
+    finish(Some(why.clone()));
     cx.failed_after_allow(&allowed, &why).await;
     if let Some((status, text)) = reply {
         answer(&mut client, cx.shared, slot, status, "", &text).await;
     }
 }
+
+#[cfg(test)]
+mod intercept_tests;
 
 #[cfg(test)]
 mod tests {

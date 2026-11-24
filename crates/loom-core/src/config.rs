@@ -81,7 +81,6 @@ use crate::admit::AdmitPolicy;
 use crate::event::ReasoningReplay;
 use crate::ids::{MissionId, SessionId};
 use crate::lineage::{is_reserved_family_word, known_family, normalize_name, resolve, Alignment, FAMILIES};
-use crate::weave::ReweavePolicy;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, HashSet};
@@ -101,6 +100,79 @@ pub enum ConfigError {
     Invalid(String),
 }
 
+/// `[context]`: when the window is compacted (CONTRACTS-COMPACTION K2, K8).
+///
+/// `compact_at_tokens` is the request size at which a session compacts; `0` means 40% of the profile's
+/// context window, never above 400 000 (100 000 when the window is not known). The keys of the re-weave
+/// (`target_tokens`, `floor_tokens`, `keep_recent_steps`, `stub_tail_lines`) are still accepted and ignored,
+/// with a startup warning ([`ContextCfg::warnings`]); `target_tokens` is read as `compact_at_tokens` when
+/// that is absent.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ContextCfg {
+    pub compact_at_tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub floor_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keep_recent_steps: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stub_tail_lines: Option<u32>,
+}
+
+/// Most a default `compact_at` can be.
+pub const COMPACT_AT_CAP: u64 = 400_000;
+
+impl ContextCfg {
+    /// The size at which a session with context window `window` compacts. Never above four fifths of a
+    /// known window, so the reply still fits.
+    pub fn compact_at(&self, window: Option<u64>) -> u64 {
+        let set = if self.compact_at_tokens > 0 { self.compact_at_tokens } else { self.target_tokens.unwrap_or(0) };
+        let size = if set > 0 {
+            set
+        } else {
+            match window {
+                Some(w) => (w / 5 * 2).min(COMPACT_AT_CAP),
+                None => 100_000,
+            }
+        };
+        match window {
+            Some(w) => size.min(w / 5 * 4).max(1_000),
+            None => size,
+        }
+    }
+
+    /// One sentence for the old keys that are set and ignored.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut old: Vec<&str> = Vec::new();
+        if self.target_tokens.is_some() {
+            old.push("target_tokens");
+        }
+        if self.floor_tokens.is_some() {
+            old.push("floor_tokens");
+        }
+        if self.keep_recent_steps.is_some() {
+            old.push("keep_recent_steps");
+        }
+        if self.stub_tail_lines.is_some() {
+            old.push("stub_tail_lines");
+        }
+        if old.is_empty() {
+            return Vec::new();
+        }
+        let used = if self.compact_at_tokens == 0 && self.target_tokens.is_some() {
+            " target_tokens is read as compact_at_tokens."
+        } else {
+            ""
+        };
+        vec![format!(
+            "config: [context] {} no longer change anything: the window is compacted at compact_at_tokens (0 = 40% of the model's window).{used}",
+            old.join(", "),
+        )]
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -108,7 +180,7 @@ pub struct Config {
     pub default_model: String,
     pub daemon: DaemonCfg,
     pub models: BTreeMap<String, ModelProfile>,
-    pub context: ReweavePolicy,
+    pub context: ContextCfg,
     pub admit: AdmitPolicy,
     pub tools: ToolsCfg,
     pub sandbox: SandboxCfg,
@@ -120,6 +192,8 @@ pub struct Config {
     pub boxed: BoxCfg,
     /// The adversarial monitor's settings (`docs/MONITOR.md`); M1 accepts the model-policy keys only.
     pub monitor: MonitorCfg,
+    /// MCP servers whose tools sessions get (docs/CONTRACTS-MCP.md). Empty by default.
+    pub mcp: McpCfg,
 }
 
 /// What a model profile is for. Absent means an agent profile.
@@ -208,6 +282,126 @@ impl Default for MonitorCfg {
     }
 }
 
+/// `[mcp]`: MCP servers as tools (docs/CONTRACTS-MCP.md M1).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct McpCfg {
+    /// Per role: MCP tool definitions beyond this many estimated tokens are left out (M6).
+    pub max_schema_tokens: u64,
+    /// A server with no call for this long is closed; it starts again on the next call (M3).
+    pub idle_close_s: u64,
+    pub servers: BTreeMap<String, McpServerCfg>,
+}
+
+impl Default for McpCfg {
+    fn default() -> Self {
+        Self { max_schema_tokens: 20_000, idle_close_s: 600, servers: BTreeMap::new() }
+    }
+}
+
+/// One `[mcp.servers.<name>]` entry (M1). Exactly one of `command` (stdio) and `url` (Streamable HTTP).
+/// `env` and `headers` values are `"env:NAME"`, `"file:/path"` or a literal; they are resolved when a
+/// session starts the server and never written to a record.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct McpServerCfg {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    pub env: BTreeMap<String, String>,
+    pub headers: BTreeMap<String, String>,
+    /// Working directory of a stdio server, relative to the workspace (default: the workspace).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Hosts added to the session's allowed hosts while the server is configured (M4).
+    pub hosts: Vec<String>,
+    /// The server's tools a session gets (default: all it lists).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<String>>,
+    /// The roles that get this server's tools (default: every role that is not read-only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub roles: Option<Vec<String>>,
+    /// The operator says no tool of this server changes anything: read-only roles get it too.
+    pub read_only: bool,
+    /// Per call, seconds.
+    pub timeout_s: u64,
+}
+
+impl Default for McpServerCfg {
+    fn default() -> Self {
+        Self {
+            command: None,
+            url: None,
+            env: BTreeMap::new(),
+            headers: BTreeMap::new(),
+            cwd: None,
+            hosts: Vec::new(),
+            tools: None,
+            roles: None,
+            read_only: false,
+            timeout_s: 120,
+        }
+    }
+}
+
+impl McpCfg {
+    /// M1's rules the types cannot express: a server name matches `[a-z0-9_-]{1,32}`, exactly one of
+    /// `command` and `url`, a non-empty `command`, an `http`/`https` `url`, `timeout_s` > 0.
+    pub fn check(&self) -> Result<(), String> {
+        for (name, s) in &self.servers {
+            let ok_name = !name.is_empty()
+                && name.len() <= 32
+                && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-');
+            if !ok_name {
+                return Err(format!("mcp.servers.{name}: a server name must match [a-z0-9_-]{{1,32}}"));
+            }
+            match (&s.command, &s.url) {
+                (Some(_), Some(_)) => {
+                    return Err(format!("mcp.servers.{name}: set command or url, not both"));
+                }
+                (None, None) => {
+                    return Err(format!("mcp.servers.{name}: set command (stdio) or url (Streamable HTTP)"));
+                }
+                (Some(c), None) => {
+                    if c.first().is_none_or(|p| p.trim().is_empty()) {
+                        return Err(format!("mcp.servers.{name}: command must name a program"));
+                    }
+                }
+                (None, Some(u)) => {
+                    let rest = u.strip_prefix("https://").or_else(|| u.strip_prefix("http://"));
+                    if rest.is_none_or(|r| r.is_empty() || r.starts_with('/')) {
+                        return Err(format!("mcp.servers.{name}: url must be an http:// or https:// address"));
+                    }
+                }
+            }
+            if s.timeout_s == 0 {
+                return Err(format!("mcp.servers.{name}: timeout_s must be at least 1"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Startup warnings: a literal (not `env:`/`file:`) value in `env` or `headers` names a secret
+    /// written in the config.
+    pub fn warnings(&self) -> Vec<String> {
+        let literal = |v: &String| !(v.starts_with("env:") || v.starts_with("file:"));
+        let mut out = Vec::new();
+        for (name, s) in &self.servers {
+            for (kind, map) in [("env", &s.env), ("headers", &s.headers)] {
+                for (key, value) in map {
+                    if literal(value) {
+                        out.push(format!(
+                            "mcp.servers.{name}.{kind}.{key}: a literal value is written in the config; use \"env:NAME\" or \"file:/path\" so a secret stays out of it"
+                        ));
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DaemonCfg {
@@ -241,6 +435,8 @@ pub struct ModelProfile {
     /// `max_tokens` sent with each request. Absent = not sent (the server's default applies).
     pub max_output_tokens: Option<u64>,
     pub reasoning_replay: ReasoningReplay,
+    /// The model takes images (OpenAI `image_url` content parts). Off: an image is named in the text, not sent.
+    pub vision: bool,
     /// Fields added to every request body verbatim (`reasoning_effort`, `temperature`, `top_p`, …).
     /// Fixed for the life of a session: some templates render them into the request head.
     pub extra_body: Map<String, Value>,
@@ -270,6 +466,30 @@ pub struct ModelProfile {
     pub recipient: Option<String>,
     /// `review` marks a reviewer profile of the monitor.
     pub purpose: Option<ProfilePurpose>,
+    /// Tool calls the model writes into its reply text instead of the tool-call channel, which the
+    /// harness then runs (see *text tool calls* in `docs/DESIGN.md`): `"any"` takes every known
+    /// format, a named format takes only that one, `"off"` takes none. Whatever the format, only
+    /// calls that end the reply are taken, and only in a step of a role that ends by calling a tool.
+    pub text_tool_calls: TextToolCalls,
+}
+
+/// The text form of tool calls a model is known to write when its server does not parse them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextToolCalls {
+    /// Every format below.
+    #[default]
+    Any,
+    /// None: text stays text.
+    Off,
+    /// `<tool_call>{"name": …, "arguments": …}</tool_call>` (Hermes, Qwen).
+    ToolCall,
+    /// `<｜DSML｜function_calls>` / `<｜DSML｜invoke name=…>` (DeepSeek).
+    Dsml,
+    /// `<function_calls>` / `<invoke name=…>` with `<parameter>` children.
+    Invoke,
+    /// A fenced JSON block holding `{"name": …, "arguments": …}`.
+    FencedJson,
 }
 
 impl Default for ModelProfile {
@@ -282,6 +502,7 @@ impl Default for ModelProfile {
             context_window: None,
             max_output_tokens: None,
             reasoning_replay: ReasoningReplay::All,
+            vision: false,
             extra_body: Map::new(),
             max_concurrent: 4,
             stall_timeout_s: 240,
@@ -291,6 +512,7 @@ impl Default for ModelProfile {
             alignment: None,
             recipient: None,
             purpose: None,
+            text_tool_calls: TextToolCalls::Any,
         }
     }
 }
@@ -306,6 +528,8 @@ pub struct ToolsCfg {
     pub read_max_lines: u64,
     /// Most matches `grep`/`glob`/`out_grep` return inline.
     pub search_max_results: usize,
+    /// Largest image file `read` attaches (larger ones are described in text only).
+    pub max_image_bytes: u64,
     pub web_fetch_timeout_s: u64,
     pub web_fetch_max_bytes: u64,
     /// A command whose output grows past this is stopped, and the result says so.
@@ -320,6 +544,20 @@ pub struct ToolsCfg {
     /// Start a reply's leading read-only calls (`read`, `glob`, `grep`, `out_read`, `out_grep`) while
     /// the rest of the reply is still streaming. What is recorded and shown is the same either way.
     pub speculate: bool,
+    /// The argument names the file and shell tools are shown with (`docs/TOOL-SHAPES.md`). Calls in
+    /// either shape, and in other widely trained shapes, are accepted whichever is shown.
+    pub dialect: Dialect,
+}
+
+/// See `ToolsCfg::dialect`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Dialect {
+    /// Claude Code's argument names and units for read, write, edit, bash, grep and glob.
+    #[default]
+    Trained,
+    /// loom's own argument names, as before.
+    Loom,
 }
 
 impl Default for ToolsCfg {
@@ -329,6 +567,7 @@ impl Default for ToolsCfg {
             kill_grace_s: 5,
             read_max_lines: 2_000,
             search_max_results: 200,
+            max_image_bytes: 5 * 1024 * 1024,
             web_fetch_timeout_s: 60,
             web_fetch_max_bytes: 20 * 1024 * 1024,
             max_output_bytes: 64 * 1024 * 1024,
@@ -336,21 +575,33 @@ impl Default for ToolsCfg {
             job_wake_gap_s: 30,
             job_wake_max: 20,
             speculate: true,
+            dialect: Dialect::Trained,
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SandboxMode {
     /// macOS `sandbox-exec` profile.
-    #[default]
     Seatbelt,
     /// Linux bubblewrap with isolated namespaces and no command network access.
     Bubblewrap,
     /// No OS sandbox: commands are unconfined. The daemon logs a warning at start when this is set, and the
     /// system prompt of every session says so.
     None,
+}
+
+/// The OS's own sandbox: Bubblewrap on Linux, Seatbelt elsewhere (macOS). A config without `[sandbox]` (as
+/// `loom config init` writes it) then starts on either system.
+impl Default for SandboxMode {
+    fn default() -> Self {
+        if cfg!(target_os = "linux") {
+            SandboxMode::Bubblewrap
+        } else {
+            SandboxMode::Seatbelt
+        }
+    }
 }
 
 impl SandboxMode {
@@ -548,7 +799,7 @@ impl NetworkMode {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NetworkCfg {
     pub mode: NetworkMode,
@@ -565,6 +816,45 @@ pub struct NetworkCfg {
     /// (cloud metadata, DevTools and Docker API ports on this machine, the daemon's port, every model
     /// endpoint, the box's Docker host) and checked before everything else, so a grant cannot lift it.
     pub infrastructure: Vec<String>,
+    /// Bytes of each request or response body kept in a captured exchange (CONTRACTS-TRAFFIC-TARGETS C2).
+    pub capture_max_bytes: u64,
+    /// Exchanges recorded per session; past it traffic is still relayed but not recorded (C2).
+    pub capture_max_exchanges: u64,
+    /// When HTTPS through the proxy is decrypted and captured (I1).
+    pub intercept: InterceptMode,
+    /// Host patterns whose HTTPS is tunneled untouched even when interception is on (I4).
+    pub intercept_passthrough: Vec<String>,
+    /// PEM files of extra roots trusted for upstream TLS when intercepting (I4).
+    pub upstream_roots: Vec<String>,
+}
+
+impl Default for NetworkCfg {
+    fn default() -> Self {
+        NetworkCfg {
+            mode: NetworkMode::default(),
+            allow: Vec::new(),
+            reference_hosts: Vec::new(),
+            deny: Vec::new(),
+            allow_private: Vec::new(),
+            infrastructure: Vec::new(),
+            capture_max_bytes: 1 << 20,
+            capture_max_exchanges: 100_000,
+            intercept: InterceptMode::default(),
+            intercept_passthrough: Vec::new(),
+            upstream_roots: Vec::new(),
+        }
+    }
+}
+
+/// When the proxy decrypts HTTPS (CONTRACTS-TRAFFIC-TARGETS I1).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InterceptMode {
+    /// As the mission's pack says (`intercept = true` in ctf, redteam, vr), unless the mission says otherwise.
+    #[default]
+    Pack,
+    Always,
+    Never,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -577,7 +867,7 @@ pub struct AgentsCfg {
     pub child_max_minutes: u32,
     /// Stop-gate nudges without progress before the session is parked for the operator.
     pub max_nudges: u32,
-    /// Steps without a new ledger entry before the harness adds a stall note.
+    /// Accepted so older configs load; ignored (the stall note was removed).
     pub stall_steps: u32,
     /// Run an independent verifier before a lead's `finish` is accepted.
     pub verify_finish: bool,
@@ -604,8 +894,10 @@ pub struct AgentsCfg {
     pub compact_tools: bool,
     /// Allow explicit-termination sessions to treat a plain reply without open ledger items as implicit finish.
     pub implicit_finish: bool,
-    /// Add a nudge paragraph when a lead stops idle with an open goal and no open plan step.
+    /// Accepted so older configs load; ignored (the idle-goal paragraph was removed).
     pub idle_ledger_nudge: bool,
+    /// Put the workspace's `AGENTS.md` and `CLAUDE.md` into the system prompt of each new session.
+    pub project_instructions: bool,
 }
 
 impl Default for AgentsCfg {
@@ -626,6 +918,7 @@ impl Default for AgentsCfg {
             compact_tools: false,
             implicit_finish: false,
             idle_ledger_nudge: true,
+            project_instructions: true,
         }
     }
 }
@@ -918,9 +1211,6 @@ impl Config {
                 self.daemon.bind
             )));
         }
-        if self.context.floor_tokens >= self.context.target_tokens {
-            return Err(ConfigError::Invalid("context.floor_tokens must be below context.target_tokens".into()));
-        }
         for p in &self.sandbox.loopback_ports {
             if DENIED_LOOPBACK_PORTS.contains(p) {
                 return Err(ConfigError::Invalid(format!(
@@ -967,6 +1257,7 @@ impl Config {
             }
         }
         self.boxed.check().map_err(ConfigError::Invalid)?;
+        self.mcp.check().map_err(ConfigError::Invalid)?;
         if self.boxed.enabled && self.sandbox.mode == SandboxMode::None {
             return Err(ConfigError::Invalid(
                 "box.enabled cannot be combined with sandbox.mode = \"none\": without a sandbox the agent's own commands could connect to the Docker socket and the ssh forward that the box uses, and would then control the Docker host. Use the seatbelt or bubblewrap sandbox, or leave the box off.".into(),
@@ -1332,7 +1623,7 @@ pub fn resolve_profile<'a>(
             return Err(ConfigError::Invalid(format!(
                 "no model given and no default_model set. Pass --model <name> or set default_model in the config ({}).",
                 configured()
-            )))
+            )));
         }
     };
     models.get_key_value(wanted).map(|(k, v)| (k.as_str(), v)).ok_or_else(|| {
@@ -1425,11 +1716,20 @@ impl Paths {
     pub fn sessions_dir(&self) -> PathBuf {
         self.home.join("sessions")
     }
+    /// Where the targets live (`{name}/target.toml`, `{name}/graph.jsonl`).
+    pub fn targets_dir(&self) -> PathBuf {
+        self.home.join("targets")
+    }
     pub fn session_dir(&self, id: &SessionId) -> PathBuf {
         self.sessions_dir().join(id_dir(id.as_str()))
     }
     pub fn session_log(&self, id: &SessionId) -> PathBuf {
         self.session_dir(id).join("log.jsonl")
+    }
+    /// The interception CA (`loom-ca.pem`, `loom-ca.key`; CONTRACTS-TRAFFIC-TARGETS I2). Under the loom home,
+    /// which no command can read.
+    pub fn ca_dir(&self) -> PathBuf {
+        self.home.join("ca")
     }
     /// Scratch directory a session's commands may write to.
     pub fn session_tmp(&self, id: &SessionId) -> PathBuf {
@@ -1482,6 +1782,13 @@ impl Paths {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_default_sandbox_is_the_one_for_this_os() {
+        let want = if cfg!(target_os = "linux") { SandboxMode::Bubblewrap } else { SandboxMode::Seatbelt };
+        assert_eq!(SandboxMode::default(), want);
+        assert_eq!(SandboxCfg::default().mode, want);
+    }
 
     #[test]
     fn bubblewrap_and_reference_hosts_are_additive_config_options() {
@@ -1539,7 +1846,9 @@ allow = ["*.example.test"]
         assert_eq!(name, "lan");
         assert_eq!(p.extra_body["reasoning_effort"], "max");
         assert_eq!(p.reasoning_replay, ReasoningReplay::All);
-        assert_eq!(c.context.keep_recent_steps, 60);
+        // The old `[context]` keys load; `target_tokens` stands in for `compact_at_tokens`.
+        assert_eq!(c.context.compact_at(Some(1_000_000)), 300_000);
+        assert_eq!(c.context.warnings().len(), 1);
         assert_eq!(c.network.mode, NetworkMode::Allowlist);
     }
 
@@ -1555,6 +1864,8 @@ allow = ["*.example.test"]
         assert!(!def.compact_tools);
         assert!(!def.implicit_finish);
         assert!(def.idle_ledger_nudge);
+        assert!(def.project_instructions);
+        assert!(!Config::parse("[agents]\nproject_instructions = false\n").unwrap().agents.project_instructions);
 
         let empty = Config::parse("").unwrap();
         assert_eq!(empty.agents, def);
@@ -1584,10 +1895,7 @@ allow = ["*.example.test"]
         let mut c = Config::default();
         c.daemon.bind = "0.0.0.0:7878".into();
         assert!(c.check().is_err());
-        let mut c = Config::default();
-        c.context.floor_tokens = c.context.target_tokens;
-        assert!(c.check().is_err());
-        // A window below the re-weave bounds is not an error: a session clamps the bounds to it.
+        // A window below the compaction size is not an error: a session clamps the size to it.
         let mut c = Config::default();
         c.models.insert("a".into(), ModelProfile { context_window: Some(100_000), ..Default::default() });
         assert!(c.check().is_ok());
@@ -1595,6 +1903,30 @@ allow = ["*.example.test"]
         c.models.insert("a".into(), ModelProfile::default());
         c.default_model = "b".into();
         assert!(c.check().is_err());
+    }
+
+    #[test]
+    fn mcp_check_and_warnings() {
+        let ok = |t: &str| Config::parse(t).unwrap().check();
+        assert!(ok("[mcp.servers.a-b_1]\ncommand = [\"x\"]").is_ok());
+        assert!(ok("[mcp.servers.h]\nurl = \"https://e.com/mcp\"").is_ok());
+        assert!(ok("[mcp.servers.A]\ncommand = [\"x\"]").is_err());
+        assert!(ok(&format!("[mcp.servers.{}]\ncommand = [\"x\"]", "a".repeat(33))).is_err());
+        assert!(ok("[mcp.servers.a]").is_err());
+        assert!(ok("[mcp.servers.a]\ncommand = [\"x\"]\nurl = \"http://h\"").is_err());
+        assert!(ok("[mcp.servers.a]\ncommand = []").is_err());
+        assert!(ok("[mcp.servers.a]\nurl = \"ftp://h\"").is_err());
+        assert!(ok("[mcp.servers.a]\ncommand = [\"x\"]\ntimeout_s = 0").is_err());
+        assert!(Config::parse("[mcp.servers.a]\ncommand = [\"x\"]\nbogus = 1").is_err());
+        let c = Config::parse(
+            "[mcp.servers.a]\ncommand = [\"x\"]\nenv = { A = \"env:A\", B = \"lit\", C = \"file:/f\" }\n[mcp.servers.b]\nurl = \"http://h\"\nheaders = { Authorization = \"tok\" }",
+        )
+        .unwrap();
+        let w = c.mcp.warnings();
+        assert_eq!(w.len(), 2);
+        assert!(w[0].contains("mcp.servers.a.env.B") && !w[0].contains("lit\""));
+        assert!(w[1].contains("mcp.servers.b.headers.Authorization") && !w[1].contains("tok\""));
+        assert!(Config::default().mcp.warnings().is_empty());
     }
 
     fn write_key(dir: &Path, name: &str, content: &[u8], mode: u32) {
@@ -1927,7 +2259,9 @@ allow = ["*.example.test"]
         assert!(!pinned_image(&format!("@{DIGEST}")));
         assert!(!pinned_image(&format!("-x@{DIGEST}")));
         // The helper image is pinned the same way.
-        let text = format!("[box]\nenabled = true\nssh_host = \"h\"\nremote_socket = \"/s\"\nimage = \"{DIGEST}\"\nhelper_image = \"alpine:3\"");
+        let text = format!(
+            "[box]\nenabled = true\nssh_host = \"h\"\nremote_socket = \"/s\"\nimage = \"{DIGEST}\"\nhelper_image = \"alpine:3\""
+        );
         assert!(Config::parse(&text).unwrap().check().unwrap_err().to_string().contains("box.helper_image"));
     }
 

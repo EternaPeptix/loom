@@ -17,6 +17,7 @@
 //! - [`evalkit`] scripted models played against the runtime, and the scorecard of each run
 
 pub mod census;
+pub mod completeness;
 pub mod continuation;
 pub mod egress;
 pub mod evalkit;
@@ -25,6 +26,7 @@ pub mod frontier;
 pub mod gate;
 pub mod hud;
 pub mod infra;
+pub mod mcp;
 pub mod monitor;
 pub mod pack;
 pub mod prior;
@@ -32,3 +34,4 @@ pub mod rtools;
 pub mod runtime;
 pub mod session;
 pub mod texts;
+pub mod traffic;

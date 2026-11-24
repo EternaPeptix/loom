@@ -25,7 +25,9 @@
 //! and are lowered to those values when larger (the result then carries the header fact `budget
 //! lowered to {steps} steps / {minutes} min`).
 //!
-//! The title of a child is its question cut to 80 characters.
+//! The title of a child is its question cut to 80 characters. `agent_spawn` also takes an optional `title`
+//! (a string, else an error); when it is non-empty after trimming, its first 80 characters are the title.
+//! `agent_fanout` items and `attempt` have no `title`.
 //!
 //! ## `agent_spawn`
 //! One assignment from the call's own arguments (the same keys, plus `mode`, `max_steps`,
@@ -178,7 +180,7 @@
 //! Result body `Body::Raw(report)`; outcome `verdict: accepted` / `verdict: not accepted` from
 //! `payload.accepted`, or `no verdict ({outcome})` when the payload has none (status `Error`).
 //! When the claim form was used, a last line is appended to the body: `The verdict is not recorded
-//! on {id}; set the claim's status yourself with `claim_update`.`
+//! on {id}; set the claim's status yourself with `claim` and `id`.`
 //!
 //! Tests required (fake `Orchestrator` recording every call and scripted per call; calls made
 //! through `loom_tools::execute`): `assignment` — every rule; `agent_spawn` — awaited result for
@@ -517,6 +519,35 @@ fn outcome_word(o: ChildOutcome) -> &'static str {
     }
 }
 
+/// The first line of a report of an agent that did not finish its work (contract N4): `[incomplete: ended
+/// by {budget|operator stop|error} at step {n}]`. `None` for an agent that returned or blocked on purpose.
+fn incomplete_header(outcome: ChildOutcome, steps: u32) -> Option<String> {
+    let cause = match outcome {
+        ChildOutcome::BudgetExhausted => "budget",
+        ChildOutcome::Stopped => "operator stop",
+        ChildOutcome::Failed => "error",
+        ChildOutcome::Returned | ChildOutcome::Blocked => return None,
+    };
+    Some(format!("[incomplete: ended by {cause} at step {steps}]"))
+}
+
+/// `report` under its incomplete header, when the agent's end calls for one.
+fn with_incomplete_header(report: &str, outcome: ChildOutcome, steps: u32) -> String {
+    match incomplete_header(outcome, steps) {
+        Some(h) => format!("{h}\n{report}"),
+        None => report.to_string(),
+    }
+}
+
+/// `out` with the limit `child incomplete` when the agent's end calls for it.
+fn mark_child_incomplete(out: ToolOutput, outcome: ChildOutcome) -> ToolOutput {
+    if incomplete_header(outcome, 0).is_some() {
+        out.with_limit("child incomplete")
+    } else {
+        out
+    }
+}
+
 /// The budget for a spawn: the call's numbers, lowered to the configured ceiling. The second value
 /// is the header fact to show when something was lowered.
 fn budget_for(shared: &Shared, args: &Map<String, Value>) -> (Budget, Option<String>) {
@@ -613,6 +644,7 @@ impl Tool for AgentSpawn {
             opt("mode", "string", "fresh: the agent starts with only the assignment. fork: it starts with everything you have seen so far.")
                 .one_of(&["fresh", "fork"])
                 .default(json!("fresh")),
+            opt("title", "string", "A short label for the operator (default: the question cut to 80 characters)."),
             opt("max_steps", "integer", "The most model steps the agent may take.").min(1),
             opt("max_minutes", "integer", "The longest the agent may run.").min(1),
             opt("background", "boolean", "true to keep working while the agent runs; its report then arrives later as a message.")
@@ -630,7 +662,9 @@ impl Tool for AgentSpawn {
         let shared = &*self.0;
         let mut fields: Map<String, Value> = args
             .iter()
-            .filter(|(k, _)| !matches!(k.as_str(), "mode" | "max_steps" | "max_minutes" | "background" | "workspace"))
+            .filter(|(k, _)| {
+                !matches!(k.as_str(), "mode" | "max_steps" | "max_minutes" | "background" | "workspace" | "title")
+            })
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         let role_note = resolve_role_synonym(shared, &mut fields);
@@ -645,7 +679,20 @@ impl Tool for AgentSpawn {
             Ok(w) => w,
             Err(e) => return ToolOutput::error(e),
         };
+        let title = match args.get("title") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(t)) => Some(cut(t.trim(), 80)).filter(|t| !t.is_empty()),
+            Some(other) => {
+                return ToolOutput::error(format!(
+                    "`title` must be a string; received {}. Give it as text.",
+                    describe(other)
+                ));
+            }
+        };
         let mut req = request(ctx, role.clone(), mode, brief, budget, !background);
+        if let Some(title) = title {
+            req.title = title;
+        }
         req.workspace = workspace;
         req.prerequisite = match prerequisite(shared, args) {
             Ok(p) => p,
@@ -664,7 +711,7 @@ impl Tool for AgentSpawn {
             let mut out = ToolOutput::ok(
                 format!("agent {id} started"),
                 Body::Message(format!(
-                    "Agent {id} ({role}) is working. Its report will arrive as a harness message when it ends. Call `wait` when you have nothing else to do until then.{copy}"
+                    "Agent {id} ({role}) is working. Its report will arrive as a harness message when it ends. Call `job_wait` without `job` when you have nothing else to do until then.{copy}"
                 )),
             );
             if let Some(note) = role_note {
@@ -681,10 +728,13 @@ impl Tool for AgentSpawn {
         };
         let copy = if workspace == Workspace::Copy { copy_report(shared, &id).await } else { None };
         let body = match copy {
-            None => settlement.report.clone(),
+            None => with_incomplete_header(&settlement.report, settlement.outcome, settlement.steps),
             Some(section) => format!(
                 "{COPY_LEGEND}\n\n===== report of agent {id} =====\n{}\n\n===== what agent {id} changed in its copy =====\n{section}\n",
-                loom_core::tagsafe::quote_lines_starting(&settlement.report, "=====")
+                loom_core::tagsafe::quote_lines_starting(
+                    &with_incomplete_header(&settlement.report, settlement.outcome, settlement.steps),
+                    "====="
+                )
             ),
         };
         let mut out =
@@ -700,7 +750,7 @@ impl Tool for AgentSpawn {
         if settlement.outcome != ChildOutcome::Returned {
             out.status = ToolStatus::Error;
         }
-        out
+        mark_child_incomplete(out, settlement.outcome)
     }
 }
 
@@ -829,6 +879,7 @@ impl Tool for AgentFanout {
             ChildOutcome::Stopped,
             ChildOutcome::Failed,
         ];
+        let mut incomplete = false;
         for (i, (id, result)) in started.iter().zip(results).enumerate() {
             let (role, outcome, steps, report) = match result {
                 Ok(s) => (s.role, s.outcome, s.steps, s.report),
@@ -846,8 +897,9 @@ impl Tool for AgentFanout {
                 "===== agent {} of {n}: {id} ({role}) \u{2014} {}, {steps} steps =====\n{}\n\n",
                 i.saturating_add(1),
                 outcome_word(outcome),
-                loom_core::tagsafe::quote_lines_starting(&report, "=====")
+                loom_core::tagsafe::quote_lines_starting(&with_incomplete_header(&report, outcome, steps), "=====")
             ));
+            incomplete |= incomplete_header(outcome, steps).is_some();
             if workspace == Workspace::Copy {
                 if let Some(section) = copy_report(shared, id).await {
                     body.push_str(&format!("===== what agent {id} changed in its copy =====\n{section}\n\n"));
@@ -874,6 +926,9 @@ impl Tool for AgentFanout {
         }
         if cancelled || counts.first().copied().unwrap_or(0) == 0 {
             out.status = ToolStatus::Error;
+        }
+        if incomplete {
+            out = out.with_limit("child incomplete");
         }
         out
     }
@@ -990,7 +1045,9 @@ impl Tool for Attempt {
                     .map(str::to_string)
                     .collect();
                 if texts.len() != items.len() {
-                    return ToolOutput::error("Every entry of `approaches` must be a sentence saying how one attempt should go about the assignment.");
+                    return ToolOutput::error(
+                        "Every entry of `approaches` must be a sentence saying how one attempt should go about the assignment.",
+                    );
                 }
                 texts
             }
@@ -998,7 +1055,7 @@ impl Tool for Attempt {
                 return ToolOutput::error(format!(
                     "`approaches` must be a list of sentences; received {}.",
                     describe(other)
-                ))
+                ));
             }
         };
         let asked = args.get("n").and_then(Value::as_u64).and_then(|n| usize::try_from(n).ok());
@@ -1010,11 +1067,13 @@ impl Tool for Attempt {
             (Some(n), len) => {
                 return ToolOutput::error(format!(
                     "`approaches` has {len} entries and `n` is {n}. Give one approach per attempt, or leave `n` out."
-                ))
+                ));
             }
         };
         if n < 2 {
-            return ToolOutput::error("An attempt set has at least 2 attempts. For a single agent in its own copy use agent_spawn with workspace: \"copy\".");
+            return ToolOutput::error(
+                "An attempt set has at least 2 attempts. For a single agent in its own copy use agent_spawn with workspace: \"copy\".",
+            );
         }
         let max = usize::try_from(shared.agents.max_children).unwrap_or(usize::MAX);
         let running = shared.orch.children(&shared.session).await.iter().filter(|c| c.running).count();
@@ -1208,7 +1267,7 @@ impl Tool for AgentAdopt {
             Ok(None) => {
                 return ToolOutput::error(format!(
                     "Agent {agent} worked in your workspace, not in a copy of it: what it changed is already here, and there is nothing to adopt."
-                ))
+                ));
             }
             Err(e) => return ToolOutput::error(e),
         };
@@ -1224,7 +1283,7 @@ impl Tool for AgentAdopt {
         }
         if copy.running {
             return ToolOutput::error(format!(
-                "Agent {id} is still working in its copy. Wait for it to end (`wait`) or stop it (`agent_stop`), then call agent_adopt again; `preview: true` shows what it has changed so far."
+                "Agent {id} is still working in its copy. Wait for it to end or stop it, then call agent_adopt again; `preview: true` shows what it has changed so far."
             ));
         }
         if std::path::Path::new(&copy.manifest.source) != ctx.workspace {
@@ -1244,7 +1303,11 @@ impl Tool for AgentAdopt {
         });
         let adopted = match adopting.await {
             Ok(result) => result,
-            Err(e) => return ToolOutput::error(format!("The adoption did not run to its end: {e}. Call agent_adopt again: paths already brought over are left alone.")),
+            Err(e) => {
+                return ToolOutput::error(format!(
+                    "The adoption did not run to its end: {e}. Call agent_adopt again: paths already brought over are left alone."
+                ));
+            }
         };
         let listed = |paths: &[(String, String)]| {
             let mut text: String =
@@ -1299,15 +1362,28 @@ impl Tool for AgentMessage {
     fn spec(&self) -> ToolSpec {
         spec(
             "agent_message",
-            "Send a message to an agent you started with background: true, for example to correct its course or add information. It reads the message at its next step.",
+            "Send a message to an agent you started with background: true, for example to correct its course or add information. It reads the message at its next step. With stop: true it ends the agent instead (a stopped agent delivers no report) and text is not needed.",
             ToolClass::State,
-            &[req("agent", "string", "Exact child ID, an unambiguous prefix, or last."), req("text", "string", "The message.")],
+            &[
+                req("agent", "string", "Exact child ID, an unambiguous prefix, or last."),
+                opt("text", "string", "The message. Required unless stop is true."),
+                opt("stop", "boolean", "true to stop the agent instead of messaging it.").default(json!(false)),
+            ],
         )
     }
-    async fn run(&self, _ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
+    async fn run(&self, ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
         let shared = &*self.0;
+        if args.get("stop").and_then(Value::as_bool).unwrap_or(false) {
+            // Contract T4: `stop: true` behaves as `agent_stop` for this agent.
+            let mut stop = args.clone();
+            stop.remove("stop");
+            stop.remove("text");
+            return AgentStop(self.0.clone()).run(ctx, &stop).await;
+        }
         let (Some(agent), Some(text)) = (str_arg(args, "agent"), str_arg(args, "text")) else {
-            return ToolOutput::error("Give `agent` (the agent's id) and `text` (the message), both as strings.");
+            return ToolOutput::error(
+                "Give `agent` (the agent's id) and `text` (the message), both as strings; or `stop: true` to end the agent.",
+            );
         };
         let id = match shared.orch.resolve_child(&shared.session, &SessionId::from(agent)).await {
             Ok(id) => id,
@@ -1560,10 +1636,10 @@ impl Tool for Verify {
             Ok(s) => s,
             Err(out) => return *out,
         };
-        let mut report = settlement.report.clone();
+        let mut report = with_incomplete_header(&settlement.report, settlement.outcome, settlement.steps);
         if let Some(id) = claim_id {
             report.push_str(&format!(
-                "\n\nThe verdict is not recorded on {id}; set the claim's status yourself with `claim_update`."
+                "\n\nThe verdict is not recorded on {id}; set the claim's status yourself with `claim` and `id`."
             ));
         }
         let mut out = match settlement.payload.get("accepted").and_then(Value::as_bool) {
@@ -1699,6 +1775,21 @@ mod tests {
         let sp = spawned(&r);
         assert_eq!(sp[0].mode, SpawnMode::Fork);
         assert_eq!(sp[0].title.chars().count(), 80);
+    }
+
+    #[tokio::test]
+    async fn spawn_title_is_used_trimmed_and_cut() {
+        let r = lead();
+        r.call("agent_spawn", json!({"question":"Find the long question text","title":"  Find it  "})).await;
+        r.call("agent_spawn", json!({"question":"q2","title":"x".repeat(100)})).await;
+        r.call("agent_spawn", json!({"question":"q3","title":"   "})).await;
+        let sp = spawned(&r);
+        assert_eq!(sp[0].title, "Find it");
+        assert_eq!(sp[1].title.chars().count(), 80);
+        assert_eq!(sp[2].title, "q3");
+        let res = r.call("agent_spawn", json!({"question":"q","title":3})).await;
+        // The schema refuses a non-string `title` before the tool runs.
+        assert_eq!(res.status, ToolStatus::Invalid, "{}", res.text);
     }
 
     #[tokio::test]
@@ -1910,7 +2001,7 @@ mod tests {
     async fn message_delivers_or_relays_refusal() {
         let r = lead();
         let res = r.call("agent_message", json!({"agent":"s-kid1","text":"hello"})).await;
-        assert_eq!(res.status, ToolStatus::Ok);
+        assert_eq!(res.status, ToolStatus::Ok, "{}", res.text);
         assert!(res.text.contains("sent") && res.text.contains("Delivered to s-kid1."), "{}", res.text);
         assert_eq!(r.orch.calls(), vec!["message s-kid1: hello"]);
         *r.orch.refuse.lock().unwrap() = Some("s-kid1 is not running.".into());
@@ -2033,7 +2124,7 @@ mod tests {
     // ---- verify ----
 
     fn with_claim(r: &Rig, with_evidence: bool) {
-        r.model_op(LedgerOp::ClaimAdd { text: "The cache is never stale".into() });
+        r.model_op(LedgerOp::ClaimAdd { text: "The cache is never stale".into(), assets: Vec::new() });
         if with_evidence {
             let handle = r.output("line one\nline two\nline three", "bash", ToolClass::Exec);
             assert!(handle.starts_with("out:"));
@@ -2065,7 +2156,7 @@ mod tests {
         assert!(res.text.contains("verdict: accepted"), "{}", res.text);
         assert!(
             res.text
-                .contains("The verdict is not recorded on c1; set the claim's status yourself with `claim_update`."),
+                .contains("The verdict is not recorded on c1; set the claim's status yourself with `claim` and `id`."),
             "{}",
             res.text
         );

@@ -45,8 +45,11 @@
 //! - `ls [-a]`: `render::sessions_table` (`-a`: archived too).
 //! - `tail <session> [--since <seq>] [--no-follow] [--reasoning] [--full] [--verbose]`: print the
 //!   session's records and keep following. `--no-follow` prints what exists and stops.
-//! - `send <session> <text…>` (`-` = standard input), then follows unless `--detach`.
-//! - `stop <session>`, `resume <session>`, `reweave <session>`, `archive <session> [--undo]`: the
+//! - `send <session> <text…> [--file PATH]…` (`-` = standard input), then follows unless `--detach`. Each
+//!   `--file` is read and uploaded (`upload_files`: `client.upload` into the session's workspace, `docs/UPLOADS.md`)
+//!   before the message, which carries the returned paths as attachments; with files the text may be empty.
+//!   `run` takes `--file` the same way (the workspace must exist: it is uploaded to before the session is made).
+//! - `stop <session>`, `resume <session>`, `compact <session>` (alias `reweave`), `archive <session> [--undo]`: the
 //!   call, then one line saying what was asked (`stop requested for {id}`).
 //! - `rule <session> <text…>` (`-` = standard input): `client.add_rule`; `rule sent to {lead}`.
 //!   `rule <session> --withdraw <rule-id> [--reason <text>]`: `client.withdraw_rule`; `withdrawal of
@@ -178,11 +181,15 @@ max_concurrent = 4           # requests in flight at once (lead, agents and vote
 retry_window_s = 300         # keep retrying an unreachable server this long; 0 = until it returns
 
 [context]
-# The request is re-woven (old tool output folded out of view, never lost) when it passes
-# target_tokens, down to floor_tokens (floor below target). A session clamps both to a smaller model window
-# automatically, so a small context_window needs no change here.
-target_tokens = 400000
-floor_tokens = 180000
+# The window is compacted (the model writes a note, old output stays readable by key, nothing is lost) when a
+# request reaches compact_at_tokens. 0 = 40% of the model's window, never above 400000; a session clamps it to a
+# smaller model window automatically, so a small context_window needs no change here.
+compact_at_tokens = 0
+
+[sandbox]
+# The OS sandbox every command runs in. Left out, it is the one for this system: "bubblewrap" on Linux
+# (needs the bwrap binary), "seatbelt" on macOS. "none" runs commands unconfined and is said at start.
+# mode = "bubblewrap"
 
 [network]
 # deny_all (the default): tools reach no host through the egress proxy.
@@ -242,7 +249,8 @@ pub enum Command {
     /// Let a stopped session carry on
     Resume(SessionArg),
     /// Fold old tool output out of a session's context now
-    Reweave(SessionArg),
+    #[command(alias = "reweave")]
+    Compact(SessionArg),
     /// Hide a finished session (or bring it back with --undo)
     Archive(ArchiveArgs),
     /// Rename a mission (set its lead session's title)
@@ -279,6 +287,16 @@ pub enum Command {
     Net(NetArgs),
     /// Print a stored tool output
     Out(OutArgs),
+    /// Targets: named scopes that missions share, with a graph of what they found
+    Target {
+        #[command(subcommand)]
+        action: TargetAction,
+    },
+    /// The interception CA (CONTRACTS-TRAFFIC-TARGETS I2)
+    Ca {
+        #[command(subcommand)]
+        action: CaAction,
+    },
     /// The configuration file
     Config {
         #[command(subcommand)]
@@ -291,11 +309,33 @@ pub enum Command {
         #[command(subcommand)]
         action: ModelsAction,
     },
+    /// MCP servers: the configured ones, and a start-and-list check of one
+    Mcp {
+        #[command(subcommand)]
+        action: McpAction,
+    },
     /// Run the daemon as a login service (macOS)
     Service {
         #[command(subcommand)]
         action: ServiceAction,
     },
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum McpAction {
+    /// The configured servers with their transport and roles (read from the configuration file)
+    List,
+    /// Start a configured server in a scratch sandbox, list its tools and close it
+    Check(McpCheckArgs),
+}
+
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct McpCheckArgs {
+    /// The server's name in [mcp.servers]
+    pub server: String,
+    /// The workspace to run it for (default: the current directory)
+    #[arg(long)]
+    pub workspace: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -336,6 +376,13 @@ pub struct StartOpts {
     /// Make the workspace folder (and the folders above it) when it does not exist
     #[arg(long)]
     pub create_workspace: bool,
+    /// A target (`loom target add`) for the mission to work on: its scope joins the network rules and its
+    /// graph is shared with the other missions of the target
+    #[arg(long, value_name = "NAME")]
+    pub target: Option<String>,
+    /// Do not decrypt HTTPS for this mission, whatever its pack says (`[network] intercept = "pack"` only)
+    #[arg(long)]
+    pub no_intercept: bool,
 }
 
 #[derive(Args, Debug)]
@@ -359,6 +406,9 @@ pub struct RunArgs {
     /// Start it and return
     #[arg(short, long)]
     pub detach: bool,
+    /// Attach a file (uploaded to the workspace first, which must exist); repeatable. The task may then be empty
+    #[arg(long = "file", value_name = "PATH")]
+    pub files: Vec<PathBuf>,
     /// The task ("-" or nothing: read standard input)
     pub message: Vec<String>,
 }
@@ -400,6 +450,13 @@ pub struct SendArgs {
     pub show: ShowOpts,
     #[arg(short, long)]
     pub detach: bool,
+    /// While the lead is in a turn, hold the message until the turn ends instead of giving it to the lead at its
+    /// next step. An idle lead takes it at once, as without the flag
+    #[arg(long)]
+    pub after_turn: bool,
+    /// Attach a file (uploaded to the session's workspace first); repeatable. The message may then be empty
+    #[arg(long = "file", value_name = "PATH")]
+    pub files: Vec<PathBuf>,
     /// The message ("-" or nothing: read standard input)
     pub text: Vec<String>,
 }
@@ -583,6 +640,65 @@ pub struct OutArgs {
     /// A line range: 10:20, 10: or :20
     #[arg(long)]
     pub lines: Option<String>,
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum TargetAction {
+    /// List the targets with how many nodes have each status
+    List,
+    /// Create a target
+    Add(TargetAddArgs),
+    /// Show a target: its scope and settings, and its nodes by status
+    Show(TargetShowArgs),
+    /// Change what a target covers: add or remove scope and exclude entries
+    Scope(TargetScopeArgs),
+}
+
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct TargetAddArgs {
+    /// The name: a-z, 0-9, `-` and `_`
+    pub name: String,
+    /// A scope entry (host, `*.domain`, IP or CIDR); repeatable
+    #[arg(long, value_name = "ENTRY")]
+    pub scope: Vec<String>,
+    /// An entry that is never reachable, whatever else allows it; repeatable
+    #[arg(long, value_name = "ENTRY")]
+    pub exclude: Vec<String>,
+    #[arg(long)]
+    pub notes: Option<String>,
+}
+
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct TargetShowArgs {
+    pub name: String,
+    /// Print the nodes too
+    #[arg(long)]
+    pub nodes: bool,
+}
+
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct TargetScopeArgs {
+    pub name: String,
+    /// Scope entries to add; repeatable
+    #[arg(long, value_name = "ENTRY")]
+    pub add: Vec<String>,
+    /// Scope entries to remove; repeatable
+    #[arg(long, value_name = "ENTRY")]
+    pub remove: Vec<String>,
+    /// Exclude entries to add; repeatable
+    #[arg(long, value_name = "ENTRY")]
+    pub exclude: Vec<String>,
+    /// Exclude entries to remove; repeatable
+    #[arg(long, value_name = "ENTRY")]
+    pub unexclude: Vec<String>,
+}
+
+#[derive(Subcommand, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaAction {
+    /// Print the CA's fingerprint and the file of its certificate (made when missing)
+    Show,
+    /// Replace the CA with a new one
+    Rotate,
 }
 
 #[derive(Subcommand, Debug, Clone, Copy, PartialEq, Eq)]
@@ -919,6 +1035,9 @@ fn new_session(opts: &StartOpts, message: Option<String>, cwd: &Path, prior: Vec
         prior,
         role_models: opts.agent_models.iter().cloned().collect(),
         create_workspace: opts.create_workspace,
+        attachments: Vec::new(),
+        target: opts.target.clone().filter(|t| !t.trim().is_empty()),
+        intercept: opts.no_intercept.then_some(false),
     }
 }
 
@@ -1159,6 +1278,8 @@ async fn follow(
                 BusEvent::Session { .. }
                 | BusEvent::Status { .. }
                 | BusEvent::Net { .. }
+                | BusEvent::Queued { .. }
+                | BusEvent::Target { .. }
                 | BusEvent::Settled { .. } => {}
             }
         }
@@ -1265,6 +1386,22 @@ async fn tail_with(c: &Client, a: &TailArgs, cfg: &FollowCfg<'_>, out: &mut dyn 
     Ok(follow(c, &id, a.since, &cfg, out).await?.code)
 }
 
+/// Read each file and upload it to `workspace`; the stored paths, in order. A file that cannot be read stops
+/// the command before anything is sent.
+async fn upload_files(c: &Client, workspace: &str, files: &[PathBuf]) -> Result<Vec<String>, String> {
+    let mut stored = Vec::with_capacity(files.len());
+    for file in files {
+        let shown = file.display();
+        let bytes = std::fs::read(file).map_err(|e| format!("Cannot read {shown} to attach it ({e})."))?;
+        let name = file.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
+            format!("Cannot attach {shown}: it has no file name. Give a path that ends in the file's name.")
+        })?;
+        let up = c.upload(workspace, name, bytes).await.map_err(|e| format!("Cannot attach {shown}: {e}"))?;
+        stored.push(up.path);
+    }
+    Ok(stored)
+}
+
 /// `send`: the message, then what follows it.
 async fn send_with(
     c: &Client,
@@ -1274,8 +1411,28 @@ async fn send_with(
     cfg: &FollowCfg<'_>,
     out: &mut dyn Write,
 ) -> Result<FollowEnd, String> {
+    send_with_files(c, id, text, (&[], false), detach, cfg, out).await
+}
+
+/// [`send_with`] with uploaded `files` attached.
+async fn send_with_files(
+    c: &Client,
+    id: &SessionId,
+    text: &str,
+    (files, after_turn): (&[String], bool),
+    detach: bool,
+    cfg: &FollowCfg<'_>,
+    out: &mut dyn Write,
+) -> Result<FollowEnd, String> {
     let baseline = last_seq(c, id).await?;
-    c.send(id, text).await?;
+    if after_turn {
+        if let Some(queued) = c.send_after_turn(id, text, files).await? {
+            put(out, &format!("queued for {id} ({}); it is sent when the turn ends\n", queued.id))?;
+            return Ok(FollowEnd { code: 0, ended: false });
+        }
+    } else {
+        c.send_with_files(id, text, files).await?;
+    }
     if detach {
         put(out, &format!("sent to {id}\n"))?;
         return Ok(FollowEnd { code: 0, ended: false });
@@ -1328,6 +1485,7 @@ async fn dispatch(command: Command) -> Result<i32, String> {
         Command::Down => cmd_down(&paths).await,
         Command::Config { action } => cmd_config(&paths, action),
         Command::Models { action } => cmd_models(&paths, action).await,
+        Command::Mcp { action } => cmd_mcp(&paths, action).await,
         Command::Monitor(a) => cmd_monitor(&paths, a).await,
         Command::Service { action } => cmd_service(&paths, action),
         Command::Status => {
@@ -1350,14 +1508,24 @@ async fn dispatch(command: Command) -> Result<i32, String> {
             tail_with(&c, &a, &cfg, &mut StdoutSink).await
         }
         Command::Send(a) => {
-            let text = read_message(&a.text, "message")?;
+            let text = if a.files.is_empty() || !a.text.is_empty() {
+                read_message(&a.text, "message")?
+            } else {
+                String::new()
+            };
             let c = client_of(&paths)?;
             let id = c.resolve(&a.session).await?;
+            let attached = if a.files.is_empty() {
+                Vec::new()
+            } else {
+                let workspace = c.session(&id).await?.info.meta.workspace;
+                upload_files(&c, &workspace, &a.files).await?
+            };
             let style = style();
             let opts = record_opts(&a.show);
             let render_record = |r: &Record| render::record(r, &style, &opts);
             let cfg = terminal_cfg(&render_record, &style, None);
-            Ok(send_with(&c, &id, &text, a.detach, &cfg, &mut StdoutSink).await?.code)
+            Ok(send_with_files(&c, &id, &text, (&attached, a.after_turn), a.detach, &cfg, &mut StdoutSink).await?.code)
         }
         Command::Stop(a) => {
             let c = client_of(&paths)?;
@@ -1371,11 +1539,11 @@ async fn dispatch(command: Command) -> Result<i32, String> {
             c.resume(&id).await?;
             outln(&format!("resume requested for {id}")).map(|()| 0)
         }
-        Command::Reweave(a) => {
+        Command::Compact(a) => {
             let c = client_of(&paths)?;
             let id = c.resolve(&a.session).await?;
-            c.reweave(&id).await?;
-            outln(&format!("re-weave requested for {id}")).map(|()| 0)
+            c.compact(&id).await?;
+            outln(&format!("compaction requested for {id}")).map(|()| 0)
         }
         Command::Archive(a) => {
             let c = client_of(&paths)?;
@@ -1491,6 +1659,15 @@ async fn dispatch(command: Command) -> Result<i32, String> {
                 text.push_str(&format!("{}\n", render::granted_hosts_line(&hosts)));
             }
             block(&text).map(|()| 0)
+        }
+        Command::Target { action } => cmd_target(&paths, action).await,
+        Command::Ca { action } => {
+            let (fp, file) = match action {
+                CaAction::Show => loom_agent::runtime::ca_show(&paths.home)?,
+                CaAction::Rotate => loom_agent::runtime::ca_rotate(&paths.home)?,
+            };
+            let verb = if action == CaAction::Rotate { "rotated; new " } else { "" };
+            outln(&format!("{verb}fingerprint sha256 {fp}\ncertificate {}", file.display())).map(|()| 0)
         }
         Command::Out(a) => {
             let range = a.lines.as_deref().map(parse_lines).transpose()?;
@@ -1728,13 +1905,18 @@ async fn cmd_open(paths: &Paths, a: &OpenArgs) -> Result<i32, String> {
 }
 
 async fn cmd_run(paths: &Paths, a: RunArgs) -> Result<i32, String> {
-    let message = read_message(&a.message, "message")?;
+    let message =
+        if a.files.is_empty() || !a.message.is_empty() { read_message(&a.message, "message")? } else { String::new() };
     let c = client_of(paths)?;
     let cwd =
         std::env::current_dir().map_err(|e| format!("Cannot find the current directory ({e}). Pass --workspace."))?;
     let client = &c;
     let prior = prior_missions(&a.start.prior, |word| async move { client.mission_of(&word).await }).await?;
-    let made = c.create_receipt(&new_session(&a.start, Some(message), &cwd, prior)).await?;
+    let mut new = new_session(&a.start, Some(message).filter(|m| !m.is_empty()), &cwd, prior);
+    if !a.files.is_empty() {
+        new.attachments = upload_files(&c, &new.workspace.to_string_lossy(), &a.files).await?;
+    }
+    let made = c.create_receipt(&new).await?;
     let id = made.info.meta.id;
     if made.created {
         errln(&format!("created workspace {}", made.info.meta.workspace));
@@ -1804,6 +1986,32 @@ that recalls them, or drop --prior to continue this one."
     }
 }
 
+async fn cmd_mcp(paths: &Paths, action: McpAction) -> Result<i32, String> {
+    match action {
+        McpAction::List => {
+            let file = paths.config_file();
+            let cfg = Config::load(&file).map_err(|e| format!("{}: {e}", file.display()))?;
+            block(&render::mcp_list(&loom_agent::mcp::configured(&cfg.mcp))).map(|()| 0)
+        }
+        McpAction::Check(a) => {
+            let c = client_of(paths)?;
+            let ws = match a.workspace {
+                Some(w) => w,
+                None => std::env::current_dir()
+                    .map_err(|e| format!("Cannot find the current directory ({e}). Pass --workspace."))?,
+            };
+            let ws = if ws.to_str().is_some_and(|w| w == "~" || w.starts_with("~/")) {
+                ws
+            } else {
+                std::path::absolute(&ws).unwrap_or(ws)
+            };
+            let view = c.mcp_check(&a.server, &ws.display().to_string()).await?;
+            block(&render::mcp_check(&view))?;
+            Ok(if view.error.is_some() { 1 } else { 0 })
+        }
+    }
+}
+
 async fn cmd_models(paths: &Paths, action: ModelsAction) -> Result<i32, String> {
     match action {
         // Read from the configuration and the packs, so it works with no daemon running.
@@ -1833,6 +2041,60 @@ async fn cmd_models(paths: &Paths, action: ModelsAction) -> Result<i32, String> 
             let role = cli_role(&a.role);
             let receipt = c.set_role_model(&id, &role, a.profile.as_deref(), a.now).await?;
             block(&render::role_model_receipt(&receipt, &role, a.profile.as_deref(), &style())).map(|()| 0)
+        }
+    }
+}
+
+/// `loom target list|add|show|scope`: the daemon holds the targets, so these go through its API.
+async fn cmd_target(paths: &Paths, action: TargetAction) -> Result<i32, String> {
+    let c = client_of(paths)?;
+    match action {
+        TargetAction::List => {
+            let list = c.targets().await?;
+            if list.is_empty() {
+                return outln("No targets yet. Create one with `loom target add NAME --scope HOST`.").map(|()| 0);
+            }
+            block(&render::target_list(&list)).map(|()| 0)
+        }
+        TargetAction::Add(a) => {
+            let body = loom_agent::runtime::TargetBody {
+                name: Some(a.name),
+                scope: Some(a.scope),
+                exclude: Some(a.exclude),
+                notes: a.notes,
+                ..Default::default()
+            };
+            let v = c.target_create(&body).await?;
+            outln(&format!("created target {} with {} scope entries", v.name, v.scope.len())).map(|()| 0)
+        }
+        TargetAction::Show(a) => {
+            let v = c.target(&a.name).await?;
+            let mut text = render::target_show(&v);
+            if a.nodes {
+                let g = c.target_graph(&a.name).await?;
+                text.push_str(&render::target_nodes(&g));
+            }
+            block(&text).map(|()| 0)
+        }
+        TargetAction::Scope(a) => {
+            let v = c.target(&a.name).await?;
+            let edit = |mut cur: Vec<String>, add: &[String], remove: &[String]| {
+                cur.retain(|e| !remove.iter().any(|r| r.eq_ignore_ascii_case(e)));
+                for e in add {
+                    if !cur.iter().any(|x| x.eq_ignore_ascii_case(e)) {
+                        cur.push(e.clone());
+                    }
+                }
+                cur
+            };
+            let body = loom_agent::runtime::TargetBody {
+                scope: Some(edit(v.scope, &a.add, &a.remove)),
+                exclude: Some(edit(v.exclude, &a.exclude, &a.unexclude)),
+                ..Default::default()
+            };
+            let v = c.target_update(&a.name, &body).await?;
+            outln(&format!("target {}: scope {}; exclude {}", v.name, v.scope.join(", "), v.exclude.join(", ")))
+                .map(|()| 0)
         }
     }
 }
@@ -2412,16 +2674,23 @@ mod tests {
         let Command::Send(a) = ok(&["send", "last", "-"]) else { panic!("not send") };
         assert_eq!(a.text, words(&["-"]));
         rejected(&["send"]);
+        let Command::Send(a) = ok(&["send", "s-1", "--file", "a.csv", "--file", "b.png", "look"]) else {
+            panic!("not send")
+        };
+        assert_eq!(a.files, vec![PathBuf::from("a.csv"), PathBuf::from("b.png")]);
+        assert_eq!(a.text, words(&["look"]));
+        let Command::Run(a) = ok(&["run", "--file", "x.txt"]) else { panic!("not run") };
+        assert_eq!((a.files, a.message.is_empty()), (vec![PathBuf::from("x.txt")], true));
     }
 
     #[test]
     fn session_commands_parse_and_need_their_argument() {
         assert!(matches!(ok(&["stop", "s-1"]), Command::Stop(SessionArg { .. })));
         assert!(matches!(ok(&["resume", "s-1"]), Command::Resume(_)));
-        assert!(matches!(ok(&["reweave", "s-1"]), Command::Reweave(_)));
+        assert!(matches!(ok(&["compact", "s-1"]), Command::Compact(_)));
         assert!(matches!(ok(&["ledger", "m-1"]), Command::Ledger(_)));
         assert!(matches!(ok(&["window", "s-1"]), Command::Window(_)));
-        for cmd in ["stop", "resume", "reweave", "archive", "ledger", "score", "window", "net", "answer", "out"] {
+        for cmd in ["stop", "resume", "compact", "archive", "ledger", "score", "window", "net", "answer", "out"] {
             rejected(&[cmd]);
         }
         let Command::Score(a) = ok(&["score", "last"]) else { panic!("not score") };
@@ -2513,6 +2782,13 @@ mod tests {
         rejected(&["config"]);
         rejected(&["config", "edit"]);
         rejected(&["service"]);
+        assert!(matches!(ok(&["mcp", "list"]), Command::Mcp { action: McpAction::List }));
+        let Command::Mcp { action: McpAction::Check(a) } = ok(&["mcp", "check", "github", "--workspace", "/w"]) else {
+            panic!("not mcp check")
+        };
+        assert_eq!((a.server.as_str(), a.workspace), ("github", Some(PathBuf::from("/w"))));
+        rejected(&["mcp"]);
+        rejected(&["mcp", "check"]);
         assert!(matches!(ok(&["models", "list"]), Command::Models { action: ModelsAction::List }));
         assert!(matches!(ok(&["models", "reload"]), Command::Models { action: ModelsAction::Reload }));
         let Command::Models { action: ModelsAction::Set(a) } = ok(&["models", "set", "last", "big"]) else {
@@ -2665,10 +2941,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::at(dir.path().join("home"));
         assert_eq!(cmd_config(&paths, ConfigAction::Init), Ok(0));
-        // The start-up checks run before the model policy, and seatbelt (the default) is macOS's: with no OS
-        // sandbox they pass on every host, so the check reaches the policy on Linux too.
+        // The start-up checks run before the model policy, and the default sandbox is the system's own (seatbelt,
+        // or bubblewrap with its binary): with no OS sandbox they pass on every host, so the check reaches the
+        // policy everywhere. The generated config has a `[sandbox]` table, with its `mode` commented out.
         let init = std::fs::read_to_string(paths.config_file()).unwrap();
-        std::fs::write(paths.config_file(), format!("{init}\n[sandbox]\nmode = \"none\"\n")).unwrap();
+        let none = init.replacen("\n[sandbox]\n", "\n[sandbox]\nmode = \"none\"\n", 1);
+        assert_ne!(none, init, "the generated config has a [sandbox] table");
+        std::fs::write(paths.config_file(), none).unwrap();
         let err = cmd_config(&paths, ConfigAction::Check).unwrap_err();
         assert!(err.starts_with("The model policy is not settled"), "{err}");
         let text = std::fs::read_to_string(paths.config_file()).unwrap();
@@ -2684,9 +2963,9 @@ mod tests {
         assert!(text.contains("\ncontext_window = 32768"));
         let config = Config::parse(&text).unwrap();
         config.check().unwrap();
-        // The session clamps the bounds to the window (`session::reweave_bounds`); the config keeps its values.
+        // The session clamps the bounds to the window (`ContextCfg::compact_at`); the config keeps its values.
         assert_eq!(config.models["local"].context_window, Some(32768));
-        assert!(config.context.target_tokens >= 32768);
+        assert_eq!(config.context.compact_at(Some(32768)), 13_106);
     }
 
     #[test]
@@ -2968,9 +3247,12 @@ mod tests {
             max_minutes: 3,
             prior: Vec::new(),
             create_workspace: true,
+            target: Some("acme".into()),
+            no_intercept: true,
             agent_models: vec![("worker".into(), "fast".into()), (ANY_ROLE.into(), "big".into())],
         };
         let n = new_session(&opts, None, cwd, vec![MissionId::from("m-1"), MissionId::from("m-2")]);
+        assert_eq!(n.intercept, Some(false));
         assert_eq!(n.prior, [MissionId::from("m-1"), MissionId::from("m-2")]);
         assert_eq!(
             n.role_models,
@@ -3501,7 +3783,7 @@ mod tests {
                         let records: Vec<Record> =
                             log.iter().filter(|r| after.is_none_or(|a| r.seq > a)).take(limit).cloned().collect();
                         let next_after = (records.len() == limit).then(|| records.last().map(|r| r.seq)).flatten();
-                        json(&crate::wire::RecordsPage { records, next_after })
+                        json(&crate::wire::RecordsPage { records, next_after, prev_before: None })
                     }
                 }),
             )

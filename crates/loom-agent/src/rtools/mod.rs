@@ -300,6 +300,14 @@ pub trait Orchestrator: Send + Sync {
     async fn resolve_child(&self, _parent: &SessionId, child: &SessionId) -> Result<SessionId, String> {
         Ok(child.clone())
     }
+    /// The mission ledger took `op` and is now in `state`: the runtime mirrors what belongs to the
+    /// mission target's graph (CONTRACTS-TRAFFIC-TARGETS T4). The default does nothing.
+    fn ledger_appended(&self, _session: &SessionId, _op: &LedgerOp, _state: &LedgerState) {}
+    /// The target of the mission of `session` with its nodes (T5, `security_query` view `target`):
+    /// `None` when the mission has no target.
+    fn target_nodes(&self, _session: &SessionId) -> Option<Result<(String, Vec<loom_core::target::NodeView>), String>> {
+        None
+    }
     /// The box of the mission of `session`, made ready to be used. The errors are the sentences the box
     /// tools return: no box configured ([`boxtools::NO_BOX`], the default), a session that works in its own
     /// copy of the workspace ([`boxtools::BOX_IN_COPY`]), a session without a mission.
@@ -334,6 +342,8 @@ struct Slots {
     /// Refusals of the lead's `finish` without new execution evidence since the last rejection. In-memory only.
     stuck_refusals: u32,
     fresh_start: Option<FreshStart>,
+    /// The limits (`cut`, `timeout`, ...) of the stored outputs whose results were not complete.
+    output_limits: std::collections::HashMap<BlobId, Vec<String>>,
 }
 
 /// One session's handle for its runtime tools. Created by the runtime, shared by `Arc`.
@@ -348,7 +358,11 @@ pub struct Shared {
     pub log_path: PathBuf,
     pub agents: AgentsCfg,
     pub orch: Arc<dyn Orchestrator>,
+    /// The session's captured exchanges and the mission's index of them (CONTRACTS-TRAFFIC-TARGETS C, F).
+    pub traffic: Arc<crate::traffic::Traffic>,
     slots: Mutex<Slots>,
+    /// The MCP servers this session owns (CONTRACTS-MCP M6), set once before its registry is built.
+    mcp: std::sync::OnceLock<Arc<crate::mcp::McpSession>>,
 }
 
 impl Shared {
@@ -363,7 +377,35 @@ impl Shared {
         agents: AgentsCfg,
         orch: Arc<dyn Orchestrator>,
     ) -> Shared {
-        Shared { session, mission, parent, role, journal, log_path, agents, orch, slots: Mutex::new(Slots::default()) }
+        Shared {
+            session,
+            mission,
+            parent,
+            role,
+            journal,
+            log_path,
+            agents,
+            orch,
+            traffic: Arc::new(crate::traffic::Traffic::none()),
+            slots: Mutex::new(Slots::default()),
+            mcp: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Give the session its MCP servers. Only the first call has an effect.
+    pub fn set_mcp(&self, mcp: crate::mcp::McpSession) {
+        let _ = self.mcp.set(Arc::new(mcp));
+    }
+
+    /// The session's MCP servers; `None` when it has none.
+    pub fn mcp(&self) -> Option<&Arc<crate::mcp::McpSession>> {
+        self.mcp.get()
+    }
+
+    /// Give the session the capture state the runtime shares with its proxy sink.
+    pub fn with_traffic(mut self, traffic: Arc<crate::traffic::Traffic>) -> Shared {
+        self.traffic = traffic;
+        self
     }
 
     pub fn is_child(&self) -> bool {
@@ -391,6 +433,18 @@ impl Shared {
         }
         slots.stuck_refusals = slots.stuck_refusals.saturating_add(1);
         slots.stuck_refusals
+    }
+
+    /// Remember what the result that stored `blob` did not cover (the verifier's brief lists it).
+    pub fn note_output_limits(&self, blob: &BlobId, limits: Vec<String>) {
+        if !limits.is_empty() {
+            self.slots().output_limits.insert(blob.clone(), limits);
+        }
+    }
+
+    /// What the result that stored `blob` did not cover; empty for a complete one.
+    pub fn output_limits(&self, blob: &BlobId) -> Vec<String> {
+        self.slots().output_limits.get(blob).cloned().unwrap_or_default()
     }
 
     pub fn take_emitted(&self) -> Vec<(Author, Event)> {
@@ -454,11 +508,9 @@ impl Shared {
         // Security records are authorized by `security_record` itself (an independent read-only judge may
         // close a hypothesis); a read-only judge explicitly granted both `evidence` and `verdict` may
         // attach verbatim-attested evidence to an existing claim; every other op is refused to a read-only role.
-        if self.role.read_only
-            && !from_user
-            && !matches!(op, LedgerOp::Security(_))
-            && !(judge_evidence && matches!(&op, LedgerOp::EvidenceAdd(input) if input.attested))
-        {
+        let judge_attests = judge_evidence && matches!(&op, LedgerOp::EvidenceAdd(input) if input.attested);
+        let allowed = from_user || matches!(op, LedgerOp::Security(_)) || judge_attests;
+        if self.role.read_only && !allowed {
             return Err("This role has read-only access to the mission ledger. Return observations through its report or verdict.".to_string());
         }
         let summary = LedgerState::summarize(&op);
@@ -483,6 +535,7 @@ impl Shared {
                 .and_then(|i| state.claim_sessions.get(i)).is_some_and(|s| *s == self.session);
             if own { Ok(()) } else { Err(format!("Claim {claim} belongs to another session. Add evidence and update status only on claims created by this child; return other observations to the lead.")) }
         }).map_err(|e| journal_sentence(&e))?;
+        self.orch.ledger_appended(&self.session, &checked_op, &state);
         let author = if from_user { Author::User } else { Author::Model };
         self.emit(author, Event::Ledger { n: entry.n, summary });
         Ok((entry, state))
@@ -593,8 +646,14 @@ pub fn build_registry(shared: &Arc<Shared>) -> Result<Registry, String> {
                 return Err(format!(
                     "role `{}` of pack `{}` lists the tool `{name}`, which does not exist",
                     shared.role.name, shared.role.pack
-                ))
+                ));
             }
+        }
+    }
+    // After the role's own tools, in server and listing order (CONTRACTS-MCP M6).
+    if let Some(mcp) = shared.mcp() {
+        for t in mcp.tools() {
+            registry.add(Arc::new(t));
         }
     }
     Ok(registry)
@@ -659,7 +718,7 @@ mod tests {
         let r = rig("lead", false, true);
         assert!(validate_dispatch_prerequisite(&r.shared, true, None, 100).is_err());
         assert_eq!(validate_dispatch_prerequisite(&r.shared, false, None, 100).unwrap(), None);
-        r.model_op(LedgerOp::ClaimAdd { text: "fixture credential observed".into() });
+        r.model_op(LedgerOp::ClaimAdd { text: "fixture credential observed".into(), assets: Vec::new() });
         r.model_op(LedgerOp::EvidenceAdd(EvidenceInput {
             claim: "c1".into(),
             kind: EvidenceKind::Execution,
@@ -747,7 +806,7 @@ mod tests {
         for (pack, role_name) in [("redteam", "op_judge"), ("ctf", "flag_judge")] {
             let role = packs.role(Some(pack), Some(role_name)).unwrap().clone();
             let r = rig_with(role, true, true, AgentsCfg::default());
-            r.model_op(LedgerOp::ClaimAdd { text: "candidate reaches target".into() });
+            r.model_op(LedgerOp::ClaimAdd { text: "candidate reaches target".into(), assets: Vec::new() });
             let h = r.output("verified oracle receipt output\n", "oracle_check", ToolClass::Exec);
             let res = r
                 .call(
@@ -765,7 +824,7 @@ mod tests {
             assert_eq!(res.status, loom_core::event::ToolStatus::Ok, "{pack}/{role_name}: {}", res.text);
             assert_eq!(r.shared.ledger().unwrap().evidence.len(), 1);
             for op in [
-                LedgerOp::ClaimAdd { text: "new claim".into() },
+                LedgerOp::ClaimAdd { text: "new claim".into(), assets: Vec::new() },
                 LedgerOp::ClaimUpdate { id: "c1".into(), status: ClaimStatus::Supported, note: String::new() },
                 LedgerOp::Decision { text: "d".into(), reason: "r".into() },
             ] {
@@ -791,7 +850,7 @@ mod tests {
         // A read-only verifier without `evidence` stays blocked from EvidenceAdd.
         let verifier_role = packs.role(Some("core"), Some("verifier")).unwrap().clone();
         let v = rig_with(verifier_role, true, true, AgentsCfg::default());
-        v.model_op(LedgerOp::ClaimAdd { text: "lead claim".into() });
+        v.model_op(LedgerOp::ClaimAdd { text: "lead claim".into(), assets: Vec::new() });
         let ev = LedgerOp::EvidenceAdd(EvidenceInput {
             claim: "c1".into(),
             kind: EvidenceKind::Static,
@@ -812,7 +871,12 @@ mod tests {
         let w = rig("worker", true, true);
         let journal = w.shared.journal.as_ref().unwrap();
         journal
-            .append(&SessionId::from("s-lead"), false, LedgerOp::ClaimAdd { text: "lead claim".into() }, &|_| Ok(()))
+            .append(
+                &SessionId::from("s-lead"),
+                false,
+                LedgerOp::ClaimAdd { text: "lead claim".into(), assets: Vec::new() },
+                &|_| Ok(()),
+            )
             .unwrap();
         let h = w.output("worker observed line\n", "bash", ToolClass::Exec);
         let res = w

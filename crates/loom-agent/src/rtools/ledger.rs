@@ -11,8 +11,18 @@
 //! `[x] p1 text — note` (done), `[>] p2 text` (doing), `[ ] p3 text` (todo), `[-] p4 text — note`
 //! (dropped); `(no plan)` when empty.
 //!
-//! - `plan`: `PlanSet { steps }` (each step trimmed; an empty step is refused before the append with
-//!   a sentence naming its position). Outcome `plan set`; text `plan_lines`.
+//! - `plan`: `steps` are strings or objects `{step|text|content|description, status?, activeForm?, id?}`
+//!   (`activeForm` and `id` are accepted and ignored). `status` is `pending|todo`, `in_progress|doing`,
+//!   `completed|done` or `cancelled|dropped` (case and `-` ignored); any other value is refused before
+//!   anything is written, naming the accepted values. Each step is trimmed; an empty step is refused with a
+//!   sentence naming its position. When the given texts equal the current plan's step texts (same count,
+//!   same order) the plan is kept, with its ids, notes and evidence, and only steps whose status differs
+//!   are updated with `PlanUpdate` (a step given no status is left as it is). Outcome `plan updated`; text
+//!   `Plan unchanged; step p2 → doing, p1 → done.` (or `Plan unchanged; no step changed status.`) then
+//!   `plan_lines`. Otherwise `PlanSet { steps }` replaces the plan (outcome `plan set`), then each step
+//!   given a status other than todo is updated; text `plan_lines`, preceded by `Plan set; step p1 → done.`
+//!   when any status was applied. The ledger refuses `done` and `dropped` without a note, so a step
+//!   moved to either keeps its existing note, or gets `marked done in `plan`` / `dropped in `plan``.
 //! - `step`: with `text` and no `id` → `PlanAdd { text }`, outcome `step added`. With `id` and
 //!   `status` → `PlanUpdate { id, status, note, evidence }`, outcome `step {id} {status}`. Any other
 //!   combination is refused: `Give `id` and `status` to update a step, or `text` alone to add one.`
@@ -24,15 +34,20 @@
 //!   would_change }`. Outcome `reflection {id} recorded`; text one line echoing the id and `next_route`.
 //!   A structured self-check for when progress stalls: what is ruled out, the best next route, and the
 //!   evidence that would change the conclusion. Each field must say something true, not a ritual glyph.
-//! - `claim`: `ClaimAdd { text }`. Outcome `claim {id} open`. Text: ``{id}: {text}`` and the line
-//!   `Attach evidence with `evidence`, then set its status with `claim_update`.`
+//! - `claim`: `ClaimAdd { text, assets: Vec::new() }`. Outcome `claim {id} open`. Text: ``{id}: {text}`` and the line
+//!   `Attach evidence with `evidence`, then set its status with `claim` and `id`.`
 //! - `claim_update`: `ClaimUpdate { id, status, note }`. Outcome `claim {id} {status}`. When the claim moves INTO
 //!   `supported` from another status, the text gains the line `Established: {id}. Results established in this
 //!   mission so far: {n} ({ids, at most 8, then …}).` (`texts::result_banked`), counted from the ledger after
 //!   the write. Nothing else is recorded; a refutation or withdrawal gets no such line. (`claim` always
 //!   creates an open claim, so it never banks.)
 //! - `evidence`:
-//!   1. `gate::check_quotes(ctx, &[Quote { handle, start, end, text: quote }])` (only an output of the
+//!   1. `gate::check_quotes_noted(ctx, &[Quote { handle, start, end, text: quote }])`: the quote is found by
+//!      its text, with no line numbers needed. More than one place → refused with each listed as
+//!      `line {n}: {line}` (at most 10, each cut at 200 characters) and "Add `start` to say which."; `start`
+//!      alone then names the line the text begins on. No exact match but one place once whitespace runs are
+//!      collapsed and line ends count as a space → taken as the whole lines it lies on, and the result adds
+//!      `matched lines {a}-{b} ignoring spacing.` (only an output of the
 //!      session's mission; another mission's is refused as a handle that names nothing); on `Err(text)`
 //!      → error `{text}\nNothing was attached.` `quote` may be left out (or blank): the quote is then
 //!      by lines, the lines `start`-`end` as the stored output has them (`gate`). This refusal and the
@@ -66,7 +81,7 @@
 //!   Outcome `evidence {id} attached to {claim}`. Text: `{id} ({supports|undermines}; {grade}: {tool} call
 //!   in {session}) attached to {claim}.` (`{grade}` is `run`, `analysis`, `read` or `reference`); when the
 //!   grade is `analysis` or `reference`, the line `texts::evidence_not_a_run(grade, tool)`; when the claim is
-//!   still `Open`, the line `The claim is still open — set its status with `claim_update`.` After a quote by lines,
+//!   still `Open`, the line `The claim is still open — set its status with `claim` and `id`.` After a quote by lines,
 //!   what was
 //!   recorded follows, since nothing compared the line numbers with a text and a miscounted range shows
 //!   nowhere else: `Recorded from {handle}, lines {start}-{end}, as stored:`, each line of the text as
@@ -90,7 +105,7 @@
 //! is not `Run` is never recorded `Execution`; a `read` producer gets no not-a-run line.
 
 use super::{observed_producer, Shared, NO_MISSION};
-use crate::gate::{check_quotes, Quote};
+use crate::gate::{check_quotes_noted, Quote};
 use crate::{frontier, texts};
 use async_trait::async_trait;
 use loom_core::event::{EvidenceGrade, ToolClass, ToolSpec, META_REFUSAL, REFUSAL_QUOTE};
@@ -148,7 +163,7 @@ fn step_text(step: &Value) -> &str {
         return s.trim();
     }
     if let Some(obj) = step.as_object() {
-        for key in ["step", "text", "content"] {
+        for key in ["step", "text", "content", "description"] {
             if let Some(s) = obj.get(key).and_then(Value::as_str) {
                 let trimmed = s.trim();
                 if !trimmed.is_empty() {
@@ -160,17 +175,70 @@ fn step_text(step: &Value) -> &str {
     ""
 }
 
+/// A step status as the `plan` tool takes it: loom's names and the TodoWrite / Codex ones.
+fn plan_status(word: &str) -> Option<StepStatus> {
+    match word.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+        "pending" | "todo" => Some(StepStatus::Todo),
+        "in_progress" | "doing" => Some(StepStatus::Doing),
+        "completed" | "done" => Some(StepStatus::Done),
+        "cancelled" | "dropped" => Some(StepStatus::Dropped),
+        _ => None,
+    }
+}
+
+fn status_word(status: StepStatus) -> &'static str {
+    match status {
+        StepStatus::Todo => "todo",
+        StepStatus::Doing => "doing",
+        StepStatus::Done => "done",
+        StepStatus::Dropped => "dropped",
+    }
+}
+
+/// The update that moves step `id` to `status`. The ledger refuses `done` and `dropped` without a note, so a
+/// step that has none gets a short one saying where the status came from.
+fn plan_update(id: &str, status: StepStatus, current_note: &str) -> LedgerOp {
+    let note = if !current_note.trim().is_empty() {
+        current_note.to_string()
+    } else {
+        match status {
+            StepStatus::Done => "marked done in `plan`".to_string(),
+            StepStatus::Dropped => "dropped in `plan`".to_string(),
+            StepStatus::Todo | StepStatus::Doing => String::new(),
+        }
+    };
+    LedgerOp::PlanUpdate { id: id.to_string(), status, note, evidence: Vec::new() }
+}
+
+/// One item of a `plan` call.
+struct PlanItem {
+    id: Option<String>,
+    text: String,
+    status: Option<StepStatus>,
+    note: String,
+    evidence: Vec<String>,
+}
+
+/// The update that moves step `id` to `status` with what the call said: `note` and `evidence` apply to
+/// `done` and `dropped` only; with neither, the step keeps its note or gets the fallback of `plan_update`.
+fn item_update(id: &str, status: StepStatus, item: &PlanItem, current_note: &str) -> LedgerOp {
+    if !matches!(status, StepStatus::Done | StepStatus::Dropped) || (item.note.is_empty() && item.evidence.is_empty()) {
+        return plan_update(id, status, current_note);
+    }
+    LedgerOp::PlanUpdate { id: id.to_string(), status, note: item.note.clone(), evidence: item.evidence.clone() }
+}
+
 #[async_trait]
 impl Tool for Plan {
     fn spec(&self) -> ToolSpec {
         spec(
             "plan",
-            "Set the plan for the mission: an ordered list of steps, each one concrete enough to be checked off. This replaces the current plan. Use `step` to update a single step as you go.",
+            "Set the plan for the mission: an ordered list of steps, each one concrete enough to be checked off. This replaces the current plan, unless the step texts are the same as the current plan's (then the plan is kept and only the statuses you give are applied) or begin with all of them (then the new ones are added at the end). To update steps, send items with `id` and `status` only (for example {id: p2, status: completed, note: ...}); the other steps stay as they are. Marking a step completed needs `note` (what showed that it is done) or `evidence` ids; cancelled needs `note` (why).",
             ToolClass::State,
             &[req(
                 "steps",
                 "array",
-                "The steps, in order. Plain strings or {step|text|content} objects, one sentence each.",
+                "The steps, in order. Plain strings or {step|text|content, status?, note?, evidence?} objects, one sentence each; or {id, status, note?, evidence?} objects to update steps by id. `status` is pending, in_progress, completed or cancelled. `note` and `evidence` (ids such as e1) go with completed or cancelled.",
             )
             .with("items", json!({"anyOf": [{"type": "string"}, {"type": "object"}]}))],
         )
@@ -179,21 +247,170 @@ impl Tool for Plan {
         let Some(steps) = args.get("steps").and_then(Value::as_array) else {
             return ToolOutput::error("`steps` must be a list of sentences, one per plan step.");
         };
-        let mut texts = Vec::new();
+        let mut items: Vec<PlanItem> = Vec::new();
         for (i, step) in steps.iter().enumerate() {
-            let text = step_text(step);
-            if text.is_empty() {
+            let position = i.saturating_add(1);
+            let text = step_text(step).to_string();
+            let obj = step.as_object();
+            let id = obj.and_then(|o| o.get("id")).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+            if text.is_empty() && id.is_none() {
                 return ToolOutput::error(format!(
-                    "Step {} of the plan is empty. Give every step a sentence saying what is to be done; nothing was recorded.",
-                    i.saturating_add(1)
+                    "Step {position} of the plan is empty. Give every step a sentence saying what is to be done; nothing was recorded.",
                 ));
             }
-            texts.push(text.to_string());
+            let status = match obj.and_then(|o| o.get("status")) {
+                None | Some(Value::Null) => None,
+                Some(v) => match v.as_str().and_then(plan_status) {
+                    Some(parsed) => Some(parsed),
+                    None => {
+                        return ToolOutput::error(format!(
+                            "Step {position} of the plan has the status {v}, which is not one of pending, in_progress, completed, cancelled (or todo, doing, done, dropped). Nothing was recorded; send the plan again with one of those."
+                        ));
+                    }
+                },
+            };
+            let note = obj.and_then(|o| o.get("note")).and_then(Value::as_str).unwrap_or("").trim().to_string();
+            let evidence = obj
+                .and_then(|o| o.get("evidence"))
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+                .unwrap_or_default();
+            items.push(PlanItem { id: id.map(str::to_string), text, status, note, evidence });
         }
-        match self.0.ledger_append(false, LedgerOp::PlanSet { steps: texts }) {
-            Ok((_, state)) => ToolOutput::ok("plan set", Body::Message(plan_lines(&state))),
-            Err(text) => ToolOutput::error(text),
+        let by_id = items.iter().filter(|it| it.text.is_empty()).count();
+        if by_id > 0 && by_id < items.len() {
+            return ToolOutput::error(
+                "Some items of `steps` give only an `id` and others give text. To update steps, give every item an `id` and a `status` and no text; to set the plan, give every item its text. Nothing was recorded.",
+            );
         }
+        if by_id > 0 {
+            return self.update_by_id(&items);
+        }
+        let texts: Vec<String> = items.iter().map(|it| it.text.clone()).collect();
+        let current = self.0.ledger().ok();
+        // The current plan is the last block of the ledger's step list: a `PlanSet` keeps the steps it
+        // replaced (dropped) and appends its own.
+        let tail_matches = |state: &LedgerState, k: usize| {
+            state.plan.len().checked_sub(k).is_some_and(|skip| {
+                state.plan.iter().skip(skip).zip(&texts).all(|(step, text)| step.text.trim() == text)
+            })
+        };
+        let same_plan = current.as_ref().is_some_and(|state| tail_matches(state, texts.len()));
+        // Append: the given texts begin with the plan's (the longest tail that does), and add more. A tail
+        // of dropped steps only is a replaced plan, not the current one.
+        let appended = if same_plan {
+            None
+        } else {
+            current.as_ref().and_then(|state| {
+                (1..texts.len()).rev().find(|k| {
+                    tail_matches(state, *k)
+                        && state.plan.iter().rev().take(*k).any(|p| !matches!(p.status, StepStatus::Dropped))
+                })
+            })
+        };
+        let (kept, outcome, mut state, mut head) = match current {
+            Some(state) if same_plan => (true, "plan updated", state, "Plan unchanged".to_string()),
+            Some(mut state) if appended.is_some() => {
+                let k = appended.unwrap_or(0);
+                for text in texts.iter().skip(k) {
+                    match self.0.ledger_append(false, LedgerOp::PlanAdd { text: text.clone() }) {
+                        Ok((_, next)) => state = next,
+                        Err(text) => return ToolOutput::error(text),
+                    }
+                }
+                let added = texts.len().saturating_sub(k);
+                (true, "plan extended", state, format!("Plan kept; {added} step(s) added"))
+            }
+            _ => match self.0.ledger_append(false, LedgerOp::PlanSet { steps: texts }) {
+                Ok((_, state)) => (false, "plan set", state, "Plan set".to_string()),
+                Err(text) => return ToolOutput::error(text),
+            },
+        };
+        let mut changes = Vec::new();
+        let first = state.plan.len().saturating_sub(items.len());
+        for (i, item) in items.iter().enumerate() {
+            let Some(wanted) = item.status else { continue };
+            let Some(step) = state.plan.get(first.saturating_add(i)) else { continue };
+            if step.status == wanted && item.note.is_empty() && item.evidence.is_empty() {
+                continue;
+            }
+            let (id, note) = (step.id.clone(), step.note.clone());
+            match self.0.ledger_append(false, item_update(&id, wanted, item, &note)) {
+                Ok((_, next)) => {
+                    state = next;
+                    changes.push(format!("{id} → {}", status_word(wanted)));
+                }
+                Err(text) => {
+                    let applied = if changes.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" Already applied: {}.", changes.join(", "))
+                    };
+                    return ToolOutput::error(format!("{text}{applied}"));
+                }
+            }
+        }
+        if changes.is_empty() {
+            if !kept {
+                return ToolOutput::ok(outcome, Body::Message(plan_lines(&state)));
+            }
+            head.push_str("; no step changed status.");
+        } else {
+            head.push_str(&format!("; step {}.", changes.join(", ")));
+        }
+        ToolOutput::ok(outcome, Body::Message(format!("{head}\n{}", plan_lines(&state))))
+    }
+}
+
+impl Plan {
+    /// Items that give an `id` and no text update those steps only; every other step is left as it is.
+    fn update_by_id(&self, items: &[PlanItem]) -> ToolOutput {
+        let Ok(mut state) = self.0.ledger() else { return ToolOutput::error(NO_MISSION) };
+        let known: Vec<String> = state.plan.iter().map(|p| p.id.clone()).collect();
+        for (i, item) in items.iter().enumerate() {
+            let position = i.saturating_add(1);
+            let id = item.id.as_deref().unwrap_or("");
+            if !known.iter().any(|k| k == id) {
+                let list = if known.is_empty() { "there are none".to_string() } else { known.join(", ") };
+                return ToolOutput::error(format!(
+                    "Item {position} of `steps` names step {id}, which is not in the plan (steps: {list}). Nothing was recorded.",
+                ));
+            }
+            if item.status.is_none() {
+                return ToolOutput::error(format!(
+                    "Item {position} of `steps` gives `id` {id} without a `status`. To update a step, give its `id` and `status`. Nothing was recorded.",
+                ));
+            }
+        }
+        let mut changes = Vec::new();
+        for item in items {
+            let (Some(id), Some(wanted)) = (item.id.as_deref(), item.status) else { continue };
+            let Some(step) = state.plan.iter().find(|p| p.id == id) else { continue };
+            if step.status == wanted && item.note.is_empty() && item.evidence.is_empty() {
+                continue;
+            }
+            let note = step.note.clone();
+            match self.0.ledger_append(false, item_update(id, wanted, item, &note)) {
+                Ok((_, next)) => {
+                    state = next;
+                    changes.push(format!("{id} → {}", status_word(wanted)));
+                }
+                Err(text) => {
+                    let applied = if changes.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" Already applied: {}.", changes.join(", "))
+                    };
+                    return ToolOutput::error(format!("{text}{applied}"));
+                }
+            }
+        }
+        let head = if changes.is_empty() {
+            "Plan unchanged; no step changed status.".to_string()
+        } else {
+            format!("Plan updated; step {}.", changes.join(", "))
+        };
+        ToolOutput::ok("plan updated", Body::Message(format!("{head}\n{}", plan_lines(&state))))
     }
 }
 
@@ -208,7 +425,8 @@ impl Tool for Step {
                 opt("id", "string", "The step to update, for example p2."),
                 opt("status", "string", "The step's new status.").one_of(&["todo", "doing", "done", "dropped"]),
                 opt("note", "string", "What showed the step is done, or why it was dropped."),
-                opt("evidence", "array", "Ids of evidence records (e1, e2) that show the step is done.").items("string"),
+                opt("evidence", "array", "Ids of evidence records (e1, e2) that show the step is done.")
+                    .items("string"),
                 opt("text", "string", "The text of a new step to add."),
             ],
         )
@@ -291,7 +509,11 @@ impl Tool for Reflect {
             &[
                 req("ruled_out", "string", "What you have ruled out, and why. One or two sentences."),
                 req("next_route", "string", "The single best next route you can see, and why."),
-                req("would_change", "string", "The evidence that, if you saw it, would change your conclusion about this mission — and what you would do with it."),
+                req(
+                    "would_change",
+                    "string",
+                    "The evidence that, if you saw it, would change your conclusion about this mission — and what you would do with it.",
+                ),
             ],
         )
     }
@@ -315,25 +537,54 @@ impl Tool for Claim {
     fn spec(&self) -> ToolSpec {
         spec(
             "claim",
-            "State something you intend to establish as fact: a finding, a root cause, 'the fix works'. You may attach evidence and set its status in the same call by passing `handle` (with `quote` or `start`/`end`) and optional `status`/`note`; otherwise the claim stays open until you call `evidence` and `claim_update`. Returns the claim's id.",
+            "State something you intend to establish as fact (a finding, a root cause, 'the fix works') with `text`; you may attach evidence and set its status in the same call by passing `handle` (with `quote` or `start`/`end`) and optional `status`/`note`, otherwise it stays open until you call `evidence` and then `claim` again. To attach evidence, copy the exact text from an output you were shown into `quote`; line numbers are not needed. Settle an existing claim with `id` and `status` (`supported` needs evidence attached; `refuted` and `withdrawn` need `note`). Returns the claim's id.",
             ToolClass::State,
             &[
-                req("text", "string", "The claim, as one checkable statement."),
+                opt("text", "string", "The claim, as one checkable statement (a new claim)."),
+                opt("id", "string", "An existing claim to settle, for example c1; give it with `status` and no `text`."),
                 opt("handle", "string", "Optional stored output handle (for example out:7f3a9c1e) to attach as evidence right away."),
-                opt("start", "integer", "First line of the quote in that output.").min(1),
-                opt("end", "integer", "Last line of the quote in that output.").min(1),
-                opt("quote", "string", "Exact text copied from that output (line numbers optional when unique), or leave out to quote lines start-end whole."),
+                opt("start", "integer", "First line of the quote in that output; only when the quote appears more than once (or with `end` and no `quote`).").min(1),
+                opt("end", "integer", "Last line of the quote in that output; only when the quote appears more than once (or with `start` and no `quote`).").min(1),
+                opt("quote", "string", "The exact text, copied from an output you were shown; line numbers are not needed. Leave out to take lines start-end whole, as stored."),
                 opt("status", "string", "Optional status to set immediately after attaching evidence.").one_of(&["supported", "refuted", "withdrawn"]),
                 opt("note", "string", "One sentence explaining what the evidence shows, or why the claim is refuted/withdrawn."),
+                opt("assets", "array", "Optional: the assets (ids or locators of the security state) a new claim is about. The hosts of host, service and endpoint assets are the hosts the claim names.").items("string"),
             ],
         )
     }
     async fn run(&self, ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
         let shared = &self.0;
         let Some(mission) = shared.mission.as_ref() else { return ToolOutput::error(NO_MISSION) };
+        let id = str_arg(args, "id");
+        let text_given = args.get("text").is_some_and(Value::is_string);
+        let has_text = str_arg(args, "text").is_some();
+        match (id, has_text) {
+            (Some(_), true) => {
+                return ToolOutput::error(
+                    "Give `text` to record a new claim, or `id` and `status` to settle an existing one, not both. To change what a claim says, record a new claim and withdraw this one.",
+                );
+            }
+            (None, false) if !text_given => {
+                return ToolOutput::error(
+                    "Give `text` to record a new claim, or `id` and `status` to settle an existing one.",
+                );
+            }
+            (Some(_), false) => {
+                if let Some(key) = ["handle", "start", "end", "quote"]
+                    .into_iter()
+                    .find(|k| args.get(*k).is_some_and(|v| !v.is_null() && v.as_str() != Some("")))
+                {
+                    return ToolOutput::error(format!(
+                        "`claim` with `id` only settles a claim, so `{key}` is not accepted with it. To change what a claim says, record a new claim and withdraw this one.",
+                    ));
+                }
+                return ClaimUpdate(shared.clone()).run(ctx, args).await;
+            }
+            _ => {}
+        }
         let text = str_arg(args, "text").unwrap_or("").to_string();
         if text.trim().is_empty() {
-            return match shared.ledger_append(false, LedgerOp::ClaimAdd { text }) {
+            return match shared.ledger_append(false, LedgerOp::ClaimAdd { text, assets: Vec::new() }) {
                 Ok(_) => unreachable!("empty claim text must be refused by ledger"),
                 Err(err) => ToolOutput::error(err),
             };
@@ -392,7 +643,13 @@ impl Tool for Claim {
             None
         };
 
-        let (_, mut state) = match shared.ledger_append(false, LedgerOp::ClaimAdd { text }) {
+        let assets: Vec<String> = match args.get("assets") {
+            Some(Value::Array(a)) => {
+                a.iter().filter_map(|v| v.as_str()).map(|v| v.trim().to_string()).filter(|v| !v.is_empty()).collect()
+            }
+            _ => Vec::new(),
+        };
+        let (_, mut state) = match shared.ledger_append(false, LedgerOp::ClaimAdd { text, assets }) {
             Ok(ok) => ok,
             Err(err) => return ToolOutput::error(err),
         };
@@ -439,6 +696,11 @@ impl Tool for Claim {
                 msg.push_str(&texts::result_banked(&claim_id, established.len(), &frontier::id_list(&established)));
             }
             if let Some((_, _, v)) = &obs {
+                if let Some(spacing) = &v.spacing {
+                    msg.push('\n');
+                    msg.push_str(spacing);
+                    msg.push('.');
+                }
                 if let Some(recorded) = &v.recorded {
                     msg.push('\n');
                     msg.push_str(recorded);
@@ -453,15 +715,20 @@ impl Tool for Claim {
             msg.push_str(&line);
         }
         if obs.is_some() {
-            msg.push_str("\nThe claim is still open — set its status with `claim_update`.");
+            msg.push_str("\nThe claim is still open — set its status with `claim` and `id`.");
             if let Some((_, _, v)) = &obs {
+                if let Some(spacing) = &v.spacing {
+                    msg.push('\n');
+                    msg.push_str(spacing);
+                    msg.push('.');
+                }
                 if let Some(recorded) = &v.recorded {
                     msg.push('\n');
                     msg.push_str(recorded);
                 }
             }
         } else {
-            msg.push_str("\nAttach evidence with `evidence`, then set its status with `claim_update`.");
+            msg.push_str("\nAttach evidence with `evidence`, then set its status with `claim` and `id`.");
         }
         ToolOutput::ok(format!("claim {claim_id} open"), Body::Message(msg))
     }
@@ -512,6 +779,8 @@ struct VerifiedObservation {
     tool: String,
     session: String,
     recorded: Option<String>,
+    /// Which lines were taken when the quote matched ignoring spacing.
+    spacing: Option<String>,
 }
 
 fn quote_refused(text: String) -> ToolOutput {
@@ -540,11 +809,11 @@ async fn verify_observation(
         ))));
     }
     let q = Quote { handle: handle.to_string(), start, end, text: quote.to_string() };
-    let verified = match check_quotes(ctx, &[q]).await {
+    let verified = match check_quotes_noted(ctx, &[q]).await {
         Ok(v) => v,
         Err(text) => return Err(Box::new(quote_refused(format!("{text}\n{fail_suffix}")))),
     };
-    let Some(v) = verified.into_iter().next() else {
+    let Some((v, spacing)) = verified.into_iter().next() else {
         return Err(Box::new(ToolOutput::error(
             "The quote could not be checked, so nothing was attached. Check `handle`, `start` and `end`.",
         )));
@@ -578,6 +847,7 @@ async fn verify_observation(
         tool: producer.tool,
         session: producer.session.to_string(),
         recorded,
+        spacing,
     })
 }
 
@@ -586,14 +856,14 @@ impl Tool for Evidence {
     fn spec(&self) -> ToolSpec {
         spec(
             "evidence",
-            "Attach evidence to a claim: lines of the stored output of a command you ran or a file you read. Two ways. By line numbers: give `handle`, `start` and `end` and leave `quote` out; the harness takes those lines from the stored output (at most 40) and shows you what it recorded. Do this when you have the numbers from `out_read`, `out_grep` or `read`. By text: give `quote`, copied exactly (`start` and `end` are optional when unique in the output; if given, the harness checks within that range or auto-locates unique text); quote whole lines, or at least 8 non-space characters of a line. `handle` is the out:… id shown in the header of the result.",
+            "Attach evidence to a claim from the output of a command you ran or a file you read. Copy the exact text from an output you were shown into `quote`; line numbers are not needed. Quote whole lines, or at least 8 non-space characters of a line. The harness finds the text and records the line or lines it is on; differences in spacing are forgiven when the text is found in one place. If the text occurs more than once, the call is refused with every place listed, and you add `start` to say which. `handle` is the out:… id shown in the header of that result. Only when you want whole lines as stored, leave `quote` out and give `handle`, `start` and `end`; the harness takes those lines (at most 40) and shows you what it recorded.",
             ToolClass::State,
             &[
                 req("claim", "string", "The claim this bears on, for example c1."),
                 req("handle", "string", "The stored output the quote is from, for example out:7f3a9c1e."),
-                opt("start", "integer", "First line of the quote in that output (optional when `quote` is unique).").min(1),
-                opt("end", "integer", "Last line of the quote in that output (optional when `quote` is unique).").min(1),
-                opt("quote", "string", "Leave out to quote lines start-end whole, as stored. Or the text, copied exactly from the output."),
+                opt("start", "integer", "First line of the quote in that output; only when the quote appears more than once (or with `end` and no `quote`).").min(1),
+                opt("end", "integer", "Last line of the quote in that output; only when the quote appears more than once (or with `start` and no `quote`).").min(1),
+                opt("quote", "string", "The exact text, copied from an output you were shown; line numbers are not needed. Leave out to take lines start-end whole, as stored."),
                 req("note", "string", "One sentence: what this shows about the claim."),
                 opt("supports", "boolean", "false when the quote counts against the claim.").default(json!(true)),
             ],
@@ -643,7 +913,12 @@ impl Tool for Evidence {
                     text.push_str(&line);
                 }
                 if state.claims.iter().any(|c| c.id == claim && c.status == ClaimStatus::Open) {
-                    text.push_str("\nThe claim is still open — set its status with `claim_update`.");
+                    text.push_str("\nThe claim is still open — set its status with `claim` and `id`.");
+                }
+                if let Some(spacing) = obs.spacing {
+                    text.push('\n');
+                    text.push_str(&spacing);
+                    text.push('.');
                 }
                 if let Some(recorded) = obs.recorded {
                     text.push('\n');
@@ -717,6 +992,68 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn plan_same_texts_keep_ids_and_apply_statuses() {
+        let rig = rig("lead", false, true);
+        ok(&rig, "plan", json!({"steps": ["read", "fix", "ship"]})).await;
+        ok(&rig, "step", json!({"id": "p3", "status": "doing"})).await;
+        let t = ok(
+            &rig,
+            "plan",
+            json!({"steps": [
+                {"content": "read", "status": "completed", "activeForm": "Reading", "id": "7"},
+                {"description": " fix ", "status": "in_progress"},
+                {"text": "ship", "status": "doing"},
+            ]}),
+        )
+        .await;
+        assert!(t.contains("plan updated"), "{t}");
+        assert!(t.contains("Plan unchanged; step p1 → done, p2 → doing."), "{t}");
+        assert!(t.contains("[x] p1 read — marked done in `plan`\n[>] p2 fix\n[>] p3 ship"), "{t}");
+        // Resent with nothing new: nothing changes, and a plain-string resend leaves statuses alone.
+        let t = ok(&rig, "plan", json!({"steps": ["read", "fix", "ship"]})).await;
+        assert!(t.contains("Plan unchanged; no step changed status."), "{t}");
+        assert!(t.contains("[x] p1 read"), "{t}");
+        let state = rig.shared.ledger().unwrap();
+        assert_eq!(state.plan.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), ["p1", "p2", "p3"]);
+    }
+
+    #[tokio::test]
+    async fn plan_changed_text_sets_new_plan_with_statuses() {
+        let rig = rig("lead", false, true);
+        ok(&rig, "plan", json!({"steps": ["read", "fix"]})).await;
+        ok(&rig, "step", json!({"id": "p1", "status": "done", "note": "read it"})).await;
+        let t = ok(
+            &rig,
+            "plan",
+            json!({"steps": [
+                {"content": "read", "status": "completed"},
+                {"content": "fix it properly", "status": "pending"},
+                {"content": "ship", "status": "in_progress"},
+            ]}),
+        )
+        .await;
+        assert!(t.contains("plan set"), "{t}");
+        // The old plan's steps stay listed (p2 dropped as replaced); numbering continues.
+        assert!(t.contains("Plan set; step p3 → done, p5 → doing."), "{t}");
+        assert!(t.contains("[x] p1 read — read it\n[-] p2 fix — replaced by a new plan\n"), "{t}");
+        assert!(t.contains("[x] p3 read — marked done in `plan`\n[ ] p4 fix it properly\n[>] p5 ship"), "{t}");
+    }
+
+    #[tokio::test]
+    async fn plan_refuses_an_unknown_status_and_takes_plain_strings() {
+        let rig = rig("lead", false, true);
+        let t = refused(&rig, "plan", json!({"steps": ["a", {"content": "b", "status": "blocked"}]})).await;
+        assert!(t.contains("Step 2") && t.contains("pending, in_progress, completed, cancelled"), "{t}");
+        assert!(t.contains("Nothing was recorded"), "{t}");
+        assert!(rig.shared.ledger().unwrap().plan.is_empty());
+        let t = ok(&rig, "plan", json!({"steps": ["a", "b"]})).await;
+        assert!(t.contains("plan set") && t.contains("[ ] p1 a\n[ ] p2 b"), "{t}");
+        assert!(!t.contains("Plan set;"), "{t}");
+        let t = ok(&rig, "plan", json!({"steps": [{"text": "a", "status": "cancelled"}, "c"]})).await;
+        assert!(t.contains("[-] p3 a — dropped in `plan`\n[ ] p4 c"), "{t}");
     }
 
     #[tokio::test]
@@ -818,7 +1155,7 @@ mod tests {
         let t = ok(&rig, "claim", json!({"text": "the bug is in parse"})).await;
         assert!(t.contains("claim c1 open"), "{t}");
         assert!(t.contains("c1: the bug is in parse"), "{t}");
-        assert!(t.contains("Attach evidence with `evidence`, then set its status with `claim_update`."), "{t}");
+        assert!(t.contains("Attach evidence with `evidence`, then set its status with `claim` and `id`."), "{t}");
 
         let r = refused(&rig, "claim_update", json!({"id": "c1", "status": "supported"})).await;
         assert!(!r.is_empty());
@@ -832,7 +1169,7 @@ mod tests {
         .await;
         assert!(t.contains("evidence e1 attached to c1"), "{t}");
         assert!(t.contains("e1 (supports; run: bash call in s-test) attached to c1."), "{t}");
-        assert!(t.contains("The claim is still open — set its status with `claim_update`."), "{t}");
+        assert!(t.contains("The claim is still open — set its status with `claim` and `id`."), "{t}");
 
         let t = ok(&rig, "claim_update", json!({"id": "c1", "status": "supported"})).await;
         assert!(t.contains("claim c1 supported"), "{t}");
@@ -882,6 +1219,49 @@ mod tests {
         ok(&rig, "claim_update", json!({"id": "c3", "status": "withdrawn", "note": "x"})).await;
         let t = ok(&rig, "claim_update", json!({"id": "c3", "status": "supported"})).await;
         assert!(t.contains("Established: c3."), "{t}");
+    }
+
+    #[tokio::test]
+    async fn claim_with_id_settles_a_claim_like_claim_update_and_refuses_ambiguous_calls() {
+        let rig = rig("lead", false, true);
+        ok(&rig, "claim", json!({"text": "first"})).await;
+        let h = rig.output("alpha\nbeta\n", "bash", ToolClass::Exec);
+        ok(&rig, "evidence", json!({"claim": "c1", "handle": h, "start": 1, "end": 1, "quote": "alpha", "note": "n"}))
+            .await;
+        let r = refused(&rig, "claim", json!({"id": "c1", "text": "x", "status": "supported"})).await;
+        assert!(r.contains("not both"), "{r}");
+        let r = refused(&rig, "claim", json!({})).await;
+        assert!(r.contains("Give `text`"), "{r}");
+        let r = refused(&rig, "claim", json!({"id": "c1", "status": "supported", "quote": "q"})).await;
+        assert!(r.contains("only settles a claim"), "{r}");
+        let t = ok(&rig, "claim", json!({"id": "c1", "status": "supported"})).await;
+        assert!(t.contains("c1 is supported: first\nEstablished: c1."), "{t}");
+        let t = ok(&rig, "claim", json!({"id": "c1", "status": "withdrawn", "note": "x"})).await;
+        assert!(t.contains("c1 is withdrawn"), "{t}");
+    }
+
+    #[tokio::test]
+    async fn plan_updates_by_id_with_note_and_evidence_and_refuses_a_mixed_list() {
+        let rig = rig("lead", false, true);
+        ok(&rig, "plan", json!({"steps": ["read", "fix", "ship"]})).await;
+        let t = ok(
+            &rig,
+            "plan",
+            json!({"steps": [{"id": "p1", "status": "done", "note": "read it"}, {"id": "p2", "status": "doing"}]}),
+        )
+        .await;
+        assert!(t.contains("Plan updated; step p1 → done, p2 → doing."), "{t}");
+        assert!(t.contains("[x] p1 read — read it\n[>] p2 fix\n[ ] p3 ship"), "{t}");
+        let r = refused(&rig, "plan", json!({"steps": [{"id": "p9", "status": "done", "note": "n"}]})).await;
+        assert!(r.contains("p9") && r.contains("Nothing was recorded"), "{r}");
+        let r = refused(&rig, "plan", json!({"steps": [{"id": "p1", "status": "done"}, "more"]})).await;
+        assert!(!r.is_empty(), "{r}");
+        // Appending when the old texts are a prefix keeps the ids.
+        let t = ok(&rig, "plan", json!({"steps": ["read", "fix", "ship", "tell"]})).await;
+        assert!(t.contains("[ ] p4 tell") && t.contains("[x] p1 read"), "{t}");
+        // A status without a note gets the fallback note, as before.
+        let t = ok(&rig, "plan", json!({"steps": [{"id": "p3", "status": "dropped"}]})).await;
+        assert!(t.contains("[-] p3 ship — dropped in `plan`"), "{t}");
     }
 
     #[tokio::test]
@@ -1299,7 +1679,7 @@ mod tests {
             .append(
                 &loom_core::ids::SessionId::from("s-lead"),
                 false,
-                LedgerOp::ClaimAdd { text: "the lead's claim".into() },
+                LedgerOp::ClaimAdd { text: "the lead's claim".into(), assets: Vec::new() },
                 &|_| Ok(()),
             )
             .unwrap();
@@ -1347,7 +1727,7 @@ mod tests {
         let before = rig.shared.journal.as_ref().unwrap().read().unwrap();
         assert!(ok(&rig, "ledger", json!({})).await.contains("verify this mission"));
         for op in [
-            LedgerOp::ClaimAdd { text: "my finding".into() },
+            LedgerOp::ClaimAdd { text: "my finding".into(), assets: Vec::new() },
             LedgerOp::Decision { text: "accept".into(), reason: "looks right".into() },
             LedgerOp::DeadEnd { what: "try again".into(), why: "failed".into() },
         ] {
@@ -1539,5 +1919,91 @@ mod tests {
         assert_eq!(r_empty.status, ToolStatus::Error);
         assert_eq!(r_empty.meta.get(loom_core::event::META_REFUSAL), Some(&json!(loom_core::event::REFUSAL_QUOTE)));
         assert!(r_empty.text.contains("Give `quote`, or both `start` and `end` line numbers."), "{}", r_empty.text);
+    }
+
+    #[tokio::test]
+    async fn an_ambiguous_quote_lists_every_place_and_start_picks_one() {
+        let rig = rig("lead", false, true);
+        ok(&rig, "claim", json!({"text": "c"})).await;
+        let long = format!("repeated match here {}", "z".repeat(300));
+        let h = rig.output(
+            &format!("first line alpha\nrepeated match here\nsecond unique beta\nrepeated match here\n{long}\n"),
+            "bash",
+            ToolClass::Exec,
+        );
+        let t =
+            refused(&rig, "evidence", json!({"claim": "c1", "handle": h, "quote": "repeated match here", "note": "n"}))
+                .await;
+        assert!(t.contains("occurs 3 times"), "{t}");
+        assert!(t.contains("\nline 2: repeated match here\n"), "{t}");
+        assert!(t.contains("\nline 4: repeated match here\n"), "{t}");
+        let cut = format!("line 5: repeated match here {}…", "z".repeat(200 - "repeated match here ".len()));
+        assert!(t.contains(&cut), "{t}");
+        assert!(t.contains("Add `start` to say which."), "{t}");
+        assert!(rig.shared.ledger().unwrap().evidence.is_empty());
+        // `start` alone says which; no `end` needed.
+        ok(
+            &rig,
+            "evidence",
+            json!({"claim": "c1", "handle": h, "quote": "repeated match here", "start": 4, "note": "n"}),
+        )
+        .await;
+        assert_eq!(rig.shared.ledger().unwrap().evidence[0].input.lines, Some((4, 4)));
+    }
+
+    #[tokio::test]
+    async fn a_quote_matching_once_ignoring_spacing_is_taken_and_says_which_lines() {
+        let rig = rig("lead", false, true);
+        ok(&rig, "claim", json!({"text": "c"})).await;
+        let h = rig.output(
+            "header\n\n  test a ...   FAILED\n    left: 1,\n    right: 2\nfooter\n",
+            "bash",
+            ToolClass::Exec,
+        );
+        let t = ok(
+            &rig,
+            "evidence",
+            json!({"claim": "c1", "handle": h, "quote": "test a ... FAILED left: 1, right: 2", "note": "n"}),
+        )
+        .await;
+        assert!(t.contains("matched lines 3-5 ignoring spacing."), "{t}");
+        let e = &rig.shared.ledger().unwrap().evidence[0].input;
+        assert_eq!(e.lines, Some((3, 5)));
+        assert_eq!(e.quote.as_deref(), Some("  test a ...   FAILED\n    left: 1,\n    right: 2"));
+        // Ignoring spacing, two places is still ambiguous.
+        let h2 = rig.output("alpha   beta gamma\nalpha beta   gamma\n", "bash", ToolClass::Exec);
+        let t =
+            refused(&rig, "evidence", json!({"claim": "c1", "handle": h2, "quote": "alpha beta gamma", "note": "n"}))
+                .await;
+        assert!(t.contains("line 1:") && t.contains("line 2:") && t.contains("Add `start`"), "{t}");
+    }
+
+    #[tokio::test]
+    async fn a_quote_only_call_on_a_whole_bash_output_records_the_right_lines() {
+        let rig = rig("lead", false, true);
+        ok(&rig, "claim", json!({"text": "c"})).await;
+        let h =
+            rig.output("$ make test\ncompiling\nerror: boom at parse.rs:12\nmore\nFAILED\n", "bash", ToolClass::Exec);
+        let t = ok(
+            &rig,
+            "evidence",
+            json!({"claim": "c1", "handle": h, "quote": "error: boom at parse.rs:12\nmore", "note": "n"}),
+        )
+        .await;
+        assert!(t.contains("run: bash call"), "{t}");
+        let e = &rig.shared.ledger().unwrap().evidence[0].input;
+        assert_eq!(e.lines, Some((3, 4)));
+        assert_eq!(e.quote.as_deref(), Some("error: boom at parse.rs:12\nmore"));
+        assert!(!t.contains("ignoring spacing"), "{t}");
+    }
+
+    #[test]
+    fn evidence_and_claim_lead_with_quoting_by_text() {
+        use loom_tools::Tool as _;
+        let rig = rig("lead", false, true);
+        for spec in [super::Evidence(rig.shared.clone()).spec(), super::Claim(rig.shared.clone()).spec()] {
+            assert!(spec.description.contains("line numbers are not needed"), "{}", spec.description);
+            assert!(!spec.description.contains("out_read"), "{}", spec.description);
+        }
     }
 }

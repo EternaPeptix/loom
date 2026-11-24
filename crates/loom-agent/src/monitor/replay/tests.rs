@@ -57,6 +57,10 @@ fn session(h: &Home, id: &str, mission: &str) -> SessionLog {
             budget: Default::default(),
             unattended: false,
             title: String::new(),
+            project_instructions: Vec::new(),
+            mcp: Vec::new(),
+            intercept: false,
+            target: None,
             schema: loom_core::event::SCHEMA,
         }),
     )
@@ -88,6 +92,8 @@ fn bash(log: &mut SessionLog, id: &str, cmd: &str) {
             class: ToolClass::Exec,
             meta: Default::default(),
             duration_ms: 1,
+            images: Vec::new(),
+            exchanges: Vec::new(),
         }),
     )
     .expect("result");
