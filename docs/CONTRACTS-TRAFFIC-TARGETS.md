@@ -182,6 +182,80 @@ edges), `GET /api/exchanges/{session}?host=&after=&limit=` (a session's exchange
 `loom target list|add|show|scope`, `loom ca show|rotate`. The SSE stream sends `{type:"target", name}`
 when a target's graph changes (at most once a second per target).
 
+## S. Stored authenticated sessions (credential profiles) (`loom-core` `creds.rs`, `loom-net` proxy injection, `loom-daemon` CLI/API)
+
+A credential profile lets the operator hand loom a session it is already logged into — including behind
+2FA — once, so missions bound to a target carry that session into their in-scope requests without the
+agent ever seeing the secret. It builds on the interception+capture path (I, C) and the target scope (T).
+
+S1. **A profile** belongs to a target: `~/.loom/targets/{name}/creds/{profile}.enc` (profile name
+`[a-z0-9][a-z0-9_-]{0,63}`; `default` when unnamed). Decrypted (S4) it is a list of items, each
+`{ kind: "cookie" | "header", name, value, host }` where `host` is a single in-scope host (never a
+glob). A `cookie` item is one `name=value` pair of a host's jar; a `header` item is a whole header
+value (e.g. `Authorization`). The item values are secrets (S5); nothing else in the file is.
+
+S2. **Recording a login through the proxy** (the operator, never the agent). `loom creds record
+--target acme [--profile default]` opens a short-lived intercepting capture session scoped to the
+target and prints one line: the proxy address and the loom CA to trust (the same CA as I2 — already
+trusted inside a mission, trusted once by the operator's browser here). The operator points a browser
+at it and logs in. For every **in-scope** exchange it collects, from the request, each `Cookie` pair
+and any `Authorization` / `X-Api-Key` value, and from the response each `Set-Cookie`; it streams what
+it is collecting as `host · cookie <name>` / `host · header <name>` lines, **names only, never
+values**. On `--stop` (or Ctrl-C) it writes the profile: per in-scope host, the latest value of each
+cookie and header seen (response `Set-Cookie` overrides an earlier request `Cookie` of the same name),
+one item each, `host` = the host it was seen on. Out-of-scope traffic is dropped, not written.
+  - Scripted path (no browser): `loom creds set --target acme [--profile default] --host api.acme.test
+    --cookie 'session=…'` / `--header 'Authorization: Bearer …'` (repeatable). `--host` must be in the
+    target scope. Same storage, same secret handling.
+
+S3. **Injection.** A mission bound to a target may name one profile at start (`creds` in the API body,
+`loom run --creds default`, a select in the new-mission form; default none). Recorded in
+`session_start` as the profile name and a redaction-safe summary (`default · 3 cookies, 1 header ·
+*.acme.test`), never values; children inherit it. The session grant carries the decrypted items. For
+**every forwarded request** — plain or intercepted — whose destination host equals an item's `host`
+**and** is allowed by the mission's network policy **and** in the target scope, the proxy, after the
+connection is allowed and before forwarding upstream:
+- merges each matching `cookie` item into the request's `Cookie` header **without overwriting a cookie
+  the request already sets** by that name (the request wins);
+- sets each matching `header` item **only if the request does not already send that header** (the
+  request wins).
+A request to any other host is forwarded untouched. The agent names the profile; it never reads the
+values, and no tool, record, prompt or UI shows them (S5).
+
+S4. **Encryption at rest, unattended.** A daemon key at `~/.loom/keys/creds.key` (32 random bytes,
+file `0600`, created on first need exactly like the access token and journal key; dir `0700`). Each
+profile file is `v1 || 12-byte nonce || ciphertext || tag` under `ring::aead` `CHACHA20_POLY1305`,
+with AAD = `"{target}/{profile}"` so a file cannot be moved or renamed between profiles or targets
+without failing to open. The key lives under `~/.loom` (never readable in the sandbox, like the CA key
+and token), so the daemon decrypts profiles at start with no passphrase and an unattended run keeps
+working. This protects a reader of the targets directory, not someone who already holds `~/.loom`
+(the same trust boundary the access token and CA key already sit behind). No new dependency: `ring` is
+in the lockfile (I5); it becomes a direct dependency of the crate that owns `creds.rs`.
+
+S5. **Secrets.** On a mission start with a profile, every injected item value is added to the session
+secret set — the one MCP server env values already use (`loom-tools` `mcp.rs` `redact`) — so it is
+replaced with `[redacted]` wherever that set is applied: the captured request exchange (the injected
+`Cookie`/`Authorization`), `bash`/tool output, `net.jsonl`, and the prompt. A `Set-Cookie` the mission
+observes on its own is still stored as evidence and masked-until-revealed per C5; only values loom
+itself injected are redacted outright. The proxy-credential rule (C5) is unchanged.
+
+S6. **Scope safety (the invariant).** The effective attach set is computed at load as, per item, its
+single `host` kept only if that host is inside the mission target's current scope (T1) and not in
+`exclude`; items failing this are dropped with a start-note count, never injected. The proxy decides
+injection on the **destination host of each forwarded request**, re-checked for every request on a
+kept-alive connection and for every request a client makes after following a 3xx, so a redirect or a
+link to an out-of-scope host carries nothing. A captured `acme.test` login is therefore only ever
+attached to in-scope `acme.test` hosts and never to an attacker-controlled host, even one reached in
+the same session. If a target's scope is later narrowed so a profile host falls outside it, that
+item stops being injected (checked at each mission start, not cached).
+
+S7. **CLI/API.** `loom creds list --target acme` (profiles with item counts and when recorded),
+`loom creds show --target acme --profile default` (item kinds, names and hosts, recorded-at — never
+values), `loom creds record|set|rm`. `POST /api/targets/{name}/creds` (record session handle / set
+items), `GET /api/targets/{name}/creds` (summaries, no values), `DELETE
+/api/targets/{name}/creds/{profile}`. The new-mission form's Target select gains a Credentials select
+listing the chosen target's profiles.
+
 ## U. UI (`ui/`, fixture)
 
 U1. **Exchanges.** A tool row with exchanges (or a `bash` row during which the proxy captured some)
@@ -225,5 +299,13 @@ page; the new-mission form has a Target select.
   `coverage_set` and a supported claim; out-of-scope never written; status derivation (T6) and the
   `view: "target"` query; two missions of a target see each other's coverage at start; the summary
   is recorded and stable across a reopen; the hash chain of `graph.jsonl`.
+- **S:** recording keeps only in-scope items (an out-of-scope host seen during record is dropped);
+  an in-scope `cookie` item is merged into a forwarded request and the same session's request to an
+  out-of-scope host is untouched; an item never overrides a cookie or header the request already
+  sends; an injected value is `[redacted]` in the captured exchange and absent from every record and
+  the prompt; a profile file round-trips through encrypt/decrypt, is unreadable from the sandbox, and
+  fails to open with the wrong AAD (swapped between profiles) or without `creds.key`; narrowing the
+  target scope drops the now-out-of-scope item at the next mission start; `loom creds show` never
+  prints a value.
 - **U:** pure models (exchange list, header masking, target tree with statuses, filters) in
   `ui/core.test.js`; fixture routes for all of T7 and exchanges.
