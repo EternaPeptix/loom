@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### MCP client
+
+- `loom-tools` has an MCP client (CONTRACTS-MCP M2, M3, M5): stdio servers run as sandboxed children and
+  Streamable HTTP servers go through the session's egress proxy; `McpTool` presents a server tool as
+  `mcp__{server}__{tool}` and maps its result (text, images, resources, `structuredContent`, `isError`, JSON-RPC
+  errors, timeouts) to a tool output. `mcp.servers.*` config is checked, and a literal `env`/`headers` value is
+  warned about. Resolved secrets never reach an output, error or `Debug` text.
+
 ### Hypotheses and the rule engine leave the harness
 
 - `security_record` no longer takes `hypothesis_open`, `hypothesis_priority`, `hypothesis_evidence`,

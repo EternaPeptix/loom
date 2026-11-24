@@ -620,7 +620,8 @@ fn check_value(
     let name = &spec.name;
     let mut notes = schema::normalize_for_tool(name, &mut parsed);
     notes.extend(schema::prepare_for_spec(&spec.parameters, &mut parsed));
-    let mut checked = schema::check(&spec.parameters, &parsed).map_err(|problems| {
+    let checker = if name.starts_with("mcp__") { schema::check_mcp } else { schema::check };
+    let mut checked = checker(&spec.parameters, &parsed).map_err(|problems| {
         let mut msg = String::from("The arguments do not fit this tool:\n");
         let internal: Vec<&str> = spec
             .parameters
