@@ -1472,3 +1472,15 @@ button.attach-open:hover { border-color: var(--accent-line); background: var(--a
 .lost-card p { margin: 0 0 10px; line-height: 1.5; }
 .lost-card p:last-child { margin-bottom: 0; }
 .lost-card code { font-family: var(--mono); padding: 1px 5px; border-radius: var(--r-sm); background: var(--code-bg); }
+
+/* Tool output: a small caption above each box so output is never mistaken for arguments. */
+.tbody > .label { margin-top: 6px; }
+.out.args-box { max-height: 30vh; }
+/* Lines the model was shown, in the full-output viewer: a quiet left mark; a cited line keeps its stronger one. */
+.source-line.seen { border-left-color: var(--info); background: color-mix(in srgb, var(--info) 8%, transparent); }
+/* A run of identical calls, and the "Show more" button of a paged group. */
+.run-head .run-same { flex: 0 0 auto; font-size: 12px; }
+.run-chip { display: inline-flex; align-items: center; gap: 4px; flex: 0 0 auto; padding: 0 7px; border: 1px solid var(--warn-line); border-radius: var(--r-pill); font-size: 11px; line-height: 17px; color: var(--warn-soft); }
+.run-chip .icon { width: 11px; height: 11px; }
+.run-body { padding-left: 16px; }
+.btn.group-more { display: block; min-height: 24px; margin: 4px 0 4px 4px; padding: 0 4px; font-size: 12px; color: var(--accent); }

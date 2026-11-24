@@ -225,6 +225,45 @@ export function shownOfTotal(result) {
   return { blob, shown, total, cut, ranges, ofBlob: !!ofBlob, words, complete };
 }
 
+/**
+ * Where "open full output" starts reading, given the ranges the model was shown (1-based, inclusive) and the stored line count
+ * (null when unknown). A tail-only or middle view opens at its first line; a head plus tail (a cut) opens at the start of the
+ * omitted middle; a head alone opens just after it when the stored output is known to go on. Otherwise line 1.
+ */
+export function openAtLine(ranges, total) {
+  const rs = mergeRanges(ranges);
+  if (!rs.length) return 1;
+  if (rs[0][0] > 1) return rs[0][0];
+  if (rs.length > 1) return rs[0][1] + 1;
+  const end = rs[0][1];
+  return Number.isInteger(total) && end < total ? end + 1 : 1;
+}
+
+/** Is line `n` inside one of `ranges` ([[start, end], ...], inclusive)? */
+export function lineInRanges(ranges, n) {
+  for (const r of ranges || []) if (n >= r[0] && n <= r[1]) return true;
+  return false;
+}
+
+/**
+ * How the viewer opens a tool result's stored output: {start, seenRanges}. `start` is openAtLine; `seenRanges` are the lines the
+ * model was shown, marked in the viewer, and empty when it was shown everything or the ranges are unknown.
+ */
+export function viewerPlan(shown) {
+  const ranges = (shown && shown.ranges) || [];
+  const partial = ranges.length > 0 && !(shown && shown.complete);
+  return { start: openAtLine(ranges, shown ? shown.total : null), seenRanges: partial ? ranges : [] };
+}
+
+/** The standing sentence of the viewer: evidence wording for a cited range, and a note on the marked lines when there are any. */
+export function viewerStanding(source) {
+  const s = source || {};
+  const base = s.citeStart
+    ? "Opening this stored snapshot is an operator action. It does not change what the model has observed, and it does not verify the claim."
+    : "This is a stored output snapshot. Opening it here does not change what the model has observed.";
+  return s.seenRanges && s.seenRanges.length ? base + " Lines the model was shown are marked." : base;
+}
+
 /** Generation speed of a reply in tokens per second: the tokens after the first, over the time from
  *  the first streamed token to the end of the stream (so the wait for the first token, where the
  *  prompt is read, is left out). Null when the record cannot support a figure. */
@@ -2647,6 +2686,141 @@ export function partialView(result) {
   return part && v.words ? { words: v.words, shown: v.shown, total: v.total, cut: !!v.cut } : null;
 }
 
+// ---- repeated calls and paging of a group's rows
+
+/** A run of this many identical consecutive calls is collapsed into one row; fewer stay as they are. */
+export const RUN_MIN = 3;
+/** A run this long marks its group with a loop warning. */
+export const LOOP_MIN = 10;
+/** Rows an open group (or an open run) renders before "Show more". */
+export const GROUP_PAGE = 50;
+
+function canonicalJson(v) {
+  if (Array.isArray(v)) return "[" + v.map(canonicalJson).join(",") + "]";
+  if (v && typeof v === "object") return "{" + Object.keys(v).sort().map((k) => JSON.stringify(k) + ":" + canonicalJson(v[k])).join(",") + "}";
+  const j = JSON.stringify(v);
+  return j === undefined ? "null" : j;
+}
+
+const sigCache = new WeakMap();
+/** What makes two calls "the same call": the tool name and the arguments' canonical JSON (the result may differ). Null for a call whose arguments are unknown. */
+export function callSignature(b) {
+  if (!b || b.kind !== "tool") return null;
+  const hit = sigCache.get(b);
+  if (hit && hit.args === b.args && hit.name === b.name) return hit.sig;
+  let sig = null;
+  if (b.args !== undefined && b.args !== null) sig = (b.name || "") + "\u0000" + canonicalJson(b.args);
+  else if (b.argsInvalid && typeof b.rawArgs === "string") sig = (b.name || "") + "\u0000raw:" + b.rawArgs;
+  sigCache.set(b, { args: b.args, name: b.name, sig });
+  return sig;
+}
+
+// Between two calls of a run only the steps' own text-less replies and request-detail lines may stand; anything that says something breaks it.
+const isPassive = (b) => !!b && (b.detail || (isTextless(b) && !isWarningBlock(b)));
+
+/**
+ * The rows of a group's `blocks`: {type:"block", block} for a block shown as itself, and {type:"run", key, name, count, entries,
+ * first, last} for RUN_MIN or more consecutive calls of one tool with identical arguments. `entries` is [{call, before}] where
+ * `before` are the passive blocks (text-less replies, detail lines) that stood in front of that call.
+ */
+export function groupRows(blocks) {
+  const rows = [];
+  const list = blocks || [];
+  let i = 0;
+  while (i < list.length) {
+    const b = list[i];
+    const sig = callSignature(b);
+    if (sig === null) { rows.push({ type: "block", block: b }); i++; continue; }
+    const entries = [{ call: b, before: [] }];
+    let j = i + 1, pending = [], end = i;
+    while (j < list.length) {
+      const c = list[j];
+      if (c.kind === "tool") {
+        if (callSignature(c) !== sig) break;
+        entries.push({ call: c, before: pending });
+        pending = [];
+        end = j;
+      } else if (isPassive(c)) pending.push(c);
+      else break;
+      j++;
+    }
+    if (entries.length >= RUN_MIN) {
+      rows.push({ type: "run", key: "run" + b.id, name: b.ran || b.name, count: entries.length, entries, first: b, last: entries[entries.length - 1].call });
+      i = end + 1;
+    } else {
+      rows.push({ type: "block", block: b });
+      i++;
+    }
+  }
+  return rows;
+}
+
+/** The longest run among a group's blocks when it is LOOP_MIN or more, else 0. */
+export function longestLoop(blocks) {
+  let best = 0;
+  for (const r of groupRows(blocks)) if (r.type === "run" && r.count > best) best = r.count;
+  return best >= LOOP_MIN ? best : 0;
+}
+
+/** The rows of a group item (`it.shown`), computed once per shown list. */
+export function rowsOf(it) {
+  if (it._rowsFor !== it.shown) { it._rows = groupRows(it.shown); it._rowsFor = it.shown; }
+  return it._rows;
+}
+
+/** The first `pages` pages of `list`: {visible, hidden, more} where `more` is how many the next page adds. */
+export function pageOf(list, pages = 1, size = GROUP_PAGE) {
+  const n = Math.max(1, pages) * size;
+  const hidden = Math.max(0, list.length - n);
+  return { visible: hidden ? list.slice(0, n) : list, hidden, more: Math.min(size, hidden) };
+}
+
+/** "Show 50 more (120 hidden)". */
+export function showMoreLabel(page) {
+  return `Show ${num(page.more)} more (${num(page.hidden)} hidden)`;
+}
+
+/**
+ * Where block `id` sits in the rows of group `it`: {row, runKey, entry, groupPages, runPages}, or null. `groupPages` is the page
+ * count of the group that shows its row, and `runPages` that of the run (0 for a row of its own) that shows the call.
+ */
+export function locateInGroup(it, id, size = GROUP_PAGE) {
+  const rows = rowsOf(it);
+  for (let r = 0; r < rows.length; r++) {
+    const row = rows[r];
+    if (row.type === "block") {
+      if (row.block.id === id) return { row: r, runKey: null, entry: null, groupPages: Math.floor(r / size) + 1, runPages: 0 };
+    } else {
+      for (let e = 0; e < row.entries.length; e++) {
+        const en = row.entries[e];
+        if (en.call.id === id || en.before.some((x) => x.id === id)) return { row: r, runKey: row.key, entry: e, groupPages: Math.floor(r / size) + 1, runPages: Math.floor(e / size) + 1 };
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * How many member rows an item list renders: for each open group the rows of its visible pages plus its "Show more" button; an
+ * open run adds its visible calls. `state` is {groupPages: Map, openRuns: Set, runPages: Map}.
+ */
+export function renderedRowCount(items, state = {}) {
+  const gp = state.groupPages || new Map(), openRuns = state.openRuns || new Set(), rp = state.runPages || new Map();
+  let total = 0;
+  for (const it of items) {
+    if (it.type !== "group" || !it.open) continue;
+    const page = pageOf(rowsOf(it), gp.get(it.key) || 1);
+    total += page.visible.length + (page.hidden ? 1 : 0);
+    for (const row of page.visible) {
+      if (row.type === "run" && openRuns.has(row.key)) {
+        const inner = pageOf(row.entries, rp.get(row.key) || 1);
+        total += inner.visible.length + (inner.hidden ? 1 : 0);
+      }
+    }
+  }
+  return total;
+}
+
 function makeGroup(blocks) {
   let toolCount = 0, exited = 0, failed = 0, denied = 0, invalid = 0, timedOut = 0, interrupted = 0, partial = 0;
   let missing = 0, warnings = 0, records = 0, running = false;
@@ -2677,7 +2851,7 @@ function makeGroup(blocks) {
     }
     if (b.result && Number.isFinite(b.result.ts) && b.result.ts > endTs) endTs = b.result.ts;
   }
-  return { type: "group", key: groupKey(blocks[0]), blocks, shown: blocks, earlier: 0, records, toolCount, exited, failed, denied, invalid, timedOut, interrupted, partial, missing, warnings, running, startTs, endTs, open: false, last: false };
+  return { type: "group", key: groupKey(blocks[0]), blocks, shown: blocks, earlier: 0, records, toolCount, exited, failed, denied, invalid, timedOut, interrupted, partial, missing, warnings, running, startTs, endTs, open: false, last: false, loop: longestLoop(blocks) };
 }
 
 /**
