@@ -637,7 +637,7 @@ mod tests {
     async fn eof_removes_an_exited_terminal_without_using_a_slot() {
         let env = crate::testutil::env();
         let out = PtyOpen.run(&env.ctx, json!({"command":"exit 0", "timeout_s":1}).as_object().unwrap()).await;
-        assert_eq!(out.status, ToolStatus::Ok);
+        assert_eq!(out.status, ToolStatus::Ok, "{out:?}");
         assert!(env.ctx.capabilities.ptys.ids().is_empty());
     }
 

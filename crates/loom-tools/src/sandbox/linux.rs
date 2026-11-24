@@ -483,7 +483,10 @@ mod tests {
         let ws = ws.canonicalize().unwrap();
         let tmp = tmp.canonicalize().unwrap();
         let home = home.canonicalize().unwrap();
+        // Built as seatbelt and switched to bubblewrap below, so no bwrap binary or reserved `.loom` is needed:
+        // the default mode is this OS's (bubblewrap on Linux), so it is named here.
         let cfg = SandboxCfg {
+            mode: SandboxMode::Seatbelt,
             protect_credentials: false,
             protected_paths: vec![ws.display().to_string()],
             ..SandboxCfg::default()
