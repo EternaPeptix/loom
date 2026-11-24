@@ -3383,6 +3383,7 @@ impl Inner {
             schema: loom_core::event::SCHEMA,
             title: meta.title.clone(),
             project_instructions: env.project_instructions,
+            mcp: Vec::new(),
         })
     }
 

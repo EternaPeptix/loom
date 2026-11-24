@@ -1439,6 +1439,7 @@ mod tests {
             unattended: false,
             title: String::new(),
             project_instructions: Vec::new(),
+            mcp: Vec::new(),
             schema,
         })
     }

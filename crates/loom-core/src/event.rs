@@ -317,6 +317,43 @@ pub struct ModelSwitched {
     pub reason: String,
 }
 
+/// What one MCP server offered when a mission started (docs/CONTRACTS-MCP.md M6). Recorded in the lead's
+/// `session_start` so every session of the mission, and a session opened from its log, presents the same
+/// tools for its whole life.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpListing {
+    /// The server's name in `[mcp.servers]`.
+    pub server: String,
+    /// `stdio` or `http`.
+    pub transport: String,
+    /// The protocol version the server answered (empty when it did not start).
+    #[serde(default)]
+    pub protocol: String,
+    #[serde(default)]
+    pub server_name: String,
+    #[serde(default)]
+    pub server_version: String,
+    #[serde(default)]
+    pub tools: Vec<McpToolDef>,
+    /// Why the server could not be started or listed; it then has no tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// One tool as an MCP server listed it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpToolDef {
+    /// The server's own name for it (not the `mcp__…` name the model sees).
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    /// The server's `inputSchema`, as listed.
+    #[serde(default)]
+    pub input_schema: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_only_hint: Option<bool>,
+}
+
 /// One project instruction file as it went into a session's system prompt.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectInstruction {
@@ -356,6 +393,10 @@ pub struct SessionStart {
     /// never rebuilt from a file that has changed since, and so the UI can list the names.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub project_instructions: Vec<ProjectInstruction>,
+    /// The MCP servers' listings (CONTRACTS-MCP M6): set on a mission lead's start; empty for a child
+    /// (it takes its lead's) and when no server is configured.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp: Vec<McpListing>,
     /// Log format version; absent in logs written before the field existed (version 1). A log with
     /// a higher number is read-only for this build.
     #[serde(default = "schema_v1")]
@@ -1066,6 +1107,7 @@ mod tests {
                     schema: SCHEMA,
                     title: "t".into(),
                     project_instructions: Vec::new(),
+                    mcp: Vec::new(),
                 }),
             ),
             (

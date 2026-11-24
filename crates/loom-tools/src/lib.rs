@@ -67,6 +67,7 @@ pub mod files;
 pub mod fstools;
 pub mod http;
 pub mod jobs;
+pub mod mcp;
 pub mod oracle;
 pub mod outputs;
 pub mod outview;

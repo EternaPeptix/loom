@@ -345,6 +345,13 @@ pub(crate) fn prepare_for_spec(schema: &Value, value: &mut Value) -> Vec<String>
     notes
 }
 
+/// True when `schema` uses only the keywords [`check`] understands (the module doc's list), so an MCP
+/// server's `inputSchema` can be checked here; otherwise the server validates (CONTRACTS-MCP M5).
+pub fn checkable(schema: &Value) -> bool {
+    let _ = schema;
+    todo!("CONTRACTS-MCP M5")
+}
+
 pub fn check(schema: &Value, value: &Value) -> Result<Checked, Vec<String>> {
     let Some(given) = value.as_object() else {
         return Err(vec![format!(

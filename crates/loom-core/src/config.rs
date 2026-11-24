@@ -169,6 +169,85 @@ pub struct Config {
     /// The remote Docker container the agent runs commands in (`box_exec`). Disabled by default.
     #[serde(rename = "box")]
     pub boxed: BoxCfg,
+    /// MCP servers whose tools sessions get (docs/CONTRACTS-MCP.md). Empty by default.
+    pub mcp: McpCfg,
+}
+
+/// `[mcp]`: MCP servers as tools (docs/CONTRACTS-MCP.md M1).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct McpCfg {
+    /// Per role: MCP tool definitions beyond this many estimated tokens are left out (M6).
+    pub max_schema_tokens: u64,
+    /// A server with no call for this long is closed; it starts again on the next call (M3).
+    pub idle_close_s: u64,
+    pub servers: BTreeMap<String, McpServerCfg>,
+}
+
+impl Default for McpCfg {
+    fn default() -> Self {
+        Self { max_schema_tokens: 20_000, idle_close_s: 600, servers: BTreeMap::new() }
+    }
+}
+
+/// One `[mcp.servers.<name>]` entry (M1). Exactly one of `command` (stdio) and `url` (Streamable HTTP).
+/// `env` and `headers` values are `"env:NAME"`, `"file:/path"` or a literal; they are resolved when a
+/// session starts the server and never written to a record.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct McpServerCfg {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    pub env: BTreeMap<String, String>,
+    pub headers: BTreeMap<String, String>,
+    /// Working directory of a stdio server, relative to the workspace (default: the workspace).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Hosts added to the session's allowed hosts while the server is configured (M4).
+    pub hosts: Vec<String>,
+    /// The server's tools a session gets (default: all it lists).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<String>>,
+    /// The roles that get this server's tools (default: every role that is not read-only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub roles: Option<Vec<String>>,
+    /// The operator says no tool of this server changes anything: read-only roles get it too.
+    pub read_only: bool,
+    /// Per call, seconds.
+    pub timeout_s: u64,
+}
+
+impl Default for McpServerCfg {
+    fn default() -> Self {
+        Self {
+            command: None,
+            url: None,
+            env: BTreeMap::new(),
+            headers: BTreeMap::new(),
+            cwd: None,
+            hosts: Vec::new(),
+            tools: None,
+            roles: None,
+            read_only: false,
+            timeout_s: 120,
+        }
+    }
+}
+
+impl McpCfg {
+    /// M1's rules the types cannot express: a server name matches `[a-z0-9_-]{1,32}`, exactly one of
+    /// `command` and `url`, a non-empty `command`, an `http`/`https` `url`, `timeout_s` > 0.
+    pub fn check(&self) -> Result<(), String> {
+        todo!("CONTRACTS-MCP M1")
+    }
+
+    /// Startup warnings: a literal (not `env:`/`file:`) value in `env` or `headers` names a secret
+    /// written in the config.
+    pub fn warnings(&self) -> Vec<String> {
+        todo!("CONTRACTS-MCP M1")
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
