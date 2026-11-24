@@ -300,6 +300,14 @@ pub trait Orchestrator: Send + Sync {
     async fn resolve_child(&self, _parent: &SessionId, child: &SessionId) -> Result<SessionId, String> {
         Ok(child.clone())
     }
+    /// The mission ledger took `op` and is now in `state`: the runtime mirrors what belongs to the
+    /// mission target's graph (CONTRACTS-TRAFFIC-TARGETS T4). The default does nothing.
+    fn ledger_appended(&self, _session: &SessionId, _op: &LedgerOp, _state: &LedgerState) {}
+    /// The target of the mission of `session` with its nodes (T5, `security_query` view `target`):
+    /// `None` when the mission has no target.
+    fn target_nodes(&self, _session: &SessionId) -> Option<Result<(String, Vec<loom_core::target::NodeView>), String>> {
+        None
+    }
     /// The box of the mission of `session`, made ready to be used. The errors are the sentences the box
     /// tools return: no box configured ([`boxtools::NO_BOX`], the default), a session that works in its own
     /// copy of the workspace ([`boxtools::BOX_IN_COPY`]), a session without a mission.
@@ -495,6 +503,7 @@ impl Shared {
                 .and_then(|i| state.claim_sessions.get(i)).is_some_and(|s| *s == self.session);
             if own { Ok(()) } else { Err(format!("Claim {claim} belongs to another session. Add evidence and update status only on claims created by this child; return other observations to the lead.")) }
         }).map_err(|e| journal_sentence(&e))?;
+        self.orch.ledger_appended(&self.session, &checked_op, &state);
         let author = if from_user { Author::User } else { Author::Model };
         self.emit(author, Event::Ledger { n: entry.n, summary });
         Ok((entry, state))

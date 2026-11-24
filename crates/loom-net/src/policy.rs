@@ -332,6 +332,8 @@ pub struct Policy {
     /// IP literals granted to this session (with optional port): exact addresses that may be reached
     /// even though they are private/loopback/link-local. See the module contract.
     granted_private: Vec<(IpAddr, Option<u16>)>,
+    /// Address blocks of a mission target's scope (`with_target`): reachable by address, private or not.
+    target_nets: Vec<(String, IpNet)>,
 }
 
 fn grant_pattern(host: &str) -> Result<Pattern, String> {
@@ -464,7 +466,39 @@ impl Policy {
             deny: parse_list("deny", &cfg.deny, PrivEntry::parse)?,
             allow_private: parse_list("allow_private", &cfg.allow_private, PrivEntry::parse_private)?,
             granted_private: Vec::new(),
+            target_nets: Vec::new(),
         })
+    }
+
+    /// The policy with a target's scope added (CONTRACTS-TRAFFIC-TARGETS T2): scope hosts, IPs and CIDR
+    /// blocks are reachable in every mode but `open` (where they change nothing), also under `deny_all`,
+    /// and the `exclude` entries are refused whatever else would allow them, `open` included. The entries
+    /// are those of a validated `Scope`.
+    pub fn with_target(mut self, scope: &[String], exclude: &[String]) -> Result<Policy, String> {
+        for e in exclude {
+            let entry =
+                PrivEntry::parse(e).map_err(|why| format!("The excluded entry \"{e}\" cannot be used: {why}."))?;
+            self.deny.push(entry);
+        }
+        if self.mode == NetworkMode::Open || scope.is_empty() {
+            return Ok(self);
+        }
+        if self.mode == NetworkMode::DenyAll {
+            self.allow.clear();
+            self.mode = NetworkMode::Allowlist;
+        }
+        for e in scope {
+            match PrivEntry::parse(e).map_err(|why| format!("The scope entry \"{e}\" cannot be used: {why}."))? {
+                PrivEntry::Name(p) => {
+                    if let Some((ip, port)) = literal_grant(e) {
+                        self.granted_private.push((ip, port));
+                    }
+                    self.allow.push(p);
+                }
+                PrivEntry::Net { text, net } => self.target_nets.push((text, net)),
+            }
+        }
+        Ok(self)
     }
 
     /// Reference-only policy for trusted in-process GET clients. Deny/address checks still apply.
@@ -515,7 +549,12 @@ impl Policy {
             NetworkMode::DenyAll => Verdict::no("mode deny_all"),
             NetworkMode::Allowlist => match self.allow.iter().find(|p| p.matches(&h, port)) {
                 Some(p) => Verdict::yes(format!("allow {}", p.text)),
-                None => Verdict::no("not in allow list"),
+                None => {
+                    match h.parse::<IpAddr>().ok().and_then(|a| self.target_nets.iter().find(|(_, n)| n.contains(a))) {
+                        Some((text, _)) => Verdict::yes(format!("target scope {text}")),
+                        None => Verdict::no("not in allow list"),
+                    }
+                }
             },
             NetworkMode::Open => Verdict::yes("mode open"),
         }
@@ -564,6 +603,9 @@ impl Policy {
             if *ip == can && gp.as_ref().is_none_or(|p| *p == grant_port) {
                 return Verdict::yes(format!("grant private-address {can}"));
             }
+        }
+        if let Some((text, _)) = self.target_nets.iter().find(|(_, n)| n.contains(addr)) {
+            return Verdict::yes(format!("target scope {text}"));
         }
         for e in &self.allow_private {
             match e {
@@ -671,6 +713,28 @@ mod tests {
     }
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn a_target_scope_is_reachable_in_deny_all_and_its_exclusions_never_are() {
+        let s = |x: &[&str]| x.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let scope = s(&["*.acme.test", "10.20.0.0/24"]);
+        let exclude = s(&["vpn.acme.test", "10.20.0.9"]);
+        for mode in [NetworkMode::DenyAll, NetworkMode::Allowlist] {
+            let p = pol(mode, &["ok.test"], &[], &[]).with_target(&scope, &exclude).unwrap();
+            assert!(p.check_name("www.acme.test", 443).allowed, "{mode:?}");
+            assert!(!p.check_name("vpn.acme.test", 443).allowed, "{mode:?}");
+            assert!(!p.check_name("other.test", 443).allowed, "{mode:?}");
+            assert!(p.check_name("10.20.0.5", 80).allowed, "{mode:?}");
+            assert!(!p.check_name("10.20.0.9", 80).allowed, "{mode:?}");
+            assert!(!p.check_name("10.30.0.5", 80).allowed, "{mode:?}");
+            assert!(p.check_addr("10.20.0.5", 80, ip("10.20.0.5"), "x").allowed, "private address in scope");
+            assert!(!p.check_addr("10.30.0.5", 80, ip("10.30.0.5"), "x").allowed);
+        }
+        // `open` changes nothing but the exclusions still hold.
+        let p = pol(NetworkMode::Open, &["*"], &[], &[]).with_target(&scope, &exclude).unwrap();
+        assert!(p.check_name("other.test", 443).allowed);
+        assert!(!p.check_name("vpn.acme.test", 443).allowed);
     }
 
     #[test]

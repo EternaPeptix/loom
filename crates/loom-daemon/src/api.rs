@@ -69,6 +69,13 @@
 //! | `POST /models/reload` | `runtime.reload_models` (no body) | `ModelsReload` |
 //! | `GET /sessions/{id}/window` | `runtime.window` | `WindowView` |
 //! | `GET /sessions/{id}/net?limit={n}` | `runtime.net` (default 200, at most 2000) | `[NetEntry]` |
+//! | `GET /exchanges/{session}?host=&after={seq}&limit={n}` | `runtime.exchanges`: the session's `exchange` records, newest last (default 200, at most 2000; `after` is a record seq) | `[ExchangeEntry]` |
+//! | `GET /targets` | `runtime.target_list` | `[TargetView]` (name, scope, exclude, settings, `counts` by status) |
+//! | `POST /targets` (`TargetBody`; `name` required) | `runtime.target_create` (`409` for a name in use or a scope entry that is not valid) | `201` `TargetView` |
+//! | `GET /targets/{name}` | `runtime.target_show` (`404` for no such target) | `TargetView` |
+//! | `PUT /targets/{name}` (`TargetBody`; what is left out stays) | `runtime.target_update` | `TargetView` |
+//! | `GET /targets/{name}/graph?status=&kind=&under=` | `runtime.target_graph`: nodes with status, missions and evidence keys; the edges between them | `GraphView` |
+//! | `GET /targets/{name}/exchanges?node=&limit={n}` | `runtime.target_exchanges`: the exchanges of every mission of the target with that node (id or locator), newest last | `[ExchangeEntry]` |
 //! | `GET /missions` | `runtime.missions` | `[MissionInfo]` |
 //! | `GET /missions/{id}/ledger` | `runtime.ledger` | `LedgerView` |
 //! | `GET /missions/{id}/score` | `runtime.score` | `ScoreView` |
@@ -157,7 +164,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
-use loom_agent::runtime::{BusEvent, NewSession, Runtime, SessionInfo};
+use loom_agent::runtime::{BusEvent, NewSession, Runtime, SessionInfo, TargetBody};
 use loom_agent::session::Phase;
 use loom_core::event::{Event as LogEvent, Seq};
 use loom_core::log::StoredRecord;
@@ -195,6 +202,8 @@ const RECORDS_DEFAULT: usize = 500;
 const RECORDS_MAX: usize = 2_000;
 const NET_DEFAULT: usize = 200;
 const NET_MAX: usize = 2_000;
+const EXCHANGES_DEFAULT: usize = 200;
+const EXCHANGES_MAX: usize = 2_000;
 const LINES_DEFAULT_END: u64 = 2_000;
 const LINES_MAX: u64 = 5_000;
 const KEEP_ALIVE: Duration = Duration::from_secs(15);
@@ -241,6 +250,11 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/models/reload", post(reload_models))
         .route("/api/sessions/{id}/window", get(window))
         .route("/api/sessions/{id}/net", get(net))
+        .route("/api/exchanges/{session}", get(session_exchanges))
+        .route("/api/targets", get(targets).post(target_create))
+        .route("/api/targets/{name}", get(target_show).put(target_update))
+        .route("/api/targets/{name}/graph", get(target_graph))
+        .route("/api/targets/{name}/exchanges", get(target_exchanges))
         .route("/api/missions", get(missions))
         .route("/api/missions/{id}/ledger", get(ledger))
         .route("/api/missions/{id}/score", get(score))
@@ -882,6 +896,65 @@ async fn window(State(s): State<ApiState>, Path(id): Path<String>) -> Res<Respon
 async fn net(State(s): State<ApiState>, Path(id): Path<String>, q: RawQuery) -> Res<Response> {
     let limit = clamp_limit(number(&params(q)?, "limit")?, NET_DEFAULT, NET_MAX);
     let entries = s.runtime.net(&SessionId::from(id), limit).map_err(rt_err)?;
+    Ok(Json(entries).into_response())
+}
+
+async fn session_exchanges(State(s): State<ApiState>, Path(id): Path<String>, q: RawQuery) -> Res<Response> {
+    let q = params(q)?;
+    let limit = clamp_limit(number(&q, "limit")?, EXCHANGES_DEFAULT, EXCHANGES_MAX);
+    let after = number(&q, "after")?;
+    let host = q.get("host").cloned();
+    let rt = s.runtime.clone();
+    let entries =
+        blocking(move || rt.exchanges(&SessionId::from(id), host.as_deref(), after, limit).map_err(rt_err)).await?;
+    Ok(Json(entries).into_response())
+}
+
+async fn targets(State(s): State<ApiState>) -> Res<Response> {
+    let rt = s.runtime.clone();
+    Ok(Json(blocking(move || rt.target_list().map_err(rt_err)).await?).into_response())
+}
+
+async fn target_show(State(s): State<ApiState>, Path(name): Path<String>) -> Res<Response> {
+    let rt = s.runtime.clone();
+    Ok(Json(blocking(move || rt.target_show(&name).map_err(rt_err)).await?).into_response())
+}
+
+async fn target_create(State(s): State<ApiState>, body: Bytes) -> Res<Response> {
+    let body: TargetBody = json_body(&body)?;
+    let rt = s.runtime.clone();
+    let view = blocking(move || rt.target_create(&body).map_err(rt_err)).await?;
+    Ok((StatusCode::CREATED, Json(view)).into_response())
+}
+
+async fn target_update(State(s): State<ApiState>, Path(name): Path<String>, body: Bytes) -> Res<Response> {
+    let body: TargetBody = json_body(&body)?;
+    let rt = s.runtime.clone();
+    Ok(Json(blocking(move || rt.target_update(&name, &body).map_err(rt_err)).await?).into_response())
+}
+
+async fn target_graph(State(s): State<ApiState>, Path(name): Path<String>, q: RawQuery) -> Res<Response> {
+    let q = params(q)?;
+    let rt = s.runtime.clone();
+    let view = blocking(move || {
+        rt.target_graph(
+            &name,
+            q.get("status").map(String::as_str),
+            q.get("kind").map(String::as_str),
+            q.get("under").map(String::as_str),
+        )
+        .map_err(rt_err)
+    })
+    .await?;
+    Ok(Json(view).into_response())
+}
+
+async fn target_exchanges(State(s): State<ApiState>, Path(name): Path<String>, q: RawQuery) -> Res<Response> {
+    let q = params(q)?;
+    let limit = clamp_limit(number(&q, "limit")?, EXCHANGES_DEFAULT, EXCHANGES_MAX);
+    let node = q.get("node").cloned();
+    let rt = s.runtime.clone();
+    let entries = blocking(move || rt.target_exchanges(&name, node.as_deref(), limit).map_err(rt_err)).await?;
     Ok(Json(entries).into_response())
 }
 

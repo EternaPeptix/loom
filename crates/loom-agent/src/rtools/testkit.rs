@@ -48,6 +48,8 @@ pub struct FakeOrch {
     pub copies: Mutex<HashMap<SessionId, Result<ChildCopy, String>>>,
     /// What `box_access` answers; unset means no box is configured.
     pub boxed: Mutex<Option<Result<Arc<loom_tools::boxctl::MissionBox>, String>>>,
+    /// What `target_nodes` answers (T5); unset means the mission has no target.
+    pub target: Mutex<Option<(String, Vec<loom_core::target::NodeView>)>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -208,6 +210,10 @@ impl Orchestrator for FakeOrch {
 
     async fn producer(&self, _mission: &MissionId, blob: &BlobId) -> Option<Producer> {
         lock(&self.producers).get(blob).cloned()
+    }
+
+    fn target_nodes(&self, _session: &SessionId) -> Option<Result<(String, Vec<loom_core::target::NodeView>), String>> {
+        lock(&self.target).clone().map(Ok)
     }
 
     async fn box_access(&self, _session: &SessionId) -> Result<Arc<loom_tools::boxctl::MissionBox>, String> {

@@ -90,6 +90,47 @@ pub struct SecurityRecord(pub Arc<Shared>);
 pub struct SecurityQuery(pub Arc<Shared>);
 pub struct SecurityIngest(pub Arc<Shared>);
 
+/// `security_query` view `target` (CONTRACTS-TRAFFIC-TARGETS T5): the nodes of the mission's target.
+fn target_view(shared: &Shared, args: &Map<String, Value>) -> Result<Value, String> {
+    use loom_core::target::{locator_host, NodeKind, NodeView};
+    let (name, nodes) = match shared.orch.target_nodes(&shared.session) {
+        Some(r) => r?,
+        None => return Err("This mission has no target; start it with a target to read one.".to_string()),
+    };
+    let word = |v: &Value| v.as_str().map(str::to_string);
+    let kind = args.get("kind").and_then(word);
+    let status = args.get("status").and_then(word);
+    let under = args.get("under").and_then(word);
+    let max = args.get("max").and_then(Value::as_u64).unwrap_or(100).clamp(1, 1000) as usize;
+    let host_of = |n: &NodeView| locator_host(n.kind, &n.locator);
+    let anchor: Option<&NodeView> =
+        match &under {
+            Some(u) => Some(nodes.iter().find(|n| &n.id == u || &n.locator == u).ok_or_else(|| {
+                format!("`{u}` is not a node of target `{name}`; read the nodes without `under` first.")
+            })?),
+            None => None,
+        };
+    let matched: Vec<&NodeView> = nodes
+        .iter()
+        .filter(|n| {
+            kind.as_ref().is_none_or(|k| serde_json::to_value(n.kind).ok().and_then(|v| word(&v)).as_ref() == Some(k))
+        })
+        .filter(|n| {
+            status
+                .as_ref()
+                .is_none_or(|s| serde_json::to_value(n.status).ok().and_then(|v| word(&v)).as_ref() == Some(s))
+        })
+        .filter(|n| match anchor {
+            None => true,
+            Some(a) if a.kind == NodeKind::Domain => {
+                n.id == a.id || host_of(n) == a.locator || host_of(n).ends_with(&format!(".{}", a.locator))
+            }
+            Some(a) => n.id == a.id || host_of(n) == host_of(a),
+        })
+        .collect();
+    Ok(json!({"target": name, "matched": matched.len(), "nodes": matched.into_iter().take(max).collect::<Vec<_>>()}))
+}
+
 fn decode<T: DeserializeOwned>(value: Option<&Value>, name: &str) -> Result<T, String> {
     serde_json::from_value(value.cloned().unwrap_or(Value::Null))
         .map_err(|e| format!("Correct `{name}` before retrying: {e}. Nothing was recorded."))
@@ -888,8 +929,12 @@ fn touched_report(before: &SecurityState, after: &SecurityState, addressed: &Sec
 impl Tool for SecurityQuery {
     fn spec(&self) -> ToolSpec {
         spec("security_query", "Read durable security state: the typed records, coverage, routes to revisit, and ID resolution. It is a read; nothing it returns is a conclusion drawn by the harness.", ToolClass::State, &[
-            req("view", "string", "The view.").one_of(&["state","assets","coverage","revisit","resolve"]),
+            req("view", "string", "The view.").one_of(&["state","assets","coverage","revisit","resolve","target"]),
             opt("target", "string", "Exact ID, alias, or unambiguous prefix for resolve."),
+            opt("kind", "string", "View target: only nodes of this kind.").one_of(&["domain","host","ip","service","endpoint"]),
+            opt("status", "string", "View target: only nodes with this status.").one_of(&["untested","tested","deferred","finding","not_seen"]),
+            opt("under", "string", "View target: only this node (an id or a locator) and what belongs to its host or domain."),
+            opt("max", "integer", "View target: at most this many nodes, default 100.").min(1),
             opt("now_ms", "integer", "Expiry evaluation time, default current UTC milliseconds.").min(0),
         ])
     }
@@ -909,6 +954,10 @@ impl Tool for SecurityQuery {
                 json!({"unlocked_routes":state.newly_unlocked_at(now_ms),"now_ms":now_ms,
                     "blocked":state.blocked,"conditions":state.unlocked})
             }
+            "target" => match target_view(&self.0, args) {
+                Ok(v) => v,
+                Err(e) => return ToolOutput::error(e),
+            },
             "resolve" => match state.resolve(args.get("target").and_then(Value::as_str).unwrap_or("")) {
                 Ok(id) => json!({"id":id}),
                 Err(e) => return ToolOutput::error(e),
@@ -1024,6 +1073,43 @@ mod tests {
             tool: None,
             grade: None,
         }));
+    }
+
+    #[tokio::test]
+    async fn the_target_view_filters_by_kind_status_and_under_and_refuses_without_a_target() {
+        use loom_core::target::{node_id, NodeKind, NodeStatus, NodeView};
+        let r = rig("lead", false, true);
+        let none = r.call("security_query", json!({"view":"target"})).await;
+        assert_eq!(none.status, Status::Error);
+        assert!(none.text.contains("no target"), "{}", none.text);
+        let nv = |kind, loc: &str, status| NodeView {
+            id: node_id(kind, loc),
+            kind,
+            locator: loc.into(),
+            status,
+            parent: None,
+            missions: vec![],
+            evidence: vec![],
+            findings: vec![],
+        };
+        *r.orch.target.lock().unwrap() = Some((
+            "acme".into(),
+            vec![
+                nv(NodeKind::Host, "a.acme.test", NodeStatus::Tested),
+                nv(NodeKind::Service, "a.acme.test:443/tcp", NodeStatus::Untested),
+                nv(NodeKind::Service, "b.acme.test:80/tcp", NodeStatus::Untested),
+            ],
+        ));
+        let all = r.call("security_query", json!({"view":"target"})).await;
+        assert_eq!(body_json(&all.text)["matched"], 3, "{}", all.text);
+        let untested = r.call("security_query", json!({"view":"target","status":"untested","kind":"service"})).await;
+        assert_eq!(body_json(&untested.text)["matched"], 2);
+        let under = r.call("security_query", json!({"view":"target","under":"a.acme.test"})).await;
+        assert_eq!(body_json(&under.text)["matched"], 2, "{}", under.text);
+        let max = r.call("security_query", json!({"view":"target","max":1})).await;
+        assert_eq!(body_json(&max.text)["nodes"].as_array().unwrap().len(), 1);
+        let bad = r.call("security_query", json!({"view":"target","under":"zzz"})).await;
+        assert_eq!(bad.status, Status::Error);
     }
 
     #[tokio::test]

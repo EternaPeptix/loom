@@ -164,6 +164,9 @@ pub struct PromptEnv {
     /// The project instruction files read when the session was created (see [`read_project_instructions`]),
     /// in order. Empty: no section.
     pub project_instructions: Vec<ProjectInstruction>,
+    /// The mission target's name and summary (CONTRACTS-TRAFFIC-TARGETS T5), for a lead only. `None`: no
+    /// section, and the prompt is what it is without targets.
+    pub target: Option<(String, String)>,
 }
 
 /// The most bytes of project instructions that go into a system prompt, all files together.
@@ -663,8 +666,12 @@ pub fn load_pack(dir: &Path) -> Result<Pack, String> {
 pub fn system_prompt(role: &RoleDef, preamble: &str, env: &PromptEnv) -> String {
     let prior = if role.solvable { format!("{}\n\n", texts::SOLVABLE_PRIOR) } else { String::new() };
     let prior = format!("{prior}{}", project_instructions_section(&env.project_instructions));
+    let target = match &env.target {
+        Some((name, summary)) => format!("\n\n# Target {name}\n{}", summary.trim_end()),
+        None => String::new(),
+    };
     format!(
-        "{}\n\n{}\n\n{prior}# Environment\nWorkspace: {}\nPlatform: {}\nSandbox: {}\nNetwork: {}",
+        "{}\n\n{}\n\n{prior}# Environment\nWorkspace: {}\nPlatform: {}\nSandbox: {}\nNetwork: {}{target}",
         preamble.trim_end(),
         role.prompt.trim_end(),
         env.workspace,
@@ -705,6 +712,7 @@ mod tests {
             sandbox: "sb".into(),
             network: "net".into(),
             project_instructions: Vec::new(),
+            target: None,
         }
     }
 

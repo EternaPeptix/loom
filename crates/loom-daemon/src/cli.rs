@@ -249,6 +249,16 @@ pub enum Command {
     Net(NetArgs),
     /// Print a stored tool output
     Out(OutArgs),
+    /// Targets: named scopes that missions share, with a graph of what they found
+    Target {
+        #[command(subcommand)]
+        action: TargetAction,
+    },
+    /// The interception CA (CONTRACTS-TRAFFIC-TARGETS I2)
+    Ca {
+        #[command(subcommand)]
+        action: CaAction,
+    },
     /// The configuration file
     Config {
         #[command(subcommand)]
@@ -304,6 +314,10 @@ pub struct StartOpts {
     /// Make the workspace folder (and the folders above it) when it does not exist
     #[arg(long)]
     pub create_workspace: bool,
+    /// A target (`loom target add`) for the mission to work on: its scope joins the network rules and its
+    /// graph is shared with the other missions of the target
+    #[arg(long, value_name = "NAME")]
+    pub target: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -487,6 +501,65 @@ pub struct OutArgs {
     /// A line range: 10:20, 10: or :20
     #[arg(long)]
     pub lines: Option<String>,
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum TargetAction {
+    /// List the targets with how many nodes have each status
+    List,
+    /// Create a target
+    Add(TargetAddArgs),
+    /// Show a target: its scope and settings, and its nodes by status
+    Show(TargetShowArgs),
+    /// Change what a target covers: add or remove scope and exclude entries
+    Scope(TargetScopeArgs),
+}
+
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct TargetAddArgs {
+    /// The name: a-z, 0-9, `-` and `_`
+    pub name: String,
+    /// A scope entry (host, `*.domain`, IP or CIDR); repeatable
+    #[arg(long, value_name = "ENTRY")]
+    pub scope: Vec<String>,
+    /// An entry that is never reachable, whatever else allows it; repeatable
+    #[arg(long, value_name = "ENTRY")]
+    pub exclude: Vec<String>,
+    #[arg(long)]
+    pub notes: Option<String>,
+}
+
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct TargetShowArgs {
+    pub name: String,
+    /// Print the nodes too
+    #[arg(long)]
+    pub nodes: bool,
+}
+
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct TargetScopeArgs {
+    pub name: String,
+    /// Scope entries to add; repeatable
+    #[arg(long, value_name = "ENTRY")]
+    pub add: Vec<String>,
+    /// Scope entries to remove; repeatable
+    #[arg(long, value_name = "ENTRY")]
+    pub remove: Vec<String>,
+    /// Exclude entries to add; repeatable
+    #[arg(long, value_name = "ENTRY")]
+    pub exclude: Vec<String>,
+    /// Exclude entries to remove; repeatable
+    #[arg(long, value_name = "ENTRY")]
+    pub unexclude: Vec<String>,
+}
+
+#[derive(Subcommand, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaAction {
+    /// Print the CA's fingerprint and the file of its certificate (made when missing)
+    Show,
+    /// Replace the CA with a new one
+    Rotate,
 }
 
 #[derive(Subcommand, Debug, Clone, Copy, PartialEq, Eq)]
@@ -801,6 +874,7 @@ fn new_session(opts: &StartOpts, message: Option<String>, cwd: &Path, prior: Vec
         role_models: opts.agent_models.iter().cloned().collect(),
         create_workspace: opts.create_workspace,
         attachments: Vec::new(),
+        target: opts.target.clone().filter(|t| !t.trim().is_empty()),
     }
 }
 
@@ -1042,6 +1116,7 @@ async fn follow(
                 | BusEvent::Status { .. }
                 | BusEvent::Net { .. }
                 | BusEvent::Queued { .. }
+                | BusEvent::Target { .. }
                 | BusEvent::Settled { .. } => {}
             }
         }
@@ -1412,6 +1487,15 @@ async fn dispatch(command: Command) -> Result<i32, String> {
             }
             block(&text).map(|()| 0)
         }
+        Command::Target { action } => cmd_target(&paths, action).await,
+        Command::Ca { action } => {
+            let (fp, file) = match action {
+                CaAction::Show => loom_agent::runtime::ca_show(&paths.home)?,
+                CaAction::Rotate => loom_agent::runtime::ca_rotate(&paths.home)?,
+            };
+            let verb = if action == CaAction::Rotate { "rotated; new " } else { "" };
+            outln(&format!("{verb}fingerprint sha256 {fp}\ncertificate {}", file.display())).map(|()| 0)
+        }
         Command::Out(a) => {
             let range = a.lines.as_deref().map(parse_lines).transpose()?;
             let c = client_of(&paths)?;
@@ -1668,6 +1752,60 @@ async fn cmd_models(paths: &Paths, action: ModelsAction) -> Result<i32, String> 
             let role = cli_role(&a.role);
             let receipt = c.set_role_model(&id, &role, a.profile.as_deref(), a.now).await?;
             block(&render::role_model_receipt(&receipt, &role, a.profile.as_deref(), &style())).map(|()| 0)
+        }
+    }
+}
+
+/// `loom target list|add|show|scope`: the daemon holds the targets, so these go through its API.
+async fn cmd_target(paths: &Paths, action: TargetAction) -> Result<i32, String> {
+    let c = client_of(paths)?;
+    match action {
+        TargetAction::List => {
+            let list = c.targets().await?;
+            if list.is_empty() {
+                return outln("No targets yet. Create one with `loom target add NAME --scope HOST`.").map(|()| 0);
+            }
+            block(&render::target_list(&list)).map(|()| 0)
+        }
+        TargetAction::Add(a) => {
+            let body = loom_agent::runtime::TargetBody {
+                name: Some(a.name),
+                scope: Some(a.scope),
+                exclude: Some(a.exclude),
+                notes: a.notes,
+                ..Default::default()
+            };
+            let v = c.target_create(&body).await?;
+            outln(&format!("created target {} with {} scope entries", v.name, v.scope.len())).map(|()| 0)
+        }
+        TargetAction::Show(a) => {
+            let v = c.target(&a.name).await?;
+            let mut text = render::target_show(&v);
+            if a.nodes {
+                let g = c.target_graph(&a.name).await?;
+                text.push_str(&render::target_nodes(&g));
+            }
+            block(&text).map(|()| 0)
+        }
+        TargetAction::Scope(a) => {
+            let v = c.target(&a.name).await?;
+            let edit = |mut cur: Vec<String>, add: &[String], remove: &[String]| {
+                cur.retain(|e| !remove.iter().any(|r| r.eq_ignore_ascii_case(e)));
+                for e in add {
+                    if !cur.iter().any(|x| x.eq_ignore_ascii_case(e)) {
+                        cur.push(e.clone());
+                    }
+                }
+                cur
+            };
+            let body = loom_agent::runtime::TargetBody {
+                scope: Some(edit(v.scope, &a.add, &a.remove)),
+                exclude: Some(edit(v.exclude, &a.exclude, &a.unexclude)),
+                ..Default::default()
+            };
+            let v = c.target_update(&a.name, &body).await?;
+            outln(&format!("target {}: scope {}; exclude {}", v.name, v.scope.join(", "), v.exclude.join(", ")))
+                .map(|()| 0)
         }
     }
 }
@@ -2363,6 +2501,7 @@ mod tests {
             max_minutes: 3,
             prior: Vec::new(),
             create_workspace: true,
+            target: Some("acme".into()),
             agent_models: vec![("worker".into(), "fast".into()), (ANY_ROLE.into(), "big".into())],
         };
         let n = new_session(&opts, None, cwd, vec![MissionId::from("m-1"), MissionId::from("m-2")]);
