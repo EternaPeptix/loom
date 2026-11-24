@@ -238,11 +238,8 @@ fn build_client(ctx: &ToolCtx) -> Result<Client, String> {
         .no_proxy()
         .pool_max_idle_per_host(0)
         .user_agent("loom-cve/0.1");
-    let proxy = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"]
-        .iter()
-        .find_map(|k| ctx.env.get(*k).filter(|v| !v.trim().is_empty()));
-    if let Some(p) = proxy {
-        let proxy = Proxy::all(p.trim()).map_err(|e| {
+    if let Some(p) = crate::web::session_proxy(ctx) {
+        let proxy = Proxy::all(p).map_err(|e| {
             format!("The session's proxy setting is not usable ({e}); this is a harness configuration fault. Report it; the CVE tools cannot run until it is fixed.")
         })?;
         builder = builder.proxy(proxy);

@@ -583,10 +583,16 @@ pub(crate) struct Exchange {
 type Sink<'a> = Option<(&'a str, &'a std::sync::Mutex<Vec<loom_core::event::Exchange>>)>;
 
 pub(crate) async fn one(ctx: &ToolCtx, client: &Client, r: &Request) -> Result<Exchange, String> {
-    exchange(ctx, client, r, None).await
+    exchange(ctx, client, r, None, None).await
 }
 
-async fn exchange(ctx: &ToolCtx, client: &Client, r: &Request, sink: Sink<'_>) -> Result<Exchange, String> {
+async fn exchange(
+    ctx: &ToolCtx,
+    client: &Client,
+    r: &Request,
+    sink: Sink<'_>,
+    jar: Option<&Jar>,
+) -> Result<Exchange, String> {
     let started = std::time::Instant::now();
     let url = checked_url(&r.url)?;
     let _permit = crate::capabilities::target_permit(url.host_str().unwrap_or_default(), &ctx.cancel).await?;
@@ -618,8 +624,46 @@ async fn exchange(ctx: &ToolCtx, client: &Client, r: &Request, sink: Sink<'_>) -
     if body.len() > 2_000_000 {
         return Err("Request body exceeds two million bytes; use a smaller bounded request.".into());
     }
-    let sent: Vec<(String, String)> =
-        headers.iter().map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("(non-UTF8)").to_string())).collect();
+    // The session's credential profile (S8): `http_send`/`http_repeat` only (`jar` is theirs), never the oracle.
+    let mut shown: Option<Vec<(String, Vec<u8>)>> = None;
+    if let (Some(jar), Some(host)) = (jar, url.host_str()) {
+        let had_cookie = headers.contains_key(reqwest::header::COOKIE);
+        // reqwest sends the jar only on a request without a `Cookie` header of its own, so a jar cookie is
+        // one the request "already sends" exactly then, and the jar is merged by hand if we add a header.
+        let jar_cookie =
+            if had_cookie { None } else { jar.cookies(&url).and_then(|v| v.to_str().ok().map(str::to_string)) };
+        let already: Vec<String> = jar_cookie
+            .iter()
+            .flat_map(|c| c.split(';'))
+            .filter_map(|p| p.split('=').next())
+            .map(|n| n.trim().to_string())
+            .collect();
+        let pairs: Vec<(String, Vec<u8>)> =
+            headers.iter().map(|(k, v)| (k.as_str().to_string(), v.as_bytes().to_vec())).collect();
+        if let Some(mut inj) = crate::traffic::inject(ctx, host, &pairs, &already) {
+            if let Some(jc) = jar_cookie.filter(|j| !j.is_empty()) {
+                for set in [&mut inj.real, &mut inj.shown] {
+                    if let Some((_, v)) = set.iter_mut().find(|(n, _)| n.eq_ignore_ascii_case("cookie")) {
+                        let mut merged = format!("{jc}; ").into_bytes();
+                        merged.extend_from_slice(v);
+                        *v = merged;
+                    }
+                }
+            }
+            let mut rebuilt = HeaderMap::new();
+            for (k, v) in &inj.real {
+                if let (Ok(k), Ok(v)) = (HeaderName::from_bytes(k.as_bytes()), HeaderValue::from_bytes(v)) {
+                    rebuilt.append(k, v);
+                }
+            }
+            headers = rebuilt;
+            shown = Some(inj.shown);
+        }
+    }
+    let sent: Vec<(String, String)> = match &shown {
+        Some(s) => s.iter().map(|(k, v)| (k.clone(), String::from_utf8_lossy(v).into_owned())).collect(),
+        None => headers.iter().map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("(non-UTF8)").to_string())).collect(),
+    };
     let request_wire = crate::traffic::request_message(method.as_str(), &url, &sent, &body);
     let method_text = method.as_str().to_string();
     let response = match client.request(method, url.clone()).headers(headers).body(body).send().await {
@@ -759,6 +803,7 @@ async fn run(ctx: &ToolCtx, tool: &str, mut r: Request, args: &Map<String, Value
         }
     }
     let principal = principal_tag(&jar, &parsed_url, &r);
+    let jar_for_inject = jar.clone();
     let client = match client(ctx, jar) {
         Ok(c) => c,
         Err(e) => return ToolOutput::error(e),
@@ -773,10 +818,11 @@ async fn run(ctx: &ToolCtx, tool: &str, mut r: Request, args: &Map<String, Value
         let slots = slots.clone();
         let client = &client;
         let r = &r;
+        let jar_ref = &jar_for_inject;
         async move {
             barrier.wait().await;
             let _slot = slots.acquire().await.map_err(|_| "HTTP batch closed.".to_string())?;
-            exchange(ctx, client, r, Some((tool, made))).await
+            exchange(ctx, client, r, Some((tool, made)), Some(jar_ref.as_ref())).await
         }
     });
     let secs = args.get("timeout_s").and_then(Value::as_u64).unwrap_or(30).clamp(1, 120);
