@@ -810,7 +810,7 @@ export function sessionActions(info) {
 /** Human-readable activity from one recorded event; null for background bookkeeping. */
 export function recordActivity(record) {
   if (!record) return null;
-  const name = oneLine(record.name || "tool", 50);
+  const name = oneLine(toolShownName(record.name || "tool"), 50);
   switch (record.kind) {
     case "user_message": return "Operator message received";
     case "model_request": return "Model request started";
@@ -912,7 +912,7 @@ export function missionOverview(records, ledgerState, inboxEntries, sinceSeq = n
     if (record.kind === "tool_result" && record.status !== "ok") {
       failedChecks++;
       tone = "bad";
-      text = `${oneLine(record.name || "Tool", 50)} returned ${oneLine(record.status || "an unknown status", 50)}`;
+      text = `${oneLine(toolShownName(record.name || "Tool"), 50)} returned ${oneLine(record.status || "an unknown status", 50)}`;
     } else if (record.kind === "tool_result" && record.status === "ok" && record.class === "write") {
       text = `Write tool completed${record.meta && record.meta.path ? ": " + oneLine(record.meta.path, 100) : ""}`;
     } else if (record.kind === "ledger") {
@@ -1574,7 +1574,7 @@ function step(store, rec) {
       push(store, { ...base(rec), kind: "line", sub: "request", detail: true, tone: "dim", text: `request ${rec.req_id}: step ${rec.step}, epoch ${rec.epoch}, about ${tokens(rec.est_tokens)} tokens${rec.purpose && rec.purpose !== "step" ? " (" + rec.purpose + ")" : ""}` });
       break;
     case "session_start":
-      store.start = { budget: rec.budget || {}, tools: (rec.tools || []).length, termination: rec.termination, reasoning_replay: rec.reasoning_replay, model: rec.model ? modelEntry(rec, rec.model) : null };
+      store.start = { budget: rec.budget || {}, tools: (rec.tools || []).length, mcpTools: countMcpTools(rec.tools), termination: rec.termination, reasoning_replay: rec.reasoning_replay, model: rec.model ? modelEntry(rec, rec.model) : null };
       if (rec.model) store.models.push(modelEntry(rec, rec.model));
       break;
     case "turn_start":
@@ -3098,6 +3098,28 @@ export function toolIcon(block) {
   }
 }
 
+/** An MCP tool is named `mcp__{server}__{tool}`. Returns {server, tool} (split at the first `__` after the prefix; `server` is "" when
+ *  there is none) for such a name, else null. */
+export function mcpToolName(name) {
+  const s = String(name || "");
+  if (!s.startsWith("mcp__")) return null;
+  const rest = s.slice(5);
+  const at = rest.indexOf("__");
+  return at > 0 && at + 2 < rest.length ? { server: rest.slice(0, at), tool: rest.slice(at + 2) } : { server: "", tool: rest };
+}
+
+/** What a tool name reads as on screen: "github · search_issues" for an MCP tool, the name itself for any other. */
+export function toolShownName(name) {
+  const m = mcpToolName(name);
+  if (!m) return String(name || "");
+  return m.server ? `${m.server} · ${m.tool}` : m.tool;
+}
+
+/** How many of the tool definitions (names or {name} objects) are MCP tools. */
+export function countMcpTools(tools) {
+  return (Array.isArray(tools) ? tools : []).filter((t) => mcpToolName(typeof t === "string" ? t : t && t.name)).length;
+}
+
 /** The look of each way a call can end: its capsule words are `text`, `tone` "ok" | "neutral" | "bad" | "warn" | "running", `icon` a
  *  template name with its own shape per outcome (check, exit, cross, lock, invalid, clock, interrupted, alert, dot). */
 export const TOOL_OUTCOME_LOOK = {
@@ -3118,7 +3140,7 @@ const TOOL_OUTCOME_WORDS = {
 };
 
 /** One tool row in a group: {icon, name, calledAs, label, argsLine, capsule, duration, state, outcome, words, partial}. `capsule` is {text, tone, icon}
- *  or null (see TOOL_OUTCOME_LOOK); `outcome` is toolOutcome().kind ("running" / "missing" while there is no result), `words` the
+ *  or null (see TOOL_OUTCOME_LOOK); `shown` the name as the row reads it and `mcp` whether it is an MCP tool (the badge); `outcome` is toolOutcome().kind ("running" / "missing" while there is no result), `words` the
  *  sentence for its tooltip, `partial` {words, shown, total, cut} when the model saw only part of the output, else null. */
 export function toolRow(block) {
   const r = block.result;
@@ -3142,7 +3164,10 @@ export function toolRow(block) {
   const d = block.args && typeof block.args === "object" && !Array.isArray(block.args) ? block.args.description : null;
   const label = typeof d === "string" && d.trim() ? oneLine(d, 160) : "";
   const calledAs = block.ran ? block.name : "";
-  return { icon: toolIcon(block.ran ? { ...block, name: block.ran } : block), name: block.ran || block.name, calledAs, label, argsLine: block.argsLine || "", capsule, duration, state: block.state, outcome, words, partial: partialView(r) };
+  const fullName = block.ran || block.name;
+  // `name` stays the full name (keys, viewer titles); `shown` is what the row reads, `mcp` says whether it carries the MCP badge.
+  const mcp = mcpToolName(fullName);
+  return { icon: toolIcon(block.ran ? { ...block, name: block.ran } : block), name: fullName, shown: toolShownName(fullName), mcp: !!mcp, calledAs, label, argsLine: block.argsLine || "", capsule, duration, state: block.state, outcome, words, partial: partialView(r) };
 }
 
 /** Footer of a reply, quiet: [profile ·] tok/s · seconds · cache N%. Pass `profile` only when the reply's model differs
@@ -4068,7 +4093,7 @@ export function findFields(b, kind = "all") {
     case "inbox": return [["text", b.item && b.item.text, b.seq], ["answer", b.resolved && b.resolved.answer, b.resolved && b.resolved.seq]];
     case "child_settled": return [["text", b.report, b.seq]];
     case "child_spawned": return [["text", typeof b.brief === "string" ? b.brief : b.brief && (b.brief.task || b.brief.text || b.brief.goal), b.seq]];
-    case "tool": return [["call", `${b.name || ""} ${b.argsLine || ""}`, Number.isInteger(b.callSeq) ? b.callSeq : b.seq], ["result", b.result && b.result.text, b.result && b.result.seq]];
+    case "tool": return [["call", `${toolShownName(b.name || "")} ${b.argsLine || ""}`, Number.isInteger(b.callSeq) ? b.callSeq : b.seq], ["result", b.result && b.result.text, b.result && b.result.seq]];
     case "reweave": return [["text", b.summary, b.seq]];
     case "compaction": return [["text", b.head, b.seq], ["note", b.note, b.seq], ["table", b.table, b.seq]];
     case "line": case "divider": case "end": return [["text", b.text, b.seq]];
@@ -4752,7 +4777,7 @@ export function percentWords(share) {
  *   cache {cached, fresh, of, text, none} of the last counted request, or null
  *   notes [{label, note}] the row notes, behind one disclosure
  */
-export function contextCardModel(w) {
+export function contextCardModel(w, opts = {}) {
   const win = Number(w && w.context_window) || 0;
   const b = w && w.breakdown;
   const segs = b && Array.isArray(b.segments) ? b.segments : [];
@@ -4800,7 +4825,10 @@ export function contextCardModel(w) {
     const t = seg ? Number(seg.tokens) || 0 : 0;
     if (!(t > 0) && !def.always) continue;
     const n = seg && Number.isFinite(seg.count) && def.counted ? seg.count : null;
-    const label = n === null ? def.label : `${def.label} · ${num(n)}`;
+    // The daemon's window view does not say which tool definitions are MCP tools; the caller counts them from the session's own
+    // `session_start` tool names (opts.mcpTools) and the label says so.
+    const mcp = def.key === "tools" && n !== null ? Math.min(Math.max(0, Number(opts.mcpTools) || 0), n) : 0;
+    const label = n === null ? def.label : `${def.label} · ${num(n)}${mcp ? ` (${mcp} MCP)` : ""}`;
     rows.push({ key: def.key, label, count: n, value: "~" + tokens(t), tokens: t, share: ctxPercent(t, total), family: def.family, pattern: def.pattern, group: def.group, note: def.note || "" });
     barParts.push({ key: def.key, tokens: t });
   }
@@ -4847,4 +4875,32 @@ export function contextCardModel(w) {
     rows, fold: foldInfo, cache,
     notes: [...rows.filter((r) => r.note).map((r) => ({ label: r.label.replace(/ · \d.*$/, ""), note: r.note }))],
   };
+}
+
+// ---------------------------------------------------------------------------------------------
+// MCP servers of a session (GET /api/sessions/{id}/mcp)
+
+const MCP_STATE_TONE = { running: "ok", "not started": "neutral", closed: "neutral", failed: "bad" };
+
+/**
+ * The Session tab's server list from the route's answer: null when there is nothing to show (not an array, or empty), else
+ * [{name, transport, state, tone, toolCount, toolsWords, tools, error, stderr, hasDetail, changed, callsWords}]. `tools` and `stderr`
+ * are plain arrays of text; `hasDetail` says whether the collapsed error/stderr block has anything in it.
+ */
+export function mcpServersModel(list) {
+  if (!Array.isArray(list) || !list.length) return null;
+  return list.filter((s) => s && typeof s === "object").map((s) => {
+    const tools = (Array.isArray(s.tools) ? s.tools : []).map(String);
+    const stderr = (Array.isArray(s.stderr_tail) ? s.stderr_tail : []).map(String);
+    const error = typeof s.error === "string" ? s.error : "";
+    const state = String(s.state || "not started");
+    const calls = Number(s.calls) || 0;
+    return {
+      name: String(s.server || ""), transport: String(s.transport || ""), state, tone: MCP_STATE_TONE[state] || "neutral",
+      toolCount: tools.length, toolsWords: count(tools.length, "tool"), tools,
+      error, stderr, hasDetail: !!error || stderr.length > 0,
+      changed: s.list_changed === true,
+      callsWords: calls ? count(calls, "call") : "",
+    };
+  });
 }

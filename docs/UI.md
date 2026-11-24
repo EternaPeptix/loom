@@ -819,3 +819,13 @@ Goose, Warp, Factory) in November 2026; these are the patterns most of them shar
 - `[` and `]` jump to your previous and next message in the record (not while typing), for reading a long record prompt by
   prompt.
 - A tool row's arguments are behind "Show arguments", not a bare "args" link.
+
+## MCP tools
+
+A tool named `mcp__{server}__{tool}` is an MCP tool (`docs/CONTRACTS-MCP.md`, M8). The row reads `{server} · {tool}` with a small "MCP" badge (`.mcp-badge`); the full name is in the tooltip. Its output label, keys, copy actions and viewer are those of any tool. The Overview's recent activity and the Find bar use the same `{server} · {tool}` form (Find matches what the row shows, so `mcp__` does not match).
+
+The Session tab lists the session's servers (`section.mcp-servers`, one `.mcp-server` card each) from `GET /api/sessions/{id}/mcp`: name, transport, state, the tool count (expands to the names), "tools changed since start" when `list_changed`, and the last error and stderr tail in a collapsed block. It loads when the tab opens and on a `session` or `status` event for that session. An empty list or a 404 (an older daemon) leaves the section out without a message.
+
+The Context tab labels the tool definitions `Tool definitions · 26 (4 MCP)`. The daemon's window view does not tag MCP tools, so the page counts the `mcp__` names in the session's `session_start` tool list.
+
+Fixture: session `s-mcp` (`#/s/s-mcp/chat`) has one call with a text result and one `isError` call; its route answers two servers, every other session `[]`.

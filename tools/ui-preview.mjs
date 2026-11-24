@@ -18,6 +18,7 @@
 // GET /api/sessions/{id}/files?path= and .../files/lines?path=&start=&count= over the workspaces /fixture/loom (nested
 // folders, big.log with 20,000 lines, target.bin binary, huge.sql over the 32 MiB cap, outside a link, locked unreadable,
 // pipe not a file, generated with 2,050 entries, .loom closed) and /fixture/indexer.
+// MCP adds: s-mcp (two MCP calls, one ok and one isError) and GET /api/sessions/{id}/mcp (two servers for s-mcp, [] for the rest).
 // Uploads add: POST /api/uploads?workspace=&name= (201 {path, name, bytes, mime} under <workspace>/.loom/uploads/, 413 over 32 MiB),
 // `attachments` in message and session bodies (the attachment block is appended as the daemon does), and the Files routes serve
 // .loom/uploads and nothing else under .loom. s-tools carries a user message with a CSV and a PNG attached.
@@ -124,9 +125,10 @@ sessions.push(
   session("s-tools", "Tool result shapes", { phase: "idle", last_end: "waiting", profile: "dsv41", workspace: "/fixture/loom", step: 9, completion: 6000, age: 90 * MIN }),
   session("s-compacted", "Long-running mission (two compactions)", { phase: "idle", last_end: "waiting", profile: "dsv41", workspace: "/fixture/loom", step: 17, completion: 120000, prompt: 61000, cached: 52000, age: 30 * 3600000 }),
   session("s-loop", "Stuck build (60 identical calls)", { phase: "idle", last_end: "waiting", profile: "dsv41", workspace: "/fixture/loom", step: 64, completion: 40000, prompt: 90000, cached: 85000, age: 3 * 3600000 }),
+  session("s-mcp", "Triage issues through MCP servers", { phase: "idle", last_end: "waiting", profile: "dsv41", workspace: "/fixture/loom", step: 4, completion: 3000, age: 50 * MIN }),
   session("s-big", "Long investigation (5,000 records)", { phase: "idle", last_end: "waiting", profile: "dsv41", workspace: "/fixture/loom", step: 1250, completion: 900000, prompt: 300000, cached: 280000, age: 6 * 3600000 }),
 );
-for (const id of ["s-parked", "s-quiet", "s-notify", "s-tools", "s-loop", "s-big", "s-compacted", "s-result"]) custom.add(id);
+for (const id of ["s-parked", "s-quiet", "s-notify", "s-tools", "s-loop", "s-big", "s-mcp", "s-compacted", "s-result"]) custom.add(id);
 let inbox = [
   { session: "s-audit", mission: "m-audit", title: "Audit harness reliability", opened_ms: now - 240000, item: { item_id: "i-scope", item_kind: "question", text: "Include the desktop app in this audit?", options: ["Include desktop", "Runtime only"], blocking: true, call_id: "question", reference: "q1" } },
   { session: "s-result", mission: "m-s-result", title: "Dependency review", opened_ms: now - 600000, item: { item_id: "i-result", item_kind: "finished", text: "The review is ready to read.", options: [], blocking: false, call_id: "finish" } },
@@ -283,6 +285,27 @@ append("s-fl-net", "inbox_opened", { ts_ms: now - 9 * MIN, ...inbox.find(e => e.
   t = step("s-tools", t, { command: "make test", status: "error", out: "make: *** [test] Error 1", exit: 1 });
   append("s-tools", "turn_end", { ts_ms: t + 1000, reason: "waiting" }, "harness");
 }
+// s-mcp: two MCP calls (contract M8): a text result and an `isError` result, and the two servers GET /api/sessions/s-mcp/mcp lists.
+{
+  const id = "s-mcp"; const t0 = now - 50 * MIN; let t = t0 + 2 * MIN;
+  startOf(sessionOf(id), t0, "Find the open issues about retries and read the retry docs.");
+  // The session's tool names: 3 of github's and 1 of docs' are MCP tools (the Context tab counts them).
+  const tool = name => ({ name, description: name, parameters: { type: "object", properties: {} } });
+  logs.get(id)[0].tools = ["bash", "read", "edit", "write", "grep", "mcp__github__search_issues", "mcp__github__get_issue", "mcp__github__list_pulls", "mcp__docs__fetch_page"].map(tool);
+  const issues = ["#412 retry budget is not reset after a parked turn", "#397 backoff overflows after 31 attempts", "#388 retry on 429 ignores Retry-After", "#371 idempotent POSTs are retried without a key", "#365 retry count missing from the status line", "#350 jitter makes the recovery test flaky", "#344 retries hide the first error", "#339 no cap on total retry time", "#331 retry docs describe the old defaults", "#318 retry log lines lack the request id"];
+  t = step(id, t, { text: "Searching the tracker for retry issues.", name: "mcp__github__search_issues", cls: "exec", args: { query: "retry is:open", repo: "fixture/loom" }, ms: 840,
+    out: "[mcp__github__search_issues · ok · github · 12 lines · out:5c1e0a7d93b24f68]\n10 results for \"retry is:open\"\n" + issues.join("\n") });
+  t = step(id, t, { text: "Reading the retry docs.", name: "mcp__docs__fetch_page", cls: "exec", args: { path: "/missing" }, status: "error", ms: 310,
+    out: "[mcp__docs__fetch_page · error · docs · 1 line · out:9b04d2e6c7a15f30]\nPage not found: /missing" });
+  append(id, "turn_end", { ts_ms: t + 1000, reason: "waiting" }, "harness");
+}
+// GET /api/sessions/{id}/mcp (contract M7): the session's servers; s-mcp has two, every other session none.
+const MCP_SERVERS = {
+  "s-mcp": [
+    { server: "github", transport: "stdio", state: "running", tools: ["search_issues", "get_issue", "list_pulls"], error: null, stderr_tail: ["github-mcp 0.4.2 starting on stdio", "authenticated as fixture-bot", "warning: rate limit remaining 412"], list_changed: true, calls: 1, last_call_ms: now - 48 * MIN },
+    { server: "docs", transport: "http", state: "failed", tools: [], error: "connection refused: https://docs.fixture.invalid/mcp did not answer after 3 attempts", stderr_tail: [], list_changed: false, calls: 1, last_call_ms: now - 47 * MIN },
+  ],
+};
 // s-loop: a stuck model. Two different calls, then 60 identical failing `cargo build` calls, then a short run of 3 and a pair.
 {
   const id = "s-loop"; const t0 = now - 3 * 3600000; let t = t0 + 2 * MIN;
@@ -948,6 +971,7 @@ const server = createServer(async (req, res) => {
     if (path.endsWith("/ledger")) return json(res, { state: ledgers.get(decodeURIComponent(path.split("/")[3] || "")) || { entries: 0 }, markdown: "" });
     if (path.endsWith("/window")) return json(res, windowFor(sessions.find(x => x.id === decodeURIComponent(path.split("/")[3] || ""))));
     if (path.endsWith("/net")) return json(res, []);
+    if (/^\/api\/sessions\/[^/]+\/mcp$/.test(path)) return json(res, MCP_SERVERS[decodeURIComponent(path.split("/")[3])] || []);
     const rawMatch = path.match(/^\/api\/blobs\/([^/]+)\/raw$/);
     if (rawMatch) {
       // The whole stored output, as the daemon's blob_raw sends it (an attachment of bytes with a length).

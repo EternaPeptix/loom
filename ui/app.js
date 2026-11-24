@@ -38,7 +38,7 @@ const S = {
   actionState: new Map(),
   stopAsked: new Set(), // sessions this tab asked to stop: their ending is not announced
   notes: { pending: [], shown: new Map(), timer: 0 },
-  requests: { ledger: 0, window: 0, net: 0, inbox: 0, status: 0, models: 0 },
+  requests: { ledger: 0, window: 0, net: 0, inbox: 0, status: 0, models: 0, mcp: 0 },
   inboxRevision: 0,
   inboxTouched: new Map(), // item id -> {rev, entry|null}: what inbox records changed, kept over an older snapshot
   sinceSeq: null,
@@ -86,6 +86,7 @@ const S = {
   win: { data: null, error: null, stale: true, hideFolded: false, from: null, notesOpen: false },
   rules: null, // the rules form of the open session: {session, box, note, hint, lists, reason, asking, shown}
   net: [],
+  mcp: { id: null, list: null }, // the open session's MCP servers (GET /api/sessions/{id}/mcp); list null = nothing to show or no route
   netError: null,
   viewer: null,
   copyOnSelect: false, // the "Copy on select" preference (localStorage, off until turned on)
@@ -841,6 +842,7 @@ function handleEvent(ev) {
         C.applySessionEvent(S.sessions, f.info);
         if (was) announceEnding(was, f.info);
         want("list", "header", "overview");
+        if (f.info && f.info.id === S.openId && S.tab === "session") loadMcp();
         // A model switched, a choice made, or an agent started in the mission the Models tab shows.
         if (S.tab === "models" && S.models.view && f.info && f.info.mission === S.models.view.mission) loadModels();
         break;
@@ -851,6 +853,7 @@ function handleEvent(ev) {
         C.applyStatus(S.sessions, f.session, f.status);
         if (was) announceEnding(was, { ...was, status: f.status });
         want("list", "header", "overview");
+        if (f.session === S.openId && S.tab === "session") loadMcp();
         break;
       }
       case "header":
@@ -2850,9 +2853,15 @@ function buildTool(root, b) {
   head.type = "button";
   head.setAttribute("aria-expanded", String(open));
   head.dataset.focusKey = "tool:" + b.id;
-  const nameEl = el("span", "name", row.name);
+  const nameEl = el("span", "name", row.shown);
   if (row.calledAs) nameEl.title = `Called as ${row.calledAs}; ran ${row.name}`;
+  else if (row.mcp) nameEl.title = row.name;
   add(head, icon("chevron"), icon(row.icon), nameEl);
+  if (row.mcp) {
+    const badge = el("span", "mcp-badge", "MCP");
+    badge.title = `MCP tool: ${row.name}`;
+    add(head, badge);
+  }
   // A call that says what it is for (bash's `description`) leads with that; the command stays beside it, dimmer.
   if (row.label) add(head, el("span", "tlabel", row.label));
   const args = el("span", row.label ? "args sub" : "args", row.argsLine);
@@ -3153,7 +3162,7 @@ function buildRun(row, group) {
   head.dataset.focusKey = "run:" + row.key;
   head.title = open ? "Fold these calls away." : `Show the ${C.num(row.count)} calls.`;
   const first = C.toolRow(row.first);
-  add(head, icon("chevron"), icon(first.icon), el("span", "name", first.name), el("span", "args", first.argsLine), el("span", "dim run-same", `same call ×${C.num(row.count)}`));
+  add(head, icon("chevron"), icon(first.icon), el("span", "name", first.shown), ...(first.mcp ? [el("span", "mcp-badge", "MCP")] : []), el("span", "args", first.argsLine), el("span", "dim run-same", `same call ×${C.num(row.count)}`));
   const chipEl = el("span", "run-chip");
   add(chipEl, icon("alert"), document.createTextNode(`repeated ${C.num(row.count)}×`));
   chipEl.title = `The same call, with the same arguments, ${C.num(row.count)} times in a row.`;
@@ -4059,6 +4068,7 @@ function loadTab() {
   if (S.tab === "ledger") loadLedger();
   else if (S.tab === "models") loadModels();
   else if (S.tab === "context") loadWindow();
+  else if (S.tab === "session") loadMcp();
   else if (S.tab === "network") {
     if (S.net.length === 0) loadNet();
     if (S.ledger.stale || !S.ledger.model) loadLedger();
@@ -4100,6 +4110,22 @@ async function loadWindow() {
   }
   if (S.tab === "context") want("right");
   if (S.sheet.open) want("sheet");
+}
+
+/** The open session's MCP servers. A 404 (an older daemon), any other failure or an empty list leaves the section out. */
+async function loadMcp() {
+  const id = S.openId;
+  if (!id) return;
+  const request = ++S.requests.mcp;
+  let list = null;
+  try {
+    list = C.mcpServersModel(await api("GET", "/api/sessions/" + encodeURIComponent(id) + "/mcp"));
+  } catch (e) {
+    list = null;
+  }
+  if (S.openId !== id || request !== S.requests.mcp) return;
+  S.mcp = { id, list };
+  if (S.tab === "session") want("right");
 }
 
 async function loadNet() {
@@ -4542,7 +4568,8 @@ function renderLedger(p) {
  * apart); `ask` is the open question of that place, if any. Text nodes only; the fills are classes.
  */
 function contextCard(w, where, ask) {
-  const m = C.contextCardModel(w);
+  // MCP tool definitions are counted from this session's own start record (the window view does not tag them).
+  const m = C.contextCardModel(w, { mcpTools: S.rec && S.rec.start ? S.rec.start.mcpTools : 0 });
   const box = el("div", "ctx");
   const hero = el("div", "ctx-hero");
   const figure = el("span", "ctx-figure");
@@ -4771,6 +4798,7 @@ function renderSessionTab(p, info) {
     }
     row("agents", d);
   }
+  const mcp = S.mcp.id === info.id ? mcpSection(S.mcp.list) : null;
   const pref = el("div", "copy-pref");
   const label = el("label", "check");
   const box = el("input");
@@ -4782,8 +4810,42 @@ function renderSessionTab(p, info) {
   add(label, box, document.createTextNode(" Copy on select"));
   add(pref, label, el("p", "dim", "Off by default. When on, text you select in the chat, a tool output or the viewer is copied as you let go of the mouse or key, and a short note says how much. Nothing is copied while you type in a field."));
   pref.lastChild.id = "copy-on-select-note";
-  p.replaceChildren(kv, pref);
+  p.replaceChildren(...[kv, mcp, pref].filter(Boolean));
 }
+
+/** The MCP servers of a session: one card each (name, transport, state, tools expandable, a collapsed error and stderr block). */
+function mcpSection(servers) {
+  if (!servers || !servers.length) return null;
+  const box = el("section", "mcp-servers");
+  box.setAttribute("aria-label", "MCP servers");
+  add(box, el("h2", "", "MCP servers"));
+  for (const m of servers) {
+    const card = el("div", "mcp-server mcp-" + m.tone);
+    card.dataset.server = m.name;
+    const head = el("div", "mcp-head");
+    const state = el("span", m.tone === "neutral" ? "capsule" : "capsule tone-" + m.tone, m.state);
+    add(head, el("span", "name", m.name), el("span", "dim", m.transport), state);
+    if (m.callsWords) add(head, el("span", "dim", m.callsWords));
+    add(card, head);
+    if (m.toolCount) {
+      const d = el("details", "mcp-tools");
+      d.append(el("summary", "", m.toolsWords));
+      d.append(ul(...m.tools.map((t) => li(el("code", "", t)))));
+      add(card, d);
+    } else add(card, el("div", "dim", "no tools"));
+    if (m.changed) add(card, el("div", "tnote warn", "tools changed since start"));
+    if (m.hasDetail) {
+      const d = el("details", "mcp-detail");
+      d.append(el("summary", "", m.error ? "last error" : "stderr"));
+      if (m.error) d.append(el("div", "mcp-error", m.error));
+      if (m.stderr.length) d.append(textBox(m.stderr.join("\n"), "txt out mcp-stderr"));
+      add(card, d);
+    }
+    add(box, card);
+  }
+  return box;
+}
+
 
 // ---------------------------------------------------------------------------------------------
 // Copy on select: a preference kept in this browser, off until the operator turns it on.

@@ -4000,3 +4000,65 @@ test("Expand all on a 5,000-record store renders a bounded number of member rows
   assert.equal(C.renderedRowCount(loop, { openRuns: new Set(C.rowsOf(lg).map((r) => r.key)) }), 1 + 50 + 1);
   assert.equal(lg.loop, 2500);
 });
+
+// ---- MCP tools (contract M8)
+
+test("mcpToolName / toolShownName: split at the first __ after the prefix; other names are not MCP", () => {
+  assert.deepEqual(C.mcpToolName("mcp__github__search_issues"), { server: "github", tool: "search_issues" });
+  assert.deepEqual(C.mcpToolName("mcp__docs__fetch__page"), { server: "docs", tool: "fetch__page" });
+  assert.deepEqual(C.mcpToolName("mcp__lonely"), { server: "", tool: "lonely" });
+  assert.equal(C.mcpToolName("bash"), null);
+  assert.equal(C.mcpToolName("my_mcp__x__y"), null);
+  assert.equal(C.mcpToolName(undefined), null);
+  assert.equal(C.toolShownName("mcp__github__search_issues"), "github · search_issues");
+  assert.equal(C.toolShownName("bash"), "bash");
+  assert.equal(C.countMcpTools([{ name: "bash" }, { name: "mcp__a__b" }, "mcp__c__d", null]), 2);
+  assert.equal(C.countMcpTools(undefined), 0);
+});
+
+test("toolRow: an MCP row reads server · tool with the badge and keeps the full name", () => {
+  const row = C.toolRow({ kind: "tool", name: "mcp__docs__fetch_page", cls: "exec", state: "done", argsLine: "", result: { status: "error", meta: {}, duration_ms: 310 } });
+  assert.equal(row.shown, "docs · fetch_page");
+  assert.equal(row.name, "mcp__docs__fetch_page");
+  assert.equal(row.mcp, true);
+  const plain = C.toolRow({ kind: "tool", name: "bash", cls: "exec", state: "running", argsLine: "ls", result: null });
+  assert.equal(plain.shown, "bash");
+  assert.equal(plain.mcp, false);
+});
+
+test("Find reads an MCP call as server · tool", () => {
+  const block = { kind: "tool", id: 1, seq: 3, callSeq: 3, name: "mcp__github__search_issues", argsLine: "retry", result: null };
+  assert.equal(C.findInRecord([block], "github · search").count, 1);
+  assert.equal(C.findInRecord([block], "mcp__").count, 0);
+});
+
+test("contextCardModel: the tools label says how many definitions are MCP, never more than the count", () => {
+  const label = (opts) => C.contextCardModel(cardWindow(), opts).rows.find((r) => r.key === "tools").label;
+  assert.equal(label(), "Tool definitions · 42");
+  assert.equal(label({ mcpTools: 0 }), "Tool definitions · 42");
+  assert.equal(label({ mcpTools: 4 }), "Tool definitions · 42 (4 MCP)");
+  assert.equal(label({ mcpTools: 99 }), "Tool definitions · 42 (42 MCP)");
+});
+
+test("session_start keeps the number of MCP tools for the context label", () => {
+  reset();
+  const store = storeOf([R("session_start", { session: "s-a", mission: "m-a", parent: null, workspace: "/w", pack: "core", role: "lead", model: MODEL_A, tools: [{ name: "bash" }, { name: "mcp__a__b" }, { name: "mcp__a__c" }], budget: {} })]);
+  assert.equal(store.start.tools, 3);
+  assert.equal(store.start.mcpTools, 2);
+});
+
+test("mcpServersModel: null for nothing, else one row per server with its facts", () => {
+  assert.equal(C.mcpServersModel([]), null);
+  assert.equal(C.mcpServersModel(undefined), null);
+  assert.equal(C.mcpServersModel({ error: "not found" }), null);
+  const m = C.mcpServersModel([
+    { server: "github", transport: "stdio", state: "running", tools: ["a", "b", "c"], error: null, stderr_tail: ["warn x"], list_changed: true, calls: 1, last_call_ms: 5 },
+    { server: "docs", transport: "http", state: "failed", tools: [], error: "connection refused", stderr_tail: [], list_changed: false, calls: 0 },
+    { server: "idle", transport: "stdio", state: "not started", tools: [], stderr_tail: [] },
+  ]);
+  assert.equal(m.length, 3);
+  assert.deepEqual([m[0].name, m[0].transport, m[0].state, m[0].tone, m[0].toolCount, m[0].toolsWords, m[0].changed, m[0].hasDetail, m[0].callsWords], ["github", "stdio", "running", "ok", 3, "3 tools", true, true, "1 call"]);
+  assert.deepEqual(m[0].stderr, ["warn x"]);
+  assert.deepEqual([m[1].tone, m[1].error, m[1].hasDetail, m[1].changed, m[1].toolsWords, m[1].callsWords], ["bad", "connection refused", true, false, "0 tools", ""]);
+  assert.deepEqual([m[2].tone, m[2].hasDetail, m[2].error], ["neutral", false, ""]);
+});
