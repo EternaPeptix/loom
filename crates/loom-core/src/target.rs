@@ -10,10 +10,10 @@
 //!   network assets, plus the host of every `http://` or `https://` URL in its text, plus, when a scope
 //!   is given, every host name or IP in the text that the scope contains. Lower-cased, deduplicated,
 //!   in first-seen order.
-//! - [`TargetStore`], [`GraphLine`], [`NodeStatus`] and [`summary`] are signatures with `todo!()` bodies
-//!   for the implementer of part T: `~/.loom/targets/{name}/target.toml` and the hash-chained
-//!   `graph.jsonl`, node ids shared with the security state's asset ids, statuses as T6 says, and the
-//!   summary text of T5.
+//! - [`TargetStore`], [`GraphLine`], [`NodeStatus`] and [`summary`] (part T):
+//!   `~/.loom/targets/{name}/target.toml` and the hash-chained `graph.jsonl`, node ids shared with the
+//!   security state's asset ids, statuses as T6 says, and the summary text of T5. Credential profiles
+//!   live beside them under `creds/` (`crate::creds`, part S).
 
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
