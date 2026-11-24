@@ -829,3 +829,27 @@ The Session tab lists the session's servers (`section.mcp-servers`, one `.mcp-se
 The Context tab labels the tool definitions `Tool definitions · 26 (4 MCP)`. The daemon's window view does not tag MCP tools, so the page counts the `mcp__` names in the session's `session_start` tool list.
 
 Fixture: session `s-mcp` (`#/s/s-mcp/chat`) has one call with a text result and one `isError` call; its route answers two servers, every other session `[]`.
+
+## Captured exchanges (CONTRACTS-TRAFFIC-TARGETS U1-U3)
+
+An `exchange` record is one captured request and its response. The record store keeps them in `store.exchanges` and also hangs each on the tool row with the same `call_id`; the daemon's `GET /api/exchanges/{session}` fills in the rest of the mission's sessions.
+
+- A tool row with exchanges shows a `N requests` badge (`.req-count`) and lists them in its body, one `button.exrow` each: method, host and path, status, size, time, and marks for `intercepted`, `upstream not verified` and `cut`. A `bash` row has none by `call_id`, so it owns the proxy's own exchanges (no call, source `proxy`) recorded between its call and its result.
+- Opening an exchange shows `dialog#exview`: the request on one side and the response on the other, each fetched from its stored message. A call with no response says why (the error) instead of showing an empty side.
+- Headers named in C5 (`Authorization`, `Cookie`, `Set-Cookie`, `Proxy-Authorization`, `X-Api-Key`) show `•••••••• hidden`. The Reveal secrets button (`#exview-reveal`, `aria-pressed`) shows them for that viewer only; closing the dialog hides them again. Bodies over 64 KiB show their first part with a sentence saying so.
+- The inspector's Network tab lists the session's exchanges under the allow and refuse decisions, with a host filter and a status filter and a line saying how many of how many are shown.
+- A claim in the Claims view lists the hosts it names (the same rule as `claim_hosts` in `crates/loom-core/src/target.rs`, in `core.js` as `claimHosts`): `reached · ex-…` when attested supporting evidence cites a call (or quotes a stored message) that got a response from that host, the id being a link that opens the exchange; `not reached`, in amber, when none did.
+
+Fixture: `#/s/s-fl-web/chat` has one `http_send` with two exchanges (a redirect and its target), a `curl` the proxy captured over plain HTTP, one intercepted HTTPS `curl` (`tls: intercepted`), and one request whose upstream refused. Its mission's claims `c2` (reached) and `c3` (admin.acme.test not reached) are on the Evidence section.
+
+## Targets (CONTRACTS-TRAFFIC-TARGETS U4)
+
+The sidebar shows a Targets entry (`#btn-targets`) when `GET /api/targets` answers. A 404 from an older daemon hides it without a message.
+
+- `#/targets` lists the targets with their counts in words. `#/t/{name}` is the target page: the scope (included and excluded entries, editable, saved with `PUT /api/targets/{name}`; a bad entry shows the daemon's sentence), the tree of assets (`.ttree`), the findings and the missions that worked on it.
+- The tree nests nodes under their parent (a node's `parent`, or the graph's edges when it names none), orders siblings by kind and name, and shows each node's status as words and a mark, never by colour alone: finding, tested, deferred, not tested yet, in scope, not seen. Filters by status and kind keep the path to a match open. Past 2 000 rows the tree draws only the rows in view.
+- Choosing a node shows its findings and the exchanges that touched its host (`GET /api/targets/{name}/exchanges?node=`).
+- The new-mission form has a Target field when there is at least one target; the mission's identity chip links to its target.
+- Live: a `target` event reloads the page that shows it.
+
+Fixture: target `acme` (scope `*.acme.test`, `10.20.0.0/24`; excluded `pay.acme.test`) with eleven nodes of every kind and status, two missions and one open finding: `#/t/acme`.
