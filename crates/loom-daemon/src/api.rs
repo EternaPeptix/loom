@@ -450,7 +450,8 @@ async fn admit(state: &ApiState, req: Request, next: Next) -> Response {
     }
     // The page and its scripts hold no secret; a login code is its own credential.
     let path = req.uri().path();
-    let exempt = (method == Method::GET && matches!(path, "/" | "/healthz" | "/app.js" | "/core.js" | "/style.css" | "/favicon.svg"))
+    let exempt = (method == Method::GET
+        && matches!(path, "/" | "/healthz" | "/app.js" | "/core.js" | "/style.css" | "/favicon.svg"))
         || (method == Method::POST && path == "/api/web-sessions");
     if !exempt && !bearer_ok(state, headers) {
         return refusal(StatusCode::UNAUTHORIZED, UNAUTHORIZED);

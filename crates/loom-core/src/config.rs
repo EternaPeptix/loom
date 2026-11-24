@@ -350,7 +350,11 @@ pub enum SandboxMode {
 /// `loom config init` writes it) then starts on either system.
 impl Default for SandboxMode {
     fn default() -> Self {
-        if cfg!(target_os = "linux") { SandboxMode::Bubblewrap } else { SandboxMode::Seatbelt }
+        if cfg!(target_os = "linux") {
+            SandboxMode::Bubblewrap
+        } else {
+            SandboxMode::Seatbelt
+        }
     }
 }
 
