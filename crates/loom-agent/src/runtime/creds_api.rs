@@ -172,7 +172,11 @@ impl Runtime {
 impl Inner {
     /// What a lead's start records for `creds` (S11): refused without a target, for a name that is not
     /// valid, a profile that does not exist or does not open.
-    pub(super) fn start_creds(&self, target: Option<&TargetRef>, name: Option<&str>) -> Result<Option<CredsRef>, String> {
+    pub(super) fn start_creds(
+        &self,
+        target: Option<&TargetRef>,
+        name: Option<&str>,
+    ) -> Result<Option<CredsRef>, String> {
         let _ = (target, name);
         todo!("S11")
     }

@@ -683,7 +683,8 @@ async fn intercept_scope_intercepts_only_in_scope_connects() {
     assert_eq!((c.transport, c.target.as_str()), (Transport::Intercepted, "/in"));
     drop(s);
 
-    let mut e = env(CaptureGrant { intercept_scope: Some(scope_of(&["10.9.9.9", "*.acme.test"])), ..intercepting() }).await;
+    let mut e =
+        env(CaptureGrant { intercept_scope: Some(scope_of(&["10.9.9.9", "*.acme.test"])), ..intercepting() }).await;
     // Out of scope: the real certificate answers (the loom CA is not trusted for it) and nothing is captured.
     assert!(tunnel_tls(&e, port, true).await.is_err());
     tokio::time::sleep(Duration::from_millis(200)).await;

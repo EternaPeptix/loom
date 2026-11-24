@@ -658,7 +658,6 @@ use crate::prior;
 mod creds_api;
 mod target_api;
 mod targets;
-pub use creds_api::{CredsBody, ProfileShow, RecordBody, RecordLines, RecordStarted, SetBody};
 use crate::rtools::{
     self, ChildCopy, ChildInfo, Orchestrator, Producer, Run, Settlement, Shared, SpawnReq, Vote, Workspace,
 };
@@ -668,6 +667,7 @@ use crate::session::{
 };
 use crate::texts;
 use async_trait::async_trait;
+pub use creds_api::{CredsBody, ProfileShow, RecordBody, RecordLines, RecordStarted, SetBody};
 use futures_util::FutureExt;
 use loom_core::config::{ensure_private_dir, Config, NetworkMode, Paths, SandboxCfg, SandboxMode};
 use loom_core::estimate::TokenEstimator;

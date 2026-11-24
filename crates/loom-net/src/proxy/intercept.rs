@@ -38,11 +38,11 @@
 
 use super::*;
 use crate::capture::{CaptureGrant, CaptureSink, Captured, Transport};
+use crate::inject::{apply_head, Inject};
 use crate::tls::Ca;
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::ClientConfig;
 use std::time::Instant;
-use crate::inject::{apply_head, Inject};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
@@ -83,10 +83,7 @@ pub(super) fn listed(patterns: &[String], host: &str, port: u16) -> bool {
 impl CaptureCfg {
     /// Whether a tunnel to `host:port` is decrypted.
     pub fn intercepts(&self, host: &str, port: u16) -> bool {
-        self.grant.intercept
-            && self.ca.is_some()
-            && !listed(&self.grant.passthrough, host, port)
-            && self.in_scope(host)
+        self.grant.intercept && self.ca.is_some() && !listed(&self.grant.passthrough, host, port) && self.in_scope(host)
     }
 
     /// Whether `host` passes the grant's `intercept_scope` (always, when it has none).

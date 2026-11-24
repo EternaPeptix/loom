@@ -105,7 +105,8 @@ fn attachable(item: &Item) -> bool {
 /// Whether a `Cookie` header of `headers` already has a pair named `name`.
 fn has_cookie(headers: &[(String, Vec<u8>)], name: &str) -> bool {
     headers.iter().filter(|(n, _)| n.eq_ignore_ascii_case("cookie")).any(|(_, v)| {
-        v.split(|b| *b == b';').any(|pair| pair.split(|b| *b == b'=').next().unwrap_or(&[]).trim_ascii() == name.as_bytes())
+        v.split(|b| *b == b';')
+            .any(|pair| pair.split(|b| *b == b'=').next().unwrap_or(&[]).trim_ascii() == name.as_bytes())
     })
 }
 
