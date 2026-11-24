@@ -219,6 +219,17 @@ open their corresponding chat blocks.
   `exit N`, failed with a cross, "no result" with an alert, running with a dot) and duration. Clicking
   the row or pressing Enter opens its output as before: 24-line clip with show all, the cut note with
   “open full output”, the arguments toggle, "no result recorded" and "running…".
+  An expanded row labels its boxes: "Output" above the output, and "Arguments" above the arguments when
+  "Show arguments" is on, so the two are not mistaken for each other.
+- **Repeated calls**: three or more consecutive calls of one tool with identical arguments (canonical
+  JSON; result status may differ; text-less replies between them do not break the run) collapse to
+  one row, "bash cargo build · same call ×40", with a "repeated 40×" chip and the last call's
+  outcome. Opening it lists the calls. A run of 10 or more puts a "loop" warning on the group head
+  ("The same call was made N times in a row. The model may be stuck."). Two identical calls stay as is.
+- **Bounded rendering**: an open group renders at most 50 rows (a collapsed run counts as one), then
+  "Show 50 more (N hidden)"; an open run pages its calls the same way. Expand all opens the group
+  heads only; each still renders its first page. Jump-to-record and search results reveal the page
+  (and open the run) that holds their target first.
 - The live reply is shown at the bottom as a reply in progress with its model chip.
 
 ### Copying
@@ -536,6 +547,11 @@ action moves focus or closes the dialog. Opening the dialog puts focus on the li
 keys scroll them at once and Enter never rests on Close. Loading earlier lines keeps the lines
 being read where they are. A cited line, the line gone to and a search match are marked
 differently, since all three can meet on one line.
+
+"Open full output" from a tool row opens at the first line the model saw other than line 1 (for a
+head-and-tail cut, at the start of the omitted middle) and marks the lines the model was shown
+(`seenRanges`, a blue left edge), with the sentence "Lines the model was shown are marked." This
+is separate from a citation: only `citeStart` switches the standing sentence to evidence wording.
 
 ## Validation
 

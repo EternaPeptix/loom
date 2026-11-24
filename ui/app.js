@@ -54,6 +54,9 @@ const S = {
   attempts: 0, // failed attempts to open the event stream in a row
   workState: new Map(), // work group key -> true (operator opened it) | false (operator folded it)
   openGroups: new Set(), // work groups kept expanded while scrolled away from the end
+  groupPages: new Map(), // work group key -> pages of rows revealed (default 1; a page is C.GROUP_PAGE rows)
+  openRuns: new Set(), // keys of collapsed runs of repeated calls that the operator opened
+  runPages: new Map(), // run key -> pages of its calls revealed
   expandAll: false,
   details: false,
   activity: new Map(), // session id -> {seq, ts} of the latest record seen on the stream
@@ -586,6 +589,9 @@ function openSession(id) {
   S.r = { from: 0, end: 0, nodes: new Map(), items: [], forced: new Set(), fresh: true, landed: false };
   S.workState = new Map();
   S.openGroups = new Set();
+  S.groupPages = new Map();
+  S.openRuns = new Set();
+  S.runPages = new Map();
   S.scrollAt = {};
   S.seat = null;
   S.follow = true;
@@ -2316,7 +2322,18 @@ function jumpToRecord(seq, { focus = false, highlight = true, done = null } = {}
     const key = C.groupKeyForSeq(S.r.items, block.seq);
     if (key) S.workState.set(key, true);
     if (block.kind === "tool") block.ui = { ...(block.ui || {}), open: true };
-    if (key || block.kind === "tool") { S.r.forced.add(block.id); syncChat(); }
+    // A record on a page that is not rendered yet: reveal that page (and open the run holding it) first.
+    const holder = key && S.r.items.find((x) => x.type === "group" && x.key === key);
+    const at = holder && C.locateInGroup(holder, block.id);
+    let revealed = false;
+    if (at) {
+      if ((S.groupPages.get(key) || 1) < at.groupPages) { S.groupPages.set(key, at.groupPages); revealed = true; }
+      if (at.runKey) {
+        if (!S.openRuns.has(at.runKey)) { S.openRuns.add(at.runKey); revealed = true; }
+        if ((S.runPages.get(at.runKey) || 1) < at.runPages) { S.runPages.set(at.runKey, at.runPages); revealed = true; }
+      }
+    }
+    if (key || block.kind === "tool" || revealed) { S.r.forced.add(block.id); syncChat(); }
     // One more frame: a pending render may still replace the node.
     requestAnimationFrame(() => {
       const node = $("blocks").querySelector(`[data-bid="${block.id}"]`);
@@ -2881,8 +2898,9 @@ function buildTool(root, b) {
       refresh(b);
     }), "args:" + b.id));
   }
-  if (b.ui.args) add(body, textBox(JSON.stringify(b.args, null, 2), "txt out"));
+  if (b.ui.args) add(body, el("div", "label", "Arguments"), textBox(JSON.stringify(b.args, null, 2), "txt out args-box"));
   if (res) {
+    add(body, el("div", "label", "Output"));
     if (res.images && res.images.length) add(body, thumbRow(res.images, { tool: b.ran || b.name, args: b.args }));
     if (res.text === "") add(body, el("div", "dim", "(no output)"));
     else add(body, collapsible(b, "all", res.text, 24, { styled: true }));
@@ -2890,7 +2908,10 @@ function buildTool(root, b) {
     if (s.words || s.blob) {
       const note = el("div", "tnote" + (s.cut ? " cutline" : ""));
       add(note, document.createTextNode(s.words ? s.words + " " : ""));
-      if (s.blob) add(note, keyed(btn("open full output", "link", (e) => openViewer(s.blob, `Full output of ${b.ran || b.name}`, s.total, {}, e.currentTarget)), "full:" + b.id));
+      if (s.blob) add(note, keyed(btn("open full output", "link", (e) => {
+        const plan = C.viewerPlan(s);
+        openViewer(s.blob, `Full output of ${b.ran || b.name}`, s.total, { start: plan.start, seenRanges: plan.seenRanges }, e.currentTarget);
+      }), "full:" + b.id));
       add(body, note);
     }
   } else if (b.state === "missing") {
@@ -3001,7 +3022,7 @@ function newGroupEntry(it) {
   const head = el("button", "group-head");
   head.type = "button";
   head.dataset.focusKey = "group:" + it.key;
-  const entry = { group: true, node: root, head, label: null, body: null, members: new Map(), earlierRow: null, headSig: "", item: it, sig: "" };
+  const entry = { group: true, node: root, head, label: null, body: null, members: new Map(), sigs: new Map(), earlierRow: null, moreRow: null, headSig: "", item: it, sig: "" };
   head.addEventListener("click", () => toggleGroup(entry.item));
   add(root, head);
   return entry;
@@ -3014,7 +3035,7 @@ function updateGroup(entry, it, dirty) {
   const counts = GROUP_MARKS.map(([field]) => it[field] || 0);
   head.setAttribute("aria-expanded", String(it.open));
   head.title = it.open ? "Fold this work away; every call stays in the record." : "Show the calls in this work.";
-  const headSig = [it.toolCount, ...counts, it.partial || 0, it.missing, it.warnings, it.running, it.records, it.running ? "" : it.endTs].join("|");
+  const headSig = [it.toolCount, ...counts, it.partial || 0, it.missing, it.warnings, it.loop || 0, it.running, it.records, it.running ? "" : it.endTs].join("|");
   if (entry.headSig !== headSig) {
     entry.headSig = headSig;
     const label = el("span", "group-label");
@@ -3042,15 +3063,26 @@ function updateGroup(entry, it, dirty) {
       add(warn, icon("alert"), el("span", "group-mark-n", String(it.warnings)), el("span", "group-mark-w", it.warnings === 1 ? "warning" : "warnings"));
       marks.append(warn);
     }
+    if (it.loop) {
+      // The same call many times in a row: a warning, because a stuck model looks like a long, busy log.
+      const loop = el("span", "group-mark group-warn group-loop");
+      loop.title = `The same call was made ${it.loop} times in a row. The model may be stuck.`;
+      add(loop, icon("alert"), el("span", "group-mark-w", "loop"));
+      marks.append(loop);
+    }
     if (marks.childElementCount) head.append(marks);
   }
   if (!it.open) {
-    if (entry.body) { entry.body.remove(); entry.body = null; entry.members.clear(); entry.earlierRow = null; }
+    if (entry.body) { entry.body.remove(); entry.body = null; entry.members.clear(); entry.sigs.clear(); entry.earlierRow = null; entry.moreRow = null; }
     return;
   }
   if (!entry.body) { entry.body = el("div", "group-body"); node.append(entry.body); }
-  const keep = new Set(it.shown.map((b) => b.id));
-  for (const [id, member] of entry.members) if (!keep.has(id)) { member.remove(); entry.members.delete(id); }
+  // Only the first pages of rows exist as nodes: a log of thousands of calls stays a few hundred elements even with Expand all.
+  const rows = C.rowsOf(it);
+  const page = C.pageOf(rows, S.groupPages.get(it.key) || 1);
+  const rowKey = (row) => row.type === "run" ? row.key : String(row.block.id);
+  const keep = new Set(page.visible.map(rowKey));
+  for (const [key, member] of entry.members) if (!keep.has(key)) { member.remove(); entry.members.delete(key); entry.sigs.delete(key); }
   const order = [];
   if (it.earlier > 0) {
     if (!entry.earlierRow) {
@@ -3063,17 +3095,84 @@ function updateGroup(entry, it, dirty) {
     entry.earlierRow.remove();
     entry.earlierRow = null;
   }
-  for (const b of it.shown) {
-    let member = entry.members.get(b.id);
-    if (!member || dirty.has(b.id)) {
-      const built = buildBlock(b, { inGroup: true });
+  for (const row of page.visible) {
+    const key = rowKey(row);
+    let member = entry.members.get(key);
+    const sig = row.type === "run" ? runSig(row) : "";
+    const stale = row.type === "run"
+      ? entry.sigs.get(key) !== sig || (dirty.size > 0 && row.entries.some((e) => dirty.has(e.call.id)))
+      : dirty.has(row.block.id);
+    if (!member || stale) {
+      const built = row.type === "run" ? buildRun(row, it) : buildBlock(row.block, { inGroup: true });
       if (member && member.parentNode === entry.body) member.replaceWith(built);
       member = built;
-      entry.members.set(b.id, member);
+      entry.members.set(key, member);
+      entry.sigs.set(key, sig);
     }
     order.push(member);
   }
+  if (page.hidden) {
+    if (!entry.moreRow) {
+      entry.moreRow = btn("", "link group-more", () => { S.groupPages.set(it.key, (S.groupPages.get(it.key) || 1) + 1); syncChat(); });
+      entry.moreRow.dataset.focusKey = "more:" + it.key;
+    }
+    entry.moreRow.textContent = C.showMoreLabel(page);
+    order.push(entry.moreRow);
+  } else if (entry.moreRow) {
+    entry.moreRow.remove();
+    entry.moreRow = null;
+  }
   placeInOrder(entry.body, order);
+}
+
+/** What a run row looks like now: its length, whether it is open, how many calls it shows and how its last call stands. */
+function runSig(row) {
+  const last = row.last;
+  return [row.count, S.openRuns.has(row.key) ? "o" + (S.runPages.get(row.key) || 1) : "c", last.state, last.result ? last.result.status : "", last.result ? last.result.seq : ""].join("|");
+}
+
+/** A run of repeated identical calls: one row, "bash ls dir5 · same call ×40", opening to its calls a page at a time. */
+function buildRun(row, group) {
+  const open = S.openRuns.has(row.key);
+  const root = el("div", "block run-row");
+  root.dataset.run = row.key;
+  const t = C.toolRow(row.last);
+  const head = el("button", "thead run-head");
+  head.type = "button";
+  head.setAttribute("aria-expanded", String(open));
+  head.dataset.focusKey = "run:" + row.key;
+  head.title = open ? "Fold these calls away." : `Show the ${C.num(row.count)} calls.`;
+  const first = C.toolRow(row.first);
+  add(head, icon("chevron"), icon(first.icon), el("span", "name", first.name), el("span", "args", first.argsLine), el("span", "dim run-same", `same call ×${C.num(row.count)}`));
+  const chipEl = el("span", "run-chip");
+  add(chipEl, icon("alert"), document.createTextNode(`repeated ${C.num(row.count)}×`));
+  chipEl.title = `The same call, with the same arguments, ${C.num(row.count)} times in a row.`;
+  add(head, chipEl);
+  if (t.capsule) {
+    const cap = el("span", "capsule tone-" + t.capsule.tone);
+    add(cap, icon(t.capsule.icon), document.createTextNode(t.capsule.text));
+    cap.title = "The last call's result" + (t.words ? ": " + t.words : "");
+    add(head, cap);
+  }
+  head.addEventListener("click", () => {
+    if (open) S.openRuns.delete(row.key); else S.openRuns.add(row.key);
+    syncChat();
+  });
+  add(root, head);
+  if (!open) return root;
+  const body = el("div", "run-body");
+  const page = C.pageOf(row.entries, S.runPages.get(row.key) || 1);
+  for (const e of page.visible) {
+    for (const x of e.before) add(body, buildBlock(x, { inGroup: true }));
+    add(body, buildBlock(e.call, { inGroup: true }));
+  }
+  if (page.hidden) {
+    const more = btn(C.showMoreLabel(page), "link group-more", () => { S.runPages.set(row.key, (S.runPages.get(row.key) || 1) + 1); syncChat(); });
+    more.dataset.focusKey = "more:" + row.key;
+    add(body, more);
+  }
+  add(root, body);
+  return root;
 }
 
 /** Put `nodes` under `parent` in that order, moving only what is out of place. */
@@ -4737,7 +4836,8 @@ const viewerStatus = (text) => { $("viewer-error").textContent = text; };
 
 /**
  * Open the dialog on a stored output. `source` may carry where to start (`start`, `end`), the
- * cited lines (`citeStart`, `citeEnd`) and where the output came from (`session`, `call`, `tool`,
+ * cited lines (`citeStart`, `citeEnd`), the lines the model was shown (`seenRanges`, marked without changing the standing
+ * sentence's evidence wording) and where the output came from (`session`, `call`, `tool`,
  * `producer`). Focus goes to the lines themselves, so the keyboard scrolls them at once and Enter
  * is not sitting on Close. `opener` is the control that asked, which gets focus back on close; a
  * click does not focus a button in every browser, so callers pass it.
@@ -4755,9 +4855,7 @@ function openViewer(blob, title, total, source = {}, opener = document.activeEle
       document.createTextNode(" in "), producer, document.createTextNode((source.call ? " · call " + source.call : "") + " · snapshot "));
   } else provenance.append(document.createTextNode("Snapshot "));
   provenance.append(el("span", "mono", "out:" + blob));
-  $("viewer-standing").textContent = source.citeStart
-    ? "Opening this stored snapshot is an operator action. It does not change what the model has observed, and it does not verify the claim."
-    : "This is a stored output snapshot. Opening it here does not change what the model has observed.";
+  $("viewer-standing").textContent = C.viewerStanding(source);
   $("viewer-find").value = "";
   $("viewer-start").value = String(source.citeStart || Math.max(1, source.start || 1));
   if (!dialog.open) dialog.showModal();
@@ -4784,7 +4882,8 @@ function loadViewer(blob, total, source, { opener = null, target = null } = {}) 
 
 function sourceLine(v, number, text) {
   const cited = !!v.source.citeStart && number >= v.source.citeStart && number <= (v.source.citeEnd || v.source.citeStart);
-  const row = el("span", "source-line" + (cited ? " cited-line" : "") + (number === v.target ? " target-line" : ""));
+  const seen = !cited && C.lineInRanges(v.source.seenRanges, number);
+  const row = el("span", "source-line" + (cited ? " cited-line" : "") + (seen ? " seen" : "") + (number === v.target ? " target-line" : ""));
   row.dataset.line = String(number);
   return add(row, el("span", "line-number", String(number)), el("span", "line-text", text), document.createTextNode("\n"));
 }

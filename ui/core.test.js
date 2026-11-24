@@ -3853,3 +3853,118 @@ test("CTX_PARTS: a compaction segment replaces the re-weave brief and the stubs,
   assert.ok(oldLabels.includes("Re-weave brief") && oldLabels.some((l) => l.startsWith("Folded-out stubs")));
   assert.match(old.fold.text, /folds at/);
 });
+
+// ---------------------------------------------------------------------------------------------
+// Full output opens where the model looked; repeated calls collapse; Expand all stays bounded
+
+test("openAtLine: the first line the model saw past line 1, or the start of an omitted middle", () => {
+  assert.equal(C.openAtLine([], 100), 1);
+  assert.equal(C.openAtLine([[40, 60]], 100), 40);
+  assert.equal(C.openAtLine([[1, 20]], 100), 21);
+  assert.equal(C.openAtLine([[1, 20], [81, 100]], 100), 21);
+  assert.equal(C.openAtLine([[1, 100]], 100), 1);
+  assert.equal(C.openAtLine([[1, 20]], null), 1);
+  assert.equal(C.openAtLine([[1, 10], [11, 20]], 100), 21, "adjacent ranges merge");
+});
+
+test("viewerPlan marks the seen ranges only for a partial view", () => {
+  assert.deepEqual(C.viewerPlan({ ranges: [[1, 20], [81, 100]], total: 100, complete: false }), { start: 21, seenRanges: [[1, 20], [81, 100]] });
+  assert.deepEqual(C.viewerPlan({ ranges: [[1, 100]], total: 100, complete: true }), { start: 1, seenRanges: [] });
+  assert.deepEqual(C.viewerPlan({ ranges: [], total: 100 }), { start: 1, seenRanges: [] });
+  assert.deepEqual(C.viewerPlan(null), { start: 1, seenRanges: [] });
+});
+
+test("viewerStanding keeps the evidence wording for citations only, and names the marks", () => {
+  assert.doesNotMatch(C.viewerStanding({ seenRanges: [[1, 5]] }), /does not verify/);
+  assert.match(C.viewerStanding({ seenRanges: [[1, 5]] }), /Lines the model was shown are marked\./);
+  assert.match(C.viewerStanding({ citeStart: 3 }), /does not verify the claim/);
+  assert.doesNotMatch(C.viewerStanding({}), /marked/);
+  assert.equal(C.lineInRanges([[2, 4]], 4), true);
+  assert.equal(C.lineInRanges([[2, 4]], 5), false);
+  assert.equal(C.lineInRanges(undefined, 1), false);
+});
+
+test("shownOfTotal ranges drive the plan end to end", () => {
+  const v = C.shownOfTotal({ text: "x", cut: true, output: { id: "ab".repeat(32), bytes: 10, lines: 100 }, meta: { shown: [[1, 20], [81, 100]] } });
+  assert.deepEqual(C.viewerPlan(v), { start: 21, seenRanges: [[1, 20], [81, 100]] });
+});
+
+// A store of tool calls: `argsOf(i)` gives the arguments of call i; `statusOf(i)` its result status.
+function callsStore(n, argsOf, statusOf = () => "ok", name = "bash") {
+  reset();
+  const recs = [start()];
+  for (let i = 0; i < n; i++) {
+    recs.push(R("tool_call", { call_id: "c" + i, req_id: "r" + i, name, args: argsOf(i), class: "exec" }, undefined, "model"));
+    recs.push(R("tool_result", { call_id: "c" + i, name, status: statusOf(i), text: "out", class: "exec", meta: {}, duration_ms: 5 }, undefined, "tool"));
+  }
+  return storeOf(recs);
+}
+const groupsOf = (store, opts = {}) => C.chatItems(store.blocks, opts).filter((i) => i.type === "group");
+
+test("callSignature ignores key order and result status", () => {
+  const s = callsStore(2, (i) => (i ? { b: 1, a: { y: 2, x: 1 } } : { a: { x: 1, y: 2 }, b: 1 }), (i) => (i ? "error" : "ok"));
+  const [a, b] = s.blocks.filter((x) => x.kind === "tool");
+  assert.equal(C.callSignature(a), C.callSignature(b));
+  assert.notEqual(C.callSignature(a), C.callSignature({ ...a, name: "read", args: a.args }));
+});
+
+test("a run of 3 identical calls collapses, 2 do not; status may differ", () => {
+  const two = groupsOf(callsStore(2, () => ({ command: "ls" })))[0];
+  assert.deepEqual(C.rowsOf(two).map((r) => r.type), ["block", "block"]);
+  const three = groupsOf(callsStore(3, () => ({ command: "ls" }), (i) => (i === 1 ? "error" : "ok")))[0];
+  const rows = C.rowsOf(three);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].type, "run");
+  assert.equal(rows[0].count, 3);
+  assert.equal(three.loop, 0);
+});
+
+test("a run is cut by a different call; runs of 10 or more flag the group as a loop", () => {
+  const g = groupsOf(callsStore(25, (i) => ({ command: i === 12 ? "pwd" : "ls" })))[0];
+  assert.deepEqual(C.rowsOf(g).map((r) => (r.type === "run" ? r.count : 1)), [12, 1, 12]);
+  assert.equal(g.loop, 12);
+  assert.equal(groupsOf(callsStore(9, () => ({ command: "ls" })))[0].loop, 0);
+  assert.equal(groupsOf(callsStore(10, () => ({ command: "ls" })))[0].loop, 10);
+});
+
+test("pageOf and showMoreLabel", () => {
+  const list = Array.from({ length: 120 }, (_, i) => i);
+  const p1 = C.pageOf(list);
+  assert.equal(p1.visible.length, 50);
+  assert.equal(C.showMoreLabel(p1), "Show 50 more (70 hidden)");
+  const p3 = C.pageOf(list, 3);
+  assert.equal(p3.visible.length, 120);
+  assert.equal(p3.hidden, 0);
+  assert.equal(C.pageOf(list, 2).more, 20);
+});
+
+test("locateInGroup finds the page of a record, inside a run too", () => {
+  const s = callsStore(130, (i) => ({ command: "ls dir" + i }));
+  const g = groupsOf(s)[0];
+  const tools = g.shown.filter((b) => b.kind === "tool");
+  assert.equal(C.locateInGroup(g, tools[0].id).groupPages, 1);
+  assert.equal(C.locateInGroup(g, tools[120].id).groupPages, 3);
+  const loop = groupsOf(callsStore(120, () => ({ command: "cargo build" })))[0];
+  const calls = loop.shown.filter((b) => b.kind === "tool");
+  const at = C.locateInGroup(loop, calls[110].id);
+  assert.equal(at.groupPages, 1);
+  assert.equal(at.runPages, 3);
+  assert.ok(at.runKey);
+  assert.equal(C.locateInGroup(loop, -5), null);
+});
+
+test("Expand all on a 5,000-record store renders a bounded number of member rows", () => {
+  const s = callsStore(2500, (i) => ({ command: "ls dir" + i }));
+  const items = C.chatItems(s.blocks, { expandAll: true });
+  const g = items.filter((i) => i.type === "group");
+  assert.ok(g.length >= 1 && g.every((x) => x.open));
+  assert.ok(g.reduce((a, x) => a + x.toolCount, 0) >= 2500);
+  assert.ok(C.renderedRowCount(items) <= g.length * 51, "one page of rows and one button per group");
+  assert.ok(C.renderedRowCount(items) < 200);
+  // The same for a log that is one long loop, even with its run open.
+  const loop = C.chatItems(callsStore(2500, () => ({ command: "cargo build" })).blocks, { expandAll: true });
+  const lg = loop.find((i) => i.type === "group");
+  assert.equal(C.rowsOf(lg).length, 1);
+  assert.equal(C.renderedRowCount(loop, { openRuns: new Set(C.rowsOf(lg).map((r) => r.key)) }), 1 + 50 + 1);
+  assert.equal(lg.loop, 2500);
+});

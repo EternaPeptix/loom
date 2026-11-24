@@ -123,9 +123,10 @@ sessions.push(
   session("s-notify", "Nightly dependency sweep", { phase: "running", profile: "qwen", workspace: "/fixture/docs", step: 12, completion: 9000, age: 40 * MIN }),
   session("s-tools", "Tool result shapes", { phase: "idle", last_end: "waiting", profile: "dsv41", workspace: "/fixture/loom", step: 9, completion: 6000, age: 90 * MIN }),
   session("s-compacted", "Long-running mission (two compactions)", { phase: "idle", last_end: "waiting", profile: "dsv41", workspace: "/fixture/loom", step: 17, completion: 120000, prompt: 61000, cached: 52000, age: 30 * 3600000 }),
+  session("s-loop", "Stuck build (60 identical calls)", { phase: "idle", last_end: "waiting", profile: "dsv41", workspace: "/fixture/loom", step: 64, completion: 40000, prompt: 90000, cached: 85000, age: 3 * 3600000 }),
   session("s-big", "Long investigation (5,000 records)", { phase: "idle", last_end: "waiting", profile: "dsv41", workspace: "/fixture/loom", step: 1250, completion: 900000, prompt: 300000, cached: 280000, age: 6 * 3600000 }),
 );
-for (const id of ["s-parked", "s-quiet", "s-notify", "s-tools", "s-big", "s-compacted", "s-result"]) custom.add(id);
+for (const id of ["s-parked", "s-quiet", "s-notify", "s-tools", "s-loop", "s-big", "s-compacted", "s-result"]) custom.add(id);
 let inbox = [
   { session: "s-audit", mission: "m-audit", title: "Audit harness reliability", opened_ms: now - 240000, item: { item_id: "i-scope", item_kind: "question", text: "Include the desktop app in this audit?", options: ["Include desktop", "Runtime only"], blocking: true, call_id: "question", reference: "q1" } },
   { session: "s-result", mission: "m-s-result", title: "Dependency review", opened_ms: now - 600000, item: { item_id: "i-result", item_kind: "finished", text: "The review is ready to read.", options: [], blocking: false, call_id: "finish" } },
@@ -282,6 +283,18 @@ append("s-fl-net", "inbox_opened", { ts_ms: now - 9 * MIN, ...inbox.find(e => e.
   t = step("s-tools", t, { command: "make test", status: "error", out: "make: *** [test] Error 1", exit: 1 });
   append("s-tools", "turn_end", { ts_ms: t + 1000, reason: "waiting" }, "harness");
 }
+// s-loop: a stuck model. Two different calls, then 60 identical failing `cargo build` calls, then a short run of 3 and a pair.
+{
+  const id = "s-loop"; const t0 = now - 3 * 3600000; let t = t0 + 2 * MIN;
+  startOf(sessionOf(id), t0, "Make the workspace build.");
+  t = step(id, t, { text: "Checking the tree first.", command: "ls", out: "Cargo.toml\ncrates", exit: 0 });
+  t = step(id, t, { command: "cat Cargo.toml", out: "[workspace]\nmembers = [\"crates/*\"]", exit: 0 });
+  const fail = "error[E0432]: unresolved import `loom_core::Missing`\n --> crates/loom-agent/src/lib.rs:3:5\nerror: could not compile `loom-agent` (lib) due to 1 previous error";
+  for (let i = 0; i < 60; i++) t = step(id, t, { command: "cargo build", status: "error", out: fail, exit: 101, ms: 900 });
+  for (let i = 0; i < 3; i++) t = step(id, t, { command: "cargo check", out: "Finished dev profile", exit: 0 });
+  for (let i = 0; i < 2; i++) t = step(id, t, { command: "cargo fmt --check", out: "", exit: 0 });
+  append(id, "turn_end", { ts_ms: t + 1000, reason: "waiting" }, "harness");
+}
 // s-big: 5,000 records (1,250 steps of request, response, call, result) with known needles for Find.
 {
   const id = "s-big"; const t0 = now - 6 * 3600000;
@@ -303,7 +316,7 @@ append("s-fl-net", "inbox_opened", { ts_ms: now - 9 * MIN, ...inbox.find(e => e.
     append(id, "model_request", { ts_ms: t, req_id, step: i + 1, epoch: 1, purpose: "step", est_tokens: 300000 }, "harness");
     append(id, "model_response", { ts_ms: t + 3000, req_id, text, reasoning: "", tool_calls: [{ call_id, name: "bash", arguments: JSON.stringify({ command: `ls dir${i}` }), complete: true }], finish: "tool_calls", usage: { prompt_tokens: 300000, cached_tokens: 280000, completion_tokens: 40 }, timing: { ttft_ms: 400, total_ms: 3000 }, attempts: 1 }, "model");
     append(id, "tool_call", { ts_ms: t + 3100, call_id, req_id, name: "bash", args: { command: `ls dir${i}` }, class: "exec" }, "model");
-    append(id, "tool_result", { ts_ms: t + 3300, call_id, name: "bash", status: "ok", text: out, ...(cut ? { output: { id: blob, bytes: 128000, lines: 5000 } } : {}), cut, class: "exec", meta: { exit_code: 0 }, duration_ms: 200 }, "tool");
+    append(id, "tool_result", { ts_ms: t + 3300, call_id, name: "bash", status: "ok", text: out, ...(cut ? { output: { id: blob, bytes: 128000, lines: 5000 } } : {}), cut, class: "exec", meta: { exit_code: 0, ...(cut ? { shown: [[1, 40]] } : {}) }, duration_ms: 200 }, "tool");
   }
   append(id, "turn_end", { ts_ms: t0 + 10000 + 1250 * 15000, reason: "waiting" }, "harness");
 }
