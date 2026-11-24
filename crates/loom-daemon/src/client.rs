@@ -63,9 +63,9 @@
 //! and the client prints `unverified_warning` to stderr, once. `Client::new` alone does not ask.
 
 use crate::wire::{
-    AnswerBody, ApprovalBody, ArchiveBody, CreatedSession, DaemonFile, ErrorBody, GcBody, LinesView, MessageBody,
-    MessageWhen, ModelBody, ModelsView, RecordsPage, ReleaseBody, RenameBody, RoleModelBody, RuleBody, ScopeBody,
-    ScopeReceipt, SessionDetail, StatusView, UploadView, WithdrawBody,
+    AnswerBody, ApprovalBody, ArchiveBody, CreatedSession, DaemonFile, ErrorBody, GcBody, LinesView, McpCheckBody,
+    McpCheckView, McpServerView, MessageBody, MessageWhen, ModelBody, ModelsView, RecordsPage, ReleaseBody, RenameBody,
+    RoleModelBody, RuleBody, ScopeBody, ScopeReceipt, SessionDetail, StatusView, UploadView, WithdrawBody,
 };
 use loom_agent::runtime::{
     BusEvent, InboxEntry, LedgerView, MissionInfo, MissionModels, ModelSwitchReceipt, ModelsReload, NetEntry,
@@ -257,6 +257,9 @@ fn segment(text: &str) -> String {
     }
     out
 }
+
+/// A server's start, its listing and its close, over the network if it is a remote one.
+const MCP_CHECK_TIMEOUT: Duration = Duration::from_secs(180);
 
 impl Client {
     pub fn new(base: &str, token: &str) -> Client {
@@ -585,6 +588,26 @@ impl Client {
     /// Read `[models]` from the configuration file again (`loom models reload`).
     pub async fn reload_models(&self) -> Result<ModelsReload, String> {
         self.call(Method::POST, "/api/models/reload", &[], None).await
+    }
+
+    /// The MCP servers of a session, with the state of each connection.
+    pub async fn mcp_servers(&self, id: &SessionId) -> Result<Vec<McpServerView>, String> {
+        self.call(Method::GET, &format!("/api/sessions/{}/mcp", segment(id.as_str())), &[], None).await
+    }
+
+    /// Start a configured server in a scratch sandbox for `workspace`, list its tools, close it
+    /// (`loom mcp check`). It may start a program, so it waits longer than an ordinary request.
+    pub async fn mcp_check(&self, server: &str, workspace: &str) -> Result<McpCheckView, String> {
+        let body = serde_json::to_value(McpCheckBody { workspace: workspace.to_string() })
+            .map_err(|e| format!("The request cannot be encoded ({e})."))?;
+        self.call_with_timeout(
+            Method::POST,
+            &format!("/api/mcp/{}/check", segment(server)),
+            &[],
+            Some(body),
+            MCP_CHECK_TIMEOUT,
+        )
+        .await
     }
 
     /// The models of a mission (`loom models show`).

@@ -259,11 +259,33 @@ pub enum Command {
         #[command(subcommand)]
         action: ModelsAction,
     },
+    /// MCP servers: the configured ones, and a start-and-list check of one
+    Mcp {
+        #[command(subcommand)]
+        action: McpAction,
+    },
     /// Run the daemon as a login service (macOS)
     Service {
         #[command(subcommand)]
         action: ServiceAction,
     },
+}
+
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum McpAction {
+    /// The configured servers with their transport and roles (read from the configuration file)
+    List,
+    /// Start a configured server in a scratch sandbox, list its tools and close it
+    Check(McpCheckArgs),
+}
+
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct McpCheckArgs {
+    /// The server's name in [mcp.servers]
+    pub server: String,
+    /// The workspace to run it for (default: the current directory)
+    #[arg(long)]
+    pub workspace: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -1247,6 +1269,7 @@ async fn dispatch(command: Command) -> Result<i32, String> {
         Command::Down => cmd_down(&paths).await,
         Command::Config { action } => cmd_config(&paths, action),
         Command::Models { action } => cmd_models(&paths, action).await,
+        Command::Mcp { action } => cmd_mcp(&paths, action).await,
         Command::Service { action } => cmd_service(&paths, action),
         Command::Status => {
             let view = client_of(&paths)?.status().await?;
@@ -1649,6 +1672,32 @@ that recalls them, or drop --prior to continue this one."
     }
 }
 
+async fn cmd_mcp(paths: &Paths, action: McpAction) -> Result<i32, String> {
+    match action {
+        McpAction::List => {
+            let file = paths.config_file();
+            let cfg = Config::load(&file).map_err(|e| format!("{}: {e}", file.display()))?;
+            block(&render::mcp_list(&loom_agent::mcp::configured(&cfg.mcp))).map(|()| 0)
+        }
+        McpAction::Check(a) => {
+            let c = client_of(paths)?;
+            let ws = match a.workspace {
+                Some(w) => w,
+                None => std::env::current_dir()
+                    .map_err(|e| format!("Cannot find the current directory ({e}). Pass --workspace."))?,
+            };
+            let ws = if ws.to_str().is_some_and(|w| w == "~" || w.starts_with("~/")) {
+                ws
+            } else {
+                std::path::absolute(&ws).unwrap_or(ws)
+            };
+            let view = c.mcp_check(&a.server, &ws.display().to_string()).await?;
+            block(&render::mcp_check(&view))?;
+            Ok(if view.error.is_some() { 1 } else { 0 })
+        }
+    }
+}
+
 async fn cmd_models(paths: &Paths, action: ModelsAction) -> Result<i32, String> {
     let c = client_of(paths)?;
     match action {
@@ -2006,6 +2055,13 @@ mod tests {
         rejected(&["config"]);
         rejected(&["config", "edit"]);
         rejected(&["service"]);
+        assert!(matches!(ok(&["mcp", "list"]), Command::Mcp { action: McpAction::List }));
+        let Command::Mcp { action: McpAction::Check(a) } = ok(&["mcp", "check", "github", "--workspace", "/w"]) else {
+            panic!("not mcp check")
+        };
+        assert_eq!((a.server.as_str(), a.workspace), ("github", Some(PathBuf::from("/w"))));
+        rejected(&["mcp"]);
+        rejected(&["mcp", "check"]);
         assert!(matches!(ok(&["models", "list"]), Command::Models { action: ModelsAction::List }));
         assert!(matches!(ok(&["models", "reload"]), Command::Models { action: ModelsAction::Reload }));
         let Command::Models { action: ModelsAction::Set(a) } = ok(&["models", "set", "last", "big"]) else {

@@ -68,6 +68,8 @@
 //! | `GET /models` | `runtime.default_model()`, `runtime.health()` | `ModelsView` |
 //! | `POST /models/reload` | `runtime.reload_models` (no body) | `ModelsReload` |
 //! | `GET /sessions/{id}/window` | `runtime.window` | `WindowView` |
+//! | `GET /sessions/{id}/mcp` | `runtime.mcp_views` | `[McpServerView]` |
+//! | `POST /mcp/{server}/check` (`McpCheckBody`) | `runtime.mcp_check` | `McpCheckView` |
 //! | `GET /sessions/{id}/net?limit={n}` | `runtime.net` (default 200, at most 2000) | `[NetEntry]` |
 //! | `GET /missions` | `runtime.missions` | `[MissionInfo]` |
 //! | `GET /missions/{id}/ledger` | `runtime.ledger` | `LedgerView` |
@@ -144,8 +146,8 @@ use crate::fsview;
 use crate::ui;
 use crate::wire::{
     AnswerBody, ApprovalBody, ArchiveBody, CreatedSession, DirsView, DiskSpace, ErrorBody, FileLinesView, FilesView,
-    GcBody, LinesView, MessageBody, MessageWhen, ModelBody, ModelsView, QueuedEditBody, QueuedReceipt, ReleaseBody,
-    RenameBody, RoleModelBody, RuleBody, ScopeBody, SessionDetail, StatusView, UploadView, WithdrawBody,
+    GcBody, LinesView, McpCheckBody, MessageBody, MessageWhen, ModelBody, ModelsView, QueuedEditBody, QueuedReceipt,
+    ReleaseBody, RenameBody, RoleModelBody, RuleBody, ScopeBody, SessionDetail, StatusView, UploadView, WithdrawBody,
 };
 use axum::body::{Body, Bytes};
 use axum::extract::rejection::BytesRejection;
@@ -240,6 +242,8 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/models", get(models))
         .route("/api/models/reload", post(reload_models))
         .route("/api/sessions/{id}/window", get(window))
+        .route("/api/sessions/{id}/mcp", get(mcp_servers))
+        .route("/api/mcp/{server}/check", post(mcp_check))
         .route("/api/sessions/{id}/net", get(net))
         .route("/api/missions", get(missions))
         .route("/api/missions/{id}/ledger", get(ledger))
@@ -879,6 +883,21 @@ async fn window(State(s): State<ApiState>, Path(id): Path<String>) -> Res<Respon
     Ok(Json(view).into_response())
 }
 
+async fn mcp_servers(State(s): State<ApiState>, Path(id): Path<String>) -> Res<Response> {
+    let runtime = s.runtime.clone();
+    let views = blocking(move || runtime.mcp_views(&SessionId::from(id)).map_err(rt_err)).await?;
+    Ok(Json(views).into_response())
+}
+
+async fn mcp_check(State(s): State<ApiState>, Path(server): Path<String>, body: Bytes) -> Res<Response> {
+    let body: McpCheckBody = json_body(&body)?;
+    if !(body.workspace.starts_with('/') || body.workspace.starts_with('~')) {
+        return Err(ApiError::bad_body(format!("workspace must be an absolute path, not \"{}\".", body.workspace)));
+    }
+    let view = s.runtime.mcp_check(&server, std::path::Path::new(&body.workspace)).await.map_err(rt_err)?;
+    Ok(Json(view).into_response())
+}
+
 async fn net(State(s): State<ApiState>, Path(id): Path<String>, q: RawQuery) -> Res<Response> {
     let limit = clamp_limit(number(&params(q)?, "limit")?, NET_DEFAULT, NET_MAX);
     let entries = s.runtime.net(&SessionId::from(id), limit).map_err(rt_err)?;
@@ -1358,6 +1377,10 @@ mod tests {
     }
 
     async fn env(script: Script) -> Env {
+        env_cfg(script, |_| {}).await
+    }
+
+    async fn env_cfg(script: Script, tweak: impl FnOnce(&mut Config)) -> Env {
         let dir = tempfile::tempdir().unwrap();
         let ws = dir.path().join("ws");
         std::fs::create_dir_all(&ws).unwrap();
@@ -1381,6 +1404,7 @@ mod tests {
         config.network.mode = NetworkMode::DenyAll;
         config.agents.verify_finish = false;
         config.tools.kill_grace_s = 1;
+        tweak(&mut config);
         let paths = Paths::at(dir.path().join("home"));
         plain_core_pack(&paths.packs_dir());
         let rt = Runtime::start(config, paths).await.unwrap();
@@ -3375,6 +3399,81 @@ mod tests {
         let deltas: Vec<&str> =
             events.iter().filter(|v| v["type"] == "delta").filter_map(|v| v["delta"]["text"].as_str()).collect();
         assert_eq!(deltas, vec!["fresh"]);
+        e.rt.shutdown().await;
+    }
+
+    /// A `/bin/sh` MCP server: answers by the id it reads, so the script needs no state.
+    fn fake_mcp(dir: &std::path::Path) -> String {
+        let path = dir.join("fake-mcp.sh");
+        std::fs::write(
+            &path,
+            r#"while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"fake","version":"1.0"}}}\n' "$id";;
+    *'"method":"tools/list"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","description":"Echo.","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":true}}]}}\n' "$id";;
+    *'"method":"tools/call"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"pong"}]}}\n' "$id";;
+  esac
+done
+"#,
+        )
+        .unwrap();
+        path.display().to_string()
+    }
+
+    fn mcp_cfg(script: String) -> impl FnOnce(&mut Config) {
+        move |c| {
+            let s =
+                loom_core::config::McpServerCfg { command: Some(vec!["/bin/sh".into(), script]), ..Default::default() };
+            c.mcp.servers.insert("fake".into(), s);
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_routes_without_servers_are_empty_and_refuse_unknown_ones() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let id = e.create("go").await;
+        let (s, b) = e.get(&format!("/api/sessions/{id}/mcp")).await;
+        assert_eq!((s, b), (200, json!([])));
+        let (s, b) = e.get("/api/sessions/s-nope/mcp").await;
+        assert_eq!((s, b["error"].as_str().unwrap()), (404, "There is no session s-nope."));
+        let (s, b) = e.post("/api/mcp/nope/check", json!({"workspace": e.ws})).await;
+        assert_eq!(s, 404, "{b}");
+        assert_eq!(b["error"], "There is no MCP server \"nope\" in the configuration.");
+        let (s, _) = e.post("/api/mcp/nope/check", json!({})).await;
+        assert_eq!(s, 400);
+        let (s, _) = e.post("/api/mcp/nope/check", json!({"workspace": "relative"})).await;
+        assert_eq!(s, 400);
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs CONTRACTS-MCP M2 (merged separately)"]
+    async fn mcp_session_route_lists_the_servers_of_a_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = fake_mcp(tmp.path());
+        let e = env_cfg(Script::new(|_, _| finish("ok")), mcp_cfg(script)).await;
+        let id = e.create("go").await;
+        let (s, b) = e.get(&format!("/api/sessions/{id}/mcp")).await;
+        assert_eq!(s, 200, "{b}");
+        assert_eq!(b[0]["server"], "fake");
+        assert_eq!(b[0]["transport"], "stdio");
+        assert_eq!(b[0]["tools"], json!(["mcp__fake__echo"]));
+        assert!(b[0]["error"].is_null());
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs CONTRACTS-MCP M2 (merged separately)"]
+    async fn mcp_check_route_lists_the_tools_of_a_server() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = fake_mcp(tmp.path());
+        let e = env_cfg(Script::new(|_, _| finish("ok")), mcp_cfg(script)).await;
+        let (s, b) = e.post("/api/mcp/fake/check", json!({"workspace": e.ws})).await;
+        assert_eq!(s, 200, "{b}");
+        assert_eq!(b["server_name"], "fake");
+        assert_eq!(b["tools"][0]["name"], "echo");
+        assert_eq!(b["tools"][0]["read_only_hint"], true);
         e.rt.shutdown().await;
     }
 }
