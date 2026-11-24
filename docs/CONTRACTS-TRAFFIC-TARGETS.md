@@ -235,8 +235,11 @@ connection is allowed and before forwarding upstream:
   the request already sets** by that name (the request wins);
 - sets each matching `header` item **only if the request does not already send that header** (the
   request wins).
-A request to any other host is forwarded untouched. The agent names the profile; it never reads the
-values, and no tool, record, prompt or UI shows them (S5).
+A request to any other host is forwarded untouched. An opaque CONNECT tunnel (a mission without interception,
+or a host on a passthrough list) carries nothing: the proxy never sees its requests, so a command's HTTPS
+reaches the target with profile items only in an intercepting mission (the in-process tools inject themselves
+either way, S8). The agent names the profile; it never reads the values, and no tool, record, prompt or UI
+shows them (S5).
 
 S4. **Encryption at rest, unattended.** A daemon key at `~/.loom/keys/creds.key` (32 random bytes,
 file `0600`, created on first need exactly like the access token and journal key; dir `0700`). Each
@@ -314,9 +317,11 @@ last session closes. Each session with `creds` gets, right after its grant: `Pro
 `SessionTools::tool_proxy` = `SessionGrant::tool_url()` (S9). A session restored after a restart fills the
 entry the same way; a profile that is gone or no longer opens leaves the mission without items (a
 `tracing::warn`, the restore goes on). The lead's network section of the system prompt (`network_with_target`)
-gains one line when `creds` is set: `Credential profile {summary line} is attached to your requests to those
-hosts (commands through the proxy, http_send, web_fetch); you never see its values, and a cookie or header your
-request sends itself overrides it.` A secret value never reaches `meta.json`, a record, the prompt or an API
+gains one line when `creds` is set. In an intercepting mission: `Credential profile {summary line} is attached
+to your requests to those hosts (commands through the proxy, http_send, web_fetch); you never see its values,
+and a cookie or header your request sends itself overrides it.` Without interception the parenthesis is
+`(http_send, web_fetch, and plain-HTTP requests from commands; a command's HTTPS goes through an opaque tunnel
+and carries nothing)`. A secret value never reaches `meta.json`, a record, the prompt or an API
 answer.
 ## U. UI (`ui/`, fixture)
 
