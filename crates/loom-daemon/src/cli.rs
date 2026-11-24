@@ -3129,14 +3129,14 @@ mod tests {
             cmd_config(&paths, ConfigAction::Init).unwrap_err(),
             format!("{} already exists.", paths.config_file().display())
         );
-        // `check` runs the start-up checks, so the default sandbox (seatbelt) passes only where `up` would
-        // accept it; on any other host it is refused with the sentence `up` gives. Past them, the generated file
-        // does not choose "not LLM-reviewed" for the operator: the check asks.
+        // `check` runs the start-up checks first, so it fails where `up` would: the generated file leaves the
+        // sandbox at this OS's default, and a host that cannot run it is refused with the sentence `up` gives.
+        // Past them, the generated file does not choose "not LLM-reviewed" for the operator: the check asks.
         let err = cmd_config(&paths, ConfigAction::Check).unwrap_err();
-        if cfg!(target_os = "macos") {
-            assert!(err.starts_with("The model policy is not settled (2 to fix)"), "{err}");
-        } else {
-            assert!(err.contains("seatbelt") && err.contains("not macOS"), "{err}");
+        let generated = Config::load(&paths.config_file()).unwrap();
+        match loom_tools::sandbox::preflight(&generated.sandbox) {
+            Ok(()) => assert!(err.starts_with("The model policy is not settled (2 to fix)"), "{err}"),
+            Err(refusal) => assert_eq!(err, refusal),
         }
         std::fs::write(paths.config_file(), "default_model = [").unwrap();
         assert!(cmd_config(&paths, ConfigAction::Check).unwrap_err().contains("config.toml"));
