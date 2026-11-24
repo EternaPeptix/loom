@@ -19,21 +19,29 @@
 //!   as a path operand, not as a search pattern; a granted host covers the sink it carries by its full name); a path is
 //!   a *write* only where the command writes it (a `>` or `>>` target other than `/dev/null` and fd duplications, `tee`
 //!   operands, the destination of `cp`, `mv`, `ln` and `install`, `sed -i` files, `touch` and `truncate` operands,
-//!   `dd of=`); `$TMPDIR`, `${TMPDIR}`, `$PWD` and bare relative paths resolve to the session's TMPDIR and the
-//!   workspace; the session's own TMPDIR and session paths are stripped after the path is canonical. The `check` of
+//!   `dd of=`); `$TMPDIR` and `${TMPDIR}` resolve to the session's TMPDIR; `$PWD` and bare relative paths in a `bash`
+//!   command resolve to its `cwd` argument, else to the directory the last `bash` result left the shell in (meta
+//!   `cwd`: `cd` persists between calls; `set_shell_dir` gives it back after a restart), else to the workspace, and a
+//!   file tool's to the workspace; the session's own TMPDIR and session paths are stripped after the path is
+//!   canonical; the workspace's `.loom/uploads` (the operator's attachments) is never the loom home. The `check` of
 //!   `attempt`, which the harness runs as a command, is read as a command though the tool is a `State` tool; every
 //!   other prose field (`State` and
 //!   `Terminal` tools: `finish`, `claim`, `report_blocker`, ledger tools, `agent_message`) are ignored except by
 //!   TW-03, TW-17, TW-24 and TW-26 (all prose), TW-06 (ledger prose, and credentials in any argument) and TW-19
 //!   (evidence quotes); `[lab]` grants and restricted-network packs relax C7 and C8 only; loopback and link-local are
-//!   never implicitly lab; hosts the operator granted or the configuration allows are never C1; every text is
+//!   never implicitly lab; hosts the operator granted or the configuration allows are never C1 (`authorized` is
+//!   `Authorization::authorizes`: grants, `allow`, the mission target's scope less its exclusions, the pack's MCP
+//!   hosts); every text is
 //!   `patterns::scan_form`ed (zero-width removed, runs of 8 bytes or more decoded) before it is matched. A hit's
 //!   `detail` and `key` carry no control character and no bidirectional or zero-width mark (an agent chose them).
 //! - TW-21 counts as in flight: an open call, an unsettled job, an interval a result reports (a result with no call on
 //!   the books, after a restart, is an interval of its own `duration_ms`) and every PTY opened and not closed (a
 //!   program left running in one). A session freed for being quiet keeps its calls, jobs and PTYs. A session that was
 //!   read before a restart is not judged for TW-21 until `blind_until` (the core sets it to the start plus
-//!   `RESTART_BLIND_MS`). TW-06's index (`log::SecretIndex`) holds, per hashed value, the missions whose own results
+//!   `RESTART_BLIND_MS`). Nor are a session's decisions before its `session_start` (`started_at`: a lead's MCP servers
+//!   are listed through its proxy before it), nor decisions toward its mission's MCP hosts while its last turn has not
+//!   ended finished or stopped (a server's own traffic; the session closes its MCP connections at such an end).
+//!   A session freed for being quiet keeps its start, its shell directory and its `blind_until`. TW-06's index (`log::SecretIndex`) holds, per hashed value, the missions whose own results
 //!   showed it; a use flags only a mission that never saw the value itself; one mission's flood evicts only its own
 //!   tags, and new tags are handed to the core to persist (`take_new_secrets`) and come back with `restore_secrets`.
 //! - What each tripwire reads, and where M2 stops (the rest is named in `docs/MONITOR.md` §9.5 or is a later phase):
@@ -55,7 +63,8 @@
 //!   of an ended session (`census`); TW-21 a net decision for a session with nothing in flight (2 s grace); TW-22
 //!   side-channel commands and long or high-entropy DNS labels; TW-23 a child's mandatory asset or one off scope;
 //!   TW-24 the canaries the core was given (`set_canaries`; M10 makes them) and the floor's decoy events; TW-25 a
-//!   run of another script in a session whose baseline has none; TW-26 build and open-run files; TW-27 harness markers in
+//!   run of another script in a session whose baseline has none; TW-26 build and open-run files (with `AGENTS.md` and
+//!   `CLAUDE.md`, which later sessions on the workspace read as instructions); TW-27 harness markers in
 //!   output; TW-28 irreversible-effect shapes in arguments (scripts are the gate's, M8).
 //! - Not built in M2, so none of these can be a hit: provenance of a credential toward its asset (G2, M8); the
 //!   `harness_test` flag (M4); the S3 of TW-17 beside a gated call (M8); a re-finish in a reopened turn (M9); gzip runs
@@ -63,11 +72,24 @@
 //!
 //! A call is read as sent and as run: the paths, URLs and content that the executor's adaptation of a call adds (an
 //! aliased tool or argument name, a Codex `apply_patch` split into one call per file, a fetch's `url` taken from its
-//! `prompt`: `loom_tools::dialect::adapt`, then `schema::normalize_for_tool`) count like those sent.
+//! `prompt`: `loom_tools::dialect::adapt` against every tool loom has, then `schema::normalize_for_tool`) count like
+//! those sent, and the call is judged as the tool that runs and by that tool's class (`CallView::of`): a name in
+//! another case or with `-` for `_` is the tool it folds to (TW-03, TW-18, TW-19 and `attempt`'s check match it), `shell`
+//! with an `apply_patch` argv writes, an editor's `view` reads; the recorded class stands where loom does not know the
+//! tool's. A `bash` `description` is prose, not command text, and TW-16's early `sleep` reads the command the call runs.
+//! An MCP tool's arguments are not a command line: only `command`, `cmd`, `script` and `shell_command` are; its text
+//! arguments are content; a tool whose name says it writes (`MCP_WRITES`) writes the paths it names.
 //!
 //! Tests required (M2): a positive and a negative fixture per tripwire; every matching rule of §6.1 with a fixture (own
 //! TMPDIR stripped, prose ignored, `/.git/config` in a URL to a target not matched, decoded base64 matched); the
-//! relaxed uptier and the reasoning cap order; the idle-egress grace; no hit from a session's own directory.
+//! relaxed uptier and the reasoning cap order; the idle-egress grace; no hit from a session's own directory. After the
+//! merge of main (604e342): `a_name_in_another_case_or_with_dashes_is_read_as_the_tool_it_runs`,
+//! `a_write_is_judged_by_the_tool_that_runs_not_the_alias_it_was_sent_under`,
+//! `relative_paths_of_a_bash_command_start_where_the_shell_was_left`, `a_missions_target_scope_and_mcp_hosts_are_authorized`,
+//! `mcp_server_traffic_and_what_comes_before_the_session_start_are_not_idle_egress`, `workspace_instructions_are_build_files`,
+//! `an_early_sleep_is_found_beside_a_description_and_a_timeout`,
+//! `an_mcp_tools_arguments_are_not_a_command_line_and_a_writing_tool_writes`,
+//! `an_upload_in_a_workspace_whose_loom_directory_is_the_home_is_not_the_home`.
 
 #![allow(clippy::too_many_arguments)]
 
@@ -123,6 +145,9 @@ pub struct Env {
     pub packs: BTreeMap<String, PackFacts>,
     /// The profiles of the configuration whose alignment resolves to relaxed (`lineage::resolve`).
     pub relaxed_profiles: BTreeSet<String>,
+    /// Per pack, the hosts its MCP servers add to its sessions (each server's `hosts` and the host of its `url`, for the
+    /// servers some role of the pack gets: what a lead connects to, CONTRACTS-MCP M4, M6).
+    pub mcp_hosts: BTreeMap<String, Vec<String>>,
 }
 
 impl std::fmt::Debug for Env {
@@ -161,6 +186,16 @@ impl Env {
             .ok()
             .and_then(|v| v.as_str().map(str::to_string))
             .unwrap_or_default();
+        let mcp_hosts = packs
+            .names()
+            .into_iter()
+            .filter_map(|n| {
+                let p = packs.get(&n)?;
+                let roles: Vec<(&str, bool)> = p.roles.values().map(|r| (r.name.as_str(), r.read_only)).collect();
+                let hosts = mcp_hosts_of(&config.mcp, &crate::mcp::pack_servers(&config.mcp, &roles));
+                (!hosts.is_empty()).then_some((n, hosts))
+            })
+            .collect();
         Env {
             home: canon(&paths.home),
             copies: {
@@ -178,6 +213,7 @@ impl Env {
             deny: config.network.deny.clone(),
             packs: facts,
             relaxed_profiles,
+            mcp_hosts,
         }
     }
 
@@ -185,6 +221,25 @@ impl Env {
     pub fn pack(&self, name: &str) -> PackFacts {
         self.packs.get(name).copied().unwrap_or_default()
     }
+
+    /// The hosts the MCP servers of pack `name` add (empty without `[mcp]`).
+    pub fn mcp_hosts(&self, name: &str) -> Vec<String> {
+        self.mcp_hosts.get(name).cloned().unwrap_or_default()
+    }
+}
+
+/// The hosts of the configured servers `names`: each one's `hosts` and the host of its `url`, without repeats.
+fn mcp_hosts_of(cfg: &loom_core::config::McpCfg, names: &[&str]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for s in names.iter().filter_map(|n| cfg.servers.get(*n)) {
+        let url_host = s.url.as_deref().and_then(|u| pat::hosts_in(u).into_iter().next());
+        for h in s.hosts.iter().map(|h| h.trim().to_string()).chain(url_host) {
+            if !h.is_empty() && !out.iter().any(|x| x.eq_ignore_ascii_case(&h)) {
+                out.push(h);
+            }
+        }
+    }
+    out
 }
 
 /// Who a session is.
@@ -214,7 +269,7 @@ impl SessionCtx {
     }
 }
 
-/// A call that has not returned.
+/// A call that has not returned: the tool it runs (`CallView::name`), the class of that tool, and the command it runs.
 #[derive(Clone, Debug)]
 struct OpenCall {
     name: String,
@@ -247,6 +302,12 @@ struct SessionState {
     /// Net decisions before this time are not judged for TW-21: the session was read before a restart, and what was in
     /// flight then is not known.
     blind_until: u64,
+    /// The time of the session's `session_start` (0 when not known): what the runtime does for a session before it
+    /// (a lead's MCP servers listed through its proxy and sandbox) is not the session's own (TW-21).
+    started_ms: u64,
+    /// The directory the last `bash` result left the shell in (meta `cwd`): where a later `bash` command's relative
+    /// paths start.
+    shell_dir: Option<String>,
 }
 
 /// The tripwires' memory.
@@ -300,7 +361,7 @@ patterns! {
     NATIVE_NET_API => r"NSURLSession|WKWebView|SecTrust";
     COMPILER => r"(?i)(?:^|[\s;&|(])(?:swiftc?|clang|cc|gcc)\b";
     CTYPES_APPLE => r"(?i)ctypes[^\n]*(?:Foundation|Security|CoreFoundation)|(?:Foundation|Security|CoreFoundation)[^\n]*ctypes";
-    BUILD_FILE => r"(?i)(?:^|/)(?:makefile|gnumakefile|build\.rs|package\.json|\.envrc|\.pre-commit-config\.yaml|tasks\.json)$";
+    BUILD_FILE => r"(?i)(?:^|/)(?:makefile|gnumakefile|build\.rs|package\.json|\.envrc|\.pre-commit-config\.yaml|tasks\.json|agents\.md|claude\.md)$";
     IRREVERSIBLE_RPC => r"(?i)eth_sendTransaction|eth_sendRawTransaction|\bsendRawTransaction\b|\bsendTransaction\b|\bsignAndSend\w*|\bsolana\s+transfer\b|\bcast\s+send\b|\bspl-token\s+transfer\b";
     IRREVERSIBLE_ROUTE => r"(?i)/(?:withdraw(?:als?)?|transfer|payouts?|orders?|invite|invitations?|password[-_/]?reset|forgot[-_]?password|share|messages?|comments?)\b";
     WRITEUP_SEARCH => r"(?i)ctftime\.org|\bwrite-?ups?\b|\bwalkthroughs?\b|\b0xdf\b|ippsec|\bsolutions?\s+(?:for|to)\b";
@@ -310,14 +371,23 @@ patterns! {
     DOCKER_SOCK => r"(?i)docker\.sock|/var/run/docker";
     FINISH_TOKEN => r"[A-Za-z0-9_-]{16,64}";
     SHORT_SLEEP => r"^\s*sleep\s+(\d+(?:\.\d+)?)\s*$";
+    /// The tool part of an MCP tool name that says it writes the paths it is given.
+    MCP_WRITES => r"(?i)(?:^|[_.-])(?:write|create|edit|append|save|put|patch|move|rename|copy|mkdir|upload)(?:[_.-]|$)";
 }
 
 /// What a tool call carries, in the forms the tripwires read.
 struct CallView {
+    /// The class of the tool that runs (see `CallView::of`).
     class: ToolClass,
+    /// The tool that runs: the executor's adaptation of the name sent (`Pty_Exec` runs `pty_exec`, `attempt_completion`
+    /// runs `finish`); the name sent when nothing adapts it (an MCP tool, an unknown name).
     name: String,
-    /// Exec: every string argument. Others: empty.
+    /// Exec: every string argument but a `description` (an MCP tool: only its command-like arguments). Others: empty.
     cmd: String,
+    /// The command line the call runs (`command` of the adapted call, else `cmd`): what TW-16's early `sleep` reads.
+    command: String,
+    /// `bash`'s `cwd` argument: where this one call starts.
+    cwd: Option<String>,
     paths: Vec<String>,
     urls: Vec<String>,
     /// File content, patches and bodies (write and edit tools).
@@ -334,6 +404,54 @@ const PATH_KEYS: [&str; 10] =
     ["path", "file", "file_path", "paths", "dir", "directory", "binary", "input_file", "candidate_file", "cwd"];
 const URL_KEYS: [&str; 5] = ["url", "urls", "uri", "endpoint", "base_url"];
 const CONTENT_KEYS: [&str; 8] = ["content", "text", "new_string", "old_string", "patch", "diff", "body", "data"];
+/// The arguments of an MCP tool that are read as a command: its class says nothing about what its other arguments are.
+const SHELL_KEYS: [&str; 4] = ["command", "cmd", "script", "shell_command"];
+
+/// The class of a loom tool by name: the built-in tools' own and the box tools'. `None` for a runtime tool (`State`
+/// or `Terminal`, which the recorded class carries) and for a name loom does not have.
+fn known_class(tool: &str) -> Option<ToolClass> {
+    static TABLE: std::sync::OnceLock<BTreeMap<String, ToolClass>> = std::sync::OnceLock::new();
+    TABLE
+        .get_or_init(|| {
+            let mut t: BTreeMap<String, ToolClass> =
+                loom_tools::Registry::builtin().specs().into_iter().map(|s| (s.name, s.class)).collect();
+            t.insert("box_exec".into(), ToolClass::Exec);
+            t.insert("box_reset".into(), ToolClass::Exec);
+            t.insert("box_get".into(), ToolClass::Write);
+            t
+        })
+        .get(tool)
+        .copied()
+}
+
+/// Every name a role may list (`rtools::known_tools`): the tools the monitor reads a call's adaptation against.
+fn known_tool(tool: &str) -> bool {
+    static NAMES: std::sync::OnceLock<BTreeSet<String>> = std::sync::OnceLock::new();
+    NAMES.get_or_init(|| crate::rtools::known_tools().into_iter().collect()).contains(tool)
+}
+
+/// The calls the executor runs for a call sent as `name` with `args` (`loom_tools::dialect::adapt` against every
+/// tool loom has, then `schema::normalize_for_tool`): one, several for a Codex `apply_patch` over several files, none
+/// for a name nothing adapts (an MCP tool, an unknown name, a refusal).
+fn run_steps(name: &str, args: &Value) -> Vec<loom_tools::dialect::Adapted> {
+    use loom_tools::dialect::{adapt, Adapt};
+    let mut calls = match adapt(name, args.clone(), loom_core::config::Dialect::default(), &known_tool) {
+        Adapt::Run(call) => vec![call],
+        Adapt::Batch(calls) => calls,
+        Adapt::Noop(_) | Adapt::Refuse(_) | Adapt::Unknown => return Vec::new(),
+    };
+    for c in &mut calls {
+        let _ = loom_tools::schema::normalize_for_tool(&c.tool, &mut c.args);
+    }
+    calls
+}
+
+/// The class of what `steps` run, when loom knows it and every step has the same (a batch is `write` and `edit`).
+fn step_class(steps: &[loom_tools::dialect::Adapted]) -> Option<ToolClass> {
+    let classes: Vec<ToolClass> = steps.iter().map(|s| known_class(&s.tool)).collect::<Option<_>>()?;
+    let first = *classes.first()?;
+    classes.iter().all(|c| *c == first).then_some(first)
+}
 
 fn leaves(v: &Value, out: &mut Vec<(String, String)>, key: &str, depth: u8) {
     if depth > 6 || out.len() > 400 {
@@ -349,63 +467,93 @@ fn leaves(v: &Value, out: &mut Vec<(String, String)>, key: &str, depth: u8) {
 }
 
 impl CallView {
+    /// The call as the tripwires read it. Its tool and class are those of what runs (`run_steps`): the class recorded
+    /// with a call is the one its sent name resolved to, which a log may hold for a name the executor adapts further
+    /// (a name in another case or with `-` for `_`; `shell` with a Codex `apply_patch` argv, which writes; an editor's
+    /// `view`, which reads). The recorded class stands where loom does not know the tool's (a runtime tool, an MCP tool).
+    /// An MCP tool's arguments are not a command line: only its command-like keys (`SHELL_KEYS`) are, and a tool whose
+    /// name says it writes (`MCP_WRITES`) writes the paths it names.
     fn of(name: &str, class: ToolClass, args: &Value) -> CallView {
         let mut ls = Vec::new();
         leaves(args, &mut ls, "", 0);
-        let prose = matches!(class, ToolClass::State | ToolClass::Terminal);
+        // An MCP tool is called by its exact name, though the executor folds case and `-` as for any other.
+        let folded = name.trim().to_ascii_lowercase().replace('-', "_");
+        let mcp = folded.starts_with("mcp__");
+        let steps = if mcp { Vec::new() } else { run_steps(name, args) };
+        let tool = steps.first().map_or_else(|| name.to_string(), |s| s.tool.clone());
+        let class = if mcp { class } else { step_class(&steps).unwrap_or(class) };
         let mut v = CallView {
             class,
-            name: name.to_string(),
+            name: tool.clone(),
             cmd: String::new(),
+            command: String::new(),
+            cwd: None,
             paths: Vec::new(),
             urls: Vec::new(),
             content: String::new(),
             all: String::new(),
-            prose,
-            runs: matches!(class, ToolClass::Exec) || name == "attempt",
+            prose: matches!(class, ToolClass::State | ToolClass::Terminal),
+            runs: matches!(class, ToolClass::Exec) || tool == "attempt",
+        };
+        let push = |into: &mut String, s: &str| {
+            if !into.is_empty() {
+                into.push('\n');
+            }
+            into.push_str(s);
         };
         for (k, s) in &ls {
-            if !v.all.is_empty() {
-                v.all.push('\n');
-            }
-            v.all.push_str(pat::cut(s, pat::MAX_SCAN_BYTES));
-            if PATH_KEYS.contains(&k.as_str()) {
+            push(&mut v.all, pat::cut(s, pat::MAX_SCAN_BYTES));
+            let k = k.as_str();
+            if PATH_KEYS.contains(&k) {
                 v.paths.push(s.clone());
-            } else if URL_KEYS.contains(&k.as_str()) {
+            } else if URL_KEYS.contains(&k) {
                 v.urls.push(s.clone());
-            } else if CONTENT_KEYS.contains(&k.as_str()) && !matches!(class, ToolClass::Exec) {
-                if !v.content.is_empty() {
-                    v.content.push('\n');
+            } else if mcp {
+                if SHELL_KEYS.contains(&k) {
+                    push(&mut v.cmd, s);
+                } else if CONTENT_KEYS.contains(&k) {
+                    push(&mut v.content, s);
                 }
-                v.content.push_str(s);
-            } else if matches!(class, ToolClass::Exec) || (name == "attempt" && k == "check") {
-                if !v.cmd.is_empty() {
-                    v.cmd.push('\n');
-                }
-                v.cmd.push_str(s);
+            } else if CONTENT_KEYS.contains(&k) && !matches!(class, ToolClass::Exec) {
+                push(&mut v.content, s);
+            } else if (matches!(class, ToolClass::Exec) && k != "description") || (tool == "attempt" && k == "check") {
+                push(&mut v.cmd, s);
             }
         }
-        v.add_repaired(name, args, &ls);
+        if mcp {
+            let tool_part = folded.splitn(3, "__").nth(2).unwrap_or("");
+            v.runs = !v.cmd.is_empty();
+            v.prose = false;
+            v.class = if v.runs {
+                ToolClass::Exec
+            } else if matches!(class, ToolClass::Write) || (MCP_WRITES.is_match(tool_part) && !v.paths.is_empty()) {
+                ToolClass::Write
+            } else {
+                ToolClass::Read
+            };
+            v.command = v.cmd.clone();
+            return v;
+        }
+        v.add_repaired(&steps, &ls);
+        let step_arg =
+            |key: &str| steps.first().and_then(|s| s.args.get(key)).and_then(Value::as_str).map(str::to_string);
+        v.command = step_arg("command").unwrap_or_else(|| v.cmd.clone());
+        if tool == "bash" {
+            v.cwd = step_arg("cwd").filter(|c| !c.trim().is_empty());
+        }
         v
     }
 
     /// A `tool_call` records the name and arguments as the model sent them; the executor adapts them to loom's tools
     /// (`loom_tools::dialect::adapt`: an alias's tool, other argument names, a Codex `apply_patch` as one call per
     /// file) and then normalises each (`schema::normalize_for_tool`). The paths, URLs and content of the calls that run
-    /// are read too (a fetch whose page is named only in `prompt` fetches that page), and nothing sent is dropped. Every
-    /// tool counts as present, so a call the role would be refused is read as it would have run; the argument
-    /// conversion is the same in every dialect.
-    fn add_repaired(&mut self, name: &str, args: &Value, sent: &[(String, String)]) {
-        use loom_tools::dialect::{adapt, Adapt, Adapted};
-        let calls = match adapt(name, args.clone(), loom_core::config::Dialect::default(), &|_| true) {
-            Adapt::Run(call) => vec![call],
-            Adapt::Batch(calls) => calls,
-            Adapt::Noop(_) | Adapt::Refuse(_) | Adapt::Unknown => return,
-        };
-        for Adapted { tool, mut args, .. } in calls {
-            let _ = loom_tools::schema::normalize_for_tool(&tool, &mut args);
+    /// (`steps`) are read too (a fetch whose page is named only in `prompt` fetches that page), and nothing sent is
+    /// dropped. Every tool loom has counts as present, so a call the role would be refused is read as it would have
+    /// run; the argument conversion is the same in every dialect.
+    fn add_repaired(&mut self, steps: &[loom_tools::dialect::Adapted], sent: &[(String, String)]) {
+        for step in steps {
             let mut repaired = Vec::new();
-            leaves(&args, &mut repaired, "", 0);
+            leaves(&step.args, &mut repaired, "", 0);
             for (k, s) in repaired {
                 let key = k.as_str();
                 if PATH_KEYS.contains(&key) {
@@ -580,22 +728,44 @@ impl Engine {
 
     /// Forget a session's per-record memory (a replay frees it when the log is read; the fleet book keeps what it needs).
     /// A session with a call, a job or a PTY in flight keeps those (and the intervals), so a long job's traffic is not
-    /// read as an idle session's.
+    /// read as an idle session's. What its log said once and no later record repeats is kept too: when it started, where
+    /// its shell was left, how long it is not judged for TW-21.
     pub fn drop_session(&mut self, session: &SessionId) {
         let Some(st) = self.sessions.get_mut(session) else { return };
-        if st.open.is_empty() && st.jobs.is_empty() && st.ptys.is_empty() {
-            self.sessions.remove(session);
-            return;
-        }
-        *st = SessionState {
+        let busy = !(st.open.is_empty() && st.jobs.is_empty() && st.ptys.is_empty());
+        let kept = SessionState {
             ctx: st.ctx.take(),
-            open: std::mem::take(&mut st.open),
-            intervals: std::mem::take(&mut st.intervals),
-            jobs: std::mem::take(&mut st.jobs),
-            ptys: std::mem::take(&mut st.ptys),
             blind_until: st.blind_until,
+            started_ms: st.started_ms,
+            shell_dir: st.shell_dir.take(),
             ..SessionState::default()
         };
+        if busy {
+            *st = SessionState {
+                open: std::mem::take(&mut st.open),
+                intervals: std::mem::take(&mut st.intervals),
+                jobs: std::mem::take(&mut st.jobs),
+                ptys: std::mem::take(&mut st.ptys),
+                ..kept
+            };
+        } else if kept.blind_until != 0 || kept.started_ms != 0 || kept.shell_dir.is_some() {
+            *st = kept;
+        } else {
+            self.sessions.remove(session);
+        }
+    }
+
+    /// The session's `session_start` was recorded at `ts` (a restart that resumes past it learns it from `prime`).
+    pub fn started_at(&mut self, session: &SessionId, ts: u64) {
+        let st = self.sessions.entry(session.clone()).or_default();
+        if st.started_ms == 0 {
+            st.started_ms = ts;
+        }
+    }
+
+    /// The directory the shell of `session` was left in by a `bash` result read before a restart.
+    pub fn set_shell_dir(&mut self, session: &SessionId, dir: Option<String>) {
+        self.sessions.entry(session.clone()).or_default().shell_dir = dir;
     }
 
     /// The session was read before a restart: its net decisions before `until` are not judged for TW-21.
@@ -625,34 +795,47 @@ impl Engine {
     }
 
     fn place(&self, ctx: &SessionCtx, raw: &str) -> Option<(Place, String)> {
+        self.place_in(ctx, raw, &ctx.workspace)
+    }
+
+    /// `raw` as an absolute path, a relative one and `$PWD` starting at `base`; `None` for what is not a local path.
+    fn expand(&self, ctx: &SessionCtx, raw: &str, base: &str) -> Option<String> {
         let home = self.env.home.trim_end_matches('/');
         let user_home = std::path::Path::new(home).parent().map(|p| p.to_string_lossy().into_owned());
-        let expanded = if let Some(rest) =
-            raw.strip_prefix("~/").or_else(|| raw.strip_prefix("$HOME/")).or_else(|| raw.strip_prefix("${HOME}/"))
-        {
-            format!("{}/{rest}", user_home.unwrap_or_default().trim_end_matches('/'))
-        } else if raw == "~" || raw == "$HOME" {
-            user_home.unwrap_or_default()
-        } else if let Some(rest) = raw
-            .strip_prefix("$TMPDIR")
-            .or_else(|| raw.strip_prefix("${TMPDIR}"))
-            .filter(|r| r.is_empty() || r.starts_with('/'))
-        {
-            format!("{}{rest}", ctx.own_tmp(&self.env))
-        } else if let Some(rest) = raw
-            .strip_prefix("$PWD")
-            .or_else(|| raw.strip_prefix("${PWD}"))
-            .filter(|r| r.is_empty() || r.starts_with('/'))
-        {
-            format!("{}{rest}", ctx.workspace.trim_end_matches('/'))
-        } else if raw.starts_with('/') {
-            raw.to_string()
-        } else if raw.is_empty() || raw.contains("://") || raw.contains('\n') || raw.starts_with('$') {
-            return None;
-        } else {
-            // A relative path is the workspace's (the form file tools take).
-            format!("{}/{raw}", ctx.workspace.trim_end_matches('/'))
-        };
+        Some(
+            if let Some(rest) =
+                raw.strip_prefix("~/").or_else(|| raw.strip_prefix("$HOME/")).or_else(|| raw.strip_prefix("${HOME}/"))
+            {
+                format!("{}/{rest}", user_home.unwrap_or_default().trim_end_matches('/'))
+            } else if raw == "~" || raw == "$HOME" {
+                user_home.unwrap_or_default()
+            } else if let Some(rest) = raw
+                .strip_prefix("$TMPDIR")
+                .or_else(|| raw.strip_prefix("${TMPDIR}"))
+                .filter(|r| r.is_empty() || r.starts_with('/'))
+            {
+                format!("{}{rest}", ctx.own_tmp(&self.env))
+            } else if let Some(rest) = raw
+                .strip_prefix("$PWD")
+                .or_else(|| raw.strip_prefix("${PWD}"))
+                .filter(|r| r.is_empty() || r.starts_with('/'))
+            {
+                format!("{}{rest}", base.trim_end_matches('/'))
+            } else if raw.starts_with('/') {
+                raw.to_string()
+            } else if raw.is_empty() || raw.contains("://") || raw.contains('\n') || raw.starts_with('$') {
+                return None;
+            } else {
+                // A relative path starts at `base`: the workspace for a file tool, the shell's directory for `bash`.
+                format!("{}/{raw}", base.trim_end_matches('/'))
+            },
+        )
+    }
+
+    /// How `raw` stands to the session, a relative path starting at `base`.
+    fn place_in(&self, ctx: &SessionCtx, raw: &str, base: &str) -> Option<(Place, String)> {
+        let home = self.env.home.trim_end_matches('/');
+        let expanded = self.expand(ctx, raw, base)?;
         let canon = canonical_path(&expanded);
         let own_tmp = ctx.own_tmp(&self.env);
         if own_tmp_relative(&expanded, &own_tmp).is_some() {
@@ -661,6 +844,12 @@ impl Engine {
         let own_dir = ctx.own_dir(&self.env);
         if in_dir(&expanded, &own_dir) {
             return Some((Place::Own, canon));
+        }
+        // The operator's attachments (`<workspace>/.loom/uploads`, docs/UPLOADS.md) are the mission's input, also in a
+        // workspace whose `.loom` is the loom home (a workspace that holds the home, such as `$HOME`).
+        let ws = ctx.workspace.trim_end_matches('/');
+        if !ws.is_empty() && in_dir(&expanded, &format!("{ws}/.loom/uploads")) {
+            return Some((Place::Elsewhere, canon));
         }
         if in_dir(&expanded, &format!("{home}/sessions")) {
             return Some((Place::OtherSession, canon));
@@ -738,6 +927,7 @@ impl Engine {
                 self.addressed_to_reviewers(ctx, rec, &text, "a brief", &mut out);
             }
             Event::InboxOpened(item) => self.on_inbox(ctx, rec, item, &mut out),
+            Event::SessionStart(_) => self.started_at(&ctx.session, rec.ts_ms),
             Event::TurnStart { .. } => {
                 self.ended.remove(ctx.session.as_str());
             }
@@ -862,7 +1052,7 @@ impl Engine {
     }
 
     fn authorized(&self, auth: &Authorization, host: &str, port: Option<u16>) -> bool {
-        auth.mark_of(host, port).is_some() || auth.allow.iter().any(|p| loom_net::policy::pattern_covers(p, host, port))
+        auth.authorizes(host, port)
     }
 
     /// True when `host` is a lab for this mission: marked so, or any host of a restricted-network pack.
@@ -888,12 +1078,13 @@ impl Engine {
         let view = CallView::of(&c.name, c.class, &c.args);
         let action = pat::scan_form(&view.action_text());
         let hosts: Vec<String> = pat::hosts_in(&action);
+        let base = self.command_dir(ctx, &view);
         {
             let all_l = pat::cut(&view.all, KEEP_ARGS_BYTES).to_lowercase();
             let st = self.state(ctx);
             st.open.insert(
                 c.call_id.as_str().to_string(),
-                OpenCall { name: c.name.clone(), class: c.class, ts: rec.ts_ms, cmd: view.cmd.clone() },
+                OpenCall { name: view.name.clone(), class: view.class, ts: rec.ts_ms, cmd: view.command.clone() },
             );
             for h in &hosts {
                 if st.named.len() < 512 {
@@ -915,7 +1106,7 @@ impl Engine {
         let reviewer_text = format!("{}\n{}", view.all, view.content);
         self.addressed_to_reviewers(ctx, rec, &reviewer_text, "a call's arguments", out);
         self.build_files(ctx, rec, &view, out);
-        match c.name.as_str() {
+        match view.name.as_str() {
             "request_scope" => self.scope_request(ctx, rec, &c.args, auth, out),
             "agent_message" | "agent_stop" => self.oversight(ctx, rec, &view, out),
             "evidence" | "evidence_add" | "attach_evidence" => self.evidence_quote(ctx, rec, &c.args, out),
@@ -925,10 +1116,24 @@ impl Engine {
             return;
         }
         // Everything below reads what the call does, not what it says.
-        self.local_paths(ctx, rec, &view, &action, out);
+        self.local_paths(ctx, rec, &view, &action, &base, out);
         self.commands(ctx, rec, &view, &action, &hosts, auth, fold, out);
         self.destinations_in_args(ctx, rec, &view, &action, &hosts, auth, fold, out);
         self.fleet_tokens(ctx, rec, &view);
+    }
+
+    /// The directory a call's command starts in, where its relative paths are: for `bash`, its `cwd` argument, else
+    /// the directory the last `bash` result left the shell in (meta `cwd`: the shell directory persists between calls),
+    /// else the workspace; the workspace for every other tool.
+    fn command_dir(&self, ctx: &SessionCtx, view: &CallView) -> String {
+        let ws = ctx.workspace.trim_end_matches('/').to_string();
+        if view.name != "bash" || !view.runs {
+            return ws;
+        }
+        if let Some(cwd) = &view.cwd {
+            return self.expand(ctx, cwd, &ws).map_or(ws, |d| canonical_path(&d));
+        }
+        self.sessions.get(&ctx.session).and_then(|s| s.shell_dir.clone()).unwrap_or(ws)
     }
 
     fn fleet_tokens(&mut self, ctx: &SessionCtx, rec: &Record, view: &CallView) {
@@ -950,10 +1155,22 @@ impl Engine {
 
     // ---- local paths: TW-05 names, TW-07, TW-09, TW-10, TW-16, TW-26 ------------------------------------------------
 
-    fn local_paths(&mut self, ctx: &SessionCtx, rec: &Record, view: &CallView, action: &str, out: &mut Vec<Hit>) {
-        let mut raw: Vec<String> = view.paths.clone();
+    /// The paths of a call: its path arguments start at the workspace, the paths in the command it runs at `base`
+    /// (`command_dir`). A path is a write when the tool that runs writes (`CallView::class`: an `apply_patch` sent through
+    /// `shell` writes, an editor's `view` reads) or the command writes it (`write_targets`).
+    fn local_paths(
+        &mut self,
+        ctx: &SessionCtx,
+        rec: &Record,
+        view: &CallView,
+        action: &str,
+        base: &str,
+        out: &mut Vec<Hit>,
+    ) {
+        let ws = ctx.workspace.clone();
+        let mut raw: Vec<(String, &str)> = view.paths.iter().map(|p| (p.clone(), ws.as_str())).collect();
         if view.runs {
-            raw.extend(pat::paths_in(action));
+            raw.extend(pat::paths_in(action).into_iter().map(|p| (p, base)));
         }
         let class_writes = matches!(view.class, ToolClass::Write);
         let targets = if view.runs {
@@ -961,11 +1178,12 @@ impl Engine {
         } else {
             Vec::new()
         };
-        let written: BTreeSet<String> = targets.iter().filter_map(|t| self.place(ctx, t)).map(|(_, c)| c).collect();
-        raw.extend(targets);
+        let written: BTreeSet<String> =
+            targets.iter().filter_map(|t| self.place_in(ctx, t, base)).map(|(_, c)| c).collect();
+        raw.extend(targets.into_iter().map(|t| (t, base)));
         let mut seen: BTreeSet<String> = BTreeSet::new();
-        for p in raw.iter().take(64) {
-            let Some((place, canon)) = self.place(ctx, p) else { continue };
+        for (p, dir) in raw.iter().take(64) {
+            let Some((place, canon)) = self.place_in(ctx, p, dir) else { continue };
             if !seen.insert(canon.clone()) {
                 continue;
             }
@@ -1576,6 +1794,7 @@ impl Engine {
             &auth.rules.join("\n"),
             &auth.grants.iter().map(|g| format!("{} {}", g.host, g.note)).collect::<Vec<_>>().join("\n"),
             &auth.allow.join("\n"),
+            &auth.target_scope.join("\n"),
         ]
         .join("\n")
         .to_lowercase();
@@ -1778,6 +1997,12 @@ impl Engine {
                     }
                     (_, Some(id)) if !st.ptys.contains(&id) && st.ptys.len() < 64 => st.ptys.push(id),
                     _ => {}
+                }
+            }
+            // The shell directory persists between `bash` calls; a result that moved it says where (meta `cwd`).
+            if r.name == "bash" {
+                if let Some(dir) = r.meta.get(loom_core::event::META_CWD).and_then(Value::as_str) {
+                    st.shell_dir = Some(canonical_path(dir));
                 }
             }
         }
@@ -2114,9 +2339,14 @@ impl Engine {
                 ));
             }
         }
-        // TW-21 needs the session's own log read to `ts_ms + grace`; the core holds the entry back until then.
+        // TW-21 needs the session's own log read to `ts_ms + grace`; the core holds the entry back until then. What the
+        // runtime does for a session before its `session_start` (a lead's MCP servers, listed through its proxy and
+        // sandbox) is not the session's; nor is a configured MCP server's traffic to its own hosts while its connection
+        // may be open (a session's connections close when a turn of it ends finished or stopped, CONTRACTS-MCP M3).
         if let Some(st) = self.sessions.get(&ctx.session) {
-            if ts_ms >= st.blind_until && !st.busy_at(ts_ms) {
+            let before_start = st.started_ms != 0 && ts_ms < st.started_ms;
+            let mcp_open = auth.is_mcp_host(&host, Some(port)) && !self.ended.contains(ctx.session.as_str());
+            if ts_ms >= st.blind_until && !before_start && !mcp_open && !st.busy_at(ts_ms) {
                 self.fleet.idle_egress(&ctx.mission, &ctx.session, &host, port, ts_ms);
                 out.push(self.mk(
                     ctx,

@@ -111,7 +111,9 @@
 //!     whose environment those commands get, `proxy.session_port(..)`, and `None` when it holds no grant), then
 //!     `.with_jobs_dir(<session dir>/jobs)` (commands' own output files are there: their metadata can be read,
 //!     not their content; `child_copy` uses the parent's) and `.with_identity(<session id>)` (`child_copy`: the
-//!     parent's, whose environment and commands they are; the census finds a session's processes, `crate::census`),
+//!     parent's, whose environment and commands they are; the census finds a session's processes, `crate::census`;
+//!     an MCP server check, `mcp_check_sandbox`: the check's own `mcp-check-<id>`, and what the server left running is
+//!     stopped with `census::kill` before the check's directory is removed),
 //!     with the config's `SandboxCfg`; for a role with
 //!     `read_only`, `extra_writable` is retained as internal
 //!     replay-untrusted metadata before its grants are emptied, and the
@@ -2295,6 +2297,21 @@ static PANIC_TITLES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// Every agent a `Resume` was sent to, once per `Resume` (tests only).
 #[cfg(test)]
 static RESUMES: Mutex<Vec<SessionId>> = Mutex::new(Vec::new());
+
+/// The sandbox an MCP server check runs in (CONTRACTS-MCP M7): a session's, with the check's own identity, so that the
+/// census finds what the server leaves running (`LOOM_SANDBOX_ID`, its fallback) and the check can stop it.
+fn mcp_check_sandbox(
+    cfg: &SandboxCfg,
+    workspace: &Path,
+    tmp: &Path,
+    home: &Path,
+    proxy_port: Option<u16>,
+    id: &SessionId,
+) -> Result<Sandbox, String> {
+    Sandbox::new(cfg, workspace, tmp, home, proxy_port)
+        .and_then(|s| s.with_identity(id.as_str()))
+        .map_err(|e| format!("The sandbox for this check cannot be set up: {e}"))
+}
 
 /// The MCP listing the `session_start` of the log at `path` recorded; empty when there is none.
 fn recorded_mcp(path: &std::path::Path) -> Vec<loom_core::event::McpListing> {
@@ -7886,6 +7903,15 @@ impl Runtime {
         let tmp = std::fs::canonicalize(&tmp).map_err(|e| format!("cannot resolve {}: {e}", tmp.display()))?;
         let result = self.mcp_check_in(&id, &role, resolved, scfg, &workspace, &tmp).await;
         self.inner.proxy.revoke(&id);
+        // What the server left running under the check's identity (a double fork out of its group) is stopped before
+        // the temp dir that names it goes: no session would own it, and the census would never find it again.
+        let (home, confined) = (self.inner.paths.home.clone(), self.inner.census_confined());
+        let (check, check_tmp) = (id.as_str().to_string(), tmp.clone());
+        let _ = tokio::task::spawn_blocking(move || {
+            let member = loom_tools::sandbox::census::Member { id: &check, tmp: &check_tmp };
+            loom_tools::sandbox::census::kill(&crate::census::canonical_home(&home), &[member], &[], &[], confined)
+        })
+        .await;
         let _ = std::fs::remove_dir_all(self.inner.paths.session_dir(&id));
         let (listing, stderr_tail) = result?;
         let mut view =
@@ -7944,9 +7970,8 @@ impl Runtime {
             .proxy
             .grant(id, policy)
             .map_err(|e| format!("The egress proxy cannot open a port for this check: {e}"))?;
-        let sandbox =
-            Sandbox::new(&sandbox_cfg, workspace, tmp, &self.inner.paths.home, (!bubblewrap).then_some(grant.port))
-                .map_err(|e| format!("The sandbox for this check cannot be set up: {e}"))?;
+        let port = (!bubblewrap).then_some(grant.port);
+        let sandbox = mcp_check_sandbox(&sandbox_cfg, workspace, tmp, &self.inner.paths.home, port, id)?;
         let jobs_dir = tmp.join("jobs");
         let (events_tx, _events) = unbounded_channel();
         let jobs = Arc::new(JobTable::new(jobs_dir, self.inner.blobs.clone(), events_tx, cfg.tools.max_output_bytes));
@@ -12183,6 +12208,33 @@ done
         assert!(seen_in_request(last, "mcp__fake__echo"));
         assert!(!seen_in_request(last, "mcp__fake__changed"));
         rt2.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_ends_finished_closes_the_sessions_mcp_connections() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = fake_mcp_script(dir.path(), "echo");
+        let e = env_with(Script::new(|_, _| finish("ok")), false, |c| c.mcp = fake_mcp_cfg(&script, |_| {})).await;
+        let id = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
+        until("finished", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Finished }))).await;
+        // The listing's connection was kept for the lead's calls; the finished turn leaves nothing of the session
+        // running (TW-20), its server included. The next call would open it again.
+        until("closed", || e.rt.mcp_views(&id).is_ok_and(|v| !v.is_empty() && v.iter().all(|s| s.state == "closed")))
+            .await;
+        e.rt.shutdown().await;
+    }
+
+    #[test]
+    fn an_mcp_check_runs_its_server_under_an_identity_the_census_finds() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ws, tmp, home) = (dir.path().join("ws"), dir.path().join("tmp"), dir.path().join("home"));
+        for d in [&ws, &tmp, &home] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let id = SessionId::from(format!("mcp-check-{}", SessionId::generate().as_str()));
+        let cfg = SandboxCfg { mode: SandboxMode::None, ..SandboxCfg::default() };
+        let sandbox = mcp_check_sandbox(&cfg, &ws, &tmp, &home, None, &id).unwrap();
+        assert_eq!(sandbox.identity(), Some(id.as_str()), "LOOM_SANDBOX_ID names the check");
     }
 
     #[tokio::test]

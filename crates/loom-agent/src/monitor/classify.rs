@@ -268,6 +268,9 @@ mod tests {
             requires_restricted_network: false,
             role: String::new(),
             active_reopen: 0,
+            target_scope: vec![],
+            target_exclude: vec![],
+            mcp_hosts: vec![],
         };
         assert!(classify(&call, &auth).is_err());
     }

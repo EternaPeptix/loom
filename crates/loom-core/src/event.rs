@@ -772,6 +772,8 @@ pub struct ToolCall {
     pub name: String,
     /// Parsed arguments (`null` when the model's JSON was invalid).
     pub args: Value,
+    /// The class of the tool the call runs: the executor's adaptation of `name` and `args` (`loom_tools::run_class`;
+    /// `Pty_Exec` runs `pty_exec`, `shell` with an `apply_patch` argv writes). `State` when nothing would run.
     pub class: ToolClass,
 }
 

@@ -247,6 +247,17 @@ pub fn pattern_covers(pattern: &str, host: &str, port: Option<u16>) -> bool {
     }
 }
 
+/// True when an entry of a mission target's `scope` or `exclude` (the grammar of [`Policy::with_target`]: a host
+/// pattern as [`pattern_covers`] reads it, an IP literal, or a CIDR block) covers `host` (a name, or an address that a
+/// literal or a block holds). `port` is as in [`pattern_covers`]. An invalid entry covers nothing.
+pub fn scope_entry_covers(entry: &str, host: &str, port: Option<u16>) -> bool {
+    match PrivEntry::parse(entry) {
+        Ok(PrivEntry::Net { net, .. }) => normalize_host(host).parse::<IpAddr>().is_ok_and(|a| net.contains(a)),
+        Ok(PrivEntry::Name(_)) => pattern_covers(entry, host, port),
+        Err(_) => false,
+    }
+}
+
 /// Splits `host[:port]`, `[v6]` and `[v6]:port`; a bare IPv6 literal has no port.
 fn split_host_port(text: &str) -> Result<(&str, Option<u16>), String> {
     let parse_port = |p: &str| p.parse::<u16>().map_err(|_| format!("`{p}` is not a port number"));
@@ -1036,6 +1047,18 @@ mod tests {
         assert!(pattern_covers("lab.example:8443", "lab.example", Some(8443)));
         assert!(!pattern_covers("lab.example:8443", "lab.example", Some(443)));
         assert!(!pattern_covers("not a host", "lab.example", None));
+    }
+
+    #[test]
+    fn a_scope_entry_covers_names_by_pattern_and_addresses_by_block() {
+        assert!(scope_entry_covers("*.acme.test", "www.ACME.test", None));
+        assert!(!scope_entry_covers("*.acme.test", "acme.test", None));
+        assert!(scope_entry_covers("10.20.0.0/24", "10.20.0.5", Some(80)));
+        assert!(!scope_entry_covers("10.20.0.0/24", "10.30.0.5", None));
+        assert!(scope_entry_covers("10.20.0.9", "10.20.0.9", None));
+        assert!(scope_entry_covers("fd00::/8", "[fd00::1]", None));
+        assert!(!scope_entry_covers("10.20.0.0/24", "www.acme.test", None), "a block never covers a name");
+        assert!(!scope_entry_covers("10.20.0.0/99", "10.20.0.5", None), "an invalid entry covers nothing");
     }
 
     #[test]

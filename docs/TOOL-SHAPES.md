@@ -80,7 +80,9 @@ maximum is clamped and said.
 
 ## 3. Records and the UI
 
-The `tool_call` record keeps the arguments exactly as sent; the `tool_result` header carries the repairs.
+The `tool_call` record keeps the name and arguments exactly as sent, with the class of the tool that runs
+(`loom_tools::run_class`: `Pty_Exec` is `exec`, `shell` with an `apply_patch` argv is `write`, an editor's `view` is
+`read`); the `tool_result` header carries the repairs.
 The UI reads paths from `path`, `file_path`, `absolute_path` and `target_file`, shows `description` as the
 row label (the command stays visible beside it), and shows a mapped call under the loom tool it ran (the
 `tool_result` record names it), with the name it was sent under in the row's tooltip ("Called as `Read`; ran

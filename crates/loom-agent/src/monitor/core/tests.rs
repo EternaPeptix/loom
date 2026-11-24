@@ -38,6 +38,7 @@ fn env_of(paths: &Paths) -> Arc<Env> {
         deny: vec![],
         packs: [("core".to_string(), PackFacts::default())].into(),
         relaxed_profiles: BTreeSet::new(),
+        mcp_hosts: Default::default(),
     })
 }
 
@@ -851,4 +852,79 @@ fn a_switch_onto_a_relaxed_model_uptiers_the_session_and_a_switch_back_does_not_
     bash(&mut s, "c4", "ps eww 104");
     core.pump(now + 70_000, &all(), true);
     assert_eq!(relaxed_now(&core), Some(true), "a restart does not lower it");
+}
+
+#[test]
+fn a_missions_target_and_mcp_hosts_reach_its_authorization() {
+    let h = home();
+    let mut env = (*env_of(&h.paths)).clone();
+    env.mcp_hosts.insert("core".into(), vec!["api.github.com".into()]);
+    let mut core = Core::open(&h.paths, Arc::new(env), cfg(), None).expect("open");
+    core.pump(loom_core::now_ms(), &all(), true);
+    let dir = h.paths.sessions_dir().join("s-1");
+    std::fs::create_dir_all(&dir).expect("dir");
+    let mut log = SessionLog::create(&dir.join("log.jsonl"), Durability::Batch).expect("create");
+    let Event::SessionStart(mut s) = start("s-1", "m-1") else { unreachable!("a start") };
+    s.target = Some(loom_core::event::TargetRef {
+        name: "acme".into(),
+        scope: vec!["*.acme.example".into()],
+        exclude: vec!["sso.acme.example".into()],
+        upstream_insecure: vec![],
+        intercept_passthrough: vec![],
+        summary: String::new(),
+    });
+    log.append(Author::Harness, Event::SessionStart(s)).expect("start");
+    bash(&mut log, "c1", "curl -X POST https://api.acme.example/login -d u=a");
+    core.pump(loom_core::now_ms() + 1_000, &all(), true);
+    let a = core.auth_for(&MissionId::from("m-1"), u64::MAX);
+    assert!(a.authorizes("api.acme.example", Some(443)), "the target's scope");
+    assert!(!a.authorizes("sso.acme.example", None), "the target's exclusions");
+    assert!(a.authorizes("api.github.com", None), "the pack's MCP hosts");
+    assert!(a.has_real_targets());
+    let hits = of_kind(&h, EntryKind::Tripwire);
+    assert!(hits.iter().all(|e| text(e, "id") != "TW-13"), "{hits:?}");
+}
+
+#[test]
+fn a_restart_keeps_the_directory_the_shell_was_left_in() {
+    let h = home();
+    let own = h.paths.sessions_dir().join("s-1");
+    let mut log = new_session(&h, "s-1", "m-1");
+    log.append(
+        Author::Model,
+        Event::ToolCall(ToolCall {
+            call_id: CallId::from("c1"),
+            req_id: "r".into(),
+            name: "bash".into(),
+            args: json!({"command": "cd $TMPDIR/.."}),
+            class: ToolClass::Exec,
+        }),
+    )
+    .expect("call");
+    let mut meta = serde_json::Map::new();
+    meta.insert(loom_core::event::META_CWD.into(), json!(own.to_string_lossy()));
+    log.append(
+        Author::Tool,
+        Event::ToolResult(ToolResult {
+            call_id: CallId::from("c1"),
+            name: "bash".into(),
+            status: ToolStatus::Ok,
+            text: String::new(),
+            output: None,
+            cut: false,
+            class: ToolClass::Exec,
+            meta,
+            duration_ms: 1,
+            images: Vec::new(),
+            exchanges: Vec::new(),
+        }),
+    )
+    .expect("result");
+    // The monitor starts after that: its cursor is past the result.
+    let mut core = open(&h);
+    core.pump(loom_core::now_ms(), &all(), true);
+    bash(&mut log, "c2", "printf '{}' >> log.jsonl");
+    core.pump(loom_core::now_ms() + 1_000, &all(), true);
+    let hits = of_kind(&h, EntryKind::Tripwire);
+    assert!(hits.iter().any(|e| text(e, "id") == "TW-16"), "the session's own log, from its directory: {hits:?}");
 }

@@ -358,6 +358,25 @@ pub fn canonical_tool_alias(name: &str) -> Option<&'static str> {
     dialect::alias_tool(name)
 }
 
+/// The class of the tool a call runs, as [`prepare`] adapts it (`dialect::adapt` against `registry`): a name in
+/// another case or with `-` for `_` runs the tool it folds to, `shell` with a Codex `apply_patch` argv runs `write` or
+/// `edit`, an editor's `view` runs `read`. The class of the first step of a batch (every step writes). `None` when
+/// nothing would run: an unknown name, a refusal, arguments that are not JSON.
+pub fn run_class(
+    registry: &Registry,
+    name: &str,
+    arguments: &str,
+    dialect: loom_core::config::Dialect,
+) -> Option<ToolClass> {
+    let parsed: Value = serde_json::from_str(if arguments.trim().is_empty() { "{}" } else { arguments }).ok()?;
+    let class_of = |tool: &str| registry.get(tool).map(|t| t.spec().class);
+    match dialect::adapt(name, parsed, dialect, &|t| registry.get(t).is_some()) {
+        dialect::Adapt::Run(call) => class_of(&call.tool),
+        dialect::Adapt::Batch(calls) => calls.first().and_then(|c| class_of(&c.tool)),
+        dialect::Adapt::Noop(_) | dialect::Adapt::Refuse(_) | dialect::Adapt::Unknown => None,
+    }
+}
+
 /// How output is admitted for this call.
 pub struct Admission<'a> {
     pub policy: &'a AdmitPolicy,
@@ -1140,6 +1159,23 @@ mod tests {
         let r = finalize(&e.ctx, &spec_of(&e, "bash"), out, &admission, Instant::now());
         assert_eq!(body_of(&r.text), text);
         assert!(r.output.is_none() && !r.cut);
+    }
+
+    #[test]
+    fn a_call_has_the_class_of_the_tool_it_runs_not_of_the_name_it_was_sent_under() {
+        let r = Registry::builtin();
+        let d = loom_core::config::Dialect::default();
+        let class = |name: &str, args: Value| run_class(&r, name, &args.to_string(), d);
+        // Not in the alias table: the case and the dash fold to the registered name, which `Registry::resolve` misses.
+        assert!(r.resolve("Pty-Exec").is_none());
+        assert_eq!(class("Pty-Exec", json!({"pty": "1", "command": "id"})), Some(ToolClass::Exec));
+        assert_eq!(class("OUT_READ", json!({"handle": "out:x"})), Some(ToolClass::Read));
+        let patch = "*** Begin Patch\n*** Add File: Makefile\n+all:\n*** End Patch";
+        assert_eq!(class("shell", json!({"command": ["apply_patch", patch]})), Some(ToolClass::Write));
+        assert_eq!(class("text_editor", json!({"command": "view", "path": "a.txt"})), Some(ToolClass::Read));
+        assert_eq!(class("bash", json!({"command": "ls"})), Some(ToolClass::Exec));
+        assert_eq!(class("no_such_tool", json!({})), None);
+        assert_eq!(run_class(&r, "bash", "{not json", d), None);
     }
 
     #[test]

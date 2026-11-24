@@ -80,8 +80,9 @@ JSON-RPC 2.0, written by hand on `serde_json` and `reqwest` (no new dependency).
   the session's egress proxy when there is one, so the session's network policy decides and every
   connection is in `net.jsonl`.
 - **Lifetime.** One connection per session per server, opened on the first call (or by the listing at
-  a mission's start, M6), closed after `idle_close_s` without a call, when the session ends, or when it
-  is archived. A closed or crashed connection opens again on the next call; a call that finds the server
+  a mission's start, M6), closed after `idle_close_s` without a call, when a turn of the session ends
+  `finished` or `stopped` (nothing of such a session runs on: the monitor reads a process of it as a
+  survivor, MONITOR.md TW-20), when a child settles, when the session ends, or when it is archived. A closed or crashed connection opens again on the next call; a call that finds the server
   dead restarts it once and its result carries the fact `server restarted`. A start that fails gives the
   call an error result with the reason and the last 40 stderr lines.
 
@@ -152,7 +153,9 @@ note (M6) names the hosts each server added.
   tools: [name], error, stderr_tail: [line], list_changed: bool, calls, last_call_ms}]` for the servers
   of that session.
 - `POST /api/mcp/{server}/check` `{workspace}` → starts the server in a scratch sandbox for that
-  workspace (the same rules as a session: proxy, policy), lists its tools and closes it: `{protocol,
+  workspace (the same rules as a session: proxy, policy, and a sandbox identity of its own, `mcp-check-<id>`, so the
+  census finds what the server leaves; what is left is stopped before the scratch directory is removed), lists its
+  tools and closes it: `{protocol,
   server_name, server_version, tools: [{name, description, read_only_hint}], stderr_tail}` or the error
   with the stderr tail. Refused (409) for a workspace the daemon refuses elsewhere.
 - CLI: `loom mcp list` (the configured servers, their transport and roles, from the daemon's config) and

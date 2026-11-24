@@ -53,7 +53,10 @@
 //! - **Authorization:** `auth_for(mission, ts)` is `Authorization::build` over the mission's journal entries up to `ts`
 //!   and the operator's messages up to `ts`, cached per mission until the journal or the messages change. A mission's
 //!   journal is read when a session of it wrote a `ledger` record (debounced by `LEDGER_DEBOUNCE_MS`), verified with
-//!   the journal key when the core has it.
+//!   the journal key when the core has it. Its facts carry the mission's named target (scope and exclusions, from the
+//!   first session primed with one: `source::prime`) and the hosts of the lead's pack's MCP servers (`Env::mcp_hosts`).
+//! - **Priming** a session tells the engine when it started (`Engine::started_at`) and, for a session resumed past
+//!   records (a cursor not at 0), where its shell was left (`source::last_shell_dir`, `Engine::set_shell_dir`).
 //! - **Model switches:** a session is relaxed-alignment (one tier up for six categories) when its `session_start`'s
 //!   lineage or its profile says so (`source::prime`), and from a `model_switched` onto a relaxed model on (its
 //!   `to.lineage`, or `to.profile` among the configuration's relaxed profiles); a switch back does not lower it. The
@@ -646,6 +649,9 @@ impl Core {
                     requires_restricted_network: p.requires_restricted_network,
                     role: role.to_string(),
                     operator_messages: Vec::new(),
+                    target_scope: Vec::new(),
+                    target_exclude: Vec::new(),
+                    mcp_hosts: env.mcp_hosts(pack),
                 },
                 cache: None,
                 prior: Vec::new(),
@@ -787,17 +793,36 @@ impl Core {
         let (pack, role) = (ctx.pack.clone(), ctx.role.clone());
         let prior = p.prior.clone();
         self.engine.set_ctx(ctx.clone());
-        if self.srcs.get(name).is_some_and(|s| s.cur.off > 0) && self.started_ms > 0 {
+        self.engine.started_at(&ctx.session, p.started_ms);
+        let resumed = self.srcs.get(name).map_or(0, |s| s.cur.off);
+        if resumed > 0 {
+            // A restart that resumes past the session's `bash` results learns where they left the shell.
+            let log = self.srcs.get(name).map(|s| s.dir.join("log.jsonl"));
+            let dir = log.and_then(|l| source::last_shell_dir(&l, resumed));
+            self.engine.set_shell_dir(&ctx.session, dir);
+        }
+        if resumed > 0 && self.started_ms > 0 {
             // Read before (or begun at its end): what was in flight at the start is not known.
             self.engine.blind_until(&ctx.session, self.started_ms.saturating_add(RESTART_BLIND_MS));
         }
+        let target = p.target.clone();
+        let mcp_hosts = self.env.mcp_hosts(&pack);
         let ms = self.mstate(&mission, &pack, &role);
         if ms.prior.is_empty() && !prior.is_empty() {
             ms.prior = prior.clone();
         }
         if ctx.parent.is_none() {
+            ms.facts.mcp_hosts = mcp_hosts;
             ms.pack = pack;
             ms.role = role;
+        }
+        // The mission's target (recorded at its lead's start, inherited by every agent) is the operator's scope.
+        if let Some(t) = target {
+            if (&ms.facts.target_scope, &ms.facts.target_exclude) != (&t.scope, &t.exclude) {
+                ms.facts.target_scope = t.scope;
+                ms.facts.target_exclude = t.exclude;
+                ms.cache = None;
+            }
         }
         if !prior.is_empty() {
             self.engine.fleet.set_prior(&mission, prior);

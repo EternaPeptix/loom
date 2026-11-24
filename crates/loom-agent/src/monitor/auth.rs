@@ -6,17 +6,25 @@
 //! - `Authorization` holds operator-authored strings only: the goal verbatim, the operator's chat messages and the
 //!   *answer part* of their inbox answers, the rules in force, the operator's grants with the operator's own notes and
 //!   their `[lab]` / `[prod]` marks, the configured allow and deny lists and network mode, the box targets, the pack's
-//!   `solvable` and `requires_restricted_network` flags and the role. An agent's `why`, a ledger note by an agent, a
-//!   goal or rule host that no operator grant backs, and a ledger asset never enter it (the deterministic
-//!   authorization of a host is the configured allow list, an operator grant, or a `[lab]` mark).
+//!   `solvable` and `requires_restricted_network` flags and the role, the `scope` and `exclude` of the mission's named
+//!   target as its lead's start recorded them (`SessionMeta::target`, CONTRACTS-TRAFFIC-TARGETS T2), and the hosts the
+//!   configured MCP servers of the mission's pack add to its sessions (each server's `hosts` and the host of its `url`,
+//!   CONTRACTS-MCP M4). An agent's `why`, a ledger note by an agent, a goal or rule host that no operator grant backs,
+//!   and a ledger asset never enter it (the deterministic authorization of a host is the configured allow list, an
+//!   operator grant, a `[lab]` mark, the target's scope or an MCP server's hosts).
+//! - `authorizes(host, port)` is that deterministic authorization: an active grant, an `allow` entry, a target scope
+//!   entry (a host pattern, an IP literal or a CIDR block: `loom_net::policy::scope_entry_covers`) or an MCP host
+//!   covers it, and no target `exclude` entry does (the proxy denies an excluded host whatever else allows it).
 //! - `Mark::Lab` is given only by `loom scope --lab` or a restricted-network pack. Loopback and link-local addresses are
 //!   `Mark::None` unless an operator said otherwise.
 //! - A **real-target mission** is defined once, here, and every other place in the monitor uses it (§2.5 triage, §2.6
 //!   refusal and the `unreviewed_pause_min` rule, §2.8, the opaque-code row of §4.4, §5.2 item 11, D9, D15):
 //!   `Authorization::has_real_targets()`. It is false for a pack that `requires_restricted_network`; otherwise it is
 //!   true when the network mode is `open`, or when any configured `allow` entry is not covered by an active
-//!   `[lab]` grant of the same text, or when any active grant is not marked `[lab]`. A mission in `allowlist` or `open`
-//!   mode with no `loom scope` grant is therefore a real-target mission. Keep-going takes this derived value
+//!   `[lab]` grant of the same text, or when any active grant is not marked `[lab]`, or when the mission's target has
+//!   a scope (a named target is the operator's real system: there is no `[lab]` mark for one). A mission in
+//!   `allowlist` or `open` mode with no `loom scope` grant is therefore a real-target mission. An MCP server's hosts
+//!   are the tools' backends, not targets, and do not make one. Keep-going takes this derived value
 //!   (`KeepGoingParams::checked`) and is refused without the operator's `--real-targets` acknowledgement whenever it is
 //!   true.
 //! - `mark_of(host, port)` resolves the mark of the *active* grants that cover `host` with `loom_net::policy`'s pattern
@@ -31,7 +39,7 @@
 //!   of its grant, `Mark::None`: `loom scope --lab` is M4), the operator's chat messages and the answer part of their
 //!   inbox answers (`AuthFacts::operator_messages`, from the records authored by the user, cut to `MAX_MESSAGES` of
 //!   `MAX_MESSAGE_CHARS`), and the configuration's allow and deny lists, network mode, `solvable`,
-//!   `requires_restricted_network` and the role. Nothing an agent wrote reaches it: not a `why`, a claim, a decision,
+//!   `requires_restricted_network`, the role, the target's scope and exclusions and the MCP hosts. Nothing an agent wrote reaches it: not a `why`, a claim, a decision,
 //!   a note, an asset, a plan or a report. The monitor keeps an `Authorization` per mission and rebuilds it when the
 //!   ledger changes.
 //!
@@ -39,7 +47,8 @@
 //! change `authorizes`; grants made in a reopened turn carry an expiry; the mission's goal is verbatim; the entries
 //! after `upto_ms` do not count; a revoked grant is gone. In P0:
 //! `a_grant_gives_its_mark_and_nothing_else_does`, `wildcard_and_port_grants_give_their_mark`,
-//! `the_strictest_mark_wins_and_lapsed_grants_give_nothing`, `real_targets_are_derived_from_mode_allow_list_and_grants`.
+//! `the_strictest_mark_wins_and_lapsed_grants_give_nothing`, `real_targets_are_derived_from_mode_allow_list_and_grants`;
+//! after the merge of targets and MCP: `the_target_scope_and_mcp_hosts_authorize_and_exclusions_do_not`.
 
 use loom_core::ledger::{Entry, LedgerState};
 use loom_core::MissionId;
@@ -90,6 +99,11 @@ pub struct AuthFacts {
     pub role: String,
     /// (time, text) of the operator's chat messages and the answer part of their inbox answers.
     pub operator_messages: Vec<(u64, String)>,
+    /// The mission target's `scope` and `exclude`, as the lead's start recorded them.
+    pub target_scope: Vec<String>,
+    pub target_exclude: Vec<String>,
+    /// The hosts the configured MCP servers of the mission's pack add to its sessions (`hosts`, and the `url` host).
+    pub mcp_hosts: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,6 +124,14 @@ pub struct Authorization {
     /// `expires_with_reopen` has lapsed.
     #[serde(default)]
     pub active_reopen: u32,
+    /// The mission target's scope entries (host patterns, IP literals, CIDR blocks) and exclusions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub target_scope: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub target_exclude: Vec<String>,
+    /// The hosts the mission's MCP servers add (CONTRACTS-MCP M4).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_hosts: Vec<String>,
 }
 
 impl Authorization {
@@ -131,7 +153,30 @@ impl Authorization {
                 .iter()
                 .any(|g| self.active(g) && g.mark == Mark::Lab && g.host.trim().eq_ignore_ascii_case(text.trim()))
         };
-        self.allow.iter().any(|a| !lab_grant(a)) || self.grants.iter().any(|g| self.active(g) && g.mark != Mark::Lab)
+        self.allow.iter().any(|a| !lab_grant(a))
+            || self.grants.iter().any(|g| self.active(g) && g.mark != Mark::Lab)
+            || !self.target_scope.is_empty()
+    }
+
+    /// The deterministic authorization of `host` (on `port`, when known): see the CONTRACT.
+    pub fn authorizes(&self, host: &str, port: Option<u16>) -> bool {
+        if self.excluded(host, port) {
+            return false;
+        }
+        self.mark_of(host, port).is_some()
+            || self.allow.iter().any(|p| loom_net::policy::pattern_covers(p, host, port))
+            || self.target_scope.iter().any(|e| loom_net::policy::scope_entry_covers(e, host, port))
+            || self.is_mcp_host(host, port)
+    }
+
+    /// True when an `exclude` entry of the mission's target covers `host`.
+    pub fn excluded(&self, host: &str, port: Option<u16>) -> bool {
+        self.target_exclude.iter().any(|e| loom_net::policy::scope_entry_covers(e, host, port))
+    }
+
+    /// True when one of the mission's MCP servers adds `host` (its own traffic, CONTRACTS-MCP M4).
+    pub fn is_mcp_host(&self, host: &str, port: Option<u16>) -> bool {
+        self.mcp_hosts.iter().any(|p| loom_net::policy::pattern_covers(p, host, port))
     }
 
     /// The block for `mission` from its journal `entries` up to `upto_ms`, and `facts` (see the CONTRACT).
@@ -172,6 +217,9 @@ impl Authorization {
             requires_restricted_network: facts.requires_restricted_network,
             role: facts.role.clone(),
             active_reopen: 0,
+            target_scope: facts.target_scope.clone(),
+            target_exclude: facts.target_exclude.clone(),
+            mcp_hosts: facts.mcp_hosts.clone(),
         }
     }
 
@@ -209,6 +257,9 @@ mod tests {
             requires_restricted_network: false,
             role: "web".into(),
             active_reopen: 0,
+            target_scope: vec![],
+            target_exclude: vec![],
+            mcp_hosts: vec![],
         }
     }
 
@@ -264,6 +315,35 @@ mod tests {
         a.requires_restricted_network = true;
         a.network_mode = "open".into();
         assert!(!a.has_real_targets(), "a restricted-network pack is a lab");
+    }
+
+    #[test]
+    fn the_target_scope_and_mcp_hosts_authorize_and_exclusions_do_not() {
+        let facts = AuthFacts {
+            network_mode: "deny_all".into(),
+            target_scope: vec!["*.acme.example".into(), "10.20.0.0/24".into()],
+            target_exclude: vec!["sso.acme.example".into()],
+            mcp_hosts: vec!["api.github.com".into()],
+            ..AuthFacts::default()
+        };
+        let a = Authorization::build(&MissionId::from("m-1"), &[], u64::MAX, &facts);
+        assert!(a.authorizes("api.acme.example", Some(443)), "a host in the target's scope");
+        assert!(a.authorizes("10.20.0.7", None), "an address in a scope block");
+        assert!(!a.authorizes("sso.acme.example", None), "an excluded host");
+        assert!(a.authorizes("api.github.com", Some(443)), "an MCP server's host");
+        assert!(a.is_mcp_host("api.github.com", None) && !a.is_mcp_host("api.acme.example", None));
+        assert!(!a.authorizes("other.example", None));
+        assert!(a.has_real_targets(), "a target's scope is a real target");
+        let tools_only = AuthFacts {
+            network_mode: "deny_all".into(),
+            mcp_hosts: vec!["api.github.com".into()],
+            ..AuthFacts::default()
+        };
+        let tools_only = Authorization::build(&MissionId::from("m-1"), &[], u64::MAX, &tools_only);
+        assert!(!tools_only.has_real_targets(), "an MCP server's host is not a target");
+        let back: Authorization =
+            serde_json::from_str(&serde_json::to_string(&a).unwrap_or_default()).unwrap_or_else(|_| sample());
+        assert_eq!(back, a);
     }
 
     fn entry(n: u64, ts: u64, session: &str, op: loom_core::ledger::LedgerOp) -> Entry {

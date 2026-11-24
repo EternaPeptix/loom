@@ -17,6 +17,36 @@
   `dialect::adapt` makes of a call (a Codex `apply_patch` becomes one call per file it names; a fetch that names its
   page only in `prompt` fetches that page), so a git hook added through `apply_patch` and a metadata page fetched
   through `prompt` are seen. A claim's `assets` are read as ledger prose.
+- **A call is recorded and judged as the tool that runs.** The executor folds case and `-` (`Pty_Exec` runs `pty_exec`),
+  runs `shell` with a Codex `apply_patch` argv as a write and an editor's `view` as a read; the `tool_call` record kept the
+  class of the name as sent (`State` for `Pty_Exec`, `Exec` for that patch, `Write` for that view). It now carries the
+  class of what runs (`loom_tools::run_class`), so `max_exec_calls` caps such calls, and the monitor derives the tool
+  and its class again for older logs: commands sent under another case are read as commands, `Request-Scope`,
+  `Agent_Stop`, `EVIDENCE` and `Finish` meet TW-03, TW-18 and TW-19, a build file or git hook written through a Codex
+  patch raises TW-26 or TW-09, and a viewed `.git/config` or `package.json` no longer does.
+- **Relative paths follow the shell directory.** `cd` persists between `bash` calls (main); the monitor resolved every
+  relative path against the workspace. A `bash` command's relative paths now start at its `cwd`, else where the last
+  result left the shell (meta `cwd`, read back after a restart), so a write to `log.jsonl` from the session's own
+  directory is TW-16 and a read from `~` of another session's log is TW-10.
+- **A target's scope and the MCP servers' hosts are authorized.** The monitor's authorization had only the configured
+  lists and grants, so traffic in a mission target's scope looked unauthorized (TW-13, TW-23, FS-4) and a target mission
+  was not a real-target one. The target's scope and exclusions (recorded at the lead's start) and the hosts of the
+  pack's MCP servers now count; the scope makes a real-target mission and is operator text for TW-03.
+- **MCP servers are not idle egress or survivors.** A lead lists its MCP servers through its proxy before its
+  `session_start`, and a server talks to its hosts between calls: TW-21 judges neither. A session's MCP connections close
+  when a turn of it ends finished or stopped, and when a child settles (they open again on the next call), so a server
+  is not a survivor of an ended session (TW-20). `loom mcp check` runs its server under an identity of its own
+  (`mcp-check-<id>`) and stops what it left running before its scratch directory goes, so the census and the lab-port
+  listener check (E4e) see it.
+- **An MCP tool's arguments are not a command line.** Issue bodies and chat text no longer raise the command tripwires
+  (`crontab` in an issue was TW-11, `ps auxeww` TW-10); only `command`, `cmd`, `script` and `shell_command` are read as a
+  command, and a tool whose name says it writes (`write_file`) writes the paths it names (TW-26).
+- **`AGENTS.md` and `CLAUDE.md` are build files** for TW-26: main reads them into every later session's system prompt.
+- **An early `sleep` is found beside a `description`.** TW-16 tested the join of every argument, so `sleep 30` with
+  the `description` Claude-trained models send (or a timeout) never matched; it now reads the command, and a
+  `description` is prose for the command tripwires.
+- **An upload is not the loom home.** With a workspace whose `.loom` is the home (`$HOME`), reading an operator
+  attachment in `.loom/uploads` was TW-07.
 
 ### Monitor and tolerant tool calls together
 

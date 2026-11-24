@@ -27,6 +27,9 @@
 //!   resolves when the record is read.
 //! - `read_journal(paths, mission, key)` reads a mission's journal as `Journal::read` does (verified) when the key is
 //!   known, else as unverified lines (a replay of a copy); it returns the entries it understands and says which.
+//! - `prime` also gives the mission's named target (`meta.json`'s, else the `session_start`'s). `last_shell_dir(log,
+//!   upto)` is the one read back from a cursor: the meta `cwd` of the last `bash` result in the `SHELL_DIR_BYTES` before
+//!   `upto` (where a restarted session's shell is, for the relative paths of its next commands).
 //!
 //! Tests required: records are read to the last whole line and the rest waits; the cursor advances and a second read
 //! returns only the new records; a cut file, a broken chain and a skipped seq are faults that leave the cursor;
@@ -308,6 +311,8 @@ pub struct Primed {
     /// Records with a seq below this are the parent's copy.
     pub skip_below: u64,
     pub started_ms: u64,
+    /// The mission's named target, as the session's `meta.json` (else its `session_start`) recorded it.
+    pub target: Option<loom_core::event::TargetRef>,
 }
 
 /// Find out who the session in directory `dir` is (see the contract).
@@ -357,12 +362,40 @@ pub fn prime(dir: &Path, name: &str) -> Option<Primed> {
     };
     let relaxed = s.model.lineage.as_ref().is_some_and(|l| l.alignment == loom_core::lineage::Alignment::Relaxed);
     let skip_below = if copied { forked.unwrap_or(u64::MAX) } else { 0 };
+    let target = meta.as_ref().and_then(|m| m.target.clone()).or_else(|| s.target.clone());
     Some(Primed {
         ctx: SessionCtx { session, mission, parent, pack, role, relaxed, workspace },
         profile,
         prior,
         skip_below,
         started_ms: start_rec.ts_ms,
+        target,
+    })
+}
+
+/// The most bytes `last_shell_dir` reads back from the cursor.
+const SHELL_DIR_BYTES: u64 = 1024 * 1024;
+
+/// The directory the last `bash` result before byte `upto` of the session log at `path` left the shell in (its meta
+/// `cwd`), read once from the last `SHELL_DIR_BYTES` before `upto` (records are not checked against the chain: this
+/// is where relative paths are read from, not a record the monitor judges). `None` when none says.
+pub fn last_shell_dir(path: &Path, upto: u64) -> Option<String> {
+    let mut f = std::fs::File::open(path).ok()?;
+    let from = upto.saturating_sub(SHELL_DIR_BYTES);
+    f.seek(SeekFrom::Start(from)).ok()?;
+    let mut buf = Vec::new();
+    f.take(upto.saturating_sub(from)).read_to_end(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf);
+    // A window that starts inside a line drops that line's tail.
+    let whole = if from == 0 { text.as_ref() } else { text.split_once('\n').map_or("", |(_, rest)| rest) };
+    whole.lines().rev().find_map(|line| {
+        let v = serde_json::from_str::<serde_json::Value>(line).ok()?;
+        match loom_core::log::record_from_value(&v)?.event {
+            Event::ToolResult(r) if r.name == "bash" => {
+                r.meta.get(loom_core::event::META_CWD).and_then(serde_json::Value::as_str).map(str::to_string)
+            }
+            _ => None,
+        }
     })
 }
 
@@ -601,6 +634,80 @@ mod tests {
         let mut l2 = SessionLog::create(&own.join("log.jsonl"), Durability::Batch).expect("create");
         l2.append(Author::Harness, start("s-own", "m-2")).expect("start");
         assert_eq!(prime(&own, "s-own").map(|p| p.skip_below), Some(0));
+    }
+
+    #[test]
+    fn the_shell_directory_is_the_last_bash_result_before_the_cursor_and_the_target_is_primed() {
+        let d = tempfile::tempdir().expect("dir");
+        let dir = d.path().join("s-1");
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("log.jsonl");
+        let mut log = SessionLog::create(&path, Durability::Batch).expect("create");
+        let target = loom_core::event::TargetRef {
+            name: "acme".into(),
+            scope: vec!["*.acme.example".into()],
+            exclude: vec!["sso.acme.example".into()],
+            upstream_insecure: vec![],
+            intercept_passthrough: vec![],
+            summary: String::new(),
+        };
+        log.append(
+            Author::Harness,
+            Event::SessionStart(loom_core::event::SessionStart {
+                session: SessionId::from("s-1"),
+                mission: MissionId::from("m-1"),
+                parent: None,
+                workspace: "/w".into(),
+                pack: "core".into(),
+                role: "lead".into(),
+                termination: loom_core::event::Termination::Explicit,
+                model: loom_core::event::ModelRef {
+                    profile: "p".into(),
+                    model: "m".into(),
+                    context_window: 10,
+                    lineage: None,
+                },
+                reasoning_replay: Default::default(),
+                system_prompt: String::new(),
+                tools: vec![],
+                budget: Default::default(),
+                unattended: false,
+                title: String::new(),
+                project_instructions: Vec::new(),
+                mcp: Vec::new(),
+                intercept: false,
+                target: Some(target.clone()),
+                schema: loom_core::event::SCHEMA,
+            }),
+        )
+        .expect("start");
+        assert_eq!(prime(&dir, "s-1").and_then(|p| p.target), Some(target), "the target of the session's start");
+        let moved = |dir: &str| {
+            let mut meta = serde_json::Map::new();
+            meta.insert(loom_core::event::META_CWD.into(), serde_json::json!(dir));
+            Event::ToolResult(loom_core::event::ToolResult {
+                call_id: loom_core::CallId::from("c"),
+                name: "bash".into(),
+                status: loom_core::event::ToolStatus::Ok,
+                text: String::new(),
+                output: None,
+                cut: false,
+                class: ToolClass::Exec,
+                meta,
+                duration_ms: 1,
+                images: Vec::new(),
+                exchanges: Vec::new(),
+            })
+        };
+        let none = std::fs::metadata(&path).expect("len").len();
+        assert_eq!(last_shell_dir(&path, none), None, "no result moved the shell");
+        log.append(Author::Tool, moved("/srv/a")).expect("a");
+        log.append(Author::Model, tool_call(1)).expect("call");
+        let after_a = std::fs::metadata(&path).expect("len").len();
+        log.append(Author::Tool, moved("/srv/b")).expect("b");
+        assert_eq!(last_shell_dir(&path, after_a).as_deref(), Some("/srv/a"), "only what is before the cursor");
+        let end = std::fs::metadata(&path).expect("len").len();
+        assert_eq!(last_shell_dir(&path, end).as_deref(), Some("/srv/b"));
     }
 
     #[test]

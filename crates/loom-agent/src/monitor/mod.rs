@@ -431,6 +431,7 @@ mod tests {
             deny: vec![],
             packs: Default::default(),
             relaxed_profiles: Default::default(),
+            mcp_hosts: Default::default(),
         }
     }
 

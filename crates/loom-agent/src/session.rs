@@ -2550,6 +2550,7 @@ Name them when you start a new mission instead."
                 if wakeable {
                     self.append(Author::Harness, Event::TurnEnd { reason: TurnEndReason::Stopped })?;
                     self.publish();
+                    self.close_mcp_after(TurnEndReason::Stopped).await;
                 }
                 Ok(None)
             }
@@ -2943,6 +2944,7 @@ Name them when you start a new mission instead."
             Flow::Next => Ok(None),
             Flow::End(reason) => {
                 self.end_turn(reason)?;
+                self.close_mcp_after(reason).await;
                 Ok(None)
             }
             Flow::Settle(d) if self.deps.shared.is_child() => Ok(Some(self.settle(d).await?)),
@@ -2955,7 +2957,19 @@ Name them when you start a new mission instead."
                     ChildOutcome::Failed => TurnEndReason::Error,
                 };
                 self.end_turn(reason)?;
+                self.close_mcp_after(reason).await;
                 Ok(None)
+            }
+        }
+    }
+
+    /// A turn that ended finished or stopped leaves nothing of the session running, its MCP servers included (the
+    /// monitor reads a process of such a session as a survivor, TW-20): their connections close, and the next call
+    /// opens them again (CONTRACTS-MCP M3).
+    async fn close_mcp_after(&self, reason: TurnEndReason) {
+        if matches!(reason, TurnEndReason::Finished | TurnEndReason::Stopped) {
+            if let Some(m) = self.deps.shared.mcp() {
+                m.close().await;
             }
         }
     }
@@ -3013,6 +3027,9 @@ Name them when you start a new mission instead."
         self.append(Author::Harness, Event::SessionEnd { outcome, detail })?;
         self.deps.ctx.capabilities.ptys.close_all().await;
         self.deps.ctx.jobs.kill_all(self.grace()).await;
+        if let Some(m) = self.deps.shared.mcp() {
+            m.close().await;
+        }
         self.phase = Phase::Ended;
         self.publish();
         Ok(settlement)
@@ -4266,7 +4283,11 @@ Name them when you start a new mission instead."
             let resolved = self.registry.resolve(&call.name);
             let tool = resolved.as_ref().map(|(t, _)| t);
             let policy_name = resolved.as_ref().and_then(|(_, canon)| *canon).unwrap_or(call.name.as_str());
-            let class = tool.map(|t| t.spec().class).unwrap_or(ToolClass::State);
+            // The class of what runs (the executor's adaptation of the call), so the log, the exec cap and the monitor
+            // read a call by what it does: `Pty_Exec` runs `pty_exec`, `shell` with an `apply_patch` argv writes.
+            let class = loom_tools::run_class(&self.registry, &call.name, &call.arguments, self.deps.ctx.cfg.dialect)
+                .or_else(|| tool.map(|t| t.spec().class))
+                .unwrap_or(ToolClass::State);
             let args = serde_json::from_str::<Value>(&call.arguments)
                 .unwrap_or_else(|_| Value::String(call.arguments.clone()));
             self.append(
@@ -8389,6 +8410,58 @@ mod tests {
         assert_eq!(results(session.records()).last().unwrap().status, ToolStatus::Invalid);
         assert!(results(session.records()).last().unwrap().text.contains("Budget wrap-up active"));
         assert_eq!(session.woven().weave.tools, specs);
+    }
+
+    #[tokio::test]
+    async fn a_call_is_recorded_with_the_class_of_the_tool_it_runs() {
+        let mut fx = Fx::new("lead", false, true, seq(vec![])).await;
+        let mut session = fx.create();
+        let token = CancellationToken::new();
+        let early = Early::new(
+            false,
+            session.registry.clone(),
+            session.deps.ctx.clone(),
+            &token,
+            HashSet::new(),
+            session.early_counts.clone(),
+        );
+        let specs = session.woven().weave.tools;
+        let req = |id: &str, name: &str, args: Value| ToolCallRequest {
+            call_id: CallId::from(id),
+            name: name.into(),
+            arguments: args.to_string(),
+            complete: true,
+        };
+        let patch = "*** Begin Patch\n*** Add File: notes.txt\n+hello\n*** End Patch";
+        let calls = vec![
+            // Folded to `out_read`, which the alias table does not name.
+            req("c1", "Out-Read", json!({"handle": "out:nothing"})),
+            // The alias is `bash`; the call writes a file.
+            req("c2", "shell", json!({"command": ["apply_patch", patch]})),
+            // The alias is `edit`; the call reads.
+            req("c3", "text_editor", json!({"command": "view", "path": "notes.txt"})),
+            req("c4", "bash", json!({"command": "true"})),
+        ];
+        session.run_calls("req", &calls, &specs, early).await.unwrap();
+        let recorded: Vec<(String, ToolClass)> = session
+            .records()
+            .iter()
+            .filter_map(|r| match &r.event {
+                Event::ToolCall(c) => Some((c.name.clone(), c.class)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            recorded,
+            vec![
+                ("Out-Read".to_string(), ToolClass::Read),
+                ("shell".to_string(), ToolClass::Write),
+                ("text_editor".to_string(), ToolClass::Read),
+                ("bash".to_string(), ToolClass::Exec),
+            ],
+            "the name as sent, the class of what ran"
+        );
+        assert!(fx.ctx.workspace.join("notes.txt").exists(), "the patch was applied");
     }
 
     #[tokio::test]
