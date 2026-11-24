@@ -7138,13 +7138,21 @@ fn scan_tree_for_ids(
 }
 
 impl Inner {
-    /// Read every `meta.json` / `status.json` under the sessions directory.
+    /// Read every `meta.json` / `status.json` under the sessions directory. A `creds-rec-*` directory is
+    /// the audit folder of a login recording (S2) that a stop of the daemon cut short: recordings never
+    /// outlive the daemon, so it is removed.
     fn load_known(&self) {
         let Ok(dir) = std::fs::read_dir(self.paths.sessions_dir()) else { return };
         let mut st = self.st();
         for entry in dir.flatten() {
             let path = entry.path();
             if !path.is_dir() {
+                continue;
+            }
+            if entry.file_name().to_string_lossy().starts_with("creds-rec-") {
+                if let Err(e) = std::fs::remove_dir_all(&path) {
+                    tracing::warn!("cannot remove the leftover recording folder {}: {e}", path.display());
+                }
                 continue;
             }
             let Some(meta) = read_json::<SessionMeta>(&path.join("meta.json")) else {
@@ -14332,6 +14340,17 @@ done
         let c = start_of(&e, &id).creds.unwrap();
         assert_eq!(c.dropped, 1, "{}", c.summary);
         assert!(!c.summary.contains("api.acme.test"), "{}", c.summary);
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_leftover_recording_folder_is_removed_at_start() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let left = e.rt.inner.paths.sessions_dir().join("creds-rec-0011223344556677");
+        std::fs::create_dir_all(&left).unwrap();
+        std::fs::write(left.join("net.jsonl"), b"{}\n").unwrap();
+        e.rt.inner.load_known();
+        assert!(!left.exists());
         e.rt.shutdown().await;
     }
 
