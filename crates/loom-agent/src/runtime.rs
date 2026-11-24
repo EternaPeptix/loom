@@ -796,6 +796,11 @@ pub struct SessionInfo {
     /// A task is driving it now.
     pub active: bool,
     pub status: Status,
+    /// When its log was last written (milliseconds since the epoch): the time of its latest record, so a
+    /// list can order and age sessions without reading their records. Set by `Runtime::sessions`; absent
+    /// elsewhere (a session event carries the record itself).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -2698,7 +2703,7 @@ impl Inner {
     }
 
     fn info_of(k: &Known) -> SessionInfo {
-        SessionInfo { meta: k.meta.clone(), active: k.active.is_some(), status: k.status.clone() }
+        SessionInfo { meta: k.meta.clone(), active: k.active.is_some(), status: k.status.clone(), last_ms: None }
     }
 
     /// Send `input` to an active session. False when no task drives it.
@@ -5217,9 +5222,19 @@ impl Runtime {
     }
 
     pub fn sessions(&self, include_archived: bool) -> Vec<SessionInfo> {
-        let st = self.inner.st();
-        let mut out: Vec<SessionInfo> =
-            st.known.values().filter(|k| include_archived || !k.meta.archived).map(Inner::info_of).collect();
+        let mut out: Vec<SessionInfo> = {
+            let st = self.inner.st();
+            st.known.values().filter(|k| include_archived || !k.meta.archived).map(Inner::info_of).collect()
+        };
+        // One stat per session, outside the lock: the log's modification time is its latest record's.
+        for info in &mut out {
+            let log = self.inner.paths.session_dir(&info.meta.id).join("log.jsonl");
+            info.last_ms = std::fs::metadata(&log)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        }
         out.sort_by(|a, b| b.meta.created_ms.cmp(&a.meta.created_ms).then_with(|| b.meta.id.cmp(&a.meta.id)));
         out
     }

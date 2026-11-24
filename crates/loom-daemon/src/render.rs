@@ -1368,6 +1368,7 @@ mod tests {
             meta: meta(s, None, s, 0),
             active: false,
             status: status_of(Phase::Idle, None, None, 0),
+            last_ms: None,
         };
         no_escape(&sessions_table(&[hostile(EVIL)], 10, &MONO));
         let entry = InboxEntry {
@@ -1920,7 +1921,7 @@ mod tests {
     }
 
     fn info(id: &str, parent: Option<&str>, title: &str, status: Status) -> SessionInfo {
-        SessionInfo { meta: meta(id, parent, title, 1_000), active: false, status }
+        SessionInfo { meta: meta(id, parent, title, 1_000), active: false, status, last_ms: None }
     }
 
     #[test]

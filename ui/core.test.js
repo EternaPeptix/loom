@@ -1820,6 +1820,17 @@ test("workspaceGroups: groups by workspace, newest activity first, Needs you pin
   // with a loaded record the age comes from the record
   const loaded = C.workspaceGroups(sessionStore(list), inboxWith([]), {}, now, { activity: new Map([["mid", { seq: 4, ts: now - 120000 }]]) });
   assert.equal(loaded.flatMap((g) => g.rows).find((r) => r.info.id === "mid").identity.text, "qwen · chat · 2m");
+  // the daemon's `last_ms` (its log's last write) ages and orders a row before it is opened; a later record wins
+  const listed = list.map((i) => (i.id === "mid" ? { ...i, last_ms: now - 300000 } : i));
+  const unopened = C.workspaceGroups(sessionStore(listed), inboxWith([]), {}, now).flatMap((g) => g.rows).find((r) => r.info.id === "mid");
+  assert.equal(unopened.identity.text, "qwen · chat · 5m");
+  assert.equal(unopened.recordedMs, now - 300000);
+  const opened = C.workspaceGroups(sessionStore(listed), inboxWith([]), {}, now, { activity: new Map([["mid", { seq: 4, ts: now - 60000 }]]) });
+  assert.equal(opened.flatMap((g) => g.rows).find((r) => r.info.id === "mid").recordedMs, now - 60000, "opening it does not move it unless a newer record arrived");
+  // a session event (no last_ms) keeps the one the list gave
+  const st = sessionStore(listed);
+  C.applySessionEvent(st, { ...list.find((i) => i.id === "mid"), title: "renamed" });
+  assert.equal(st.byId.get("mid").last_ms, now - 300000);
 });
 
 test("workspaceGroups: activity orders groups and rows; agents nest under their mission when expanded", () => {

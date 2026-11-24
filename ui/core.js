@@ -559,7 +559,9 @@ function sessionChanged(store, id) {
 /** A `session` event: {type:"session", info}. */
 export function applySessionEvent(store, info) {
   if (info && info.id) {
-    store.byId.set(info.id, info);
+    // A session event carries no `last_ms` (the list does): keep the one the list gave.
+    const prev = store.byId.get(info.id);
+    store.byId.set(info.id, prev && prev.last_ms && !info.last_ms ? { ...info, last_ms: prev.last_ms } : info);
     sessionChanged(store, info.id);
   }
   return store;
@@ -3076,10 +3078,14 @@ export function identityLine(info, activityMs, waiting, now) {
  */
 export function workspaceGroups(store, inbox, watermarks, now, opts = {}) {
   const { showArchived = false, expanded = new Set(), activity = new Map() } = opts;
-  // `recorded`: the time of the latest record seen, or null. The creation time only orders rows that have none; it is never shown.
+  // `recorded`: the time of the latest record seen, or the daemon's `last_ms` (its log's last write, sent with the
+  // list so rows are ordered and aged before they are opened), whichever is later; null when neither is known. The
+  // creation time only orders rows that have neither; it is never shown.
   const recorded = (info) => {
     const a = activity.get(info.id);
-    return a && Number.isFinite(a.ts) ? a.ts : null;
+    const seen = a && Number.isFinite(a.ts) ? a.ts : null;
+    const listed = Number.isFinite(info.last_ms) && info.last_ms > 0 ? info.last_ms : null;
+    return seen === null ? listed : listed === null ? seen : Math.max(seen, listed);
   };
   const lastMs = (info) => recorded(info) ?? (Number(info.created_ms) || 0);
   const isFresh = (info) => {

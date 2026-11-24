@@ -972,6 +972,7 @@ pub(crate) mod testkit {
             },
             active: false,
             status: status(Phase::Idle),
+            last_ms: None,
         }
     }
 
