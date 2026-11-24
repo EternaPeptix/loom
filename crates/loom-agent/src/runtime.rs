@@ -655,8 +655,10 @@
 
 use crate::pack::{self, Packs, PromptEnv, RoleDef};
 use crate::prior;
+mod creds_api;
 mod target_api;
 mod targets;
+pub use creds_api::{CredsBody, ProfileShow, RecordBody, RecordLines, RecordStarted, SetBody};
 use crate::rtools::{
     self, ChildCopy, ChildInfo, Orchestrator, Producer, Run, Settlement, Shared, SpawnReq, Vote, Workspace,
 };
@@ -2308,6 +2310,12 @@ struct Inner {
     traffic: Mutex<HashMap<SessionId, Weak<crate::traffic::Traffic>>>,
     /// Each mission's index of exchanges, shared by its sessions.
     mission_traffic: Mutex<HashMap<MissionId, Weak<crate::traffic::MissionTraffic>>>,
+    /// Each mission's credential profile items while a session holds them (CONTRACTS-TRAFFIC-TARGETS S11).
+    #[allow(dead_code)] // scaffolding: used by S11
+    mission_creds: Mutex<HashMap<MissionId, creds_api::MissionCreds>>,
+    /// Login recordings by handle (S2).
+    #[allow(dead_code)] // scaffolding: used by S2
+    recordings: Mutex<HashMap<String, Arc<creds_api::Recording>>>,
 }
 
 impl Drop for Inner {
@@ -5077,6 +5085,8 @@ impl Runtime {
             capture_tx,
             traffic: Mutex::new(HashMap::new()),
             mission_traffic: Mutex::new(HashMap::new()),
+            mission_creds: Mutex::new(HashMap::new()),
+            recordings: Mutex::new(HashMap::new()),
         });
 
         let weak = Arc::downgrade(&inner);

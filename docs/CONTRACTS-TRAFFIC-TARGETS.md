@@ -273,8 +273,12 @@ item stops being injected (checked at each mission start, not cached).
 S7. **CLI/API.** `loom creds list --target acme` (profiles with item counts and when recorded),
 `loom creds show --target acme --profile default` (item kinds, names and hosts, recorded-at — never
 values), `loom creds record|set|rm`. `POST /api/targets/{name}/creds` (record session handle / set
-items), `GET /api/targets/{name}/creds` (summaries, no values), `DELETE
-/api/targets/{name}/creds/{profile}`. The new-mission form's Target select gains a Credentials select
+items), `GET /api/targets/{name}/creds` (`[ProfileSummary]`, no values), `GET
+/api/targets/{name}/creds/{profile}` (`{summary: ProfileSummary, items: [ItemView]}`), `DELETE
+/api/targets/{name}/creds/{profile}` (`204`; `404` when there was none). Setting items over the API:
+`POST /api/targets/{name}/creds` with `{"set":{"profile":"default","items":[{kind,name,value,host}]}}` →
+`ProfileSummary`; a host outside the scope is a `409` with the sentence. Every creds route is the
+operator's (the access token), never reachable from a session's proxy credential. The new-mission form's Target select gains a Credentials select
 listing the chosen target's profiles.
 
 S8. **In-process tools.** `http_send` and `web_fetch` (except requests on the reference path) apply S3 to

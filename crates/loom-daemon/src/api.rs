@@ -78,6 +78,11 @@
 //! | `PUT /targets/{name}` (`TargetBody`; what is left out stays) | `runtime.target_update` | `TargetView` |
 //! | `GET /targets/{name}/graph?status=&kind=&under=` | `runtime.target_graph`: nodes with status, missions and evidence keys; the edges between them | `GraphView` |
 //! | `GET /targets/{name}/exchanges?node=&limit={n}` | `runtime.target_exchanges`: the exchanges of every mission of the target with that node (id or locator), newest last | `[ExchangeEntry]` |
+//! | `GET /targets/{name}/creds` | `runtime.creds_list` (CONTRACTS-TRAFFIC-TARGETS S7; no values) | `[ProfileSummary]` |
+//! | `POST /targets/{name}/creds` (`CredsBody`: exactly one of `record`, `stop`, `set`) | `runtime.creds_record_start` / `creds_record_stop` / `creds_set` (S2; `400` for none or more than one) | `RecordStarted` / `ProfileSummary` / `ProfileSummary` |
+//! | `GET /targets/{name}/creds/record/{handle}?after={n}` | `runtime.creds_record_lines` (name lines only) | `RecordLines` |
+//! | `GET /targets/{name}/creds/{profile}` | `runtime.creds_show` | `ProfileShow` (`summary`, `items[{kind, name, host}]`) |
+//! | `DELETE /targets/{name}/creds/{profile}` | `runtime.creds_remove` (`404` when there was none) | `204` |
 //! | `GET /missions` | `runtime.missions` | `[MissionInfo]` |
 //! | `GET /missions/{id}/ledger` | `runtime.ledger` | `LedgerView` |
 //! | `GET /missions/{id}/score` | `runtime.score` | `ScoreView` |
@@ -259,6 +264,9 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/targets/{name}", get(target_show).put(target_update))
         .route("/api/targets/{name}/graph", get(target_graph))
         .route("/api/targets/{name}/exchanges", get(target_exchanges))
+        .route("/api/targets/{name}/creds", get(creds_list).post(creds_post))
+        .route("/api/targets/{name}/creds/record/{handle}", get(creds_record_lines))
+        .route("/api/targets/{name}/creds/{profile}", get(creds_show).delete(creds_remove))
         .route("/api/missions", get(missions))
         .route("/api/missions/{id}/ledger", get(ledger))
         .route("/api/missions/{id}/score", get(score))
@@ -975,6 +983,35 @@ async fn target_exchanges(State(s): State<ApiState>, Path(name): Path<String>, q
     let rt = s.runtime.clone();
     let entries = blocking(move || rt.target_exchanges(&name, node.as_deref(), limit).map_err(rt_err)).await?;
     Ok(Json(entries).into_response())
+}
+
+async fn creds_list(State(s): State<ApiState>, Path(name): Path<String>) -> Res<Response> {
+    let _ = (s, name);
+    todo!("S7")
+}
+
+async fn creds_post(State(s): State<ApiState>, Path(name): Path<String>, body: Bytes) -> Res<Response> {
+    let _ = (s, name, body);
+    todo!("S2, S7")
+}
+
+async fn creds_record_lines(
+    State(s): State<ApiState>,
+    Path((name, handle)): Path<(String, String)>,
+    q: RawQuery,
+) -> Res<Response> {
+    let _ = (s, name, handle, q);
+    todo!("S2")
+}
+
+async fn creds_show(State(s): State<ApiState>, Path((name, profile)): Path<(String, String)>) -> Res<Response> {
+    let _ = (s, name, profile);
+    todo!("S7")
+}
+
+async fn creds_remove(State(s): State<ApiState>, Path((name, profile)): Path<(String, String)>) -> Res<Response> {
+    let _ = (s, name, profile);
+    todo!("S7")
 }
 
 async fn missions(State(s): State<ApiState>) -> Response {

@@ -681,6 +681,45 @@ impl Client {
         self.call(Method::GET, &format!("/api/targets/{}/graph", segment(name)), &[], None).await
     }
 
+    /// `GET /api/targets/{name}/creds` (S7).
+    pub async fn creds_list(&self, target: &str) -> Result<Vec<loom_core::creds::ProfileSummary>, String> {
+        let _ = target;
+        todo!("S7")
+    }
+
+    /// `GET /api/targets/{name}/creds/{profile}` (S7).
+    pub async fn creds_show(&self, target: &str, profile: &str) -> Result<loom_agent::runtime::ProfileShow, String> {
+        let _ = (target, profile);
+        todo!("S7")
+    }
+
+    /// `POST /api/targets/{name}/creds` with one of `record`, `stop`, `set`; the answer as JSON.
+    pub async fn creds_post(
+        &self,
+        target: &str,
+        body: &loom_agent::runtime::CredsBody,
+    ) -> Result<serde_json::Value, String> {
+        let _ = (target, body);
+        todo!("S2, S7")
+    }
+
+    /// `GET /api/targets/{name}/creds/record/{handle}?after={n}` (S2).
+    pub async fn creds_record_lines(
+        &self,
+        target: &str,
+        handle: &str,
+        after: usize,
+    ) -> Result<loom_agent::runtime::RecordLines, String> {
+        let _ = (target, handle, after);
+        todo!("S2")
+    }
+
+    /// `DELETE /api/targets/{name}/creds/{profile}` (S7).
+    pub async fn creds_remove(&self, target: &str, profile: &str) -> Result<(), String> {
+        let _ = (target, profile);
+        todo!("S7")
+    }
+
     pub async fn missions(&self) -> Result<Vec<MissionInfo>, String> {
         self.call(Method::GET, "/api/missions", &[], None).await
     }

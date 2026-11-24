@@ -254,6 +254,11 @@ pub enum Command {
         #[command(subcommand)]
         action: TargetAction,
     },
+    /// Credential profiles of a target: logins attached to a mission's in-scope requests (CONTRACTS-TRAFFIC-TARGETS S)
+    Creds {
+        #[command(subcommand)]
+        action: CredsAction,
+    },
     /// The interception CA (CONTRACTS-TRAFFIC-TARGETS I2)
     Ca {
         #[command(subcommand)]
@@ -340,6 +345,10 @@ pub struct StartOpts {
     /// graph is shared with the other missions of the target
     #[arg(long, value_name = "NAME")]
     pub target: Option<String>,
+    /// A credential profile of the target (`loom creds`) attached to the mission's in-scope requests;
+    /// needs --target
+    #[arg(long, value_name = "PROFILE", requires = "target")]
+    pub creds: Option<String>,
     /// Do not decrypt HTTPS for this mission, whatever its pack says (`[network] intercept = "pack"` only)
     #[arg(long)]
     pub no_intercept: bool,
@@ -538,6 +547,53 @@ pub enum TargetAction {
     Show(TargetShowArgs),
     /// Change what a target covers: add or remove scope and exclude entries
     Scope(TargetScopeArgs),
+}
+
+/// `loom creds` (S2, S7). No subcommand prints a value; `set` takes values only as arguments.
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum CredsAction {
+    /// List a target's profiles with item counts and when each was recorded
+    List(CredsTargetArgs),
+    /// Show a profile: item kinds, names and hosts, never values
+    Show(CredsProfileArgs),
+    /// Record a login: prints a proxy to point a browser at, streams the names it collects, writes the
+    /// profile on Ctrl-C or after 30 minutes
+    Record(CredsProfileArgs),
+    /// Set items without a browser; replaces the profile's items for the hosts given
+    Set(CredsSetArgs),
+    /// Delete a profile
+    Rm(CredsProfileArgs),
+}
+
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct CredsTargetArgs {
+    #[arg(long)]
+    pub target: String,
+}
+
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct CredsProfileArgs {
+    #[arg(long)]
+    pub target: String,
+    #[arg(long, default_value = "default")]
+    pub profile: String,
+}
+
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct CredsSetArgs {
+    #[arg(long)]
+    pub target: String,
+    #[arg(long, default_value = "default")]
+    pub profile: String,
+    /// The in-scope host the items below are attached to
+    #[arg(long)]
+    pub host: String,
+    /// `name=value`; repeatable
+    #[arg(long, value_name = "NAME=VALUE")]
+    pub cookie: Vec<String>,
+    /// `Name: value`; repeatable
+    #[arg(long, value_name = "NAME: VALUE")]
+    pub header: Vec<String>,
 }
 
 #[derive(Args, Debug, Clone, PartialEq, Eq)]
@@ -901,8 +957,7 @@ fn new_session(opts: &StartOpts, message: Option<String>, cwd: &Path, prior: Vec
         attachments: Vec::new(),
         target: opts.target.clone().filter(|t| !t.trim().is_empty()),
         intercept: opts.no_intercept.then_some(false),
-        // S3: `loom run --creds {profile}` is the daemon implementer's.
-        creds: None,
+        creds: opts.creds.clone().filter(|c| !c.trim().is_empty()),
     }
 }
 
@@ -1517,6 +1572,7 @@ async fn dispatch(command: Command) -> Result<i32, String> {
             block(&text).map(|()| 0)
         }
         Command::Target { action } => cmd_target(&paths, action).await,
+        Command::Creds { action } => cmd_creds(&paths, action).await,
         Command::Ca { action } => {
             let (fp, file) = match action {
                 CaAction::Show => loom_agent::runtime::ca_show(&paths.home)?,
@@ -1863,6 +1919,16 @@ async fn cmd_target(paths: &Paths, action: TargetAction) -> Result<i32, String> 
                 .map(|()| 0)
         }
     }
+}
+
+/// `loom creds` (S2, S7). `set` builds items from `--cookie name=value` / `--header 'Name: value'` (a
+/// malformed one is refused naming the flag, never echoing the value) and sends `{"set": ...}`. `record`
+/// starts a recording, prints one line (`proxy {proxy} user {user} password {password}; trust CA {ca_path}
+/// (sha256 {ca_sha256})`), then polls the lines every second and prints each, until Ctrl-C or `done`, then
+/// sends `{"stop": handle}` and prints the summary line (or the nothing-collected sentence, exit 1).
+async fn cmd_creds(paths: &Paths, action: CredsAction) -> Result<i32, String> {
+    let _ = (paths, action);
+    todo!("S2, S7")
 }
 
 fn cmd_config(paths: &Paths, action: ConfigAction) -> Result<i32, String> {
@@ -2564,11 +2630,13 @@ mod tests {
             prior: Vec::new(),
             create_workspace: true,
             target: Some("acme".into()),
+            creds: Some("default".into()),
             no_intercept: true,
             agent_models: vec![("worker".into(), "fast".into()), (ANY_ROLE.into(), "big".into())],
         };
         let n = new_session(&opts, None, cwd, vec![MissionId::from("m-1"), MissionId::from("m-2")]);
         assert_eq!(n.intercept, Some(false));
+        assert_eq!(n.creds.as_deref(), Some("default"));
         assert_eq!(n.prior, [MissionId::from("m-1"), MissionId::from("m-2")]);
         assert_eq!(
             n.role_models,
