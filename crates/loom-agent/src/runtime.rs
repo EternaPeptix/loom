@@ -3381,6 +3381,8 @@ impl Inner {
             budget,
             unattended: meta.unattended,
             schema: loom_core::event::SCHEMA,
+            intercept: false,
+            target: None,
             title: meta.title.clone(),
             project_instructions: env.project_instructions,
             mcp: Vec::new(),

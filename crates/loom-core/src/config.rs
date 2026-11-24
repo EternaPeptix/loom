@@ -530,7 +530,7 @@ impl NetworkMode {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NetworkCfg {
     pub mode: NetworkMode,
@@ -542,6 +542,44 @@ pub struct NetworkCfg {
     pub deny: Vec<String>,
     /// Private, loopback or link-local destinations that are permitted (same pattern syntax, or CIDR).
     pub allow_private: Vec<String>,
+    /// Bytes of each request or response body kept in a captured exchange (CONTRACTS-TRAFFIC-TARGETS C2).
+    pub capture_max_bytes: u64,
+    /// Exchanges recorded per session; past it traffic is still relayed but not recorded (C2).
+    pub capture_max_exchanges: u64,
+    /// When HTTPS through the proxy is decrypted and captured (I1).
+    pub intercept: InterceptMode,
+    /// Host patterns whose HTTPS is tunneled untouched even when interception is on (I4).
+    pub intercept_passthrough: Vec<String>,
+    /// PEM files of extra roots trusted for upstream TLS when intercepting (I4).
+    pub upstream_roots: Vec<String>,
+}
+
+impl Default for NetworkCfg {
+    fn default() -> Self {
+        NetworkCfg {
+            mode: NetworkMode::default(),
+            allow: Vec::new(),
+            reference_hosts: Vec::new(),
+            deny: Vec::new(),
+            allow_private: Vec::new(),
+            capture_max_bytes: 1 << 20,
+            capture_max_exchanges: 100_000,
+            intercept: InterceptMode::default(),
+            intercept_passthrough: Vec::new(),
+            upstream_roots: Vec::new(),
+        }
+    }
+}
+
+/// When the proxy decrypts HTTPS (CONTRACTS-TRAFFIC-TARGETS I1).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InterceptMode {
+    /// As the mission's pack says (`intercept = true` in ctf, redteam, vr), unless the mission says otherwise.
+    #[default]
+    Pack,
+    Always,
+    Never,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

@@ -1440,6 +1440,8 @@ mod tests {
             title: String::new(),
             project_instructions: Vec::new(),
             mcp: Vec::new(),
+            intercept: false,
+            target: None,
             schema,
         })
     }

@@ -610,6 +610,19 @@ impl Proxy {
         Ok(port)
     }
 
+    /// As [`Proxy::grant`], with the session's traffic captured to `sink` as `capture` says
+    /// (CONTRACTS-TRAFFIC-TARGETS C3, I4).
+    pub fn grant_with_capture(
+        &self,
+        _session: &SessionId,
+        _policy: Policy,
+        _capture: crate::capture::CaptureGrant,
+        _sink: crate::capture::CaptureSink,
+        _ca: Option<std::sync::Arc<crate::tls::Ca>>,
+    ) -> Result<SessionGrant, ProxyError> {
+        todo!("CONTRACTS-TRAFFIC-TARGETS C3, I4")
+    }
+
     pub fn grant(&self, session: &SessionId, policy: Policy) -> Result<SessionGrant, ProxyError> {
         let port = self.session_listener(session)?;
         let password = format!("{:032x}", rand::rng().random::<u128>());

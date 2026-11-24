@@ -486,6 +486,14 @@ pub fn record(rec: &Record, style: &Style, opts: &RecordOpts) -> String {
             );
             out.push(paint(style, YELLOW, &text));
         }
+        Event::Exchange(x) => {
+            // CONTRACTS-TRAFFIC-TARGETS C1: one line per captured exchange.
+            let status =
+                x.status.map(|c| c.to_string()).or_else(|| x.error.clone()).unwrap_or_else(|| "no response".into());
+            let line =
+                format!("⇄ {} {} {}://{}{} · {} · {}", x.id, x.method, x.scheme, x.host, x.target, status, x.source);
+            out.push(paint(style, DIM, &line));
+        }
         Event::Compaction(c) => {
             let text = format!(
                 "⟲ context compacted ({}): {} outputs in the key table, about {} → {} tokens{}",
@@ -1213,6 +1221,8 @@ mod tests {
                 budget: budget.clone(),
                 unattended: true,
                 schema: loom_core::event::SCHEMA,
+                intercept: false,
+                target: None,
                 title: s.into(),
                 project_instructions: Vec::new(),
                 mcp: Vec::new(),
@@ -1462,6 +1472,8 @@ mod tests {
             budget: Budget::default(),
             unattended: false,
             schema: loom_core::event::SCHEMA,
+            intercept: false,
+            target: None,
             title: String::new(),
             project_instructions: Vec::new(),
             mcp: Vec::new(),

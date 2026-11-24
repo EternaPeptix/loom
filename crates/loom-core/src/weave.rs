@@ -723,6 +723,8 @@ mod tests {
                     budget: Budget::default(),
                     unattended: false,
                     schema: crate::event::SCHEMA,
+                    intercept: false,
+                    target: None,
                     title: String::new(),
                     project_instructions: Vec::new(),
                     mcp: Vec::new(),

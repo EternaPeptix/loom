@@ -34,6 +34,7 @@ pub mod prefix;
 pub mod scorecard;
 pub mod security_state;
 pub mod tagsafe;
+pub mod target;
 pub mod weave;
 
 pub use blob::{BlobRef, BlobStore};

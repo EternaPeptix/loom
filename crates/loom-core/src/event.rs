@@ -227,6 +227,8 @@ pub enum Event {
     Reweave(Reweave),
     /// The window was compacted: a note with a key table replaces what came before. See [`Compaction`].
     Compaction(Compaction),
+    /// One captured HTTP request and its response (CONTRACTS-TRAFFIC-TARGETS C1).
+    Exchange(Exchange),
     /// Keep this call's output verbatim through evictions until unpinned.
     Pin {
         call_id: CallId,
@@ -320,6 +322,62 @@ pub struct ModelSwitched {
 /// What one MCP server offered when a mission started (docs/CONTRACTS-MCP.md M6). Recorded in the lead's
 /// `session_start` so every session of the mission, and a session opened from its log, presents the same
 /// tools for its whole life.
+/// One captured HTTP request and its response (CONTRACTS-TRAFFIC-TARGETS C1). The messages are whole HTTP/1.1
+/// messages (head and body) in the blob store, readable as outputs by their keys.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Exchange {
+    /// `ex-` and 12 base32 characters.
+    pub id: String,
+    /// The call it was made in: the tool's own call, or for proxy traffic the call running when it started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<CallId>,
+    /// `tool` (an in-process client: http_send, web_fetch, MCP over HTTP) or `proxy` (a command's traffic).
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    /// `http` or `https`.
+    pub scheme: String,
+    /// `plain`, `intercepted` or `tool`.
+    pub tls: String,
+    pub method: String,
+    pub host: String,
+    pub port: u16,
+    /// Path and query as sent.
+    pub target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub request: BlobRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response: Option<BlobRef>,
+    pub request_bytes: u64,
+    pub response_bytes: u64,
+    /// A body passed `capture_max_bytes` and was cut there (the byte counts are the true sizes).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
+    /// Intercepted HTTPS to a host listed in the target's `upstream_insecure`: its certificate was not checked.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub upstream_unverified: bool,
+    pub duration_ms: u64,
+}
+
+/// The named target a mission works on, as recorded at its start (CONTRACTS-TRAFFIC-TARGETS T2, T5).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TargetRef {
+    pub name: String,
+    pub scope: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub upstream_insecure: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub intercept_passthrough: Vec<String>,
+    /// The graph summary that went into the lead's system prompt (T5).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub summary: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpListing {
     /// The server's name in `[mcp.servers]`.
@@ -397,6 +455,12 @@ pub struct SessionStart {
     /// (it takes its lead's) and when no server is configured.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp: Vec<McpListing>,
+    /// HTTPS through the proxy is decrypted and captured for this mission (CONTRACTS-TRAFFIC-TARGETS I1).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub intercept: bool,
+    /// The named target the mission works on, as it was at the start (T2, T5); a child takes its lead's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<TargetRef>,
     /// Log format version; absent in logs written before the field existed (version 1). A log with
     /// a higher number is read-only for this build.
     #[serde(default = "schema_v1")]
@@ -1105,6 +1169,8 @@ mod tests {
                     budget: budget(),
                     unattended: true,
                     schema: SCHEMA,
+                    intercept: false,
+                    target: None,
                     title: "t".into(),
                     project_instructions: Vec::new(),
                     mcp: Vec::new(),
