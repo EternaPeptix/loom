@@ -103,28 +103,54 @@ impl Tool for HttpSend {
         )
         .with("additionalProperties", json!(true))];
         p.extend(fields());
-        spec("http_send","Send a structured HTTP request through the session's scoped egress proxy. Keep cookies between calls, capture origin-bound variables, and store complete bounded exchanges. Headers/body are evidence and may contain secrets; avoid unnecessary credentials.",ToolClass::Exec,&p)
+        spec(
+            "http_send",
+            "Send a structured HTTP request through the session's scoped egress proxy. Keep cookies between calls, capture origin-bound variables, and store complete bounded exchanges. Headers/body are evidence and may contain secrets; avoid unnecessary credentials.",
+            ToolClass::Exec,
+            &p,
+        )
     }
     async fn run(&self, ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
         let request = match serde_json::from_value(args.get("request").cloned().unwrap_or(Value::Null)) {
             Ok(r) => r,
             Err(e) => return ToolOutput::error(format!("Correct the request object: {e}.")),
         };
-        run(ctx, request, args).await
+        run(ctx, "http_send", request, args).await
     }
 }
 
 #[async_trait]
 impl Tool for HttpRepeat {
     fn spec(&self) -> ToolSpec {
-        let mut p=vec![req("request_id","string","A completed rq ID or last; state is not restored after restart."),opt("patch","object","Overlay method, path, query, headers (null deletes), cookies, json, body or body_base64. Origin changes are refused.").with("additionalProperties",json!(true))];
+        let mut p=vec![req("request_id","string","A completed rq ID, an ex- id of a recorded exchange (works after a restart), or last."),opt("patch","object","Overlay method, path, query, headers (null deletes), cookies, json, body or body_base64. Origin changes are refused.").with("additionalProperties",json!(true))];
         p.extend(fields());
-        spec("http_repeat","Replay a stored HTTP request with a structured patch. Preserve session cookies and recompute framing; no raw-smuggling mode.",ToolClass::Exec,&p)
+        spec(
+            "http_repeat",
+            "Replay a stored HTTP request with a structured patch. Preserve session cookies and recompute framing; no raw-smuggling mode.",
+            ToolClass::Exec,
+            &p,
+        )
     }
     async fn run(&self, ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
         let id = args.get("request_id").and_then(Value::as_str).unwrap_or_default();
         if id.trim().is_empty() {
             return ToolOutput::error("Supply a complete request_id or last.");
+        }
+        if id.starts_with("ex-") {
+            let mut r = match stored_request(ctx, id) {
+                Ok(r) => r,
+                Err(e) => return ToolOutput::error(e),
+            };
+            if let Some(p) = args.get("patch").and_then(Value::as_object) {
+                if let Err(e) = patch(&mut r, p) {
+                    return ToolOutput::error(e);
+                }
+            }
+            let mut out = run(ctx, "http_repeat", r, args).await;
+            out.more.push(format!(
+                "{id} was replayed from its stored request; its cookie jar and captured variables are not restored, so a session cookie must be in the headers or the patch."
+            ));
+            return out;
         }
         let state = ctx.capabilities.http.lock().await;
         let id = if id == "last" {
@@ -146,15 +172,54 @@ impl Tool for HttpRepeat {
         });
         drop(state);
         let Some(mut r) = request.take() else {
-            return ToolOutput::error("Request ID is unknown or ambiguous. Use a complete rq ID from this session; restart discards replay state.");
+            return ToolOutput::error(
+                "Request ID is unknown or ambiguous. Use a complete rq ID from this session; restart discards replay state.",
+            );
         };
         if let Some(p) = args.get("patch").and_then(Value::as_object) {
             if let Err(e) = patch(&mut r, p) {
                 return ToolOutput::error(e);
             }
         }
-        run(ctx, r, args).await
+        run(ctx, "http_repeat", r, args).await
     }
+}
+
+/// The request of a recorded exchange (`ex-` id), read from the session log and the blob store, so it works
+/// after a restart.
+fn stored_request(ctx: &ToolCtx, id: &str) -> Result<Request, String> {
+    let lookup =
+        ctx.capabilities.exchange_lookup.get().ok_or("Recorded exchanges cannot be replayed in this session.")?;
+    let x = lookup(id).ok_or_else(|| {
+        format!("No exchange {id} was recorded by this session. Copy the id from an http_send result or the log.")
+    })?;
+    if x.source == "proxy" && x.tls == "intercepted" || x.method == "TLS" {
+        return Err(format!("{id} is not a replayable HTTP request."));
+    }
+    if x.truncated && x.request_bytes > crate::traffic::CAPTURE_MAX_BYTES as u64 {
+        return Err(format!(
+            "The request of {id} was stored cut at {} bytes; replaying it would send a different body.",
+            crate::traffic::CAPTURE_MAX_BYTES
+        ));
+    }
+    let bytes =
+        ctx.blobs.read_all(&x.request.id).map_err(|e| format!("The stored request of {id} could not be read: {e}."))?;
+    let (method, headers, body) =
+        crate::traffic::parse_request(&bytes).ok_or("The stored request is not a readable HTTP message.")?;
+    let default_port = if x.scheme == "https" { 443 } else { 80 };
+    let host = if x.port == default_port { x.host.clone() } else { format!("{}:{}", x.host, x.port) };
+    let mut r = Request {
+        url: format!("{}://{host}{}", x.scheme, x.target),
+        method,
+        headers: headers.into_iter().collect(),
+        body: String::new(),
+        body_base64: None,
+        json: None,
+    };
+    if !body.is_empty() {
+        r.body_base64 = Some(STANDARD.encode(&body));
+    }
+    Ok(r)
 }
 
 fn checked_url(s: &str) -> Result<Url, String> {
@@ -509,9 +574,20 @@ pub(crate) struct Exchange {
     pub truncated: bool,
     pub read_error: Option<String>,
     pub proxy_generated: bool,
+    /// The id of the `exchange` record this one became (C3); not part of the tool's JSON.
+    #[serde(skip)]
+    ex_id: Option<String>,
 }
 
+/// Where the exchanges a call makes are collected (see `traffic`), with the tool's name.
+type Sink<'a> = Option<(&'a str, &'a std::sync::Mutex<Vec<loom_core::event::Exchange>>)>;
+
 pub(crate) async fn one(ctx: &ToolCtx, client: &Client, r: &Request) -> Result<Exchange, String> {
+    exchange(ctx, client, r, None).await
+}
+
+async fn exchange(ctx: &ToolCtx, client: &Client, r: &Request, sink: Sink<'_>) -> Result<Exchange, String> {
+    let started = std::time::Instant::now();
     let url = checked_url(&r.url)?;
     let _permit = crate::capabilities::target_permit(url.host_str().unwrap_or_default(), &ctx.cancel).await?;
     let method = Method::from_bytes(r.method.as_bytes()).map_err(|_| "Use a valid HTTP method token.")?;
@@ -542,13 +618,33 @@ pub(crate) async fn one(ctx: &ToolCtx, client: &Client, r: &Request) -> Result<E
     if body.len() > 2_000_000 {
         return Err("Request body exceeds two million bytes; use a smaller bounded request.".into());
     }
-    let response = client
-        .request(method, url.clone())
-        .headers(headers)
-        .body(body)
-        .send()
-        .await
-        .map_err(|e| format!("HTTP exchange failed: {e}. Consult the session egress log for proxy decisions."))?;
+    let sent: Vec<(String, String)> =
+        headers.iter().map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("(non-UTF8)").to_string())).collect();
+    let request_wire = crate::traffic::request_message(method.as_str(), &url, &sent, &body);
+    let method_text = method.as_str().to_string();
+    let response = match client.request(method, url.clone()).headers(headers).body(body).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = format!("HTTP exchange failed: {e}. Consult the session egress log for proxy decisions.");
+            if let Some((tool, out)) = sink {
+                let made = crate::traffic::Made {
+                    tool,
+                    url: &url,
+                    method: &method_text,
+                    request: &request_wire,
+                    response: None,
+                    status: None,
+                    error: Some(msg.clone()),
+                    response_cut: false,
+                    started,
+                };
+                if let Some(x) = crate::traffic::record(ctx, &made) {
+                    out.lock().unwrap_or_else(|p| p.into_inner()).push(x);
+                }
+            }
+            return Err(msg);
+        }
+    };
     let proxy_generated =
         crate::web::marked_by_proxy(crate::web::session_proxy(ctx).is_some(), &url, response.headers());
     let status = response.status().as_u16();
@@ -581,6 +677,26 @@ pub(crate) async fn one(ctx: &ToolCtx, client: &Client, r: &Request) -> Result<E
     }
     let body_text = String::from_utf8_lossy(&body).into_owned();
     let forms = extract_forms(&headers, &body_text);
+    let mut ex_id = None;
+    if let Some((tool, out)) = sink {
+        let pairs: Vec<(String, String)> = headers.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let wire = crate::traffic::response_message(status, &pairs, &body);
+        let made = crate::traffic::Made {
+            tool,
+            url: &url,
+            method: &method_text,
+            request: &request_wire,
+            response: Some(&wire),
+            status: Some(status),
+            error: read_error.clone(),
+            response_cut: truncated,
+            started,
+        };
+        if let Some(x) = crate::traffic::record(ctx, &made) {
+            ex_id = Some(x.id.clone());
+            out.lock().unwrap_or_else(|p| p.into_inner()).push(x);
+        }
+    }
     Ok(Exchange {
         request: r.clone(),
         status,
@@ -591,10 +707,11 @@ pub(crate) async fn one(ctx: &ToolCtx, client: &Client, r: &Request) -> Result<E
         truncated,
         read_error,
         proxy_generated,
+        ex_id,
     })
 }
 
-async fn run(ctx: &ToolCtx, mut r: Request, args: &Map<String, Value>) -> ToolOutput {
+async fn run(ctx: &ToolCtx, tool: &str, mut r: Request, args: &Map<String, Value>) -> ToolOutput {
     let origin = match checked_url(&r.url) {
         Ok(u) => u.origin().ascii_serialization(),
         Err(e) => return ToolOutput::error(e),
@@ -649,6 +766,8 @@ async fn run(ctx: &ToolCtx, mut r: Request, args: &Map<String, Value>) -> ToolOu
     let count = args.get("race_count").and_then(Value::as_u64).unwrap_or(1).clamp(1, 20) as usize;
     let barrier = Arc::new(Barrier::new(count));
     let slots = Arc::new(Semaphore::new(ctx.capabilities.target_concurrency as usize));
+    let made: std::sync::Mutex<Vec<loom_core::event::Exchange>> = std::sync::Mutex::new(Vec::new());
+    let made = &made;
     let futures = (0..count).map(|_| {
         let barrier = barrier.clone();
         let slots = slots.clone();
@@ -657,13 +776,20 @@ async fn run(ctx: &ToolCtx, mut r: Request, args: &Map<String, Value>) -> ToolOu
         async move {
             barrier.wait().await;
             let _slot = slots.acquire().await.map_err(|_| "HTTP batch closed.".to_string())?;
-            one(ctx, client, r).await
+            exchange(ctx, client, r, Some((tool, made))).await
         }
     });
     let secs = args.get("timeout_s").and_then(Value::as_u64).unwrap_or(30).clamp(1, 120);
     let result = tokio::select! {biased;_ = ctx.cancel.cancelled()=>return ToolOutput::denied("HTTP batch cancelled. Some requests may have reached the target; do not assume rollback."),
     out=tokio::time::timeout(Duration::from_secs(secs),join_all(futures))=>out};
-    let exchanges=match result {Ok(r)=>r,Err(_)=>return ToolOutput::error("HTTP batch timed out. Requests may have reached the target; no completed replay IDs were committed. Inspect the target before retrying.")};
+    let exchanges = match result {
+        Ok(r) => r,
+        Err(_) => {
+            return ToolOutput::error(
+                "HTTP batch timed out. Requests may have reached the target; no completed replay IDs were committed. Inspect the target before retrying.",
+            );
+        }
+    };
     let mut state = ctx.capabilities.http.lock().await;
     let mut outputs = Vec::new();
     let mut failed = false;
@@ -694,7 +820,8 @@ async fn run(ctx: &ToolCtx, mut r: Request, args: &Map<String, Value>) -> ToolOu
                         }
                     }
                 }
-                let mut entry = json!({"request_id":id,"exchange":e,"capture_errors":capture_errors});
+                let mut entry =
+                    json!({"request_id":id,"exchange_id":e.ex_id,"exchange":e,"capture_errors":capture_errors});
                 if let Some(diff) = differential {
                     if let Some(obj) = entry.as_object_mut() {
                         obj.insert("differential_observation".into(), diff);
@@ -704,7 +831,8 @@ async fn run(ctx: &ToolCtx, mut r: Request, args: &Map<String, Value>) -> ToolOu
             }
         }
     }
-    ToolOutput{status:if failed{ToolStatus::Error}else{ToolStatus::Ok},outcome:format!("{} HTTP exchanges",outputs.len()),more:vec!["redirects not followed; race workers respect a two-request per-host limit; captures/cookies are session-local".into()],body:Body::Raw(json!(outputs).to_string().into_bytes()),meta:Map::new()}
+    let recorded = std::mem::take(&mut *made.lock().unwrap_or_else(|p| p.into_inner()));
+    ToolOutput{status:if failed{ToolStatus::Error}else{ToolStatus::Ok},outcome:format!("{} HTTP exchanges",outputs.len()),more:vec!["redirects not followed; race workers respect a two-request per-host limit; captures/cookies are session-local".into()],body:Body::Raw(json!(outputs).to_string().into_bytes()),meta:Map::new()}.with_exchanges(&recorded)
 }
 
 fn expand_json(v: Value, vars: &BTreeMap<String, Variable>, origin: &str) -> Result<Value, String> {
@@ -786,7 +914,7 @@ mod tests {
         let ctx = env.ctx;
         let args = json!({"capture":{"jwt":"json:/token"}});
         let r: Request = serde_json::from_value(json!({"url":format!("http://{addr}/login"),"method":"POST"})).unwrap();
-        let out = run(&ctx, r, args.as_object().unwrap()).await;
+        let out = run(&ctx, "http_send", r, args.as_object().unwrap()).await;
         assert_eq!(out.status, ToolStatus::Ok);
         let out=HttpRepeat.run(&ctx,json!({"request_id":"rq1","patch":{"path":"/check","headers":{"Authorization":"Bearer {{jwt}}","Content-Length":"999","Transfer-Encoding":"chunked"},"body":"new"},"race_count":2}).as_object().unwrap()).await;
         let Body::Raw(bytes) = out.body else { panic!() };

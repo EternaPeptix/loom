@@ -568,7 +568,8 @@ async fn synthesize_inline_evidence(
     // Preflight all synthesized records and the SecurityOp against a cloned LedgerState so a core
     // validation failure never leaves stray ClaimAdd / EvidenceAdd entries in the real journal.
     let mut staged = state.clone();
-    let auto_claim_op = LedgerOp::ClaimAdd { text: "Observed mission output for security evidence.".into() };
+    let auto_claim_op =
+        LedgerOp::ClaimAdd { text: "Observed mission output for security evidence.".into(), assets: Vec::new() };
     let staged_claim_id = match &target_claim {
         Some(id) => id.clone(),
         None => {
@@ -887,11 +888,16 @@ fn touched_report(before: &SecurityState, after: &SecurityState, addressed: &Sec
 #[async_trait]
 impl Tool for SecurityQuery {
     fn spec(&self) -> ToolSpec {
-        spec("security_query", "Read durable security state: the typed records, coverage, routes to revisit, and ID resolution. It is a read; nothing it returns is a conclusion drawn by the harness.", ToolClass::State, &[
-            req("view", "string", "The view.").one_of(&["state","assets","coverage","revisit","resolve"]),
-            opt("target", "string", "Exact ID, alias, or unambiguous prefix for resolve."),
-            opt("now_ms", "integer", "Expiry evaluation time, default current UTC milliseconds.").min(0),
-        ])
+        spec(
+            "security_query",
+            "Read durable security state: the typed records, coverage, routes to revisit, and ID resolution. It is a read; nothing it returns is a conclusion drawn by the harness.",
+            ToolClass::State,
+            &[
+                req("view", "string", "The view.").one_of(&["state", "assets", "coverage", "revisit", "resolve"]),
+                opt("target", "string", "Exact ID, alias, or unambiguous prefix for resolve."),
+                opt("now_ms", "integer", "Expiry evaluation time, default current UTC milliseconds.").min(0),
+            ],
+        )
     }
     async fn run(&self, _ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
         let ledger = match self.0.ledger() {
@@ -922,11 +928,16 @@ impl Tool for SecurityQuery {
 #[async_trait]
 impl Tool for SecurityIngest {
     fn spec(&self) -> ToolSpec {
-        spec("security_ingest", "Import asset observations from an existing scanner-output blob. Supply attested evidence IDs citing that exact output; record evidence first. Supported formats: nmap XML, nuclei JSONL, ffuf JSON, netexec JSON, BloodHound JSON. Scanner hits remain unverified observations and grant no scope. No scans or network requests are performed.", ToolClass::State, &[
-            req("format", "string", "Scanner format.").one_of(&["nmap","nuclei","ffuf","netexec","bloodhound"]),
-            req("handle", "string", "Existing observed out: handle of scanner output."),
-            req("evidence", "array", "Attested evidence IDs citing the scanner output.").items("string"),
-        ])
+        spec(
+            "security_ingest",
+            "Import asset observations from an existing scanner-output blob. Supply attested evidence IDs citing that exact output; record evidence first. Supported formats: nmap XML, nuclei JSONL, ffuf JSON, netexec JSON, BloodHound JSON. Scanner hits remain unverified observations and grant no scope. No scans or network requests are performed.",
+            ToolClass::State,
+            &[
+                req("format", "string", "Scanner format.").one_of(&["nmap", "nuclei", "ffuf", "netexec", "bloodhound"]),
+                req("handle", "string", "Existing observed out: handle of scanner output."),
+                req("evidence", "array", "Attested evidence IDs citing the scanner output.").items("string"),
+            ],
+        )
     }
     async fn run(&self, ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
         let ledger = match self.0.ledger() {
@@ -961,7 +972,9 @@ impl Tool for SecurityIngest {
         match ctx.blobs.meta(&blob) {
             Ok(meta) if meta.bytes <= 2 * 1024 * 1024 => {}
             Ok(_) => {
-                return ToolOutput::error("Scanner imports are limited to 2 MiB; split the output before importing it.")
+                return ToolOutput::error(
+                    "Scanner imports are limited to 2 MiB; split the output before importing it.",
+                );
             }
             Err(e) => return ToolOutput::error(format!("The scanner output could not be read: {e}.")),
         }
@@ -1008,7 +1021,7 @@ mod tests {
         serde_json::Deserializer::from_str(&text[start..]).into_iter::<Value>().next().unwrap().unwrap()
     }
     fn evidence(r: &Rig, handle: &str) {
-        r.model_op(LedgerOp::ClaimAdd { text: "scanner output observed".into() });
+        r.model_op(LedgerOp::ClaimAdd { text: "scanner output observed".into(), assets: Vec::new() });
         let blob = r.env.ctx.blobs.resolve(handle).unwrap();
         r.model_op(LedgerOp::EvidenceAdd(EvidenceInput {
             claim: "c1".into(),
@@ -1410,7 +1423,7 @@ mod tests {
 
         // Prefers the latest open claim over closed claims, and handles object quote specs + oversized single lines.
         r.model_op(LedgerOp::ClaimUpdate { id: "c1".into(), status: ClaimStatus::Supported, note: "done".into() });
-        r.model_op(LedgerOp::ClaimAdd { text: "second open claim".into() });
+        r.model_op(LedgerOp::ClaimAdd { text: "second open claim".into(), assets: Vec::new() });
         let big_line =
             format!("{{\"results\":[{{\"url\":\"http://10.0.0.5/api\",\"body\":\"{}\"}}]}}\n", "x".repeat(2500));
         let h2 = r.output(&big_line, "http_send", ToolClass::Exec);

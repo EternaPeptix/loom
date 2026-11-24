@@ -1920,6 +1920,11 @@ Name them when you start a new mission instead."
             return Err(format!("the session log {} holds no readable record", path.display()));
         }
         let mut session = Session::bare(deps, log, report.records, registry);
+        for r in &session.records {
+            if let Event::Exchange(x) = &r.event {
+                session.deps.shared.traffic.mission.add(x);
+            }
+        }
         session.deps.shared.take_continuation();
         // A durable plan is an audit artifact, never a restart queue: the last dispatch may
         // have taken effect without a receipt. Reconcile it through a real actor callback.
@@ -2224,6 +2229,9 @@ Name them when you start a new mission instead."
             }
         }
         let record = self.log.append(author, event).map_err(fatal)?;
+        if let Event::Exchange(x) = &record.event {
+            self.deps.shared.traffic.mission.add(x);
+        }
         self.st.absorb(self.records.len(), &record);
         self.deps.sink.record(&self.deps.shared.session, &record);
         let seq = record.seq;
@@ -2235,6 +2243,20 @@ Name them when you start a new mission instead."
     fn flush_emitted(&mut self) -> R<()> {
         for (author, event) in self.deps.shared.take_emitted() {
             self.append(author, event)?;
+        }
+        self.flush_traffic()
+    }
+
+    /// Append the exchanges the proxy captured since the last flush (CONTRACTS-TRAFFIC-TARGETS C3), and the
+    /// one note that capture stopped at the session's cap.
+    fn flush_traffic(&mut self) -> R<()> {
+        let traffic = self.deps.shared.traffic.clone();
+        let (list, note) = traffic.take_pending();
+        for x in list {
+            self.append(Author::Harness, Event::Exchange(x))?;
+        }
+        if let Some(text) = note {
+            self.note(Author::Harness, NoteKind::Info, text)?;
         }
         Ok(())
     }
@@ -2459,6 +2481,7 @@ Name them when you start a new mission instead."
     }
 
     async fn idle_input(&mut self, input: Input) -> R<Option<Trigger>> {
+        self.flush_traffic()?;
         match input {
             Input::Resume => {
                 // What was queued while the session ran (and kept by a stop) goes first.
@@ -2746,6 +2769,7 @@ Name them when you start a new mission instead."
     /// Record a job event. True when a note was appended that should wake a waiting session.
     /// Record a job event. `Some`: the turn it starts when the session is idle.
     async fn on_job_event(&mut self, event: JobEvent) -> R<Option<Trigger>> {
+        self.flush_traffic()?;
         let asleep = matches!(self.st.last_end, Some(TurnEndReason::Waiting | TurnEndReason::Yielded));
         match event {
             JobEvent::Registered(info) => {
@@ -4255,6 +4279,7 @@ Name them when you start a new mission instead."
                 self.claim_early(run, &early, &ctx, call).await
             } else {
                 if class == ToolClass::Exec {
+                    self.deps.shared.traffic.call_started(&call.call_id, now_ms());
                     self.append(Author::Harness, Event::ExecStarted { call_id: call.call_id.clone() })?;
                 }
                 let admission = Admission { policy: &policy, estimator: &self.estimator };
@@ -4283,7 +4308,14 @@ Name them when you start a new mission instead."
                 }
                 result.output.as_ref().map(|blob| texts::flag_candidate(&blob.handle()))
             });
+            // The exchanges the tool made itself follow its result, each with the call's id (C3).
+            let made = std::mem::take(&mut result.exchanges);
             self.append(Author::Tool, Event::ToolResult(result))?;
+            self.deps.shared.traffic.call_ended(&call.call_id, now_ms());
+            for x in made {
+                self.deps.shared.traffic.count_one();
+                self.append(Author::Tool, Event::Exchange(x))?;
+            }
             if let Some(text) = flag_note {
                 let already = self.own().iter().any(
                     |r| matches!(&r.event, Event::HarnessNote { note: NoteKind::Info, text: old } if old == &text),
@@ -6670,6 +6702,7 @@ mod tests {
         let c = ToolCall { call_id, req_id: "r-1".into(), name: "bash".into(), args, class };
         session.append(Author::Model, Event::ToolCall(c)).unwrap();
         let result = loom_core::event::ToolResult {
+            exchanges: Vec::new(),
             call_id: CallId::from(call),
             name: "bash".into(),
             status: ToolStatus::Ok,
@@ -6693,6 +6726,7 @@ mod tests {
         std::fs::create_dir_all(&b).unwrap();
         for (i, dir) in [&a, &b].into_iter().enumerate() {
             let result = loom_core::event::ToolResult {
+                exchanges: Vec::new(),
                 call_id: CallId::from(format!("c{i}")),
                 name: "bash".into(),
                 status: ToolStatus::Ok,

@@ -1045,7 +1045,9 @@ impl Tool for Attempt {
                     .map(str::to_string)
                     .collect();
                 if texts.len() != items.len() {
-                    return ToolOutput::error("Every entry of `approaches` must be a sentence saying how one attempt should go about the assignment.");
+                    return ToolOutput::error(
+                        "Every entry of `approaches` must be a sentence saying how one attempt should go about the assignment.",
+                    );
                 }
                 texts
             }
@@ -1053,7 +1055,7 @@ impl Tool for Attempt {
                 return ToolOutput::error(format!(
                     "`approaches` must be a list of sentences; received {}.",
                     describe(other)
-                ))
+                ));
             }
         };
         let asked = args.get("n").and_then(Value::as_u64).and_then(|n| usize::try_from(n).ok());
@@ -1065,11 +1067,13 @@ impl Tool for Attempt {
             (Some(n), len) => {
                 return ToolOutput::error(format!(
                     "`approaches` has {len} entries and `n` is {n}. Give one approach per attempt, or leave `n` out."
-                ))
+                ));
             }
         };
         if n < 2 {
-            return ToolOutput::error("An attempt set has at least 2 attempts. For a single agent in its own copy use agent_spawn with workspace: \"copy\".");
+            return ToolOutput::error(
+                "An attempt set has at least 2 attempts. For a single agent in its own copy use agent_spawn with workspace: \"copy\".",
+            );
         }
         let max = usize::try_from(shared.agents.max_children).unwrap_or(usize::MAX);
         let running = shared.orch.children(&shared.session).await.iter().filter(|c| c.running).count();
@@ -1263,7 +1267,7 @@ impl Tool for AgentAdopt {
             Ok(None) => {
                 return ToolOutput::error(format!(
                     "Agent {agent} worked in your workspace, not in a copy of it: what it changed is already here, and there is nothing to adopt."
-                ))
+                ));
             }
             Err(e) => return ToolOutput::error(e),
         };
@@ -1299,7 +1303,11 @@ impl Tool for AgentAdopt {
         });
         let adopted = match adopting.await {
             Ok(result) => result,
-            Err(e) => return ToolOutput::error(format!("The adoption did not run to its end: {e}. Call agent_adopt again: paths already brought over are left alone.")),
+            Err(e) => {
+                return ToolOutput::error(format!(
+                    "The adoption did not run to its end: {e}. Call agent_adopt again: paths already brought over are left alone."
+                ));
+            }
         };
         let listed = |paths: &[(String, String)]| {
             let mut text: String =
@@ -1373,7 +1381,9 @@ impl Tool for AgentMessage {
             return AgentStop(self.0.clone()).run(ctx, &stop).await;
         }
         let (Some(agent), Some(text)) = (str_arg(args, "agent"), str_arg(args, "text")) else {
-            return ToolOutput::error("Give `agent` (the agent's id) and `text` (the message), both as strings; or `stop: true` to end the agent.");
+            return ToolOutput::error(
+                "Give `agent` (the agent's id) and `text` (the message), both as strings; or `stop: true` to end the agent.",
+            );
         };
         let id = match shared.orch.resolve_child(&shared.session, &SessionId::from(agent)).await {
             Ok(id) => id,
@@ -2114,7 +2124,7 @@ mod tests {
     // ---- verify ----
 
     fn with_claim(r: &Rig, with_evidence: bool) {
-        r.model_op(LedgerOp::ClaimAdd { text: "The cache is never stale".into() });
+        r.model_op(LedgerOp::ClaimAdd { text: "The cache is never stale".into(), assets: Vec::new() });
         if with_evidence {
             let handle = r.output("line one\nline two\nline three", "bash", ToolClass::Exec);
             assert!(handle.starts_with("out:"));

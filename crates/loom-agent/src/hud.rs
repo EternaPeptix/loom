@@ -514,6 +514,7 @@ mod tests {
         rec(
             seq,
             Event::ToolResult(ToolResult {
+                exchanges: Vec::new(),
                 call_id: CallId::from(id),
                 name: name.into(),
                 status: ToolStatus::Ok,
@@ -906,6 +907,7 @@ Waiting on the operator (1):\n- q2: Which branch should this target?",
         use loom_core::ledger::{Claim, ClaimStatus};
         let mut l = ledger();
         l.claims = vec![Claim {
+            assets: Vec::new(),
             id: "c1".into(),
             text: "the parser drops the last token".into(),
             status: ClaimStatus::Supported,
@@ -1117,6 +1119,7 @@ Waiting on the operator (1):\n- q2: Which branch should this target?",
         recs.push(rec(
             seq,
             Event::ToolResult(ToolResult {
+                exchanges: Vec::new(),
                 call_id: CallId::from("rf_err"),
                 name: "read".into(),
                 status: ToolStatus::Error,

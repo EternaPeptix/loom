@@ -19,6 +19,8 @@ pub struct SessionTools {
     pub target_concurrency: u32,
     pub binary_cache: Mutex<BTreeMap<String, Vec<u8>>>,
     pub oracle_contract: crate::oracle::ContractCache,
+    /// Finds a recorded exchange of this session by its `ex-` id, from the session log (set by the runtime).
+    pub exchange_lookup: OnceLock<Arc<crate::traffic::ExchangeLookup>>,
 }
 
 impl Default for SessionTools {
@@ -36,6 +38,7 @@ impl SessionTools {
             target_concurrency: target_concurrency.clamp(1, 2),
             binary_cache: Mutex::new(BTreeMap::new()),
             oracle_contract: crate::oracle::ContractCache::default(),
+            exchange_lookup: OnceLock::new(),
         }
     }
 }
@@ -135,7 +138,9 @@ pub fn guard_script(script: &str) -> Result<(), String> {
         None
     };
     match blocked {
-        Some(next) => Err(format!("Command guard blocked an interactive or unbounded pattern. {next} This guard does not replace the sandbox or scope policy.")),
+        Some(next) => Err(format!(
+            "Command guard blocked an interactive or unbounded pattern. {next} This guard does not replace the sandbox or scope policy."
+        )),
         None => Ok(()),
     }
 }

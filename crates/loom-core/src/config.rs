@@ -1240,7 +1240,7 @@ pub fn resolve_profile<'a>(
             return Err(ConfigError::Invalid(format!(
                 "no model given and no default_model set. Pass --model <name> or set default_model in the config ({}).",
                 configured()
-            )))
+            )));
         }
     };
     models.get_key_value(wanted).map(|(k, v)| (k.as_str(), v)).ok_or_else(|| {
@@ -1338,6 +1338,11 @@ impl Paths {
     }
     pub fn session_log(&self, id: &SessionId) -> PathBuf {
         self.session_dir(id).join("log.jsonl")
+    }
+    /// The interception CA (`loom-ca.pem`, `loom-ca.key`; CONTRACTS-TRAFFIC-TARGETS I2). Under the loom home,
+    /// which no command can read.
+    pub fn ca_dir(&self) -> PathBuf {
+        self.home.join("ca")
     }
     /// Scratch directory a session's commands may write to.
     pub fn session_tmp(&self, id: &SessionId) -> PathBuf {
@@ -1867,7 +1872,9 @@ allow = ["*.example.test"]
         assert!(!pinned_image(&format!("@{DIGEST}")));
         assert!(!pinned_image(&format!("-x@{DIGEST}")));
         // The helper image is pinned the same way.
-        let text = format!("[box]\nenabled = true\nssh_host = \"h\"\nremote_socket = \"/s\"\nimage = \"{DIGEST}\"\nhelper_image = \"alpine:3\"");
+        let text = format!(
+            "[box]\nenabled = true\nssh_host = \"h\"\nremote_socket = \"/s\"\nimage = \"{DIGEST}\"\nhelper_image = \"alpine:3\""
+        );
         assert!(Config::parse(&text).unwrap().check().unwrap_err().to_string().contains("box.helper_image"));
     }
 

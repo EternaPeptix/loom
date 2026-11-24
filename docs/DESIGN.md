@@ -699,6 +699,17 @@ only when every check passes and, where verification is required, a verifier acc
   confirm impossibility. A mission the operator released (`OperatorRelease`) may finish without a
   conclusion; it is delivered as `[closed by operator, goal not established]` and is not verified. Free
   termination roles are not gated.
+- Findings tied to traffic. A role with `require_traffic = true` (the finishing roles of `ctf`, `redteam` and
+  `vr`) cannot `finish`, or `conclude` with `met`, while a claim the answer relies on (the supported claims the
+  `finish` evidence cites, or every supported claim when it cites none) names a network host that none of the
+  claim's attested, supporting evidence reached. The hosts a claim names come from `loom_core::target::claim_hosts`:
+  its `assets` (new optional field of `claim`; host, service and endpoint assets count, file and identity do not),
+  URLs in its text, and, once a mission has a target, hosts of its text inside the target's scope. A host is reached
+  when that evidence cites a call during which an exchange with the host (any port) was recorded with a status, or
+  quotes the blob of such an exchange. The refusal names only the tools the role is shown:
+  `finish cannot be accepted yet: c3 names api.acme.test, but none of its supporting evidence reached it. Cite the
+  evidence of a call that did (http_send, web_fetch, or a command while interception is on for this mission;
+  interception is off), or take the host out of the claim.` A mission the operator released is not gated.
 - A lead's `finish` is refused while the ledger has open items (§7); otherwise a finish claim `f{n}` is
   recorded. Verification is required when the role has `verify_finish` and the config's
   `agents.verify_finish` is on (default). Without it the result is delivered marked `[not verified]`.
@@ -1463,6 +1474,36 @@ The box tools are `Exec` (`box_exec`, `box_reset`) and `Write` (`box_get`) calls
 is an ordinary job, and killing it signals the process group in the container through `docker exec`
 (`proc::RemoteStop`). Not done: a box for an agent that has its own workspace copy; wildcard grants; IPv6;
 a remote stop for a box job adopted after a daemon restart (its record does not keep one).
+
+**Captured exchanges** (`loom-agent::traffic`, `loom-tools::traffic`). Every HTTP exchange of a session is a record
+in its log: `Event::Exchange` with `id` (`ex-` and 12 base32 characters), `call_id`, `source` (`tool` or
+`proxy`), `tool`, `scheme`, `tls` (`plain`, `intercepted` or `tool`), `method`, `host`, `port`, `target`,
+`status`, `error`, `request` and `response` (blobs holding the HTTP/1.1 messages), byte counts, `truncated` and
+`duration_ms`. The in-process tools (`http_send`, `http_repeat`, `web_fetch`, MCP over HTTP) store the messages they
+sent and received and hand the exchanges back through the reserved `META_EXCHANGES` meta key; `finalize` moves
+them to `ToolResult::exchanges` and the session appends one `exchange` right after the call's `tool_result`, with
+the call's id. They are recorded whether or not the proxy captures. The proxy's exchanges arrive on the runtime's
+capture sink; the runtime stores both messages as blobs and attributes each to the call running when it started
+(between `exec_started` and `tool_result`); a background job's exchange has no call id. `[network]
+capture_max_bytes` (1 MiB) bounds each body; `capture_max_exchanges` (100 000) bounds a session, after which one
+note says capture stopped and traffic is still relayed. `Authorization`, `Cookie`, `Set-Cookie`,
+`Proxy-Authorization` and `X-Api-Key` stay in the stored messages (they are the evidence) and are masked only by
+views. `http_send`'s result names the `ex-` id beside each `rq` id, and `http_repeat` accepts an `ex-` id: the
+request is read back from the log's blobs, so it works after a restart (cookie jar and captured variables are not
+restored). The compaction key table lists the newest 40 exchanges under "Traffic" as `ex-… · METHOD host/target ·
+status` with the keys of both messages.
+
+**HTTPS interception** (opt-in; `Runtime::decide_intercept`). `[network] intercept` is `"pack"` (default),
+`"always"` or `"never"`. With `"pack"` a mission intercepts when its pack says `intercept = true` (ctf, redteam,
+vr) unless it was started with `intercept: false` (API body, `loom run --no-intercept`); another pack's mission may
+be started with `intercept: true`. The choice is recorded in `session_start.intercept` and `SessionMeta.intercept`
+and every child inherits it. An intercepting session is granted with `Proxy::grant_with_capture`; the CA is
+`~/.loom/ca/loom-ca.{pem,key}` (`Ca::load_or_create`), created on first use, and a mission that was promised
+decrypted traffic does not start when it cannot be loaded. The session's tmp dir gets `ca-bundle.pem` (system roots
+plus the loom CA) and the session's command environment sets `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`,
+`CURL_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`, `GIT_SSL_CAINFO`, `PIP_CERT` and `AWS_CA_BUNDLE` to it; nothing is added
+to any trust store. The loom home, CA key included, is never readable from the sandbox (`check_read`). A session
+with interception off and no capture is granted and run exactly as before.
 
 **Tool shapes.** Models are not fine-tuned for loom, so `read`, `write`, `edit`, `bash`, `grep` and `glob` are shown in Claude Code's argument names (`ToolsCfg.dialect`, default `trained`; `loom` shows loom's own), and calls in the shapes other widely trained harnesses use (Codex `apply_patch`, Cline `replace_in_file`, `str_replace_editor`, Gemini and Cursor names, `TodoWrite`, and so on) are converted to loom's tools before checking, with the repair named in the result. The tables and rules are in `TOOL-SHAPES.md`; the code is `loom-tools/src/dialect.rs`, called from `prepare`.
 

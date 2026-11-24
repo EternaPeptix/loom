@@ -235,6 +235,9 @@ pub struct TableInput {
     pub compact_at: u64,
 }
 
+/// Exchanges the key table lists.
+const TRAFFIC_ROWS: usize = 40;
+
 struct Row {
     seq: Seq,
     key: String,
@@ -308,6 +311,7 @@ pub fn build_table(records: &[Record], input: &TableInput) -> (String, Vec<Strin
     let mut files: Vec<(String, u64, u64, u32, Seq, Option<String>)> = Vec::new();
     let mut jobs: Vec<(String, String, u32)> = Vec::new();
     let mut agents: Vec<(String, String, String, String, Option<String>)> = Vec::new();
+    let mut traffic: Vec<&crate::event::Exchange> = Vec::new();
     for r in records {
         if r.seq > upto {
             break;
@@ -353,6 +357,7 @@ pub fn build_table(records: &[Record], input: &TableInput) -> (String, Vec<Strin
                     None,
                 ));
             }
+            Event::Exchange(x) => traffic.push(x),
             Event::ChildSettled(c) if !c.inline || c.full.is_some() => {
                 let outcome = serde_json::to_value(c.outcome).ok().and_then(|v| v.as_str().map(str::to_string));
                 if let Some(a) = agents.iter_mut().find(|a| a.0 == c.child.to_string()) {
@@ -466,6 +471,35 @@ pub fn build_table(records: &[Record], input: &TableInput) -> (String, Vec<Strin
                 "\n… {} earlier outputs (steps {lo}–{hi}) are not listed: search them with log_search.",
                 unlisted.len()
             );
+        }
+        sections.push(s);
+    }
+    if !traffic.is_empty() {
+        // The newest exchanges; each lists the keys of its request and response so a summary can still read them.
+        let skip = traffic.len().saturating_sub(TRAFFIC_ROWS);
+        let mut s = String::from("Traffic — the request and response of each are outputs: read(path: \"out:<key>\")");
+        for x in traffic.iter().skip(skip) {
+            let status = x.status.map_or_else(
+                || x.error.as_deref().map_or("no response".to_string(), |e| one_line_cut(e, 60)),
+                |c| c.to_string(),
+            );
+            let _ = write!(
+                s,
+                "\n{} · {} {}{} · {status} · {}",
+                x.id,
+                x.method,
+                x.host,
+                one_line_cut(&x.target, 80),
+                x.request.handle()
+            );
+            keys.push(x.request.handle());
+            if let Some(r) = &x.response {
+                let _ = write!(s, " · {}", r.handle());
+                keys.push(r.handle());
+            }
+        }
+        if skip > 0 {
+            let _ = write!(s, "\n… {skip} earlier exchanges are not listed: search them with log_search.");
         }
         sections.push(s);
     }

@@ -146,8 +146,14 @@ impl Tool for LogSearch {
             "Search the complete record of this session for a regular expression: every message, every call you made and every output — including anything that is no longer in view. Matches in tool output come with the out:… handle and line number, which `read` opens.",
             ToolClass::Nav,
             &[
-                req("pattern", "string", "A regular expression (Rust regex syntax, case-sensitive; prefix (?i) to ignore case)."),
-                opt("in", "string", "Which part of the record to search.").one_of(&["all", "messages", "calls", "outputs"]).default(json!("all")),
+                req(
+                    "pattern",
+                    "string",
+                    "A regular expression (Rust regex syntax, case-sensitive; prefix (?i) to ignore case).",
+                ),
+                opt("in", "string", "Which part of the record to search.")
+                    .one_of(&["all", "messages", "calls", "outputs"])
+                    .default(json!("all")),
                 opt("max", "integer", "The most lines to return.").min(1).max(500).default(json!(60)),
             ],
         )
@@ -166,7 +172,7 @@ impl Tool for LogSearch {
             Err(e) => {
                 return ToolOutput::error(format!(
                     "The pattern is not a valid regular expression: {e}\nNothing was searched."
-                ))
+                ));
             }
         };
         let report = match read_records(&self.0.log_path) {
@@ -267,6 +273,7 @@ mod tests {
 
     fn result(call: &str, name: &str, text: &str, output: Option<BlobRef>, meta: Map<String, Value>) -> Event {
         Event::ToolResult(ToolResult {
+            exchanges: Vec::new(),
             call_id: CallId::from(call),
             name: name.into(),
             status: ToolStatus::Ok,

@@ -1151,7 +1151,12 @@ mod tests {
         let journal = crate::journal::Journal::new(dir.path().join("journal.jsonl"), vec![7; 32]);
         let session = SessionId::from("s-test");
         journal
-            .append(&session, false, LedgerOp::ClaimAdd { text: "scanner observed host".into() }, &|_| Ok(()))
+            .append(
+                &session,
+                false,
+                LedgerOp::ClaimAdd { text: "scanner observed host".into(), assets: Vec::new() },
+                &|_| Ok(()),
+            )
             .unwrap();
         let mut input = ledger().evidence[0].input.clone();
         input.claim = "c1".into();

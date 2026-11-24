@@ -45,9 +45,34 @@ pub(super) struct Shared {
     pub list_changed: AtomicBool,
     ring: StdMutex<VecDeque<String>>,
     dropped: AtomicU64,
+    /// HTTP messages of the current call, taken by the tool after it (CONTRACTS-TRAFFIC-TARGETS C3).
+    traffic: StdMutex<Vec<Raw>>,
 }
 
+/// One POST of the HTTP transport, before it is stored as an exchange.
+pub(super) struct Raw {
+    pub url: String,
+    pub request: Vec<u8>,
+    pub response: Option<Vec<u8>>,
+    pub status: Option<u16>,
+    pub error: Option<String>,
+    pub started: std::time::Instant,
+}
+
+const TRAFFIC_BUFFER: usize = 64;
+
 impl Shared {
+    fn push_traffic(&self, raw: Raw) {
+        let mut t = lock(&self.traffic);
+        if t.len() < TRAFFIC_BUFFER {
+            t.push(raw);
+        }
+    }
+
+    pub fn take_traffic(&self) -> Vec<Raw> {
+        std::mem::take(&mut *lock(&self.traffic))
+    }
+
     pub fn next_id(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::Relaxed) + 1
     }
@@ -154,7 +179,7 @@ pub(super) async fn initialize<T: Transport + ?Sized>(t: &T, shared: &Shared) ->
     let result = match t.rpc(shared.next_id(), "initialize", params).await {
         Ok(r) => r,
         Err(Fail::Rpc { code, message, .. }) => {
-            return Err(format!("the server refused to initialize (error {code}): {message}"))
+            return Err(format!("the server refused to initialize (error {code}): {message}"));
         }
         Err(Fail::NotSent(m) | Fail::Lost(m)) => return Err(m),
         Err(Fail::Expired) => return Err("the server forgot the session during initialize".into()),
@@ -519,6 +544,29 @@ impl Http {
         rb
     }
 
+    /// The request as it goes out (headers the transport adds are included; stored as sent, C5).
+    fn request_wire(&self, body: &Value) -> Vec<u8> {
+        let mut headers: Vec<(String, String)> = vec![
+            ("Accept".into(), "application/json, text/event-stream".into()),
+            ("Content-Type".into(), "application/json".into()),
+        ];
+        for (n, v) in &self.extra {
+            headers.push((n.to_string(), v.to_str().unwrap_or_default().to_string()));
+        }
+        if let Some(s) = self.session() {
+            headers.push(("Mcp-Session-Id".into(), s));
+        }
+        if let Some(p) = lock(&self.protocol).clone() {
+            headers.push(("MCP-Protocol-Version".into(), p));
+        }
+        match url::Url::parse(&self.url) {
+            Ok(u) => {
+                crate::traffic::request_message("POST", &u, &headers, &serde_json::to_vec(body).unwrap_or_default())
+            }
+            Err(_) => Vec::new(),
+        }
+    }
+
     fn post_builder(&self, body: &Value) -> reqwest::RequestBuilder {
         self.builder(reqwest::Method::POST)
             .header("Accept", "application/json, text/event-stream")
@@ -534,11 +582,21 @@ impl Http {
     /// POST a request and read the answer with id `want`.
     async fn post(&self, body: &Value, want: u64) -> Result<Value, Fail> {
         let sent_with_session = self.session().is_some();
+        let started = std::time::Instant::now();
+        let request_wire = self.request_wire(body);
         let mut resp = match self.post_builder(body).send().await {
             Ok(r) => r,
             Err(e) => {
                 let connect = e.is_connect();
                 let text = e.without_url().to_string();
+                self.shared.push_traffic(Raw {
+                    url: self.url.clone(),
+                    request: request_wire,
+                    response: None,
+                    status: None,
+                    error: Some(text.clone()),
+                    started,
+                });
                 return Err(if connect {
                     Fail::NotSent(format!("could not connect to the server: {text}"))
                 } else {
@@ -555,8 +613,24 @@ impl Http {
         }
         let content_type =
             resp.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("").to_ascii_lowercase();
+        let head: Vec<(String, String)> = resp
+            .headers()
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("(non-UTF8)").to_string()))
+            .collect();
+        let note = |body: &[u8], error: Option<String>| {
+            self.shared.push_traffic(Raw {
+                url: self.url.clone(),
+                request: request_wire.clone(),
+                response: Some(crate::traffic::response_message(status.as_u16(), &head, body)),
+                status: Some(status.as_u16()),
+                error,
+                started,
+            });
+        };
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
+            note(text.as_bytes(), None);
             if let Ok(msg) = serde_json::from_str::<Value>(&text) {
                 if let Incoming::Response(_, Err(fail)) = classify(&msg) {
                     return Err(fail);
@@ -571,18 +645,27 @@ impl Http {
         }
         if content_type.starts_with("text/event-stream") {
             let mut sse = Sse::default();
+            let mut seen: Vec<u8> = Vec::new();
             loop {
                 let chunk = match resp.chunk().await {
                     Ok(Some(c)) => c,
                     Ok(None) => break,
-                    Err(e) => return Err(Fail::Lost(format!("the event stream failed: {}", e.without_url()))),
+                    Err(e) => {
+                        let why = format!("the event stream failed: {}", e.without_url());
+                        note(&seen, Some(why.clone()));
+                        return Err(Fail::Lost(why));
+                    }
                 };
+                if seen.len() < crate::traffic::CAPTURE_MAX_BYTES {
+                    seen.extend_from_slice(&chunk);
+                }
                 for data in sse.push(&chunk) {
                     if let Some(r) = self.on_message(&data, want).await {
                         return r;
                     }
                 }
             }
+            note(&seen, None);
             if let Some(data) = sse.finish() {
                 if let Some(r) = self.on_message(&data, want).await {
                     return r;
@@ -591,6 +674,7 @@ impl Http {
             return Err(Fail::Lost("the event stream ended without an answer".into()));
         }
         let bytes = resp.bytes().await.map_err(|e| Fail::Lost(format!("the answer failed: {}", e.without_url())))?;
+        note(&bytes, None);
         let text = String::from_utf8_lossy(&bytes).into_owned();
         if let Some(r) = self.on_message(&text, want).await {
             return r;

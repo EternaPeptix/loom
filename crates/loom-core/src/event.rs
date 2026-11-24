@@ -806,6 +806,10 @@ pub struct ToolResult {
     /// Images the result carries (`read` of an image file). Skipped when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<ImageRef>,
+    /// The exchanges the tool made itself (`http_send`, `web_fetch`, MCP over HTTP): the session records one
+    /// `exchange` right after this result. Never serialized here: each is its own record.
+    #[serde(skip)]
+    pub exchanges: Vec<Exchange>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1087,6 +1091,7 @@ mod tests {
         assert_eq!(serde_json::from_value::<Record>(v).unwrap(), r);
 
         let t = ToolResult {
+            exchanges: Vec::new(),
             call_id: CallId::from("c1"),
             name: "read".into(),
             status: ToolStatus::Ok,
@@ -1267,6 +1272,7 @@ mod tests {
             (
                 "tool_result",
                 Event::ToolResult(ToolResult {
+                    exchanges: Vec::new(),
                     call_id: c(),
                     name: "bash".into(),
                     status: ToolStatus::Ok,
@@ -1429,6 +1435,7 @@ mod tests {
     #[test]
     fn struct_variants_round_trip() {
         let r = record(Event::ToolResult(ToolResult {
+            exchanges: Vec::new(),
             call_id: CallId::from("c1"),
             name: "bash".into(),
             status: ToolStatus::Ok,

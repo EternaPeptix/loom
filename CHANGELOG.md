@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Captured exchanges, HTTPS interception, findings tied to traffic
+
+- Every HTTP exchange of a session is an `exchange` record in its log (CONTRACTS-TRAFFIC-TARGETS C): the proxy's
+  captures (stored as blobs, attributed to the running call) and the exchanges of `http_send`, `http_repeat`,
+  `web_fetch` and MCP over HTTP, which exist even when the proxy does not capture. `http_repeat` accepts an `ex-`
+  id and replays from the log after a restart. The compaction key table lists the newest exchanges.
+- `[network] intercept = "pack" | "always" | "never"`, pack key `intercept = true` (ctf, redteam, vr),
+  `intercept` on a new session, `loom run --no-intercept`; recorded in `session_start`, inherited by children.
+  An intercepting session gets a CA bundle in its tmp dir and the trust environment variables; the CA key under
+  the loom home is never readable from the sandbox. New `[network]` keys: `capture_max_bytes`,
+  `capture_max_exchanges`, `intercept_passthrough`, `upstream_roots`.
+- `require_traffic` roles (the finishing roles of ctf, redteam, vr) cannot `finish` or `conclude` `met` while a
+  claim names a host no supporting evidence reached; `claim` takes optional `assets`.
+
 ### MCP client
 
 - `loom-tools` has an MCP client (CONTRACTS-MCP M2, M3, M5): stdio servers run as sandboxed children and

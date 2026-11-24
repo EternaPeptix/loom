@@ -758,7 +758,7 @@ async fn upload(
         let root = match loom_agent::runtime::plan_workspace(&paths, std::path::Path::new(&workspace), false) {
             Ok(loom_agent::runtime::WorkspacePlan::Existing(root)) => root,
             Ok(_) => {
-                return Err(ApiError::new(StatusCode::NOT_FOUND, format!("The workspace {workspace} does not exist.")))
+                return Err(ApiError::new(StatusCode::NOT_FOUND, format!("The workspace {workspace} does not exist.")));
             }
             Err(e) if e.contains("does not exist") => return Err(ApiError::new(StatusCode::NOT_FOUND, e)),
             Err(e) => return Err(ApiError::new(StatusCode::CONFLICT, e)),
@@ -1379,6 +1379,7 @@ mod tests {
         config.default_model = "mock".into();
         config.sandbox.mode = SandboxMode::None;
         config.network.mode = NetworkMode::DenyAll;
+        config.network.capture_max_exchanges = 0;
         config.agents.verify_finish = false;
         config.tools.kill_grace_s = 1;
         let paths = Paths::at(dir.path().join("home"));
@@ -2212,7 +2213,9 @@ mod tests {
         // Added to the file and reloaded: usable at once, without a restart.
         let url = e.rt.config().models["mock"].base_url.clone();
         let profile = |name: &str| {
-            format!("[models.{name}]\nbase_url = \"{url}\"\nmodel = \"mock\"\ncontext_window = 1000000\nretry_window_s = 1\nretry_max_delay_s = 1\nstall_timeout_s = 30\n")
+            format!(
+                "[models.{name}]\nbase_url = \"{url}\"\nmodel = \"mock\"\ncontext_window = 1000000\nretry_window_s = 1\nretry_max_delay_s = 1\nstall_timeout_s = 30\n"
+            )
         };
         let text = format!("default_model = \"mock\"\n\n{}\n{}", profile("mock"), profile("other"));
         std::fs::write(e.rt.paths().config_file(), text).unwrap();

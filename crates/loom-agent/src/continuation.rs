@@ -258,6 +258,7 @@ mod tests {
             &e.ctx,
         );
         let mut receipt = ToolResult {
+            exchanges: Vec::new(),
             call_id: "actual".into(),
             name: "bash".into(),
             status: ToolStatus::Ok,

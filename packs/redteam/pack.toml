@@ -5,8 +5,10 @@ preamble = "harness.md"
 requires_restricted_network = true
 command_guard = "offensive"
 target_concurrency = 2
+intercept = true
 
 [roles.commander]
+require_traffic = true
 prompt = "roles/commander.md"
 termination = "explicit"
 tools = ["read", "out_read", "plan", "step", "claim", "claim_update", "evidence", "security_record", "security_query", "agent_spawn", "agent_fanout", "agent_message", "agent_stop", "verify", "request_scope", "conclude", "finish", "report_blocker"]
@@ -18,6 +20,7 @@ require_oracle = true
 max_exec_calls = 0
 
 [roles.recon_operator]
+require_traffic = true
 prompt = "roles/recon_operator.md"
 termination = "explicit"
 tools = ["bash", "read", "write", "out_read", "web_fetch", "http_send", "security_ingest", "security_query", "security_record", "claim", "evidence", "finish", "report_blocker", "request_scope", "job_wait", "job_kill", "codec_calc"]
@@ -25,6 +28,7 @@ hidden_tools = ["out_read"]
 max_steps = 25
 
 [roles.tactical_operator]
+require_traffic = true
 prompt = "roles/tactical_operator.md"
 termination = "explicit"
 tools = ["bash", "read", "write", "out_read", "pty_open", "pty_exec", "pty_close", "http_send", "http_repeat", "security_record", "security_query", "claim", "evidence", "finish", "report_blocker", "request_scope", "job_wait", "job_kill"]
@@ -32,6 +36,7 @@ hidden_tools = ["out_read"]
 max_steps = 30
 
 [roles.lateral_operator]
+require_traffic = true
 prompt = "roles/lateral_operator.md"
 termination = "explicit"
 tools = ["bash", "read", "write", "out_read", "pty_open", "pty_exec", "pty_close", "http_send", "http_repeat", "security_record", "security_query", "claim", "evidence", "finish", "report_blocker", "request_scope", "job_wait", "job_kill"]

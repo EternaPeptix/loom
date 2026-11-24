@@ -304,6 +304,9 @@ pub struct StartOpts {
     /// Make the workspace folder (and the folders above it) when it does not exist
     #[arg(long)]
     pub create_workspace: bool,
+    /// Do not decrypt HTTPS for this mission, whatever its pack says (`[network] intercept = "pack"` only)
+    #[arg(long)]
+    pub no_intercept: bool,
 }
 
 #[derive(Args, Debug)]
@@ -801,6 +804,7 @@ fn new_session(opts: &StartOpts, message: Option<String>, cwd: &Path, prior: Vec
         role_models: opts.agent_models.iter().cloned().collect(),
         create_workspace: opts.create_workspace,
         attachments: Vec::new(),
+        intercept: opts.no_intercept.then_some(false),
     }
 }
 
@@ -2363,9 +2367,11 @@ mod tests {
             max_minutes: 3,
             prior: Vec::new(),
             create_workspace: true,
+            no_intercept: true,
             agent_models: vec![("worker".into(), "fast".into()), (ANY_ROLE.into(), "big".into())],
         };
         let n = new_session(&opts, None, cwd, vec![MissionId::from("m-1"), MissionId::from("m-2")]);
+        assert_eq!(n.intercept, Some(false));
         assert_eq!(n.prior, [MissionId::from("m-1"), MissionId::from("m-2")]);
         assert_eq!(
             n.role_models,

@@ -331,6 +331,7 @@ mod tests {
 
     fn result(name: &str, status: ToolStatus, meta: Value) -> Event {
         Event::ToolResult(ToolResult {
+            exchanges: Vec::new(),
             call_id: CallId::from("c"),
             name: name.into(),
             status,

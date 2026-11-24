@@ -68,6 +68,10 @@ pub enum LedgerOp {
     /// A statement that could reach a report.
     ClaimAdd {
         text: String,
+        /// Assets (ids or locators of the security state) the claim is about; their hosts are the hosts it
+        /// names (CONTRACTS-TRAFFIC-TARGETS F1). Not serialized when empty, so older entries keep their bytes.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        assets: Vec<String>,
     },
     ClaimUpdate {
         id: String,
@@ -324,6 +328,9 @@ pub struct Claim {
     pub note: String,
     /// Evidence ids attached to this claim.
     pub evidence: Vec<String>,
+    /// Assets the claim is about (CONTRACTS-TRAFFIC-TARGETS F1).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub assets: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -776,14 +783,20 @@ fn cap_last<T>(items: Vec<&T>, capped: impl Fn(&T) -> bool, keep: usize) -> (Vec
 /// Refusal text for an id that does not exist: names the ids that do.
 fn no_such(kind: &str, id: &str, existing: String) -> String {
     if existing == "none" {
-        format!("There is no {kind} with id `{id}`: no {kind} has been recorded yet. Check the id against the ledger brief before using it.")
+        format!(
+            "There is no {kind} with id `{id}`: no {kind} has been recorded yet. Check the id against the ledger brief before using it."
+        )
     } else {
-        format!("There is no {kind} with id `{id}`. Existing {kind} ids: {existing}. Use one of those ids exactly as written; ids are never renumbered.")
+        format!(
+            "There is no {kind} with id `{id}`. Existing {kind} ids: {existing}. Use one of those ids exactly as written; ids are never renumbered."
+        )
     }
 }
 
 fn user_only(what: &str) -> String {
-    format!("{what} records the operator's own words and cannot be written by a tool call. Do not try to record it yourself; if you need the operator to decide or confirm something, use ask_user and the runtime will record their answer.")
+    format!(
+        "{what} records the operator's own words and cannot be written by a tool call. Do not try to record it yourself; if you need the operator to decide or confirm something, use ask_user and the runtime will record their answer."
+    )
 }
 
 fn needs_text(what: &str, field: &str) -> String {
@@ -859,7 +872,7 @@ impl LedgerState {
                 let id = next_id("x", self.dead_ends.len());
                 self.dead_ends.push(DeadEnd { id, what: what.clone(), why: why.clone(), n });
             }
-            LedgerOp::ClaimAdd { text } => {
+            LedgerOp::ClaimAdd { text, assets } => {
                 let id = next_id("c", self.claims.len());
                 self.claim_sessions.push(entry.session.clone());
                 self.claims.push(Claim {
@@ -868,6 +881,7 @@ impl LedgerState {
                     status: ClaimStatus::Open,
                     note: String::new(),
                     evidence: Vec::new(),
+                    assets: assets.clone(),
                 });
             }
             LedgerOp::ClaimUpdate { id, status, note } => {
@@ -1055,10 +1069,14 @@ impl LedgerState {
                 self.check_evidence_ids(evidence, "`plan`")?;
                 match status {
                     StepStatus::Done if blank(note) && evidence.is_empty() => {
-                        return Err(format!("Plan step {id} cannot be marked done without saying how it was verified. Call `plan` again with a `note` describing the check you ran and what it showed, or with `evidence` ids from the `evidence` tool."));
+                        return Err(format!(
+                            "Plan step {id} cannot be marked done without saying how it was verified. Call `plan` again with a `note` describing the check you ran and what it showed, or with `evidence` ids from the `evidence` tool."
+                        ));
                     }
                     StepStatus::Dropped if blank(note) => {
-                        return Err(format!("Plan step {id} cannot be dropped without a reason. Call `plan` again with a `note` saying why the step is no longer needed."));
+                        return Err(format!(
+                            "Plan step {id} cannot be dropped without a reason. Call `plan` again with a `note` saying why the step is no longer needed."
+                        ));
                     }
                     _ => {}
                 }
@@ -1091,7 +1109,7 @@ impl LedgerState {
                     return Err(needs_text("the dead end", "`why`"));
                 }
             }
-            LedgerOp::ClaimAdd { text } => {
+            LedgerOp::ClaimAdd { text, .. } => {
                 if blank(text) {
                     return Err(needs_text("the claim", "text"));
                 }
@@ -1107,11 +1125,16 @@ impl LedgerState {
                             .iter()
                             .any(|e| e.input.claim == claim.id && e.input.supports && e.input.attested);
                         if !backed {
-                            return Err(format!("Claim {id} cannot be marked supported: it has no attested evidence that supports it. Run or read something that shows it, then call `evidence` with claim {id}, the `out:` handle of that output, the line range `start` and `end`, and a `quote` copied from those lines; evidence the harness did not witness does not count. Then call `claim` again with `id`."));
+                            return Err(format!(
+                                "Claim {id} cannot be marked supported: it has no attested evidence that supports it. Run or read something that shows it, then call `evidence` with claim {id}, the `out:` handle of that output, the line range `start` and `end`, and a `quote` copied from those lines; evidence the harness did not witness does not count. Then call `claim` again with `id`."
+                            ));
                         }
                     }
                     ClaimStatus::Refuted | ClaimStatus::Withdrawn if blank(note) => {
-                        return Err(format!("Claim {id} cannot be marked {} without a note. Call claim_update again with a `note` saying what showed it false or why you are withdrawing it.", if *status == ClaimStatus::Refuted { "refuted" } else { "withdrawn" }));
+                        return Err(format!(
+                            "Claim {id} cannot be marked {} without a note. Call claim_update again with a `note` saying what showed it false or why you are withdrawing it.",
+                            if *status == ClaimStatus::Refuted { "refuted" } else { "withdrawn" }
+                        ));
                     }
                     _ => {}
                 }
@@ -1127,7 +1150,11 @@ impl LedgerState {
                 }
                 if let Some(grade) = input.grade {
                     if (grade == EvidenceGrade::Run) != (input.kind == EvidenceKind::Execution) {
-                        return Err(format!("The harness recorded the grade {} for this evidence, which contradicts its kind ({}). This is a fault in the harness, not in your call: there is nothing to change in it. Report it to the operator and carry on with other work.", grade.as_str(), if input.kind == EvidenceKind::Execution { "execution" } else { "static" }));
+                        return Err(format!(
+                            "The harness recorded the grade {} for this evidence, which contradicts its kind ({}). This is a fault in the harness, not in your call: there is nothing to change in it. Report it to the operator and carry on with other work.",
+                            grade.as_str(),
+                            if input.kind == EvidenceKind::Execution { "execution" } else { "static" }
+                        ));
                     }
                 }
             }
@@ -1166,7 +1193,10 @@ impl LedgerState {
                     return Err(no_such("approval", id, ids(self.approvals.iter().map(|a| a.id.as_str()))));
                 };
                 if let Some(prev) = &a.used_for {
-                    return Err(format!("Approval {id} was already used (for: {}). An approval covers one use; if you need to do this again, ask the operator with ask_user.", line(prev, 120)));
+                    return Err(format!(
+                        "Approval {id} was already used (for: {}). An approval covers one use; if you need to do this again, ask the operator with ask_user.",
+                        line(prev, 120)
+                    ));
                 }
                 if blank(used_for) {
                     return Err(needs_text("the approval use", "used_for"));
@@ -1199,7 +1229,10 @@ impl LedgerState {
                 }
                 let uncovered = self.security.mandatory_open();
                 if self.release.is_none() && !uncovered.is_empty() {
-                    return Err(format!("Cannot finish yet: mandatory security coverage is untested for {}. Use security_record coverage_set to cite attested test evidence or defer each asset with a reason, then finish again.", uncovered.join(", ")));
+                    return Err(format!(
+                        "Cannot finish yet: mandatory security coverage is untested for {}. Use security_record coverage_set to cite attested test evidence or defer each asset with a reason, then finish again.",
+                        uncovered.join(", ")
+                    ));
                 }
             }
             LedgerOp::FinishVerdict { claim, accepted, .. } => {
@@ -1207,7 +1240,10 @@ impl LedgerState {
                     return Err(no_such("finish claim", claim, ids(self.finishes.iter().map(|f| f.id.as_str()))));
                 };
                 if let Some(acc) = f.accepted {
-                    return Err(format!("Finish claim {claim} already has a verdict ({}). Verdicts are final; a new finish claim gets its own verdict.", if acc { "accepted" } else { "rejected" }));
+                    return Err(format!(
+                        "Finish claim {claim} already has a verdict ({}). Verdicts are final; a new finish claim gets its own verdict.",
+                        if acc { "accepted" } else { "rejected" }
+                    ));
                 }
                 if *accepted && self.release.is_none() && !self.security.mandatory_open().is_empty() {
                     return Err("Cannot accept the finish: mandatory security coverage became untested during verification. Record test evidence or a reasoned deferral before finishing again.".into());
@@ -1219,10 +1255,14 @@ impl LedgerState {
                     return Err(no_such("finish claim", finish, ids(self.finishes.iter().map(|f| f.id.as_str()))));
                 };
                 if f.accepted != Some(false) {
-                    return Err(format!("Finish claim {finish} was not rejected by a verifier, so it does not reopen the goal. Only a rejected finish does."));
+                    return Err(format!(
+                        "Finish claim {finish} was not rejected by a verifier, so it does not reopen the goal. Only a rejected finish does."
+                    ));
                 }
                 if self.finishes.last().map(|l| l.id.as_str()) != Some(finish.as_str()) {
-                    return Err(format!("Finish claim {finish} is not the latest finish claim. Only the latest one, once rejected, reopens the goal."));
+                    return Err(format!(
+                        "Finish claim {finish} is not the latest finish claim. Only the latest one, once rejected, reopens the goal."
+                    ));
                 }
                 if f.reopened_goal {
                     return Err(format!(
@@ -1268,7 +1308,9 @@ impl LedgerState {
                         return Err(needs_text("a scope grant host", "entry"));
                     }
                     if h.chars().any(|c| c.is_whitespace() || c == ',') {
-                        return Err(format!("The host entry `{h}` contains whitespace or a comma. Give one host per entry in `hosts`, for example [\"a.example\", \"b.example\"]."));
+                        return Err(format!(
+                            "The host entry `{h}` contains whitespace or a comma. Give one host per entry in `hosts`, for example [\"a.example\", \"b.example\"]."
+                        ));
                     }
                 }
             }
@@ -1291,7 +1333,10 @@ impl LedgerState {
             return Err("The goal-met status can only be set to supported (the goal is met) or refuted (the goal cannot be met as stated); it cannot be reopened or withdrawn. Run the target, record the run with `evidence`, then conclude.".to_string());
         }
         if current.status == status {
-            return Err(format!("The goal is already recorded as {}. Change it only to the other conclusion, with new execution evidence recorded after that.", goal_met_label(status)));
+            return Err(format!(
+                "The goal is already recorded as {}. Change it only to the other conclusion, with new execution evidence recorded after that.",
+                goal_met_label(status)
+            ));
         }
         if blank(note) {
             return Err(needs_text("the goal-met conclusion", "note") + " Say what the evidence shows about the goal.");
@@ -1302,7 +1347,10 @@ impl LedgerState {
         self.check_evidence_ids(evidence, "the goal-met conclusion")?;
         let cited: Vec<&Evidence> = self.evidence.iter().filter(|e| evidence.contains(&e.id)).collect();
         if let Some(e) = cited.iter().find(|e| !(e.input.supports && e.input.attested)) {
-            return Err(format!("Evidence {} is not attested evidence that supports the conclusion, so it cannot back it. Cite only attested, supporting evidence records.", e.id));
+            return Err(format!(
+                "Evidence {} is not attested evidence that supports the conclusion, so it cannot back it. Cite only attested, supporting evidence records.",
+                e.id
+            ));
         }
         let executed: Vec<&&Evidence> = cited.iter().filter(|e| e.input.kind == EvidenceKind::Execution).collect();
         if executed.is_empty() {
@@ -1321,11 +1369,18 @@ impl LedgerState {
             return Err(m);
         }
         if current.status != GoalMetStatus::Open && !executed.iter().any(|e| e.n > current.n) {
-            return Err(format!("The goal is recorded as {}. To change it, run the target again and cite execution evidence recorded after that conclusion (entry {}).", goal_met_label(current.status), current.n));
+            return Err(format!(
+                "The goal is recorded as {}. To change it, run the target again and cite execution evidence recorded after that conclusion (entry {}).",
+                goal_met_label(current.status),
+                current.n
+            ));
         }
         // Open again after a rejected finish: what was shown before the rejection did not hold up.
         if current.reopened() && !executed.iter().any(|e| e.n > current.n) {
-            return Err(format!("The goal is open again: a check did not accept the earlier result (entry {}), so runs recorded before that cannot conclude it. Run the target again, record the run with `evidence`, and cite that new record.", current.n));
+            return Err(format!(
+                "The goal is open again: a check did not accept the earlier result (entry {}), so runs recorded before that cannot conclude it. Run the target again, record the run with `evidence`, and cite that new record.",
+                current.n
+            ));
         }
         Ok(())
     }
@@ -1817,7 +1872,7 @@ impl LedgerState {
             LedgerOp::Reflection { next_route, .. } => format!("reflection: {next_route}"),
             LedgerOp::Decision { text, reason } => format!("decision: {text} — {reason}"),
             LedgerOp::DeadEnd { what, why } => format!("dead end: {what} — {why}"),
-            LedgerOp::ClaimAdd { text } => format!("claim added: {text}"),
+            LedgerOp::ClaimAdd { text, .. } => format!("claim added: {text}"),
             LedgerOp::ClaimUpdate { id, status, note } => {
                 format!("claim {id} -> {}{}", claim_status(*status), suffix(note))
             }
@@ -1987,7 +2042,7 @@ mod tests {
             },
             LedgerOp::Decision { text: "t".into(), reason: "r".into() },
             LedgerOp::DeadEnd { what: "w".into(), why: "y".into() },
-            LedgerOp::ClaimAdd { text: "it works".into() },
+            LedgerOp::ClaimAdd { text: "it works".into(), assets: Vec::new() },
             LedgerOp::ClaimUpdate { id: "c1".into(), status: ClaimStatus::Supported, note: String::new() },
             LedgerOp::EvidenceAdd(ev("c1", true, true)),
             LedgerOp::ObligationOpen { kind: ObligationKind::Job, text: "job".into(), reference: "pid 4".into() },
@@ -2026,7 +2081,7 @@ mod tests {
             LedgerOp::PlanAdd { text: "three".into() },
             LedgerOp::Decision { text: "d".into(), reason: "r".into() },
             LedgerOp::DeadEnd { what: "w".into(), why: "y".into() },
-            LedgerOp::ClaimAdd { text: "c".into() },
+            LedgerOp::ClaimAdd { text: "c".into(), assets: Vec::new() },
             LedgerOp::EvidenceAdd(ev("c1", true, true)),
             LedgerOp::ObligationOpen { kind: ObligationKind::Promise, text: "o".into(), reference: String::new() },
             LedgerOp::ApprovalGrant { text: "a".into(), scope: "s".into() },
@@ -2100,7 +2155,7 @@ mod tests {
                 note: "ok".into(),
                 evidence: vec!["e2".into()],
             },
-            LedgerOp::ClaimAdd { text: "c".into() },
+            LedgerOp::ClaimAdd { text: "c".into(), assets: Vec::new() },
             LedgerOp::ClaimUpdate { id: "c1".into(), status: ClaimStatus::Withdrawn, note: "wrong".into() },
             LedgerOp::ObligationOpen { kind: ObligationKind::Job, text: "o".into(), reference: String::new() },
             LedgerOp::ObligationSettle { id: "o1".into(), outcome: "finished".into() },
@@ -2131,7 +2186,10 @@ mod tests {
 
     #[test]
     fn apply_ignores_unknown_ids() {
-        let base = build(vec![LedgerOp::ClaimAdd { text: "c".into() }, LedgerOp::PlanAdd { text: "p".into() }]);
+        let base = build(vec![
+            LedgerOp::ClaimAdd { text: "c".into(), assets: Vec::new() },
+            LedgerOp::PlanAdd { text: "p".into() },
+        ]);
         let mut s = base.clone();
         let ops = vec![
             LedgerOp::ConstraintRetire { id: "k9".into(), reason: "r".into() },
@@ -2188,7 +2246,7 @@ mod tests {
         let s = build(vec![
             LedgerOp::ConstraintAdd { text: "a".into() },
             LedgerOp::PlanSet { steps: vec!["a".into(), "b".into()] },
-            LedgerOp::ClaimAdd { text: "c".into() },
+            LedgerOp::ClaimAdd { text: "c".into(), assets: Vec::new() },
             LedgerOp::ObligationOpen { kind: ObligationKind::Job, text: "o".into(), reference: String::new() },
             LedgerOp::ApprovalGrant { text: "a".into(), scope: "s".into() },
             LedgerOp::QuestionAsk { text: "q".into(), blocking: false },
@@ -2251,7 +2309,7 @@ mod tests {
             LedgerOp::PlanAdd { text: " ".into() },
             LedgerOp::Decision { text: "".into(), reason: "r".into() },
             LedgerOp::DeadEnd { what: "\t".into(), why: "y".into() },
-            LedgerOp::ClaimAdd { text: "".into() },
+            LedgerOp::ClaimAdd { text: "".into(), assets: Vec::new() },
             LedgerOp::ObligationOpen { kind: ObligationKind::Job, text: " ".into(), reference: String::new() },
             LedgerOp::QuestionAsk { text: "".into(), blocking: false },
             LedgerOp::FinishClaim { summary: "  ".into(), evidence: vec![] },
@@ -2275,7 +2333,7 @@ mod tests {
     fn plan_update_rules() {
         let s = build(vec![
             LedgerOp::PlanAdd { text: "a".into() },
-            LedgerOp::ClaimAdd { text: "c".into() },
+            LedgerOp::ClaimAdd { text: "c".into(), assets: Vec::new() },
             LedgerOp::EvidenceAdd(ev("c1", true, true)),
         ]);
         let upd = |status, note: &str, evidence: Vec<&str>| LedgerOp::PlanUpdate {
@@ -2296,7 +2354,7 @@ mod tests {
 
     #[test]
     fn claim_update_rules() {
-        let mut ops = vec![LedgerOp::ClaimAdd { text: "c".into() }];
+        let mut ops = vec![LedgerOp::ClaimAdd { text: "c".into(), assets: Vec::new() }];
         let upd = |status, note: &str| LedgerOp::ClaimUpdate { id: "c1".into(), status, note: note.into() };
         let s = build(ops.clone());
         let m = refusal(&s, upd(ClaimStatus::Supported, ""), false);
@@ -2316,7 +2374,7 @@ mod tests {
 
     #[test]
     fn evidence_add_rules() {
-        let s = build(vec![LedgerOp::ClaimAdd { text: "c".into() }]);
+        let s = build(vec![LedgerOp::ClaimAdd { text: "c".into(), assets: Vec::new() }]);
         assert!(s.validate(&LedgerOp::EvidenceAdd(ev("c1", true, true)), false).is_ok());
         let mut no_note = ev("c1", true, true);
         no_note.note = "  ".into();
@@ -2362,7 +2420,7 @@ mod tests {
                 text: "benchmark job".into(),
                 reference: String::new(),
             },
-            LedgerOp::ClaimAdd { text: "it is fast".into() },
+            LedgerOp::ClaimAdd { text: "it is fast".into(), assets: Vec::new() },
             LedgerOp::QuestionAsk { text: "blocking q".into(), blocking: true },
             LedgerOp::QuestionAsk { text: "idle q".into(), blocking: false },
         ]);
@@ -2413,8 +2471,8 @@ mod tests {
             LedgerOp::ObligationOpen { kind: ObligationKind::Job, text: "a".into(), reference: String::new() },
             LedgerOp::ObligationOpen { kind: ObligationKind::Job, text: "b".into(), reference: String::new() },
             LedgerOp::ObligationSettle { id: "o1".into(), outcome: "x".into() },
-            LedgerOp::ClaimAdd { text: "a".into() },
-            LedgerOp::ClaimAdd { text: "b".into() },
+            LedgerOp::ClaimAdd { text: "a".into(), assets: Vec::new() },
+            LedgerOp::ClaimAdd { text: "b".into(), assets: Vec::new() },
             LedgerOp::ClaimUpdate { id: "c2".into(), status: ClaimStatus::Withdrawn, note: "n".into() },
             LedgerOp::QuestionAsk { text: "a".into(), blocking: true },
             LedgerOp::QuestionAsk { text: "b".into(), blocking: true },
@@ -2476,7 +2534,7 @@ mod tests {
                 reference: String::new(),
             },
             LedgerOp::ObligationSettle { id: "o2".into(), outcome: "kept".into() },
-            LedgerOp::ClaimAdd { text: "parser handles nesting".into() },
+            LedgerOp::ClaimAdd { text: "parser handles nesting".into(), assets: Vec::new() },
             LedgerOp::EvidenceAdd(ev("c1", true, true)),
             LedgerOp::Decision { text: "use nom".into(), reason: "speed".into() },
             LedgerOp::Decision { text: "drop serde".into(), reason: "size".into() },
@@ -2537,7 +2595,7 @@ mod tests {
             LedgerOp::GoalSet { text: long.clone() },
             LedgerOp::ConstraintAdd { text: long.clone() },
             LedgerOp::PlanAdd { text: long.clone() },
-            LedgerOp::ClaimAdd { text: "é".repeat(100) },
+            LedgerOp::ClaimAdd { text: "é".repeat(100), assets: Vec::new() },
         ]);
         let b = s.brief(&BriefOpts { max_decisions: 1, max_dead_ends: 1, max_line: 20, ..BriefOpts::default() });
         // the operator's words are never cut
@@ -2583,14 +2641,14 @@ mod tests {
             });
         }
         for i in 0..settled {
-            ops.push(LedgerOp::ClaimAdd { text: format!("settled claim {i}") });
+            ops.push(LedgerOp::ClaimAdd { text: format!("settled claim {i}"), assets: Vec::new() });
             ops.push(LedgerOp::ClaimUpdate {
                 id: format!("c{}", i + 1),
                 status: ClaimStatus::Withdrawn,
                 note: "no".into(),
             });
         }
-        ops.push(LedgerOp::ClaimAdd { text: "still open".into() });
+        ops.push(LedgerOp::ClaimAdd { text: "still open".into(), assets: Vec::new() });
         build(ops)
     }
 
@@ -2654,8 +2712,8 @@ mod tests {
         assert!(b.contains("(1 older settled not shown: c1;"), "{b}");
         // an open claim older than the settled ones is kept at cap 0
         let s = build(vec![
-            LedgerOp::ClaimAdd { text: "first, open".into() },
-            LedgerOp::ClaimAdd { text: "second".into() },
+            LedgerOp::ClaimAdd { text: "first, open".into(), assets: Vec::new() },
+            LedgerOp::ClaimAdd { text: "second".into(), assets: Vec::new() },
             LedgerOp::ClaimUpdate { id: "c2".into(), status: ClaimStatus::Withdrawn, note: "no".into() },
         ]);
         let b = s.brief(&BriefOpts { max_claims: 0, ..BriefOpts::default() });
@@ -2719,7 +2777,7 @@ mod tests {
             });
         }
         for i in 0..74 {
-            ops.push(LedgerOp::ClaimAdd { text: text("claim", i) });
+            ops.push(LedgerOp::ClaimAdd { text: text("claim", i), assets: Vec::new() });
             if i < 60 {
                 ops.push(LedgerOp::ClaimUpdate {
                     id: format!("c{}", i + 1),
@@ -2840,7 +2898,7 @@ mod tests {
                 note: String::new(),
                 evidence: vec![],
             });
-            ops.push(LedgerOp::ClaimAdd { text: format!("claim {i}") });
+            ops.push(LedgerOp::ClaimAdd { text: format!("claim {i}"), assets: Vec::new() });
             ops.push(LedgerOp::ClaimUpdate { id: format!("c{i}"), status: ClaimStatus::Withdrawn, note: "no".into() });
             ops.push(LedgerOp::ObligationOpen {
                 kind: ObligationKind::Job,
@@ -2936,7 +2994,7 @@ mod tests {
     fn with_goal_and_run() -> LedgerState {
         build(vec![
             LedgerOp::GoalSet { text: "g".into() },
-            LedgerOp::ClaimAdd { text: "it runs".into() },
+            LedgerOp::ClaimAdd { text: "it runs".into(), assets: Vec::new() },
             LedgerOp::EvidenceAdd(ev("c1", true, true)),
         ])
     }
@@ -2952,13 +3010,13 @@ mod tests {
     #[test]
     fn goal_met_is_absent_before_a_goal_and_open_after() {
         assert_eq!(LedgerState::default().goal_met, None);
-        assert_eq!(build(vec![LedgerOp::ClaimAdd { text: "c".into() }]).goal_met, None);
+        assert_eq!(build(vec![LedgerOp::ClaimAdd { text: "c".into(), assets: Vec::new() }]).goal_met, None);
         let s = build(vec![LedgerOp::GoalSet { text: "g".into() }]);
         assert_eq!(s.goal_met.as_ref().map(|g| g.status), Some(GoalMetStatus::Open));
         // Setting the goal again does not reopen a conclusion.
         let s = build(vec![
             LedgerOp::GoalSet { text: "g".into() },
-            LedgerOp::ClaimAdd { text: "c".into() },
+            LedgerOp::ClaimAdd { text: "c".into(), assets: Vec::new() },
             LedgerOp::EvidenceAdd(ev("c1", true, true)),
             conclude(GoalMetStatus::Supported, &["e1"]),
             LedgerOp::GoalSet { text: "g2".into() },
@@ -2969,7 +3027,10 @@ mod tests {
     #[test]
     fn goal_met_needs_a_goal_and_execution_evidence() {
         // before any goal
-        let s = build(vec![LedgerOp::ClaimAdd { text: "c".into() }, LedgerOp::EvidenceAdd(ev("c1", true, true))]);
+        let s = build(vec![
+            LedgerOp::ClaimAdd { text: "c".into(), assets: Vec::new() },
+            LedgerOp::EvidenceAdd(ev("c1", true, true)),
+        ]);
         for st in [GoalMetStatus::Supported, GoalMetStatus::Refuted] {
             assert!(refusal(&s, conclude(st, &["e1"]), false).contains("no goal yet"));
         }
@@ -2979,7 +3040,7 @@ mod tests {
         assert!(s.validate(&conclude(GoalMetStatus::Refuted, &["e1"]), false).is_ok());
         let folded = build(vec![
             LedgerOp::GoalSet { text: "g".into() },
-            LedgerOp::ClaimAdd { text: "c".into() },
+            LedgerOp::ClaimAdd { text: "c".into(), assets: Vec::new() },
             LedgerOp::EvidenceAdd(ev("c1", true, true)),
             conclude(GoalMetStatus::Refuted, &["e1"]),
         ]);
@@ -2995,7 +3056,7 @@ mod tests {
         // static-only basis
         let s = build(vec![
             LedgerOp::GoalSet { text: "g".into() },
-            LedgerOp::ClaimAdd { text: "c".into() },
+            LedgerOp::ClaimAdd { text: "c".into(), assets: Vec::new() },
             LedgerOp::EvidenceAdd(static_ev("c1")),
             LedgerOp::EvidenceAdd(ev("c1", true, true)),
         ]);
@@ -3008,7 +3069,7 @@ mod tests {
         // evidence that does not support, or is not attested, is refused
         let s = build(vec![
             LedgerOp::GoalSet { text: "g".into() },
-            LedgerOp::ClaimAdd { text: "c".into() },
+            LedgerOp::ClaimAdd { text: "c".into(), assets: Vec::new() },
             LedgerOp::EvidenceAdd(ev("c1", false, true)),
             LedgerOp::EvidenceAdd(ev("c1", true, false)),
         ]);
@@ -3029,7 +3090,7 @@ mod tests {
         // A forged Open entry cannot retract a conclusion.
         let mut s = build(vec![
             LedgerOp::GoalSet { text: "g".into() },
-            LedgerOp::ClaimAdd { text: "c".into() },
+            LedgerOp::ClaimAdd { text: "c".into(), assets: Vec::new() },
             LedgerOp::EvidenceAdd(ev("c1", true, true)),
             conclude(GoalMetStatus::Supported, &["e1"]),
         ]);
@@ -3052,7 +3113,7 @@ mod tests {
     fn concluded_and_finished(status: GoalMetStatus) -> Vec<LedgerOp> {
         vec![
             LedgerOp::GoalSet { text: "g".into() },
-            LedgerOp::ClaimAdd { text: "it runs".into() },
+            LedgerOp::ClaimAdd { text: "it runs".into(), assets: Vec::new() },
             LedgerOp::EvidenceAdd(ev("c1", true, true)),
             conclude(status, &["e1"]),
             LedgerOp::FinishClaim { summary: "done".into(), evidence: vec![] },
@@ -3161,7 +3222,7 @@ mod tests {
     fn goal_met_is_not_an_ordinary_open_claim() {
         let s = build(vec![
             LedgerOp::GoalSet { text: "g".into() },
-            LedgerOp::ClaimAdd { text: "c".into() },
+            LedgerOp::ClaimAdd { text: "c".into(), assets: Vec::new() },
             LedgerOp::EvidenceAdd(ev("c1", true, true)),
             LedgerOp::ClaimUpdate { id: "c1".into(), status: ClaimStatus::Supported, note: String::new() },
         ]);
@@ -3181,7 +3242,7 @@ mod tests {
         let ops = |st| {
             vec![
                 LedgerOp::GoalSet { text: "g".into() },
-                LedgerOp::ClaimAdd { text: "c".into() },
+                LedgerOp::ClaimAdd { text: "c".into(), assets: Vec::new() },
                 LedgerOp::EvidenceAdd(ev("c1", true, true)),
                 conclude(st, &["e1"]),
             ]
@@ -3299,7 +3360,8 @@ mod tests {
     }
 
     fn goal_with(evs: Vec<EvidenceInput>) -> LedgerState {
-        let mut ops = vec![LedgerOp::GoalSet { text: "g".into() }, LedgerOp::ClaimAdd { text: "c".into() }];
+        let mut ops =
+            vec![LedgerOp::GoalSet { text: "g".into() }, LedgerOp::ClaimAdd { text: "c".into(), assets: Vec::new() }];
         ops.extend(evs.into_iter().map(LedgerOp::EvidenceAdd));
         build(ops)
     }
@@ -3345,7 +3407,7 @@ mod tests {
 
     #[test]
     fn a_grade_that_contradicts_the_kind_is_refused() {
-        let s = build(vec![LedgerOp::ClaimAdd { text: "c".into() }]);
+        let s = build(vec![LedgerOp::ClaimAdd { text: "c".into(), assets: Vec::new() }]);
         let run_but_static = EvidenceInput { kind: EvidenceKind::Static, ..graded("c1", "bash", EvidenceGrade::Run) };
         let analysis_but_exec =
             EvidenceInput { kind: EvidenceKind::Execution, ..graded("c1", "dep_scan", EvidenceGrade::Analysis) };
@@ -3398,7 +3460,7 @@ mod tests {
         assert!(brief.contains("- c1 [open] c (evidence: e1 analysis by dep_scan, e2 run, e3 read)"), "{brief}");
         let met = build(vec![
             LedgerOp::GoalSet { text: "g".into() },
-            LedgerOp::ClaimAdd { text: "c".into() },
+            LedgerOp::ClaimAdd { text: "c".into(), assets: Vec::new() },
             LedgerOp::EvidenceAdd(graded("c1", "bash", EvidenceGrade::Run)),
             conclude_with(&["e1"]),
         ]);

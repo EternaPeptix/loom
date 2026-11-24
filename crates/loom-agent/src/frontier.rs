@@ -261,6 +261,7 @@ mod tests {
 
     fn claim(id: &str, text: &str, status: ClaimStatus, evidence: &[&str]) -> Claim {
         Claim {
+            assets: Vec::new(),
             id: id.into(),
             text: text.into(),
             status,
@@ -298,6 +299,7 @@ mod tests {
         rec(
             seq,
             Event::ToolResult(ToolResult {
+                exchanges: Vec::new(),
                 call_id: CallId::from(id),
                 name: "t".into(),
                 status,

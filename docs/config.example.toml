@@ -100,6 +100,13 @@ mode = "deny_all"
 # deny = ["169.254.0.0/16", "tracker.example.test"]   # always refused, in every mode: host patterns, IP addresses or CIDR blocks
 # allow_private = ["10.1.2.3"]   # private, loopback or link-local destinations that are permitted (host pattern, IP or CIDR)
 
+# Captured traffic and HTTPS interception (docs/DESIGN.md, section 11).
+# capture_max_bytes = 1048576     # bytes of each request or response body kept in a captured exchange
+# capture_max_exchanges = 100000  # exchanges recorded per session; past it traffic is relayed but not recorded
+# intercept = "pack"              # "pack": missions of packs with intercept = true decrypt HTTPS; "always"; "never"
+# intercept_passthrough = ["*.bank.example.test"]  # hosts tunneled untouched even when intercepting
+# upstream_roots = ["/etc/ssl/corp-root.pem"]       # extra PEM roots trusted for upstream TLS when intercepting
+
 [box]
 # A remote container the agent's commands can run in with `box_exec` (raw TCP to granted hosts, tooling
 # that the local sandbox cannot run). Off by default. See docs/RUN.md, "A box".
