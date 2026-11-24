@@ -21,6 +21,19 @@ pub struct SessionTools {
     pub oracle_contract: crate::oracle::ContractCache,
     /// Finds a recorded exchange of this session by its `ex-` id, from the session log (set by the runtime).
     pub exchange_lookup: OnceLock<Arc<crate::traffic::ExchangeLookup>>,
+    /// The credential profile items the session attaches to its in-scope requests (CONTRACTS-TRAFFIC-TARGETS
+    /// S8), set by the runtime before the first call; unset = none.
+    pub creds: OnceLock<Arc<loom_net::Inject>>,
+    /// The session secret set (S5), set by the runtime with `creds`; unset = nothing to redact.
+    pub secrets: OnceLock<Arc<loom_core::creds::Secrets>>,
+    /// The proxy URL with the session's tool credential (S9), set by the runtime; unset = the command proxy
+    /// from `ToolCtx::env` (tests and callers without a runtime).
+    pub tool_proxy: OnceLock<String>,
+    /// The mission target's `upstream_insecure` list (CONTRACTS-TRAFFIC-TARGETS S12), set by the runtime for a
+    /// session with a target; unset = every certificate is verified.
+    pub upstream_insecure: OnceLock<Vec<String>>,
+    /// The mission target's scope, set with `upstream_insecure`; only used to word a certificate failure (S13).
+    pub target_scope: OnceLock<loom_core::target::Scope>,
 }
 
 impl Default for SessionTools {
@@ -39,6 +52,11 @@ impl SessionTools {
             binary_cache: Mutex::new(BTreeMap::new()),
             oracle_contract: crate::oracle::ContractCache::default(),
             exchange_lookup: OnceLock::new(),
+            creds: OnceLock::new(),
+            secrets: OnceLock::new(),
+            tool_proxy: OnceLock::new(),
+            upstream_insecure: OnceLock::new(),
+            target_scope: OnceLock::new(),
         }
     }
 }

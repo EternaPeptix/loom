@@ -1713,6 +1713,10 @@ impl Paths {
     pub fn journal_key(&self) -> PathBuf {
         self.keys_dir().join("journal.key")
     }
+    /// The key credential profiles are sealed with (CONTRACTS-TRAFFIC-TARGETS S4).
+    pub fn creds_key(&self) -> PathBuf {
+        self.keys_dir().join("creds.key")
+    }
     pub fn sessions_dir(&self) -> PathBuf {
         self.home.join("sessions")
     }

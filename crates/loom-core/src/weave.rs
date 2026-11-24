@@ -726,6 +726,7 @@ mod tests {
                     schema: crate::event::SCHEMA,
                     intercept: false,
                     target: None,
+                    creds: None,
                     title: String::new(),
                     project_instructions: Vec::new(),
                     mcp: Vec::new(),

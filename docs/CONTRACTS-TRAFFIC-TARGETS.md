@@ -208,6 +208,22 @@ one item each, `host` = the host it was seen on. Out-of-scope traffic is dropped
     --cookie 'session=…'` / `--header 'Authorization: Bearer …'` (repeatable). `--host` must be in the
     target scope. Same storage, same secret handling.
 
+  - Collection rules: request `Cookie` pairs and response `Set-Cookie` (name and value only; attributes
+    ignored) give `cookie` items; request `Authorization` and `X-Api-Key` (names case-insensitive, stored as
+    first seen) give `header` items. Within one exchange the request is read before the response. A
+    `Set-Cookie` with an empty value or `Max-Age` of 0 or less removes that cookie item. Cookie names are
+    case-sensitive.
+  - The recording session (daemon side): a proxy grant for a pseudo-session `creds-rec-{random}` with the
+    daemon's `[network]` policy in `open` mode plus the target scope (T2), so the operator's browser reaches
+    the target and any login provider; interception only for hosts the target scope contains
+    (`CaptureGrant::intercept_scope`), every other CONNECT stays an opaque tunnel and nothing of it is read.
+    It prints the proxy address with its user and password (browsers ask for them), the CA path and its
+    SHA-256 fingerprint. It ends on `--stop`, Ctrl-C, or after 30 minutes, and writes the profile in each
+    case; a recording that collected nothing writes nothing and says so. API: `POST
+    /api/targets/{name}/creds` with `{"record":{"profile":"default"}}` → `{handle, proxy, user, password,
+    ca_path, ca_sha256}`; `GET /api/targets/{name}/creds/record/{handle}?after={n}` → `{lines, next, done}`
+    (name lines only); `POST /api/targets/{name}/creds` with `{"stop": handle}` → the profile summary.
+
 S3. **Injection.** A mission bound to a target may name one profile at start (`creds` in the API body,
 `loom run --creds default`, a select in the new-mission form; default none). Recorded in
 `session_start` as the profile name and a redaction-safe summary (`default · 3 cookies, 1 header ·
@@ -219,8 +235,11 @@ connection is allowed and before forwarding upstream:
   the request already sets** by that name (the request wins);
 - sets each matching `header` item **only if the request does not already send that header** (the
   request wins).
-A request to any other host is forwarded untouched. The agent names the profile; it never reads the
-values, and no tool, record, prompt or UI shows them (S5).
+A request to any other host is forwarded untouched. An opaque CONNECT tunnel (a mission without interception,
+or a host on a passthrough list) carries nothing: the proxy never sees its requests, so a command's HTTPS
+reaches the target with profile items only in an intercepting mission (the in-process tools inject themselves
+either way, S8). The agent names the profile; it never reads the values, and no tool, record, prompt or UI
+shows them (S5).
 
 S4. **Encryption at rest, unattended.** A daemon key at `~/.loom/keys/creds.key` (32 random bytes,
 file `0600`, created on first need exactly like the access token and journal key; dir `0700`). Each
@@ -232,12 +251,17 @@ working. This protects a reader of the targets directory, not someone who alread
 (the same trust boundary the access token and CA key already sit behind). No new dependency: `ring` is
 in the lockfile (I5); it becomes a direct dependency of the crate that owns `creds.rs`.
 
-S5. **Secrets.** On a mission start with a profile, every injected item value is added to the session
-secret set — the one MCP server env values already use (`loom-tools` `mcp.rs` `redact`) — so it is
-replaced with `[redacted]` wherever that set is applied: the captured request exchange (the injected
-`Cookie`/`Authorization`), `bash`/tool output, `net.jsonl`, and the prompt. A `Set-Cookie` the mission
-observes on its own is still stored as evidence and masked-until-revealed per C5; only values loom
-itself injected are redacted outright. The proxy-credential rule (C5) is unchanged.
+S5. **Secrets.** On a mission start with a profile, the session's secret set
+(`loom_core::creds::Secrets`, held in `SessionTools::secrets`) gets every injected item value of at least
+`Secrets::MIN_LEN` (8) bytes, and for a header value of the form `<scheme> <token>` the token as well. The set
+replaces each with `[redacted]` in every tool result's text and in every output a tool stores
+(`loom_tools::finalize`), and in the request and response blobs of every exchange the session records
+(`Traffic::ingest`, and the exchanges in-process tools hand back). Independently of length, the request a
+capture stores is the **redacted copy**: the proxy (S3) and in-process tools (S8) record the request with each
+value loom itself added replaced by `[redacted]`, and send the real one. `net.jsonl` records no header or body,
+so it never holds a value. A `Set-Cookie` the mission observes on its own is still stored as evidence and
+masked-until-revealed per C5; only values loom injected are redacted outright. The proxy-credential rule (C5)
+is unchanged. The prompt is built from tool results, so it never holds a value either.
 
 S6. **Scope safety (the invariant).** The effective attach set is computed at load as, per item, its
 single `host` kept only if that host is inside the mission target's current scope (T1) and not in
@@ -252,10 +276,72 @@ item stops being injected (checked at each mission start, not cached).
 S7. **CLI/API.** `loom creds list --target acme` (profiles with item counts and when recorded),
 `loom creds show --target acme --profile default` (item kinds, names and hosts, recorded-at — never
 values), `loom creds record|set|rm`. `POST /api/targets/{name}/creds` (record session handle / set
-items), `GET /api/targets/{name}/creds` (summaries, no values), `DELETE
-/api/targets/{name}/creds/{profile}`. The new-mission form's Target select gains a Credentials select
+items), `GET /api/targets/{name}/creds` (`[ProfileSummary]`, no values), `GET
+/api/targets/{name}/creds/{profile}` (`{summary: ProfileSummary, items: [ItemView]}`), `DELETE
+/api/targets/{name}/creds/{profile}` (`204`; `404` when there was none). Setting items over the API:
+`POST /api/targets/{name}/creds` with `{"set":{"profile":"default","items":[{kind,name,value,host}]}}` →
+`ProfileSummary`; a host outside the scope is a `409` with the sentence. Every creds route is the
+operator's (the access token), never reachable from a session's proxy credential. The new-mission form's Target select gains a Credentials select
 listing the chosen target's profiles.
 
+S8. **In-process tools.** `http_send` and `web_fetch` (except requests on the reference path) apply S3 to
+each request they send themselves, with the session's items (`SessionTools::creds`), the same host equality
+and the same request-wins merging (`loom_net::inject::apply`), and record the redacted copy as the exchange's
+request. A cookie the tool's own jar holds for that host counts as one the request already sends. MCP servers
+over HTTP are never given profile items (they carry their own configured auth).
+
+S9. **The in-process proxy credential.** Every session grant also carries a second credential for in-process
+clients (`SessionGrant::tool_url`), with the same session, listener and policy. A request made with it is never
+intercepted, captured or injected by the proxy: the in-process tools record their own exchanges (`tls:
+"tool"`) and inject themselves (S8). So in an intercepting mission `http_send`, `web_fetch` and MCP over HTTPS
+keep verifying the real server certificate with their own roots instead of meeting the loom CA, which their
+client does not trust. Commands never get it (it is not in `env()`). `loom_tools::web::session_proxy` returns
+`SessionTools::tool_proxy` when the runtime set it, else the command proxy from `ToolCtx::env` (tests and
+callers without a runtime).
+
+S12. **In-process TLS to the target** (found in the live test: a self-signed in-scope host was reachable by
+`curl` through the intercepting proxy but never by `http_send`). The runtime sets `SessionTools::upstream_insecure`
+to the mission target's `upstream_insecure` (T1; the lead's `TargetRef`, so every agent of the mission has it)
+for every session with a target; MCP sessions never get it. `http_send`, `http_repeat`, `web_fetch` and the
+oracle decide per request, on the request URL's host and port (`port_or_known_default`), with the same matcher
+the proxy uses (`loom_net::host_listed`, the former `intercept::listed`): a listed `https` request is sent by a
+client that does not verify the server certificate, and its recorded exchange has `upstream_unverified: true`;
+every other request (another host, a redirect hop to another host, the reference path, `cve`/`dep_scan` lookups,
+MCP) keeps full verification. A redirect is decided again on each hop's own URL.
+
+S13. **Transport errors name their cause.** When an in-process client fails before a response (connect, TLS, a
+proxy refusal, a timeout), the error text the tool returns and records is reqwest's message followed by each
+`std::error::Error::source()` in the chain, `: `-joined, skipping a source whose text the line already holds
+(so a certificate failure reads `error sending request for url (https://h:p/x): … invalid peer certificate:
+UnknownIssuer`, not the top line alone). For a certificate failure on a host that is in the mission target's
+scope but not on its `upstream_insecure` list it adds one sentence: `The server's certificate did not verify;
+the operator can list {host} in the target's upstream_insecure if it is a lab host with a self-signed
+certificate.`
+
+S10. **Summary line** (`creds::summary_line`): `{profile} · {n} cookie(s), {m} header(s) · {hosts}`, the
+counts of the effective set, a count of 0 left out (`default · 2 cookies · acme.test`), hosts sorted and
+comma-separated, at most 3 then `and {k} more`; when S6 dropped items it ends with ` · {d} out of scope, not
+attached`.
+
+
+S11. **Runtime.** `NewSession::creds` names the profile; it is refused (one sentence, nothing created) without
+`target`, for an invalid or unknown profile name, or for a profile that does not open. The lead's
+`SessionMeta::creds` and its `session_start` carry `CredsRef { profile, summary, dropped }` (S10 line, S6
+count); every agent of the mission inherits the same `CredsRef`. The items live only in memory: a per-mission
+entry of the runtime holds `Arc<Inject>` and `Arc<Secrets>`, filled on first need by reading the profile
+through `CredsStore` and applying S6 with the scope recorded in the lead's `TargetRef` (T2), and shared by
+every session of the mission (lead, agents, the finish gate's verifier); it is dropped when the mission's
+last session closes. Each session with `creds` gets, right after its grant: `Proxy::set_inject`, and
+`SessionTools::creds`, `SessionTools::secrets`, `Traffic::secrets`; every session gets
+`SessionTools::tool_proxy` = `SessionGrant::tool_url()` (S9). A session restored after a restart fills the
+entry the same way; a profile that is gone or no longer opens leaves the mission without items (a
+`tracing::warn`, the restore goes on). The lead's network section of the system prompt (`network_with_target`)
+gains one line when `creds` is set. In an intercepting mission: `Credential profile {summary line} is attached
+to your requests to those hosts (commands through the proxy, http_send, web_fetch); you never see its values,
+and a cookie or header your request sends itself overrides it.` Without interception the parenthesis is
+`(http_send, web_fetch, and plain-HTTP requests from commands; a command's HTTPS goes through an opaque tunnel
+and carries nothing)`. A secret value never reaches `meta.json`, a record, the prompt or an API
+answer.
 ## U. UI (`ui/`, fixture)
 
 U1. **Exchanges.** A tool row with exchanges (or a `bash` row during which the proxy captured some)
@@ -278,6 +364,15 @@ links to their claims, evidence keys (open the viewer), and the exchanges with t
 The tree is virtualized past 2 000 rows. A mission's header shows a `target acme` chip linking to its
 page; the new-mission form has a Target select.
 
+U5. **Credential profiles.** The target page gets a Credentials panel: one row per profile from `GET
+/api/targets/{name}/creds` (`{profile} · {n} cookies, {m} headers · {hosts} · recorded {age}`), a Show that
+lists item kind, name and host (never a value: the API sends none), a Delete with a confirm, and the two ways
+to add one as copyable commands (`loom creds record --target {name}`, `loom creds set --target {name} --host …
+--cookie '…'`); the UI never takes a secret value itself. The new-mission form shows a Credentials select
+under Target once a target with profiles is chosen (default "none"), sent as `creds`. A mission whose
+`session_start` has `creds` shows a `creds default` chip beside the target chip with the summary as its
+title, and the Session tab shows the summary line.
+
 ## Tests
 
 - **C:** a plain-HTTP request from `bash` through the proxy is recorded with both bodies, attributed to
@@ -299,13 +394,21 @@ page; the new-mission form has a Target select.
   `coverage_set` and a supported claim; out-of-scope never written; status derivation (T6) and the
   `view: "target"` query; two missions of a target see each other's coverage at start; the summary
   is recorded and stable across a reopen; the hash chain of `graph.jsonl`.
-- **S:** recording keeps only in-scope items (an out-of-scope host seen during record is dropped);
-  an in-scope `cookie` item is merged into a forwarded request and the same session's request to an
-  out-of-scope host is untouched; an item never overrides a cookie or header the request already
-  sends; an injected value is `[redacted]` in the captured exchange and absent from every record and
-  the prompt; a profile file round-trips through encrypt/decrypt, is unreadable from the sandbox, and
-  fails to open with the wrong AAD (swapped between profiles) or without `creds.key`; narrowing the
-  target scope drops the now-out-of-scope item at the next mission start; `loom creds show` never
-  prints a value.
+- **S:** recording keeps only in-scope items (an out-of-scope host seen during record is dropped, and its
+  tunnel is not intercepted); `Set-Cookie` overrides an earlier request cookie and `Max-Age=0` removes it; an
+  in-scope `cookie` item is merged into a forwarded request (plain and intercepted) and the same session's
+  request to an out-of-scope host is untouched; an item never overrides a cookie or header the request already
+  sends; the captured request holds `[redacted]` where loom injected and the upstream received the real value;
+  a response echoing an injected value is `[redacted]` in the stored exchange and in the tool result; a
+  profile file round-trips through seal/open, fails to open with the wrong AAD (swapped between profiles or
+  targets) or another key; the key file is 0600 in a 0700 dir; narrowing the target scope drops the
+  now-out-of-scope item at the next mission start and the summary says so; `loom creds show` and every API
+  answer never hold a value (`Item`'s `Debug` neither); a mission started with `creds` records `CredsRef` (no value anywhere in its session directory) and an agent it starts attaches the same items; `creds` without `target` is refused; the tool credential is never intercepted (an
+  `http_send` to an https test server works in an intercepting session) and never in a command's env;
+  `http_send` injects for a matching host and records the redacted copy; with the target listing `127.0.0.1`
+  in `upstream_insecure`, `http_send` and `web_fetch` reach a self-signed https test server, record
+  `upstream_unverified: true` and still inject the profile, a self-signed server not listed fails with the
+  certificate cause in the error text (S13), and a redirect from a listed host to an unlisted self-signed one
+  fails verification on the second hop.
 - **U:** pure models (exchange list, header masking, target tree with statuses, filters) in
   `ui/core.test.js`; fixture routes for all of T7 and exchanges.

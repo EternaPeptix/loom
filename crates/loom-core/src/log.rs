@@ -1442,6 +1442,7 @@ mod tests {
             mcp: Vec::new(),
             intercept: false,
             target: None,
+            creds: None,
             schema,
         })
     }

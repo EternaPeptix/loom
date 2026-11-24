@@ -4683,6 +4683,7 @@ mod tests {
                 schema: loom_core::event::SCHEMA,
                 intercept: false,
                 target: None,
+                creds: None,
                 title: "test".into(),
                 project_instructions: Vec::new(),
                 mcp: Vec::new(),

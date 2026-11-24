@@ -1352,6 +1352,7 @@ mod tests {
                 schema: loom_core::event::SCHEMA,
                 intercept: false,
                 target: None,
+                creds: None,
                 title: s.into(),
                 project_instructions: Vec::new(),
                 mcp: Vec::new(),
@@ -1609,6 +1610,7 @@ mod tests {
             schema: loom_core::event::SCHEMA,
             intercept: false,
             target: None,
+            creds: None,
             title: String::new(),
             project_instructions: Vec::new(),
             mcp: Vec::new(),
@@ -2054,6 +2056,7 @@ mod tests {
             prior: Vec::new(),
             role_models: Default::default(),
             target: None,
+            creds: None,
         }
     }
 

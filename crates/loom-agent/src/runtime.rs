@@ -766,6 +766,7 @@
 
 use crate::pack::{self, Packs, PromptEnv, RoleDef};
 use crate::prior;
+mod creds_api;
 mod target_api;
 mod targets;
 use crate::rtools::{
@@ -777,6 +778,7 @@ use crate::session::{
 };
 use crate::texts;
 use async_trait::async_trait;
+pub use creds_api::{CredsBody, ProfileShow, RecordBody, RecordLines, RecordStarted, SetBody};
 use futures_util::FutureExt;
 use loom_core::config::{ensure_private_dir, Config, NetworkMode, Paths, ProfilePurpose, SandboxCfg, SandboxMode};
 use loom_core::estimate::TokenEstimator;
@@ -862,6 +864,10 @@ pub struct NewSession {
     /// The name of a target (`~/.loom/targets/{name}`) the mission works on (CONTRACTS-TRAFFIC-TARGETS T2).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
+    /// The credential profile of `target` attached to the mission's in-scope requests
+    /// (CONTRACTS-TRAFFIC-TARGETS S3). Refused without `target`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub creds: Option<String>,
     /// Decrypt the mission's HTTPS (CONTRACTS-TRAFFIC-TARGETS I1): `Some(false)` turns it off for a pack that
     /// asks for it, `Some(true)` turns it on for one that does not. Absent = the pack decides. Fixed for the
     /// mission; `[network] intercept = "always"|"never"` overrides it.
@@ -922,6 +928,10 @@ pub struct SessionMeta {
     /// an agent inherits it, and a session restored after a restart uses this record, not the target's file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<loom_core::event::TargetRef>,
+    /// The credential profile the mission attaches (CONTRACTS-TRAFFIC-TARGETS S3, S11): name and summary only;
+    /// an agent inherits it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creds: Option<loom_core::event::CredsRef>,
 }
 
 /// The key of [`SessionMeta::role_models`] that stands for every role the lead starts (`may_spawn`),
@@ -2294,6 +2304,10 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 #[cfg(test)]
 static PANIC_TITLES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
+/// The in-process tool state each session was given (tests only).
+#[cfg(test)]
+static SESSION_TOOLS: Mutex<Vec<(SessionId, Arc<loom_tools::capabilities::SessionTools>)>> = Mutex::new(Vec::new());
+
 /// Every agent a `Resume` was sent to, once per `Resume` (tests only).
 #[cfg(test)]
 static RESUMES: Mutex<Vec<SessionId>> = Mutex::new(Vec::new());
@@ -2650,6 +2664,10 @@ struct Inner {
     traffic: Mutex<HashMap<SessionId, Weak<crate::traffic::Traffic>>>,
     /// Each mission's index of exchanges, shared by its sessions.
     mission_traffic: Mutex<HashMap<MissionId, Weak<crate::traffic::MissionTraffic>>>,
+    /// Each mission's credential profile items while a session holds them (CONTRACTS-TRAFFIC-TARGETS S11).
+    mission_creds: Mutex<HashMap<MissionId, creds_api::MissionCreds>>,
+    /// Login recordings by handle (S2).
+    recordings: Mutex<HashMap<String, Arc<creds_api::Recording>>>,
 }
 
 impl Inner {
@@ -4101,9 +4119,16 @@ impl Inner {
             let capture = loom_net::CaptureGrant {
                 max_bytes: net.capture_max_bytes,
                 intercept: meta.intercept,
-                passthrough: net.intercept_passthrough.clone(),
-                // The target's `upstream_insecure` joins here when targets are wired (part T).
-                upstream_insecure: Vec::new(),
+                // The target's own lists join the daemon's (T2): its passthrough hosts and the hosts whose
+                // upstream certificate is not checked.
+                passthrough: net
+                    .intercept_passthrough
+                    .iter()
+                    .chain(meta.target.iter().flat_map(|t| t.intercept_passthrough.iter()))
+                    .cloned()
+                    .collect(),
+                upstream_insecure: meta.target.as_ref().map(|t| t.upstream_insecure.clone()).unwrap_or_default(),
+                intercept_scope: None,
             };
             self.proxy.grant_with_capture(id, policy, capture, self.capture_tx.clone(), ca.clone())
         } else {
@@ -4142,6 +4167,29 @@ impl Inner {
             let index = traffic.mission.clone();
             let _ = capabilities.exchange_lookup.set(Arc::new(move |id: &str| index.find(id)));
         }
+        // S9: in-process clients reach the proxy with the tool credential, which is never intercepted.
+        let _ = capabilities.tool_proxy.set(grant.tool_url());
+        // S12: the target's `upstream_insecure` and scope reach the in-process tools; no target, nothing set.
+        if let Some(t) = &meta.target {
+            let _ = capabilities.upstream_insecure.set(t.upstream_insecure.clone());
+            match loom_core::target::Scope::parse(&t.scope, &t.exclude) {
+                Ok(scope) => {
+                    let _ = capabilities.target_scope.set(scope);
+                }
+                Err(e) => {
+                    tracing::warn!(target = %t.name, "the target scope does not parse, certificate hints off: {e}")
+                }
+            }
+        }
+        // S11: the mission's profile items, shared by its sessions, reach the proxy and the tools.
+        if let Some((inject, secrets)) = self.mission_creds(meta) {
+            self.proxy.set_inject(id, Some(inject.clone()));
+            let _ = capabilities.creds.set(inject);
+            let _ = capabilities.secrets.set(secrets.clone());
+            let _ = traffic.secrets.set(secrets);
+        }
+        #[cfg(test)]
+        lock(&SESSION_TOOLS).push((id.clone(), capabilities.clone()));
         let ctx = ToolCtx {
             session: id.clone(),
             call_id: CallId::from(""),
@@ -4224,7 +4272,7 @@ impl Inner {
             workspace: deps.ctx.workspace.display().to_string(),
             platform: format!("{} ({})", std::env::consts::OS, std::env::consts::ARCH),
             sandbox: deps.ctx.sandbox.describe(),
-            network: targets::network_with_target(network_text(&self.config), meta.target.as_ref()),
+            network: targets::network_with_target(network_text(&self.config), meta),
             target: targets::prompt_target(meta),
             // Read now, once: the record below carries them, and the prompt is rendered from this value.
             project_instructions: if self.config.agents.project_instructions {
@@ -4261,6 +4309,7 @@ impl Inner {
             schema: loom_core::event::SCHEMA,
             intercept: meta.intercept,
             target: meta.target.clone(),
+            creds: meta.creds.clone(),
             title: meta.title.clone(),
             project_instructions: env.project_instructions,
             mcp: Vec::new(),
@@ -4823,6 +4872,7 @@ impl Inner {
                 gate: req.harness.then(|| req.brief.clone()),
                 prior: Vec::new(),
                 target: p.meta.target.clone(),
+                creds: p.meta.creds.clone(),
             };
             let explicit = prole.termination == Termination::Explicit;
             st.known.insert(child_id.clone(), Known::new(meta.clone(), idle_status()));
@@ -5807,6 +5857,8 @@ impl Runtime {
             capture_tx,
             traffic: Mutex::new(HashMap::new()),
             mission_traffic: Mutex::new(HashMap::new()),
+            mission_creds: Mutex::new(HashMap::new()),
+            recordings: Mutex::new(HashMap::new()),
         });
 
         let weak = Arc::downgrade(&inner);
@@ -6252,6 +6304,8 @@ impl Runtime {
         }
         // The target is read once, here: the lead records it (scope and summary) and the agents inherit it.
         let target = inner.target_ref(new.target.as_deref())?;
+        // S11: a profile is refused here, before the folder or any log exists.
+        let creds = inner.start_creds(target.as_ref(), new.creds.as_deref())?;
         let (model, window, from_config) = inner.facts(&profile_name).await?;
         // The earlier missions to recall can refuse the request too, so they are read before the folder is made.
         let (prior_ids, recalled) = self.recall_earlier(&new.prior).await?;
@@ -6294,6 +6348,7 @@ impl Runtime {
                 prior: prior_ids,
                 role_models,
                 target,
+                creds,
             };
             inner.st().known.insert(id.clone(), Known::new(meta.clone(), idle_status()));
             (made, workspace, created, id, meta)
@@ -7990,10 +8045,12 @@ impl Runtime {
             files: Arc::new(loom_tools::files::FileTracker::new()),
             jobs,
             cancel: CancellationToken::new(),
-            capabilities: Arc::new(loom_tools::capabilities::SessionTools::new(
-                pack.command_guard,
-                pack.target_concurrency,
-            )),
+            capabilities: {
+                let tools = loom_tools::capabilities::SessionTools::new(pack.command_guard, pack.target_concurrency);
+                // S9: MCP over HTTPS uses the tool credential; S8: it is never given profile items.
+                let _ = tools.tool_proxy.set(grant.tool_url());
+                Arc::new(tools)
+            },
             view_chars: cfg.admit.for_window(None).view_chars(&loom_core::estimate::TokenEstimator::default()),
             shell: Arc::new(loom_tools::bash::ShellState::default()),
         };
@@ -8072,6 +8129,7 @@ impl Runtime {
         if inner.shutting.swap(true, Ordering::SeqCst) {
             return;
         }
+        inner.stop_recordings();
         let (actives, background) = {
             let mut st = inner.st();
             let mut actives = Vec::new();
@@ -8317,13 +8375,21 @@ fn scan_tree_for_ids(
 }
 
 impl Inner {
-    /// Read every `meta.json` / `status.json` under the sessions directory.
+    /// Read every `meta.json` / `status.json` under the sessions directory. A `creds-rec-*` directory is
+    /// the audit folder of a login recording (S2) that a stop of the daemon cut short: recordings never
+    /// outlive the daemon, so it is removed.
     fn load_known(&self) {
         let Ok(dir) = std::fs::read_dir(self.paths.sessions_dir()) else { return };
         let mut st = self.st();
         for entry in dir.flatten() {
             let path = entry.path();
             if !path.is_dir() {
+                continue;
+            }
+            if entry.file_name().to_string_lossy().starts_with("creds-rec-") {
+                if let Err(e) = std::fs::remove_dir_all(&path) {
+                    tracing::warn!("cannot remove the leftover recording folder {}: {e}", path.display());
+                }
                 continue;
             }
             let Some(meta) = read_json::<SessionMeta>(&path.join("meta.json")) else {
@@ -16332,6 +16398,258 @@ done
         assert!(s2.contains("Known: 1 domain, 2 hosts"), "{s2}");
         assert_ne!(before, s2);
         assert_eq!(start_of(&e, &one).target.unwrap().summary, before);
+        e.rt.shutdown().await;
+    }
+
+    // --- Credential profiles (CONTRACTS-TRAFFIC-TARGETS S) ---
+
+    const SECRET: &str = "s3cr3t-session-value-9f2";
+
+    fn cookie_item(host: &str, name: &str, value: &str) -> loom_core::creds::Item {
+        loom_core::creds::Item {
+            kind: loom_core::creds::ItemKind::Cookie,
+            name: name.into(),
+            value: value.into(),
+            host: host.into(),
+        }
+    }
+
+    fn files_under(dir: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut todo = vec![dir.to_path_buf()];
+        while let Some(d) = todo.pop() {
+            for entry in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    todo.push(path);
+                } else {
+                    out.push(path);
+                }
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn a_mission_with_creds_records_a_ref_and_no_value_reaches_its_session_directory() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        e.rt.target_create(&target_body(&["*.acme.test", "acme.test"], &[])).unwrap();
+        e.rt.creds_set("acme", "default", vec![cookie_item("www.acme.test", "session", SECRET)]).unwrap();
+        let mut new = e.new_session(Some("go"));
+        new.target = Some("acme".into());
+        new.creds = Some("default".into());
+        let id = e.rt.create_session(new).await.unwrap().meta.id;
+        let start = start_of(&e, &id);
+        let c = start.creds.expect("creds recorded");
+        assert_eq!(c.profile, "default");
+        assert_eq!(c.dropped, 0);
+        assert!(c.summary.contains("1 cookie"), "{}", c.summary);
+        assert!(start.system_prompt.contains("Credential profile"), "{}", start.system_prompt);
+        e.rt.shutdown().await;
+        let dir = e.rt.inner.paths.session_dir(&id);
+        for f in files_under(&dir) {
+            let bytes = std::fs::read(&f).unwrap();
+            assert!(!String::from_utf8_lossy(&bytes).contains(SECRET), "value found in {}", f.display());
+        }
+    }
+
+    #[tokio::test]
+    async fn creds_are_refused_without_a_target_for_an_unknown_or_invalid_profile_and_create_nothing() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        e.rt.target_create(&target_body(&["acme.test"], &[])).unwrap();
+        let count = |e: &Env| files_under(&e.rt.inner.paths.home.join("sessions")).len();
+        let before = count(&e);
+        let mut no_target = e.new_session(Some("go"));
+        no_target.creds = Some("default".into());
+        assert!(e.rt.create_session(no_target).await.unwrap_err().contains("target"));
+        for name in ["missing", "Bad Name"] {
+            let mut new = e.new_session(Some("go"));
+            new.target = Some("acme".into());
+            new.creds = Some(name.into());
+            let err = e.rt.create_session(new).await.unwrap_err();
+            assert!(err.contains("profile"), "{err}");
+        }
+        assert_eq!(before, count(&e), "a refused start must create nothing");
+        assert!(e.rt.sessions(true).is_empty());
+        e.rt.shutdown().await;
+    }
+
+    fn tools_of(id: &SessionId) -> Arc<loom_tools::capabilities::SessionTools> {
+        lock(&SESSION_TOOLS).iter().rev().find(|(s, _)| s == id).map(|(_, t)| t.clone()).expect("session tools")
+    }
+
+    #[tokio::test]
+    async fn a_target_session_gets_upstream_insecure_and_the_scope_and_one_without_a_target_gets_none() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let mut body = target_body(&["*.acme.test", "127.0.0.1"], &["no.acme.test"]);
+        body.upstream_insecure = Some(vec!["127.0.0.1".into(), "*.lab.acme.test".into()]);
+        e.rt.target_create(&body).unwrap();
+        let mut new = e.new_session(Some("go"));
+        new.target = Some("acme".into());
+        let lead = e.rt.create_session(new).await.unwrap().meta.id;
+        let t = tools_of(&lead);
+        assert_eq!(t.upstream_insecure.get().cloned(), Some(vec!["127.0.0.1".to_string(), "*.lab.acme.test".into()]));
+        let scope = t.target_scope.get().expect("scope");
+        assert!(scope.contains("www.acme.test") && !scope.contains("no.acme.test"));
+        let plain = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
+        let t = tools_of(&plain);
+        assert!(t.upstream_insecure.get().is_none() && t.target_scope.get().is_none());
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_child_inherits_the_mission_creds() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        e.rt.target_create(&target_body(&["*.acme.test"], &[])).unwrap();
+        e.rt.creds_set("acme", "default", vec![cookie_item("www.acme.test", "session", SECRET)]).unwrap();
+        let mut new = e.new_session(None);
+        new.target = Some("acme".into());
+        new.creds = Some("default".into());
+        let parent = e.rt.create_session(new).await.unwrap().meta.id;
+        let child =
+            e.rt.inner
+                .spawn_child(
+                    &parent,
+                    SpawnReq {
+                        role: "worker".into(),
+                        mode: SpawnMode::Fresh,
+                        brief: Brief { question: "look".into(), ..Brief::default() },
+                        budget: Budget::default(),
+                        call_id: CallId::from("c1"),
+                        title: "child".into(),
+                        awaited: false,
+                        harness: false,
+                        prerequisite: None,
+                        workspace: Workspace::Shared,
+                    },
+                )
+                .await
+                .unwrap();
+        let cs = start_of(&e, &child);
+        assert_eq!(cs.creds.map(|c| c.profile), Some("default".to_string()));
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn narrowing_the_target_scope_drops_the_item_at_the_next_mission_start() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        e.rt.target_create(&target_body(&["*.acme.test"], &[])).unwrap();
+        e.rt.creds_set(
+            "acme",
+            "default",
+            vec![cookie_item("www.acme.test", "a", SECRET), cookie_item("api.acme.test", "b", SECRET)],
+        )
+        .unwrap();
+        let narrow = TargetBody { scope: Some(vec!["www.acme.test".into()]), ..Default::default() };
+        e.rt.target_update("acme", &narrow).unwrap();
+        let mut new = e.new_session(Some("go"));
+        new.target = Some("acme".into());
+        new.creds = Some("default".into());
+        let id = e.rt.create_session(new).await.unwrap().meta.id;
+        let c = start_of(&e, &id).creds.unwrap();
+        assert_eq!(c.dropped, 1, "{}", c.summary);
+        assert!(!c.summary.contains("api.acme.test"), "{}", c.summary);
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_leftover_recording_folder_is_removed_at_start() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let left = e.rt.inner.paths.sessions_dir().join("creds-rec-0011223344556677");
+        std::fs::create_dir_all(&left).unwrap();
+        std::fs::write(left.join("net.jsonl"), b"{}\n").unwrap();
+        e.rt.inner.load_known();
+        assert!(!left.exists());
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_creds_routes_validate_and_never_return_a_value() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        assert!(e.rt.creds_list("nope").unwrap_err().starts_with("There is no target"));
+        e.rt.target_create(&target_body(&["*.acme.test"], &[])).unwrap();
+        assert!(e.rt.creds_list("acme").unwrap().is_empty());
+        let s = e.rt.creds_set("acme", "default", vec![cookie_item("www.acme.test", "session", SECRET)]).unwrap();
+        assert_eq!((s.cookies, s.headers), (1, 0));
+        assert!(e.rt.creds_set("acme", "other", vec![cookie_item("evil.test", "x", SECRET)]).is_err());
+        assert!(e.rt.creds_set("acme", "Bad Name", vec![cookie_item("www.acme.test", "x", SECRET)]).is_err());
+        assert!(e.rt.creds_set("acme", "other", vec![]).is_err());
+        assert_eq!(e.rt.creds_list("acme").unwrap().len(), 1);
+        let show = e.rt.creds_show("acme", "default").unwrap();
+        let json = serde_json::to_string(&(&show, e.rt.creds_list("acme").unwrap())).unwrap();
+        assert!(!json.contains(SECRET), "{json}");
+        assert!(!format!("{:?}", cookie_item("h", "n", SECRET)).contains(SECRET));
+        assert!(e.rt.creds_remove("acme", "default").is_ok());
+        assert!(e.rt.creds_remove("acme", "default").unwrap_err().starts_with("No profile"));
+        assert!(e.rt.creds_record_lines("acme", "nothing", 0).unwrap_err().starts_with("No recording"));
+        e.rt.shutdown().await;
+    }
+
+    /// A tiny HTTP server on loopback: answers every request with `Set-Cookie: seen=1`.
+    async fn http_stub() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let _ = sock.read(&mut buf).await;
+                    let _ = sock
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\nSet-Cookie: seen=1\r\n\r\nok")
+                        .await;
+                });
+            }
+        });
+        port
+    }
+
+    async fn via_proxy(grant: &RecordStarted, port: u16, cookie: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let proxy = grant.proxy.trim_start_matches("http://").to_string();
+        let mut s = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        let auth = base64(&format!("{}:{}", grant.user, grant.password));
+        let req = format!(
+            "GET http://127.0.0.1:{port}/ HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nProxy-Authorization: Basic {auth}\r\nCookie: {cookie}\r\nConnection: close\r\n\r\n"
+        );
+        s.write_all(req.as_bytes()).await.unwrap();
+        let mut out = Vec::new();
+        let _ = s.read_to_end(&mut out).await;
+        String::from_utf8_lossy(&out).to_string()
+    }
+
+    #[tokio::test]
+    async fn a_recording_through_the_proxy_writes_a_profile_and_one_with_nothing_in_scope_writes_nothing() {
+        let e = env_with(Script::new(|_, _| finish("ok")), false, |c| {
+            c.network.allow_private = vec!["127.0.0.0/8".into()];
+        })
+        .await;
+        let port = http_stub().await;
+        e.rt.target_create(&target_body(&["127.0.0.1"], &[])).unwrap();
+        let started = e.rt.creds_record_start("acme", "default").await.unwrap();
+        assert!(e.rt.creds_record_start("acme", "default").await.unwrap_err().contains(&started.handle));
+        assert_eq!(started.ca_sha256.split(':').count(), 32, "{}", started.ca_sha256);
+        let answer = via_proxy(&started, port, &format!("session={SECRET}")).await;
+        assert!(answer.contains("200"), "{answer}");
+        let mut lines = Vec::new();
+        for _ in 0..50 {
+            lines = e.rt.creds_record_lines("acme", &started.handle, 0).unwrap().lines;
+            if !lines.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(lines.iter().any(|l| l.contains("session")), "{lines:?}");
+        assert!(lines.iter().all(|l| !l.contains(SECRET)), "{lines:?}");
+        let summary = e.rt.creds_record_stop("acme", &started.handle).await.unwrap();
+        assert!(summary.cookies >= 1, "{summary:?}");
+        assert!(e.rt.creds_show("acme", "default").is_ok());
+        assert!(e.rt.creds_record_lines("acme", &started.handle, 0).is_err());
+
+        let empty = e.rt.creds_record_start("acme", "empty").await.unwrap();
+        let err = e.rt.creds_record_stop("acme", &empty.handle).await.unwrap_err();
+        assert!(err.contains("collected nothing"), "{err}");
+        assert!(e.rt.creds_show("acme", "empty").is_err());
         e.rt.shutdown().await;
     }
 }

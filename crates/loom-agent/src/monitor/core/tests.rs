@@ -70,6 +70,7 @@ fn start(session: &str, mission: &str) -> Event {
         mcp: Vec::new(),
         intercept: false,
         target: None,
+        creds: None,
         schema: loom_core::event::SCHEMA,
     })
 }

@@ -84,6 +84,11 @@
 //! | `PUT /targets/{name}` (`TargetBody`; what is left out stays) | `runtime.target_update` | `TargetView` |
 //! | `GET /targets/{name}/graph?status=&kind=&under=` | `runtime.target_graph`: nodes with status, missions and evidence keys; the edges between them | `GraphView` |
 //! | `GET /targets/{name}/exchanges?node=&limit={n}` | `runtime.target_exchanges`: the exchanges of every mission of the target with that node (id or locator), newest last | `[ExchangeEntry]` |
+//! | `GET /targets/{name}/creds` | `runtime.creds_list` (CONTRACTS-TRAFFIC-TARGETS S7; no values) | `[ProfileSummary]` |
+//! | `POST /targets/{name}/creds` (`CredsBody`: exactly one of `record`, `stop`, `set`) | `runtime.creds_record_start` / `creds_record_stop` / `creds_set` (S2; `400` for none or more than one) | `RecordStarted` / `ProfileSummary` / `ProfileSummary` |
+//! | `GET /targets/{name}/creds/record/{handle}?after={n}` | `runtime.creds_record_lines` (name lines only) | `RecordLines` |
+//! | `GET /targets/{name}/creds/{profile}` | `runtime.creds_show` | `ProfileShow` (`summary`, `items[{kind, name, host}]`) |
+//! | `DELETE /targets/{name}/creds/{profile}` | `runtime.creds_remove` (`404` when there was none) | `204` |
 //! | `GET /missions` | `runtime.missions` | `[MissionInfo]` |
 //! | `GET /missions/{id}/ledger` | `runtime.ledger` | `LedgerView` |
 //! | `GET /missions/{id}/score` | `runtime.score` | `ScoreView` |
@@ -273,6 +278,9 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/targets/{name}", get(target_show).put(target_update))
         .route("/api/targets/{name}/graph", get(target_graph))
         .route("/api/targets/{name}/exchanges", get(target_exchanges))
+        .route("/api/targets/{name}/creds", get(creds_list).post(creds_post))
+        .route("/api/targets/{name}/creds/record/{handle}", get(creds_record_lines))
+        .route("/api/targets/{name}/creds/{profile}", get(creds_show).delete(creds_remove))
         .route("/api/missions", get(missions))
         .route("/api/missions/{id}/ledger", get(ledger))
         .route("/api/missions/{id}/score", get(score))
@@ -1045,6 +1053,61 @@ async fn target_exchanges(State(s): State<ApiState>, Path(name): Path<String>, q
     let rt = s.runtime.clone();
     let entries = blocking(move || rt.target_exchanges(&name, node.as_deref(), limit).map_err(rt_err)).await?;
     Ok(Json(entries).into_response())
+}
+
+async fn creds_list(State(s): State<ApiState>, Path(name): Path<String>) -> Res<Response> {
+    let rt = s.runtime.clone();
+    Ok(Json(blocking(move || rt.creds_list(&name).map_err(rt_err)).await?).into_response())
+}
+
+async fn creds_post(State(s): State<ApiState>, Path(name): Path<String>, body: Bytes) -> Res<Response> {
+    let body: loom_agent::runtime::CredsBody = json_body(&body)?;
+    let given = usize::from(body.record.is_some()) + usize::from(body.stop.is_some()) + usize::from(body.set.is_some());
+    if given != 1 {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Give exactly one of `record`, `stop` and `set` in the body.".to_string(),
+        ));
+    }
+    let rt = s.runtime.clone();
+    if let Some(r) = body.record {
+        let started = rt.creds_record_start(&name, r.profile.as_deref().unwrap_or("default")).await.map_err(rt_err)?;
+        return Ok(Json(started).into_response());
+    }
+    if let Some(handle) = body.stop {
+        let summary = rt.creds_record_stop(&name, &handle).await.map_err(rt_err)?;
+        return Ok(Json(summary).into_response());
+    }
+    let Some(set) = body.set else {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "Give one of `record`, `stop` and `set`.".to_string()));
+    };
+    let summary =
+        blocking(move || rt.creds_set(&name, set.profile.as_deref().unwrap_or("default"), set.items).map_err(rt_err))
+            .await?;
+    Ok(Json(summary).into_response())
+}
+
+async fn creds_record_lines(
+    State(s): State<ApiState>,
+    Path((name, handle)): Path<(String, String)>,
+    q: RawQuery,
+) -> Res<Response> {
+    let q = params(q)?;
+    let after = number(&q, "after")?.unwrap_or(0);
+    let after = usize::try_from(after).unwrap_or(usize::MAX);
+    let lines = s.runtime.creds_record_lines(&name, &handle, after).map_err(rt_err)?;
+    Ok(Json(lines).into_response())
+}
+
+async fn creds_show(State(s): State<ApiState>, Path((name, profile)): Path<(String, String)>) -> Res<Response> {
+    let rt = s.runtime.clone();
+    Ok(Json(blocking(move || rt.creds_show(&name, &profile).map_err(rt_err)).await?).into_response())
+}
+
+async fn creds_remove(State(s): State<ApiState>, Path((name, profile)): Path<(String, String)>) -> Res<Response> {
+    let rt = s.runtime.clone();
+    blocking(move || rt.creds_remove(&name, &profile).map_err(rt_err)).await?;
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 async fn missions(State(s): State<ApiState>) -> Response {
@@ -3720,6 +3783,43 @@ done
         assert_eq!(b["server_name"], "fake");
         assert_eq!(b["tools"][0]["name"], "echo");
         assert_eq!(b["tools"][0]["read_only_hint"], true);
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_creds_routes_answer_with_the_right_statuses_and_never_a_value() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let secret = "s3cr3t-session-value-9f2";
+        let (st, b) = e.get("/api/targets/nope/creds").await;
+        assert_eq!(st, 404, "{b}");
+        let (st, b) = e.post("/api/targets", json!({"name": "acme", "scope": ["*.acme.test"]})).await;
+        assert_eq!(st, 201, "{b}");
+        let item = json!({"kind": "cookie", "name": "session", "value": secret, "host": "www.acme.test"});
+        let (st, b) = e.post("/api/targets/acme/creds", json!({"set": {"profile": "default", "items": [item]}})).await;
+        assert_eq!(st, 200, "{b}");
+        assert!(!b.to_string().contains(secret));
+        let out = json!({"kind": "cookie", "name": "x", "value": secret, "host": "evil.test"});
+        let (st, b) = e.post("/api/targets/acme/creds", json!({"set": {"items": [out]}})).await;
+        assert_eq!(st, 409, "{b}");
+        let (st, _) = e.post("/api/targets/acme/creds", json!({})).await;
+        assert_eq!(st, 400);
+        let (st, _) = e.post("/api/targets/acme/creds", json!({"stop": "x", "record": {}})).await;
+        assert_eq!(st, 400);
+        let (st, b) = e.post("/api/targets/acme/creds", json!({"stop": "nope"})).await;
+        assert_eq!(st, 404, "{b}");
+        for path in ["/api/targets/acme/creds", "/api/targets/acme/creds/default"] {
+            let (st, b) = e.get(path).await;
+            assert_eq!(st, 200, "{b}");
+            assert!(!b.to_string().contains(secret), "{b}");
+        }
+        let (st, _) = e.get("/api/targets/acme/creds/missing").await;
+        assert_eq!(st, 404);
+        let (st, _) = e.get("/api/targets/acme/creds/record/nope?after=0").await;
+        assert_eq!(st, 404);
+        let r = e.rq(Method::DELETE, "/api/targets/acme/creds/default").send().await.unwrap();
+        assert_eq!(r.status().as_u16(), 204);
+        let r = e.rq(Method::DELETE, "/api/targets/acme/creds/default").send().await.unwrap();
+        assert_eq!(r.status().as_u16(), 404);
         e.rt.shutdown().await;
     }
 }

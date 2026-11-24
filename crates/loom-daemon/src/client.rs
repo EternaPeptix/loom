@@ -713,6 +713,49 @@ impl Client {
         self.call(Method::GET, &format!("/api/targets/{}/graph", segment(name)), &[], None).await
     }
 
+    /// `GET /api/targets/{name}/creds` (S7).
+    pub async fn creds_list(&self, target: &str) -> Result<Vec<loom_core::creds::ProfileSummary>, String> {
+        self.call(Method::GET, &format!("/api/targets/{}/creds", segment(target)), &[], None).await
+    }
+
+    /// `GET /api/targets/{name}/creds/{profile}` (S7).
+    pub async fn creds_show(&self, target: &str, profile: &str) -> Result<loom_agent::runtime::ProfileShow, String> {
+        self.call(Method::GET, &format!("/api/targets/{}/creds/{}", segment(target), segment(profile)), &[], None).await
+    }
+
+    /// `POST /api/targets/{name}/creds` with one of `record`, `stop`, `set`; the answer as JSON.
+    pub async fn creds_post(
+        &self,
+        target: &str,
+        body: &loom_agent::runtime::CredsBody,
+    ) -> Result<serde_json::Value, String> {
+        let body = serde_json::to_value(body).map_err(|e| format!("The request cannot be encoded ({e})."))?;
+        self.call(Method::POST, &format!("/api/targets/{}/creds", segment(target)), &[], Some(body)).await
+    }
+
+    /// `GET /api/targets/{name}/creds/record/{handle}?after={n}` (S2).
+    pub async fn creds_record_lines(
+        &self,
+        target: &str,
+        handle: &str,
+        after: usize,
+    ) -> Result<loom_agent::runtime::RecordLines, String> {
+        let query = [("after", after.to_string())];
+        self.call(
+            Method::GET,
+            &format!("/api/targets/{}/creds/record/{}", segment(target), segment(handle)),
+            &query,
+            None,
+        )
+        .await
+    }
+
+    /// `DELETE /api/targets/{name}/creds/{profile}` (S7).
+    pub async fn creds_remove(&self, target: &str, profile: &str) -> Result<(), String> {
+        self.call_unit(Method::DELETE, &format!("/api/targets/{}/creds/{}", segment(target), segment(profile)), None)
+            .await
+    }
+
     pub async fn missions(&self) -> Result<Vec<MissionInfo>, String> {
         self.call(Method::GET, "/api/missions", &[], None).await
     }
@@ -1049,6 +1092,7 @@ pub(crate) mod testkit {
                 prior: Vec::new(),
                 role_models: Default::default(),
                 target: None,
+                creds: None,
             },
             active: false,
             status: status(Phase::Idle),

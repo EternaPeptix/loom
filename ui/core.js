@@ -2500,6 +2500,9 @@ export function buildNewSession(form) {
   // A target (CONTRACTS-TRAFFIC-TARGETS T2) is named by its name; none means a mission with its own security state.
   const target = String(form.target || "").trim();
   if (target) body.target = target;
+  // A credential profile (S3) goes with a target only; "none" or empty sends nothing.
+  const creds = String(form.creds || "").trim();
+  if (target && creds && creds !== "none") body.creds = creds;
   // Only a lead starts agents: the choice for every role goes with it, before its first agent.
   if (form.agentModel && role === "lead") body.role_models = { "*": form.agentModel };
   const title = String(form.title || "").trim();
@@ -5469,4 +5472,61 @@ export function graphNodes(g) {
 export function callWindowExchanges(block, list) {
   if (!block || (block.ran || block.name) !== "bash" || !block.result || !Number.isFinite(block.ts) || !Number.isFinite(block.result.ts)) return [];
   return list.filter((x) => !x.call_id && x.source === "proxy" && x.ts >= block.ts && x.ts <= block.result.ts);
+}
+
+/** A profile of GET /api/targets/{name}/creds as the panel shows it (no values exist in the answer). */
+export function credProfileOf(p) {
+  const hosts = Array.isArray(p.hosts) ? p.hosts.map(String) : typeof p.hosts === "string" && p.hosts ? [p.hosts] : [];
+  return { profile: String(p.profile), cookies: Number(p.cookies) || 0, headers: Number(p.headers) || 0, hosts, recorded_ms: Number(p.recorded_ms) || 0, error: p.error ? String(p.error) : "" };
+}
+
+/** `2 cookies, 1 header`: a count of 0 is left out (S10); empty when both are 0. */
+export function credCountsWords(cookies, headers) {
+  const parts = [];
+  if (cookies > 0) parts.push(count(cookies, "cookie"));
+  if (headers > 0) parts.push(count(headers, "header"));
+  return parts.join(", ");
+}
+
+/** Hosts sorted, at most 3, then `and {k} more` (S10). */
+export function credHostsWords(hosts) {
+  const sorted = [...new Set(hosts || [])].sort();
+  const shown = sorted.slice(0, 3).join(", ");
+  return sorted.length > 3 ? `${shown} and ${sorted.length - 3} more` : shown;
+}
+
+/** One panel row: `{profile} · {n} cookies, {m} headers · {hosts} · recorded {age}`; an error replaces the counts. */
+export function credRowText(p, now) {
+  const q = credProfileOf(p);
+  const parts = [q.profile];
+  if (q.error) parts.push(q.error);
+  else {
+    const counts = credCountsWords(q.cookies, q.headers);
+    if (counts) parts.push(counts);
+    const hosts = credHostsWords(q.hosts);
+    if (hosts) parts.push(hosts);
+  }
+  if (q.recorded_ms > 0) {
+    const a = age(now, q.recorded_ms);
+    parts.push("recorded " + (a === "now" ? "just now" : a + " ago"));
+  }
+  return parts.join(" \u00b7 ");
+}
+
+/** The items of GET /api/targets/{name}/creds/{profile}: `{summary, lines}`, each line `kind name \u00b7 host`. */
+export function credShow(r) {
+  const items = Array.isArray(r?.items) ? r.items : [];
+  return { summary: String(r?.summary || ""), lines: items.map((i) => `${i.kind} ${i.name} \u00b7 ${i.host}`) };
+}
+
+/** The two commands that add a profile; the UI never takes a secret itself. */
+export function credCommands(target) {
+  return [`loom creds record --target ${target}`, `loom creds set --target ${target} --host \u2026 --cookie '\u2026'`];
+}
+
+/** The `creds` of a `session_start`: `{profile, summary, dropped}` or null. */
+export function credsRefOf(start) {
+  const c = start && start.creds;
+  if (!c || !c.profile) return null;
+  return { profile: String(c.profile), summary: String(c.summary || ""), dropped: Number(c.dropped) || 0 };
 }

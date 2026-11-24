@@ -1532,6 +1532,7 @@ fn mcp_server_traffic_and_what_comes_before_the_session_start_are_not_idle_egres
         mcp: Vec::new(),
         intercept: false,
         target: None,
+        creds: None,
         schema: loom_core::event::SCHEMA,
     }));
     t.e.record(&t.ctx.clone(), &start, &t.auth, &t.fold);

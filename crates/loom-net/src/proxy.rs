@@ -328,6 +328,7 @@
 //! when they have already been relayed.
 
 mod intercept;
+pub use self::intercept::listed as host_listed;
 
 use self::intercept::{CaptureCfg, Tap};
 use crate::clienthello::{self, Hello};
@@ -478,12 +479,21 @@ pub struct SessionGrant {
     pub port: u16,
     pub user: String,
     pub password: String,
+    /// The in-process tools' credential for the same session (CONTRACTS-TRAFFIC-TARGETS S9): never
+    /// intercepted, captured or injected, and never in [`SessionGrant::env`]. Empty on a reference grant.
+    pub tool_user: String,
+    pub tool_password: String,
 }
 
 impl SessionGrant {
     /// `http://{user}:{password}@127.0.0.1:{port}`
     pub fn url(&self) -> String {
         format!("http://{}:{}@127.0.0.1:{}", self.user, self.password, self.port)
+    }
+
+    /// `http://{tool_user}:{tool_password}@127.0.0.1:{port}`, for in-process clients only (S9).
+    pub fn tool_url(&self) -> String {
+        format!("http://{}:{}@127.0.0.1:{}", self.tool_user, self.tool_password, self.port)
     }
 
     /// Proxy variables for a command's environment (see module contract).
@@ -529,6 +539,11 @@ struct Entry {
     lookups: Arc<Semaphore>,
     /// What the session's traffic is captured with; `None` for a session granted without capture.
     capture: Option<Arc<CaptureCfg>>,
+    /// The credential profile's items attached to this credential's forwarded requests; only on a session's
+    /// command credential (S3).
+    inject: Option<Arc<crate::inject::Inject>>,
+    /// The in-process tools' credential (S9): never intercepted, captured or injected.
+    tool: bool,
 }
 
 /// A pending connection: its id, the token that closes it and its connection permit.
@@ -979,9 +994,31 @@ impl Proxy {
             permits: semaphore(limits.max_per_session),
             lookups: semaphore(limits.max_lookups_per_session),
             capture,
+            inject: None,
+            tool: false,
         };
-        lock(&self.inner.shared.sessions).insert(session.as_str().to_string(), entry);
-        Ok(SessionGrant { port, user: session.as_str().to_string(), password })
+        // S9: the tool credential is an entry of its own sharing the session's policy, permits and lookups,
+        // with no capture and no injection.
+        let tool_user = format!("tool-{:032x}", rand::rng().random::<u128>());
+        let tool_password = format!("{:032x}", rand::rng().random::<u128>());
+        let tool_entry = Entry {
+            reference: false,
+            session: session.clone(),
+            password: tool_password.clone(),
+            policy: entry.policy.clone(),
+            permits: entry.permits.clone(),
+            lookups: entry.lookups.clone(),
+            capture: None,
+            inject: None,
+            tool: true,
+        };
+        {
+            let mut sessions = lock(&self.inner.shared.sessions);
+            sessions.retain(|_, e| !(e.tool && &e.session == session));
+            sessions.insert(session.as_str().to_string(), entry);
+            sessions.insert(tool_user.clone(), tool_entry);
+        }
+        Ok(SessionGrant { port, user: session.as_str().to_string(), password, tool_user, tool_password })
     }
 
     /// Mint a credential for in-process reference GET clients. It is not added to command env.
@@ -1003,11 +1040,39 @@ impl Proxy {
             permits: semaphore(limits.max_per_session),
             lookups: semaphore(limits.max_lookups_per_session),
             capture: None,
+            inject: None,
+            tool: false,
         };
         let mut sessions = lock(&self.inner.shared.sessions);
         sessions.retain(|_, entry| !(entry.reference && &entry.session == session));
         sessions.insert(user.clone(), entry);
-        Ok(ReferenceGrant { grant: SessionGrant { port: self.inner.port, user, password }, raw_policy })
+        Ok(ReferenceGrant {
+            grant: SessionGrant {
+                port: self.inner.port,
+                user,
+                password,
+                tool_user: String::new(),
+                tool_password: String::new(),
+            },
+            raw_policy,
+        })
+    }
+
+    /// Attach (or with `None` stop attaching) a credential profile's items to the session's forwarded requests
+    /// (CONTRACTS-TRAFFIC-TARGETS S3): plain and intercepted requests made with the session's command
+    /// credential whose destination host equals an item's host get [`crate::inject::apply`] /
+    /// [`crate::inject::apply_head`] after the connection is allowed and before the head is sent upstream,
+    /// decided again for every request (a kept-alive intercepted connection, each request after a redirect).
+    /// Never on the reference credential or the tool credential (S8, S9). The runtime calls it right after
+    /// the grant, before the session is handed its environment. False when the session holds no grant.
+    pub fn set_inject(&self, session: &SessionId, inject: Option<Arc<crate::inject::Inject>>) -> bool {
+        match lock(&self.inner.shared.sessions).get_mut(session.as_str()) {
+            Some(entry) if !entry.reference && !entry.tool => {
+                entry.inject = inject;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Replaces the policy of **both** entries of a session, the command grant and its reference grant, with
@@ -1028,9 +1093,15 @@ impl Proxy {
     /// Replace the policy of a session that holds a grant. Its credentials stay as they are. False
     /// when the session holds no grant.
     pub fn set_policy(&self, session: &SessionId, policy: Policy) -> bool {
-        match lock(&self.inner.shared.sessions).get_mut(session.as_str()) {
+        let mut sessions = lock(&self.inner.shared.sessions);
+        let policy = Arc::new(policy);
+        // The tool credential follows the command credential (S9); the reference one has its own policy.
+        for entry in sessions.values_mut().filter(|e| e.tool && &e.session == session) {
+            entry.policy = policy.clone();
+        }
+        match sessions.get_mut(session.as_str()) {
             Some(entry) => {
-                entry.policy = Arc::new(policy);
+                entry.policy = policy;
                 true
             }
             None => false,
@@ -1522,6 +1593,8 @@ struct Authed {
     permits: Arc<Semaphore>,
     lookups: Arc<Semaphore>,
     capture: Option<Arc<CaptureCfg>>,
+    inject: Option<Arc<crate::inject::Inject>>,
+    tool: bool,
 }
 
 /// Why a request carries no usable credentials.
@@ -1564,6 +1637,8 @@ fn authenticate(shared: &Shared, head: &Head) -> Result<Authed, AuthError> {
             permits: e.permits.clone(),
             lookups: e.lookups.clone(),
             capture: e.capture.clone(),
+            inject: e.inject.clone(),
+            tool: e.tool,
         })
     } else {
         Err(AuthError::Failed(format!("wrong password for session {}", e.session.as_str())))
@@ -2023,7 +2098,8 @@ async fn handle(
     };
     // Cuts made from here on end the connection once it is registered (see `Proxy::cut`).
     let seen = shared.cut_seq.load(Ordering::SeqCst);
-    let Authed { reference, session, policy, permits, lookups, capture } = auth;
+    let Authed { reference, session, policy, permits, lookups, capture, inject, tool } = auth;
+    let inject = inject.filter(|_| !reference && !tool);
     // Command credentials count only on their own session's listener, reference ones only on the shared
     // one; nothing else of the request is acted on before this.
     let wrong_port = match (&origin, reference) {
@@ -2080,7 +2156,18 @@ async fn handle(
                 if connect {
                     let live = LiveGuard::register(shared, session, &host, port, seen);
                     let policy = current_policy(shared, session, reference, policy);
-                    tunnel(client, extra, &cx, &policy, capture.as_deref(), slot, cancel, live.cut.clone()).await;
+                    tunnel(
+                        client,
+                        extra,
+                        &cx,
+                        &policy,
+                        capture.as_deref(),
+                        inject.as_deref(),
+                        slot,
+                        cancel,
+                        live.cut.clone(),
+                    )
+                    .await;
                 } else {
                     check(&mut client, &cx, &policy, slot).await;
                 }
@@ -2106,7 +2193,8 @@ async fn handle(
             let cut = live.cut.clone();
             let policy = current_policy(shared, session, reference, policy);
             let capture = capture.as_deref();
-            forward(client, extra, &head, &cx, &policy, capture, &authority, &path, reference, slot, cancel, cut).await;
+            let fx = Forward { authority: &authority, path: &path, reference, inject: inject.as_deref() };
+            forward(client, extra, &head, &cx, &policy, capture, &fx, slot, cancel, cut).await;
         }
         Err(m) => reject(&mut client, &shared, slot, &session, &head, &m).await,
     }
@@ -2236,6 +2324,7 @@ async fn tunnel(
     cx: &Ctx<'_>,
     policy: &Policy,
     capture: Option<&CaptureCfg>,
+    inject: Option<&crate::inject::Inject>,
     slot: OwnedSemaphorePermit,
     cancel: CancellationToken,
     cut: Cut,
@@ -2271,7 +2360,7 @@ async fn tunnel(
             };
             let first = match intercept {
                 Some(cap) if matches!(clienthello::parse(&first), Hello::Tls { .. }) => {
-                    match intercept::run(&mut client, first, &mut up, cx, &allowed, cap).await {
+                    match intercept::run(&mut client, first, &mut up, cx, &allowed, cap, inject).await {
                         intercept::Ended::Done => return Phase::Intercepted,
                         intercept::Ended::Opaque(first) => first,
                     }
@@ -2956,6 +3045,15 @@ async fn relay(
     RelayEnd::Done(wrote())
 }
 
+/// What `forward` needs of the request target and the credential used.
+struct Forward<'a> {
+    authority: &'a str,
+    path: &'a str,
+    reference: bool,
+    /// The items to attach, `None` for the reference and tool credentials and sessions without a profile.
+    inject: Option<&'a crate::inject::Inject>,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn forward(
     mut client: TcpStream,
@@ -2964,13 +3062,12 @@ async fn forward(
     cx: &Ctx<'_>,
     policy: &Policy,
     capture: Option<&CaptureCfg>,
-    authority: &str,
-    path: &str,
-    reference: bool,
+    fx: &Forward<'_>,
     slot: OwnedSemaphorePermit,
     cancel: CancellationToken,
     cut: Cut,
 ) {
+    let Forward { authority, path, reference, inject } = *fx;
     let idle = cx.shared.limits.idle_timeout;
     let body = match body_kind(head) {
         Ok(b) => b,
@@ -2988,7 +3085,16 @@ async fn forward(
     }
 
     let mut out: Vec<u8> = format!("{} {} HTTP/1.1\r\nHost: {}\r\n", head.method, path, authority).into_bytes();
-    for (n, v) in &head.headers {
+    // S3: the profile's items for the destination, after the connection was allowed; the request's own cookies
+    // and headers win.
+    let mut attached = None;
+    if let Some(inj) = inject.filter(|i| i.applies_to(cx.host)) {
+        let mut headers = head.headers.clone();
+        if crate::inject::apply(inj.items(), cx.host, &mut headers, &[]) > 0 {
+            attached = Some(headers);
+        }
+    }
+    for (n, v) in attached.as_ref().unwrap_or(&head.headers) {
         let drop = ["proxy-authorization", "proxy-connection", "connection", "keep-alive", "upgrade", "host"]
             .iter()
             .any(|d| n.eq_ignore_ascii_case(d));

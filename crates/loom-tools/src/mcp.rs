@@ -732,6 +732,7 @@ impl Tool for McpTool {
                         status: raw.status,
                         error: raw.error.clone(),
                         response_cut: false,
+                        unverified: false,
                         started: raw.started,
                     },
                 )

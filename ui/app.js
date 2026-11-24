@@ -38,10 +38,11 @@ const S = {
   actionState: new Map(),
   stopAsked: new Set(), // sessions this tab asked to stop: their ending is not announced
   notes: { pending: [], shown: new Map(), timer: 0 },
-  requests: { ledger: 0, window: 0, net: 0, inbox: 0, status: 0, models: 0, mcp: 0, exch: 0, target: 0 },
+  requests: { ledger: 0, window: 0, net: 0, inbox: 0, status: 0, models: 0, mcp: 0, exch: 0, target: 0, creds: 0, formCreds: 0 },
   exch: { session: null, list: [], error: null, loaded: false }, // the open mission's captured exchanges (C1), from the daemon
   exFilter: { host: "all", status: "all" },
   exview: null, // the exchange open in its viewer
+  formCreds: [], // profile names of the new-mission form's chosen target; empty hides the select
   targets: { supported: null, list: [], error: null }, // null until asked; false when the daemon has no targets (404)
   tp: null, // the target page: its configuration, nodes, filters and the node chosen
   inboxRevision: 0,
@@ -1273,6 +1274,10 @@ function renderIdentity(info) {
   const tchip = $("s-target");
   tchip.hidden = !tgt;
   if (tgt) { tchip.textContent = "target " + tgt.name; tchip.setAttribute("href", C.targetHash(tgt.name)); tchip.title = "Open the target's page"; }
+  const cref = C.credsRefOf(S.rec && S.rec.start);
+  const cchip = $("s-creds");
+  cchip.hidden = !cref;
+  if (cref) { cchip.textContent = "creds " + cref.profile; cchip.title = cref.summary; }
   $("s-role").textContent = chips.role.text;
   $("s-role").title = chips.role.tip;
   const id = $("s-id");
@@ -4048,6 +4053,7 @@ async function submitNew(ev, create = false) {
     prior: $("f-prior").value,
     unattended: $("f-unattended").checked,
     target: $("f-target").value,
+    creds: $("f-creds-field").hidden ? "" : $("f-creds").value,
     // Only for a folder the operator chose to make: the picker's New folder, or the answer to the question below.
     createWorkspace: create || (pickerCreate !== null && workspace === pickerCreate),
   });
@@ -4864,6 +4870,8 @@ function renderSessionTab(p, info) {
   row("created", new Date(info.created_ms).toLocaleString());
   const b = S.rec && S.rec.start ? S.rec.start.budget : null;
   row("budget", b ? budgetWords(b) : "loading\u2026");
+  const cref = C.credsRefOf(S.rec && S.rec.start);
+  if (cref) row("credentials", cref.summary || cref.profile);
   row("unattended", info.unattended ? "yes" : "no");
   row("context window", info.context_window ? C.tokens(info.context_window) : "unknown");
   if (info.parent) row("parent", link(info.parent, "#/s/" + encodeURIComponent(info.parent)));
@@ -7170,6 +7178,32 @@ function renderNewTarget() {
   const keep = sel.options.length ? sel.value : "";
   sel.replaceChildren(new Option("None: a private security state", ""), ...names.map((n) => new Option(n, n)));
   if (names.includes(keep)) sel.value = keep;
+  if (!sel.dataset.credsBound) {
+    sel.dataset.credsBound = "1";
+    sel.addEventListener("change", loadFormCreds);
+  }
+  loadFormCreds();
+}
+
+/** The new-mission form's Credentials select: the chosen target's profiles; hidden with no target, no profile, or an older daemon (404). */
+async function loadFormCreds() {
+  const name = $("f-target").value;
+  const request = ++S.requests.formCreds;
+  let names = [];
+  if (name) {
+    try {
+      const list = await api("GET", "/api/targets/" + encodeURIComponent(name) + "/creds");
+      names = (Array.isArray(list) ? list : []).filter((p) => p && p.profile && !p.error).map((p) => String(p.profile));
+    } catch { names = []; }
+  }
+  if (request !== S.requests.formCreds) return;
+  S.formCreds = names;
+  const field = $("f-creds-field");
+  const sel = $("f-creds");
+  const keep = sel.options.length ? sel.value : "";
+  sel.replaceChildren(new Option("none", ""), ...names.map((n) => new Option(n, n)));
+  sel.value = names.includes(keep) ? keep : "";
+  field.hidden = names.length === 0;
 }
 
 function showTargets() {
@@ -7202,7 +7236,7 @@ const TP_FILTERS = () => ({ status: "all", kind: "all", text: "" });
 
 async function showTargetPage(name) {
   setView("target");
-  if (!S.tp || S.tp.name !== name) S.tp = { name, cfg: null, nodes: [], error: null, loaded: false, filters: TP_FILTERS(), collapsed: new Set(), sel: null, ex: { node: null, list: [], error: null }, edit: null, saved: "", scroll: 0 };
+  if (!S.tp || S.tp.name !== name) S.tp = { name, cfg: null, nodes: [], error: null, loaded: false, filters: TP_FILTERS(), collapsed: new Set(), sel: null, ex: { node: null, list: [], error: null }, edit: null, creds: { supported: null, list: [], error: null, shown: new Map(), ask: null }, saved: "", scroll: 0 };
   renderTargetPage();
   await loadTargetPage();
 }
@@ -7224,6 +7258,96 @@ async function loadTargetPage() {
   }
   tp.loaded = true;
   if (S.view === "target" && S.tp === tp) renderTargetPage();
+  await loadTargetCreds(tp);
+}
+
+async function loadTargetCreds(tp) {
+  if (!tp.cfg) return;
+  const request = ++S.requests.creds;
+  try {
+    const list = await api("GET", "/api/targets/" + encodeURIComponent(tp.name) + "/creds");
+    if (S.tp !== tp || request !== S.requests.creds) return;
+    tp.creds.supported = true;
+    tp.creds.list = Array.isArray(list) ? list.filter((p) => p && p.profile).map(C.credProfileOf) : [];
+    tp.creds.error = null;
+  } catch (e) {
+    if (S.tp !== tp || request !== S.requests.creds) return;
+    // An older daemon has no credential profiles: the panel is not shown, and nothing says why.
+    tp.creds.supported = e.status === 404 ? false : tp.creds.supported;
+    tp.creds.error = e.status === 404 ? null : e.message;
+  }
+  if (S.view === "target" && S.tp === tp) renderTargetPage();
+}
+
+async function toggleCredShow(tp, profile) {
+  const c = tp.creds;
+  if (c.shown.has(profile)) { c.shown.delete(profile); renderTargetPage(); return; }
+  try {
+    c.shown.set(profile, C.credShow(await api("GET", "/api/targets/" + encodeURIComponent(tp.name) + "/creds/" + encodeURIComponent(profile))));
+  } catch (e) {
+    c.shown.set(profile, { summary: "", lines: [], error: e.message });
+  }
+  if (S.view === "target" && S.tp === tp) renderTargetPage();
+}
+
+async function deleteCred(tp, profile) {
+  const c = tp.creds;
+  c.ask = null;
+  try {
+    await api("DELETE", "/api/targets/" + encodeURIComponent(tp.name) + "/creds/" + encodeURIComponent(profile));
+    c.shown.delete(profile);
+    c.error = null;
+  } catch (e) {
+    c.error = e.message;
+  }
+  await loadTargetCreds(tp);
+  if (S.view === "target" && S.tp === tp) renderTargetPage();
+  loadFormCreds();
+}
+
+/** The Credentials panel of a target page (U5): profiles without values, Show, Delete, and the commands that add one. */
+function credsPanel(tp) {
+  const c = tp.creds;
+  const box = el("section", "tcreds");
+  box.setAttribute("aria-label", "Credentials");
+  box.append(heading("h2", "Credentials"));
+  if (c.error) box.append(el("p", "error", c.error));
+  if (!c.list.length) box.append(el("p", "dim", "No stored login on this target yet."));
+  else {
+    const ul = el("ul", "tcred-list");
+    const now = Date.now();
+    for (const p of c.list) {
+      const li = el("li", "tcred");
+      const head = el("div", "tcred-head");
+      const show = btn(c.shown.has(p.profile) ? "Hide" : "Show", "small", () => toggleCredShow(tp, p.profile));
+      show.setAttribute("aria-label", (c.shown.has(p.profile) ? "Hide " : "Show ") + p.profile);
+      const del = btn("Delete", "small", () => { c.ask = p.profile; renderTargetPage(); });
+      del.setAttribute("aria-label", "Delete " + p.profile);
+      add(head, el("span", "tcred-text" + (p.error ? " error" : ""), C.credRowText(p, now)), show, del);
+      li.append(head);
+      const got = c.shown.get(p.profile);
+      if (got) {
+        if (got.error) li.append(el("p", "error", got.error));
+        else if (!got.lines.length) li.append(el("p", "dim", "No item."));
+        else {
+          const items = el("ul", "tcred-items mono");
+          for (const line of got.lines) items.append(el("li", "", line));
+          li.append(items);
+        }
+      }
+      if (c.ask === p.profile) {
+        li.append(confirmRow({ text: `Delete the stored login ${p.profile} of ${tp.name}? This cannot be undone.`, yes: "Delete", no: "Keep" },
+          () => deleteCred(tp, p.profile), () => { c.ask = null; renderTargetPage(); }, "cred:" + p.profile + ":"));
+      }
+      ul.append(li);
+    }
+    box.append(ul);
+  }
+  box.append(el("p", "dim field-note", "Add one from a terminal; the page never takes a secret value."));
+  for (const cmd of C.credCommands(tp.name)) {
+    add(box, add(el("div", "tcred-cmd"), el("code", "mono", cmd), copyButton("Copy command", () => cmd, { what: "Command" })));
+  }
+  return box;
 }
 
 function targetFilterBar(tp) {
@@ -7324,6 +7448,7 @@ function renderTargetPage() {
   if (!tp.loaded) frag.append(el("p", "dim", "Loading the target…"));
   if (tp.cfg) {
     frag.append(scopeEditor(tp));
+    if (tp.creds.supported === true) frag.append(credsPanel(tp));
     frag.append(el("p", "tcounts", C.countsWords(C.targetCounts(tp.nodes))));
     const tree = el("section", "ttree-wrap");
     tree.setAttribute("aria-label", "Assets");

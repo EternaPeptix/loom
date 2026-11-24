@@ -62,6 +62,7 @@ fn session(h: &Home, id: &str, mission: &str) -> SessionLog {
             mcp: Vec::new(),
             intercept: false,
             target: None,
+            creds: None,
             schema: loom_core::event::SCHEMA,
         }),
     )

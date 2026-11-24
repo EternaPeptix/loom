@@ -292,6 +292,11 @@ pub enum Command {
         #[command(subcommand)]
         action: TargetAction,
     },
+    /// Credential profiles of a target: logins attached to a mission's in-scope requests (CONTRACTS-TRAFFIC-TARGETS S)
+    Creds {
+        #[command(subcommand)]
+        action: CredsAction,
+    },
     /// The interception CA (CONTRACTS-TRAFFIC-TARGETS I2)
     Ca {
         #[command(subcommand)]
@@ -380,6 +385,10 @@ pub struct StartOpts {
     /// graph is shared with the other missions of the target
     #[arg(long, value_name = "NAME")]
     pub target: Option<String>,
+    /// A credential profile of the target (`loom creds`) attached to the mission's in-scope requests;
+    /// needs --target
+    #[arg(long, value_name = "PROFILE", requires = "target")]
+    pub creds: Option<String>,
     /// Do not decrypt HTTPS for this mission, whatever its pack says (`[network] intercept = "pack"` only)
     #[arg(long)]
     pub no_intercept: bool,
@@ -652,6 +661,64 @@ pub enum TargetAction {
     Show(TargetShowArgs),
     /// Change what a target covers: add or remove scope and exclude entries
     Scope(TargetScopeArgs),
+}
+
+/// `loom creds` (S2, S7). No subcommand prints a value; `set` takes values only as arguments.
+#[derive(Subcommand, Debug, Clone, PartialEq, Eq)]
+pub enum CredsAction {
+    /// List a target's profiles with item counts and when each was recorded
+    List(CredsTargetArgs),
+    /// Show a profile: item kinds, names and hosts, never values
+    Show(CredsProfileArgs),
+    /// Record a login: prints a proxy to point a browser at, streams the names it collects, writes the
+    /// profile on Ctrl-C or after 30 minutes
+    Record(CredsRecordArgs),
+    /// Set items without a browser; replaces the profile's items for the hosts given
+    Set(CredsSetArgs),
+    /// Delete a profile
+    Rm(CredsProfileArgs),
+}
+
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct CredsTargetArgs {
+    #[arg(long)]
+    pub target: String,
+}
+
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct CredsProfileArgs {
+    #[arg(long)]
+    pub target: String,
+    #[arg(long, default_value = "default")]
+    pub profile: String,
+}
+
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct CredsRecordArgs {
+    #[arg(long)]
+    pub target: String,
+    #[arg(long, default_value = "default")]
+    pub profile: String,
+    /// Stop a recording started elsewhere and write its profile
+    #[arg(long, value_name = "HANDLE")]
+    pub stop: Option<String>,
+}
+
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct CredsSetArgs {
+    #[arg(long)]
+    pub target: String,
+    #[arg(long, default_value = "default")]
+    pub profile: String,
+    /// The in-scope host the items below are attached to
+    #[arg(long)]
+    pub host: String,
+    /// `name=value`; repeatable
+    #[arg(long, value_name = "NAME=VALUE")]
+    pub cookie: Vec<String>,
+    /// `Name: value`; repeatable
+    #[arg(long, value_name = "NAME: VALUE")]
+    pub header: Vec<String>,
 }
 
 #[derive(Args, Debug, Clone, PartialEq, Eq)]
@@ -1038,6 +1105,7 @@ fn new_session(opts: &StartOpts, message: Option<String>, cwd: &Path, prior: Vec
         attachments: Vec::new(),
         target: opts.target.clone().filter(|t| !t.trim().is_empty()),
         intercept: opts.no_intercept.then_some(false),
+        creds: opts.creds.clone().filter(|c| !c.trim().is_empty()),
     }
 }
 
@@ -1661,6 +1729,7 @@ async fn dispatch(command: Command) -> Result<i32, String> {
             block(&text).map(|()| 0)
         }
         Command::Target { action } => cmd_target(&paths, action).await,
+        Command::Creds { action } => cmd_creds(&paths, action).await,
         Command::Ca { action } => {
             let (fp, file) = match action {
                 CaAction::Show => loom_agent::runtime::ca_show(&paths.home)?,
@@ -2096,6 +2165,152 @@ async fn cmd_target(paths: &Paths, action: TargetAction) -> Result<i32, String> 
             outln(&format!("target {}: scope {}; exclude {}", v.name, v.scope.join(", "), v.exclude.join(", ")))
                 .map(|()| 0)
         }
+    }
+}
+
+/// `loom creds` (S2, S7). `set` builds items from `--cookie name=value` / `--header 'Name: value'` (a
+/// malformed one is refused naming the flag, never echoing the value) and sends `{"set": ...}`. `record`
+/// starts a recording, prints one line (`proxy {proxy} user {user} password {password}; trust CA {ca_path}
+/// (sha256 {ca_sha256})`), then polls the lines every second and prints each, until Ctrl-C or `done`, then
+/// sends `{"stop": handle}` and prints the summary line (or the nothing-collected sentence, exit 1).
+async fn cmd_creds(paths: &Paths, action: CredsAction) -> Result<i32, String> {
+    let c = client_of(paths)?;
+    match action {
+        CredsAction::List(a) => {
+            let list = c.creds_list(&a.target).await?;
+            if list.is_empty() {
+                return outln(&format!(
+                    "No credential profiles for target {}. Make one with `loom creds record --target {}`.",
+                    a.target, a.target
+                ))
+                .map(|()| 0);
+            }
+            let mut out = String::new();
+            for p in &list {
+                out.push_str(&creds_summary_row(p));
+                out.push('\n');
+            }
+            block(&out).map(|()| 0)
+        }
+        CredsAction::Show(a) => {
+            let v = c.creds_show(&a.target, &a.profile).await?;
+            let mut out = format!("{}\n", creds_summary_row(&v.summary));
+            for i in &v.items {
+                let kind = match i.kind {
+                    loom_core::creds::ItemKind::Cookie => "cookie",
+                    loom_core::creds::ItemKind::Header => "header",
+                };
+                out.push_str(&format!("{kind} {} {}\n", i.name, i.host));
+            }
+            block(&out).map(|()| 0)
+        }
+        CredsAction::Set(a) => {
+            let mut items = Vec::new();
+            for raw in &a.cookie {
+                let (name, value) = raw
+                    .split_once('=')
+                    .filter(|(n, _)| !n.trim().is_empty())
+                    .ok_or_else(|| "--cookie takes `name=value`; one of them has no name or no `=`.".to_string())?;
+                items.push(loom_core::creds::Item {
+                    kind: loom_core::creds::ItemKind::Cookie,
+                    name: name.trim().to_string(),
+                    value: value.to_string(),
+                    host: a.host.clone(),
+                });
+            }
+            for raw in &a.header {
+                let (name, value) = raw
+                    .split_once(':')
+                    .filter(|(n, _)| !n.trim().is_empty())
+                    .ok_or_else(|| "--header takes `Name: value`; one of them has no name or no `:`.".to_string())?;
+                items.push(loom_core::creds::Item {
+                    kind: loom_core::creds::ItemKind::Header,
+                    name: name.trim().to_string(),
+                    value: value.trim().to_string(),
+                    host: a.host.clone(),
+                });
+            }
+            if items.is_empty() {
+                return Err("Give at least one --cookie 'name=value' or --header 'Name: value'.".to_string());
+            }
+            let body = loom_agent::runtime::CredsBody {
+                set: Some(loom_agent::runtime::SetBody { profile: Some(a.profile.clone()), items }),
+                ..Default::default()
+            };
+            let v = c.creds_post(&a.target, &body).await?;
+            let summary: loom_core::creds::ProfileSummary =
+                serde_json::from_value(v).map_err(|e| format!("The daemon's answer was not understood ({e})."))?;
+            outln(&format!("stored {}", creds_summary_row(&summary))).map(|()| 0)
+        }
+        CredsAction::Rm(a) => {
+            c.creds_remove(&a.target, &a.profile).await?;
+            outln(&format!("removed profile {} of target {}", a.profile, a.target)).map(|()| 0)
+        }
+        CredsAction::Record(a) => {
+            if let Some(handle) = a.stop {
+                return creds_stop(&c, &a.target, &handle).await;
+            }
+            let body = loom_agent::runtime::CredsBody {
+                record: Some(loom_agent::runtime::RecordBody { profile: Some(a.profile.clone()) }),
+                ..Default::default()
+            };
+            let v = c.creds_post(&a.target, &body).await?;
+            let field = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let handle = field("handle");
+            outln(&format!(
+                "proxy {} user {} password {}; trust CA {} (sha256 {}); recording {}",
+                field("proxy"),
+                field("user"),
+                field("password"),
+                field("ca_path"),
+                field("ca_sha256"),
+                handle
+            ))?;
+            let mut after = 0usize;
+            loop {
+                let wait = tokio::time::sleep(std::time::Duration::from_secs(1));
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => break,
+                    () = wait => {}
+                }
+                let page = c.creds_record_lines(&a.target, &handle, after).await?;
+                for l in &page.lines {
+                    outln(l)?;
+                }
+                after = page.next;
+                if page.done {
+                    break;
+                }
+            }
+            creds_stop(&c, &a.target, &handle).await
+        }
+    }
+}
+
+/// One profile on one line: no values exist in a summary.
+fn creds_summary_row(p: &loom_core::creds::ProfileSummary) -> String {
+    let plural = |n: usize, w: &str| if n == 1 { format!("{n} {w}") } else { format!("{n} {w}s") };
+    let mut out = format!("{} · {}, {}", p.profile, plural(p.cookies, "cookie"), plural(p.headers, "header"));
+    if !p.hosts.is_empty() {
+        out.push_str(&format!(" · {}", p.hosts.join(", ")));
+    }
+    if let Some(e) = &p.error {
+        out.push_str(&format!(" · {e}"));
+    }
+    out
+}
+
+/// Stop a recording and print what was written; nothing collected is a sentence and exit status 1.
+async fn creds_stop(c: &Client, target: &str, handle: &str) -> Result<i32, String> {
+    let body = loom_agent::runtime::CredsBody { stop: Some(handle.to_string()), ..Default::default() };
+    match c.creds_post(target, &body).await {
+        Ok(v) => {
+            let summary: loom_core::creds::ProfileSummary =
+                serde_json::from_value(v).map_err(|e| format!("The daemon's answer was not understood ({e})."))?;
+            outln(&format!("wrote {}", creds_summary_row(&summary))).map(|()| 0)
+        }
+        Err(e) if e.starts_with("The recording collected nothing") => outln(&e).map(|()| 1),
+        Err(e) => Err(e),
     }
 }
 
@@ -3248,11 +3463,13 @@ mod tests {
             prior: Vec::new(),
             create_workspace: true,
             target: Some("acme".into()),
+            creds: Some("default".into()),
             no_intercept: true,
             agent_models: vec![("worker".into(), "fast".into()), (ANY_ROLE.into(), "big".into())],
         };
         let n = new_session(&opts, None, cwd, vec![MissionId::from("m-1"), MissionId::from("m-2")]);
         assert_eq!(n.intercept, Some(false));
+        assert_eq!(n.creds.as_deref(), Some("default"));
         assert_eq!(n.prior, [MissionId::from("m-1"), MissionId::from("m-2")]);
         assert_eq!(
             n.role_models,

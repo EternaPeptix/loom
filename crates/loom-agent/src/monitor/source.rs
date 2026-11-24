@@ -596,6 +596,7 @@ mod tests {
                 mcp: Vec::new(),
                 intercept: false,
                 target: None,
+                creds: None,
                 schema: loom_core::event::SCHEMA,
             })
         };
@@ -677,6 +678,7 @@ mod tests {
                 mcp: Vec::new(),
                 intercept: false,
                 target: Some(target.clone()),
+                creds: None,
                 schema: loom_core::event::SCHEMA,
             }),
         )

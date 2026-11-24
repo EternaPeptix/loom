@@ -690,7 +690,85 @@ fn check_value(
 }
 
 /// Turn a tool's output into the record. Public so that runtime-owned tools share the same path.
+///
+/// When the session has secrets (CONTRACTS-TRAFFIC-TARGETS S5) every value in them is replaced by
+/// `[redacted]` in the result's text and meta and in every output that is stored for it: bytes before they
+/// are stored, and the blob a view or a produced view points at is re-stored redacted when it held one.
+/// Without secrets nothing is copied.
 pub fn finalize(
+    ctx: &ToolCtx,
+    spec: &ToolSpec,
+    mut output: ToolOutput,
+    admission: &Admission<'_>,
+    started: Instant,
+) -> ToolResult {
+    let Some(secrets) = ctx.capabilities.secrets.get().filter(|s| !s.is_empty()) else {
+        return finalize_plain(ctx, spec, output, admission, started);
+    };
+    redact_output(ctx, secrets, &mut output);
+    let mut result = finalize_plain(ctx, spec, output, admission, started);
+    if let std::borrow::Cow::Owned(t) = secrets.redact(&result.text) {
+        result.text = t;
+    }
+    redact_meta(secrets, &mut result.meta);
+    result
+}
+
+fn redact_string(secrets: &loom_core::creds::Secrets, s: &mut String) {
+    if let std::borrow::Cow::Owned(t) = secrets.redact(s) {
+        *s = t;
+    }
+}
+
+fn redact_meta(secrets: &loom_core::creds::Secrets, meta: &mut Map<String, Value>) {
+    fn walk(secrets: &loom_core::creds::Secrets, v: &mut Value) {
+        match v {
+            Value::String(s) => redact_string(secrets, s),
+            Value::Array(a) => a.iter_mut().for_each(|x| walk(secrets, x)),
+            Value::Object(o) => o.values_mut().for_each(|x| walk(secrets, x)),
+            _ => {}
+        }
+    }
+    meta.values_mut().for_each(|v| walk(secrets, v));
+}
+
+/// A stored blob with the secrets taken out: `None` when it held none (or cannot be read, which the
+/// caller's own read will report), else the new, redacted blob.
+fn redacted_blob(ctx: &ToolCtx, secrets: &loom_core::creds::Secrets, id: &BlobId) -> Option<loom_core::BlobRef> {
+    let bytes = ctx.blobs.read_all(id).ok()?;
+    match secrets.redact_bytes(&bytes) {
+        std::borrow::Cow::Owned(clean) => ctx.blobs.put_bytes(&clean).ok(),
+        std::borrow::Cow::Borrowed(_) => None,
+    }
+}
+
+fn redact_output(ctx: &ToolCtx, secrets: &loom_core::creds::Secrets, output: &mut ToolOutput) {
+    redact_string(secrets, &mut output.outcome);
+    output.more.iter_mut().for_each(|m| redact_string(secrets, m));
+    redact_meta(secrets, &mut output.meta);
+    match &mut output.body {
+        Body::Raw(bytes) => {
+            if let std::borrow::Cow::Owned(clean) = secrets.redact_bytes(bytes) {
+                *bytes = clean;
+            }
+        }
+        Body::Message(text) => redact_string(secrets, text),
+        Body::View { of, text, .. } => {
+            redact_string(secrets, text);
+            if let Some(clean) = redacted_blob(ctx, secrets, of) {
+                *of = clean.id;
+            }
+        }
+        Body::ProducedView { blob, text, .. } => {
+            redact_string(secrets, text);
+            if let Some(clean) = redacted_blob(ctx, secrets, &blob.id) {
+                *blob = clean;
+            }
+        }
+    }
+}
+
+fn finalize_plain(
     ctx: &ToolCtx,
     spec: &ToolSpec,
     output: ToolOutput,
@@ -987,6 +1065,12 @@ pub mod testutil {
         }
     }
 }
+
+#[cfg(test)]
+mod creds_tests;
+
+#[cfg(test)]
+mod tls_tests;
 
 #[cfg(test)]
 mod tests {

@@ -7,14 +7,16 @@
 
 pub mod capture;
 pub mod clienthello;
+pub mod inject;
 pub mod netlog;
 pub mod policy;
 pub mod proxy;
 pub mod tls;
 
 pub use capture::{CaptureGrant, CaptureSink, Captured, Transport};
+pub use inject::Inject;
 pub use policy::{InfraAddr, InfraSpec, Policy, Verdict};
 pub use proxy::{
-    AuditFn, CanaryFn, CanaryHit, Dest, Limits, ListenerFn, Proxy, ProxyError, ReferenceGrant, RefusalFn, SessionGrant,
-    VetoFn, CHECK_METHOD, RULE_HEADER,
+    host_listed, AuditFn, CanaryFn, CanaryHit, Dest, Limits, ListenerFn, Proxy, ProxyError, ReferenceGrant, RefusalFn,
+    SessionGrant, VetoFn, CHECK_METHOD, RULE_HEADER,
 };
