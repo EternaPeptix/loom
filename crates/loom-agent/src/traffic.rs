@@ -132,9 +132,17 @@ impl Traffic {
         if !self.count_one() {
             return false;
         }
-        let Ok(request) = blobs.put_bytes(&cap.request) else { return false };
+        // S5: values loom injected for the mission never reach a blob, whichever side echoes them.
+        let secrets = self.secrets.get().filter(|s| !s.is_empty());
+        let clean = |b: &[u8]| -> Vec<u8> {
+            match secrets {
+                Some(s) => s.redact_bytes(b).into_owned(),
+                None => b.to_vec(),
+            }
+        };
+        let Ok(request) = blobs.put_bytes(&clean(&cap.request)) else { return false };
         let response = match &cap.response {
-            Some(r) => match blobs.put_bytes(r) {
+            Some(r) => match blobs.put_bytes(&clean(r)) {
                 Ok(b) => Some(b),
                 Err(_) => return false,
             },
@@ -393,5 +401,30 @@ mod tests {
         assert!(t.ingest(&blobs, c));
         let (xs, _) = t.take_pending();
         assert_eq!((xs[0].scheme.as_str(), xs[0].tls.as_str()), ("https", "intercepted"));
+    }
+
+    #[test]
+    fn ingest_redacts_the_mission_secrets_in_both_directions() {
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = BlobStore::open(dir.path()).unwrap();
+        let t = Traffic::none();
+        let item = loom_core::creds::Item {
+            kind: loom_core::creds::ItemKind::Cookie,
+            name: "session".into(),
+            value: "s3cr3t-session-value-9f2".into(),
+            host: "t.test".into(),
+        };
+        let _ = t.secrets.set(Arc::new(loom_core::creds::Secrets::for_items(&[item])));
+        let mut c = cap(1);
+        c.request = b"GET /a HTTP/1.1\r\nCookie: session=s3cr3t-session-value-9f2\r\n\r\n".to_vec();
+        c.response = Some(b"HTTP/1.1 200 OK\r\n\r\necho s3cr3t-session-value-9f2".to_vec());
+        let counted = (c.request_bytes, c.response_bytes);
+        assert!(t.ingest(&blobs, c));
+        let (xs, _) = t.take_pending();
+        let req = String::from_utf8(blobs.read_all(&xs[0].request.id).unwrap()).unwrap();
+        let resp = String::from_utf8(blobs.read_all(&xs[0].response.as_ref().unwrap().id).unwrap()).unwrap();
+        assert!(req.contains("[redacted]") && !req.contains("s3cr3t"), "{req}");
+        assert!(resp.contains("[redacted]") && !resp.contains("s3cr3t"), "{resp}");
+        assert_eq!((xs[0].request_bytes, xs[0].response_bytes), counted);
     }
 }

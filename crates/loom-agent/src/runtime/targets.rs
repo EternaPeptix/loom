@@ -12,12 +12,24 @@ use loom_core::target::{
 };
 use std::time::Instant;
 
-/// The network sentence with what the target adds (T2). Without a target it is unchanged.
-pub(super) fn network_with_target(text: String, target: Option<&TargetRef>) -> String {
-    let Some(t) = target else { return text };
+/// The network sentence with what the target adds (T2) and, for a lead whose mission has a credential
+/// profile, the line that says it is attached (S11). Without a target it is unchanged.
+pub(super) fn network_with_target(text: String, meta: &SessionMeta) -> String {
+    let Some(t) = meta.target.as_ref() else { return text };
     let mut s = format!("{text} Target `{}` adds these to what can be reached: {}.", t.name, t.scope.join(", "));
     if !t.exclude.is_empty() {
         s.push_str(&format!(" Refused even where something else would allow them: {}.", t.exclude.join(", ")));
+    }
+    if let (Some(c), None) = (meta.creds.as_ref(), meta.parent.as_ref()) {
+        let via = if meta.intercept {
+            "commands through the proxy, http_send, web_fetch"
+        } else {
+            "http_send, web_fetch, and plain-HTTP requests from commands; a command's HTTPS goes through an opaque tunnel and carries nothing"
+        };
+        s.push_str(&format!(
+            " Credential profile {} is attached to your requests to those hosts ({via}); you never see its values, and a cookie or header your request sends itself overrides it.",
+            c.summary
+        ));
     }
     s
 }
