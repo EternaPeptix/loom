@@ -38,7 +38,12 @@ const S = {
   actionState: new Map(),
   stopAsked: new Set(), // sessions this tab asked to stop: their ending is not announced
   notes: { pending: [], shown: new Map(), timer: 0 },
-  requests: { ledger: 0, window: 0, net: 0, inbox: 0, status: 0, models: 0, mcp: 0 },
+  requests: { ledger: 0, window: 0, net: 0, inbox: 0, status: 0, models: 0, mcp: 0, exch: 0, target: 0 },
+  exch: { session: null, list: [], error: null, loaded: false }, // the open mission's captured exchanges (C1), from the daemon
+  exFilter: { host: "all", status: "all" },
+  exview: null, // the exchange open in its viewer
+  targets: { supported: null, list: [], error: null }, // null until asked; false when the daemon has no targets (404)
+  tp: null, // the target page: its configuration, nodes, filters and the node chosen
   inboxRevision: 0,
   inboxTouched: new Map(), // item id -> {rev, entry|null}: what inbox records changed, kept over an older snapshot
   sinceSeq: null,
@@ -543,6 +548,8 @@ function route() {
   }
   if (r.view === "inbox") return showInbox();
   if (r.view === "new") return showNew();
+  if (r.view === "targets") return showTargets();
+  if (r.view === "target") return showTargetPage(r.name);
   setView("empty");
 }
 
@@ -559,6 +566,8 @@ function setView(v) {
   $("view-session").hidden = v !== "session";
   $("view-inbox").hidden = v !== "inbox";
   $("view-new").hidden = v !== "new";
+  $("view-targets").hidden = v !== "targets";
+  $("view-target").hidden = v !== "target";
   if (v === "session") {
     markRead();
     if (was !== "session" && !matchMedia("(max-width: 1099px)").matches && S.inspectorPref && !document.body.classList.contains("show-right")) {
@@ -606,6 +615,8 @@ function openSession(id) {
   S.goalOpen = false;
   S.net = [];
   S.netError = null;
+  S.exch = { session: id, list: [], error: null, loaded: false };
+  S.exFilter = { host: "all", status: "all" };
   S.liveEl = null;
   S.win = { ...S.win, data: null, error: null, stale: true, from: null, notesOpen: false };
   S.ledger = { mission: null, model: null, state: null, error: null, stale: true };
@@ -886,6 +897,7 @@ function handleEvent(ev) {
       case "apply_record":
         if (C.applyRecord(S.rec, f.record)) {
           want("blocks", "live", "header", "overview");
+          if (f.record.kind === "exchange") want("right");
           updateDelivery(ev.session);
           if (!S.rec.loading && C.missing(S.rec)) loadRecords(S.rec, 0);
         }
@@ -905,6 +917,9 @@ function handleEvent(ev) {
       case "net":
         C.applyNet(S.net, f.entry);
         if (S.tab === "network") want("right");
+        break;
+      case "target_changed":
+        targetChanged(f.name);
         break;
       case "notice":
         notice(f.text);
@@ -1245,6 +1260,10 @@ function renderIdentity(info) {
   const kids = [document.createTextNode(m.text)];
   if (m.warn) kids.push(add(el("span", "id-warn"), icon(m.warn.icon), document.createTextNode(m.warn.word)));
   chipContent(model, ...kids);
+  const tgt = S.rec && S.rec.start && S.rec.start.target;
+  const tchip = $("s-target");
+  tchip.hidden = !tgt;
+  if (tgt) { tchip.textContent = "target " + tgt.name; tchip.setAttribute("href", C.targetHash(tgt.name)); tchip.title = "Open the target's page"; }
   $("s-role").textContent = chips.role.text;
   $("s-role").title = chips.role.tip;
   const id = $("s-id");
@@ -2409,6 +2428,7 @@ function renderEvidence(panel) {
       chip(C.claimStatusWords(claim.status), "status-" + claim.status), el("span", "mono dim", claim.id), el("span", "dim", "status recorded by the agent")));
     section.append(el("h3", "", claim.text));
     if (claim.note) section.append(el("p", "claim-note", claim.note));
+    add(section, reachLine(claim));
     if (!claim.evidence.length) section.append(el("p", "dim", "No source evidence attached."));
     for (const evidence of claim.evidence) section.append(evidenceCard(evidence));
     frag.append(section);
@@ -2895,6 +2915,12 @@ function buildTool(root, b) {
     n.setAttribute("aria-label", C.imageCountLabel(res.images.length));
     add(head, n);
   }
+  const calls = toolExchanges(b);
+  if (calls.length) {
+    const n = el("span", "req-count", C.requestsWords(calls.length));
+    n.title = "Requests captured during this call. Open the row to see them.";
+    add(head, n);
+  }
   if (row.duration) add(head, el("span", "dur", row.duration));
   else if (row.state === "running" && Number.isFinite(b.ts)) {
     // A call still out counts up, so a long build reads as working, not stuck (tickGroups moves it each second).
@@ -2918,6 +2944,7 @@ function buildTool(root, b) {
     }), "args:" + b.id));
   }
   if (b.ui.args) add(body, el("div", "label", "Arguments"), textBox(JSON.stringify(b.args, null, 2), "txt out args-box"));
+  if (calls.length) add(body, el("div", "label", C.requestsWords(calls.length)), exchangeList(calls, "tool-" + b.id + ":"));
   if (res) {
     add(body, el("div", "label", "Output"));
     if (res.images && res.images.length) add(body, thumbRow(res.images, { tool: b.ran || b.name, args: b.args }));
@@ -2939,6 +2966,13 @@ function buildTool(root, b) {
     add(body, el("div", "tnote", "running…"));
   }
   add(root, body);
+}
+
+/** The exchanges of a tool row: those recorded with its call id, or (a `bash` row) the proxy's own made while it ran. */
+function toolExchanges(b) {
+  const own = b.exchanges || [];
+  if (own.length || !S.rec) return own;
+  return C.callWindowExchanges(b, S.rec.exchanges);
 }
 
 /** The copy buttons of an open tool row: its command (or path, or arguments), its recorded output, and the full stored output. */
@@ -3988,6 +4022,7 @@ function showNew() {
   $("f-error").hidden = true;
   hideCreateAsk();
   $("f-receipt").hidden = true;
+  renderNewTarget();
   workspaceNote();
 }
 
@@ -4003,6 +4038,7 @@ async function submitNew(ev, create = false) {
     title: $("f-title").value,
     prior: $("f-prior").value,
     unattended: $("f-unattended").checked,
+    target: $("f-target").value,
     // Only for a folder the operator chose to make: the picker's New folder, or the answer to the question below.
     createWorkspace: create || (pickerCreate !== null && workspace === pickerCreate),
   });
@@ -4071,6 +4107,7 @@ function loadTab() {
   else if (S.tab === "session") loadMcp();
   else if (S.tab === "network") {
     if (S.net.length === 0) loadNet();
+    if (!S.exch.loaded) loadExchanges();
     if (S.ledger.stale || !S.ledger.model) loadLedger();
   }
 }
@@ -4547,6 +4584,7 @@ function renderLedger(p) {
     for (const c of m.claims) {
       const item = li(el("span", "k", c.id), el("strong", "", c.status + " "), document.createTextNode(c.text));
       if (c.note) add(item, el("div", "dim", c.note));
+      add(item, reachLine(c));
       for (const e of c.evidence) {
         add(item, evidenceCard(e));
       }
@@ -4747,24 +4785,49 @@ function renderNetwork(p) {
   // A failed load (a damaged audit log among them) stays in view next to the decisions that arrive live.
   const error = S.netError ? [el("p", "error", S.netError)] : [];
   const granted = S.ledger.model ? [el("p", "dim", C.scopeLine(S.ledger.model))] : [];
-  if (S.net.length === 0) {
-    preserveFocus(p, () => p.replaceChildren(...granted, ...(error.length ? error : [el("p", "dim", "No network decisions recorded for this session.")])));
-    return;
+  const parts = [...granted];
+  if (S.net.length === 0) parts.push(...(error.length ? error : [el("p", "dim", "No network decisions recorded for this session.")]));
+  else {
+    const t = el("table", "net");
+    for (const e of S.net.slice(-500).reverse().map(C.netRow)) {
+      const tr = el("tr", e.verdict);
+      add(tr, el("td", "", clock(e.ts)), el("td", "", e.verdict), el("td", "", e.method), el("td", "", e.target), el("td", "", e.rule));
+      t.append(tr);
+    }
+    parts.push(...error, t);
   }
-  const t = el("table", "net");
-  for (const e of S.net.slice(-500).reverse().map(C.netRow)) {
-    const tr = el("tr", e.verdict);
-    add(tr, el("td", "", clock(e.ts)), el("td", "", e.verdict), el("td", "", e.method), el("td", "", e.target), el("td", "", e.rule));
-    t.append(tr);
-  }
-  preserveFocus(p, () => p.replaceChildren(...granted, ...error, t));
+  parts.push(requestsSection());
+  preserveFocus(p, () => p.replaceChildren(...parts));
 }
 
-function budgetWords(b) {
-  const parts = [];
-  if (b.max_steps) parts.push(`${b.max_steps} steps`);
-  if (b.max_minutes) parts.push(`${b.max_minutes} minutes`);
-  return parts.length ? parts.join(", ") : "none set";
+/** The session's captured requests under its decisions: filterable by host and status, newest first (U2). */
+function requestsSection() {
+  const box = el("section", "net-requests");
+  box.setAttribute("aria-label", "Requests");
+  box.append(el("h3", "", "Requests"));
+  const all = allExchanges();
+  if (S.exch.error) box.append(el("p", "error", S.exch.error));
+  if (!all.length) { box.append(el("p", "dim", S.exch.loaded ? C.exchangeCountLine(0, 0) : "Loading requests…")); return box; }
+  const opts = C.exchangeFilterOptions(all);
+  if (!opts.hosts.includes(S.exFilter.host)) S.exFilter.host = "all";
+  if (S.exFilter.status !== "all" && !opts.statuses.some((o) => o.key === S.exFilter.status)) S.exFilter.status = "all";
+  const bar = el("div", "tfilters");
+  bar.setAttribute("role", "group");
+  bar.setAttribute("aria-label", "Filter requests");
+  const select = (label, key, options) => {
+    const s = el("select");
+    for (const [value, text] of options) s.append(new Option(text, value));
+    s.value = S.exFilter[key];
+    s.dataset.focusKey = "ex-filter:" + key;
+    s.addEventListener("change", () => { S.exFilter[key] = s.value; want("right"); });
+    const l = el("label", "", label + " ");
+    l.append(s);
+    return l;
+  };
+  add(bar, select("Host", "host", [["all", "Any"], ...opts.hosts.map((h) => [h, h])]), select("Status", "status", [["all", "Any"], ...opts.statuses.map((o) => [o.key, o.label])]));
+  const shown = C.filterExchanges(all, S.exFilter).reverse();
+  box.append(bar, el("p", "dim ex-count", C.exchangeCountLine(shown.length, all.length)), exchangeList(shown.slice(0, 500), "net-"));
+  return box;
 }
 
 function renderSessionTab(p, info) {
@@ -6570,6 +6633,16 @@ function wire() {
     if (location.hash === "#/inbox") route();
     else location.hash = "#/inbox";
   });
+  $("btn-targets").addEventListener("click", () => { location.hash = C.targetHash(""); });
+  $("exview-close").addEventListener("click", closeExchange);
+  $("exview-reveal").addEventListener("click", () => { if (S.exview) { S.exview.revealed = !S.exview.revealed; renderExchange(); } });
+  $("exview").addEventListener("close", () => {
+    S.exview = null;
+    const o = exOpener;
+    exOpener = null;
+    if (o && document.contains(o)) o.focus({ preventScroll: true });
+  });
+  $("exview").addEventListener("click", (e) => { if (e.target === $("exview")) closeExchange(); });
   $("btn-new").addEventListener("click", () => {
     if (location.hash === "#/new") route();
     else location.hash = "#/new";
@@ -6884,6 +6957,527 @@ $("picker").addEventListener("keydown", pickerEmptyKeys);
   });
 }
 
+// ---------------------------------------------------------------------------------------------
+// Captured exchanges (docs/CONTRACTS-TRAFFIC-TARGETS.md C, U1-U3)
+
+/** The session's exchanges: what the daemon listed (the whole mission's sessions) with the ones the open record holds, oldest first. */
+function allExchanges() {
+  const list = S.exch.list.slice();
+  if (S.rec) for (const x of S.rec.exchanges) C.mergeExchange(list, { ...x, session: x.session || S.openId });
+  return list;
+}
+
+/** One exchange as a row that opens the viewer. */
+function exchangeButton(x, key) {
+  const row = C.exchangeRow(x);
+  const b = el("button", "exrow tone-" + row.tone);
+  b.type = "button";
+  b.dataset.focusKey = key || "ex:" + x.id;
+  b.dataset.exchange = x.id;
+  add(b, el("span", "ex-method", x.method), el("span", "ex-where mono", row.where), el("span", "ex-status", row.status), el("span", "ex-size dim", row.size), el("span", "ex-time dim", row.time));
+  for (const m of row.marks) { const mark = el("span", "ex-mark", m.text); mark.title = m.tip; b.append(mark); }
+  if (row.words) b.append(el("span", "ex-error dim", row.words));
+  b.setAttribute("aria-label", `${row.text}${row.marks.length ? " · " + row.marks.map((m) => m.text).join(", ") : ""}`);
+  b.addEventListener("click", (e) => openExchange(x, e.currentTarget));
+  return b;
+}
+
+function exchangeList(list, keyPrefix) {
+  const ul = el("ul", "ex-list");
+  for (const x of list) add(ul, add(el("li"), exchangeButton(x, keyPrefix + x.id)));
+  return ul;
+}
+
+async function loadExchanges() {
+  const id = S.openId;
+  const info = id && S.sessions.byId.get(id);
+  if (!info) return;
+  const request = ++S.requests.exch;
+  const ids = [...S.sessions.byId.values()].filter((s) => s.id === id || (info.mission && s.mission === info.mission)).map((s) => s.id);
+  const list = [];
+  let error = null;
+  await Promise.all(ids.map(async (sid) => {
+    try {
+      const rows = await api("GET", "/api/exchanges/" + encodeURIComponent(sid) + "?limit=2000");
+      for (const r of Array.isArray(rows) ? rows : []) { const x = C.exchangeOf({ ...r, session: r.session || sid }); if (x) C.mergeExchange(list, x); }
+    } catch (e) {
+      // An older daemon has no such route: there is simply nothing to list.
+      if (e.status !== 404) error = e.message;
+    }
+  }));
+  if (S.openId !== id || request !== S.requests.exch) return;
+  S.exch = { session: id, list, error, loaded: true };
+  want("right", "overview", "blocks");
+}
+
+/** The claim's hosts, each `reached · ex-…` (links) or `not reached`, under the claim; null when it names no host. */
+function reachLine(claim) {
+  const target = S.rec && S.rec.start && S.rec.start.target;
+  const scope = target ? C.parseScope(target.scope, target.exclude) : null;
+  const list = allExchanges();
+  const reach = C.claimReach(claim, list, scope);
+  if (!reach.length) return null;
+  const box = el("ul", "reach");
+  box.setAttribute("aria-label", "Hosts this claim names");
+  for (const r of reach) {
+    const item = el("li", "reach-item " + (r.reached ? "reached" : "not-reached"));
+    item.title = C.reachWords(r);
+    add(item, el("span", "reach-host mono", r.host));
+    if (r.reached) {
+      add(item, el("span", "reach-state", "reached"), document.createTextNode(" · "));
+      r.ids.forEach((id, i) => {
+        if (i) item.append(document.createTextNode(" "));
+        const x = list.find((e) => e.id === id);
+        item.append(btn(id, "link mono keylink", (e) => openExchange(x, e.currentTarget)));
+      });
+    } else {
+      add(item, el("span", "reach-state", "not reached"));
+    }
+    box.append(item);
+  }
+  return box;
+}
+
+// -- the exchange viewer
+
+let exOpener = null;
+
+async function openExchange(x, opener = document.activeElement) {
+  if (!x) return;
+  exOpener = opener;
+  S.exview = { ex: x, revealed: false, req: null, res: null, reqError: null, resError: null, loading: true };
+  const v = S.exview;
+  renderExchange();
+  const dialog = $("exview");
+  if (!dialog.open) dialog.showModal();
+  $("exview-close").focus({ preventScroll: true });
+  const read = async (ref, key) => {
+    if (!ref) return;
+    try { v[key] = await fetchStoredText(ref.id); } catch (e) { v[key + "Error"] = e.message; }
+  };
+  await Promise.all([read(x.request, "req"), read(x.response, "res")]);
+  if (S.exview !== v) return;
+  v.loading = false;
+  renderExchange();
+}
+
+function closeExchange() {
+  S.exview = null;
+  if ($("exview").open) $("exview").close();
+}
+
+function messagePane(title, ref, text, error, v, label) {
+  const pane = el("section", "ex-side");
+  pane.setAttribute("aria-label", label);
+  const head = el("div", "ex-side-head");
+  add(head, el("h3", "", title));
+  pane.append(head);
+  if (!ref) { pane.append(el("p", "dim", title === "Response" ? (v.ex.error ? "No response: " + v.ex.error : "No response was received.") : "No request was stored.")); return pane; }
+  if (error) {
+    pane.append(el("p", "error", error));
+    add(pane, openAsOutput(ref, `${title} of ${v.ex.id}`));
+    return pane;
+  }
+  if (text === null) { pane.append(el("p", "dim", "Loading…")); return pane; }
+  const m = C.messageView(text, { revealed: v.revealed });
+  pane.append(el("pre", "ex-start mono", m.start));
+  if (m.rows.length) {
+    const t = el("table", "ex-headers");
+    for (const r of m.rows) {
+      const val = el("td", "ex-hval mono" + (r.sensitive && !v.revealed ? " masked" : ""), r.shown);
+      add(t, add(el("tr"), el("th", "mono", r.name), val));
+    }
+    pane.append(t);
+  } else pane.append(el("p", "dim", "No headers."));
+  const bodyNote = m.cut ? `${m.bodyWords} · first ${C.byteSize(C.EXCHANGE_BODY_CAP)} shown` : m.bodyWords;
+  pane.append(el("div", "label", "Body"), el("div", "dim ex-body-note", bodyNote));
+  if (m.body) pane.append(el("pre", "txt out ex-body", m.body));
+  const actions = el("div", "copy-row");
+  if (m.body) add(actions, copyButton("Copy body", () => m.fullBody, { what: "Body", text: true, cls: "ghost", key: "ex-copy:" + title }));
+  add(actions, openAsOutput(ref, `${title} of ${v.ex.id}`));
+  pane.append(actions);
+  return pane;
+}
+
+function openAsOutput(ref, title) {
+  const b = btn("Open as output", "small ghost", (e) => openViewer(ref.id, title, ref.lines || null, {}, e.currentTarget));
+  b.title = "Open the stored message in the output viewer, line by line.";
+  return b;
+}
+
+function renderExchange() {
+  const v = S.exview;
+  if (!v) return;
+  const x = v.ex;
+  const row = C.exchangeRow(x);
+  $("exview-title").textContent = `${x.method} ${row.where}`;
+  const info = [x.id, row.status, row.size, row.time].filter(Boolean).join(" · ");
+  $("exview-info").textContent = info;
+  const marks = $("exview-marks");
+  marks.replaceChildren(...row.marks.map((m) => { const c = chip(m.text, "dim"); c.title = m.tip; return c; }));
+  const how = x.source === "proxy" ? "Captured by loom's proxy" : `Sent by ${x.tool || "a tool"}`;
+  $("exview-how").textContent = how + (x.call_id ? ` · call ${x.call_id}` : "");
+  const reveal = $("exview-reveal");
+  const secrets = v.req !== null && C.messageView(v.req).hasSecrets || v.res !== null && C.messageView(v.res).hasSecrets;
+  reveal.hidden = !secrets;
+  reveal.textContent = v.revealed ? "Hide secrets" : "Reveal secrets";
+  reveal.setAttribute("aria-pressed", String(v.revealed));
+  $("exview-note").hidden = !secrets;
+  $("exview-note").textContent = v.revealed ? "Secret header values are showing. They are never stored in a copy of this page." : "Authorization, cookie and API-key values are hidden. Reveal shows them on this screen only.";
+  $("exview-sides").replaceChildren(
+    messagePane("Request", x.request, v.req, v.reqError, v, "Request"),
+    messagePane("Response", x.response, v.res, v.resError, v, "Response"),
+  );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Targets (docs/CONTRACTS-TRAFFIC-TARGETS.md T, U4)
+
+async function loadTargets() {
+  try {
+    const list = await api("GET", "/api/targets");
+    S.targets = { supported: true, list: (Array.isArray(list) ? list : []).map(C.targetOf), error: null };
+  } catch (e) {
+    // An older daemon has no targets: the entry is not shown, and nothing says why.
+    S.targets = { supported: e.status === 404 ? false : S.targets.supported, list: S.targets.list, error: e.status === 404 ? null : e.message };
+  }
+  $("btn-targets").hidden = S.targets.supported !== true;
+  renderNewTarget();
+  if (S.view === "targets") renderTargets();
+}
+
+function renderNewTarget() {
+  const field = $("f-target-field");
+  const sel = $("f-target");
+  const names = S.targets.supported === true ? S.targets.list.map((t) => t.name) : [];
+  field.hidden = names.length === 0;
+  const keep = sel.options.length ? sel.value : "";
+  sel.replaceChildren(new Option("None: a private security state", ""), ...names.map((n) => new Option(n, n)));
+  if (names.includes(keep)) sel.value = keep;
+}
+
+function showTargets() {
+  setView("targets");
+  renderTargets();
+  loadTargets();
+}
+
+function renderTargets() {
+  const box = $("targets-body");
+  const frag = document.createDocumentFragment();
+  if (S.targets.error) frag.append(el("p", "error", S.targets.error));
+  if (S.targets.supported === false) frag.append(el("p", "dim", "This daemon does not keep targets."));
+  else if (S.targets.supported === null) frag.append(el("p", "dim", "Loading targets…"));
+  else if (!S.targets.list.length) frag.append(el("p", "dim", "No target yet. Create one with loom target add, then name it when you start a mission."));
+  else {
+    const ul = el("ul", "target-list");
+    for (const t of S.targets.list) {
+      const a = link("", C.targetHash(t.name));
+      a.className = "target-card";
+      add(a, el("strong", "", t.name), el("span", "dim", t.scope.join(", ")), el("span", "dim", t.words));
+      add(ul, add(el("li"), a));
+    }
+    frag.append(ul);
+  }
+  box.replaceChildren(frag);
+}
+
+const TP_FILTERS = () => ({ status: "all", kind: "all", text: "" });
+
+async function showTargetPage(name) {
+  setView("target");
+  if (!S.tp || S.tp.name !== name) S.tp = { name, cfg: null, nodes: [], error: null, loaded: false, filters: TP_FILTERS(), collapsed: new Set(), sel: null, ex: { node: null, list: [], error: null }, edit: null, saved: "", scroll: 0 };
+  renderTargetPage();
+  await loadTargetPage();
+}
+
+async function loadTargetPage() {
+  const tp = S.tp;
+  if (!tp) return;
+  const request = ++S.requests.target;
+  try {
+    const [list, graph] = await Promise.all([api("GET", "/api/targets"), api("GET", "/api/targets/" + encodeURIComponent(tp.name) + "/graph")]);
+    if (S.tp !== tp || request !== S.requests.target) return;
+    S.targets = { supported: true, list: (Array.isArray(list) ? list : []).map(C.targetOf), error: null };
+    tp.cfg = S.targets.list.find((t) => t.name === tp.name) || null;
+    tp.nodes = C.graphNodes(graph);
+    tp.error = tp.cfg ? null : `There is no target named ${tp.name}.`;
+  } catch (e) {
+    if (S.tp !== tp || request !== S.requests.target) return;
+    tp.error = e.status === 404 ? `There is no target named ${tp.name}.` : e.message;
+  }
+  tp.loaded = true;
+  if (S.view === "target" && S.tp === tp) renderTargetPage();
+}
+
+function targetFilterBar(tp) {
+  const bar = el("div", "tfilters");
+  bar.setAttribute("role", "group");
+  bar.setAttribute("aria-label", "Filter the tree");
+  const select = (label, key, options) => {
+    const s = el("select");
+    for (const [value, text] of options) s.append(new Option(text, value));
+    s.value = tp.filters[key];
+    s.addEventListener("change", () => { tp.filters[key] = s.value; tp.scroll = 0; renderTargetTree(); });
+    const l = el("label", "", label + " ");
+    l.append(s);
+    return l;
+  };
+  const text = el("input");
+  text.type = "search";
+  text.placeholder = "Part of a name";
+  text.value = tp.filters.text;
+  text.setAttribute("aria-label", "Filter by name");
+  text.addEventListener("input", () => { tp.filters.text = text.value; tp.scroll = 0; renderTargetTree(); });
+  add(bar,
+    select("Status", "status", [["all", "Any"], ...C.NODE_STATUSES.map((s) => [s, C.nodeStatusWords(s)])]),
+    select("Kind", "kind", [["all", "Any"], ...C.NODE_KINDS.map((k) => [k, k])]),
+    add(el("label", "", "Name "), text));
+  return bar;
+}
+
+function scopeEditor(tp) {
+  const box = el("section", "tscope");
+  box.setAttribute("aria-label", "Scope");
+  const head = heading("h2", "Scope");
+  box.append(head);
+  const list = (title, entries) => add(el("div", "tscope-col"), el("div", "label", title), entries.length ? el("ul", "tscope-list mono", "") : el("p", "dim", "none"));
+  if (!tp.edit) {
+    const cols = el("div", "tscope-cols");
+    for (const [title, entries] of [["In scope", tp.cfg.scope], ["Left out", tp.cfg.exclude]]) {
+      const col = list(title, entries);
+      const ul = col.querySelector("ul");
+      if (ul) for (const e of entries) ul.append(el("li", "", e));
+      cols.append(col);
+    }
+    box.append(cols);
+    if (tp.cfg.notes) box.append(el("p", "dim tnotes", tp.cfg.notes));
+    head.append(btn("Edit scope", "small", () => { tp.edit = { scope: C.scopeText(tp.cfg.scope), exclude: C.scopeText(tp.cfg.exclude), error: null, busy: false }; renderTargetPage(); }));
+    return box;
+  }
+  const f = el("form", "form tscope-form");
+  const area = (id, label, value, key) => {
+    const t = el("textarea", "mono");
+    t.id = id;
+    t.rows = 4;
+    t.value = value;
+    t.addEventListener("input", () => { tp.edit[key] = t.value; });
+    const l = el("label", "field");
+    l.htmlFor = id;
+    add(l, el("span", "", label));
+    return add(el("div", "field"), l, t);
+  };
+  add(f,
+    area("t-scope", "In scope: one entry per line (a name, *.name, an IP or a CIDR)", tp.edit.scope, "scope"),
+    area("t-exclude", "Left out: these win over the scope", tp.edit.exclude, "exclude"));
+  const err = el("p", "error", tp.edit.error || "");
+  err.setAttribute("role", "alert");
+  err.hidden = !tp.edit.error;
+  const save = btn(tp.edit.busy ? "Saving…" : "Save scope", "primary", () => {});
+  save.type = "submit";
+  save.disabled = tp.edit.busy;
+  add(f, err, add(el("div", "form-row"), save, btn("Cancel", "", () => { tp.edit = null; renderTargetPage(); })));
+  f.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const put = C.targetPut(tp.cfg, tp.edit.scope, tp.edit.exclude);
+    if (put.error) { tp.edit.error = put.error; renderTargetPage(); return; }
+    tp.edit.busy = true;
+    tp.edit.error = null;
+    renderTargetPage();
+    try {
+      await api("PUT", "/api/targets/" + encodeURIComponent(tp.name), put.body);
+      tp.edit = null;
+      await loadTargetPage();
+      loadTargets();
+    } catch (e) {
+      tp.edit = { ...tp.edit, busy: false, error: e.message };
+      renderTargetPage();
+    }
+  });
+  box.append(f);
+  return box;
+}
+
+function renderTargetPage() {
+  const tp = S.tp;
+  const box = $("target-body");
+  if (!tp) { box.replaceChildren(); return; }
+  $("target-title").textContent = tp.name;
+  const frag = document.createDocumentFragment();
+  if (tp.error) frag.append(el("p", "error", tp.error));
+  if (!tp.loaded) frag.append(el("p", "dim", "Loading the target…"));
+  if (tp.cfg) {
+    frag.append(scopeEditor(tp));
+    frag.append(el("p", "tcounts", C.countsWords(C.targetCounts(tp.nodes))));
+    const tree = el("section", "ttree-wrap");
+    tree.setAttribute("aria-label", "Assets");
+    add(tree, heading("h2", "Assets"), targetFilterBar(tp), el("p", "dim tshown", ""), el("div", "ttree"));
+    const layout = el("div", "tlayout");
+    add(layout, tree, el("aside", "tnode-panel"));
+    frag.append(layout);
+    const findings = C.targetFindings(tp.nodes);
+    const fs = el("section", "tfindings");
+    fs.setAttribute("aria-label", "Findings");
+    fs.append(heading("h2", "Findings"));
+    if (!findings.length) fs.append(el("p", "dim", "No findings on this target yet."));
+    else {
+      const ul = el("ul", "tfinding-list");
+      for (const f of findings) {
+        const li = el("li", "tfinding" + (f.open ? "" : " closed"));
+        const lead = [...S.sessions.byId.values()].find((s) => !s.parent && s.mission === f.mission);
+        add(li, chip(f.open ? "open" : f.status, f.open ? "bad" : "dim"), el("span", "mono dim", f.claim), el("strong", "", f.text), el("span", "dim", " on " + f.locator),
+          lead ? link("claim in its mission", C.sessionHash(lead.id, "evidence")) : null);
+        ul.append(li);
+      }
+      fs.append(ul);
+    }
+    frag.append(fs);
+    const ms = el("section", "tmissions");
+    ms.setAttribute("aria-label", "Missions");
+    ms.append(heading("h2", "Missions"));
+    const missions = C.targetMissions(tp.nodes, S.sessions.byId, tp.name);
+    if (!missions.length) ms.append(el("p", "dim", "No mission has worked on this target yet."));
+    else {
+      const ul = el("ul", "tmission-list");
+      for (const m of missions) add(ul, add(el("li"), m.session ? link(m.title, C.sessionHash(m.session, "chat")) : el("span", "", m.title), el("span", "dim", " · " + m.words)));
+      ms.append(ul);
+    }
+    frag.append(ms);
+  }
+  box.replaceChildren(frag);
+  renderTargetTree();
+}
+
+const TREE_ROW_PX = 40;
+
+function renderTargetTree() {
+  const tp = S.tp;
+  const host = $("target-body").querySelector(".ttree");
+  if (!tp || !host) return;
+  const res = C.targetTree(tp.nodes, tp.filters, tp.collapsed);
+  tp.rows = res.rows;
+  const shown = $("target-body").querySelector(".tshown");
+  shown.textContent = res.filtering ? `${C.count(res.shown, "asset")} match, of ${tp.nodes.length}` : tp.nodes.length ? C.count(tp.nodes.length, "asset") : "No assets seen yet.";
+  host.setAttribute("role", "tree");
+  host.setAttribute("aria-label", "Assets of " + tp.name);
+  const draw = () => {
+    const w = C.treeWindow(res.rows.length, host.scrollTop, host.clientHeight || 600, TREE_ROW_PX);
+    const frag = document.createDocumentFragment();
+    host.classList.toggle("virtual", w.virtual);
+    host.style.setProperty("padding-top", w.before + "px");
+    host.style.setProperty("padding-bottom", w.after + "px");
+    for (const row of res.rows.slice(w.start, w.end)) frag.append(treeRow(tp, row, res));
+    host.replaceChildren(frag);
+  };
+  tp.redraw = res.rows.length > C.VIRTUAL_ROWS ? draw : null;
+  if (!host.dataset.scrollWired) {
+    host.dataset.scrollWired = "1";
+    host.addEventListener("scroll", () => { if (S.tp && S.tp.redraw) { S.tp.scroll = host.scrollTop; S.tp.redraw(); } });
+  }
+  draw();
+  if (res.rows.length > C.VIRTUAL_ROWS) host.scrollTop = tp.scroll;
+  renderNodePanel();
+}
+
+function treeRow(tp, row, res) {
+  const n = row.node;
+  const li = el("div", "tnode" + (row.context ? " context" : "") + (tp.sel === n.id ? " sel" : ""));
+  li.setAttribute("role", "treeitem");
+  li.setAttribute("aria-level", String(row.depth + 1));
+  if (row.hasKids) li.setAttribute("aria-expanded", String(row.open));
+  li.dataset.node = n.id;
+  li.dataset.status = n.status;
+  li.style.setProperty("padding-left", 8 + row.depth * 18 + "px");
+  if (row.hasKids) {
+    const f = el("button", "tfold");
+    f.type = "button";
+    f.setAttribute("aria-label", (row.open ? "Fold " : "Unfold ") + n.locator);
+    f.disabled = res.filtering;
+    f.append(icon("chevron"));
+    if (row.open) f.classList.add("open");
+    f.addEventListener("click", () => { if (tp.collapsed.has(n.id)) tp.collapsed.delete(n.id); else tp.collapsed.add(n.id); renderTargetTree(); });
+    li.append(f);
+  } else li.append(el("span", "tfold-gap"));
+  const dot = el("span", "nstat nstat-" + n.status);
+  dot.setAttribute("role", "img");
+  dot.setAttribute("aria-label", C.nodeStatusWords(n.status));
+  dot.title = C.nodeStatusWords(n.status);
+  const pick = el("button", "tpick");
+  pick.type = "button";
+  pick.dataset.focusKey = "node:" + n.id;
+  add(pick, dot, el("span", "tkind dim", n.kind), el("span", "tloc mono", n.locator), el("span", "tstatus dim", C.nodeStatusWords(n.status)));
+  pick.addEventListener("click", () => { tp.sel = n.id; tp.ex = { node: n.id, list: [], error: null, loading: true }; renderTargetTree(); loadNodeExchanges(); });
+  li.append(pick);
+  return li;
+}
+
+async function loadNodeExchanges() {
+  const tp = S.tp;
+  const id = tp && tp.sel;
+  if (!id) return;
+  try {
+    const rows = await api("GET", "/api/targets/" + encodeURIComponent(tp.name) + "/exchanges?node=" + encodeURIComponent(id));
+    if (S.tp !== tp || tp.sel !== id) return;
+    const list = [];
+    for (const r of Array.isArray(rows) ? rows : []) { const x = C.exchangeOf(r); if (x) C.mergeExchange(list, x); }
+    tp.ex = { node: id, list, error: null, loading: false };
+  } catch (e) {
+    if (S.tp !== tp || tp.sel !== id) return;
+    tp.ex = { node: id, list: [], error: e.status === 404 ? null : e.message, loading: false };
+  }
+  renderNodePanel();
+}
+
+function renderNodePanel() {
+  const tp = S.tp;
+  const panel = $("target-body").querySelector(".tnode-panel");
+  if (!tp || !panel) return;
+  const n = tp.nodes.find((x) => x.id === tp.sel);
+  if (!n) { panel.replaceChildren(el("p", "dim", "Choose an asset to see what is known about it.")); return; }
+  const frag = document.createDocumentFragment();
+  const dot = el("span", "nstat nstat-" + n.status);
+  dot.setAttribute("aria-hidden", "true");
+  add(frag, add(el("h3", "tnode-title"), dot, el("span", "mono", n.locator)));
+  frag.append(el("p", "", `${n.kind} · ${C.nodeStatusWords(n.status)}`));
+  const byId = S.sessions.byId;
+  const missionLink = (id) => {
+    const lead = [...byId.values()].find((s) => !s.parent && s.mission === id);
+    return lead ? link(lead.title || id, C.sessionHash(lead.id, "chat")) : document.createTextNode(id);
+  };
+  frag.append(el("div", "label", "Missions that set it"));
+  if (!n.missions.length) frag.append(el("p", "dim", "None recorded."));
+  else { const ul = el("ul"); for (const m of n.missions) add(ul, add(el("li"), missionLink(m))); frag.append(ul); }
+  frag.append(el("div", "label", "Findings"));
+  if (!n.findings.length) frag.append(el("p", "dim", "None."));
+  else {
+    const ul = el("ul");
+    for (const f of n.findings) {
+      const lead = [...byId.values()].find((s) => !s.parent && s.mission === f.mission);
+      add(ul, add(el("li"), chip(f.status, f.status === "open" ? "bad" : "dim"), el("strong", "", " " + f.text + " "), lead ? link(f.claim, C.sessionHash(lead.id, "evidence")) : el("span", "mono dim", f.claim)));
+    }
+    frag.append(ul);
+  }
+  frag.append(el("div", "label", "Evidence"));
+  if (!n.evidence.length) frag.append(el("p", "dim", "None attached."));
+  else {
+    const ul = el("ul", "tkeys");
+    for (const k of n.evidence) add(ul, add(el("li"), outKeyButton(String(k).replace(/^out:/, ""))));
+    frag.append(ul);
+  }
+  frag.append(el("div", "label", "Requests with it"));
+  if (tp.ex.loading) frag.append(el("p", "dim", "Loading…"));
+  else if (tp.ex.error) frag.append(el("p", "error", tp.ex.error));
+  else if (!tp.ex.list.length) frag.append(el("p", "dim", "No captured request names this asset."));
+  else frag.append(exchangeList(tp.ex.list, "tx:"));
+  preserveFocus(panel, () => panel.replaceChildren(frag));
+}
+
+/** The graph changed (an event, at most once a second): read it again when the page is open. */
+function targetChanged(name) {
+  if (S.view === "target" && S.tp && S.tp.name === name) loadTargetPage();
+  if (S.targets.supported === true) loadTargets();
+}
+
 async function start() {
   // A login address opened in a tab that already has the page changes only the fragment: load the
   // page again, so that the code is exchanged and leaves the address bar. Also on the lost() page.
@@ -6902,7 +7496,7 @@ async function start() {
   resizeInspector(Number(recalled("inspector-width", 396)) || 396);
   renderDot();
   connect();
-  await Promise.all([loadSessions(), loadInbox(), loadStatus()]);
+  await Promise.all([loadSessions(), loadInbox(), loadStatus(), loadTargets()]);
   route();
   setInterval(() => {
     S.now = Date.now();

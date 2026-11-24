@@ -4062,3 +4062,243 @@ test("mcpServersModel: null for nothing, else one row per server with its facts"
   assert.deepEqual([m[1].tone, m[1].error, m[1].hasDetail, m[1].changed, m[1].toolsWords, m[1].callsWords], ["bad", "connection refused", true, false, "0 tools", ""]);
   assert.deepEqual([m[2].tone, m[2].hasDetail, m[2].error], ["neutral", false, ""]);
 });
+
+// ---- captured exchanges and targets (docs/CONTRACTS-TRAFFIC-TARGETS.md, parts C, F, T, U) ----
+
+const exRec = (id, fields = {}) => ({
+  seq: seqCounter++, ts_ms: 5000 + seqCounter, kind: "exchange", id, call_id: "c-http", source: "tool", tool: "http_send", scheme: "https", tls: "tool",
+  method: "get", host: "API.acme.test", port: 443, target: "/v1/users?id=1", status: 200, error: null,
+  request: { id: "11".repeat(32), bytes: 120, lines: 4 }, response: { id: "22".repeat(32), bytes: 900, lines: 12 },
+  request_bytes: 120, response_bytes: 2048, truncated: false, upstream_unverified: false, duration_ms: 240, ...fields,
+});
+
+test("an exchange record joins the tool row of its call and the store's list, once", () => {
+  seqCounter = 0;
+  const store = C.createRecordStore("s-a");
+  C.applyRecords(store, [
+    rec("tool_call", { call_id: "c-http", req_id: "r", name: "http_send", args: { url: "https://api.acme.test/v1/users" }, class: "net" }, "model"),
+    rec("tool_result", { call_id: "c-http", name: "http_send", status: "ok", text: "ok", cut: false, class: "net", meta: {}, duration_ms: 5 }, "tool"),
+    exRec("ex-aaaaaaaaaaaa"),
+    exRec("ex-bbbbbbbbbbbb", { target: "/v1/other", status: null, error: "connection reset", response: null }),
+    exRec("ex-cccccccccccc", { call_id: null, source: "proxy", tls: "plain", scheme: "http", port: 80 }),
+  ]);
+  assert.deepEqual(store.exchanges.map((x) => x.id), ["ex-aaaaaaaaaaaa", "ex-bbbbbbbbbbbb", "ex-cccccccccccc"]);
+  const row = C.toolRow(store.blocks[0]);
+  assert.equal(row.requests, "2 requests");
+  assert.deepEqual(row.exchanges.map((x) => x.id), ["ex-aaaaaaaaaaaa", "ex-bbbbbbbbbbbb"]);
+  assert.equal(C.toolRow({ ...store.blocks[0], exchanges: undefined }).requests, "");
+  assert.equal(C.applyRecord(store, exRec("ex-aaaaaaaaaaaa", { seq: store.next })), true);
+  assert.equal(store.exchanges.length, 3, "an id already held is not listed twice");
+  assert.deepEqual(C.exchangesForCall(store.exchanges, "c-http").map((x) => x.id), ["ex-aaaaaaaaaaaa", "ex-bbbbbbbbbbbb"]);
+  assert.deepEqual(C.exchangesForCall(store.exchanges, null), []);
+});
+
+test("the exchange list model: one line each, marks, filters and the count line", () => {
+  const a = C.exchangeOf(exRec("ex-aaaaaaaaaaaa"));
+  const e = C.exchangeOf(exRec("ex-eeeeeeeeeeee", { tls: "intercepted", upstream_unverified: true, truncated: true, source: "proxy", status: 503, host: "10.20.0.4", port: 8443, target: "/x" }));
+  const n = C.exchangeOf(exRec("ex-nnnnnnnnnnnn", { status: null, error: "timed out", response: null, response_bytes: 0, host: "pay.acme.test", port: 80, scheme: "http", duration_ms: 30000 }));
+  assert.equal(C.exchangeOf({ kind: "exchange" }), null);
+  const r = C.exchangeRow(a);
+  assert.equal(r.text, "GET API.acme.test/v1/users?id=1 · 200 · 2.0 KiB · 240ms");
+  assert.equal(r.tone, "ok");
+  assert.deepEqual(r.marks, []);
+  const re = C.exchangeRow(e);
+  assert.equal(re.where, "10.20.0.4:8443/x");
+  assert.equal(re.tone, "bad");
+  assert.deepEqual(re.marks.map((m) => m.key), ["intercepted", "unverified", "cut"]);
+  const rn = C.exchangeRow(n);
+  assert.equal(rn.text, "GET pay.acme.test/v1/users?id=1 · no response · 30s");
+  assert.equal(rn.words, "timed out");
+  assert.equal(C.exchangeRow(C.exchangeOf(exRec("ex-x", { status: 404, response_bytes: 0 }))).tone, "warn");
+  assert.equal(C.exchangeWhere(C.exchangeOf(exRec("ex-x", { host: "::1", port: 8080, scheme: "http", target: "p" }))), "[::1]:8080/p");
+  const list = [a, e, n];
+  const opts = C.exchangeFilterOptions(list);
+  assert.deepEqual(opts.hosts, ["10.20.0.4", "api.acme.test", "pay.acme.test"]);
+  assert.deepEqual(opts.statuses.map((s) => s.label), ["2xx", "5xx", "no response"]);
+  assert.deepEqual(C.filterExchanges(list, { host: "API.acme.test" }).map((x) => x.id), [a.id]);
+  assert.deepEqual(C.filterExchanges(list, { status: "none" }).map((x) => x.id), [n.id]);
+  assert.deepEqual(C.filterExchanges(list, { host: "all", status: "all" }), list);
+  assert.deepEqual(C.filterExchanges(list, { host: "10.20.0.4", status: "ok" }), []);
+  assert.equal(C.exchangeCountLine(1, 3), "1 request of 3");
+  assert.equal(C.exchangeCountLine(3, 3), "3 requests");
+  assert.equal(C.exchangeCountLine(0, 0), "No requests were captured for this session.");
+  const merged = [];
+  C.mergeExchange(merged, C.exchangeOf(exRec("ex-late", { ts_ms: 9000 })));
+  C.mergeExchange(merged, C.exchangeOf(exRec("ex-early", { ts_ms: 100 })));
+  assert.equal(C.mergeExchange(merged, C.exchangeOf(exRec("ex-early", { ts_ms: 100 }))), false);
+  assert.deepEqual(merged.map((x) => x.id), ["ex-early", "ex-late"]);
+});
+
+test("a stored message splits into start line, headers and body, and secrets stay masked until revealed", () => {
+  const msg = "POST /login HTTP/1.1\r\nHost: api.acme.test\r\nauthorization: Bearer abc\r\nCookie: sid=1\r\nX-Api-Key: k\r\nSet-Cookie: a=b\r\nProxy-Authorization: Basic x\r\nAccept: */*\r\nX-Long: one\r\n two\r\n\r\n{\"user\":\"a\"}\r\n\r\ntail";
+  const v = C.messageView(msg);
+  assert.equal(v.start, "POST /login HTTP/1.1");
+  assert.equal(v.body, "{\"user\":\"a\"}\r\n\r\ntail");
+  assert.equal(v.hasSecrets, true);
+  assert.deepEqual(v.rows.map((r) => [r.name, r.sensitive]), [["Host", false], ["authorization", true], ["Cookie", true], ["X-Api-Key", true], ["Set-Cookie", true], ["Proxy-Authorization", true], ["Accept", false], ["X-Long", false]]);
+  assert.equal(v.rows[1].shown, C.HEADER_MASK);
+  assert.equal(v.rows[1].value, "Bearer abc", "the value is kept for the reveal");
+  assert.equal(v.rows[0].shown, "api.acme.test");
+  assert.equal(v.rows[7].shown, "one two");
+  const shown = C.messageView(msg, { revealed: true });
+  assert.equal(shown.rows[1].shown, "Bearer abc");
+  assert.equal(shown.rows[5].shown, "Basic x");
+  assert.equal(C.isSensitiveHeader(" COOKIE "), true);
+  assert.equal(C.isSensitiveHeader("Accept"), false);
+  const head = C.messageView("HTTP/1.1 204 No Content\r\nServer: x");
+  assert.equal(head.bodyWords, "no body");
+  assert.equal(head.hasSecrets, false);
+  const big = C.messageView("HTTP/1.1 200 OK\n\n" + "x".repeat(C.EXCHANGE_BODY_CAP + 5));
+  assert.equal(big.cut, true);
+  assert.equal(big.body.length, C.EXCHANGE_BODY_CAP);
+});
+
+const tscope = (inc, exc = []) => C.parseScope(inc, exc);
+
+test("scope entries parse and match as target.rs does (names, globs, IPs, CIDRs, exclude wins)", () => {
+  const s = tscope(["acme.test", "*.acme.test", "10.20.0.0/24", "192.0.2.7", "2001:db8::/32"], ["admin.acme.test", "10.20.0.9"]);
+  assert.deepEqual(s.errors, []);
+  assert.ok(s.contains("acme.test") && s.contains("ACME.test.") && s.contains("api.acme.test") && s.contains("a.b.acme.test"));
+  assert.ok(!s.contains("evilacme.test") && !s.contains("acme.test.evil"));
+  assert.ok(s.contains("10.20.0.5") && !s.contains("10.20.1.5") && s.contains("192.0.2.7") && s.contains("[2001:db8::1]"));
+  assert.ok(!s.contains("admin.acme.test") && !s.contains("10.20.0.9"));
+  assert.ok(s.excluded("admin.acme.test"));
+  assert.ok(!tscope(["*.acme.test"]).contains("acme.test"), "a glob does not include the bare domain");
+  for (const bad of ["https://acme.test", "acme.test:443", "10.0.0.0/33", "*.", "", "a b"]) {
+    const r = C.parseScopeEntry(bad);
+    assert.ok(r.error && (r.error.includes("scope entry") || r.error.includes("CIDR")), `${bad}: ${r.error}`);
+  }
+  assert.deepEqual(tscope(["acme.test", "a b"]).errors.length, 1);
+});
+
+test("claim hosts: the same cases as claim_hosts in target.rs", () => {
+  const s = tscope(["*.acme.test", "10.20.0.0/24"]);
+  const text = "The login at https://User@Login.acme.test:8443/auth?x=1 leaks; api.acme.test and 10.20.0.4:22 too, not example.com or http://other.test/x.";
+  assert.deepEqual(C.claimHosts(text, ["db.acme.test"], s), ["db.acme.test", "login.acme.test", "other.test", "api.acme.test", "10.20.0.4"]);
+  assert.deepEqual(C.claimHosts(text, [], null), ["login.acme.test", "other.test"], "without a scope only URLs count");
+  assert.deepEqual(C.claimHosts("see http://[::1]:8080/x", [], null), ["::1"]);
+  assert.deepEqual(C.claimHosts("ftp://files.acme.test/x and no hosts", [], null), []);
+  assert.deepEqual(C.claimHosts("seen on 10.20.1.4 and 10.20.0.4.", [], s), ["10.20.0.4"]);
+  assert.equal(C.assetHost("api.acme.test:8443/tcp"), "api.acme.test");
+  assert.equal(C.assetHost("GET https://Shop.acme.test:8443/cart/{id}"), "shop.acme.test");
+  assert.equal(C.assetHost("file:/etc/passwd"), "");
+  assert.equal(C.assetHost("a1b2c3d4"), "");
+  assert.equal(C.assetHost("[::1]:80/tcp"), "::1");
+});
+
+test("a claim's host is reached by evidence that cites a call (or a stored message) that got a response, and by nothing else", () => {
+  const ex = [
+    C.exchangeOf(exRec("ex-aaaaaaaaaaaa", { call_id: "c1", host: "api.acme.test" })),
+    C.exchangeOf(exRec("ex-bbbbbbbbbbbb", { call_id: "c2", host: "login.acme.test", status: null, response: null })),
+    C.exchangeOf(exRec("ex-cccccccccccc", { call_id: "c3", host: "other.test", request: { id: "99".repeat(32), bytes: 1, lines: 1 } })),
+  ];
+  const ev = (id, f) => ({ id, supports: true, attested: true, call_id: null, blob: null, session: null, ...f });
+  const s = tscope(["*.acme.test"]);
+  const claim = { text: "api.acme.test and login.acme.test leak, see http://other.test/x and www.acme.test", assets: ["db.acme.test:5432/tcp", "file:/etc/x"], evidence: [ev("e1", { call_id: "c1" }), ev("e2", { call_id: "c2" }), ev("e3", { blob: "99".repeat(32) })] };
+  assert.deepEqual(C.claimReach(claim, ex, s), [
+    { host: "db.acme.test", reached: false, ids: [] },
+    { host: "other.test", reached: true, ids: ["ex-cccccccccccc"] },
+    { host: "api.acme.test", reached: true, ids: ["ex-aaaaaaaaaaaa"] },
+    { host: "login.acme.test", reached: false, ids: [] },
+    { host: "www.acme.test", reached: false, ids: [] },
+  ]);
+  const weak = { ...claim, evidence: [ev("e1", { call_id: "c1", attested: false }), ev("e2", { call_id: "c1", supports: false }), ev("e3", { call_id: "c1", session: "s-elsewhere" })] };
+  assert.equal(C.claimReach(weak, [{ ...ex[0], session: "s-here" }], s).find((r) => r.host === "api.acme.test").reached, false);
+  assert.equal(C.claimReach({ text: "a note with no host", evidence: [] }, ex, s).length, 0);
+  assert.equal(C.reachWords({ host: "h.test", reached: true, ids: ["ex-1", "ex-2"] }), "h.test: reached by ex-1, ex-2");
+  assert.match(C.reachWords({ host: "h.test", reached: false, ids: [] }), /not reached/);
+});
+
+const gnode = (id, kind, locator, status, parent = null, extra = {}) => C.nodeOf({ id, kind, locator, status, parent, missions: ["m-1"], evidence: [], findings: [], ...extra });
+
+test("the target tree nests by parent, orders siblings, folds and filters with the path kept", () => {
+  const nodes = [
+    gnode("d1", "domain", "acme.test", "untested"),
+    gnode("h1", "host", "www.acme.test", "finding", "d1", { findings: [{ claim: "c1", text: "XSS", status: "open", mission: "m-1", evidence: [] }] }),
+    gnode("h2", "host", "api.acme.test", "tested", "d1"),
+    gnode("i1", "ip", "10.20.0.4", "untested", "h2"),
+    gnode("s1", "service", "10.20.0.4:443/tcp", "deferred", "i1"),
+    gnode("e1", "endpoint", "GET https://api.acme.test:443/v1/users/{id}", "tested", "s1"),
+    gnode("n1", "ip", "10.20.0.0/24", "not_seen"),
+    gnode("o1", "host", "orphan.test", "untested", "missing-parent"),
+    gnode("l1", "host", "loop-a.test", "untested", "l2"),
+    gnode("l2", "host", "loop-b.test", "untested", "l1"),
+  ];
+  const all = C.targetTree(nodes);
+  assert.deepEqual(all.rows.map((r) => [r.depth, r.node.locator]), [
+    [0, "acme.test"], [1, "www.acme.test"], [1, "api.acme.test"], [2, "10.20.0.4"], [3, "10.20.0.4:443/tcp"], [4, "GET https://api.acme.test:443/v1/users/{id}"],
+    [0, "loop-a.test"], [0, "loop-b.test"], [0, "orphan.test"], [0, "10.20.0.0/24"],
+  ]);
+  assert.equal(all.shown, 10);
+  const folded = C.targetTree(nodes, {}, new Set(["h2", "d1"]));
+  assert.deepEqual(folded.rows.filter((r) => r.hasKids).map((r) => [r.node.id, r.open]), [["d1", false]]);
+  assert.equal(C.targetTree(nodes, {}, new Set(["h2"])).rows.find((r) => r.id === "h2").open, false);
+  assert.equal(C.targetTree(nodes, {}, new Set(["h2"])).rows.some((r) => r.id === "i1"), false);
+  const tested = C.targetTree(nodes, { status: "tested" }, new Set(["d1"]));
+  assert.deepEqual(tested.rows.map((r) => [r.node.id, r.context]), [["d1", true], ["h2", false], ["i1", true], ["s1", true], ["e1", false]], "the path to a match is kept and opened");
+  assert.equal(tested.shown, 2);
+  assert.deepEqual(C.targetTree(nodes, { kind: "ip" }).rows.filter((r) => !r.context).map((r) => r.id), ["i1", "n1"]);
+  assert.deepEqual(C.targetTree(nodes, { text: " WWW" }).rows.map((r) => r.id), ["d1", "h1"]);
+  assert.deepEqual(C.targetTree(nodes, { text: "nothing like this" }).rows, []);
+  assert.deepEqual(C.targetCounts(nodes), { finding: 1, tested: 2, deferred: 1, untested: 5, not_seen: 1 });
+  assert.equal(C.countsWords({ finding: 1, tested: 2, deferred: 0, untested: 5, not_seen: 1 }), "1 finding · 2 tested · 5 not tested yet · 1 in scope, not seen");
+  assert.equal(C.countsWords({}), "nothing seen yet");
+  assert.equal(C.nodeStatusWords("not_seen"), "in scope, not seen");
+  assert.equal(gnode("x", "weird", "x", "weird").kind, "host", "an unknown kind or status is drawn, not dropped");
+  assert.equal(gnode("x", "weird", "x", "weird").status, "untested");
+});
+
+test("a long tree draws a window of rows; a short one draws all", () => {
+  assert.deepEqual(C.treeWindow(1500, 9000, 600), { start: 0, end: 1500, before: 0, after: 0, virtual: false });
+  const w = C.treeWindow(5000, 4000, 800, 40, 10);
+  assert.deepEqual(w, { start: 90, end: 130, before: 3600, after: 194800, virtual: true });
+  assert.equal(C.treeWindow(5000, 10 ** 9, 800).end, 5000);
+});
+
+test("findings, missions and the scope editor of a target", () => {
+  const nodes = [
+    gnode("h1", "host", "www.acme.test", "finding", null, { findings: [{ claim: "c1", text: "XSS", status: "open", mission: "m-1", evidence: ["out:aa"] }, { claim: "c0", text: "Old", status: "withdrawn", mission: "m-2", evidence: [] }], missions: ["m-1", "m-2"] }),
+    gnode("h2", "host", "api.acme.test", "tested", null, { missions: ["m-2"] }),
+  ];
+  const f = C.targetFindings(nodes);
+  assert.deepEqual(f.map((x) => [x.claim, x.open, x.locator]), [["c1", true, "www.acme.test"], ["c0", false, "www.acme.test"]]);
+  const byId = new Map([["s-1", { id: "s-1", mission: "m-1", title: "Audit acme" }], ["s-1a", { id: "s-1a", mission: "m-1", parent: "s-1", title: "agent" }], ["s-2", { id: "s-2", mission: "m-2", title: "Fleet" }]]);
+  const m = C.targetMissions(nodes, byId, "acme");
+  assert.deepEqual(m.map((x) => [x.id, x.session, x.title, x.seen, x.tested, x.findings]), [["m-1", "s-1", "Audit acme", 1, 0, 1], ["m-2", "s-2", "Fleet", 2, 1, 0]]);
+  assert.equal(m[1].words, "saw 2 nodes · tested 1");
+  assert.equal(C.targetMissions(nodes, new Map(), "acme")[0].session, null);
+  assert.equal(C.scopeText(["a.test", "*.a.test"]), "a.test\n*.a.test");
+  assert.deepEqual(C.scopeFromText("a.test, *.a.test\n\n a.test \n10.0.0.0/8"), { entries: ["a.test", "*.a.test", "10.0.0.0/8"] });
+  assert.match(C.scopeFromText("a.test\nhttps://x.test").error, /not a CIDR/);
+  assert.match(C.scopeFromText("a.test\nx y").error, /not a scope entry/);
+  const cfg = C.targetOf({ name: "acme", scope: ["a.test"], upstream_insecure: ["u.test"], notes: "n", counts: { tested: 2 } });
+  assert.equal(cfg.words, "2 tested");
+  assert.deepEqual(C.targetPut(cfg, "a.test\n*.a.test", "x.a.test").body, { scope: ["a.test", "*.a.test"], exclude: ["x.a.test"], upstream_insecure: ["u.test"], intercept_passthrough: [], notes: "n" });
+  assert.match(C.targetPut(cfg, "", "").error, /at least one/);
+  assert.match(C.targetPut(cfg, "a.test", "bad entry").error, /scope entry/);
+});
+
+test("targets have routes, a form field and an event; the new-mission body names the target only when one is chosen", () => {
+  assert.deepEqual(C.parseRoute("#/targets"), { view: "targets" });
+  assert.deepEqual(C.parseRoute("#/t/acme"), { view: "target", name: "acme" });
+  assert.deepEqual(C.parseRoute(C.targetHash("a b")), { view: "target", name: "a b" });
+  assert.equal(C.targetHash(""), "#/targets");
+  assert.deepEqual(C.parseRoute("#/t/"), { view: "empty" });
+  assert.deepEqual(C.parseRoute("#/t/a/b"), { view: "empty" });
+  assert.equal(C.buildNewSession({ workspace: "/w", message: "go", target: "acme" }).body.target, "acme");
+  assert.equal("target" in C.buildNewSession({ workspace: "/w", message: "go", target: " " }).body, false);
+  const fx = C.planEvent({ type: "target", name: "acme" }, { openId: null, known: () => true, missionOf: () => null });
+  assert.deepEqual(fx, [{ fx: "target_changed", name: "acme" }]);
+});
+
+test("graph nodes take their parent from the edges when a node does not name one; a bash row owns the proxy's calls made during it", () => {
+  const g = { nodes: [{ id: "d", kind: "domain", locator: "a.test", status: "untested" }, { id: "h", kind: "host", locator: "w.a.test", status: "tested" }, { id: "i", kind: "ip", locator: "10.0.0.1", status: "untested" }, { id: "s", kind: "service", locator: "10.0.0.1:80/tcp", status: "untested", parent: "h" }],
+    edges: [{ kind: "parent", from: "h", to: "d" }, { kind: "resolves", from: "h", to: "i" }, { kind: "runs", from: "i", to: "s" }] };
+  assert.deepEqual(C.graphNodes(g).map((n) => [n.id, n.parent]), [["d", null], ["h", "d"], ["i", "h"], ["s", "h"]]);
+  assert.deepEqual(C.graphNodes([{ id: "x", kind: "host", locator: "x", status: "tested" }]).map((n) => n.parent), [null]);
+  assert.deepEqual(C.graphNodes(null), []);
+  const block = { name: "bash", ts: 100, result: { ts: 200 } };
+  const list = [{ id: "a", call_id: null, source: "proxy", ts: 150 }, { id: "b", call_id: null, source: "proxy", ts: 250 }, { id: "c", call_id: "z", source: "proxy", ts: 150 }];
+  assert.deepEqual(C.callWindowExchanges(block, list).map((x) => x.id), ["a"]);
+  assert.deepEqual(C.callWindowExchanges({ ...block, name: "read" }, list), []);
+});

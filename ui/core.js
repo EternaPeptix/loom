@@ -1020,6 +1020,9 @@ export function sendFailure(state, message, { rejected = false } = {}) {
 
 const SESSION_SECTIONS = new Set(["chat", "overview", "agents", "evidence"]);
 /** Hash of a session view: `#/s/<id>/<chat|overview|agents|evidence>`; "record" (the old name of chat) and unknown sections give chat. */
+export function targetHash(name) {
+  return name ? `#/t/${encodeURIComponent(name)}` : "#/targets";
+}
 export function sessionHash(session, section = "chat") {
   return `#/s/${encodeURIComponent(session)}/${SESSION_SECTIONS.has(section) ? section : "chat"}`;
 }
@@ -1028,6 +1031,10 @@ export function parseRoute(hash) {
   const parts = String(hash || "").replace(/^#/, "").split("/");
   if (parts[1] === "inbox" && parts.length === 2) return { view: "inbox" };
   if (parts[1] === "new" && parts.length === 2) return { view: "new" };
+  if (parts[1] === "targets" && parts.length === 2) return { view: "targets" };
+  if (parts[1] === "t" && parts[2] && parts.length === 3) {
+    try { return { view: "target", name: decodeURIComponent(parts[2]) }; } catch { return { view: "empty" }; }
+  }
   if (parts[1] !== "s" || !parts[2] || parts.length > 4) return { view: "empty" };
   try {
     const session = decodeURIComponent(parts[2]);
@@ -1272,6 +1279,7 @@ export function createRecordStore(session) {
     start: null, // facts from session_start / forked, for the Session tab
     models: [], // the model in effect over time: {seq, ts, profile, model, context_window}, ascending by seq
     turn: null, // {seq, ts} of the turn running now (latest turn_start with no turn_end/interrupt/end after it)
+    exchanges: [], // the captured exchanges recorded so far, in record order (CONTRACTS-TRAFFIC-TARGETS C1)
   };
 }
 
@@ -1574,7 +1582,7 @@ function step(store, rec) {
       push(store, { ...base(rec), kind: "line", sub: "request", detail: true, tone: "dim", text: `request ${rec.req_id}: step ${rec.step}, epoch ${rec.epoch}, about ${tokens(rec.est_tokens)} tokens${rec.purpose && rec.purpose !== "step" ? " (" + rec.purpose + ")" : ""}` });
       break;
     case "session_start":
-      store.start = { budget: rec.budget || {}, tools: (rec.tools || []).length, mcpTools: countMcpTools(rec.tools), termination: rec.termination, reasoning_replay: rec.reasoning_replay, model: rec.model ? modelEntry(rec, rec.model) : null };
+      store.start = { target: rec.target || null, budget: rec.budget || {}, tools: (rec.tools || []).length, mcpTools: countMcpTools(rec.tools), termination: rec.termination, reasoning_replay: rec.reasoning_replay, model: rec.model ? modelEntry(rec, rec.model) : null };
       if (rec.model) store.models.push(modelEntry(rec, rec.model));
       break;
     case "turn_start":
@@ -1583,6 +1591,18 @@ function step(store, rec) {
     case "forked":
       store.start = { ...(store.start || {}), budget: rec.budget || {}, termination: rec.termination, forked_from: rec.parent, upto_seq: rec.upto_seq };
       break;
+    case "exchange": {
+      const ex = exchangeOf(rec);
+      if (!ex || store.exchanges.some((x) => x.id === ex.id)) break;
+      store.exchanges.push(ex);
+      // A call's requests are shown on its row: the one named by call_id, which the daemon also sets for a command's proxied traffic.
+      const call = ex.call_id ? store.calls.get(ex.call_id) : null;
+      if (call) {
+        (call.exchanges ||= []).push(ex);
+        touch(store, call);
+      }
+      break;
+    }
     default:
       // pin, unpin, net and kinds this build does not know.
       break;
@@ -2190,6 +2210,7 @@ export function ledgerModel(view) {
       text: c.text,
       status: c.status,
       note: c.note || "",
+      assets: (c.assets || []).map(String),
       evidence: (c.evidence || []).map((id) => evById.get(id)).filter(Boolean).map((e) => ({
         id: e.id,
         supports: !!e.supports,
@@ -2421,6 +2442,9 @@ export function planEvent(ev, ctx) {
     case "net":
       if (ev.session === ctx.openId) out.push({ fx: "net", entry: ev.entry });
       break;
+    case "target":
+      if (ev.name) out.push({ fx: "target_changed", name: String(ev.name) });
+      break;
     case "settled":
       break;
     case "error":
@@ -2461,6 +2485,9 @@ export function buildNewSession(form) {
   const role = form.role || "lead";
   const body = { workspace, message, role, unattended: !!form.unattended };
   if (form.model) body.model = form.model;
+  // A target (CONTRACTS-TRAFFIC-TARGETS T2) is named by its name; none means a mission with its own security state.
+  const target = String(form.target || "").trim();
+  if (target) body.target = target;
   // Only a lead starts agents: the choice for every role goes with it, before its first agent.
   if (form.agentModel && role === "lead") body.role_models = { "*": form.agentModel };
   const title = String(form.title || "").trim();
@@ -3167,7 +3194,8 @@ export function toolRow(block) {
   const fullName = block.ran || block.name;
   // `name` stays the full name (keys, viewer titles); `shown` is what the row reads, `mcp` says whether it carries the MCP badge.
   const mcp = mcpToolName(fullName);
-  return { icon: toolIcon(block.ran ? { ...block, name: block.ran } : block), name: fullName, shown: toolShownName(fullName), mcp: !!mcp, calledAs, label, argsLine: block.argsLine || "", capsule, duration, state: block.state, outcome, words, partial: partialView(r) };
+  const exchanges = block.exchanges || [];
+  return { exchanges, requests: exchanges.length ? requestsWords(exchanges.length) : "", icon: toolIcon(block.ran ? { ...block, name: block.ran } : block), name: fullName, shown: toolShownName(fullName), mcp: !!mcp, calledAs, label, argsLine: block.argsLine || "", capsule, duration, state: block.state, outcome, words, partial: partialView(r) };
 }
 
 /** Footer of a reply, quiet: [profile ·] tok/s · seconds · cache N%. Pass `profile` only when the reply's model differs
@@ -4903,4 +4931,530 @@ export function mcpServersModel(list) {
       callsWords: calls ? count(calls, "call") : "",
     };
   });
+}
+
+// ---------------------------------------------------------------------------------------------
+// Captured exchanges (docs/CONTRACTS-TRAFFIC-TARGETS.md C and U1-U3)
+
+const blobRefOf = (r) => (r && typeof r === "object" && typeof r.id === "string" && r.id ? { id: r.id, bytes: Number(r.bytes) || 0, lines: Number(r.lines) || 0 } : null);
+
+/** An `exchange` record (or one row of GET /api/exchanges/{session}) as the UI holds it; null when it is not one. */
+export function exchangeOf(rec) {
+  if (!rec || typeof rec !== "object" || typeof rec.id !== "string" || !rec.id) return null;
+  const status = Number.isInteger(rec.status) ? rec.status : null;
+  return {
+    id: rec.id,
+    seq: Number.isInteger(rec.seq) ? rec.seq : null,
+    call_id: typeof rec.call_id === "string" && rec.call_id ? rec.call_id : null,
+    session: typeof rec.session === "string" && rec.session ? rec.session : null,
+    ts: Number(rec.ts_ms) || 0,
+    source: rec.source === "proxy" ? "proxy" : "tool",
+    tool: typeof rec.tool === "string" && rec.tool ? rec.tool : null,
+    scheme: rec.scheme === "https" ? "https" : "http",
+    tls: rec.tls === "intercepted" || rec.tls === "tool" ? rec.tls : "plain",
+    method: String(rec.method || "").toUpperCase(),
+    host: String(rec.host || ""),
+    port: Number(rec.port) || 0,
+    target: String(rec.target || "/"),
+    status,
+    error: typeof rec.error === "string" && rec.error ? rec.error : null,
+    request: blobRefOf(rec.request),
+    response: blobRefOf(rec.response),
+    request_bytes: Number(rec.request_bytes) || 0,
+    response_bytes: Number(rec.response_bytes) || 0,
+    truncated: !!rec.truncated,
+    upstream_unverified: !!rec.upstream_unverified,
+    duration_ms: Number(rec.duration_ms) || 0,
+  };
+}
+
+/** Add `ex` to `list` unless one with its id is there; the list stays oldest first (newest last). Returns whether it was added. */
+export function mergeExchange(list, ex) {
+  if (!ex || list.some((x) => x.id === ex.id)) return false;
+  let i = list.length;
+  while (i > 0 && list[i - 1].ts > ex.ts) i--;
+  list.splice(i, 0, ex);
+  return true;
+}
+
+/** "1 request", "3 requests". */
+export function requestsWords(n) {
+  return count(n, "request");
+}
+
+const bracketed = (host) => (host.includes(":") && !host.startsWith("[") ? `[${host}]` : host);
+
+/** What an exchange is called: `host/target`, with the port when it is not the scheme's own. */
+export function exchangeWhere(ex) {
+  const port = ex.port && ex.port !== (ex.scheme === "https" ? 443 : 80) ? ":" + ex.port : "";
+  const target = ex.target.startsWith("/") ? ex.target : "/" + ex.target;
+  return `${bracketed(ex.host)}${port}${target}`;
+}
+
+/** The status class used to filter and to colour: "ok" 2xx and 1xx, "redirect" 3xx, "client" 4xx, "server" 5xx, "none" without a response. */
+export function statusClass(ex) {
+  if (ex.status === null) return "none";
+  if (ex.status >= 500) return "server";
+  if (ex.status >= 400) return "client";
+  if (ex.status >= 300) return "redirect";
+  return "ok";
+}
+const STATUS_CLASS_WORDS = { ok: "2xx", redirect: "3xx", client: "4xx", server: "5xx", none: "no response" };
+const STATUS_CLASS_TONE = { ok: "ok", redirect: "ok", client: "warn", server: "bad", none: "bad" };
+
+/** One line of an exchange list: `METHOD host/target · status · size · time`, its colour and its small marks. */
+export function exchangeRow(ex) {
+  const cls = statusClass(ex);
+  const status = ex.status === null ? "no response" : String(ex.status);
+  const size = ex.status === null ? "" : ex.response_bytes ? byteSize(ex.response_bytes) : "empty";
+  const time = ex.duration_ms ? seconds(ex.duration_ms) : "";
+  const marks = [];
+  if (ex.tls === "intercepted") marks.push({ key: "intercepted", text: "intercepted", tip: "HTTPS that loom's proxy opened to record it (interception is on for this mission)." });
+  if (ex.upstream_unverified) marks.push({ key: "unverified", text: "server not verified", tip: "loom did not verify this server's certificate: the target lists it as upstream_insecure." });
+  if (ex.truncated) marks.push({ key: "cut", text: "cut", tip: "A body passed the capture limit and was stored only up to it; the sizes are the true ones." });
+  const head = `${ex.method} ${exchangeWhere(ex)}`;
+  return {
+    id: ex.id, head, method: ex.method, where: exchangeWhere(ex), status, tone: STATUS_CLASS_TONE[cls], cls, size, time, marks,
+    text: [head, status, size, time].filter(Boolean).join(" · "),
+    words: ex.error && ex.status === null ? ex.error : "",
+  };
+}
+
+/** The exchanges of one call, in order. */
+export function exchangesForCall(list, callId) {
+  return callId ? list.filter((x) => x.call_id === callId) : [];
+}
+
+/** The choices of the two filters of an exchange list: the hosts seen and the status classes present. */
+export function exchangeFilterOptions(list) {
+  const hosts = [...new Set(list.map((x) => x.host.toLowerCase()))].sort();
+  const present = new Set(list.map(statusClass));
+  const statuses = ["ok", "redirect", "client", "server", "none"].filter((k) => present.has(k)).map((k) => ({ key: k, label: STATUS_CLASS_WORDS[k] }));
+  return { hosts, statuses };
+}
+
+/** The exchanges that pass the filters (`host` and `status` are "" or "all" for no filter); order is kept. */
+export function filterExchanges(list, { host = "", status = "" } = {}) {
+  const h = host && host !== "all" ? host.toLowerCase() : "";
+  const st = status && status !== "all" ? status : "";
+  return list.filter((x) => (!h || x.host.toLowerCase() === h) && (!st || statusClass(x) === st));
+}
+
+/** The words above an exchange list: how many are shown of how many. */
+export function exchangeCountLine(shown, total) {
+  if (!total) return "No requests were captured for this session.";
+  return shown === total ? count(total, "request") : `${count(shown, "request")} of ${total}`;
+}
+
+// -- headers and messages (C5)
+
+export const HEADER_MASK = "•••••••• hidden";
+const SENSITIVE_HEADERS = new Set(["authorization", "cookie", "set-cookie", "proxy-authorization", "x-api-key"]);
+
+/** Whether a header's value is a secret that is hidden until revealed (CONTRACTS-TRAFFIC-TARGETS C5). */
+export function isSensitiveHeader(name) {
+  return SENSITIVE_HEADERS.has(String(name).trim().toLowerCase());
+}
+
+/** Split one whole HTTP/1.1 message (head and body) into its start line, header list and body text. */
+export function parseHttpMessage(text) {
+  const t = String(text ?? "");
+  const m = /\r?\n\r?\n/.exec(t);
+  const head = m ? t.slice(0, m.index) : t;
+  const body = m ? t.slice(m.index + m[0].length) : "";
+  const lines = head.split(/\r?\n/);
+  const start = lines.shift() || "";
+  const headers = [];
+  for (const line of lines) {
+    if (/^[ \t]/.test(line) && headers.length) { headers[headers.length - 1].value += " " + line.trim(); continue; }
+    const i = line.indexOf(":");
+    if (i > 0) headers.push({ name: line.slice(0, i).trim(), value: line.slice(i + 1).trim() });
+  }
+  return { start, headers, body };
+}
+
+/** The header table's rows: a secret's value is the mask until `revealed`. */
+export function maskHeaders(headers, revealed = false) {
+  return headers.map((h) => {
+    const sensitive = isSensitiveHeader(h.name);
+    return { name: h.name, value: h.value, sensitive, shown: sensitive && !revealed ? HEADER_MASK : h.value };
+  });
+}
+
+/** How much of a body the viewer draws; the rest is one Open as output away. */
+export const EXCHANGE_BODY_CAP = 64 * 1024;
+
+/** One side of the exchange viewer: the message split, its rows masked, its body cut for the screen. */
+export function messageView(text, { revealed = false } = {}) {
+  const m = parseHttpMessage(text);
+  const rows = maskHeaders(m.headers, revealed);
+  const cut = m.body.length > EXCHANGE_BODY_CAP;
+  return { start: m.start, rows, hasSecrets: rows.some((r) => r.sensitive), body: cut ? m.body.slice(0, EXCHANGE_BODY_CAP) : m.body, fullBody: m.body, cut, bodyWords: m.body ? byteSize(new TextEncoder().encode(m.body).length) : "no body" };
+}
+
+// -- hosts of a claim (a port of claim_hosts in crates/loom-core/src/target.rs)
+
+function normHost(h) {
+  let s = String(h).trim().replace(/\.+$/, "").replace(/[A-Z]/g, (c) => c.toLowerCase());
+  if (s.startsWith("[") && s.endsWith("]")) s = s.slice(1, -1);
+  return s;
+}
+
+function validName(n) {
+  return n !== "" && n.length <= 253 && n.split(".").every((l) => l !== "" && l.length <= 63 && /^[A-Za-z0-9_-]+$/.test(l) && !l.startsWith("-"));
+}
+
+/** An IP address as {v: 4 | 6, n: BigInt}, or null. */
+function parseIp(s) {
+  if (/^[0-9.]+$/.test(s) && s.includes(".")) {
+    const p = s.split(".");
+    if (p.length !== 4 || p.some((x) => !/^(0|[1-9][0-9]{0,2})$/.test(x) || Number(x) > 255)) return null;
+    return { v: 4, n: p.reduce((a, x) => (a << 8n) | BigInt(x), 0n) };
+  }
+  if (!s.includes(":") || !/^[0-9a-fA-F:.]+$/.test(s)) return null;
+  let str = s;
+  const dot = str.lastIndexOf(":") + 1;
+  if (str.slice(dot).includes(".")) {
+    const v4 = parseIp(str.slice(dot));
+    if (!v4 || v4.v !== 4) return null;
+    str = str.slice(0, dot) + (v4.n >> 16n).toString(16) + ":" + (v4.n & 0xffffn).toString(16);
+  }
+  const halves = str.split("::");
+  if (halves.length > 2) return null;
+  const groups = (x) => (x === "" ? [] : x.split(":"));
+  const head = groups(halves[0]);
+  const tail = halves.length === 2 ? groups(halves[1]) : [];
+  const fill = 8 - head.length - tail.length;
+  if (halves.length === 1 ? head.length !== 8 : fill < 1) return null;
+  const all = [...head, ...(halves.length === 2 ? Array(fill).fill("0") : []), ...tail];
+  if (all.length !== 8 || all.some((g) => !/^[0-9a-fA-F]{1,4}$/.test(g))) return null;
+  return { v: 6, n: all.reduce((a, g) => (a << 16n) | BigInt("0x" + g), 0n) };
+}
+
+const inCidr = (ip, net, bits) => ip.v === net.v && ip.n >> BigInt((ip.v === 4 ? 32 : 128) - bits) === net.n >> BigInt((ip.v === 4 ? 32 : 128) - bits);
+
+/** One scope entry parsed: {entry} or {error} with the sentence the daemon would give. */
+export function parseScopeEntry(raw) {
+  const e = String(raw ?? "").trim();
+  if (!e) return { error: "An empty scope entry: give a host name, `*.domain`, an IP address or a CIDR." };
+  const slash = e.indexOf("/");
+  if (slash >= 0) {
+    const addr = e.slice(0, slash);
+    const bits = e.slice(slash + 1);
+    const ip = parseIp(addr);
+    if (!ip) return { error: `\`${e}\` is not a CIDR: \`${addr}\` is not an IP address.` };
+    const max = ip.v === 4 ? 32 : 128;
+    if (!/^[0-9]+$/.test(bits) || Number(bits) > max) return { error: `\`${e}\` is not a CIDR: the prefix length must be 0 to ${max}.` };
+    return { entry: { kind: "cidr", ip, bits: Number(bits) } };
+  }
+  const lower = normHost(e);
+  const ip = parseIp(lower);
+  if (ip) return { entry: { kind: "ip", ip } };
+  if (lower.startsWith("*.")) {
+    const rest = lower.slice(2);
+    if (validName(rest)) return { entry: { kind: "glob", suffix: "." + rest } };
+    return { error: `\`${e}\` is not a scope entry: after \`*.\` give a domain name such as \`acme.test\`.` };
+  }
+  if (validName(lower)) return { entry: { kind: "host", name: lower } };
+  return { error: `\`${e}\` is not a scope entry: give a host name (\`acme.test\`), \`*.acme.test\`, an IP address or a CIDR (\`10.0.0.0/24\`), without a scheme, port or path.` };
+}
+
+function entryMatches(entry, host) {
+  const h = normHost(host);
+  switch (entry.kind) {
+    case "host": return h === entry.name;
+    case "glob": return h.length > entry.suffix.length && h.endsWith(entry.suffix);
+    case "ip": { const a = parseIp(h); return !!a && a.v === entry.ip.v && a.n === entry.ip.n; }
+    default: { const a = parseIp(h); return !!a && inCidr(a, entry.ip, entry.bits); }
+  }
+}
+
+/** A scope from its two lists; entries that do not parse are skipped (the daemon has already refused them) and named in `errors`. */
+export function parseScope(include, exclude = []) {
+  const errors = [];
+  const take = (list) => (list || []).flatMap((raw) => { const r = parseScopeEntry(raw); if (r.error) errors.push(r.error); return r.entry ? [r.entry] : []; });
+  const inc = take(include);
+  const exc = take(exclude);
+  return {
+    include: inc, exclude: exc, errors,
+    excluded: (host) => exc.some((e) => entryMatches(e, host)),
+    contains(host) { return inc.some((e) => entryMatches(e, host)) && !this.excluded(host); },
+  };
+}
+
+/** The hosts a claim names: its asset hosts, the host of every http(s) URL in its text, and (with a scope) every in-scope name or IP in it. */
+export function claimHosts(text, assetHosts = [], scope = null) {
+  const out = [];
+  const push = (h) => { if (h && !out.includes(h)) out.push(h); };
+  const t = String(text ?? "");
+  for (const h of assetHosts) push(normHost(h));
+  for (let at = t.indexOf("://"); at >= 0; at = t.indexOf("://", at + 3)) {
+    const scheme = /[A-Za-z]*$/.exec(t.slice(0, at))[0].toLowerCase();
+    if (scheme !== "http" && scheme !== "https") continue;
+    const rest = t.slice(at + 3);
+    const end = rest.search(/[/?#\s"'`)>,]/);
+    const authority = end < 0 ? rest : rest.slice(0, end);
+    const hostport = authority.includes("@") ? authority.slice(authority.lastIndexOf("@") + 1) : authority;
+    let host;
+    if (hostport.startsWith("[")) {
+      const close = hostport.indexOf("]");
+      host = close < 0 ? hostport.slice(1) : hostport.slice(1, close);
+    } else {
+      const colon = hostport.indexOf(":");
+      host = colon < 0 ? hostport : hostport.slice(0, colon);
+    }
+    push(normHost(host));
+  }
+  if (scope) {
+    for (const word of t.split(/[\s"'`()<>,;/]/)) {
+      let w = word.replace(/[.:]+$/, "");
+      const colon = w.indexOf(":");
+      if (colon >= 0) {
+        const h = w.slice(0, colon);
+        const p = w.slice(colon + 1);
+        if (!h.includes(":") && /^[0-9]*$/.test(p)) w = h;
+      }
+      w = normHost(w);
+      if (!w || !(parseIp(w) || (w.includes(".") && validName(w)))) continue;
+      if (scope.contains(w)) push(w);
+    }
+  }
+  return out;
+}
+
+/** The host an asset locator names: `host`, `host:port`, `host:port/proto` or a URL; "" for a file, an identity or an id. */
+export function assetHost(locator) {
+  const s = String(locator ?? "").trim().replace(/^[A-Z]+\s+(?=\S)/, "");
+  if (!s || /^(file|identity):/i.test(s)) return "";
+  const url = /^[A-Za-z][A-Za-z0-9+.-]*:\/\/([^/?#\s]+)/.exec(s);
+  const auth = (url ? url[1] : s.split(/[/\s]/)[0]).replace(/^.*@/, "");
+  if (!auth) return "";
+  let host = auth;
+  if (auth.startsWith("[")) host = auth.slice(1, auth.indexOf("]") < 0 ? undefined : auth.indexOf("]"));
+  else if ((auth.match(/:/g) || []).length === 1) host = auth.slice(0, auth.indexOf(":"));
+  host = normHost(host);
+  return parseIp(host) || (host.includes(".") && validName(host)) ? host : "";
+}
+
+/**
+ * What each host a claim names was reached by. A host is reached when some evidence of the claim that is attested and supports it
+ * cites a call during which an exchange with that host (any port) got a response, or quotes the stored message of such an exchange
+ * (F1). Returns [{host, reached, ids}] in the order claimHosts gives them; ids are the `ex-` ids that did it.
+ */
+export function claimReach(claim, exchanges, scope = null) {
+  const hosts = claimHosts(claim.text, (claim.assets || []).map(assetHost).filter(Boolean), scope);
+  const proof = (claim.evidence || []).filter((e) => e.attested && e.supports);
+  return hosts.map((host) => {
+    const ids = [];
+    for (const x of exchanges) {
+      if (x.status === null || normHost(x.host) !== host) continue;
+      const viaCall = proof.some((e) => e.call_id && e.call_id === x.call_id && (!e.session || !x.session || e.session === x.session));
+      const viaBlob = proof.some((e) => e.blob && ((x.request && x.request.id === e.blob) || (x.response && x.response.id === e.blob)));
+      if ((viaCall || viaBlob) && !ids.includes(x.id)) ids.push(x.id);
+    }
+    return { host, reached: ids.length > 0, ids };
+  });
+}
+
+/** The words of a claim's reach line for screen readers and tooltips. */
+export function reachWords(r) {
+  return r.reached ? `${r.host}: reached by ${r.ids.join(", ")}` : `${r.host}: not reached by any of its evidence`;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Targets (docs/CONTRACTS-TRAFFIC-TARGETS.md T and U4)
+
+export const NODE_STATUSES = ["finding", "tested", "deferred", "untested", "not_seen"];
+const STATUS_WORDS = { finding: "finding", tested: "tested", deferred: "deferred", untested: "not tested yet", not_seen: "in scope, not seen" };
+const STATUS_RANK = { finding: 0, untested: 1, deferred: 2, tested: 3, not_seen: 4 };
+export const NODE_KINDS = ["domain", "host", "ip", "service", "endpoint"];
+const KIND_ORDER = { domain: 0, host: 1, ip: 2, service: 3, endpoint: 4 };
+
+/** The words of a node status. */
+export function nodeStatusWords(status) {
+  return STATUS_WORDS[status] || String(status || "unknown");
+}
+
+/** A node as the page holds it, from a node of GET /api/targets/{name}/graph. */
+export function nodeOf(n) {
+  return {
+    id: String(n.id), kind: NODE_KINDS.includes(n.kind) ? n.kind : "host", locator: String(n.locator ?? n.id),
+    status: STATUS_WORDS[n.status] ? n.status : "untested", parent: n.parent || null,
+    missions: Array.isArray(n.missions) ? n.missions.map(String) : [], evidence: Array.isArray(n.evidence) ? n.evidence.map(String) : [],
+    findings: (Array.isArray(n.findings) ? n.findings : []).map((f) => ({ claim: String(f.claim ?? ""), text: String(f.text ?? ""), status: String(f.status ?? "open"), mission: String(f.mission ?? ""), evidence: Array.isArray(f.evidence) ? f.evidence.map(String) : [] })),
+  };
+}
+
+/** How many nodes have each status. */
+export function targetCounts(nodes) {
+  const c = { finding: 0, tested: 0, deferred: 0, untested: 0, not_seen: 0 };
+  for (const n of nodes) if (n.status in c) c[n.status]++;
+  return c;
+}
+
+/** The counts as one sentence: "2 findings · 3 tested · 1 deferred · 4 not tested yet · 1 in scope, not seen" (zeros left out). */
+export function countsWords(counts) {
+  const parts = [];
+  if (counts.finding) parts.push(count(counts.finding, "finding"));
+  if (counts.tested) parts.push(`${counts.tested} tested`);
+  if (counts.deferred) parts.push(`${counts.deferred} deferred`);
+  if (counts.untested) parts.push(`${counts.untested} not tested yet`);
+  if (counts.not_seen) parts.push(`${counts.not_seen} in scope, not seen`);
+  return parts.length ? parts.join(" · ") : "nothing seen yet";
+}
+
+/** Whether a node passes the filters {status, kind, text}: "" or "all" means any; text is a case-insensitive part of the locator. */
+export function nodeMatches(n, { status = "", kind = "", text = "" } = {}) {
+  if (status && status !== "all" && n.status !== status) return false;
+  if (kind && kind !== "all" && n.kind !== kind) return false;
+  const q = String(text).trim().toLowerCase();
+  return !q || n.locator.toLowerCase().includes(q);
+}
+
+const natural = new Intl.Collator("en", { numeric: true, sensitivity: "base" });
+
+/**
+ * The rows of the tree, domain → host → ip → service → endpoint, by each node's `parent`. A node that passes the filters is
+ * shown with the path above it (those rows are `context`: they do not pass themselves); siblings go by kind, then finding
+ * first, then name. `collapsed` holds the ids the operator folded; a filter opens every path it needs. A parent that is not
+ * among the nodes (or a loop) makes the node a root.
+ */
+export function targetTree(nodes, filters = {}, collapsed = new Set()) {
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const kids = new Map();
+  const roots = [];
+  const parentOf = (n) => {
+    if (!n.parent || n.parent === n.id || !byId.has(n.parent)) return null;
+    let p = byId.get(n.parent);
+    for (let hops = 0; p; hops++) {
+      if (p.id === n.id || hops > nodes.length) return null;
+      p = p.parent ? byId.get(p.parent) : null;
+    }
+    return n.parent;
+  };
+  for (const n of nodes) {
+    const p = parentOf(n);
+    if (p) (kids.get(p) || kids.set(p, []).get(p)).push(n); else roots.push(n);
+  }
+  const order = (a, b) => KIND_ORDER[a.kind] - KIND_ORDER[b.kind] || STATUS_RANK[a.status] - STATUS_RANK[b.status] || natural.compare(a.locator, b.locator);
+  const filtering = ["status", "kind", "text"].some((k) => filters[k] && filters[k] !== "all" && String(filters[k]).trim());
+  const rows = [];
+  let shown = 0;
+  const walk = (n, depth) => {
+    const own = nodeMatches(n, filters);
+    const sub = (kids.get(n.id) || []).slice().sort(order);
+    const at = rows.length;
+    const row = { id: n.id, node: n, depth, context: false, hasKids: sub.length > 0, open: false, kids: sub.length };
+    rows.push(row);
+    let any = own;
+    for (const k of sub) if (walk(k, depth + 1)) any = true;
+    if (!any) { rows.length = at; return false; }
+    row.context = !own;
+    row.open = (filtering || !collapsed.has(n.id)) && sub.length > 0;
+    if (!row.open) rows.length = at + 1;
+    if (own) shown++;
+    return true;
+  };
+  for (const r of roots.sort(order)) walk(r, 0);
+  return { rows, shown, total: nodes.length, filtering };
+}
+
+/** Rows of a long tree to draw (past `VIRTUAL_ROWS`): the slice for a scroll position, with the space above and below it. */
+export const VIRTUAL_ROWS = 2000;
+export function treeWindow(total, scrollTop, viewHeight, rowHeight = 40, overscan = 20) {
+  if (total <= VIRTUAL_ROWS) return { start: 0, end: total, before: 0, after: 0, virtual: false };
+  const first = Math.max(0, Math.floor(scrollTop / rowHeight) - overscan);
+  const last = Math.min(total, Math.ceil((scrollTop + viewHeight) / rowHeight) + overscan);
+  return { start: first, end: last, before: first * rowHeight, after: (total - last) * rowHeight, virtual: true };
+}
+
+const FINDING_CLOSED = new Set(["withdrawn", "refuted"]);
+
+/** Every finding on the nodes, open ones first, each with the node it sits on; `open` is false once withdrawn or refuted. */
+export function targetFindings(nodes) {
+  const out = [];
+  for (const n of nodes) for (const f of n.findings) out.push({ ...f, node: n.id, locator: n.locator, open: !FINDING_CLOSED.has(f.status) });
+  return out.sort((a, b) => Number(b.open) - Number(a.open) || natural.compare(a.locator, b.locator) || natural.compare(a.claim, b.claim));
+}
+
+/**
+ * The missions that touched a target: every mission named on a node, with what it did there, and the session that leads it
+ * (to link to). `byId` is the session store's map.
+ */
+export function targetMissions(nodes, byId = new Map(), targetName = "") {
+  const m = new Map();
+  const get = (id) => m.get(id) || m.set(id, { id, seen: 0, tested: 0, findings: 0 }).get(id);
+  for (const n of nodes) {
+    for (const id of n.missions) {
+      const x = get(id);
+      x.seen++;
+      if (n.status === "tested") x.tested++;
+    }
+    for (const f of n.findings) if (f.mission && !FINDING_CLOSED.has(f.status)) get(f.mission).findings++;
+  }
+  if (targetName) for (const info of byId.values()) if (!info.parent && info.target === targetName) get(info.mission || info.id);
+  const out = [];
+  for (const x of m.values()) {
+    let lead = null;
+    for (const info of byId.values()) if (!info.parent && (info.mission === x.id || info.id === x.id)) { lead = info; break; }
+    out.push({ ...x, session: lead ? lead.id : null, title: lead ? lead.title || lead.id : x.id, words: [`saw ${count(x.seen, "node")}`, x.tested ? `tested ${x.tested}` : "", x.findings ? count(x.findings, "open finding") : ""].filter(Boolean).join(" · ") });
+  }
+  return out.sort((a, b) => natural.compare(a.title, b.title));
+}
+
+/** The scope as the operator edits it: one entry per line. */
+export function scopeText(list) {
+  return (list || []).join("\n");
+}
+
+/** The entries of an edited scope box (lines or commas); the first one that does not parse comes back as `error`. */
+export function scopeFromText(text) {
+  const entries = [];
+  for (const raw of String(text ?? "").split(/[\n,]/)) {
+    const e = raw.trim();
+    if (!e) continue;
+    const r = parseScopeEntry(e);
+    if (r.error) return { error: r.error };
+    if (!entries.includes(e)) entries.push(e);
+  }
+  return { entries };
+}
+
+/** The body of PUT /api/targets/{name} for an edited scope: the whole configuration, the other lists as loaded. */
+export function targetPut(cfg, scope, exclude) {
+  const s = scopeFromText(scope);
+  if (s.error) return { error: s.error };
+  const x = scopeFromText(exclude);
+  if (x.error) return { error: x.error };
+  if (!s.entries.length) return { error: "A target needs at least one scope entry." };
+  return { body: { scope: s.entries, exclude: x.entries, upstream_insecure: cfg.upstream_insecure || [], intercept_passthrough: cfg.intercept_passthrough || [], notes: cfg.notes || "" } };
+}
+
+/** A target of GET /api/targets as the list shows it. */
+export function targetOf(t) {
+  const counts = { finding: 0, tested: 0, deferred: 0, untested: 0, not_seen: 0, ...(t.counts || {}) };
+  return {
+    name: String(t.name), scope: Array.isArray(t.scope) ? t.scope.map(String) : [], exclude: Array.isArray(t.exclude) ? t.exclude.map(String) : [],
+    upstream_insecure: Array.isArray(t.upstream_insecure) ? t.upstream_insecure.map(String) : [], intercept_passthrough: Array.isArray(t.intercept_passthrough) ? t.intercept_passthrough.map(String) : [],
+    notes: String(t.notes || ""), counts, words: countsWords(counts),
+  };
+}
+
+/** The nodes of GET /api/targets/{name}/graph: `{nodes, edges}` or a bare list; a node without a `parent` takes it from the edges (T3). */
+export function graphNodes(g) {
+  const list = Array.isArray(g) ? g : Array.isArray(g?.nodes) ? g.nodes : [];
+  const edges = Array.isArray(g?.edges) ? g.edges : [];
+  const parents = new Map();
+  for (const e of edges) {
+    if (!e || !e.from || !e.to) continue;
+    if (e.kind === "parent") parents.set(String(e.from), String(e.to));
+    else if (["resolves", "runs", "serves"].includes(e.kind) && !parents.has(String(e.to))) parents.set(String(e.to), String(e.from));
+  }
+  return list.map((n) => nodeOf({ ...n, parent: n.parent || parents.get(String(n.id)) || null }));
+}
+
+/** The exchanges of a `bash` row that has none by call id: the proxy's own, with no call, recorded between its call and its result. */
+export function callWindowExchanges(block, list) {
+  if (!block || (block.ran || block.name) !== "bash" || !block.result || !Number.isFinite(block.ts) || !Number.isFinite(block.result.ts)) return [];
+  return list.filter((x) => !x.call_id && x.source === "proxy" && x.ts >= block.ts && x.ts <= block.result.ts);
 }

@@ -197,6 +197,46 @@ for (const [id, , parent, , phase, last_end, outcome, , nsteps, , age, quiet] of
     append(id, "model_request", { ts_ms: lastTs, req_id: "fx-run-" + id, step: nsteps, epoch: 1, purpose: "step", est_tokens: 80000 }, "harness");
   }
 }
+
+// ---- Captured exchanges (CONTRACTS-TRAFFIC-TARGETS C1) ---------------------------------------------------------------
+// s-fl-web (a ctf solver) sends two requests with http_send (one redirect followed), runs two curls the proxy captured
+// (plain HTTP, and intercepted HTTPS) and makes one request its upstream refused. Messages are whole HTTP/1.1 texts in blobs.
+const EXBLOBS = new Map();
+const EXCHANGES = new Map(); // session -> exchange records, oldest first
+const EX_IDS = ["a2b3c4d5e6f7", "b3c4d5e6f7a2", "c4d5e6f7a2b3", "d5e6f7a2b3c4", "e6f7a2b3c4d5"];
+let exN = 0;
+const exBlob = (text) => { const id = (EXBLOBS.size + 1).toString(16).padStart(4, "0").repeat(16); EXBLOBS.set(id, text); return { id, bytes: Buffer.byteLength(text), lines: text.split("\n").length }; };
+function exchange(session, ts_ms, f) {
+  const n = exN++;
+  const reqText = `${f.method} ${f.target} HTTP/1.1\nHost: ${f.host}\nUser-Agent: loom/0.9\nAuthorization: Bearer fx-secret-token-9b2e\nCookie: session=fx-cookie-77c1; theme=dark\nAccept: application/json\n\n`;
+  const resText = f.status == null ? null : `HTTP/1.1 ${f.status} ${f.reason || "OK"}\nContent-Type: application/json\nSet-Cookie: session=fx-set-cookie-31d0; HttpOnly\nX-Request-Id: fx-req-${n}\n${f.location ? "Location: " + f.location + "\n" : ""}\n${f.body ?? ""}`;
+  const rec = { id: "ex-" + EX_IDS[n % EX_IDS.length], call_id: f.call_id ?? null, source: f.source || "tool", tool: f.tool ?? null, scheme: f.scheme || "https", tls: f.tls || "tool", method: f.method, host: f.host, port: f.port ?? 443, target: f.target, status: f.status ?? null, error: f.error ?? null, request: exBlob(reqText), response: resText === null ? null : exBlob(resText), request_bytes: reqText.length, response_bytes: resText ? resText.length : 0, truncated: !!f.truncated, upstream_unverified: !!f.unverified, duration_ms: f.ms ?? 120 };
+  append(session, "exchange", { ts_ms, ...rec }, "harness");
+  (EXCHANGES.get(session) || EXCHANGES.set(session, []).get(session)).push({ ts_ms, session, ...rec });
+}
+{
+  const id = "s-fl-web"; let t = now - 200 * MIN;
+  const call = (call_id, name, args, ms, text, run) => {
+    append(id, "tool_call", { ts_ms: t, call_id, req_id: "fx-ex-" + call_id, name, args, class: "exec" }, "model");
+    run(t);
+    append(id, "tool_result", { ts_ms: t + ms, call_id, name, status: "ok", text, cut: false, class: "exec", meta: {}, duration_ms: ms }, "tool");
+    t += ms + 4000;
+  };
+  call("fx-hs1", "http_send", { method: "GET", url: "https://api.acme.test/v1/users?id=1" }, 900, "HTTP 200 after one redirect (2 requests)", (at) => {
+    exchange(id, at + 100, { call_id: "fx-hs1", tool: "http_send", method: "GET", host: "api.acme.test", target: "/v1/users?id=1", status: 302, reason: "Found", location: "/v2/users?id=1", ms: 80 });
+    exchange(id, at + 400, { call_id: "fx-hs1", tool: "http_send", method: "GET", host: "api.acme.test", target: "/v2/users?id=1", status: 200, body: '{"id":1,"name":"Ada","email":"ada@acme.test","role":"admin"}', ms: 210 });
+  });
+  call("fx-b1", "bash", { command: "curl -s http://10.20.0.4:8080/health" }, 700, "ok", (at) =>
+    exchange(id, at + 200, { source: "proxy", scheme: "http", tls: "plain", method: "GET", host: "10.20.0.4", port: 8080, target: "/health", status: 200, body: '{"status":"ok"}', ms: 35 }));
+  call("fx-b2", "bash", { command: "curl -s https://login.acme.test/auth -d user=admin" }, 1300, '{"error":"bad credentials"}', (at) =>
+    exchange(id, at + 300, { source: "proxy", scheme: "https", tls: "intercepted", method: "POST", host: "login.acme.test", target: "/auth", status: 401, reason: "Unauthorized", body: '{"error":"bad credentials"}', unverified: true, truncated: true, ms: 310 }));
+  call("fx-hs2", "http_send", { method: "GET", url: "https://admin.acme.test/" }, 600, "error: connection refused", (at) =>
+    exchange(id, at + 100, { call_id: "fx-hs2", tool: "http_send", method: "GET", host: "admin.acme.test", target: "/", status: null, error: "connection refused (os error 61)", ms: 12 }));
+}
+// The fleet lead works on the `acme` target (TargetRef in its session_start, the field in the session list).
+sessionOf("s-fl-lead").target = "acme";
+for (const r of logs.get("s-fl-lead")) if (r.kind === "session_start") r.target = { name: "acme", scope: ["*.acme.test", "10.20.0.0/24"], exclude: ["pay.acme.test"], upstream_insecure: [], intercept_passthrough: [], summary: "" };
+
 // Parent logs were appended to out of time order: sort each by timestamp and renumber.
 for (const [id] of fleet) { const log = logs.get(id); log.sort((a, b) => a.ts_ms - b.ts_ms || a.seq - b.seq); log.forEach((r, i) => { r.seq = i; }); }
 
@@ -406,6 +446,35 @@ const ledger = { entries: 9, goal: "Find actionable reliability defects and pres
 
 // m-fleet keeps a ledger too: a six-step plan (two done, one doing) for the progress line, and an open claim.
 const fleetLedger = { entries: 14, goal: "Find where a release of the build pipeline could ship unverified.", constraints: [{ id: "k1", text: "Read-only: change nothing in the pipeline." }], plan: [{ id: "p1", text: "Inventory the dependencies", status: "done", note: "" }, { id: "p2", text: "Trace the release signing path", status: "done", note: "Signing key is out of the workspace." }, { id: "p3", text: "Audit the web build hooks", status: "doing", note: "" }, { id: "p4", text: "Check the registry mirrors", status: "todo", note: "" }, { id: "p5", text: "Re-check the release binary claims", status: "todo", note: "" }, { id: "p6", text: "Write up the findings", status: "todo", note: "" }], claims: [{ id: "c1", text: "build/sign.sh skips verification when verify=false.", status: "open", evidence: [], note: "Reproduction pending." }], evidence: [], obligations: [], decisions: [], dead_ends: [], questions: [{ id: "q2", text: "Is the signing key in the vault?", status: "open" }] };
+
+// Two claims that name hosts, with evidence that cites the calls above: c2 reached api.acme.test, c3 names admin.acme.test whose one request was refused.
+fleetLedger.evidence.push(
+  { id: "e10", supports: true, kind: "execution", attested: true, quote: '"role":"admin"', session: "s-fl-web", call_id: "fx-hs1", note: "Any caller can read another user." },
+  { id: "e11", supports: true, kind: "execution", attested: true, quote: "error: connection refused", session: "s-fl-web", call_id: "fx-hs2" },
+);
+fleetLedger.claims.push(
+  { id: "c2", text: "https://api.acme.test/v2/users returns another user's record, including its role, to any caller.", status: "supported", evidence: ["e10"], note: "" },
+  { id: "c3", text: "admin.acme.test answers without a login, and so does login.acme.test.", status: "open", evidence: ["e11"], note: "The one request to admin.acme.test was refused." },
+);
+
+// One target, `acme` (T1, T6, T7).
+const TARGETS = new Map([["acme", { name: "acme", scope: ["*.acme.test", "10.20.0.0/24"], exclude: ["pay.acme.test"], upstream_insecure: ["login.acme.test"], intercept_passthrough: [], notes: "Staging copy of the Acme shop. No load tests." }]]);
+const tnode = (id, kind, locator, status, parent, missions = [], evidence = [], findings = []) => ({ id, kind, locator, status, parent, missions, evidence, findings });
+const TARGET_NODES = [
+  tnode("n-dom", "domain", "acme.test", "tested", null, ["m-fleet", "m-audit"]),
+  tnode("n-www", "host", "www.acme.test", "tested", "n-dom", ["m-fleet"]),
+  tnode("n-api", "host", "api.acme.test", "finding", "n-dom", ["m-fleet"]),
+  tnode("n-login", "host", "login.acme.test", "tested", "n-dom", ["m-fleet"]),
+  tnode("n-admin", "host", "admin.acme.test", "deferred", "n-dom", ["m-audit"]),
+  tnode("n-docs", "host", "docs.acme.test", "not_seen", "n-dom"),
+  tnode("n-ip", "ip", "10.20.0.4", "untested", "n-api", ["m-fleet"]),
+  tnode("n-svc", "service", "10.20.0.4:8080/tcp", "tested", "n-ip", ["m-fleet"]),
+  tnode("n-ep1", "endpoint", "GET https://api.acme.test:443/v2/users/{id}", "finding", "n-api", ["m-fleet"], [blob], [{ claim: "c2", text: "Any caller can read another user's record.", status: "open", mission: "m-fleet", evidence: ["e10"] }]),
+  tnode("n-ep2", "endpoint", "POST https://login.acme.test:443/auth", "tested", "n-login", ["m-fleet"]),
+  tnode("n-ep3", "endpoint", "GET http://10.20.0.4:8080/health", "untested", "n-svc", ["m-fleet"]),
+];
+const targetCounts = () => { const c = { finding: 0, tested: 0, deferred: 0, untested: 0, not_seen: 0 }; for (const n of TARGET_NODES) c[n.status]++; return c; };
+
 const ledgers = new Map([["m-audit", ledger], ["m-fleet", fleetLedger]]);
 
 // GET /api/missions/{id}/score: the daemon's ScoreView, { mission, sessions: [{ session, role, parent, card }], total }.
@@ -787,6 +856,30 @@ const server = createServer(async (req, res) => {
     const url = new URL(req.url, "http://localhost");
     const path = url.pathname;
     if (path === "/__fixture/state") return json(res, { requests, inbox, scoreCalls });
+    const exchangesMatch = path.match(/^\/api\/exchanges\/([^/]+)$/);
+    if (exchangesMatch && req.method === "GET") {
+      const host = url.searchParams.get("host"); const after = Number(url.searchParams.get("after") ?? -1); const limit = Number(url.searchParams.get("limit") || 500);
+      return json(res, (EXCHANGES.get(decodeURIComponent(exchangesMatch[1])) || []).filter(x => (!host || x.host === host)).slice(0, limit));
+    }
+    if (path === "/api/targets" && req.method === "GET") return json(res, [...TARGETS.values()].map(t => ({ ...t, counts: targetCounts() })));
+    if (path === "/api/targets" && req.method === "POST") { const b = await body(req); TARGETS.set(b.name, { upstream_insecure: [], intercept_passthrough: [], notes: "", exclude: [], ...b }); return json(res, TARGETS.get(b.name), 201); }
+    const targetMatch = path.match(/^\/api\/targets\/([^/]+)(?:\/(graph|exchanges))?$/);
+    if (targetMatch) {
+      const name = decodeURIComponent(targetMatch[1]);
+      if (!TARGETS.has(name)) return json(res, { error: "No such target." }, 404);
+      if (targetMatch[2] === "graph") {
+        const status = url.searchParams.get("status"); const kind = url.searchParams.get("kind");
+        const nodes = TARGET_NODES.filter(n => (!status || n.status === status) && (!kind || n.kind === kind));
+        return json(res, { nodes, edges: TARGET_NODES.filter(n => n.parent).map(n => ({ kind: "parent", from: n.id, to: n.parent })) });
+      }
+      if (targetMatch[2] === "exchanges") {
+        const n = TARGET_NODES.find(x => x.id === url.searchParams.get("node"));
+        const host = n ? n.locator.replace(/^[A-Z]+ https?:\/\//, "").replace(/[:/].*$/, "") : "";
+        return json(res, [...EXCHANGES.values()].flat().filter(x => x.host === host));
+      }
+      if (req.method === "PUT") { const b = await body(req); TARGETS.set(name, { ...TARGETS.get(name), ...b, name }); return json(res, TARGETS.get(name)); }
+      return json(res, { ...TARGETS.get(name), counts: targetCounts() });
+    }
     const imageMatch = path.match(/^\/api\/images\/([0-9a-f]+)$/);
     if (imageMatch && req.method === "GET") {
       const bytes = IMAGES.get(imageMatch[1]);
@@ -975,7 +1068,8 @@ const server = createServer(async (req, res) => {
     const rawMatch = path.match(/^\/api\/blobs\/([^/]+)\/raw$/);
     if (rawMatch) {
       // The whole stored output, as the daemon's blob_raw sends it (an attachment of bytes with a length).
-      const bytes = Buffer.from(decodeURIComponent(rawMatch[1]) === bigBlob ? "x".repeat(3 * 1024 * 1024 - 1) + "\n" : lines.join("\n") + "\n");
+      const exText = EXBLOBS.get(decodeURIComponent(rawMatch[1]));
+      const bytes = Buffer.from(exText !== undefined ? exText : decodeURIComponent(rawMatch[1]) === bigBlob ? "x".repeat(3 * 1024 * 1024 - 1) + "\n" : lines.join("\n") + "\n");
       res.writeHead(200, { "content-type": "application/octet-stream", "content-length": bytes.length, "content-disposition": 'attachment; filename="out-fixture"' });
       return res.end(bytes);
     }
