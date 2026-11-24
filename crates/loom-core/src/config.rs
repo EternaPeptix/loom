@@ -240,13 +240,56 @@ impl McpCfg {
     /// M1's rules the types cannot express: a server name matches `[a-z0-9_-]{1,32}`, exactly one of
     /// `command` and `url`, a non-empty `command`, an `http`/`https` `url`, `timeout_s` > 0.
     pub fn check(&self) -> Result<(), String> {
-        todo!("CONTRACTS-MCP M1")
+        for (name, s) in &self.servers {
+            let ok_name = !name.is_empty()
+                && name.len() <= 32
+                && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-');
+            if !ok_name {
+                return Err(format!("mcp.servers.{name}: a server name must match [a-z0-9_-]{{1,32}}"));
+            }
+            match (&s.command, &s.url) {
+                (Some(_), Some(_)) => {
+                    return Err(format!("mcp.servers.{name}: set command or url, not both"));
+                }
+                (None, None) => {
+                    return Err(format!("mcp.servers.{name}: set command (stdio) or url (Streamable HTTP)"));
+                }
+                (Some(c), None) => {
+                    if c.first().is_none_or(|p| p.trim().is_empty()) {
+                        return Err(format!("mcp.servers.{name}: command must name a program"));
+                    }
+                }
+                (None, Some(u)) => {
+                    let rest = u.strip_prefix("https://").or_else(|| u.strip_prefix("http://"));
+                    if rest.is_none_or(|r| r.is_empty() || r.starts_with('/')) {
+                        return Err(format!("mcp.servers.{name}: url must be an http:// or https:// address"));
+                    }
+                }
+            }
+            if s.timeout_s == 0 {
+                return Err(format!("mcp.servers.{name}: timeout_s must be at least 1"));
+            }
+        }
+        Ok(())
     }
 
     /// Startup warnings: a literal (not `env:`/`file:`) value in `env` or `headers` names a secret
     /// written in the config.
     pub fn warnings(&self) -> Vec<String> {
-        todo!("CONTRACTS-MCP M1")
+        let literal = |v: &String| !(v.starts_with("env:") || v.starts_with("file:"));
+        let mut out = Vec::new();
+        for (name, s) in &self.servers {
+            for (kind, map) in [("env", &s.env), ("headers", &s.headers)] {
+                for (key, value) in map {
+                    if literal(value) {
+                        out.push(format!(
+                            "mcp.servers.{name}.{kind}.{key}: a literal value is written in the config; use \"env:NAME\" or \"file:/path\" so a secret stays out of it"
+                        ));
+                    }
+                }
+            }
+        }
+        out
     }
 }
 
@@ -891,6 +934,7 @@ impl Config {
             )));
         }
         self.boxed.check().map_err(ConfigError::Invalid)?;
+        self.mcp.check().map_err(ConfigError::Invalid)?;
         if self.boxed.enabled && self.sandbox.mode == SandboxMode::None {
             return Err(ConfigError::Invalid(
                 "box.enabled cannot be combined with sandbox.mode = \"none\": without a sandbox the agent's own commands could connect to the Docker socket and the ssh forward that the box uses, and would then control the Docker host. Use the seatbelt or bubblewrap sandbox, or leave the box off.".into(),
@@ -1429,6 +1473,30 @@ allow = ["*.example.test"]
         c.models.insert("a".into(), ModelProfile::default());
         c.default_model = "b".into();
         assert!(c.check().is_err());
+    }
+
+    #[test]
+    fn mcp_check_and_warnings() {
+        let ok = |t: &str| Config::parse(t).unwrap().check();
+        assert!(ok("[mcp.servers.a-b_1]\ncommand = [\"x\"]").is_ok());
+        assert!(ok("[mcp.servers.h]\nurl = \"https://e.com/mcp\"").is_ok());
+        assert!(ok("[mcp.servers.A]\ncommand = [\"x\"]").is_err());
+        assert!(ok(&format!("[mcp.servers.{}]\ncommand = [\"x\"]", "a".repeat(33))).is_err());
+        assert!(ok("[mcp.servers.a]").is_err());
+        assert!(ok("[mcp.servers.a]\ncommand = [\"x\"]\nurl = \"http://h\"").is_err());
+        assert!(ok("[mcp.servers.a]\ncommand = []").is_err());
+        assert!(ok("[mcp.servers.a]\nurl = \"ftp://h\"").is_err());
+        assert!(ok("[mcp.servers.a]\ncommand = [\"x\"]\ntimeout_s = 0").is_err());
+        assert!(Config::parse("[mcp.servers.a]\ncommand = [\"x\"]\nbogus = 1").is_err());
+        let c = Config::parse(
+            "[mcp.servers.a]\ncommand = [\"x\"]\nenv = { A = \"env:A\", B = \"lit\", C = \"file:/f\" }\n[mcp.servers.b]\nurl = \"http://h\"\nheaders = { Authorization = \"tok\" }",
+        )
+        .unwrap();
+        let w = c.mcp.warnings();
+        assert_eq!(w.len(), 2);
+        assert!(w[0].contains("mcp.servers.a.env.B") && !w[0].contains("lit\""));
+        assert!(w[1].contains("mcp.servers.b.headers.Authorization") && !w[1].contains("tok\""));
+        assert!(Config::default().mcp.warnings().is_empty());
     }
 
     fn write_key(dir: &Path, name: &str, content: &[u8], mode: u32) {

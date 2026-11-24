@@ -135,7 +135,7 @@ impl Tool for WebFetch {
 
 /// A client that never follows redirects itself, keeps no idle connection, uses the session's proxy if
 /// there is one, and reads nothing from the process environment.
-fn build_client(ctx: &ToolCtx) -> Result<Client, String> {
+pub(crate) fn build_client(ctx: &ToolCtx) -> Result<Client, String> {
     build_client_with_proxy(session_proxy(ctx).map(str::to_string))
 }
 
