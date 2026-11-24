@@ -1017,6 +1017,7 @@ pub(crate) mod testkit {
                 prior: Vec::new(),
                 role_models: Default::default(),
                 target: None,
+                creds: None,
             },
             active: false,
             status: status(Phase::Idle),

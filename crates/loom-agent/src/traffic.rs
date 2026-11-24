@@ -59,6 +59,9 @@ pub struct Traffic {
     note_due: AtomicBool,
     pending: Mutex<Vec<Exchange>>,
     windows: Mutex<VecDeque<Window>>,
+    /// The session secret set (CONTRACTS-TRAFFIC-TARGETS S5): `ingest` stores the request and response of a
+    /// captured exchange with these values replaced. Set by the runtime with the grant; unset = none.
+    pub secrets: std::sync::OnceLock<Arc<loom_core::creds::Secrets>>,
 }
 
 const WINDOWS_KEPT: usize = 8;
@@ -74,6 +77,7 @@ impl Traffic {
             note_due: AtomicBool::new(false),
             pending: Mutex::new(Vec::new()),
             windows: Mutex::new(VecDeque::new()),
+            secrets: std::sync::OnceLock::new(),
         }
     }
 

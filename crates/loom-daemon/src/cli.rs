@@ -901,6 +901,8 @@ fn new_session(opts: &StartOpts, message: Option<String>, cwd: &Path, prior: Vec
         attachments: Vec::new(),
         target: opts.target.clone().filter(|t| !t.trim().is_empty()),
         intercept: opts.no_intercept.then_some(false),
+        // S3: `loom run --creds {profile}` is the daemon implementer's.
+        creds: None,
     }
 }
 

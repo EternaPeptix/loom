@@ -751,6 +751,10 @@ pub struct NewSession {
     /// The name of a target (`~/.loom/targets/{name}`) the mission works on (CONTRACTS-TRAFFIC-TARGETS T2).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
+    /// The credential profile of `target` attached to the mission's in-scope requests
+    /// (CONTRACTS-TRAFFIC-TARGETS S3). Refused without `target`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub creds: Option<String>,
     /// Decrypt the mission's HTTPS (CONTRACTS-TRAFFIC-TARGETS I1): `Some(false)` turns it off for a pack that
     /// asks for it, `Some(true)` turns it on for one that does not. Absent = the pack decides. Fixed for the
     /// mission; `[network] intercept = "always"|"never"` overrides it.
@@ -811,6 +815,10 @@ pub struct SessionMeta {
     /// an agent inherits it, and a session restored after a restart uses this record, not the target's file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<loom_core::event::TargetRef>,
+    /// The credential profile the mission attaches (CONTRACTS-TRAFFIC-TARGETS S3, S11): name and summary only;
+    /// an agent inherits it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creds: Option<loom_core::event::CredsRef>,
 }
 
 /// The key of [`SessionMeta::role_models`] that stands for every role the lead starts (`may_spawn`),
@@ -3434,9 +3442,16 @@ impl Inner {
             let capture = loom_net::CaptureGrant {
                 max_bytes: net.capture_max_bytes,
                 intercept: meta.intercept,
-                passthrough: net.intercept_passthrough.clone(),
-                // The target's `upstream_insecure` joins here when targets are wired (part T).
-                upstream_insecure: Vec::new(),
+                // The target's own lists join the daemon's (T2): its passthrough hosts and the hosts whose
+                // upstream certificate is not checked.
+                passthrough: net
+                    .intercept_passthrough
+                    .iter()
+                    .chain(meta.target.iter().flat_map(|t| t.intercept_passthrough.iter()))
+                    .cloned()
+                    .collect(),
+                upstream_insecure: meta.target.as_ref().map(|t| t.upstream_insecure.clone()).unwrap_or_default(),
+                intercept_scope: None,
             };
             self.proxy.grant_with_capture(id, policy, capture, self.capture_tx.clone(), ca.clone())
         } else {
@@ -3583,6 +3598,7 @@ impl Inner {
             schema: loom_core::event::SCHEMA,
             intercept: meta.intercept,
             target: meta.target.clone(),
+            creds: meta.creds.clone(),
             title: meta.title.clone(),
             project_instructions: env.project_instructions,
             mcp: Vec::new(),
@@ -4139,6 +4155,7 @@ impl Inner {
                 gate: req.harness.then(|| req.brief.clone()),
                 prior: Vec::new(),
                 target: p.meta.target.clone(),
+                creds: p.meta.creds.clone(),
             };
             let explicit = prole.termination == Termination::Explicit;
             st.known.insert(child_id.clone(), Known::new(meta.clone(), idle_status()));
@@ -5331,6 +5348,8 @@ impl Runtime {
                 prior: prior_ids,
                 role_models,
                 target,
+                // S3/S11: the runtime implementer resolves `new.creds` against the target here.
+                creds: None,
             };
             inner.st().known.insert(id.clone(), Known::new(meta.clone(), idle_status()));
             (made, workspace, created, id, meta)

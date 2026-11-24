@@ -967,6 +967,7 @@ dependencies = [
  "libc",
  "rand",
  "regex",
+ "ring",
  "serde",
  "serde_json",
  "sha2",

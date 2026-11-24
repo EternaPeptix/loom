@@ -378,6 +378,21 @@ pub struct TargetRef {
     pub summary: String,
 }
 
+/// The credential profile a mission attaches, as recorded at its start (CONTRACTS-TRAFFIC-TARGETS S3). Never a
+/// value: the profile name and the redaction-safe summary line (S10).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CredsRef {
+    pub profile: String,
+    pub summary: String,
+    /// Items left out because their host was outside the target scope at the start (S6).
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub dropped: usize,
+}
+
+fn is_zero_usize(n: &usize) -> bool {
+    *n == 0
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpListing {
     /// The server's name in `[mcp.servers]`.
@@ -461,6 +476,9 @@ pub struct SessionStart {
     /// The named target the mission works on, as it was at the start (T2, T5); a child takes its lead's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<TargetRef>,
+    /// The credential profile attached to the mission's in-scope requests (S3); a child takes its lead's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creds: Option<CredsRef>,
     /// Log format version; absent in logs written before the field existed (version 1). A log with
     /// a higher number is read-only for this build.
     #[serde(default = "schema_v1")]
@@ -1176,6 +1194,7 @@ mod tests {
                     schema: SCHEMA,
                     intercept: false,
                     target: None,
+                    creds: None,
                     title: "t".into(),
                     project_instructions: Vec::new(),
                     mcp: Vec::new(),

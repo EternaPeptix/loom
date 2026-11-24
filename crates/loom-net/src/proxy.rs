@@ -289,12 +289,21 @@ pub struct SessionGrant {
     pub port: u16,
     pub user: String,
     pub password: String,
+    /// The in-process tools' credential for the same session (CONTRACTS-TRAFFIC-TARGETS S9): never
+    /// intercepted, captured or injected, and never in [`SessionGrant::env`]. Empty on a reference grant.
+    pub tool_user: String,
+    pub tool_password: String,
 }
 
 impl SessionGrant {
     /// `http://{user}:{password}@127.0.0.1:{port}`
     pub fn url(&self) -> String {
         format!("http://{}:{}@127.0.0.1:{}", self.user, self.password, self.port)
+    }
+
+    /// `http://{tool_user}:{tool_password}@127.0.0.1:{port}`, for in-process clients only (S9).
+    pub fn tool_url(&self) -> String {
+        format!("http://{}:{}@127.0.0.1:{}", self.tool_user, self.tool_password, self.port)
     }
 
     /// Proxy variables for a command's environment (see module contract).
@@ -663,7 +672,15 @@ impl Proxy {
             capture,
         };
         lock(&self.inner.shared.sessions).insert(session.as_str().to_string(), entry);
-        Ok(SessionGrant { port, user: session.as_str().to_string(), password })
+        // S9: the tool credential (an entry of its own, sharing the session's policy, permits and lookups) is
+        // the implementer's; until then it is empty.
+        Ok(SessionGrant {
+            port,
+            user: session.as_str().to_string(),
+            password,
+            tool_user: String::new(),
+            tool_password: String::new(),
+        })
     }
 
     /// Mint a credential for in-process reference GET clients. It is not added to command env.
@@ -689,7 +706,28 @@ impl Proxy {
         let mut sessions = lock(&self.inner.shared.sessions);
         sessions.retain(|_, entry| !(entry.reference && &entry.session == session));
         sessions.insert(user.clone(), entry);
-        Ok(ReferenceGrant { grant: SessionGrant { port: self.inner.port, user, password }, raw_policy })
+        Ok(ReferenceGrant {
+            grant: SessionGrant {
+                port: self.inner.port,
+                user,
+                password,
+                tool_user: String::new(),
+                tool_password: String::new(),
+            },
+            raw_policy,
+        })
+    }
+
+    /// Attach (or with `None` stop attaching) a credential profile's items to the session's forwarded requests
+    /// (CONTRACTS-TRAFFIC-TARGETS S3): plain and intercepted requests made with the session's command
+    /// credential whose destination host equals an item's host get [`crate::inject::apply`] /
+    /// [`crate::inject::apply_head`] after the connection is allowed and before the head is sent upstream,
+    /// decided again for every request (a kept-alive intercepted connection, each request after a redirect).
+    /// Never on the reference credential or the tool credential (S8, S9). The runtime calls it right after
+    /// the grant, before the session is handed its environment. False when the session holds no grant.
+    pub fn set_inject(&self, session: &SessionId, inject: Option<Arc<crate::inject::Inject>>) -> bool {
+        let _ = (session, inject);
+        todo!("S3")
     }
 
     /// Replace the policy of a session that holds a grant. Its credentials stay as they are. False

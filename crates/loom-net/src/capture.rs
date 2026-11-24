@@ -59,4 +59,8 @@ pub struct CaptureGrant {
     pub passthrough: Vec<String>,
     /// Hosts whose upstream certificate is not checked when intercepting.
     pub upstream_insecure: Vec<String>,
+    /// When set, only a CONNECT whose host this scope contains (and does not exclude) is intercepted; every
+    /// other one is an opaque tunnel and is not captured (the credential recording session, S2). `None` for
+    /// a mission: `intercept` and `passthrough` alone decide.
+    pub intercept_scope: Option<loom_core::target::Scope>,
 }

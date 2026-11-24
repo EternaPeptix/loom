@@ -21,6 +21,14 @@ pub struct SessionTools {
     pub oracle_contract: crate::oracle::ContractCache,
     /// Finds a recorded exchange of this session by its `ex-` id, from the session log (set by the runtime).
     pub exchange_lookup: OnceLock<Arc<crate::traffic::ExchangeLookup>>,
+    /// The credential profile items the session attaches to its in-scope requests (CONTRACTS-TRAFFIC-TARGETS
+    /// S8), set by the runtime before the first call; unset = none.
+    pub creds: OnceLock<Arc<loom_net::Inject>>,
+    /// The session secret set (S5), set by the runtime with `creds`; unset = nothing to redact.
+    pub secrets: OnceLock<Arc<loom_core::creds::Secrets>>,
+    /// The proxy URL with the session's tool credential (S9), set by the runtime; unset = the command proxy
+    /// from `ToolCtx::env` (tests and callers without a runtime).
+    pub tool_proxy: OnceLock<String>,
 }
 
 impl Default for SessionTools {
@@ -39,6 +47,9 @@ impl SessionTools {
             binary_cache: Mutex::new(BTreeMap::new()),
             oracle_contract: crate::oracle::ContractCache::default(),
             exchange_lookup: OnceLock::new(),
+            creds: OnceLock::new(),
+            secrets: OnceLock::new(),
+            tool_proxy: OnceLock::new(),
         }
     }
 }
