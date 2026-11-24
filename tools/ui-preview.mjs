@@ -823,7 +823,7 @@ const server = createServer(async (req, res) => {
     }
     if (req.method === "POST" && path === "/api/web-sessions") {
       const data = await body(req); requests.push({ path, body: data });
-      if (data.code !== LOGIN_CODE) return json(res, { error: "That login code is not valid. Run `loom login` for a new one." }, 401);
+      if (data.code !== LOGIN_CODE) return json(res, { error: "Missing or wrong access token. Run `loom open`, or send the token in ~/.loom/token as a Bearer token." }, 401);
       return json(res, { secret: "fixture-secret" });
     }
     if (req.method === "POST" && path === "/api/uploads") {
@@ -947,7 +947,7 @@ const server = createServer(async (req, res) => {
       const last = Math.min(lines.length, first + 4999, Number(url.searchParams.get("end") || first + 999));
       return json(res, { text: lines.slice(first - 1, last).join("\n") + "\n", first, last, total: lines.length });
     }
-    const assets = { "/": ["index.html", "text/html"], "/app.js": ["app.js", "text/javascript"], "/core.js": ["core.js", "text/javascript"], "/style.css": ["style.css", "text/css"] };
+    const assets = { "/": ["index.html", "text/html"], "/app.js": ["app.js", "text/javascript"], "/core.js": ["core.js", "text/javascript"], "/style.css": ["style.css", "text/css"], "/favicon.svg": ["favicon.svg", "image/svg+xml"] };
     if (!assets[path]) return json(res, { error: "No such fixture route." }, 404);
     const [file, type] = assets[path];
     res.writeHead(200, { "content-type": type + "; charset=utf-8", "cache-control": "no-store", "content-security-policy": "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'" });

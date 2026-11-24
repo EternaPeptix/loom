@@ -3186,18 +3186,21 @@ export function runWords(info, opts = {}) {
   const step = st.step > 0 ? ` · step ${st.step}` : "";
   const shape = (STANDING[mark] || STANDING.idle);
   let text;
+  let short = null; // the words for a narrow place (the phone bar): no step number, the state alone
   let running = false;
   switch (mark) {
-    case "needs_you": text = "Waiting for you"; break;
+    case "needs_you": text = "Waiting for you"; short = "Needs you"; break;
     case "running": {
       running = true;
       const ms = Number.isFinite(opts.startMs) && Number.isFinite(opts.now) ? Math.max(0, opts.now - opts.startMs) : null;
       const whole = ms === null ? 0 : Math.floor(ms / 1000);
-      text = `Running${step}${ms === null ? "" : " · " + (whole < 10 ? whole + "s" : seconds(whole * 1000))}`;
+      const clock = ms === null ? "" : " · " + (whole < 10 ? whole + "s" : seconds(whole * 1000));
+      text = `Running${step}${clock}`;
+      short = `Running${clock}`;
       break;
     }
-    case "waiting": text = `Waiting for jobs or agents${step}`; break;
-    case "stopped": text = st.phase === "ended" ? "Ended · stopped" : `Stopped${step}`; break;
+    case "waiting": text = `Waiting for jobs or agents${step}`; short = "Waiting on jobs"; break;
+    case "stopped": text = st.phase === "ended" ? "Ended · stopped" : `Stopped${step}`; short = st.phase === "ended" ? "Ended" : "Stopped"; break;
     case "finished":
     case "failed":
     case "result_ready": {
@@ -3207,10 +3210,11 @@ export function runWords(info, opts = {}) {
         : mark === "failed" ? `Failed${step}` : `Idle${step}${mark === "result_ready" ? " · result ready" : ""}`;
       break;
     }
-    case "question": text = `Idle${step} · question open`; break;
-    default: text = `Idle${step}`;
+    case "question": text = `Idle${step} · question open`; short = "Question open"; break;
+    default: text = `Idle${step}`; short = "Idle";
   }
-  return { text, mark, icon: shape.icon, tone: shape.tone, running };
+  if (short === null) short = st.phase === "ended" ? text.replace(/ · result ready$/, "") : mark === "result_ready" ? "Result ready" : text.replace(step, "");
+  return { text, short, mark, icon: shape.icon, tone: shape.tone, running };
 }
 
 /**

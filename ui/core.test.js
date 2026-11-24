@@ -1222,13 +1222,17 @@ test("events are handed on one by one: bad JSON is skipped and a handler that th
 
 // ---- app.js where it runs without a real page: a tab that is not signed in ----
 
+/** The text of a fake element: its own textContent, else its children's, in order. */
+const textOf = (k) => (k.textContent !== undefined ? String(k.textContent) : (k.kids || []).map(textOf).join(" "));
+
 /** Load a fresh copy of app.js at `hash` against a daemon that refuses every login code. */
 async function loadSignedOutPage(t, hash) {
   const page = { shown: [], hashchange: [], reloads: 0, requests: [], replaced: [] };
   const fake = {
     document: {
-      createElement: (tag) => ({ tag }),
-      body: { replaceChildren: (...kids) => (page.shown = kids.map((k) => k.textContent)) },
+      createElement: (tag) => ({ tag, kids: [], append(...k) { this.kids.push(...k); }, setAttribute(n, v) { this[n] = v; } }),
+      createTextNode: (text) => ({ textContent: text }),
+      body: { replaceChildren: (...kids) => (page.shown = kids.map(textOf)) },
     },
     window: { addEventListener: (type, fn) => type === "hashchange" && page.hashchange.push(fn) },
     location: { hash, pathname: "/", search: "", reload: () => page.reloads++ },
@@ -1253,7 +1257,9 @@ async function loadSignedOutPage(t, hash) {
 test("app.js: with no code and no stored secret the page says to run loom open, and a login address arriving in that tab loads it again", async (t) => {
   const page = await loadSignedOutPage(t, "");
   assert.deepEqual(page.requests, []);
-  assert.deepEqual(page.shown, [C.LOST_TOKEN]);
+  assert.equal(page.shown.length, 1);
+  assert.match(page.shown[0], /not signed in/);
+  assert.match(page.shown[0], /loom open/);
   // Pasting an address into the tab changes only the fragment; the page is not loaded by the browser.
   const arrive = (hash) => {
     globalThis.location.hash = hash;
@@ -1273,7 +1279,9 @@ test("app.js: a code the daemon refuses is sent once without credentials, leaves
     { url: "/api/web-sessions", method: "POST", credentials: "omit", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code }) },
   ]);
   assert.deepEqual(page.replaced, ["/"]);
-  assert.deepEqual(page.shown, [C.LOST_TOKEN]);
+  assert.equal(page.shown.length, 1);
+  assert.match(page.shown[0], /not signed in/);
+  assert.match(page.shown[0], /loom open/);
 });
 
 // ---- safety: nothing in the shipped DOM code can turn record content into markup ----
@@ -3863,4 +3871,17 @@ test("CTX_PARTS: a compaction segment replaces the re-weave brief and the stubs,
   const oldLabels = old.rows.map((r) => r.label);
   assert.ok(oldLabels.includes("Re-weave brief") && oldLabels.some((l) => l.startsWith("Folded-out stubs")));
   assert.match(old.fold.text, /folds at/);
+});
+
+test("runWords has a short form for the phone bar: the state alone, no step", () => {
+  const w = C.runWords({ status: { phase: "idle", step: 9, last_end: "waiting" } });
+  assert.equal(w.text, "Waiting for jobs or agents · step 9");
+  assert.equal(w.short, "Waiting on jobs");
+  const r = C.runWords({ status: { phase: "running", step: 142 } }, { now: 70000, startMs: 0 });
+  assert.equal(r.short, "Running · 1m10s");
+  assert.ok(!r.short.includes("step"));
+  const e = C.runWords({ status: { phase: "ended", step: 48, outcome: "done", last_end: "finished" } });
+  assert.ok(!e.short.includes("step") && e.short.startsWith("Ended"), e.short);
+  const i = C.runWords({ status: { phase: "idle", step: 3 } });
+  assert.equal(i.short, "Idle");
 });

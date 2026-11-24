@@ -334,17 +334,24 @@ impl Default for ToolsCfg {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SandboxMode {
     /// macOS `sandbox-exec` profile.
-    #[default]
     Seatbelt,
     /// Linux bubblewrap with isolated namespaces and no command network access.
     Bubblewrap,
     /// No OS sandbox: commands are unconfined. The daemon logs a warning at start when this is set, and the
     /// system prompt of every session says so.
     None,
+}
+
+/// The OS's own sandbox: Bubblewrap on Linux, Seatbelt elsewhere (macOS). A config without `[sandbox]` (as
+/// `loom config init` writes it) then starts on either system.
+impl Default for SandboxMode {
+    fn default() -> Self {
+        if cfg!(target_os = "linux") { SandboxMode::Bubblewrap } else { SandboxMode::Seatbelt }
+    }
 }
 
 impl SandboxMode {
@@ -1218,6 +1225,13 @@ impl Paths {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_default_sandbox_is_the_one_for_this_os() {
+        let want = if cfg!(target_os = "linux") { SandboxMode::Bubblewrap } else { SandboxMode::Seatbelt };
+        assert_eq!(SandboxMode::default(), want);
+        assert_eq!(SandboxCfg::default().mode, want);
+    }
 
     #[test]
     fn bubblewrap_and_reference_hosts_are_additive_config_options() {

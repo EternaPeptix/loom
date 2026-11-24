@@ -154,6 +154,11 @@ retry_window_s = 300         # keep retrying an unreachable server this long; 0 
 # smaller model window automatically, so a small context_window needs no change here.
 compact_at_tokens = 0
 
+[sandbox]
+# The OS sandbox every command runs in. Left out, it is the one for this system: "bubblewrap" on Linux
+# (needs the bwrap binary), "seatbelt" on macOS. "none" runs commands unconfined and is said at start.
+# mode = "bubblewrap"
+
 [network]
 # deny_all (the default): tools reach no host through the egress proxy.
 # To let them reach chosen hosts, use:  mode = "allowlist"  with  allow = ["*.example.com"]

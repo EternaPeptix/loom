@@ -11,7 +11,7 @@
 //!    `403` `{"error": "Requests from other origins are refused."}`.
 //! 3. Token: `auth::bearer_token(Authorization)` must match `state.token` (`auth::token_matches`)
 //!    or be a live web-session secret (`state.logins`); there are no cookies. Exceptions: `GET /`,
-//!    `GET /healthz`, the three static assets and `POST /api/web-sessions`. Otherwise `401`
+//!    `GET /healthz`, the static assets (page, scripts, style, icon) and `POST /api/web-sessions`. Otherwise `401`
 //!    `{"error": "Missing or wrong access token. Run `loom open`, or send the token in ~/.loom/token as a Bearer token."}`.
 //!
 //! Every response carries `Cache-Control: no-store` (except `GET /api/images/{blob}`, which sets its own) and `X-Content-Type-Options: nosniff`.
@@ -210,6 +210,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/app.js", get(|| async { asset("text/javascript; charset=utf-8", ui::APP_JS) }))
         .route("/core.js", get(|| async { asset("text/javascript; charset=utf-8", ui::CORE_JS) }))
         .route("/style.css", get(|| async { asset("text/css; charset=utf-8", ui::STYLE_CSS) }))
+        .route("/favicon.svg", get(|| async { asset("image/svg+xml", ui::FAVICON_SVG) }))
         .route("/healthz", get(healthz))
         .route("/api/login-codes", post(login_code))
         .route("/api/web-sessions", post(web_session))
@@ -449,7 +450,7 @@ async fn admit(state: &ApiState, req: Request, next: Next) -> Response {
     }
     // The page and its scripts hold no secret; a login code is its own credential.
     let path = req.uri().path();
-    let exempt = (method == Method::GET && matches!(path, "/" | "/healthz" | "/app.js" | "/core.js" | "/style.css"))
+    let exempt = (method == Method::GET && matches!(path, "/" | "/healthz" | "/app.js" | "/core.js" | "/style.css" | "/favicon.svg"))
         || (method == Method::POST && path == "/api/web-sessions");
     if !exempt && !bearer_ok(state, headers) {
         return refusal(StatusCode::UNAUTHORIZED, UNAUTHORIZED);
@@ -1666,7 +1667,7 @@ mod tests {
         let e = env(Script::new(|_, _| finish("x"))).await;
         let anon = |p: &str| e.http.get(e.url(p));
 
-        for path in ["/", "/app.js", "/core.js", "/style.css"] {
+        for path in ["/", "/app.js", "/core.js", "/style.css", "/favicon.svg"] {
             let r = anon(path).send().await.unwrap();
             assert_eq!(r.status(), 200, "{path}");
             assert!(r.headers().get("set-cookie").is_none(), "{path}");
@@ -1852,6 +1853,7 @@ mod tests {
             ("/app.js", "text/javascript; charset=utf-8", ui::APP_JS),
             ("/core.js", "text/javascript; charset=utf-8", ui::CORE_JS),
             ("/style.css", "text/css; charset=utf-8", ui::STYLE_CSS),
+            ("/favicon.svg", "image/svg+xml", ui::FAVICON_SVG),
         ] {
             let r = e.rq(Method::GET, path).send().await.unwrap();
             assert_eq!(r.status(), 200, "{path}");

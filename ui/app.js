@@ -294,7 +294,14 @@ function lost() {
   streamStopped = true;
   if (streamCtl) streamCtl.abort();
   keepSecret(null);
-  document.body.replaceChildren(el("p", "pad", C.LOST_TOKEN));
+  // A page of its own, not a bare line: what happened, and the one command that opens a signed-in page.
+  const card = add(el("main", "lost-card"),
+    el("h1", "", "This tab is not signed in"),
+    el("p", "", "Its sign-in lasts as long as the tab, and it has ended (or the daemon was restarted with a new token). Nothing in your missions changed."),
+    add(el("p", ""), document.createTextNode("Run "), el("code", "", "loom open"), document.createTextNode(" in a terminal: it opens a signed-in page.")));
+  card.setAttribute("aria-label", C.LOST_TOKEN);
+  document.body.replaceChildren(add(el("div", "lost-page"), card));
+  document.title = "loom · not signed in";
 }
 
 async function api(method, path, body) {
@@ -1131,10 +1138,13 @@ function renderRun(info) {
   // A running session with no new record for a while says so, as a fact and in neutral words; nothing while the age is unknown or the stream is down.
   const quiet = live && run.running ? C.quietFor(info, S.activity.get(info.id), Date.now(), S.connectedSince) : null;
   const text = live ? run.text + (quiet ? " · " + quiet.text : "") : "Last known · " + run.text;
+  // The phone bar is narrow: it says the state alone ("Waiting on jobs"), the whole line is its tooltip.
+  const shortText = live ? run.short : "Last known · " + run.short;
   for (const node of [$("s-run"), $("bar-run")]) {
-    node.title = quiet ? quiet.tip : "";
-    node.className = (node.id === "s-run" ? "id-chip id-run" : "id-chip id-run bar-chip") + (run.tone ? " tone-" + run.tone : "");
-    chipContent(node, icon(run.icon), document.createTextNode(text));
+    const bar = node.id === "bar-run";
+    node.title = quiet ? quiet.tip : bar ? text : "";
+    node.className = (bar ? "id-chip id-run bar-chip" : "id-chip id-run") + (run.tone ? " tone-" + run.tone : "");
+    chipContent(node, icon(run.icon), document.createTextNode(bar ? shortText : text));
     node.hidden = node.id === "bar-run" && S.view !== "session";
   }
   if (run.running && live && !S.runTimer) S.runTimer = setInterval(() => {
@@ -4376,9 +4386,11 @@ function showLedger(p, ...nodes) {
   const form = rulesForm();
   form.hint.textContent = C.rulesHint(S.ledger.error);
   renderRuleLists(form, S.ledger.model);
-  if (p.firstChild !== form.box) p.replaceChildren(form.box);
-  while (form.box.nextSibling) form.box.nextSibling.remove();
-  p.append(...nodes);
+  // The ledger itself (goal, plan, claims) comes first; the rules and approvals form follows it. The form node is kept
+  // across renders (so a half-typed rule keeps its text and focus) and the ledger is re-drawn before it.
+  if (p.lastChild !== form.box) p.replaceChildren(form.box);
+  while (form.box.previousSibling) form.box.previousSibling.remove();
+  form.box.before(...nodes);
 }
 
 function renderLedger(p) {
