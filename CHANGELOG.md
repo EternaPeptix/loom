@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Captured exchanges and HTTPS interception (loom-net)
+
+- `Proxy::grant_with_capture` captures a session's forwarded `http://` requests (head as the destination saw it,
+  bodies up to `max_bytes`, true sizes) and sends them to a sink. With `intercept` and a loom CA (`tls::Ca`,
+  ECDSA P-256, key mode 0600, per-host 24 h leaves, `ca_bundle`), an allowed `CONNECT` is TLS-terminated, relayed
+  to a verified (or `upstream_insecure`) upstream and captured request by request; a non-HTTP stream is recorded as
+  `TLS`. A session granted with `grant` is relayed exactly as before.
+
 ### MCP client
 
 - `loom-tools` has an MCP client (CONTRACTS-MCP M2, M3, M5): stdio servers run as sandboxed children and
