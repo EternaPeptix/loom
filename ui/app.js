@@ -4830,6 +4830,13 @@ function requestsSection() {
   return box;
 }
 
+function budgetWords(b) {
+  const parts = [];
+  if (b.max_steps) parts.push(`${b.max_steps} steps`);
+  if (b.max_minutes) parts.push(`${b.max_minutes} minutes`);
+  return parts.length ? parts.join(", ") : "none set";
+}
+
 function renderSessionTab(p, info) {
   const kv = el("dl", "kv");
   const row = (k, v) => {
@@ -7325,7 +7332,7 @@ function renderTargetPage() {
       for (const f of findings) {
         const li = el("li", "tfinding" + (f.open ? "" : " closed"));
         const lead = [...S.sessions.byId.values()].find((s) => !s.parent && s.mission === f.mission);
-        add(li, chip(f.open ? "open" : f.status, f.open ? "bad" : "dim"), el("span", "mono dim", f.claim), el("strong", "", f.text), el("span", "dim", " on " + f.locator),
+        add(li, chip(f.open ? "open" : f.status, f.open ? "bad" : "dim"), el("span", "mono dim", f.claim), el("strong", "", f.text), el("span", "dim", "on " + f.locator),
           lead ? link("claim in its mission", C.sessionHash(lead.id, "evidence")) : null);
         ul.append(li);
       }
