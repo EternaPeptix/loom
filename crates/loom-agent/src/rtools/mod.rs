@@ -351,6 +351,8 @@ pub struct Shared {
     pub agents: AgentsCfg,
     pub orch: Arc<dyn Orchestrator>,
     slots: Mutex<Slots>,
+    /// The MCP servers this session owns (CONTRACTS-MCP M6), set once before its registry is built.
+    mcp: std::sync::OnceLock<Arc<crate::mcp::McpSession>>,
 }
 
 impl Shared {
@@ -365,7 +367,28 @@ impl Shared {
         agents: AgentsCfg,
         orch: Arc<dyn Orchestrator>,
     ) -> Shared {
-        Shared { session, mission, parent, role, journal, log_path, agents, orch, slots: Mutex::new(Slots::default()) }
+        Shared {
+            session,
+            mission,
+            parent,
+            role,
+            journal,
+            log_path,
+            agents,
+            orch,
+            slots: Mutex::new(Slots::default()),
+            mcp: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Give the session its MCP servers. Only the first call has an effect.
+    pub fn set_mcp(&self, mcp: crate::mcp::McpSession) {
+        let _ = self.mcp.set(Arc::new(mcp));
+    }
+
+    /// The session's MCP servers; `None` when it has none.
+    pub fn mcp(&self) -> Option<&Arc<crate::mcp::McpSession>> {
+        self.mcp.get()
     }
 
     pub fn is_child(&self) -> bool {
@@ -607,6 +630,12 @@ pub fn build_registry(shared: &Arc<Shared>) -> Result<Registry, String> {
                     shared.role.name, shared.role.pack
                 ))
             }
+        }
+    }
+    // After the role's own tools, in server and listing order (CONTRACTS-MCP M6).
+    if let Some(mcp) = shared.mcp() {
+        for t in mcp.tools() {
+            registry.add(Arc::new(t));
         }
     }
     Ok(registry)

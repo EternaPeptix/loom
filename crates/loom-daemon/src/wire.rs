@@ -286,6 +286,19 @@ pub struct ScopeBody {
 /// The answer to `POST /api/sessions/{id}/scope`.
 pub use loom_agent::runtime::ScopeReceipt;
 
+/// What `GET /api/sessions/{id}/mcp` answers per server, and what the check route and `loom mcp list`
+/// show (the types live with the runtime's MCP wiring).
+pub use loom_agent::mcp::{McpCheckTool, McpCheckView, McpConfigured, McpServerView};
+
+/// Body of `POST /api/mcp/{server}/check`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpCheckBody {
+    /// The absolute path of an existing workspace folder: the check runs the server the way a session
+    /// there would.
+    pub workspace: String,
+}
+
 /// Body of `POST /api/sessions/{id}/release`: the operator closes the mission without the goal established.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

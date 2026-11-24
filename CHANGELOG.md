@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### MCP servers become tools
+
+- New `[mcp]` configuration: stdio (`command`) and Streamable HTTP (`url`) servers whose tools are offered as
+  `mcp__{server}__{tool}`. A mission's lead lists each server whose `roles` match once and records the listing in
+  `session_start.mcp`; children and reopened sessions reuse it. Role selection (`roles`, `read_only`, `tools`), a
+  `max_schema_tokens` budget per role and a start note saying what each server gave and what was left out.
+- A server's `hosts` are added to the allowed hosts of sessions whose role gets it (they reach `bash` too).
+- `GET /api/sessions/{id}/mcp`, `POST /api/mcp/{server}/check`, `loom mcp list`, `loom mcp check`.
+- A session without `[mcp]` sends the same requests as before. Secret values are never recorded or logged.
+
 ### Hypotheses and the rule engine leave the harness
 
 - `security_record` no longer takes `hypothesis_open`, `hypothesis_priority`, `hypothesis_evidence`,

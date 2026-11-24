@@ -1881,6 +1881,10 @@ impl Session {
         start.tools = wire_tools(&registry, &deps);
         let mut session = Session::bare(deps, log, Vec::new(), registry);
         session.append(Author::Harness, Event::SessionStart(start)).map_err(|e| e.0)?;
+        // The MCP servers' note (CONTRACTS-MCP M6): once, before anything else is said.
+        if let Some(text) = session.deps.shared.mcp().and_then(|m| m.note().map(str::to_string)) {
+            session.append(Author::Harness, Event::HarnessNote { note: NoteKind::Info, text }).map_err(|e| e.0)?;
+        }
         if let Some((parent, text)) = assignment {
             session
                 .append(Author::Agent(parent), Event::HarnessNote { note: NoteKind::Assignment, text })

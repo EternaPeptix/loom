@@ -18,6 +18,7 @@ pub mod evalkit;
 pub mod frontier;
 pub mod gate;
 pub mod hud;
+pub mod mcp;
 pub mod pack;
 pub mod prior;
 pub mod rtools;

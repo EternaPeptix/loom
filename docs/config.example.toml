@@ -143,6 +143,26 @@ copy_max_files = 300000    # a workspace with more files is not copied for an ag
 copy_max_mb = 20480        # nor one with more MiB of file content, where a copy duplicates them; 0 = no limit. Not applied on APFS, where copies are clones that take no space until files change
 project_instructions = true  # put the workspace root's AGENTS.md and CLAUDE.md into each new session's system prompt (32 KiB at most); false = never read them
 
+[mcp]
+# MCP servers become tools named mcp__{server}__{tool}. Nothing here applies without a [mcp.servers.*] table.
+# max_schema_tokens = 20000    # per role: MCP tool definitions beyond this are left out
+# idle_close_s = 600           # a server with no call for this long is closed; it starts again on the next call
+
+# [mcp.servers.github]
+# command = ["npx", "-y", "@modelcontextprotocol/server-github"]   # stdio: run in the session sandbox
+# env = { GITHUB_PERSONAL_ACCESS_TOKEN = "env:GITHUB_PAT" }        # "env:NAME" | "file:/path" | literal (warned about)
+# cwd = "."                    # relative to the workspace
+# hosts = ["api.github.com"]   # added to the allowed hosts of sessions that get this server (bash can reach them too)
+# tools = ["search_issues", "get_issue"]   # default: every tool the server lists
+# roles = ["lead", "worker"]   # default: every role that is not read-only
+# read_only = false            # true: no tool of this server changes anything, so read-only roles get it too
+# timeout_s = 120              # per call
+
+# [mcp.servers.docs]
+# url = "https://mcp.example.com/mcp"                 # Streamable HTTP, through the session's egress proxy
+# headers = { Authorization = "env:DOCS_MCP_AUTH" }
+# hosts = ["mcp.example.com"]
+
 [notify]
 # command = ["/usr/local/bin/my-notify"]   # program run per notification, given LOOM_KIND, LOOM_SESSION, LOOM_TITLE and LOOM_TEXT in its environment; default: the platform's notifier (macOS only; elsewhere nobody is notified)
 repeat_minutes = 0         # re-notify an unanswered blocking item this often; 0 = never (example: 30)

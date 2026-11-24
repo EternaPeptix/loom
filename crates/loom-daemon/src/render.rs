@@ -114,7 +114,7 @@
 //! the empty cases and the child indentation; rows never exceed `width` characters; the score table
 //! for one session and for several, with a card that is not recorded, wider than the width.
 
-use crate::wire::{ModelsView, StatusView};
+use crate::wire::{McpCheckView, McpConfigured, ModelsView, StatusView};
 use loom_agent::runtime::{
     InboxEntry, MissionModels, ModelSwitchReceipt, ModelsReload, NetEntry, RoleModelReceipt, RoleModels, ScoreView,
     SessionInfo, WindowView, ANY_ROLE,
@@ -922,6 +922,77 @@ pub fn models_table(view: &ModelsView, style: &Style) -> String {
     }
     if view.default_model.is_empty() {
         out.push(cut("no default_model: a new session names its model with --model", width));
+    }
+    finish(out)
+}
+
+/// `loom mcp list`: one line per configured server. Names only: a secret value is never in it.
+pub fn mcp_list(servers: &[McpConfigured]) -> String {
+    if servers.is_empty() {
+        return "No MCP servers are configured. Add them under [mcp.servers.NAME] in the config.\n".to_string();
+    }
+    let rows: Vec<Vec<String>> = servers
+        .iter()
+        .map(|s| {
+            let roles =
+                if s.roles.is_empty() { "every role that is not read-only".to_string() } else { s.roles.join(", ") };
+            let mut extra = Vec::new();
+            if s.read_only {
+                extra.push("read_only".to_string());
+            }
+            if !s.hosts.is_empty() {
+                extra.push(format!("hosts {}", s.hosts.join(", ")));
+            }
+            if let Some(t) = &s.tools {
+                extra.push(format!("tools {}", t.join(", ")));
+            }
+            vec![flat(&s.server), s.transport.clone(), flat(&roles), flat(&extra.join(" · "))]
+        })
+        .collect();
+    let mut out = vec![format!("{} configured", servers.len())];
+    for r in rows {
+        out.push(format!(
+            "{} · {} · roles: {}{}",
+            r[0],
+            r[1],
+            r[2],
+            if r[3].is_empty() { String::new() } else { format!(" · {}", r[3]) }
+        ));
+    }
+    finish(out)
+}
+
+/// `loom mcp check`: the tools the server lists, or why it could not, with what it wrote to stderr.
+pub fn mcp_check(v: &McpCheckView) -> String {
+    let mut out = Vec::new();
+    match &v.error {
+        Some(e) => out.push(format!("{} ({}) failed: {}", flat(&v.server), v.transport, flat(e))),
+        None => {
+            out.push(format!(
+                "{} ({}) · {} {} · protocol {} · {} tools",
+                flat(&v.server),
+                v.transport,
+                flat(&v.server_name),
+                flat(&v.server_version),
+                flat(&v.protocol),
+                v.tools.len()
+            ));
+            for t in &v.tools {
+                let first = t.description.lines().next().unwrap_or("");
+                let ro = if t.read_only_hint == Some(true) { " [read-only]" } else { "" };
+                out.push(format!(
+                    "  {}{ro}{}",
+                    flat(&t.name),
+                    if first.is_empty() { String::new() } else { format!(" · {}", flat(first)) }
+                ));
+            }
+        }
+    }
+    if !v.stderr_tail.is_empty() {
+        out.push("stderr:".to_string());
+        for l in &v.stderr_tail {
+            out.push(format!("  {}", flat(l)));
+        }
     }
     finish(out)
 }

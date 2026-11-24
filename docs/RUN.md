@@ -219,6 +219,45 @@ Environment variables whose names look like secrets (in any case: containing `KE
 variable whose value holds a URL with a password in it) are not passed to commands unless listed in
 `env_pass`.
 
+## Using MCP servers
+
+An MCP server gives the model more tools. Each tool shows up as `mcp__{server}__{tool}` and its result is
+stored like any other output (you can `read` and `grep` it, quote it as evidence, and the verifier can read it).
+Add servers under `[mcp.servers.NAME]` and restart the daemon:
+
+```toml
+[mcp]
+max_schema_tokens = 20000   # per role: MCP tool definitions beyond this are left out
+idle_close_s = 600
+
+# A local program, run inside the session's sandbox.
+[mcp.servers.github]
+command = ["npx", "-y", "@modelcontextprotocol/server-github"]
+env = { GITHUB_PERSONAL_ACCESS_TOKEN = "env:GITHUB_PAT" }   # read from the daemon's environment
+hosts = ["api.github.com"]            # the sandbox can reach these while the server is configured
+tools = ["search_issues", "get_issue"]
+
+# A remote server, reached through the session's egress proxy.
+[mcp.servers.docs]
+url = "https://mcp.example.com/mcp"
+headers = { Authorization = "file:/home/me/.docs-mcp-token" }
+hosts = ["mcp.example.com"]
+read_only = true                      # the verifier gets its tools too
+```
+
+Prefer `env:NAME` or `file:/path` for secrets: a literal in the file makes the daemon warn at start, and a value
+is never written to a log or a record. `hosts` are granted to every session whose role gets the server, and
+that includes the agent's own `bash` and `web_fetch`: list only hosts you would let the agent reach.
+
+```
+loom mcp list                                   # the configured servers, transport and roles
+loom mcp check github --workspace ~/work/repo   # start it for that workspace, list its tools, close it
+```
+
+`loom mcp check` prints the tools or the error with the server's last stderr lines. A mission lists its servers
+once, when its lead starts; to pick up a changed server, start a new mission. The Session view of the API
+(`GET /api/sessions/{id}/mcp`) shows each server's state.
+
 ## A box
 
 `[box]` gives the agent a place to run what the local sandbox cannot (raw TCP to a target, heavy
