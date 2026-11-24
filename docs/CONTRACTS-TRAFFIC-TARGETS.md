@@ -299,6 +299,25 @@ client does not trust. Commands never get it (it is not in `env()`). `loom_tools
 `SessionTools::tool_proxy` when the runtime set it, else the command proxy from `ToolCtx::env` (tests and
 callers without a runtime).
 
+S12. **In-process TLS to the target** (found in the live test: a self-signed in-scope host was reachable by
+`curl` through the intercepting proxy but never by `http_send`). The runtime sets `SessionTools::upstream_insecure`
+to the mission target's `upstream_insecure` (T1; the lead's `TargetRef`, so every agent of the mission has it)
+for every session with a target; MCP sessions never get it. `http_send`, `http_repeat`, `web_fetch` and the
+oracle decide per request, on the request URL's host and port (`port_or_known_default`), with the same matcher
+the proxy uses (`loom_net::host_listed`, the former `intercept::listed`): a listed `https` request is sent by a
+client that does not verify the server certificate, and its recorded exchange has `upstream_unverified: true`;
+every other request (another host, a redirect hop to another host, the reference path, `cve`/`dep_scan` lookups,
+MCP) keeps full verification. A redirect is decided again on each hop's own URL.
+
+S13. **Transport errors name their cause.** When an in-process client fails before a response (connect, TLS, a
+proxy refusal, a timeout), the error text the tool returns and records is reqwest's message followed by each
+`std::error::Error::source()` in the chain, `: `-joined, skipping a source whose text the line already holds
+(so a certificate failure reads `error sending request for url (https://h:p/x): … invalid peer certificate:
+UnknownIssuer`, not the top line alone). For a certificate failure on a host that is in the mission target's
+scope but not on its `upstream_insecure` list it adds one sentence: `The server's certificate did not verify;
+the operator can list {host} in the target's upstream_insecure if it is a lab host with a self-signed
+certificate.`
+
 S10. **Summary line** (`creds::summary_line`): `{profile} · {n} cookie(s), {m} header(s) · {hosts}`, the
 counts of the effective set, a count of 0 left out (`default · 2 cookies · acme.test`), hosts sorted and
 comma-separated, at most 3 then `and {k} more`; when S6 dropped items it ends with ` · {d} out of scope, not
@@ -386,6 +405,10 @@ title, and the Session tab shows the summary line.
   now-out-of-scope item at the next mission start and the summary says so; `loom creds show` and every API
   answer never hold a value (`Item`'s `Debug` neither); a mission started with `creds` records `CredsRef` (no value anywhere in its session directory) and an agent it starts attaches the same items; `creds` without `target` is refused; the tool credential is never intercepted (an
   `http_send` to an https test server works in an intercepting session) and never in a command's env;
-  `http_send` injects for a matching host and records the redacted copy.
+  `http_send` injects for a matching host and records the redacted copy; with the target listing `127.0.0.1`
+  in `upstream_insecure`, `http_send` and `web_fetch` reach a self-signed https test server, record
+  `upstream_unverified: true` and still inject the profile, a self-signed server not listed fails with the
+  certificate cause in the error text (S13), and a redirect from a listed host to an unlisted self-signed one
+  fails verification on the second hop.
 - **U:** pure models (exchange list, header masking, target tree with statuses, filters) in
   `ui/core.test.js`; fixture routes for all of T7 and exchanges.
