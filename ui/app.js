@@ -38,7 +38,7 @@ const S = {
   actionState: new Map(),
   stopAsked: new Set(), // sessions this tab asked to stop: their ending is not announced
   notes: { pending: [], shown: new Map(), timer: 0 },
-  requests: { ledger: 0, window: 0, net: 0, inbox: 0, status: 0, models: 0, mcp: 0, exch: 0, target: 0, creds: 0, formCreds: 0 },
+  requests: { ledger: 0, window: 0, net: 0, inbox: 0, status: 0, models: 0, mcp: 0, exch: 0, target: 0, creds: 0, formCreds: 0, packs: 0 },
   exch: { session: null, list: [], error: null, loaded: false }, // the open mission's captured exchanges (C1), from the daemon
   exFilter: { host: "all", status: "all" },
   exview: null, // the exchange open in its viewer
@@ -75,7 +75,8 @@ const S = {
   openId: null,
   inspectorPref: false, // desktop inspector open preference across non-session routes
   childBlocker: null,
-  newForm: { model: null, agentModel: null },
+  newForm: { model: null, agentModel: null, pack: null, role: null },
+  packs: C.fallbackPacks(), // GET /api/packs for the new-mission form (the core fallback until fetched, or for an older daemon)
   rec: null, // record store of the open session
   r: null, // what is rendered of it: {from, end, nodes, fresh}
   follow: true,
@@ -4000,14 +4001,68 @@ function renderInbox() {
 // ---------------------------------------------------------------------------------------------
 // New session form
 
+/** The chosen pack of the new-mission form (its entry of S.packs), else the first. */
+function chosenPack() {
+  return S.packs.find((p) => p.name === $("f-pack").value) || S.packs[0];
+}
+
+/** The agents' model applies only to a role that starts agents. */
+function syncAgentsModel() {
+  const pack = chosenPack();
+  const r = pack && (pack.roles || []).find((x) => x.name === $("f-role").value);
+  $("f-agent-model").disabled = !(r && r.starts_agents);
+}
+
+/** Fill the Pack select from S.packs, then the Role select; `packChanged` selects the pack's default role. */
+function renderNewPack(packChanged) {
+  const sel = $("f-pack");
+  if (!packChanged) {
+    const keep = sel.options.length ? sel.value : S.newForm.pack;
+    sel.replaceChildren(...S.packs.map((p) => { const o = new Option(p.name, p.name); o.title = p.description || ""; return o; }));
+    sel.value = S.packs.some((p) => p.name === keep) ? keep : (S.packs.find((p) => p.name === "core") || S.packs[0]).name;
+    S.newForm.pack = sel.value;
+  }
+  const pack = chosenPack();
+  const role = $("f-role");
+  const keepRole = packChanged ? pack.default_role : (role.options.length ? role.value : S.newForm.role);
+  role.replaceChildren();
+  for (const g of C.roleGroups(pack)) {
+    const group = document.createElement("optgroup");
+    group.label = g.label;
+    for (const r of g.roles) { const o = new Option(r.name, r.name); o.title = r.title; group.append(o); }
+    role.append(group);
+  }
+  const names = [...role.options].map((o) => o.value);
+  role.value = names.includes(keepRole) ? keepRole : names.includes(pack.default_role) ? pack.default_role : names[0] || "";
+  S.newForm.role = role.value;
+  const note = $("f-pack-note");
+  note.textContent = C.packNote(pack);
+  note.hidden = !note.textContent;
+  syncAgentsModel();
+}
+
+/** Fetch the installed packs when the form is shown; an older daemon (no route) keeps the core fallback. */
+async function loadPacks() {
+  const request = ++S.requests.packs;
+  let list = null;
+  try {
+    const got = await api("GET", "/api/packs");
+    if (Array.isArray(got)) list = got.filter((p) => p && p.name && Array.isArray(p.roles));
+  } catch { list = null; }
+  if (request !== S.requests.packs) return;
+  S.packs = list && list.length ? list : C.fallbackPacks();
+  renderNewPack(false);
+}
+
 function showNew() {
   setView("new");
-  const role = $("f-role");
-  if (role.options.length === 0) {
-    for (const r of C.ROLES) role.append(new Option(r, r));
-    // Only a lead starts agents: a chat has no agents' model to choose.
-    role.addEventListener("change", () => { $("f-agent-model").disabled = role.value !== "lead"; });
+  if (!$("f-pack").dataset.bound) {
+    $("f-pack").dataset.bound = "1";
+    $("f-pack").addEventListener("change", () => { S.newForm.pack = $("f-pack").value; renderNewPack(true); });
+    $("f-role").addEventListener("change", () => { S.newForm.role = $("f-role").value; syncAgentsModel(); });
   }
+  renderNewPack(false);
+  loadPacks();
   const model = $("f-model");
   const prevModel = model.options.length ? model.value : S.newForm.model;
   model.replaceChildren();
@@ -4023,7 +4078,7 @@ function showNew() {
   for (const m of models) agents.append(new Option(m.profile, m.profile));
   if (prevAgentModel !== null && prevAgentModel !== undefined && [...agents.options].some(o => o.value === prevAgentModel)) agents.value = prevAgentModel;
   S.newForm.agentModel = agents.value;
-  agents.disabled = role.value !== "lead";
+  syncAgentsModel();
   $("f-error").hidden = true;
   hideCreateAsk();
   $("f-receipt").hidden = true;
@@ -4037,7 +4092,9 @@ async function submitNew(ev, create = false) {
   const r = C.buildNewSession({
     workspace: $("f-workspace").value,
     message: $("f-message").value,
+    pack: $("f-pack").value,
     role: $("f-role").value,
+    startsAgents: !$("f-agent-model").disabled,
     model: $("f-model").value,
     agentModel: $("f-agent-model").value,
     title: $("f-title").value,

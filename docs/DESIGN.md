@@ -1699,6 +1699,13 @@ session; `resume` and `archive` roots only; archiving is refused while the missi
 The same actions exist in the CLI (`loom send`, `rule`, `approve`, `rule --withdraw`, `stop`,
 `resume`, `compact`, `archive`, `answer`) and in the web UI.
 
+**The new-mission form.** Its Pack menu is filled from `GET /api/packs` (`runtime.packs`: each pack's
+name, description, default role and, per role, `starts_agents` and `top_level`; no prompts, tools or
+models; `core` first). The Role menu follows the pack: roles that start a mission first, the
+roles a pack's other roles start or verify in a second group, the pack's default role selected. The
+body names `pack` unless it is `core`, and the Agents' model is offered only for a role that starts
+agents. An older daemon without the route leaves `core` with `lead` and `chat`.
+
 **Scope and release.** `POST /scope` (`loom scope`) is the only way a session's reachable hosts grow
 while it runs, and only the operator can call it: it goes to the mission's lead like a rule and is
 recorded as a `scope_grant` (and a standing rule); the grant lasts as long as the session. An agent asks

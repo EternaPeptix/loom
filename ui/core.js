@@ -2464,13 +2464,41 @@ export function planEvent(ev, ctx) {
 // ---------------------------------------------------------------------------------------------
 // New session form
 
+/** The roles offered when GET /api/packs is unavailable (an older daemon): core's two that an operator starts. */
 export const ROLES = ["lead", "chat"];
+
+/** The pack list of that fallback: just `core`, with the roles above (the lead starts agents). */
+export function fallbackPacks() {
+  return [{
+    name: "core", description: "", default_role: "lead", intercept: false, requires_restricted_network: false,
+    roles: ROLES.map((name) => ({ name, description: "", starts_agents: name === "lead", top_level: true })),
+  }];
+}
+
+/**
+ * The Role select's groups for a pack from GET /api/packs: `[{label, roles: [{name, title}]}]`. The daemon
+ * orders the roles (default first, then by name); this keeps that order. An empty group is left out.
+ */
+export function roleGroups(pack) {
+  const roles = (pack && pack.roles) || [];
+  const pick = (top) => roles.filter((r) => !!r.top_level === top).map((r) => ({ name: r.name, title: r.description || "" }));
+  return [
+    { label: "Starts a mission", roles: pick(true) },
+    { label: "Usually started by another role", roles: pick(false) },
+  ].filter((g) => g.roles.length > 0);
+}
+
+/** The dim line under the Pack and Role selects: the chosen pack's description, "" for none. */
+export function packNote(pack) {
+  return pack && pack.description ? String(pack.description).trim() : "";
+}
 
 /** The most earlier missions one new mission may name (the daemon's `prior::MAX_PRIOR`). */
 export const MAX_PRIOR = 8;
 
 /**
  * Validate the form; returns {body} for POST /api/sessions or {error}.
+ * `form.pack` (optional; sent unless empty or `core`) and `form.startsAgents` (the chosen role may start agents; gates `role_models`).
  * `form.prior` (optional text): earlier missions for the new one to recall. Split on whitespace and commas;
  * each must be a mission id as the daemon names them (1 to 128 of A-Z a-z 0-9 _ . -, not starting with `.`),
  * else `"{word}" is not a mission id; mission ids look like m-….`; repeats dropped (first kept); more than 8 →
@@ -2491,8 +2519,10 @@ export function buildNewSession(form) {
   // A credential profile (S3) goes with a target only; "none" or empty sends nothing.
   const creds = String(form.creds || "").trim();
   if (target && creds && creds !== "none") body.creds = creds;
-  // Only a lead starts agents: the choice for every role goes with it, before its first agent.
-  if (form.agentModel && role === "lead") body.role_models = { "*": form.agentModel };
+  // `core` is the daemon's default pack: a core mission's body names none.
+  if (form.pack && form.pack !== "core") body.pack = String(form.pack);
+  // Only a role that starts agents has an agents' model: the choice for every role goes with it, before its first agent.
+  if (form.agentModel && form.startsAgents) body.role_models = { "*": form.agentModel };
   const title = String(form.title || "").trim();
   if (title) body.title = title;
   const prior = [];

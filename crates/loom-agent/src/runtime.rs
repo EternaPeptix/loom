@@ -1245,6 +1245,29 @@ pub struct ScoreView {
     pub total: Scorecard,
 }
 
+/// One role of an installed pack, as the new-mission form offers it (descriptions only, no prompt text).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleView {
+    pub name: String,
+    pub description: String,
+    /// The role may start agents (its `may_spawn` is not empty).
+    pub starts_agents: bool,
+    /// No role of the pack lists it in `may_spawn` or has it as its `verifier`: it is started by an operator.
+    pub top_level: bool,
+}
+
+/// An installed pack (see [`Runtime::packs`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PackView {
+    pub name: String,
+    pub description: String,
+    pub default_role: String,
+    pub intercept: bool,
+    pub requires_restricted_network: bool,
+    /// The default role first, then the other top-level roles by name, then the rest by name.
+    pub roles: Vec<RoleView>,
+}
+
 /// What became of a rule, an approval or a withdrawal the operator sent (see [`Runtime::add_rule`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuleReceipt {
@@ -6875,6 +6898,53 @@ impl Runtime {
         Ok(entries)
     }
 
+    /// The installed packs for the new-mission form: `core` first, then by name. Names and descriptions only.
+    pub fn packs(&self) -> Vec<PackView> {
+        let packs = &self.inner.packs;
+        let mut names = packs.names();
+        names.sort_by(|a, b| (a != "core", a).cmp(&(b != "core", b)));
+        let mut out = Vec::new();
+        for name in names {
+            let Some(pack) = packs.get(&name) else { continue };
+            let used = |role: &str| {
+                pack.roles
+                    .values()
+                    .any(|r| r.may_spawn.iter().any(|m| m == role) || r.verifier.as_deref() == Some(role))
+            };
+            let mut roles: Vec<RoleView> = pack
+                .roles
+                .values()
+                .map(|r| RoleView {
+                    name: r.name.clone(),
+                    description: r.description.clone(),
+                    starts_agents: !r.may_spawn.is_empty(),
+                    top_level: !used(&r.name),
+                })
+                .collect();
+            roles.sort_by(|a, b| {
+                let rank = |r: &RoleView| {
+                    if r.name == pack.default_role {
+                        0
+                    } else if r.top_level {
+                        1
+                    } else {
+                        2
+                    }
+                };
+                (rank(a), &a.name).cmp(&(rank(b), &b.name))
+            });
+            out.push(PackView {
+                name: pack.name.clone(),
+                description: pack.description.clone(),
+                default_role: pack.default_role.clone(),
+                intercept: pack.intercept,
+                requires_restricted_network: pack.requires_restricted_network,
+                roles,
+            });
+        }
+        out
+    }
+
     /// The live `default_model` (empty: none set): the profile a session uses when none is named.
     pub fn default_model(&self) -> String {
         self.inner.models().default_model.clone()
@@ -7379,6 +7449,46 @@ mod tests {
         packs(&paths.packs_dir());
         let rt = Runtime::start(config.clone(), paths).await.unwrap();
         Env { dir, server, rt, ws, config }
+    }
+
+    #[tokio::test]
+    async fn packs_view_orders_roles_and_hides_prompts() {
+        let e = env_with_packs(Script::new(|_, _| finish("ok")), |_| {}, |packs| {
+            let dir = packs.join("aaa");
+            std::fs::create_dir_all(dir.join("roles")).unwrap();
+            let tools = "[\"bash\", \"read\", \"out_read\", \"verdict\", \"finish\"]";
+            let toml = format!(
+                "name = \"aaa\"\ndescription = \"Test pack.\"\ndefault_role = \"mid\"\nintercept = true\n\
+                 [roles.mid]\ndescription = \"The default.\"\nprompt = \"roles/p.md\"\ntools = {tools}\nmay_spawn = [\"helper\"]\nverifier = \"judge\"\n\
+                 [roles.zed]\nprompt = \"roles/p.md\"\ntools = {tools}\n\
+                 [roles.alpha]\nprompt = \"roles/p.md\"\ntools = {tools}\n\
+                 [roles.helper]\nprompt = \"roles/p.md\"\ntools = {tools}\n\
+                 [roles.judge]\nprompt = \"roles/p.md\"\ntools = {tools}\nread_only = true\n"
+            );
+            std::fs::write(dir.join("pack.toml"), toml).unwrap();
+            std::fs::write(dir.join("roles/p.md"), "SECRET-PROMPT-TEXT").unwrap();
+        })
+        .await;
+        let packs = e.rt.packs();
+        assert_eq!(packs.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["core", "aaa"]);
+        let aaa = &packs[1];
+        assert_eq!((aaa.description.as_str(), aaa.default_role.as_str(), aaa.intercept), ("Test pack.", "mid", true));
+        let names: Vec<_> = aaa.roles.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["mid", "alpha", "zed", "helper", "judge"]);
+        let by = |n: &str| aaa.roles.iter().find(|r| r.name == n).unwrap();
+        assert!(by("mid").starts_agents && by("mid").top_level);
+        assert!(!by("zed").starts_agents && by("zed").top_level);
+        assert!(!by("helper").top_level, "a spawned role is not top-level");
+        assert!(!by("judge").top_level, "a verifier role is not top-level");
+        let core = &packs[0];
+        assert_eq!(core.roles[0].name, "lead");
+        assert!(core.roles.iter().find(|r| r.name == "chat").unwrap().top_level);
+        assert!(!core.roles.iter().find(|r| r.name == "worker").unwrap().top_level);
+        let json = serde_json::to_string(&packs).unwrap();
+        assert!(
+            !json.contains("SECRET-PROMPT-TEXT") && !json.contains("\"prompt\"") && !json.contains("tools"),
+            "{json}"
+        );
     }
 
     /// The handle of the latest stored output shown in a request's tool messages.

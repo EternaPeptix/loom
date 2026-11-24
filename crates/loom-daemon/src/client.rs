@@ -69,7 +69,7 @@ use crate::wire::{
 };
 use loom_agent::runtime::{
     BusEvent, InboxEntry, LedgerView, MissionInfo, MissionModels, ModelSwitchReceipt, ModelsReload, NetEntry,
-    NewSession, RoleModelReceipt, RuleReceipt, ScoreView, SessionInfo, WindowView,
+    NewSession, PackView, RoleModelReceipt, RuleReceipt, ScoreView, SessionInfo, WindowView,
 };
 use loom_agent::runtime::{GraphView, TargetBody, TargetView};
 use loom_core::config::{Config, Paths};
@@ -579,6 +579,11 @@ impl Client {
         let body = serde_json::to_value(RenameBody { title: title.to_string() })
             .map_err(|e| format!("The request cannot be encoded ({e})."))?;
         self.call_unit(Method::POST, &format!("/api/sessions/{}/rename", segment(id.as_str())), Some(body)).await
+    }
+
+    /// The installed packs and their roles.
+    pub async fn packs(&self) -> Result<Vec<PackView>, String> {
+        self.call(Method::GET, "/api/packs", &[], None).await
     }
 
     /// The live model profiles and the default one.

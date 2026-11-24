@@ -526,7 +526,8 @@ light/dark appearance and reduced-motion support. Avoid dependence on color or h
   the models again. A lead that starts no agents shows only its own model.
 
 The new-mission form's **Agents' model** sends `role_models: {"*": profile}`; it is disabled unless
-the role is `lead`, the only form role that starts agents.
+the chosen role starts agents (`starts_agents` in `GET /api/packs`; `lead` when that route is missing). The
+form's Pack menu sends `pack` unless it is `core`.
 
 ## Stored output dialog
 

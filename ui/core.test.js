@@ -1098,9 +1098,43 @@ test("new session form", () => {
   });
   assert.equal(C.buildNewSession({ workspace: "/w", message: "x", title: "T", unattended: true }).body.title, "T");
   // The agents' model goes with a lead, as the choice for every role; a chat lead starts no agents.
-  assert.deepEqual(C.buildNewSession({ workspace: "/w", message: "x", role: "lead", agentModel: "fast" }).body.role_models, { "*": "fast" });
+  assert.deepEqual(C.buildNewSession({ workspace: "/w", message: "x", role: "lead", agentModel: "fast", startsAgents: true }).body.role_models, { "*": "fast" });
   assert.equal(C.buildNewSession({ workspace: "/w", message: "x", role: "chat", agentModel: "fast" }).body.role_models, undefined);
-  assert.equal(C.buildNewSession({ workspace: "/w", message: "x", role: "lead", agentModel: "" }).body.role_models, undefined);
+  assert.equal(C.buildNewSession({ workspace: "/w", message: "x", role: "lead", agentModel: "", startsAgents: true }).body.role_models, undefined);
+  // The choice follows the role's startsAgents, not its name.
+  assert.equal(C.buildNewSession({ workspace: "/w", message: "x", role: "lead", agentModel: "fast", startsAgents: false }).body.role_models, undefined);
+  assert.deepEqual(C.buildNewSession({ workspace: "/w", message: "x", role: "boss", agentModel: "fast", startsAgents: true }).body.role_models, { "*": "fast" });
+  // The pack is sent unless it is core or empty.
+  assert.equal("pack" in C.buildNewSession({ workspace: "/w", message: "x", pack: "core" }).body, false);
+  assert.equal("pack" in C.buildNewSession({ workspace: "/w", message: "x", pack: "" }).body, false);
+  assert.equal(C.buildNewSession({ workspace: "/w", message: "x", pack: "ctf", role: "solver" }).body.pack, "ctf");
+});
+
+test("roleGroups and packNote shape the new-mission form's Pack and Role menus", () => {
+  const pack = {
+    name: "ctf", description: " Capture the flag. ", default_role: "solver",
+    roles: [
+      { name: "solver", description: "Solves.", starts_agents: true, top_level: true },
+      { name: "zed", description: "", starts_agents: false, top_level: true },
+      { name: "scout", description: "Scouts.", starts_agents: false, top_level: false },
+    ],
+  };
+  assert.deepEqual(C.roleGroups(pack), [
+    { label: "Starts a mission", roles: [{ name: "solver", title: "Solves." }, { name: "zed", title: "" }] },
+    { label: "Usually started by another role", roles: [{ name: "scout", title: "Scouts." }] },
+  ]);
+  const only = C.roleGroups({ roles: [{ name: "a", description: "A", top_level: false }] });
+  assert.deepEqual(only, [{ label: "Usually started by another role", roles: [{ name: "a", title: "A" }] }]);
+  assert.deepEqual(C.roleGroups({ roles: [{ name: "a", top_level: true }] }).map((g) => g.label), ["Starts a mission"]);
+  assert.deepEqual(C.roleGroups({ roles: [] }), []);
+  assert.deepEqual(C.roleGroups(null), []);
+  assert.equal(C.packNote(pack), "Capture the flag.");
+  assert.equal(C.packNote({ name: "x", description: "" }), "");
+  assert.equal(C.packNote(null), "");
+  const fb = C.fallbackPacks();
+  assert.deepEqual(fb.map((p) => p.name), ["core"]);
+  assert.deepEqual(fb[0].roles.map((r) => [r.name, r.starts_agents]), [["lead", true], ["chat", false]]);
+  assert.equal(C.roleGroups(fb[0]).length, 1);
 });
 
 test("models tab words and requests", () => {

@@ -65,6 +65,7 @@
 //! | `POST /sessions/{id}/model` (`ModelBody`) | `runtime.set_session_model` | `ModelSwitchReceipt` |
 //! | `GET /sessions/{id}/models` | `runtime.mission_models` | `MissionModels` |
 //! | `POST /sessions/{id}/role-model` (`RoleModelBody`) | `runtime.set_role_model` | `RoleModelReceipt` |
+//! | `GET /packs` | `runtime.packs` | `[PackView]` (name, description, default_role, intercept, requires_restricted_network, `roles`: name, description, starts_agents, top_level; `core` first, the default role first) |
 //! | `GET /models` | `runtime.default_model()`, `runtime.health()` | `ModelsView` |
 //! | `POST /models/reload` | `runtime.reload_models` (no body) | `ModelsReload` |
 //! | `GET /sessions/{id}/window` | `runtime.window` | `WindowView` |
@@ -253,6 +254,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/sessions/{id}/model", post(set_model))
         .route("/api/sessions/{id}/models", get(mission_models))
         .route("/api/sessions/{id}/role-model", post(set_role_model))
+        .route("/api/packs", get(packs))
         .route("/api/models", get(models))
         .route("/api/models/reload", post(reload_models))
         .route("/api/sessions/{id}/window", get(window))
@@ -935,6 +937,10 @@ async fn session_exchanges(State(s): State<ApiState>, Path(id): Path<String>, q:
     let entries =
         blocking(move || rt.exchanges(&SessionId::from(id), host.as_deref(), after, limit).map_err(rt_err)).await?;
     Ok(Json(entries).into_response())
+}
+
+async fn packs(State(s): State<ApiState>) -> Res<Response> {
+    Ok(Json(s.runtime.packs()).into_response())
 }
 
 async fn targets(State(s): State<ApiState>) -> Res<Response> {
@@ -2355,6 +2361,21 @@ mod tests {
             let (s, b) = e.get(&format!("/api/missions/{bad}/ledger")).await;
             assert_eq!(s, 404, "{bad}: {b}");
         }
+    }
+
+    #[tokio::test]
+    async fn packs_are_listed_over_the_api() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let (s, v) = e.get("/api/packs").await;
+        assert_eq!(s, 200, "{v}");
+        let core = &v[0];
+        assert_eq!((core["name"].as_str(), core["default_role"].as_str()), (Some("core"), Some("lead")));
+        assert_eq!(core["roles"][0]["name"], "lead");
+        assert_eq!(core["roles"][0]["starts_agents"], true);
+        assert_eq!(core["roles"][0]["top_level"], true);
+        assert!(core["intercept"].is_boolean() && core["requires_restricted_network"].is_boolean());
+        let (s, _) = json_of(e.http.get(e.url("/api/packs")).send().await.unwrap()).await;
+        assert_eq!(s, 401);
     }
 
     #[tokio::test]
