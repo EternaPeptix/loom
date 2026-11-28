@@ -6,13 +6,13 @@ rules move into `docs/DESIGN.md` (and `docs/UI.md` for the UI) and this file shr
 Evidence from the operator's logs (551 sessions, 21,272 calls) that shaped these:
 
 - `cd` is the first word of 75% of `bash` commands (6,848 of 9,080): models re-establish a
-  directory every call, because the trained shell keeps it and loom's did not.
+  directory every call, because the trained shell keeps it and ferret's did not.
 - 14 of 20,872 `bash` results were cut (the inline limit is a window/8 token budget). Output is
   already shown whole. Yet `out_read` ran 1,416 times, 1,094 of them on `bash` output that had been
   shown whole (median 20 lines), and no `evidence` call ever quoted by text alone (783 by line
   numbers, 437 with both). Models re-read what they saw to get line numbers for evidence.
 
-## A. The shell directory persists (`crates/loom-tools/src/bash.rs`, `lib.rs`, runtime `ToolCtx`)
+## A. The shell directory persists (`crates/ferret-tools/src/bash.rs`, `lib.rs`, runtime `ToolCtx`)
 
 1. A session has one shell directory, `ToolCtx.shell: Arc<ShellState>` (`ShellState { cwd:
    Mutex<Option<PathBuf>> }`), created with the session's `ToolCtx` (`runtime.rs`, where `jobs` is
@@ -21,8 +21,8 @@ Evidence from the operator's logs (551 sessions, 21,272 calls) that shaped these
    set and is still a directory, else in the workspace. When it was set and is no longer a
    directory, the call runs in the workspace, the state is cleared, and the result has the fact
    `shell directory reset to the workspace ({old} no longer exists)`.
-3. The script runs as `trap 'pwd -P >| "$LOOM_SHELL_CWD" 2>/dev/null' EXIT; {script}` (same line, so
-   line numbers in shell errors are the script's), with `LOOM_SHELL_CWD` in the command's
+3. The script runs as `trap 'pwd -P >| "$FERRET_SHELL_CWD" 2>/dev/null' EXIT; {script}` (same line, so
+   line numbers in shell errors are the script's), with `FERRET_SHELL_CWD` in the command's
    environment naming `{tmp_dir}/.shell-cwd-{job id}`, a path the sandbox lets the command write.
    A script that sets its own EXIT trap just does not move the shell directory.
 4. After a foreground call that ended (exit status or signal; not a timeout, not cancelled, not a
@@ -44,7 +44,7 @@ Evidence from the operator's logs (551 sessions, 21,272 calls) that shaped these
    `background` does not; `cwd` given then `cd` moves it; error line numbers unchanged (`bash -c`
    with a syntax error on line 2 says line 2); restart restores from meta.
 
-## B. Quote what you saw (`crates/loom-agent/src/rtools/ledger.rs`, `loom-core` evidence matching)
+## B. Quote what you saw (`crates/ferret-agent/src/rtools/ledger.rs`, `ferret-core` evidence matching)
 
 1. `evidence` and `claim` descriptions lead with quoting by text: "Copy the exact text from an
    output you were shown into `quote`; line numbers are not needed." Remove the advice to get line
@@ -59,9 +59,9 @@ Evidence from the operator's logs (551 sessions, 21,272 calls) that shaped these
 4. Tests for 2 and 3, and that a quote-only call on a `bash` output shown whole records the right
    lines.
 
-## C. Project instructions (`crates/loom-agent/src/pack.rs`, session start, `loom-core` config)
+## C. Project instructions (`crates/ferret-agent/src/pack.rs`, session start, `ferret-core` config)
 
-1. When a session starts (lead, child, chat), loom reads the workspace root's `AGENTS.md` and
+1. When a session starts (lead, child, chat), ferret reads the workspace root's `AGENTS.md` and
    `CLAUDE.md` (both when both exist; the second is left out when its bytes equal the first). Only
    valid UTF-8 files are read; others are left out with a harness note.
 2. The system prompt gets, after the role prompt and before `# Environment`:
@@ -84,7 +84,7 @@ Images are content, not paths. A model whose profile says `vision = true` is sen
 model is told in text that an image is there and where its file is.
 
 1. `ImageRef { blob: String (the blob store's hex id), mime: String, bytes: u64, width: u32,
-   height: u32, name: Option<String> }` in `loom-core`. Accepted: PNG, JPEG, GIF, WebP, detected by
+   height: u32, name: Option<String> }` in `ferret-core`. Accepted: PNG, JPEG, GIF, WebP, detected by
    magic bytes (not by extension); width and height read from the header (hand-written parsers, no
    new dependency).
 2. Events: `UserMessage` and `ToolResult` gain `images: Vec<ImageRef>` (serde default empty, skipped
@@ -116,7 +116,7 @@ model is told in text that an image is there and where its file is.
    the image full size in a dialog with its name, size and Copy path. Composer chips for images
    show a small thumbnail. A model without vision shows a note on the chip: "This model does not
    take images; it gets the file path."
-8. `loom models` lists `vision`. `docs/config.example.toml` documents `vision`.
+8. `ferret models` lists `vision`. `docs/config.example.toml` documents `vision`.
 9. Tests: magic-byte detection and header sizes for each format; event round-trip with and without
    images; request body shape (user message, tool-result run, vision off); estimate; the route's
    404 for a blob no record names; old log without `images` reads.
@@ -142,6 +142,6 @@ message held until the lead's turn ends, then sent as the start of the next turn
    button has a small menu "Send now / Queue for after this turn". Queued messages sit in a list
    above the composer, each with Edit, Send now and Remove, and a count in the composer caption.
    The help line says which key does which.
-6. CLI: `loom send {id} TEXT --after-turn`.
+6. CLI: `ferret send {id} TEXT --after-turn`.
 7. Tests: order, edit, remove, send-now, idle equals now, survives a daemon restart, stop keeps
    them.

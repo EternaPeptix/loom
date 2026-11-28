@@ -1,4 +1,4 @@
-# What loom does about the DSH and dsh-vr findings
+# What ferret does about the DSH and dsh-vr findings
 
 > **A dated record, not maintained.** This is the account of one verification run on 2026-11-11, against
 > the code as it was then. The "live" evidence below comes from sessions of that run on a local
@@ -7,21 +7,21 @@
 > contracts describe the current behaviour, and `CHANGELOG.md` lists what changed in behaviour. The test
 > counts and session ids below are as of that run.
 
-loom was designed after auditing DeepSeek Harness (DSH) source and the dsh-vr research plugin, and
+ferret was designed after auditing DeepSeek Harness (DSH) source and the dsh-vr research plugin, and
 measuring their behaviour on real session logs. This document takes the findings of those reviews,
-grouped by theme, and for each says the mechanism in loom that answers it and the evidence that it
+grouped by theme, and for each says the mechanism in ferret that answers it and the evidence that it
 works. "Live" evidence is from missions run against a local model server on 2026-11-11; the session ids
-are those of the run's own loom home.
+are those of the run's own ferret home.
 
 The through-line: in DSH the *model* is asked to manage context, judge its own certainty, and not
-leak — all by prompt. In loom those are mechanisms the model cannot see or skip, so a small model
+leak — all by prompt. In ferret those are mechanisms the model cannot see or skip, so a small model
 gets the same discipline as a large one. That is the point of the rewrite.
 
 ---
 
 ## 1. Context and compaction
 
-| DSH finding | loom |
+| DSH finding | ferret |
 |---|---|
 | Compaction summary reuses no prompt cache (112–145 s each). | There is no summary step. The window is a pure function of the append-only log (`weave`); folding out old material is an eviction recorded in a `reweave` event, and the request prefix stays a growing prefix, so it is a cache hit. When narration must go, a *digest* request is sent **on the existing prefix** — a full cache hit — and stored in the `reweave` record. |
 | Summary drops user messages (600k–725k tokens → 6–10k chars). | User messages and the system prompt are never evicted. Enforced in `plan_reweave` (protected classes) and checked live. |
@@ -36,7 +36,7 @@ needle (log3 line 843) was still found after the reads that contained it had bee
 
 ## 2. Prompt cache / eviction
 
-| DSH finding | loom |
+| DSH finding | ferret |
 |---|---|
 | Tool-list changes discard the whole prompt cache (41.6M tokens re-read in 7 days). | The tool set is frozen at `session_start` and never changes mid-session; a forked child keeps the parent's tool list exactly (role restrictions are enforced at call time, not by editing the list). |
 | System-prompt edits rewrite the whole prefix on the vLLM route. | The system message is fixed for the session's life; request fields that some templates render into the prompt head (reasoning effort, sampling) are fixed per session too. |
@@ -69,7 +69,7 @@ consolidated finish carried MD5 checksums proving no file was edited.
 
 ## 4. Orchestration
 
-| DSH / dsh-vr finding | loom |
+| DSH / dsh-vr finding | ferret |
 |---|---|
 | Child output is unframed and unbounded. | A settled child is rendered to its parent as a framed `<harness kind="agent-report" agent=… outcome=…>` block, capped, explicitly marked unverified, with a handle to the full text. |
 | Stop does not reach child agents. | Stop cascades to all descendants; a settlement arriving at a stopped parent is recorded and does not wake it. |
@@ -84,7 +84,7 @@ consolidating. Every `finish` in every mission was accepted by a verifier child 
 
 ## 5. Nothing leaves the machine unless configured
 
-| DSH finding | loom |
+| DSH finding | ferret |
 |---|---|
 | Session-log upload on by default for the DeepSeek adapter. | No upload path exists. Model requests go only to the configured endpoint. |
 | Feedback upload sends the unredacted session. | There is no feedback channel. |
@@ -98,7 +98,7 @@ allowed 0 outbound connections; private/loopback/link-local destinations are ref
 
 ## 6. Unattended runs
 
-| DSH finding | loom |
+| DSH finding | ferret |
 |---|---|
 | An unhandled rejection exits the Host; no auto-restart. | The daemon is supervised and log-recovered: on start it scans sessions whose last turn did not end, writes an `interrupted` record, and resumes those marked unattended. |
 | Jobs vanish on restart; process trees orphaned. | Background jobs are recorded as obligations; their output is stored and survives a crash; the job table resumes job numbering from the log. |
@@ -110,22 +110,22 @@ started (`tick 1`…`tick 8`) **survived the crash** with its stored output inta
 
 ## 7. Permissions and enforcement outside the agent's reach
 
-| DSH / dsh-vr finding | loom |
+| DSH / dsh-vr finding | ferret |
 |---|---|
 | Full-access mode lets the agent install Host code without a prompt; a sandbox command can plant project skills. | Harness state, keys, config and the tool set live outside the sandbox's writable area. The tool set is frozen at session start; there is no "install a tool" path for the model. |
 | "Operation not permitted" reported as a sandbox denial regardless of cause. | Tool status distinguishes `denied` (policy) from `error` (the tool ran and failed) from `invalid` (nothing ran); denials name the rule. |
-| Writes not confined to the workspace; token/keys readable. | A macOS seatbelt sandbox allows writes only under the workspace and the session temp dir, denies writes under `~/.loom` and `<workspace>/.loom`, and denies reads of `~/.loom/token` and `~/.loom/keys`. File tools also refuse writes to content changed since the session last read it (staleness guard). |
+| Writes not confined to the workspace; token/keys readable. | A macOS seatbelt sandbox allows writes only under the workspace and the session temp dir, denies writes under `~/.ferret` and `<workspace>/.ferret`, and denies reads of `~/.ferret/token` and `~/.ferret/keys`. File tools also refuse writes to content changed since the session last read it (staleness guard). |
 | dsh-vr: allowlist fails open; host guard not installed when the deny list is empty; a judge can't see the URL it judges. | Network scope is an egress proxy plus an OS sandbox that permits no other route — not shell-text parsing. Every decision is attributed to a session and logged as a `net` event; the proxy resolves the name itself and connects to the address it resolved. |
 
 **Live:** sandbox profile verified in isolation on the test machine — writes outside the workspace denied,
-writes under `.loom` denied, `~/.loom/token` unreadable, direct network denied except the proxy
+writes under `.ferret` denied, `~/.ferret/token` unreadable, direct network denied except the proxy
 port, symlink escape denied, signalling processes outside the sandbox denied. The edit mission showed
 the read-before-write staleness guard in use.
 
 ## 8. State discipline (from the dsh-vr review)
 
 dsh-vr used Markdown as a database and hit escaping bugs, newline injection, and concurrent writes
-overwriting each other. In loom, mission state is a typed, append-only, HMAC-sealed journal
+overwriting each other. In ferret, mission state is a typed, append-only, HMAC-sealed journal
 (`ledger`); Markdown is a generated view that is never parsed. Appends take an exclusive lock so ids
 are race-free across processes; a journal that fails verification refuses every further write and is
 surfaced to the operator, not repaired by the agent. Evidence records point at a `(session, call)`

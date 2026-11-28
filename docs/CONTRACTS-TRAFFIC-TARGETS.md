@@ -13,7 +13,7 @@ command is a CONNECT tunnel it cannot read. `http_send` sees whole exchanges but
 (1024 at most) and loses them at a restart. A finding therefore cannot point at the traffic that shows
 it, and nothing a mission learns about a target outlives the mission.
 
-## C. Captured exchanges (`loom-core` event, `loom-net` sink, `loom-tools` http/web/mcp, runtime)
+## C. Captured exchanges (`ferret-core` event, `ferret-net` sink, `ferret-tools` http/web/mcp, runtime)
 
 C1. **Record.** New event `Event::Exchange(Exchange)`, written to the session log:
 ```
@@ -61,27 +61,27 @@ its stored request (its cookie jar and captures are still not restored, and the 
 
 C5. **Secrets.** Bodies and headers are stored as sent: they are evidence. The UI and the API mark
 `Authorization`, `Cookie`, `Set-Cookie`, `Proxy-Authorization` and `X-Api-Key` values as sensitive and
-show them masked until revealed (part U). Proxy credentials (`Proxy-Authorization` to loom's own proxy)
+show them masked until revealed (part U). Proxy credentials (`Proxy-Authorization` to ferret's own proxy)
 are never stored.
 
-## I. HTTPS interception, opt-in (`loom-net` new module `tls.rs`, `proxy.rs`, config, packs, sandbox env)
+## I. HTTPS interception, opt-in (`ferret-net` new module `tls.rs`, `proxy.rs`, config, packs, sandbox env)
 
 I1. **Switch.** `[network] intercept = "pack"` (default) | `"always"` | `"never"`. With `"pack"`, a
 mission intercepts when its pack says `intercept = true` (set for `ctf`, `redteam`, `vr`), unless the
-mission was started with `intercept: false` (API body, `loom run --no-intercept`, a checkbox in the new
+mission was started with `intercept: false` (API body, `ferret run --no-intercept`, a checkbox in the new
 mission form); a mission of another pack can be started with `intercept: true`. The choice is recorded
 in `session_start` (`intercept: bool`) and is fixed for the mission; its children inherit it.
 
-I2. **The CA.** On first need the daemon creates `~/.loom/ca/loom-ca.pem` and `loom-ca.key` (ECDSA
-P-256, 10 years, CN "loom interception CA (this machine)", key file `0600`). `~/.loom` is never
-readable in the sandbox (already the rule), so no command can read the key. `loom ca show` prints the
-certificate and its SHA-256 fingerprint; `loom ca rotate` makes a new one (sessions started after it
+I2. **The CA.** On first need the daemon creates `~/.ferret/ca/ferret-ca.pem` and `ferret-ca.key` (ECDSA
+P-256, 10 years, CN "ferret interception CA (this machine)", key file `0600`). `~/.ferret` is never
+readable in the sandbox (already the rule), so no command can read the key. `ferret ca show` prints the
+certificate and its SHA-256 fingerprint; `ferret ca rotate` makes a new one (sessions started after it
 use it).
 
 I3. **The sandbox trusts it** only for intercepting sessions: the session's tmp dir gets
 `ca-bundle.pem` = the system roots (the first of `/etc/ssl/cert.pem`, `/etc/ssl/certs/ca-certificates.crt`,
 `/etc/pki/tls/certs/ca-bundle.crt` that exists, else the bundled webpki roots in PEM) followed by the
-loom CA, and the command environment gets `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`,
+ferret CA, and the command environment gets `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`,
 `NODE_EXTRA_CA_CERTS`, `GIT_SSL_CAINFO`, `PIP_CERT` and `AWS_CA_BUNDLE` pointing at it. Nothing is added
 to a system or user trust store.
 
@@ -100,7 +100,7 @@ matches `[network] intercept_passthrough` (globs, default empty) or the target's
   one by one (keep-alive allowed), and each request/response pair is captured (C1). If the first bytes
   are not an HTTP/1.1 request, the stream is relayed as bytes and one `Exchange` with `method:
   "TLS"`, no status and `error: "not HTTP/1.1: {n} bytes each way, not stored"` is recorded.
-- A client that refuses the loom certificate (pinning, its own trust store) fails its handshake; the
+- A client that refuses the ferret certificate (pinning, its own trust store) fails its handshake; the
   decision `client refused the interception certificate for {host}` is recorded, and the next
   `bash` result's facts say: `HTTPS to {host} was refused by the client under interception; add it to
   intercept_passthrough or use http_send`.
@@ -108,9 +108,9 @@ matches `[network] intercept_passthrough` (globs, default empty) or the target's
   only after a connection is allowed.
 
 I5. **New dependencies:** `rcgen` (with the `ring` backend, already in the lockfile), `rustls` and
-`tokio-rustls` (already in the lockfile through reqwest) as direct dependencies of `loom-net`.
+`tokio-rustls` (already in the lockfile through reqwest) as direct dependencies of `ferret-net`.
 
-## F. Findings tied to traffic (`loom-agent` gate and ledger tools, packs)
+## F. Findings tied to traffic (`ferret-agent` gate and ledger tools, packs)
 
 F1. A role with `require_traffic = true` (set on the finishing roles of `ctf`, `redteam`, `vr`) cannot
 `finish`, or `conclude` with `status: met`, while a claim the answer relies on names a network host
@@ -132,15 +132,15 @@ tools the role is shown (T1 of the steering contract).
 F3. Every claim in the ledger view and the verifier's brief shows its hosts as `reached` (with the
 `ex-` ids) or `not reached`, whatever the role, so the verifier and the operator see it too.
 
-## T. Targets shared across missions (`loom-core` new module `target.rs`, runtime, daemon, CLI)
+## T. Targets shared across missions (`ferret-core` new module `target.rs`, runtime, daemon, CLI)
 
-T1. **A target** lives in `~/.loom/targets/{name}/` (name: `[a-z0-9][a-z0-9_-]{0,63}`):
+T1. **A target** lives in `~/.ferret/targets/{name}/` (name: `[a-z0-9][a-z0-9_-]{0,63}`):
 `target.toml` with `scope = ["acme.test", "*.acme.test", "10.20.0.0/24"]`, `exclude = [...]`,
 `upstream_insecure = [...]`, `intercept_passthrough = [...]`, `notes = "..."`; and `graph.jsonl`,
-append-only and hash-chained like `net.jsonl`. Created and edited with `loom target add|show|scope|list`
+append-only and hash-chained like `net.jsonl`. Created and edited with `ferret target add|show|scope|list`
 and the API. A scope entry is a host, `*.` glob, IP or CIDR; `exclude` wins.
 
-T2. **A mission** may name one target at start (`target` in the API body, `loom run --target acme`, a
+T2. **A mission** may name one target at start (`target` in the API body, `ferret run --target acme`, a
 select in the new-mission form). Recorded in `session_start` with the scope as it was then; children
 inherit it. The target's scope is added to the mission's network allowlist (in every mode but `open`,
 where it changes nothing), and `exclude` is denied even when another rule would allow it; the start
@@ -179,24 +179,24 @@ T7. **API and CLI:** `GET /api/targets` (name, scope, counts by status), `POST /
 `GET /api/targets/{name}/graph?status=&kind=&under=` (nodes with status, missions and evidence keys;
 edges), `GET /api/exchanges/{session}?host=&after=&limit=` (a session's exchanges, newest last),
 `GET /api/targets/{name}/exchanges?node=` (exchanges of every mission of the target with that node).
-`loom target list|add|show|scope`, `loom ca show|rotate`. The SSE stream sends `{type:"target", name}`
+`ferret target list|add|show|scope`, `ferret ca show|rotate`. The SSE stream sends `{type:"target", name}`
 when a target's graph changes (at most once a second per target).
 
-## S. Stored authenticated sessions (credential profiles) (`loom-core` `creds.rs`, `loom-net` proxy injection, `loom-daemon` CLI/API)
+## S. Stored authenticated sessions (credential profiles) (`ferret-core` `creds.rs`, `ferret-net` proxy injection, `ferret-daemon` CLI/API)
 
-A credential profile lets the operator hand loom a session it is already logged into — including behind
+A credential profile lets the operator hand ferret a session it is already logged into — including behind
 2FA — once, so missions bound to a target carry that session into their in-scope requests without the
 agent ever seeing the secret. It builds on the interception+capture path (I, C) and the target scope (T).
 
-S1. **A profile** belongs to a target: `~/.loom/targets/{name}/creds/{profile}.enc` (profile name
+S1. **A profile** belongs to a target: `~/.ferret/targets/{name}/creds/{profile}.enc` (profile name
 `[a-z0-9][a-z0-9_-]{0,63}`; `default` when unnamed). Decrypted (S4) it is a list of items, each
 `{ kind: "cookie" | "header", name, value, host }` where `host` is a single in-scope host (never a
 glob). A `cookie` item is one `name=value` pair of a host's jar; a `header` item is a whole header
 value (e.g. `Authorization`). The item values are secrets (S5); nothing else in the file is.
 
-S2. **Recording a login through the proxy** (the operator, never the agent). `loom creds record
+S2. **Recording a login through the proxy** (the operator, never the agent). `ferret creds record
 --target acme [--profile default]` opens a short-lived intercepting capture session scoped to the
-target and prints one line: the proxy address and the loom CA to trust (the same CA as I2 — already
+target and prints one line: the proxy address and the ferret CA to trust (the same CA as I2 — already
 trusted inside a mission, trusted once by the operator's browser here). The operator points a browser
 at it and logs in. For every **in-scope** exchange it collects, from the request, each `Cookie` pair
 and any `Authorization` / `X-Api-Key` value, and from the response each `Set-Cookie`; it streams what
@@ -204,7 +204,7 @@ it is collecting as `host · cookie <name>` / `host · header <name>` lines, **n
 values**. On `--stop` (or Ctrl-C) it writes the profile: per in-scope host, the latest value of each
 cookie and header seen (response `Set-Cookie` overrides an earlier request `Cookie` of the same name),
 one item each, `host` = the host it was seen on. Out-of-scope traffic is dropped, not written.
-  - Scripted path (no browser): `loom creds set --target acme [--profile default] --host api.acme.test
+  - Scripted path (no browser): `ferret creds set --target acme [--profile default] --host api.acme.test
     --cookie 'session=…'` / `--header 'Authorization: Bearer …'` (repeatable). `--host` must be in the
     target scope. Same storage, same secret handling.
 
@@ -225,7 +225,7 @@ one item each, `host` = the host it was seen on. Out-of-scope traffic is dropped
     (name lines only); `POST /api/targets/{name}/creds` with `{"stop": handle}` → the profile summary.
 
 S3. **Injection.** A mission bound to a target may name one profile at start (`creds` in the API body,
-`loom run --creds default`, a select in the new-mission form; default none). Recorded in
+`ferret run --creds default`, a select in the new-mission form; default none). Recorded in
 `session_start` as the profile name and a redaction-safe summary (`default · 3 cookies, 1 header ·
 *.acme.test`), never values; children inherit it. The session grant carries the decrypted items. For
 **every forwarded request** — plain or intercepted — whose destination host equals an item's `host`
@@ -241,26 +241,26 @@ reaches the target with profile items only in an intercepting mission (the in-pr
 either way, S8). The agent names the profile; it never reads the values, and no tool, record, prompt or UI
 shows them (S5).
 
-S4. **Encryption at rest, unattended.** A daemon key at `~/.loom/keys/creds.key` (32 random bytes,
+S4. **Encryption at rest, unattended.** A daemon key at `~/.ferret/keys/creds.key` (32 random bytes,
 file `0600`, created on first need exactly like the access token and journal key; dir `0700`). Each
 profile file is `v1 || 12-byte nonce || ciphertext || tag` under `ring::aead` `CHACHA20_POLY1305`,
 with AAD = `"{target}/{profile}"` so a file cannot be moved or renamed between profiles or targets
-without failing to open. The key lives under `~/.loom` (never readable in the sandbox, like the CA key
+without failing to open. The key lives under `~/.ferret` (never readable in the sandbox, like the CA key
 and token), so the daemon decrypts profiles at start with no passphrase and an unattended run keeps
-working. This protects a reader of the targets directory, not someone who already holds `~/.loom`
+working. This protects a reader of the targets directory, not someone who already holds `~/.ferret`
 (the same trust boundary the access token and CA key already sit behind). No new dependency: `ring` is
 in the lockfile (I5); it becomes a direct dependency of the crate that owns `creds.rs`.
 
 S5. **Secrets.** On a mission start with a profile, the session's secret set
-(`loom_core::creds::Secrets`, held in `SessionTools::secrets`) gets every injected item value of at least
+(`ferret_core::creds::Secrets`, held in `SessionTools::secrets`) gets every injected item value of at least
 `Secrets::MIN_LEN` (8) bytes, and for a header value of the form `<scheme> <token>` the token as well. The set
 replaces each with `[redacted]` in every tool result's text and in every output a tool stores
-(`loom_tools::finalize`), and in the request and response blobs of every exchange the session records
+(`ferret_tools::finalize`), and in the request and response blobs of every exchange the session records
 (`Traffic::ingest`, and the exchanges in-process tools hand back). Independently of length, the request a
 capture stores is the **redacted copy**: the proxy (S3) and in-process tools (S8) record the request with each
-value loom itself added replaced by `[redacted]`, and send the real one. `net.jsonl` records no header or body,
+value ferret itself added replaced by `[redacted]`, and send the real one. `net.jsonl` records no header or body,
 so it never holds a value. A `Set-Cookie` the mission observes on its own is still stored as evidence and
-masked-until-revealed per C5; only values loom injected are redacted outright. The proxy-credential rule (C5)
+masked-until-revealed per C5; only values ferret injected are redacted outright. The proxy-credential rule (C5)
 is unchanged. The prompt is built from tool results, so it never holds a value either.
 
 S6. **Scope safety (the invariant).** The effective attach set is computed at load as, per item, its
@@ -273,9 +273,9 @@ attached to in-scope `acme.test` hosts and never to an attacker-controlled host,
 the same session. If a target's scope is later narrowed so a profile host falls outside it, that
 item stops being injected (checked at each mission start, not cached).
 
-S7. **CLI/API.** `loom creds list --target acme` (profiles with item counts and when recorded),
-`loom creds show --target acme --profile default` (item kinds, names and hosts, recorded-at — never
-values), `loom creds record|set|rm`. `POST /api/targets/{name}/creds` (record session handle / set
+S7. **CLI/API.** `ferret creds list --target acme` (profiles with item counts and when recorded),
+`ferret creds show --target acme --profile default` (item kinds, names and hosts, recorded-at — never
+values), `ferret creds record|set|rm`. `POST /api/targets/{name}/creds` (record session handle / set
 items), `GET /api/targets/{name}/creds` (`[ProfileSummary]`, no values), `GET
 /api/targets/{name}/creds/{profile}` (`{summary: ProfileSummary, items: [ItemView]}`), `DELETE
 /api/targets/{name}/creds/{profile}` (`204`; `404` when there was none). Setting items over the API:
@@ -286,7 +286,7 @@ listing the chosen target's profiles.
 
 S8. **In-process tools.** `http_send` and `web_fetch` (except requests on the reference path) apply S3 to
 each request they send themselves, with the session's items (`SessionTools::creds`), the same host equality
-and the same request-wins merging (`loom_net::inject::apply`), and record the redacted copy as the exchange's
+and the same request-wins merging (`ferret_net::inject::apply`), and record the redacted copy as the exchange's
 request. A cookie the tool's own jar holds for that host counts as one the request already sends. MCP servers
 over HTTP are never given profile items (they carry their own configured auth).
 
@@ -294,8 +294,8 @@ S9. **The in-process proxy credential.** Every session grant also carries a seco
 clients (`SessionGrant::tool_url`), with the same session, listener and policy. A request made with it is never
 intercepted, captured or injected by the proxy: the in-process tools record their own exchanges (`tls:
 "tool"`) and inject themselves (S8). So in an intercepting mission `http_send`, `web_fetch` and MCP over HTTPS
-keep verifying the real server certificate with their own roots instead of meeting the loom CA, which their
-client does not trust. Commands never get it (it is not in `env()`). `loom_tools::web::session_proxy` returns
+keep verifying the real server certificate with their own roots instead of meeting the ferret CA, which their
+client does not trust. Commands never get it (it is not in `env()`). `ferret_tools::web::session_proxy` returns
 `SessionTools::tool_proxy` when the runtime set it, else the command proxy from `ToolCtx::env` (tests and
 callers without a runtime).
 
@@ -304,7 +304,7 @@ S12. **In-process TLS to the target** (found in the live test: a self-signed in-
 to the mission target's `upstream_insecure` (T1; the lead's `TargetRef`, so every agent of the mission has it)
 for every session with a target; MCP sessions never get it. `http_send`, `http_repeat`, `web_fetch` and the
 oracle decide per request, on the request URL's host and port (`port_or_known_default`), with the same matcher
-the proxy uses (`loom_net::host_listed`, the former `intercept::listed`): a listed `https` request is sent by a
+the proxy uses (`ferret_net::host_listed`, the former `intercept::listed`): a listed `https` request is sent by a
 client that does not verify the server certificate, and its recorded exchange has `upstream_unverified: true`;
 every other request (another host, a redirect hop to another host, the reference path, `cve`/`dep_scan` lookups,
 MCP) keeps full verification. A redirect is decided again on each hop's own URL.
@@ -367,7 +367,7 @@ page; the new-mission form has a Target select.
 U5. **Credential profiles.** The target page gets a Credentials panel: one row per profile from `GET
 /api/targets/{name}/creds` (`{profile} · {n} cookies, {m} headers · {hosts} · recorded {age}`), a Show that
 lists item kind, name and host (never a value: the API sends none), a Delete with a confirm, and the two ways
-to add one as copyable commands (`loom creds record --target {name}`, `loom creds set --target {name} --host …
+to add one as copyable commands (`ferret creds record --target {name}`, `ferret creds set --target {name} --host …
 --cookie '…'`); the UI never takes a secret value itself. The new-mission form shows a Credentials select
 under Target once a target with profiles is chosen (default "none"), sent as `creds`. A mission whose
 `session_start` has `creds` shows a `creds default` chip beside the target chip with the summary as its
@@ -385,7 +385,7 @@ title, and the Session tab shows the summary line.
   the same request is a tunnel and nothing is recorded; a passthrough host is tunneled; an upstream
   with an invalid certificate and no `upstream_insecure` is refused and recorded; a non-HTTP TLS
   stream is relayed and recorded as `TLS`; the CA key is not readable from the sandbox (mirror the
-  existing `~/.loom` read test); keep-alive with two requests gives two exchanges.
+  existing `~/.ferret` read test); keep-alive with two requests gives two exchanges.
 - **F:** finish refused when a supported claim names a host no evidence reached, accepted when an
   `http_send` evidence reached it, accepted for a claim naming only a `File` asset, not gated for a
   role without `require_traffic`; the refusal text names only shown tools.
@@ -398,11 +398,11 @@ title, and the Session tab shows the summary line.
   tunnel is not intercepted); `Set-Cookie` overrides an earlier request cookie and `Max-Age=0` removes it; an
   in-scope `cookie` item is merged into a forwarded request (plain and intercepted) and the same session's
   request to an out-of-scope host is untouched; an item never overrides a cookie or header the request already
-  sends; the captured request holds `[redacted]` where loom injected and the upstream received the real value;
+  sends; the captured request holds `[redacted]` where ferret injected and the upstream received the real value;
   a response echoing an injected value is `[redacted]` in the stored exchange and in the tool result; a
   profile file round-trips through seal/open, fails to open with the wrong AAD (swapped between profiles or
   targets) or another key; the key file is 0600 in a 0700 dir; narrowing the target scope drops the
-  now-out-of-scope item at the next mission start and the summary says so; `loom creds show` and every API
+  now-out-of-scope item at the next mission start and the summary says so; `ferret creds show` and every API
   answer never hold a value (`Item`'s `Debug` neither); a mission started with `creds` records `CredsRef` (no value anywhere in its session directory) and an agent it starts attaches the same items; `creds` without `target` is refused; the tool credential is never intercepted (an
   `http_send` to an https test server works in an intercepting session) and never in a command's env;
   `http_send` injects for a matching host and records the redacted copy; with the target listing `127.0.0.1`

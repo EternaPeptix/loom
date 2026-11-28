@@ -2,7 +2,7 @@
 
 The new runtime/tools/packs are implemented features, not a demonstrated benchmark improvement.
 External harness scores, answering-context reductions and model-diversity anecdotes do not measure
-Loom. There is no vendored `loom-frontier`, Cybench, CyberGym corpus or authenticated lab deployment
+Ferret. There is no vendored `ferret-frontier`, Cybench, CyberGym corpus or authenticated lab deployment
 in this repository. Integrate those runners with their actual versioned contracts; do not fabricate
 an invocation, score or trusted acceptance endpoint.
 
@@ -16,14 +16,14 @@ be tested separately on each supported toolchain and object format.
 
 ## Paired model evaluation
 
-Pin Loom commit, model/profile/discovery metadata, reasoning/output limits, pack files, oracle
+Pin Ferret commit, model/profile/discovery metadata, reasoning/output limits, pack files, oracle
 contracts, target/source hashes, tools/container images and random seeds. Use independent fresh
 workspaces/sessions for each arm. Keep the same acceptance oracle, scope, hard deadline, token/step
 budget and verifier policy. Randomize paired order and repeat each task; do not select completed
 episodes after observing their outcome. Include exploratory and verifier model usage, all children,
 retries, fallback, tool execution and checker costs.
 
-Compare default Loom against one change at a time before the combined pack: heterogeneous fresh
+Compare default Ferret against one change at a time before the combined pack: heterogeneous fresh
 children, wrap-up/caps, typed-state projections, structured HTTP, binary tools, and the full workflow.
 Include ordinary multi-tool replies and batched bash as baselines. Keep directed tool probes separate
 from complete mission results. Separate local reasoning-model families/profile effects from harness

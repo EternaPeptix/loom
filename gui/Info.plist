@@ -3,11 +3,11 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>
-    <string>loom-desk</string>
+    <string>ferret-desk</string>
     <key>CFBundleDisplayName</key>
-    <string>loom</string>
+    <string>ferret</string>
     <key>CFBundleIdentifier</key>
-    <string>com.loom.desk</string>
+    <string>com.ferret.desk</string>
     <key>CFBundleVersion</key>
     <string>1</string>
     <key>CFBundleShortVersionString</key>
@@ -15,7 +15,7 @@
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleExecutable</key>
-    <string>loom-desk</string>
+    <string>ferret-desk</string>
     <key>LSMinimumSystemVersion</key>
     <string>14.0</string>
     <key>CFBundleIconFile</key>
@@ -30,6 +30,6 @@
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSHumanReadableCopyright</key>
-    <string>loom</string>
+    <string>ferret</string>
 </dict>
 </plist>

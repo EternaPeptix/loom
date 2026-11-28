@@ -24,14 +24,14 @@ framework. `core.js` owns pure state and presentation decisions; `app.js` owns D
   carry the meaning, and each state has its own shape so it is not told apart by colour alone.
 - **Authentication** is a bearer secret; there is no cookie. The page and its three assets need no
   authentication; every `/api` request does, except the code exchange `POST /api/web-sessions`, where
-  the login code is the credential. `loom open` (or loom-desk) opens the page as
+  the login code is the credential. `ferret open` (or ferret-desk) opens the page as
   `/#code=<login code>`: at load the page takes the single-use code from the fragment, removes the
   fragment with `history.replaceState`, and trades the code for a web-session secret
   (`POST /api/web-sessions {code}` → `{secret}`). The secret is kept in `sessionStorage` (in memory
   when storage is blocked) and sent as `Authorization: Bearer <secret>` on every request, event
   stream included; every `fetch` uses `credentials: "omit"`. With no code and no stored secret, or
-  on a `401` anywhere, the page is replaced with: `This page is not signed in. Run "loom open"
-  again.` Web-session secrets live in the daemon's memory, so a daemon restart needs `loom open`
+  on a `401` anywhere, the page is replaced with: `This page is not signed in. Run "ferret open"
+  again.` Web-session secrets live in the daemon's memory, so a daemon restart needs `ferret open`
   again.
 
 ## Missions and navigation
@@ -92,11 +92,11 @@ running. Token counts and step counters are run details rather than a measure of
 The New mission form (`#/new`) has an optional *Recall earlier missions* field: mission ids separated by
 spaces or commas (at most 8). They are sent as `prior` (`core.buildNewSession`); the daemon checks that each
 mission exists, and the new lead starts with one note of what those missions recorded in their sealed
-ledgers (`loom_agent::prior`), visible in its record like any harness note.
+ledgers (`ferret_agent::prior`), visible in its record like any harness note.
 
 Routes are `#/s/<id>/chat`, `/overview` and `/evidence`. `#/s/<id>` and `/chat` open Chat, the
 default tab; the earlier `/record` is accepted and rewritten to `/chat` with `history.replaceState`.
-loom-desk opens `#/s/<id>`, which keeps working. `#/inbox` and `#/new` retain their meaning. Browser
+ferret-desk opens `#/s/<id>`, which keeps working. `#/inbox` and `#/new` retain their meaning. Browser
 Back/Forward restores the selected mission view.
 
 The sidebar header holds the connection dot, a short connection word (`Live`, `Connecting…`,
@@ -165,8 +165,8 @@ ones stay listed below them. Tab-scoped `sessionStorage` holds only the sign-in 
 record seen per session (`activity.<id>`, which keeps ages across a reload) and the inspector width. The
 switcher, Find, notifications, Agents and the progress line store nothing; message and answer text stays
 in memory. The one thing kept beyond the tab is the **Copy on select** preference: `localStorage` key
-`loom_copy_on_select` (`"1"` when on, absent when off), read and written inside `try`/`catch` so a blocked
-store only means the choice lasts for the page load. loom-desk uses a non-persistent data store, so there
+`ferret_copy_on_select` (`"1"` when on, absent when off), read and written inside `try`/`catch` so a blocked
+store only means the choice lasts for the page load. ferret-desk uses a non-persistent data store, so there
 the preference lasts until the app quits.
 
 Evidence lists claims with their recorded status, source quotes and remaining notes, and can be
@@ -288,12 +288,12 @@ inside a field, for one that is not wholly in those places, or twice for the sam
 between the same two points; deselecting or selecting something else starts over). The decision is
 `copyOnSelectDecision` in `core.js`; with the preference off no selection is read.
 
-**loom-desk.** The web pane is a plain `WKWebView` on a loopback `http` origin with a non-persistent data
+**ferret-desk.** The web pane is a plain `WKWebView` on a loopback `http` origin with a non-persistent data
 store, and `WebPane.swift` injects no script and sets no preference, so the page's own clipboard calls are
 what run. Checked with a stand-alone `WKWebView` configured the same way (non-persistent store, `http://127.0.0.1`
 page): `isSecureContext` is true, `navigator.clipboard.writeText` is present and resolves, and
 `document.execCommand("copy")` is supported and returns true. That probe ran page script from the app,
-not a real click inside loom-desk (and run as injected script, which WebKit treats as a user gesture), so what is confirmed is that the API is offered and allowed; the fallback
+not a real click inside ferret-desk (and run as injected script, which WebKit treats as a user gesture), so what is confirmed is that the API is offered and allowed; the fallback
 (selection plus the copy command, then selected-for-Ctrl+C) is there for a build that refuses. The CSP needs no
 change (neither call is a script, style or request), and the purity tests allow exactly one clipboard use and one
 copy command, both inside `copyText`. No Swift change was needed.
@@ -526,7 +526,8 @@ light/dark appearance and reduced-motion support. Avoid dependence on color or h
   the models again. A lead that starts no agents shows only its own model.
 
 The new-mission form's **Agents' model** sends `role_models: {"*": profile}`; it is disabled unless
-the role is `lead`, the only form role that starts agents.
+the chosen role starts agents (`starts_agents` in `GET /api/packs`; `lead` when that route is missing). The
+form's Pack menu sends `pack` unless it is `core`.
 
 ## Stored output dialog
 
@@ -569,9 +570,9 @@ node tools/ui-preview.mjs
 ```
 
 Open the printed loopback URL, `/#code=facefeedfacefeed`: the fixture answers `POST /api/web-sessions` for
-that code, so the page signs in as it would from `loom open` (alternatively set the `sessionStorage`
+that code, so the page signs in as it would from `ferret open` (alternatively set the `sessionStorage`
 secret `fixture-secret` and open `/#/s/s-audit`). The fixture contains three workspaces
-(`/fixture/loom`, `/fixture/indexer`, `/fixture/docs`) and three model profiles with different
+(`/fixture/ferret`, `/fixture/indexer`, `/fixture/docs`) and three model profiles with different
 context windows: `dsv41` (1M), `qwen` (`qwen4-max-preview`, 262k) and `necromicon` (128k), the last
 reported unreachable by `/api/status` and `GET /api/models`. Its sessions are a mission lead with a
 blocking question that switched from `necromicon` to `dsv41` mid-record, a running agent nested under
@@ -790,14 +791,14 @@ request reads "Approved · hosts granted: …", a refused one "Refused".
   folder above it that can, and says so. In a folder with no subfolders Backspace and Alt+Up still go up (focus is on **Up one folder**). Escape closes and returns focus to Browse.
 - **Files tab** (`#tab-files`, and the header's `#b-files`; `GET /api/sessions/{id}/files?path=`): the session's workspace as
   breadcrumbs and a list read one folder at a time, on opening and on **Refresh** only (no polling). Keys as in the picker (in an empty folder focus is on the current crumb, and Backspace, Left and Alt+Up go up from there); a
-  filter over the loaded entries; Show hidden (the daemon's `hidden` flag); links, non-files and the root's `.loom` (the
+  filter over the loaded entries; Show hidden (the daemon's `hidden` flag); links, non-files and the root's `.ferret` (the
   entry the daemon marks with a `note`) are listed but closed, each with its reason; a folder the daemon cannot list
-  shows the daemon's sentence (409) in the status line. The root's `.loom` stays closed, but `.loom/uploads` and what lies
+  shows the daemon's sentence (409) in the status line. The root's `.ferret` stays closed, but `.ferret/uploads` and what lies
   under it can be typed as a path, listed and read (`docs/UPLOADS.md`). The tab's DOM is built once per session, so a redraw never loses the filter or the focus.
 - **A file in the viewer** (`GET …/files/lines?path=&start=&count=`): the stored-output dialog in file mode: the relative path,
   size and age in the header, "File in the workspace now — it may have changed since the agent read it", Go to line and Find
   in loaded lines, **Copy path** (the absolute path), no citation marks. A binary file says so and shows no lines; a refusal
-  (over the 32 MiB cap, a link, `.loom`; all 409) shows the daemon's sentence. The route's status codes: 404 for a
+  (over the 32 MiB cap, a link, `.ferret`; all 409) shows the daemon's sentence. The route's status codes: 404 for a
   missing path or session, 409 for every other refusal, 400 for a bad query.
 - **Open file** on a tool row (inside the expanded row) shows the Files tab at that path when the call's `path`, `file_path`
   or `file` is inside the workspace; the entry is selected, and a missing one is said.
@@ -805,7 +806,7 @@ request reads "Approved · hosts granted: …", a refused one "Refused".
 ## Pass 3: changes, plan and stop where the eyes are
 
 Compared against the other agent GUIs (Claude Code, Codex, Cursor, Devin, Copilot, OpenHands, Cline, Kilo, Zed, Amp, Antigravity,
-Goose, Warp, Factory) in November 2026; these are the patterns most of them share that loom lacked.
+Goose, Warp, Factory) in November 2026; these are the patterns most of them share that ferret lacked.
 
 - An edit or write row says how much it changed ("+3 −2") in its head, and its expanded output colours the unified diff the tool
   returned: added lines green, removed red, hunk headers blue, the tool's own `[...]` header and footer dim. Only the look
@@ -838,7 +839,7 @@ An `exchange` record is one captured request and its response. The record store 
 - Opening an exchange shows `dialog#exview`: the request on one side and the response on the other, each fetched from its stored message. A call with no response says why (the error) instead of showing an empty side.
 - Headers named in C5 (`Authorization`, `Cookie`, `Set-Cookie`, `Proxy-Authorization`, `X-Api-Key`) show `•••••••• hidden`. The Reveal secrets button (`#exview-reveal`, `aria-pressed`) shows them for that viewer only; closing the dialog hides them again. Bodies over 64 KiB show their first part with a sentence saying so.
 - The inspector's Network tab lists the session's exchanges under the allow and refuse decisions, with a host filter and a status filter and a line saying how many of how many are shown.
-- A claim in the Claims view lists the hosts it names (the same rule as `claim_hosts` in `crates/loom-core/src/target.rs`, in `core.js` as `claimHosts`): `reached · ex-…` when attested supporting evidence cites a call (or quotes a stored message) that got a response from that host, the id being a link that opens the exchange; `not reached`, in amber, when none did.
+- A claim in the Claims view lists the hosts it names (the same rule as `claim_hosts` in `crates/ferret-core/src/target.rs`, in `core.js` as `claimHosts`): `reached · ex-…` when attested supporting evidence cites a call (or quotes a stored message) that got a response from that host, the id being a link that opens the exchange; `not reached`, in amber, when none did.
 
 Fixture: `#/s/s-fl-web/chat` has one `http_send` with two exchanges (a redirect and its target), a `curl` the proxy captured over plain HTTP, one intercepted HTTPS `curl` (`tls: intercepted`), and one request whose upstream refused. Its mission's claims `c2` (reached) and `c3` (admin.acme.test not reached) are on the Evidence section.
 

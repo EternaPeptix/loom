@@ -1,0 +1,1084 @@
+//! Running the daemon, and starting it in the background.
+//!
+//! CONTRACT.
+//!
+//! ## `run(paths)` — the body of `ferret daemon`
+//! 0. Raise the soft limit on open files to the smaller of the hard limit and 16384
+//!    (`libc::getrlimit` / `setrlimit` with `RLIMIT_NOFILE`; a failure is ignored). A process
+//!    started by launchd or over ssh gets 256, and every running session holds a log, pipes for
+//!    its commands and sockets to the model server, so a busy daemon would otherwise start failing
+//!    with "Too many open files" in the middle of missions.
+//! 1. `prepare_home(paths)`: create the home and its top-level directories `keys/`, `sessions/`, `missions/`,
+//!    `blobs/` and `logs/` with mode 0700, and tighten any of them that exists with a group or other permission
+//!    bit to 0700 (`Paths::ensure_private_layout`; files inside are left as they are). Take an exclusive,
+//!    non-blocking lock on `<home>/daemon.lock` (created 0600) and hold it
+//!    until `run` returns (the process exits): when it is taken, another daemon drives this home and the
+//!    answer is the "already running" sentence below (pid and address from `daemon.json` when it is readable
+//!    and its pid is alive; otherwise the sentence says the daemon is starting and its address is not written yet).
+//!    `Config::load(paths.config_file())`, then
+//!    `check()`; an error is returned as `{path}: {error}`. Then `check_model_keys(paths.model_keys_dir())`;
+//!    its error is returned as it is (the key files are read again by the model clients in step 5).
+//! 2. If `daemon.json` exists and its `pid` is alive (`libc::kill(pid, 0)` succeeds or fails with
+//!    `EPERM`) and `GET http://{bind}/healthz` answers within 2 s: return `A ferret daemon is already
+//!    running for {home} (pid {pid}, {bind}).` A stale file is removed.
+//! 3. `auth::load_or_create_token(paths.token_file())`.
+//! 4. Bind `config.daemon.bind` (`TcpListener`; `SO_REUSEADDR`). A failure is `Cannot listen on
+//!    {bind}: {error}.` The port actually bound is the port used everywhere below (so port 0
+//!    works, for tests).
+//! 5. `Runtime::start(config, paths)`, with `config.sandbox.daemon_port` set to the port bound, so that no
+//!    sandboxed command can connect to this daemon (a `ferret open` login code on another process's
+//!    command line could otherwise be redeemed).
+//! 6. Write `daemon.json` (`DaemonFile`, atomically). Log one line at info level with the address.
+//! 7. Serve `api::router` until SIGINT, SIGTERM, or the state's `shutdown` token (graceful
+//!    shutdown: stop accepting, give open requests 3 s — event streams are simply dropped).
+//! 8. `runtime.shutdown().await`, remove `daemon.json`, return `Ok(())`.
+//!
+//! Logging: `tracing_subscriber` to stderr, level from `FERRET_LOG` (default `info`), installed once
+//! (`try_init`, an error ignored). Nothing is ever logged that contains the token.
+//!
+//! `run_until(paths, stop)` is `run` with one more reason to stop (for tests): `stop` cancelled.
+//! It calls `ready(bind)` once, after step 6.
+//!
+//! ## `spawn_background(paths)` — the body of `ferret up`
+//! If the daemon already answers (`healthz` on the configured bind; when the token file exists the listener must also
+//! prove it holds the token, `/healthz?nonce=`, unless `--unverified-daemon`): `Ok(Already)`. A listener that answers
+//! without the proof is refused with the identity sentence (no child is started, `daemon.json` is left alone; the
+//! same in `run_until`). Otherwise `prepare_home(paths)` (as in step 1 of `run`) and start
+//! `std::env::current_exe()` with the single argument `daemon` and only the environment
+//! `daemon_env(&config, std::env::vars_os(), &paths.home)` (`env_clear` first), stdin `/dev/null`, stdout and stderr appended to `{logs}/ferretd.log` (`open_daemon_log`: created 0600 when
+//! missing), in its own session (`pre_exec` + `libc::setsid`) so it outlives the terminal. Then poll `healthz` every 100 ms for
+//! up to 20 s. If the child exits first or the time runs out: `Err` with `The daemon did not come
+//! up. Last lines of {log}:` followed by the log's last 15 lines.
+//!
+//! ## `daemon_env(config, parent, home)` — the environment `ferret up` gives the daemon
+//! From `parent` (`ferret up`'s own variables, `OsString` pairs, values kept as they are), only the
+//! variables named `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `LANG`, `TZ`, `TMPDIR`, `FERRET_LOG`,
+//! `RUST_BACKTRACE`, any name that starts with `LC_`, every model profile's `api_key_env`, and every
+//! `sandbox.env_pass` name; then `FERRET_HOME` = `home` (replacing one from `parent`). Nothing else: a
+//! secret exported in the shell (`GITHUB_TOKEN`, `AWS_*`, …), proxy variables and loader variables
+//! (`DYLD_*`) do not reach the daemon, where any command could read them from the environment the
+//! daemon was started with (macOS `KERN_PROCARGS2`) and where commands and the notify command would
+//! inherit them. The `api_key_env` variables are kept so that existing configurations keep working;
+//! `Config::key_env_warnings` says what that exposes. A daemon started by launchd gets the plist's
+//! variables (below) and launchd's own, and a `ferret daemon` run straight from a shell keeps that
+//! shell's whole environment: neither is changed, and the start warnings (runtime) name the variables in
+//! it that look like secrets.
+//!
+//! ## `launch_agent_plist(exe, home)` — for `ferret service install` (macOS)
+//! A LaunchAgent property list with `Label` [`SERVICE_LABEL`], `ProgramArguments` `[exe, "daemon"]`,
+//! `EnvironmentVariables` `{FERRET_HOME: home, PATH: /usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin}`,
+//! `RunAtLoad` true, `KeepAlive` `{SuccessfulExit: false}`, `ProcessType` `Background`,
+//! `SoftResourceLimits` `{NumberOfFiles: 16384}`,
+//! `StandardOutPath` and `StandardErrorPath` `{home}/logs/ferretd.log`. Every inserted string is
+//! XML-escaped (`&`, `<`, `>`).
+//!
+//! Tests required: `run_until` over a temporary home with port 0 and a `MockServer`-backed config:
+//! `ready` fires, `daemon.json` exists and names the bound port (and the runtime's `config.sandbox.daemon_port`
+//! is that port), `/healthz` answers, the token file
+//! is 0600; cancelling `stop` returns `Ok` and removes `daemon.json`; a second `run` against a live
+//! first one is refused with the sentence above; a stale `daemon.json` is replaced; an invalid
+//! config is reported with its path; the plist (escaping, both paths present); `prepare_home` tightens a
+//! 0755 home and makes the top-level directories 0700; a profile whose key file is missing stops `run_until`
+//! with a sentence naming the profile and the file. `daemon_env`: keeps each listed name, an `LC_` name, a
+//! profile's `api_key_env` and an `env_pass` name; drops `GITHUB_TOKEN`, `AWS_SECRET_ACCESS_KEY`,
+//! `HTTP_PROXY`, `ALL_PROXY`, `DYLD_INSERT_LIBRARIES` and an unlisted `FOO`; sets `FERRET_HOME` over a
+//! parent's. `daemon_command(program, config, home)` (the `Command` `spawn_background` starts from, before
+//! it adds the argument, stdio and `setsid`), run with `/usr/bin/env` as `program`, prints exactly
+//! `daemon_env`'s variables, so `env_clear` is in force.
+
+use crate::api::{self, ApiState};
+use crate::auth;
+use crate::wire::{DaemonFile, SignalHealth};
+use ferret_agent::runtime::Runtime;
+use ferret_core::config::{Config, ConfigError, Paths};
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
+use std::future::IntoFuture;
+use std::net::SocketAddr;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio_util::sync::CancellationToken;
+
+/// The soft limit on open files the daemon asks for.
+const NOFILE_TARGET: libc::rlim_t = 16_384;
+/// What macOS accepts as a soft limit when the hard limit is unlimited.
+const NOFILE_MACOS_CAP: libc::rlim_t = 10_240;
+/// How long open requests get to finish after a stop is asked for.
+const GRACE: Duration = Duration::from_secs(3);
+/// How long an existing daemon has to answer `/healthz`.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long `spawn_background` waits for the new daemon.
+const UP_TIMEOUT: Duration = Duration::from_secs(20);
+const UP_POLL: Duration = Duration::from_millis(100);
+const LOG_TAIL_LINES: usize = 15;
+const DAEMON_FILE: &str = "daemon.json";
+const LOCK_FILE: &str = "daemon.lock";
+
+/// launchd label of the daemon's LaunchAgent.
+pub const SERVICE_LABEL: &str = "dev.ferret.daemon";
+
+/// How `spawn_background` found or left things.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Spawned {
+    /// A daemon was already answering.
+    Already,
+    Started,
+}
+
+/// Run the daemon until it is told to stop.
+pub async fn run(paths: Paths) -> Result<(), String> {
+    run_until(paths, CancellationToken::new(), |_| {}).await
+}
+
+/// `run`, also stopping when `stop` is cancelled; `ready` is called with the bound address.
+pub async fn run_until(paths: Paths, stop: CancellationToken, ready: impl FnOnce(&str) + Send) -> Result<(), String> {
+    raise_open_files_limit();
+    init_logging();
+
+    prepare_home(&paths)?;
+    let _home_lock = take_home_lock(&paths)?;
+    let mut config = load_config(&paths)?;
+    config.check_model_keys(&paths.model_keys_dir())?;
+    ferret_tools::sandbox::preflight(&config.sandbox)?;
+
+    if let Some(file) = read_daemon_file(&paths) {
+        if pid_alive(file.pid) {
+            match probe(&paths, &file.bind, PROBE_TIMEOUT).await {
+                Probe::Daemon => {
+                    return Err(format!(
+                        "A ferret daemon is already running for {} (pid {}, {}).",
+                        paths.home.display(),
+                        file.pid,
+                        file.bind
+                    ));
+                }
+                // Something live holds the address and may be an older daemon: leave its `daemon.json` alone.
+                Probe::Unproven => return Err(crate::client::unproven_message(&file.bind)),
+                Probe::Nothing => {}
+            }
+        }
+        // The process that wrote it is gone, or it no longer serves.
+        let _ = std::fs::remove_file(daemon_file_path(&paths));
+    }
+
+    let token = auth::load_or_create_token(&paths.token_file())
+        .map_err(|e| format!("{}: {e}", paths.token_file().display()))?;
+
+    let listener = bind_listener(&config.daemon.bind).await?;
+    let local = listener.local_addr().map_err(|e| format!("Cannot listen on {}: {e}.", config.daemon.bind))?;
+    let bind = local.to_string();
+    let port = local.port();
+
+    // No sandboxed command may connect to this daemon, whatever else the sandbox allows.
+    config.sandbox.daemon_port = Some(port);
+    let signal_cfg = config.signal.clone();
+    let runtime = Runtime::start(config, paths.clone()).await?;
+
+    let started_ms = ferret_core::now_ms();
+    let file = DaemonFile { pid: std::process::id(), bind: bind.clone(), started_ms };
+    if let Err(e) = write_daemon_file(&paths, &file) {
+        runtime.shutdown().await;
+        return Err(format!("Cannot write {}: {e}.", daemon_file_path(&paths).display()));
+    }
+    let shutdown = CancellationToken::new();
+    let signal_health = Arc::new(SignalHealth::from_config(&signal_cfg));
+    let signal_task = crate::signal::spawn_bridge(
+        signal_cfg,
+        runtime.clone(),
+        paths.home.join("signal_sent.json"),
+        signal_health.clone(),
+        shutdown.clone(),
+    );
+    let state = ApiState {
+        runtime: runtime.clone(),
+        token: Arc::new(token),
+        bind: bind.clone(),
+        port,
+        started_ms,
+        shutdown: shutdown.clone(),
+        logins: Arc::new(auth::Logins::new()),
+        signal_health,
+    };
+    tracing::info!("ferret daemon listening on http://{bind} (home {})", paths.home.display());
+    ready(&bind);
+    let begin = CancellationToken::new();
+    let server = axum::serve(listener, api::router(state)).with_graceful_shutdown({
+        let begin = begin.clone();
+        async move { begin.cancelled().await }
+    });
+    let mut server = Box::pin(server.into_future());
+    let stopping = async {
+        tokio::select! {
+            _ = stop.cancelled() => {}
+            _ = shutdown.cancelled() => {}
+            _ = os_signal() => {}
+        }
+        // Streams end on the token; the server stops accepting and waits for the rest.
+        shutdown.cancel();
+        begin.cancel();
+        tokio::time::sleep(GRACE).await;
+    };
+    tokio::select! {
+        result = &mut server => {
+            if let Err(e) = result {
+                tracing::error!("the HTTP server stopped: {e}");
+            }
+        }
+        _ = stopping => tracing::info!("open requests did not finish within {} s; dropping them", GRACE.as_secs()),
+    }
+    drop(server);
+
+    shutdown.cancel();
+    if let Some(task) = signal_task {
+        let _ = tokio::time::timeout(GRACE, task).await;
+    }
+    runtime.shutdown().await;
+    let _ = std::fs::remove_file(daemon_file_path(&paths));
+    tracing::info!("ferret daemon stopped");
+    Ok(())
+}
+
+/// Create the home and its top-level directories as private (0700), tightening ones left looser by an earlier
+/// version or by an operator who created them first.
+pub fn prepare_home(paths: &Paths) -> Result<(), String> {
+    paths
+        .ensure_private_layout()
+        .map_err(|e| format!("Cannot prepare {} as a private directory: {e}.", paths.home.display()))
+}
+
+/// The daemon's log, `{logs}/ferretd.log`, opened for appending and created 0600 when it is missing. Returns its path
+/// with the file.
+pub fn open_daemon_log(paths: &Paths) -> Result<(PathBuf, std::fs::File), String> {
+    let log = paths.logs_dir().join("ferretd.log");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(&log)
+        .map_err(|e| format!("Cannot open {}: {e}.", log.display()))?;
+    Ok((log, file))
+}
+
+/// Variables of `ferret up`'s environment that the daemon keeps, besides `LC_*`, the profiles' `api_key_env` and
+/// `sandbox.env_pass`.
+const DAEMON_ENV_KEEP: &[&str] =
+    &["PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "TZ", "TMPDIR", "FERRET_LOG", "RUST_BACKTRACE"];
+
+/// The environment `ferret up` gives the daemon: from `parent` only the variables of `DAEMON_ENV_KEEP`, those
+/// starting with `LC_`, every profile's `api_key_env` and every `sandbox.env_pass` name; then `FERRET_HOME` =
+/// `home`. Nothing else, so a secret exported in the shell does not become readable by commands through the
+/// daemon's environment.
+pub fn daemon_env(
+    config: &Config,
+    parent: impl IntoIterator<Item = (OsString, OsString)>,
+    home: &Path,
+) -> BTreeMap<OsString, OsString> {
+    let mut named: BTreeSet<&str> = DAEMON_ENV_KEEP.iter().copied().collect();
+    named.extend(config.models.values().filter_map(|p| p.api_key_env.as_deref()));
+    named.extend(config.sandbox.env_pass.iter().map(String::as_str));
+    let mut env: BTreeMap<OsString, OsString> = parent
+        .into_iter()
+        .filter(|(name, _)| name.as_bytes().starts_with(b"LC_") || name.to_str().is_some_and(|n| named.contains(n)))
+        .collect();
+    env.insert("FERRET_HOME".into(), home.as_os_str().to_owned());
+    env
+}
+
+/// The `Command` for the daemon's program before `spawn_background` adds the argument, stdio and `setsid`:
+/// an empty environment plus `daemon_env` of this process's.
+pub fn daemon_command(program: &Path, config: &Config, home: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new(program);
+    command.env_clear().envs(daemon_env(config, std::env::vars_os(), home));
+    command
+}
+
+/// Start the daemon in the background and wait until it answers.
+pub async fn spawn_background(paths: &Paths) -> Result<Spawned, String> {
+    let config = load_config(paths)?;
+    if answering(paths, &config).await? {
+        return Ok(Spawned::Already);
+    }
+    prepare_home(paths)?;
+    let (log, out) = open_daemon_log(paths)?;
+    let err = out.try_clone().map_err(|e| format!("Cannot open {}: {e}.", log.display()))?;
+    let exe = std::env::current_exe().map_err(|e| format!("Cannot find the ferret program to start: {e}."))?;
+    let mut command = daemon_command(&exe, &config, &paths.home);
+    command.arg("daemon").stdin(Stdio::null()).stdout(out).stderr(err);
+    // SAFETY: the closure only calls `setsid`, which is async-signal-safe.
+    unsafe {
+        command.pre_exec(|| if libc::setsid() < 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) });
+    }
+    let mut child = command.spawn().map_err(|e| format!("Cannot start {}: {e}.", exe.display()))?;
+
+    let deadline = Instant::now() + UP_TIMEOUT;
+    loop {
+        if let Some(file) = read_daemon_file(paths) {
+            if file.pid == child.id() && probe(paths, &file.bind, PROBE_TIMEOUT).await == Probe::Daemon {
+                return Ok(Spawned::Started);
+            }
+        }
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                // It may have lost a race with another daemon that is now up.
+                if answering(paths, &config).await? {
+                    return Ok(Spawned::Already);
+                }
+                return Err(did_not_come_up(&log));
+            }
+            Ok(None) => {}
+            Err(_) => return Err(did_not_come_up(&log)),
+        }
+        if Instant::now() >= deadline {
+            return Err(did_not_come_up(&log));
+        }
+        tokio::time::sleep(UP_POLL).await;
+    }
+}
+
+pub fn launch_agent_plist(exe: &Path, home: &Path) -> String {
+    let logs = home.join("logs").join("ferretd.log");
+    let string = |s: &str| format!("<string>{}</string>", xml_escape(s));
+    let key = |k: &str| format!("<key>{}</key>", xml_escape(k));
+    let exe = exe.to_string_lossy();
+    let home_text = home.to_string_lossy();
+    let logs = logs.to_string_lossy();
+    let mut out = String::new();
+    out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    out.push_str(
+        "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n",
+    );
+    out.push_str("<plist version=\"1.0\">\n<dict>\n");
+    out.push_str(&format!("  {}\n  {}\n", key("Label"), string(SERVICE_LABEL)));
+    out.push_str(&format!(
+        "  {}\n  <array>\n    {}\n    {}\n  </array>\n",
+        key("ProgramArguments"),
+        string(&exe),
+        string("daemon")
+    ));
+    out.push_str(&format!(
+        "  {}\n  <dict>\n    {}\n    {}\n    {}\n    {}\n  </dict>\n",
+        key("EnvironmentVariables"),
+        key("FERRET_HOME"),
+        string(&home_text),
+        key("PATH"),
+        string("/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin")
+    ));
+    out.push_str(&format!("  {}\n  <true/>\n", key("RunAtLoad")));
+    out.push_str(&format!(
+        "  {}\n  <dict>\n    {}\n    <false/>\n  </dict>\n",
+        key("KeepAlive"),
+        key("SuccessfulExit")
+    ));
+    out.push_str(&format!("  {}\n  {}\n", key("ProcessType"), string("Background")));
+    out.push_str(&format!(
+        "  {}\n  <dict>\n    {}\n    <integer>{NOFILE_TARGET}</integer>\n  </dict>\n",
+        key("SoftResourceLimits"),
+        key("NumberOfFiles")
+    ));
+    out.push_str(&format!("  {}\n  {}\n", key("StandardOutPath"), string(&logs)));
+    out.push_str(&format!("  {}\n  {}\n", key("StandardErrorPath"), string(&logs)));
+    out.push_str("</dict>\n</plist>\n");
+    out
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+// ---------------------------------------------------------------------------------------------
+// Helpers
+
+/// Ask for a bigger soft limit on open files; a failure is ignored.
+fn raise_open_files_limit() {
+    let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    // SAFETY: `limit` is a valid, writable `rlimit`.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return;
+    }
+    let want: libc::rlim_t = limit.rlim_max.min(NOFILE_TARGET);
+    if limit.rlim_cur >= want {
+        return;
+    }
+    for target in [want, want.min(NOFILE_MACOS_CAP)] {
+        let new = libc::rlimit { rlim_cur: target, rlim_max: limit.rlim_max };
+        // SAFETY: `new` is a valid `rlimit`.
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &new) } == 0 {
+            return;
+        }
+    }
+}
+
+/// Log to stderr, level from `FERRET_LOG` (default `info`). Installed once; an error is ignored.
+fn init_logging() {
+    let filter = tracing_subscriber::EnvFilter::try_from_env("FERRET_LOG")
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).try_init();
+}
+
+fn load_config(paths: &Paths) -> Result<Config, String> {
+    let path = paths.config_file();
+    let describe = |e: ConfigError| match e {
+        // Already begins with the path.
+        ConfigError::Parse { .. } => e.to_string(),
+        other => format!("{}: {other}", path.display()),
+    };
+    let config = Config::load(&path).map_err(describe)?;
+    config.check().map_err(describe)?;
+    Ok(config)
+}
+
+fn daemon_file_path(paths: &Paths) -> PathBuf {
+    paths.home.join(DAEMON_FILE)
+}
+
+fn read_daemon_file(paths: &Paths) -> Option<DaemonFile> {
+    let text = std::fs::read_to_string(daemon_file_path(paths)).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// Write `daemon.json` by writing a sibling file and renaming it over.
+fn write_daemon_file(paths: &Paths, file: &DaemonFile) -> std::io::Result<()> {
+    use std::io::Write;
+    let text = serde_json::to_string_pretty(file).map_err(std::io::Error::other)?;
+    let target = daemon_file_path(paths);
+    let tmp = paths.home.join(format!(".{DAEMON_FILE}.{}.tmp", std::process::id()));
+    let result = (|| {
+        let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        f.write_all(b"\n")?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, &target)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// True when a process with this pid exists (it may belong to someone else).
+fn pid_alive(pid: u32) -> bool {
+    let Ok(pid) = i32::try_from(pid) else { return false };
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: signal 0 only checks that the process exists.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// The pid `daemon.json` names, when that process is alive.
+pub(crate) fn live_daemon_pid(paths: &Paths) -> Option<u32> {
+    read_daemon_file(paths).map(|f| f.pid).filter(|&pid| pid_alive(pid))
+}
+
+/// What answers on an address, as far as this home's daemon goes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Probe {
+    /// This home's daemon (or, with `--unverified-daemon`, a listener that cannot prove it is not).
+    Daemon,
+    /// Something answers `/healthz` but did not prove it holds this home's access token.
+    Unproven,
+    /// Nothing answers.
+    Nothing,
+}
+
+/// Ask `GET http://{bind}/healthz` within `timeout`. When this home has an access token the listener must prove it
+/// holds it (`/healthz?nonce=`): any other listener on the address is not "the daemon". `allow_unverified`
+/// (`--unverified-daemon`) accepts one that cannot prove it (a daemon from before the proof), with a warning.
+async fn probe_with(paths: &Paths, bind: &str, timeout: Duration, allow_unverified: bool) -> Probe {
+    let Ok(client) = reqwest::Client::builder().no_proxy().timeout(timeout).build() else { return Probe::Nothing };
+    let token = std::fs::read_to_string(paths.token_file()).map(|t| t.trim().to_string()).unwrap_or_default();
+    if token.is_empty() {
+        return match client.get(format!("http://{bind}/healthz")).send().await {
+            Ok(response) if response.status().is_success() => Probe::Daemon,
+            _ => Probe::Nothing,
+        };
+    }
+    match crate::client::daemon_proves_identity(&client, &format!("http://{bind}"), &token, timeout).await {
+        Ok(true) => Probe::Daemon,
+        Ok(false) if allow_unverified => {
+            crate::client::warn_unverified(bind);
+            Probe::Daemon
+        }
+        Ok(false) => Probe::Unproven,
+        Err(_) => Probe::Nothing,
+    }
+}
+
+async fn probe(paths: &Paths, bind: &str, timeout: Duration) -> Probe {
+    probe_with(paths, bind, timeout, crate::client::unverified_daemon_allowed()).await
+}
+
+/// Whether this home's daemon answers: at the address in `daemon.json`, or the configured one. `Err` is the sentence
+/// for a listener that answers but would not prove itself, when no proven daemon answers anywhere.
+async fn answering(paths: &Paths, config: &Config) -> Result<bool, String> {
+    let mut unproven = None;
+    if let Some(file) = read_daemon_file(paths) {
+        if pid_alive(file.pid) {
+            match probe(paths, &file.bind, PROBE_TIMEOUT).await {
+                Probe::Daemon => return Ok(true),
+                Probe::Unproven => unproven = Some(file.bind),
+                Probe::Nothing => {}
+            }
+        }
+    }
+    match probe(paths, &config.daemon.bind, PROBE_TIMEOUT).await {
+        Probe::Daemon => Ok(true),
+        Probe::Unproven => Err(crate::client::unproven_message(&config.daemon.bind)),
+        Probe::Nothing => unproven.map_or(Ok(false), |bind| Err(crate::client::unproven_message(&bind))),
+    }
+}
+
+/// Take the exclusive lock on `<home>/daemon.lock`; the returned file holds it until it is dropped. A lock that
+/// another daemon holds is answered with the "already running" sentence.
+pub(crate) fn take_home_lock(paths: &Paths) -> Result<std::fs::File, String> {
+    use std::os::fd::AsRawFd;
+    let path = paths.home.join(LOCK_FILE);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|e| format!("Cannot open {}: {e}.", path.display()))?;
+    // SAFETY: flock on a descriptor this function owns.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(file);
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() != Some(libc::EWOULDBLOCK) {
+        return Err(format!("Cannot lock {}: {err}.", path.display()));
+    }
+    // A daemon.json left by a crashed daemon names a process that is gone; only a live pid is reported.
+    Err(match read_daemon_file(paths).filter(|f| pid_alive(f.pid)) {
+        Some(f) => {
+            format!("A ferret daemon is already running for {} (pid {}, {}).", paths.home.display(), f.pid, f.bind)
+        }
+        None => format!(
+            "A ferret daemon is already running for {} (it is starting; its address is not written yet).",
+            paths.home.display()
+        ),
+    })
+}
+
+/// True when no process holds the lock on `<home>/daemon.lock`. The lock is taken to find out and given back at
+/// once; a lock that cannot be tested counts as free, so a caller never waits on it.
+pub(crate) fn home_lock_free(paths: &Paths) -> bool {
+    use std::os::fd::AsRawFd;
+    let Ok(file) = std::fs::OpenOptions::new().read(true).write(true).open(paths.home.join(LOCK_FILE)) else {
+        return true;
+    };
+    // SAFETY: flock on a descriptor this function owns; closing the file releases the lock.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::EWOULDBLOCK)
+}
+
+/// Waits until the daemon of this home has let go of `<home>/daemon.lock` (its shutdown has finished);
+/// false when `within` passes first.
+pub(crate) async fn wait_home_lock_free(paths: &Paths, within: Duration) -> bool {
+    // A bound too far ahead to be a time is no bound.
+    let deadline = std::time::Instant::now().checked_add(within);
+    while !home_lock_free(paths) {
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    true
+}
+
+/// The address to bind among those `bind` resolved to: a loopback one, IPv4 preferred. When none is loopback the
+/// answer names the first address the name resolved to.
+fn pick_loopback(bind: &str, addrs: &[SocketAddr]) -> Result<SocketAddr, String> {
+    let loopback = |a: &&SocketAddr| a.ip().is_loopback();
+    addrs.iter().filter(loopback).find(|a| a.is_ipv4()).or_else(|| addrs.iter().find(loopback)).copied().ok_or_else(
+        || match addrs.first() {
+            Some(a) => format!(
+                "Cannot listen on {bind}: it resolves to {}, which is not a loopback address. Set [daemon] bind to \
+                 127.0.0.1:<port> (or [::1]:<port>); the API must not be reachable from other machines.",
+                a.ip()
+            ),
+            None => format!("Cannot listen on {bind}: the address does not resolve."),
+        },
+    )
+}
+
+/// Bind with `SO_REUSEADDR`, preferring an IPv4 address when the name has several. Only loopback addresses are
+/// bound, whatever name was configured.
+async fn bind_listener(bind: &str) -> Result<tokio::net::TcpListener, String> {
+    let fail = |why: &dyn std::fmt::Display| format!("Cannot listen on {bind}: {why}.");
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host(bind).await.map_err(|e| fail(&e))?.collect();
+    let addr = pick_loopback(bind, &addrs)?;
+    let socket = if addr.is_ipv4() { tokio::net::TcpSocket::new_v4() } else { tokio::net::TcpSocket::new_v6() }
+        .map_err(|e| fail(&e))?;
+    socket.set_reuseaddr(true).map_err(|e| fail(&e))?;
+    socket.bind(addr).map_err(|e| fail(&e))?;
+    socket.listen(1024).map_err(|e| fail(&e))
+}
+
+/// Resolves on SIGINT or SIGTERM.
+async fn os_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    let term = async {
+        match signal(SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    let int = async {
+        if tokio::signal::ctrl_c().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    };
+    tokio::select! {
+        _ = term => {}
+        _ = int => {}
+    }
+}
+
+fn did_not_come_up(log: &Path) -> String {
+    let text = std::fs::read(log).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
+    let mut lines: Vec<&str> = text.lines().rev().take(LOG_TAIL_LINES).collect();
+    lines.reverse();
+    format!("The daemon did not come up. Last lines of {}:\n{}", log.display(), lines.join("\n"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ferret_model::mock::{MockServer, Reply, Script};
+    use std::os::unix::fs::PermissionsExt;
+
+    struct Home {
+        dir: tempfile::TempDir,
+        paths: Paths,
+        _server: MockServer,
+    }
+
+    async fn home_with(extra: &str) -> Home {
+        let dir = tempfile::tempdir().unwrap();
+        let server = MockServer::start(Script::new(|_, _| Reply::text("hi").into())).await.unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let config = format!(
+            "default_model = \"mock\"\n[daemon]\nbind = \"127.0.0.1:0\"\n[sandbox]\nmode = \"none\"\n[network]\nmode = \"deny_all\"\n[models.mock]\nbase_url = \"{}\"\nmodel = \"mock\"\ncontext_window = 1000000\n{extra}",
+            server.base_url()
+        );
+        std::fs::write(home.join("config.toml"), config).unwrap();
+        Home { paths: Paths::at(home), dir, _server: server }
+    }
+
+    #[test]
+    fn preparing_a_looser_home_tightens_it_and_its_top_level_directories() {
+        let h = tempfile::tempdir().unwrap();
+        let paths = Paths::at(h.path().join(".ferret"));
+        std::fs::create_dir_all(paths.logs_dir()).unwrap();
+        for d in [&paths.home, &paths.logs_dir()] {
+            std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        prepare_home(&paths).unwrap();
+        for d in [
+            paths.home.clone(),
+            paths.keys_dir(),
+            paths.sessions_dir(),
+            paths.missions_dir(),
+            paths.blobs_dir(),
+            paths.logs_dir(),
+        ] {
+            let mode = std::fs::metadata(&d).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{}", d.display());
+        }
+    }
+
+    type Running = (tokio::task::JoinHandle<Result<(), String>>, CancellationToken, String);
+
+    async fn start(paths: &Paths) -> Running {
+        let stop = CancellationToken::new();
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+        let task = tokio::spawn(run_until(paths.clone(), stop.clone(), move |bind: &str| {
+            let _ = tx.send(bind.to_string());
+        }));
+        let bind = tokio::time::timeout(Duration::from_secs(30), rx).await.unwrap().unwrap();
+        (task, stop, bind)
+    }
+
+    async fn stop_and_join((task, stop, _): Running) {
+        stop.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(30), task).await.unwrap().unwrap();
+        assert_eq!(result, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn run_until_serves_writes_files_and_cleans_up() {
+        let h = home_with("").await;
+        let running = start(&h.paths).await;
+        let bind = running.2.clone();
+        let port: u16 = bind.rsplit_once(':').unwrap().1.parse().unwrap();
+        assert_ne!(port, 0);
+
+        let file: DaemonFile =
+            serde_json::from_str(&std::fs::read_to_string(h.paths.home.join("daemon.json")).unwrap()).unwrap();
+        assert_eq!(file.bind, bind);
+        assert_eq!(file.pid, std::process::id());
+        let mode = std::fs::metadata(h.paths.token_file()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert!(!h.paths.home.read_dir().unwrap().any(|e| e.unwrap().file_name().to_string_lossy().ends_with(".tmp")));
+
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let ok = http.get(format!("http://{bind}/healthz")).send().await.unwrap();
+        assert_eq!(ok.status(), 200);
+        assert_eq!(ok.text().await.unwrap(), "ok");
+        let token = std::fs::read_to_string(h.paths.token_file()).unwrap();
+        let status: serde_json::Value = http
+            .get(format!("http://{bind}/api/status"))
+            .bearer_auth(token.trim())
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(status["bind"], bind.as_str());
+
+        stop_and_join(running).await;
+        assert!(!h.paths.home.join("daemon.json").exists());
+        assert!(http.get(format!("http://{bind}/healthz")).send().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_second_daemon_for_the_same_home_is_refused() {
+        let h = home_with("").await;
+        let running = start(&h.paths).await;
+        let err = run_until(h.paths.clone(), CancellationToken::new(), |_| {}).await.unwrap_err();
+        assert_eq!(
+            err,
+            format!(
+                "A ferret daemon is already running for {} (pid {}, {}).",
+                h.paths.home.display(),
+                std::process::id(),
+                running.2
+            )
+        );
+        // The first one is untouched.
+        assert!(h.paths.home.join("daemon.json").exists());
+        assert_eq!(spawn_background(&h.paths).await, Ok(Spawned::Already));
+        stop_and_join(running).await;
+    }
+
+    /// A listener that answers `ok` to every path, as an impostor on the daemon's port would.
+    async fn impostor() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let app = axum::Router::new().fallback(|| async { "ok" });
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn only_a_listener_that_proves_the_token_counts_as_the_daemon() {
+        let h = home_with("").await;
+        let running = start(&h.paths).await;
+        let other = impostor().await;
+        assert_eq!(probe_with(&h.paths, &running.2, PROBE_TIMEOUT, false).await, Probe::Daemon);
+        assert_eq!(probe_with(&h.paths, &other, PROBE_TIMEOUT, false).await, Probe::Unproven);
+        // `--unverified-daemon` accepts it, and says so.
+        assert_eq!(probe_with(&h.paths, &other, PROBE_TIMEOUT, true).await, Probe::Daemon);
+        let warnings = crate::client::WARNINGS.lock().unwrap().clone();
+        assert!(warnings.contains(&crate::client::unverified_warning(&other)), "{warnings:?}");
+        // Without a token file there is nothing to prove with: any 200 will do, as before.
+        std::fs::remove_file(h.paths.token_file()).unwrap();
+        assert_eq!(probe_with(&h.paths, &other, PROBE_TIMEOUT, false).await, Probe::Daemon);
+        stop_and_join(running).await;
+    }
+
+    #[tokio::test]
+    async fn ferret_up_and_a_second_daemon_refuse_an_unproven_listener_and_leave_daemon_json_alone() {
+        let h = home_with("").await;
+        auth::load_or_create_token(&h.paths.token_file()).unwrap();
+        let other = impostor().await;
+        let config = std::fs::read_to_string(h.paths.config_file()).unwrap().replace("127.0.0.1:0", &other);
+        std::fs::write(h.paths.config_file(), config).unwrap();
+
+        // `ferret up`: no child is started (nothing is logged) and the operator gets the identity sentence.
+        let err = spawn_background(&h.paths).await.unwrap_err();
+        assert_eq!(err, crate::client::unproven_message(&other));
+        assert!(err.contains("older daemon") || err.contains("older than this"), "{err}");
+        assert!(!h.paths.logs_dir().join("ferretd.log").exists(), "a child daemon was started");
+
+        // The same through a `daemon.json` of a live pid: the file stays, the listener is not called a daemon.
+        let file = DaemonFile { pid: std::process::id(), bind: other.clone(), started_ms: 1 };
+        std::fs::write(h.paths.home.join("daemon.json"), serde_json::to_string(&file).unwrap()).unwrap();
+        let err = spawn_background(&h.paths).await.unwrap_err();
+        assert_eq!(err, crate::client::unproven_message(&other));
+        let err = run_until(h.paths.clone(), CancellationToken::new(), |_| {}).await.unwrap_err();
+        assert_eq!(err, crate::client::unproven_message(&other));
+        assert!(h.paths.home.join("daemon.json").exists());
+    }
+
+    #[tokio::test]
+    async fn a_stale_daemon_file_is_replaced() {
+        let h = home_with("").await;
+        let write = |pid: u32, bind: &str| {
+            let file = DaemonFile { pid, bind: bind.to_string(), started_ms: 1 };
+            std::fs::write(h.paths.home.join("daemon.json"), serde_json::to_string(&file).unwrap()).unwrap();
+        };
+        // A pid nobody has.
+        write(2_000_000_000, "127.0.0.1:1");
+        let running = start(&h.paths).await;
+        let file = read_daemon_file(&h.paths).unwrap();
+        assert_eq!((file.pid, file.bind.as_str()), (std::process::id(), running.2.as_str()));
+        stop_and_join(running).await;
+
+        // A live pid (this process) that serves nothing at the recorded address.
+        write(std::process::id(), "127.0.0.1:1");
+        let running = start(&h.paths).await;
+        assert_eq!(read_daemon_file(&h.paths).unwrap().bind, running.2);
+        stop_and_join(running).await;
+    }
+
+    #[tokio::test]
+    async fn an_invalid_config_is_reported_with_its_path() {
+        let h = home_with("").await;
+        let file = h.paths.config_file();
+        std::fs::write(&file, "bogus_key = 1\n").unwrap();
+        let err = run_until(h.paths.clone(), CancellationToken::new(), |_| {}).await.unwrap_err();
+        assert!(err.starts_with(&file.display().to_string()), "{err}");
+
+        std::fs::write(&file, "default_model = \"nope\"\n[models.a]\nmodel = \"a\"\n").unwrap();
+        let err = run_until(h.paths.clone(), CancellationToken::new(), |_| {}).await.unwrap_err();
+        assert!(err.starts_with(&format!("{}: ", file.display())) && err.contains("nope"), "{err}");
+
+        std::fs::write(&file, "[daemon]\nbind = \"0.0.0.0:0\"\n").unwrap();
+        let err = spawn_background(&h.paths).await.unwrap_err();
+        assert!(err.starts_with(&file.display().to_string()) && err.contains("loopback"), "{err}");
+        assert!(!h.paths.home.join("daemon.json").exists());
+        let _ = &h.dir;
+    }
+
+    #[tokio::test]
+    async fn a_missing_key_file_stops_the_daemon_naming_the_profile_and_file() {
+        let h = home_with("api_key_file = \"mock\"\n").await;
+        let err = run_until(h.paths.clone(), CancellationToken::new(), |_| {}).await.unwrap_err();
+        let file = h.paths.model_keys_dir().join("mock");
+        assert!(err.starts_with("models.mock: ") && err.contains(&file.display().to_string()), "{err}");
+        assert!(!h.paths.home.join("daemon.json").exists());
+    }
+
+    fn os_pairs(pairs: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
+        pairs.iter().map(|(k, v)| (OsString::from(k), OsString::from(v))).collect()
+    }
+
+    fn env_config() -> Config {
+        let mut c = Config::default();
+        c.models.insert(
+            "m".into(),
+            ferret_core::config::ModelProfile { api_key_env: Some("MY_MODEL_KEY".into()), ..Default::default() },
+        );
+        c.sandbox.env_pass = vec!["PASS_ME".into()];
+        c
+    }
+
+    #[test]
+    fn daemon_env_keeps_the_allowlist_and_drops_the_rest() {
+        let parent = os_pairs(&[
+            ("PATH", "/usr/bin"),
+            ("HOME", "/h"),
+            ("USER", "u"),
+            ("LOGNAME", "u"),
+            ("SHELL", "/bin/zsh"),
+            ("LANG", "C"),
+            ("TZ", "UTC"),
+            ("TMPDIR", "/t"),
+            ("FERRET_LOG", "debug"),
+            ("RUST_BACKTRACE", "1"),
+            ("LC_ALL", "C"),
+            ("LC_CTYPE", "C"),
+            ("MY_MODEL_KEY", "sk-x"),
+            ("PASS_ME", "yes"),
+            ("FERRET_HOME", "/elsewhere"),
+            ("GITHUB_TOKEN", "t"),
+            ("AWS_SECRET_ACCESS_KEY", "t"),
+            ("HTTP_PROXY", "http://p"),
+            ("ALL_PROXY", "http://p"),
+            ("DYLD_INSERT_LIBRARIES", "/x.dylib"),
+            ("FOO", "bar"),
+        ]);
+        let env = daemon_env(&env_config(), parent, Path::new("/ferret/home"));
+        let names: Vec<&str> = env.keys().filter_map(|k| k.to_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "FERRET_HOME",
+                "FERRET_LOG",
+                "HOME",
+                "LANG",
+                "LC_ALL",
+                "LC_CTYPE",
+                "LOGNAME",
+                "MY_MODEL_KEY",
+                "PASS_ME",
+                "PATH",
+                "RUST_BACKTRACE",
+                "SHELL",
+                "TMPDIR",
+                "TZ",
+                "USER"
+            ]
+        );
+        assert_eq!(env[&OsString::from("FERRET_HOME")], OsString::from("/ferret/home"));
+        assert_eq!(env[&OsString::from("MY_MODEL_KEY")], OsString::from("sk-x"));
+    }
+
+    #[test]
+    fn daemon_command_runs_with_exactly_the_daemon_env() {
+        let env_bin = Path::new("/usr/bin/env");
+        if !env_bin.exists() {
+            return;
+        }
+        let config = env_config();
+        let home = Path::new("/ferret/home");
+        let out = daemon_command(env_bin, &config, home).output().unwrap();
+        assert!(out.status.success());
+        let mut printed: Vec<String> = String::from_utf8_lossy(&out.stdout).lines().map(str::to_string).collect();
+        printed.sort();
+        let mut expected: Vec<String> = daemon_env(&config, std::env::vars_os(), home)
+            .into_iter()
+            .map(|(k, v)| format!("{}={}", k.to_string_lossy(), v.to_string_lossy()))
+            .collect();
+        expected.sort();
+        // Values with a newline would split into several lines on both sides alike; compare names only for them.
+        let names = |v: &[String]| {
+            v.iter()
+                .filter(|l| l.contains('='))
+                .map(|l| l.split('=').next().unwrap_or("").to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&printed), names(&expected));
+        assert!(printed.contains(&"FERRET_HOME=/ferret/home".to_string()), "{printed:?}");
+        assert!(printed.iter().all(|l| !l.starts_with("DYLD_") && !l.starts_with("HTTP_PROXY=")), "{printed:?}");
+    }
+
+    #[tokio::test]
+    async fn an_address_in_use_is_reported() {
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = taken.local_addr().unwrap();
+        let h = home_with("").await;
+        let config = std::fs::read_to_string(h.paths.config_file()).unwrap().replace("127.0.0.1:0", &addr.to_string());
+        std::fs::write(h.paths.config_file(), config).unwrap();
+        let err = run_until(h.paths.clone(), CancellationToken::new(), |_| {}).await.unwrap_err();
+        assert!(err.starts_with(&format!("Cannot listen on {addr}: ")) && err.ends_with('.'), "{err}");
+    }
+
+    #[test]
+    fn the_home_lock_is_exclusive_until_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::at(dir.path());
+        let first = take_home_lock(&paths).unwrap();
+        let err = take_home_lock(&paths).unwrap_err();
+        assert!(err.starts_with(&format!("A ferret daemon is already running for {}", paths.home.display())), "{err}");
+        let file = DaemonFile { pid: std::process::id(), bind: "127.0.0.1:9".to_string(), started_ms: 1 };
+        write_daemon_file(&paths, &file).unwrap();
+        assert_eq!(
+            take_home_lock(&paths).unwrap_err(),
+            format!("A ferret daemon is already running for {} (pid {}, 127.0.0.1:9).", paths.home.display(), file.pid)
+        );
+        drop(first);
+        assert!(take_home_lock(&paths).is_ok());
+    }
+
+    #[test]
+    fn a_stale_daemon_file_is_not_named_by_the_home_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::at(dir.path());
+        let _held = take_home_lock(&paths).unwrap();
+        // A pid no process can have: above the kernel's pid limit.
+        let file = DaemonFile { pid: 4_000_000_000, bind: "127.0.0.1:9".to_string(), started_ms: 1 };
+        write_daemon_file(&paths, &file).unwrap();
+        assert_eq!(
+            take_home_lock(&paths).unwrap_err(),
+            format!(
+                "A ferret daemon is already running for {} (it is starting; its address is not written yet).",
+                paths.home.display()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn waiting_for_the_home_lock_ends_when_the_holder_lets_go() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::at(dir.path());
+        let held = take_home_lock(&paths).unwrap();
+        assert!(!home_lock_free(&paths));
+        assert!(!wait_home_lock_free(&paths, Duration::from_millis(200)).await);
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            drop(held);
+        });
+        assert!(wait_home_lock_free(&paths, Duration::from_secs(5)).await);
+        release.await.unwrap();
+        // The check does not keep the lock.
+        assert!(take_home_lock(&paths).is_ok());
+    }
+
+    #[test]
+    fn only_loopback_addresses_are_bound() {
+        let a = |s: &str| s.parse::<SocketAddr>().unwrap();
+        assert_eq!(pick_loopback("localhost:1", &[a("[::1]:1"), a("127.0.0.1:1")]), Ok(a("127.0.0.1:1")));
+        assert_eq!(pick_loopback("localhost:1", &[a("[::1]:1")]), Ok(a("[::1]:1")));
+        let err = pick_loopback("evil.example:1", &[a("10.1.2.3:1"), a("127.0.0.1:1")]).unwrap();
+        assert_eq!(err, a("127.0.0.1:1"));
+        let err = pick_loopback("evil.example:1", &[a("10.1.2.3:1")]).unwrap_err();
+        assert!(
+            err.contains("evil.example:1") && err.contains("10.1.2.3") && err.contains("not a loopback address"),
+            "{err}"
+        );
+        assert!(pick_loopback("x:1", &[]).unwrap_err().contains("does not resolve"));
+    }
+
+    #[tokio::test]
+    async fn bind_listener_refuses_an_address_that_is_not_loopback() {
+        let err = bind_listener("0.0.0.0:0").await.unwrap_err();
+        assert!(err.contains("0.0.0.0") && err.contains("not a loopback address"), "{err}");
+        assert!(bind_listener("127.0.0.1:0").await.is_ok());
+    }
+
+    #[test]
+    fn the_plist_escapes_and_names_both_paths() {
+        let plist = launch_agent_plist(Path::new("/opt/a&b/<ferret>"), Path::new("/Users/x&y/.ferret"));
+        assert!(plist.contains(&format!("<string>{SERVICE_LABEL}</string>")));
+        assert!(plist.contains("<string>/opt/a&amp;b/&lt;ferret&gt;</string>"));
+        assert!(plist.contains("<key>FERRET_HOME</key>\n    <string>/Users/x&amp;y/.ferret</string>"));
+        assert_eq!(plist.matches("<string>/Users/x&amp;y/.ferret/logs/ferretd.log</string>").count(), 2);
+        assert!(plist.contains("<key>StandardOutPath</key>") && plist.contains("<key>StandardErrorPath</key>"));
+        assert!(plist.contains("/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"));
+        assert!(plist.contains("<key>NumberOfFiles</key>\n    <integer>16384</integer>"));
+        assert!(plist.contains("<key>SuccessfulExit</key>\n    <false/>"));
+        assert!(plist.contains("<string>daemon</string>") && plist.contains("<string>Background</string>"));
+        assert!(!plist.contains("a&b"));
+    }
+
+    #[test]
+    fn the_log_tail_is_the_last_fifteen_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("ferretd.log");
+        let text: String = (1..=20).map(|n| format!("line {n}\n")).collect();
+        std::fs::write(&log, text).unwrap();
+        let msg = did_not_come_up(&log);
+        assert!(msg.starts_with("The daemon did not come up. Last lines of "));
+        assert!(msg.contains("\nline 6\n") && msg.ends_with("line 20") && !msg.contains("line 5\n"));
+    }
+}

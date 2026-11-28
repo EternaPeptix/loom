@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""Import DeepSeek Harness (DSH) v4 sessions into loom as read-only archive sessions.
+"""Import DeepSeek Harness (DSH) v4 sessions into ferret as read-only archive sessions.
 
-A DSH session and a loom session have different, incompatible models, so loom cannot *resume* a DSH
-session. What this does is faithfully convert the DSH transcript into a loom event log that is marked
-ended, so the conversation is present, browsable and searchable inside loom (CLI and web UI) — history,
+A DSH session and a ferret session have different, incompatible models, so ferret cannot *resume* a DSH
+session. What this does is faithfully convert the DSH transcript into a ferret event log that is marked
+ended, so the conversation is present, browsable and searchable inside ferret (CLI and web UI) — history,
 not a live session.
 
 Usage:
-    import-dsh.py --dsh ~/.dsh/sessions --loom ~/.loom [--workspace SUBSTR] [--limit N] [--model NAME]
+    import-dsh.py --dsh ~/.dsh/sessions --ferret ~/.ferret [--workspace SUBSTR] [--limit N] [--model NAME]
                   [--dry-run]
 
 Requires the `zstd` command on PATH (DSH session files are zstd-compressed; install it with
 `brew install zstd`). Python 3 standard library only.
 
-It writes, per DSH session, a loom session dir under <loom>/sessions/s-dsh<id>/ with log.jsonl
+It writes, per DSH session, a ferret session dir under <ferret>/sessions/s-dsh<id>/ with log.jsonl
 (hash-chained), meta.json and status.json. Directories are created 0700 and files 0600; every file is
 written to a temporary file next to its final name and renamed into place, so a crash never leaves a
 half-written file. Re-running rewrites the same ids (idempotent) and keeps the `archived` flag an
@@ -26,7 +26,7 @@ import argparse, hashlib, json, os, sys, glob, subprocess, datetime, shutil, tem
 ZERO = "0" * 64
 # Largest decompressed session accepted; a bigger one is almost certainly not a normal transcript.
 MAX_DECOMPRESSED = 512 * 1024 * 1024
-# The log schema number this importer writes (crates/loom-core/src/event.rs, SCHEMA). A log with a
+# The log schema number this importer writes (crates/ferret-core/src/event.rs, SCHEMA). A log with a
 # higher number is read-only for the daemon, so this must not run ahead of it.
 SCHEMA = 1
 
@@ -145,7 +145,7 @@ def decompress(path: str):
 
 
 def convert(dsh_path: str, uuid: str):
-    """Return (records, header) where records are loom event dicts WITHOUT seq/prev/ts chaining yet."""
+    """Return (records, header) where records are ferret event dicts WITHOUT seq/prev/ts chaining yet."""
     header = None
     body = []
     call_names = {}
@@ -194,7 +194,7 @@ def convert(dsh_path: str, uuid: str):
 
 
 def build_log(body, header, sid, mission, workspace, model, created_ms, title):
-    """Chain the records into loom log bytes: one compact JSON object per line, each `prev` the SHA-256
+    """Chain the records into ferret log bytes: one compact JSON object per line, each `prev` the SHA-256
     of the previous line's bytes without its newline."""
     start_event = {
         "kind": "session_start",
@@ -208,7 +208,7 @@ def build_log(body, header, sid, mission, workspace, model, created_ms, title):
         "model": {"profile": "imported", "model": model, "context_window": 1048576},
         "reasoning_replay": "none",
         "system_prompt": (
-            "Read-only archive of a DeepSeek Harness (DSH) session imported into loom. "
+            "Read-only archive of a DeepSeek Harness (DSH) session imported into ferret. "
             f"Original DSH session {header.get('id') if header else '?'}, workspace {workspace}."
         ),
         "tools": [],
@@ -300,7 +300,7 @@ def import_one(p, a, counts):
         counts["done"] += 1
         return
 
-    sdir = os.path.join(a.loom, "sessions", sid)
+    sdir = os.path.join(a.ferret, "sessions", sid)
     mkdir_private(os.path.join(sdir, "tmp"))
     meta_path = os.path.join(sdir, "meta.json")
     meta = {
@@ -323,10 +323,10 @@ def import_one(p, a, counts):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Import DSH sessions into loom as read-only archives. Needs the `zstd` command on PATH."
+        description="Import DSH sessions into ferret as read-only archives. Needs the `zstd` command on PATH."
     )
     ap.add_argument("--dsh", default=os.path.expanduser("~/.dsh/sessions"))
-    ap.add_argument("--loom", default=os.path.expanduser("~/.loom"))
+    ap.add_argument("--ferret", default=os.path.expanduser("~/.ferret"))
     ap.add_argument("--workspace", default=None, help="only sessions whose DSH workspace dir contains this substring")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--model", default="dsv41", help="model name recorded in the imported sessions (default: dsv41)")

@@ -4,7 +4,7 @@
 
 import * as C from "./core.js";
 
-const $ = (id) => document.getElementById(id);
+const $ = (id) => (typeof document.getElementById === "function" ? document.getElementById(id) : null);
 
 // Layout follows the width; input behaviour follows the pointer, so a narrow window with a mouse keeps Enter-to-send.
 const PHONE = matchMedia("(max-width: 699px)");
@@ -38,12 +38,13 @@ const S = {
   actionState: new Map(),
   stopAsked: new Set(), // sessions this tab asked to stop: their ending is not announced
   notes: { pending: [], shown: new Map(), timer: 0 },
-  requests: { ledger: 0, window: 0, net: 0, inbox: 0, status: 0, models: 0, mcp: 0, exch: 0, target: 0, creds: 0, formCreds: 0 },
+  requests: { ledger: 0, window: 0, net: 0, inbox: 0, status: 0, models: 0, mcp: 0, exch: 0, target: 0, creds: 0, formCreds: 0, packs: 0, noise: 0, rewrites: 0 },
   exch: { session: null, list: [], error: null, loaded: false }, // the open mission's captured exchanges (C1), from the daemon
   exFilter: { host: "all", status: "all" },
   exview: null, // the exchange open in its viewer
   formCreds: [], // profile names of the new-mission form's chosen target; empty hides the select
   targets: { supported: null, list: [], error: null }, // null until asked; false when the daemon has no targets (404)
+  targetNew: null, // inline create-target form state on #/targets
   tp: null, // the target page: its configuration, nodes, filters and the node chosen
   inboxRevision: 0,
   inboxTouched: new Map(), // item id -> {rev, entry|null}: what inbox records changed, kept over an older snapshot
@@ -51,6 +52,14 @@ const S = {
   jumpFrom: null, // the last record seq held when the operator scrolled away from the end (the count behind Jump to latest)
   ask: null, // an inline confirmation waiting in the inspector: {kind:"compact"} | {kind:"lead", lead, value} | {kind:"role", lead, role, value}
   headAsk: null, // an inline confirmation waiting in the session header: {kind:"stop"|"archive", session}
+  composerStopAsk: null, // inline stop confirmation inside the composer: {session, opener}
+  noise: { supported: null, data: null, error: null }, // GET /api/network/noise
+  rewrites: { supported: null, list: [], error: null, editing: null, askDelete: null, busy: false, formError: null }, // /api/traffic/rewrite-rules
+  scopeForm: null, // persistent host-grant form for the open session
+  mcpChecks: new Map(), // server name -> {busy, result, error}
+  gc: { busy: false, report: null, error: null, confirmApply: false },
+  hiddenAt: 0,
+  appStarted: false,
   section: "chat",
   profiles: null, // GET /api/models for the model seat: {default_model, models: [...]} (null until fetched)
   seat: null, // a model switch waiting for the operator's answer: {session, profile}
@@ -75,7 +84,8 @@ const S = {
   openId: null,
   inspectorPref: false, // desktop inspector open preference across non-session routes
   childBlocker: null,
-  newForm: { model: null, agentModel: null },
+  newForm: { model: null, agentModel: null, pack: null, role: null },
+  packs: C.fallbackPacks(), // GET /api/packs for the new-mission form (the core fallback until fetched, or for an older daemon)
   rec: null, // record store of the open session
   r: null, // what is rendered of it: {from, end, nodes, fresh}
   follow: true,
@@ -161,11 +171,11 @@ const clock = (ms) => new Date(ms).toLocaleTimeString();
 const ago = (ms) => { const age = C.age(Date.now(), ms); return age === "now" ? "just now" : age + " ago"; };
 
 function remember(key, value) {
-  try { sessionStorage.setItem("loom.ui." + key, JSON.stringify(value)); } catch { /* private browsing may refuse storage */ }
+  try { sessionStorage.setItem("ferret.ui." + key, JSON.stringify(value)); } catch { /* private browsing may refuse storage */ }
 }
 
 function recalled(key, fallback) {
-  try { return JSON.parse(sessionStorage.getItem("loom.ui." + key)) ?? fallback; } catch { return fallback; }
+  try { return JSON.parse(sessionStorage.getItem("ferret.ui." + key)) ?? fallback; } catch { return fallback; }
 }
 
 function preserveFocus(container, render) {
@@ -221,19 +231,54 @@ function keyedText(text, cls = "txt out") {
 function prose(text) {
   const root = el("div", "prose");
   const inline = (target, parts) => {
-    for (const part of parts) target.append(part.type === "text" ? document.createTextNode(part.text) : el(part.type, "", part.text));
+    for (const part of parts) {
+      if (part.type === "text") target.append(document.createTextNode(part.text));
+      else if (part.type === "a") {
+        const a = el("a", "", part.text);
+        a.href = part.href;
+        a.target = "_blank";
+        a.rel = "noopener noreferrer";
+        target.append(a);
+      } else target.append(el(part.type, "", part.text));
+    }
   };
   for (const block of C.proseTree(text)) {
     if (block.type === "pre") {
       const pre = add(el("pre", "out"), el("code", "", block.text));
       root.append(add(el("div", "codeblock reveal-copy"), pre, copyButton("Copy code", () => C.codeCopyText(block), { what: "Code", source: pre })));
-    }
-    else if (block.type === "ul" || block.type === "ol") {
+    } else if (block.type === "ul" || block.type === "ol") {
       const list = el(block.type);
       for (const item of block.items) { const li = el("li"); inline(li, item); list.append(li); }
       root.append(list);
+    } else if (block.type === "table") {
+      const table = el("table");
+      const thead = el("thead");
+      const htr = el("tr");
+      for (const cell of block.headers) { const th = el("th"); inline(th, cell); htr.append(th); }
+      thead.append(htr);
+      const tbody = el("tbody");
+      for (const row of block.rows) {
+        const tr = el("tr");
+        for (const cell of row) { const td = el("td"); inline(td, cell); tr.append(td); }
+        tbody.append(tr);
+      }
+      table.append(thead, tbody);
+      root.append(add(el("div", "prose-table-wrap"), table));
+    } else if (block.type === "blockquote") {
+      const bq = el("blockquote");
+      const p = el("p");
+      inline(p, block.inline);
+      bq.append(p);
+      root.append(bq);
+    } else if (block.type === "hr") {
+      root.append(el("hr"));
+    } else if (block.type === "h") {
+      const tag = block.level === 2 ? "h2" : block.level === 4 ? "h4" : "h3";
+      const node = el(tag);
+      inline(node, block.inline);
+      root.append(node);
     } else {
-      const node = el(block.type === "h" ? "h3" : "p");
+      const node = el("p");
       inline(node, block.inline);
       root.append(node);
     }
@@ -246,10 +291,13 @@ function prose(text) {
 
 // The page signs in with a single-use code from the URL fragment, trades it for a web-session
 // secret and sends that as a bearer on every request. No cookie is involved.
-const SECRET_KEY = "loom_web_secret";
+const SECRET_KEY = "ferret_web_secret";
 let secret = null; // also kept in sessionStorage when the browser allows it
 let streamCtl = null;
 let streamStopped = false;
+let reconnectWake = null; // resolves the backoff wait in connect() immediately when asked
+let pendingLoginCode = null; // kept in memory if network failed during initial code redemption
+let authLostReason = ""; // "network" | "expired" | ""
 
 function storedSecret() {
   try {
@@ -268,28 +316,42 @@ function keepSecret(value) {
   }
 }
 
+async function redeemCode(code) {
+  const r = await fetch("/api/web-sessions", {
+    method: "POST",
+    credentials: "omit",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ code }),
+  });
+  if (r.ok) {
+    const j = await r.json();
+    if (j && typeof j.secret === "string") {
+      keepSecret(j.secret);
+      pendingLoginCode = null;
+      return { ok: true };
+    }
+  }
+  return { ok: false, status: r.status, text: typeof r.text === "function" ? await r.text().catch(() => "") : "" };
+}
+
 /** Exchange the code in the fragment (if any) for a secret; true when the page has one. */
 async function signIn() {
-  const code = C.codeFromHash(location.hash);
+  const code = C.codeFromHash(location.hash) || pendingLoginCode;
+  authLostReason = "";
   if (code) {
+    pendingLoginCode = code;
     try {
-      history.replaceState(null, "", location.pathname + location.search);
-    } catch {
-      // the fragment stays visible; the code is single use anyway
-    }
-    try {
-      const r = await fetch("/api/web-sessions", {
-        method: "POST",
-        credentials: "omit",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ code }),
-      });
-      if (r.ok) {
-        const j = await r.json();
-        if (j && typeof j.secret === "string") keepSecret(j.secret);
+      const res = await redeemCode(code);
+      // Only strip #code= once the daemon actually received the request (not on network failure).
+      if (C.codeFromHash(location.hash)) {
+        try { history.replaceState(null, "", location.pathname + location.search); } catch { /* ignore */ }
+      }
+      if (!res.ok) {
+        pendingLoginCode = null;
+        authLostReason = "expired";
       }
     } catch {
-      // unreachable or refused: fall back to a stored secret, else the "run loom open" page
+      authLostReason = "network";
     }
   }
   if (!secret) secret = storedSecret();
@@ -300,18 +362,147 @@ function authHeaders(extra) {
   return { ...(extra || {}), Authorization: "Bearer " + secret };
 }
 
-function lost() {
+function showAuthOverlay(reason) {
+  const overlay = $("auth-overlay");
+  if (!overlay) {
+    // Headless / fallback DOM without #auth-overlay: render the standalone sign-in card.
+    const card = add(el("main", "lost-card"),
+      el("h1", "", "This tab is not signed in"),
+      el("p", "", "Its sign-in lasts as long as the tab, and it has ended (or the daemon was restarted with a new token). Nothing in your missions changed."),
+      add(el("p", ""), document.createTextNode("Run "), el("code", "", "ferret open"), document.createTextNode(" in a terminal: it opens a signed-in page.")));
+    card.setAttribute("aria-label", C.LOST_TOKEN);
+    document.body.replaceChildren(add(el("div", "lost-page"), card));
+    return;
+  }
+  const reasonEl = $("auth-overlay-reason");
+  const errEl = $("auth-overlay-error");
+  if (errEl) { errEl.textContent = ""; errEl.hidden = true; }
+  if (reasonEl) {
+    reasonEl.textContent = reason === "network"
+      ? "The daemon could not be reached while signing in. Your open view and unsaved drafts are kept; click Retry once the daemon is running, or paste a new login code."
+      : "Its sign-in lasts as long as the tab, and it has ended (or the daemon was restarted with a new token). Your open view and unsaved drafts are still here.";
+  }
+  overlay.hidden = false;
+  if (typeof requestAnimationFrame === "function") {
+    requestAnimationFrame(() => {
+      const target = pendingLoginCode ? $("auth-overlay-retry") : $("auth-overlay-input");
+      if (target && typeof target.focus === "function") target.focus({ preventScroll: true });
+    });
+  }
+}
+
+function hideAuthOverlay() {
+  const overlay = $("auth-overlay");
+  if (overlay) overlay.hidden = true;
+  const input = $("auth-overlay-input");
+  if (input) input.value = "";
+  const errEl = $("auth-overlay-error");
+  if (errEl) { errEl.textContent = ""; errEl.hidden = true; }
+}
+
+/** Non-destructive sign-out recovery: preserves #app, drafts, and view while still updating document.title for ferret-desk KVO. */
+function lost(reason = authLostReason || "expired") {
   streamStopped = true;
   if (streamCtl) streamCtl.abort();
+  if (reconnectWake) { const w = reconnectWake; reconnectWake = null; w(); }
   keepSecret(null);
-  // A page of its own, not a bare line: what happened, and the one command that opens a signed-in page.
-  const card = add(el("main", "lost-card"),
-    el("h1", "", "This tab is not signed in"),
-    el("p", "", "Its sign-in lasts as long as the tab, and it has ended (or the daemon was restarted with a new token). Nothing in your missions changed."),
-    add(el("p", ""), document.createTextNode("Run "), el("code", "", "loom open"), document.createTextNode(" in a terminal: it opens a signed-in page.")));
-  card.setAttribute("aria-label", C.LOST_TOKEN);
-  document.body.replaceChildren(add(el("div", "lost-page"), card));
-  document.title = "loom · not signed in";
+  S.connected = false;
+  S.connectedSince = null;
+  // Critical contract with ferret-desk (WebPane.swift): KVO observes document.title === "ferret · not signed in"
+  // to auto-mint a fresh login code without JS injection.
+  document.title = "ferret · not signed in";
+  showAuthOverlay(reason);
+}
+
+async function resumeAfterAuth() {
+  hideAuthOverlay();
+  document.title = C.pageTitle(C.inboxCounts(S.inbox));
+  if (!S.appStarted) {
+    await bootApp();
+    return;
+  }
+  streamStopped = false;
+  renderDot();
+  connect();
+  refetchAll();
+  loadTargets();
+}
+
+function wireAuthOverlay() {
+  const form = $("auth-overlay-form");
+  const input = $("auth-overlay-input");
+  const submit = $("auth-overlay-submit");
+  const retry = $("auth-overlay-retry");
+  const errEl = $("auth-overlay-error");
+  if (!form || form.dataset.bound) return;
+  form.dataset.bound = "1";
+  const showErr = (msg) => { errEl.textContent = msg; errEl.hidden = false; };
+  const setBusy = (on) => { submit.disabled = on; retry.disabled = on; input.disabled = on; };
+  const testBearer = async (token) => {
+    const r = await fetch("/api/status", { credentials: "omit", headers: { Authorization: "Bearer " + token } });
+    return r.ok;
+  };
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    errEl.hidden = true;
+    const parsed = C.classifyAuthInput(input.value);
+    if (parsed.error) return showErr(parsed.error);
+    setBusy(true);
+    try {
+      if (parsed.kind === "code" || parsed.kind === "code_or_token") {
+        const res = await redeemCode(parsed.value);
+        if (res.ok) { await resumeAfterAuth(); return; }
+        if (parsed.kind === "code_or_token" && await testBearer(parsed.value)) {
+          keepSecret(parsed.value);
+          await resumeAfterAuth();
+          return;
+        }
+        showErr(res.status === 401 ? "That login code was rejected or already used. Run `ferret open` for a fresh one." : C.errorSentence(res.status, res.text));
+      } else {
+        if (await testBearer(parsed.value)) {
+          keepSecret(parsed.value);
+          await resumeAfterAuth();
+          return;
+        }
+        showErr("That token was rejected by the daemon.");
+      }
+    } catch {
+      showErr("Could not reach the daemon. Check that it is running and try again.");
+    } finally {
+      setBusy(false);
+    }
+  });
+  retry.addEventListener("click", async () => {
+    errEl.hidden = true;
+    setBusy(true);
+    try {
+      if (await signIn()) {
+        await resumeAfterAuth();
+        return;
+      }
+      showErr(authLostReason === "network" ? "The daemon is still unreachable." : "Still not signed in. Run `ferret open` or paste a login code above.");
+    } finally {
+      setBusy(false);
+    }
+  });
+}
+
+async function downloadAuthed(url, filename) {
+  const r = await fetch(url, { credentials: "omit", headers: authHeaders() });
+  if (r.status === 401) { lost(); throw new Error(C.LOST_TOKEN); }
+  if (!r.ok) {
+    const text = await r.text().catch(() => "");
+    throw new Error(C.errorSentence(r.status, text));
+  }
+  const blob = await r.blob();
+  const obj = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = obj;
+  a.download = filename;
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(obj), 60_000);
 }
 
 async function api(method, path, body) {
@@ -489,20 +680,184 @@ function renderDot() {
     state.title = words.tip;
   }
   const wrap = $("connection-wrap");
-  if (wrap) wrap.title = words.tip;
+  if (wrap) {
+    wrap.title = words.tip + "\nClick to open Daemon & Signal status.";
+    wrap.setAttribute("aria-label", `Connection: ${words.short}. Open daemon and Signal status.`);
+  }
   // The bar speaks the loss of the connection only where the sidebar is a closed drawer (under 700px); beside the open sidebar it would be said twice.
   const bar = $("bar-connection");
   if (bar) bar.textContent = !S.connected && PHONE.matches ? `${words.short} · execution state unknown` : "";
+  const banner = $("offline-banner");
+  if (banner) {
+    const showOffline = !S.connected && !streamStopped && (S.everConnected || S.attempts >= 1);
+    banner.hidden = !showOffline;
+    if (showOffline) {
+      $("offline-banner-text").textContent = S.attempts >= 3
+        ? "Offline — the daemon event stream is unreachable; execution state may be stale."
+        : "Disconnected from the daemon event stream — reconnecting…";
+    }
+  }
   $("bar-offline").hidden = S.connected || S.view !== "session";
   // A run chip counts up only while the stream is up: it changes with the connection.
   if (S.view === "session") want("header");
+  if ($("daemon-status")?.open) renderDaemonStatus();
 }
 
 function renderDiskWarning() {
   const box = $("disk-warning");
   const text = C.diskWarning(S.status && S.status.disk);
-  box.textContent = text || "";
   box.hidden = !text;
+  if (!text) { box.replaceChildren(); return; }
+  const gcBtn = btn("Preview GC…", "small", () => { openDaemonStatus(); runGc(false); });
+  box.replaceChildren(el("span", "", text + " "), gcBtn);
+}
+
+let statusOpener = null;
+function openDaemonStatus(opener = document.activeElement) {
+  const dialog = $("daemon-status");
+  if (!dialog) return;
+  if (dialog.open) return;
+  if (document.querySelector("dialog[open]")) return;
+  statusOpener = opener;
+  S.gc.confirmApply = false;
+  renderDaemonStatus();
+  dialog.showModal();
+  $("daemon-status-close").focus({ preventScroll: true });
+  loadStatus();
+}
+
+function closeDaemonStatus() {
+  const dialog = $("daemon-status");
+  if (dialog && dialog.open) dialog.close();
+}
+
+async function runGc(apply) {
+  if (S.gc.busy) return;
+  S.gc.busy = true;
+  S.gc.error = null;
+  if (apply) S.gc.confirmApply = false;
+  renderDaemonStatus();
+  try {
+    const report = await api("POST", "/api/gc", { apply: !!apply });
+    S.gc.report = report;
+    toast(C.formatGcReport(report));
+    if (apply) loadStatus();
+  } catch (e) {
+    S.gc.error = e.message;
+  } finally {
+    S.gc.busy = false;
+    renderDaemonStatus();
+  }
+}
+
+async function reloadModelProfiles() {
+  try {
+    const report = await api("POST", "/api/models/reload", {});
+    toast(C.formatReloadReport(report));
+    await Promise.all([loadStatus(), loadProfiles(), S.tab === "models" ? loadModels() : Promise.resolve()]);
+    if (S.view === "new") renderNewModels();
+  } catch (e) {
+    notice(e.message);
+  }
+}
+
+function renderDaemonStatus() {
+  const body = $("daemon-status-body");
+  if (!body || !$("daemon-status")?.open) return;
+  const st = S.status;
+  const frag = document.createDocumentFragment();
+  if (S.statusError) frag.append(el("p", "error", "Could not refresh status: " + S.statusError));
+  if (!st) {
+    frag.append(el("p", "dim", "Loading daemon status…"));
+    body.replaceChildren(frag);
+    return;
+  }
+  const makeKv = (rows) => {
+    const dl = el("dl", "kv");
+    for (const [k, v] of rows) {
+      if (v === null || v === undefined || v === "") continue;
+      add(dl, el("dt", "", k));
+      const dd = el("dd");
+      if (v instanceof Node) dd.append(v); else dd.textContent = String(v);
+      dl.append(dd);
+    }
+    return dl;
+  };
+  const now = Date.now();
+  const uptime = st.started_ms ? C.seconds(Math.max(0, now - st.started_ms)) : "";
+  const gib = (b) => (Number(b) / 1024 ** 3).toFixed(1) + " GiB";
+  const diskText = st.disk && st.disk.total_bytes > 0
+    ? `${gib(st.disk.free_bytes)} free of ${gib(st.disk.total_bytes)}`
+    : "unknown";
+  const daemonRows = [
+    ["Event stream", S.connected ? "Connected" : S.attempts >= 3 ? "Offline" : "Reconnecting…"],
+    ["Version", st.version],
+    ["PID", st.pid ? String(st.pid) : ""],
+    ["Uptime", uptime],
+    ["Bind", st.bind],
+    ["Proxy port", st.proxy_port ? String(st.proxy_port) : ""],
+    ["Sandbox", st.sandbox || "unknown"],
+    ["Network mode", st.network || "unknown"],
+    ["Egress", st.egress ? st.egress.level : ""],
+    ["Monitor", st.monitor ? `${st.monitor.state} · ${C.num(st.monitor.open_flags)} open flags` : ""],
+    ["Default model", st.default_model || (S.profiles && S.profiles.default_model) || ""],
+    ["Sessions", `${C.num(st.sessions_total)} total · ${C.num(st.sessions_active)} active · ${C.num(st.sessions_running)} running`],
+    ["Inbox open", C.num(st.inbox_open)],
+    ["Home", st.home],
+    ["Disk", diskText],
+  ];
+  frag.append(add(el("section", "status-section"), el("h3", "", "Daemon"), makeKv(daemonRows)));
+
+  // Signal bridge section
+  const sig = C.formatSignalStatus(st.signal, now);
+  const sigSec = el("section", "status-section");
+  const sigTone = sig.tone === "ok" ? "ok" : sig.tone === "bad" ? "bad" : sig.tone === "warn" ? "warn" : "dim";
+  add(sigSec, add(el("div", "section-heading"), el("h3", "", "Signal bridge"), chip(sig.state, sigTone)));
+  if (sig.rows.length) sigSec.append(makeKv(sig.rows));
+  else if (!sig.available) sigSec.append(el("p", "dim field-note", "Signal bridge is disabled or not configured on this daemon."));
+  frag.append(sigSec);
+
+  // Models section
+  const modSec = el("section", "status-section");
+  const reloadBtn = btn("Reload profiles", "small", reloadModelProfiles);
+  add(modSec, add(el("div", "section-heading"), el("h3", "", "Models"), reloadBtn));
+  const models = st.models || [];
+  if (!models.length) modSec.append(el("p", "dim field-note", "No model profiles configured."));
+  else {
+    const ul = el("ul", "status-models");
+    for (const m of models) {
+      const li = el("li", "status-model-row");
+      add(li, el("span", "mono", m.profile), el("span", "dim", m.model || ""), chip(m.reachable ? "reachable" : "unreachable", m.reachable ? "ok" : "warn"));
+      if (m.detail && !m.reachable) li.append(el("span", "dim", m.detail));
+      ul.append(li);
+    }
+    modSec.append(ul);
+  }
+  frag.append(modSec);
+
+  // Storage / GC section
+  const gcSec = el("section", "status-section");
+  gcSec.append(el("h3", "", "Storage garbage collection"));
+  const gcActions = el("div", "status-actions");
+  const prevBtn = btn(S.gc.busy ? "Working…" : "Preview GC", "small", () => runGc(false));
+  prevBtn.disabled = S.gc.busy;
+  const applyBtn = btn("Run GC…", "small danger", () => { S.gc.confirmApply = true; renderDaemonStatus(); });
+  applyBtn.disabled = S.gc.busy;
+  add(gcActions, prevBtn, applyBtn);
+  gcSec.append(gcActions);
+  if (S.gc.confirmApply) {
+    gcSec.append(confirmRow(
+      { text: "Delete unreferenced stored outputs from disk now?", yes: "Run GC", no: "Cancel" },
+      () => runGc(true),
+      () => { S.gc.confirmApply = false; renderDaemonStatus(); },
+      "gc:",
+    ));
+  }
+  if (S.gc.error) gcSec.append(el("p", "error", S.gc.error));
+  if (S.gc.report) gcSec.append(el("p", "dim field-note", C.formatGcReport(S.gc.report)));
+  frag.append(gcSec);
+
+  preserveFocus(body, () => body.replaceChildren(frag));
 }
 
 function renderEgressWarning() {
@@ -605,6 +960,9 @@ function openSession(id) {
   S.openId = id;
   S.headAsk = null;
   hideHeadConfirm();
+  hideComposerStopConfirm();
+  S.scopeForm = null;
+  S.mcpChecks = new Map();
   S.seatNote.delete(id); // a switch sentence from an earlier visit is not news
   let ancestor = S.sessions.byId.get(id)?.parent;
   const walked = new Set();
@@ -747,15 +1105,16 @@ async function loadRecords(store, tries) {
  */
 async function loadEarlier(store, { all = false } = {}) {
   if (store.earlierLoading) return store.earlierLoading;
-  if (!C.hasEarlier(store)) return;
+  if (!C.hasEarlier(store)) return false;
   const run = (async () => {
+    let ok = false;
     $("btn-earlier").disabled = true;
     $("btn-earlier").textContent = "Loading earlier records…";
     try {
       do {
         const req = C.earlierRequest(store);
         const page = await api("GET", C.recordsUrl(store.session, null, req.limit, req.before));
-        if (S.rec !== store) return;
+        if (S.rec !== store) return false;
         const scroller = chatScroller();
         const bottom = scroller.scrollHeight - scroller.scrollTop;
         const added = C.prependRecords(store, page.records, page.prev_before ?? null);
@@ -767,13 +1126,16 @@ async function loadEarlier(store, { all = false } = {}) {
         if (!S.follow) scroller.scrollTop = scroller.scrollHeight - bottom;
         want("overview");
       } while (all && C.hasEarlier(store));
+      ok = true;
     } catch (e) {
       toast("Could not load earlier records: " + e.message);
+      ok = false;
     } finally {
       store.earlierLoading = null;
       $("btn-earlier").disabled = false;
       if (S.rec === store) syncChat();
     }
+    return ok;
   })();
   store.earlierLoading = run;
   return run;
@@ -832,7 +1194,10 @@ function setSection(section, navigate = true) {
     });
   }
   if (S.section === "chat") want("blocks", "live");
-  if (S.section === "evidence" && S.ledger.stale) loadLedger();
+  if (S.section === "evidence") {
+    if (S.ledger.stale) loadLedger();
+    if (!S.exch.loaded) loadExchanges();
+  }
   if (S.section === "agents") loadScore(true);
   want("overview");
 }
@@ -939,6 +1304,17 @@ function handleEvent(ev) {
   }
 }
 
+function reconnectNow() {
+  if (streamStopped) return;
+  if (reconnectWake) {
+    const wake = reconnectWake;
+    reconnectWake = null;
+    wake();
+    return;
+  }
+  if (!S.connected && streamCtl) streamCtl.abort();
+}
+
 // EventSource cannot send an Authorization header, so the stream is read with fetch.
 async function connect() {
   let attempt = 0;
@@ -983,14 +1359,17 @@ async function connect() {
     clearTimeout(idle);
     // However the read ended, let go of the connection before another is opened.
     streamCtl.abort();
-    // After lost() the page is the sign-in sentence: there is no dot to update.
+    // After lost() the page shows the sign-in overlay: stop the loop until resumed.
     if (streamStopped) return;
     S.connected = false;
     S.connectedSince = null;
     want("list", "header", "overview"); // the quiet notes go with the stream
     S.attempts++;
     renderDot();
-    await new Promise((resolve) => setTimeout(resolve, C.reconnectDelayMs(attempt++)));
+    await new Promise((resolve) => {
+      const t = setTimeout(() => { reconnectWake = null; resolve(); }, C.reconnectDelayMs(attempt++));
+      reconnectWake = () => { clearTimeout(t); attempt = 0; resolve(); };
+    });
   }
 }
 
@@ -1062,10 +1441,13 @@ async function loadStatus() {
     renderDot();
     renderDiskWarning();
     renderEgressWarning();
+    if (S.view === "new") { renderPackRoleNotes(); renderNewModels(); }
+    if ($("daemon-status")?.open) renderDaemonStatus();
   } catch (e) {
     if (request !== S.requests.status) return;
     S.statusError = e.message;
     renderDot();
+    if ($("daemon-status")?.open) renderDaemonStatus();
   }
 }
 
@@ -1563,6 +1945,29 @@ function cancelHeadConfirm(restore = true) {
   }
 }
 
+function hideComposerStopConfirm() {
+  S.composerStopAsk = null;
+  const box = $("composer-stop-confirm");
+  if (box) box.hidden = true;
+}
+
+function cancelComposerStopConfirm(restore = true) {
+  const ask = S.composerStopAsk;
+  hideComposerStopConfirm();
+  if (restore && ask && ask.opener && document.contains(ask.opener) && !ask.opener.hidden) {
+    ask.opener.focus({ preventScroll: true });
+  }
+}
+
+function askComposerStop(info, opener) {
+  if (!info) return;
+  hideHeadConfirm();
+  S.composerStopAsk = { session: info.id, opener };
+  $("composer-stop-text").textContent = C.stopQuestion(info);
+  $("composer-stop-confirm").hidden = false;
+  $("composer-stop-cancel").focus({ preventScroll: true });
+}
+
 function askHeaderConfirm(kind, info, opener) {
   if (!info) return;
   let text = null;
@@ -1572,6 +1977,7 @@ function askHeaderConfirm(kind, info, opener) {
     if (!text) { sessionAction("archive", { archived: true }); return; }
   }
   if (!text) return;
+  hideComposerStopConfirm();
   S.headAsk = { kind, session: info.id, opener };
   $("shead-confirm-text").textContent = text;
   const yes = $("shead-confirm-yes");
@@ -1579,6 +1985,7 @@ function askHeaderConfirm(kind, info, opener) {
   yes.className = kind === "stop" ? "btn small danger" : "btn small primary";
   $("shead-confirm-cancel").textContent = kind === "stop" ? "Keep running" : "Keep open";
   $("shead-confirm").hidden = false;
+  $("shead-confirm").scrollIntoView({ block: "nearest" });
   $("shead-confirm-cancel").focus({ preventScroll: true });
 }
 
@@ -1671,6 +2078,9 @@ function renderHeader() {
   if (S.headAsk && (S.headAsk.session !== info.id || (S.headAsk.kind === "stop" && !a.stop) || (S.headAsk.kind === "archive" && !a.archive))) {
     hideHeadConfirm();
   }
+  if (S.composerStopAsk && (S.composerStopAsk.session !== info.id || !a.stop)) {
+    hideComposerStopConfirm();
+  }
   // The text box and Send go with the ability to send; the model seat stays, so an ended session can still be re-seated.
   $("msg").hidden = !a.send;
   $("send").hidden = !a.send;
@@ -1690,7 +2100,8 @@ function renderHeader() {
   // A message is not an answer: say so while a question of this mission waits on the operator.
   const paused = missionEntries().some(entry => entry.item.blocking);
   const lead = C.rootNoun(info) === "lead";
-  const help = C.composerHelp({ coarse: COARSE.matches, paused, running: a.running && lead, lead, mac: MAC });
+  const canQueue = C.canQueueSession(info);
+  const help = C.composerHelp({ coarse: COARSE.matches, paused, running: canQueue, lead, mac: MAC });
   $("composer-help").textContent = [help.keys, help.note].filter(Boolean).join(" ");
   $("composer-help").hidden = !a.send;
   $("msg").enterKeyHint = COARSE.matches ? "enter" : "send";
@@ -1711,7 +2122,7 @@ function renderHeader() {
   const sending = S.sending.has(info.id);
   const message = S.messageState.get(info.id);
   // A message held for after the turn is on disk and listed above; it must not lock Send until the turn ends.
-  const pendingReceipt = message?.accepted && message.recordedSeq === undefined && message.state !== "failed" && message.state !== "held";
+  const pendingReceipt = C.isPendingReceipt(message);
   $("msg").disabled = sending;
   const att = attachState("message:" + info.id);
   $("attach-bar").hidden = !a.send;
@@ -1723,7 +2134,6 @@ function renderHeader() {
   $("send").setAttribute("aria-label", sendLabel);
   $("send").title = att.busy ? "Waiting for the uploads to finish" : att.failed ? "Remove the attachment that failed to upload first" : sendLabel === "Send" ? (COARSE.matches ? "Send" : "Send (Enter)") : sendLabel;
   $("send").setAttribute("aria-busy", String(sending || !!pendingReceipt));
-  const canQueue = a.send && a.running && lead;
   $("send-more").hidden = !canQueue;
   $("send-more").disabled = $("send").disabled;
   if (!canQueue) closeSendMenu();
@@ -2072,10 +2482,23 @@ function buildSheet(info) {
     rows.push(srow("Title", null, { full: rename }));
   }
   if (a.archive || a.unarchive) {
-    const arch = btn(action?.name === "archive" ? action.label : a.archive ? "Archive" : "Unarchive", "", () => sessionAction("archive", { archived: !!a.archive }));
+    const arch = btn(action?.name === "archive" ? action.label : a.archive ? "Archive" : "Unarchive", "", () => {
+      if (a.archive && C.archiveQuestion(info, missionEntries().length)) {
+        S.sheet.ask = { kind: "archive", focus: true };
+        want("sheet");
+      } else {
+        sessionAction("archive", { archived: !!a.archive });
+      }
+    });
     arch.dataset.focusKey = "sheet:archive";
     arch.disabled = !!action;
     rows.push(srow("Mission", null, { full: arch }));
+    if (a.archive && S.sheet.ask && S.sheet.ask.kind === "archive") {
+      const q = { text: C.archiveQuestion(info, missionEntries().length), yes: "Archive", no: "Keep open" };
+      if (q.text) {
+        rows.push(confirmRow(q, () => { S.sheet.ask = null; want("sheet"); sessionAction("archive", { archived: true }); requestAnimationFrame(() => focusKey("sheet:h:session")); }, () => { S.sheet.ask = null; want("sheet"); requestAnimationFrame(() => focusKey("sheet:archive")); }, "sheet:"));
+      }
+    }
   }
   rows.push(srow("Session id", null, { full: add(el("div"), copy, copied) }), srow("Inspector", null, { full: inspector }));
   out.push(sheetSection("session", "Session", sheetCard(...rows)));
@@ -2350,15 +2773,17 @@ function renderMiniPlan(info) {
  * next Tab continues from there. `done(node)` is called once it is shown. While the jump settles `S.jumping` keeps the scroll handler
  * from deciding that the chat is following the end again (widening the window keeps the bottom offset and would say so).
  */
-function jumpToRecord(seq, { focus = false, highlight = true, done = null } = {}) {
+function jumpToRecord(seq, { focus = false, highlight = true, done = null, _retried = false } = {}) {
   setSection("chat");
   S.jumping = true;
   requestAnimationFrame(() => {
     const block = S.rec?.blocks.find(b => b.seq === seq || b.callSeq === seq || b.result?.seq === seq || b.resolved?.seq === seq);
-    if (!block && S.rec && C.hasEarlier(S.rec)) {
-      // The record is before the loaded ones: load them, then go there.
+    if (!block && !_retried && S.rec && C.hasEarlier(S.rec)) {
+      // The record is before the loaded ones: load them, then go there (at most once, stopping on failure).
       S.jumping = false;
-      loadEarlier(S.rec, { all: true }).then(() => jumpToRecord(seq, { focus, highlight, done }));
+      loadEarlier(S.rec, { all: true }).then((ok) => {
+        if (ok) jumpToRecord(seq, { focus, highlight, done, _retried: true });
+      });
       return;
     }
     if (!block || !S.r) { S.jumping = false; return; }
@@ -2425,7 +2850,21 @@ function renderEvidence(panel) {
       filters.append(b);
     }
   }
-  frag.append(heading("h2", "Claims and source evidence", claims.length ? filters : null));
+  const info = S.sessions.byId.get(S.openId);
+  const sarifBtn = info && info.mission ? btn("Export SARIF", "small", async (e) => {
+    const b = e.currentTarget;
+    b.disabled = true;
+    try {
+      await downloadAuthed(C.sarifUrl(info.mission), `${info.mission}.sarif.json`);
+      toast("Downloaded SARIF report.");
+    } catch (err) {
+      notice(err.message);
+    } finally {
+      b.disabled = false;
+    }
+  }) : null;
+  if (sarifBtn) sarifBtn.dataset.focusKey = "evidence:sarif";
+  frag.append(heading("h2", "Claims and source evidence", sarifBtn, claims.length ? filters : null));
   const about = el("p", "dim evidence-about");
   add(about, document.createTextNode("Two separate checks appear below. "), el("strong", "", "Quote match"),
     document.createTextNode(" means the runtime found the quoted text in the stored output. "), el("strong", "", "Claim status"),
@@ -2768,6 +3207,17 @@ function buildBlock(b, ctx = {}) {
       else if (b.mode === "fork") modeEl.title = "Starts from a copy of the lead's conversation.";
       add(h, icon("tool-agent"), el("strong", "", `agent started: ${b.role}`), modeEl, childLink(b.child));
       add(root, h, textBox(b.brief.question || "", "txt"));
+      const extra = C.briefDetails(b.brief);
+      if (extra.length) {
+        const d = el("details", "brief-details");
+        const sum = el("summary", "", `Brief details (${extra.map((x) => x.label.toLowerCase()).join(", ")})`);
+        sum.dataset.focusKey = "brief:" + b.id;
+        remembered(d, b, "brief");
+        const dl = el("dl", "brief-dl");
+        for (const item of extra) add(dl, el("dt", "", item.label), el("dd", "", item.text));
+        add(d, sum, dl);
+        add(root, d);
+      }
       break;
     }
     case "child_settled": {
@@ -3641,7 +4091,8 @@ function inboxCard(entry, resolved, context = "inbox") {
   if (resolved) {
     const given = el("div", "given");
     // A scope request the operator approved is not "Dismissed": the hosts were granted first.
-    add(given, el("div", "label", resolved.approved ? "Approved · hosts granted: " + resolved.approved.join(", ") : C.isRefusal(resolved.answer) ? "Refused" : resolved.answer === "" ? (C.scopeRequestHosts(item) ? "Closed" : "Dismissed") : "Answered"));
+    const approvedHosts = Array.isArray(resolved.approved) && resolved.approved.length > 0 ? resolved.approved : null;
+    add(given, el("div", "label", approvedHosts ? "Approved · hosts granted: " + approvedHosts.join(", ") : C.isRefusal(resolved.answer) ? "Refused" : resolved.answer === "" ? (C.scopeRequestHosts(item) ? "Closed" : "Dismissed") : "Answered"));
     if (resolved.answer !== "") given.append(textBox(resolved.answer, "txt prose-text"));
     card.append(given);
     return card;
@@ -3816,7 +4267,7 @@ function parkControls(entry, choices, ta, sync, send, err) {
     if (!choice) return;
     ta.value = choice.answer;
     sync();
-    send(ta.value, []);
+    send(ta.value);
   });
   noRepeat(draftYes);
   const draftNo = btn("Keep draft", "small", () => {
@@ -3869,7 +4320,7 @@ function parkControls(entry, choices, ta, sync, send, err) {
         draftConfirm.hidden = true;
         ta.value = c.answer;
         sync();
-        send(ta.value, []);
+        send(ta.value);
       } else if (c.action === "provide") {
         ta.focus();
       } else {
@@ -4000,8 +4451,12 @@ function renderInbox() {
   for (const g of groups) g.root = rootId(g.mission);
   reconcileInbox($("inbox-list"), groups.flatMap(g => g.entries), "inbox", groups);
   const granted = notificationsAvailable() && Notification.permission === "granted";
-  // When they are off, say why: a phone browser often offers none, and a refusal is changed in the browser's site settings.
-  const why = !notificationsAvailable() ? "this browser does not offer page notifications here" : Notification.permission === "denied" ? "blocked in this browser's site settings" : "";
+  // When they are off, say why cleanly (also covering macOS WKWebView inside ferret-desk where Notification API is absent).
+  const why = !notificationsAvailable()
+    ? "not available in this web view (desktop app notifications are managed in the menu bar and System Settings)"
+    : Notification.permission === "denied"
+      ? "blocked in this browser's site settings"
+      : "";
   $("notif-state").textContent = "Notifications: " + (granted ? "on" : why ? "off, " + why : "off");
   $("notif-btn").hidden = !notificationsAvailable() || Notification.permission !== "default";
 }
@@ -4009,30 +4464,152 @@ function renderInbox() {
 // ---------------------------------------------------------------------------------------------
 // New session form
 
-function showNew() {
-  setView("new");
-  const role = $("f-role");
-  if (role.options.length === 0) {
-    for (const r of C.ROLES) role.append(new Option(r, r));
-    // Only a lead starts agents: a chat has no agents' model to choose.
-    role.addEventListener("change", () => { $("f-agent-model").disabled = role.value !== "lead"; });
+/** The chosen pack of the new-mission form (its entry of S.packs), else the first. */
+function chosenPack() {
+  return S.packs.find((p) => p.name === $("f-pack").value) || S.packs[0];
+}
+
+/** The agents' model applies only to a role that starts agents. */
+function syncAgentsModel() {
+  const pack = chosenPack();
+  const r = pack && (pack.roles || []).find((x) => x.name === $("f-role").value);
+  $("f-agent-model").disabled = !(r && r.starts_agents);
+}
+
+function renderPackRoleNotes() {
+  const pack = chosenPack();
+  const roleName = $("f-role").value;
+  const info = C.packRoleSummary(pack, roleName, (S.status && S.status.network) || "");
+  const note = $("f-pack-note");
+  const packParts = [];
+  if (info.desc) packParts.push(document.createTextNode(info.desc));
+  for (const flag of info.flags) {
+    if (packParts.length) packParts.push(document.createTextNode(" "));
+    packParts.push(chip(flag, flag.includes("restricted") ? "warn" : "dim"));
   }
+  note.replaceChildren(...packParts);
+  note.hidden = !packParts.length;
+  const roleNote = $("f-role-note");
+  if (roleNote) {
+    roleNote.textContent = info.roleDesc ? `${roleName}: ${info.roleDesc}` : "";
+    roleNote.hidden = !info.roleDesc;
+  }
+  const warn = $("f-pack-warn");
+  if (warn) {
+    warn.textContent = info.warning || "";
+    warn.hidden = !info.warning;
+  }
+}
+
+function renderNewModels() {
+  const models = seatModels();
+  const defaultModel = (S.profiles && S.profiles.default_model) || (S.status && S.status.default_model) || "";
   const model = $("f-model");
   const prevModel = model.options.length ? model.value : S.newForm.model;
   model.replaceChildren();
-  const models = (S.status && S.status.models) || [];
-  for (const m of models) model.append(new Option(m.profile + (m.reachable ? "" : " (not reachable)"), m.profile));
+  for (const m of models) model.append(new Option(m.profile + (m.reachable === false ? " (not reachable)" : ""), m.profile));
   if (models.length === 0) model.append(new Option("default", ""));
-  if (prevModel !== null && prevModel !== undefined && [...model.options].some(o => o.value === prevModel)) model.value = prevModel;
+  if (prevModel && [...model.options].some((o) => o.value === prevModel)) {
+    model.value = prevModel;
+  } else {
+    const picked = C.defaultModelProfile(models, defaultModel);
+    if (picked && [...model.options].some((o) => o.value === picked)) model.value = picked;
+  }
   S.newForm.model = model.value;
-  // The model the mission's agents start on, before the lead's first one; empty: as the pack says.
   const agents = $("f-agent-model");
   const prevAgentModel = agents.options.length ? agents.value : S.newForm.agentModel;
   agents.replaceChildren(new Option("As the pack says", ""));
-  for (const m of models) agents.append(new Option(m.profile, m.profile));
-  if (prevAgentModel !== null && prevAgentModel !== undefined && [...agents.options].some(o => o.value === prevAgentModel)) agents.value = prevAgentModel;
+  for (const m of models) agents.append(new Option(m.profile + (m.reachable === false ? " (not reachable)" : ""), m.profile));
+  if (prevAgentModel !== null && prevAgentModel !== undefined && [...agents.options].some((o) => o.value === prevAgentModel)) agents.value = prevAgentModel;
   S.newForm.agentModel = agents.value;
-  agents.disabled = role.value !== "lead";
+  renderChips(attachCtx.start);
+}
+
+function renderPriorPicks() {
+  const box = $("f-prior-picks");
+  if (!box) return;
+  const roots = [...S.sessions.byId.values()]
+    .filter((s) => !s.parent && s.mission)
+    .sort((a, b) => (b.created_ms || 0) - (a.created_ms || 0));
+  const seen = new Set();
+  const picks = [];
+  for (const r of roots) {
+    if (seen.has(r.mission)) continue;
+    seen.add(r.mission);
+    picks.push(r);
+    if (picks.length >= 8) break;
+  }
+  box.hidden = picks.length === 0;
+  if (!picks.length) { box.replaceChildren(); return; }
+  const current = new Set(String($("f-prior").value || "").split(/[\s,]+/).filter(Boolean));
+  const items = [el("span", "dim prior-picks-label", "Recent missions:")];
+  for (const r of picks) {
+    const active = current.has(r.mission);
+    const b = btn(`${r.mission} (${C.oneLine(r.title || r.id, 26)})`, "small" + (active ? " primary" : ""), () => {
+      const words = String($("f-prior").value || "").split(/[\s,]+/).filter(Boolean);
+      const next = words.includes(r.mission) ? words.filter((w) => w !== r.mission) : [...words, r.mission];
+      $("f-prior").value = next.join(" ");
+      renderPriorPicks();
+    });
+    b.title = `${r.mission}: ${r.title || r.id}`;
+    items.push(b);
+  }
+  box.replaceChildren(...items);
+}
+
+/** Fill the Pack select from S.packs, then the Role select; `packChanged` selects the pack's default role. */
+function renderNewPack(packChanged) {
+  const sel = $("f-pack");
+  if (!packChanged) {
+    const keep = sel.options.length ? sel.value : S.newForm.pack;
+    sel.replaceChildren(...S.packs.map((p) => { const o = new Option(p.name, p.name); o.title = p.description || ""; return o; }));
+    sel.value = S.packs.some((p) => p.name === keep) ? keep : (S.packs.find((p) => p.name === "core") || S.packs[0]).name;
+    S.newForm.pack = sel.value;
+  }
+  const pack = chosenPack();
+  const role = $("f-role");
+  const keepRole = packChanged ? pack.default_role : (role.options.length ? role.value : S.newForm.role);
+  role.replaceChildren();
+  for (const g of C.roleGroups(pack)) {
+    const group = document.createElement("optgroup");
+    group.label = g.label;
+    for (const r of g.roles) { const o = new Option(r.name, r.name); o.title = r.title; group.append(o); }
+    role.append(group);
+  }
+  const names = [...role.options].map((o) => o.value);
+  role.value = names.includes(keepRole) ? keepRole : names.includes(pack.default_role) ? pack.default_role : names[0] || "";
+  S.newForm.role = role.value;
+  renderPackRoleNotes();
+  syncAgentsModel();
+}
+
+/** Fetch the installed packs when the form is shown; an older daemon (no route) keeps the core fallback. */
+async function loadPacks() {
+  const request = ++S.requests.packs;
+  let list = null;
+  try {
+    const got = await api("GET", "/api/packs");
+    if (Array.isArray(got)) list = got.filter((p) => p && p.name && Array.isArray(p.roles));
+  } catch { list = null; }
+  if (request !== S.requests.packs) return;
+  S.packs = list && list.length ? list : C.fallbackPacks();
+  renderNewPack(false);
+}
+
+function showNew() {
+  setView("new");
+  if (!$("f-pack").dataset.bound) {
+    $("f-pack").dataset.bound = "1";
+    $("f-pack").addEventListener("change", () => { S.newForm.pack = $("f-pack").value; renderNewPack(true); });
+    $("f-role").addEventListener("change", () => { S.newForm.role = $("f-role").value; syncAgentsModel(); renderPackRoleNotes(); });
+    $("f-prior").addEventListener("input", renderPriorPicks);
+  }
+  renderNewPack(false);
+  loadPacks();
+  renderNewModels();
+  loadProfiles();
+  syncAgentsModel();
+  renderPriorPicks();
   $("f-error").hidden = true;
   hideCreateAsk();
   $("f-receipt").hidden = true;
@@ -4043,21 +4620,33 @@ function showNew() {
 async function submitNew(ev, create = false) {
   if (ev) ev.preventDefault();
   const workspace = $("f-workspace").value.trim();
+  const priorRes = C.resolvePriorInput($("f-prior").value, S.sessions.byId);
+  const err = $("f-error");
+  if (priorRes.unknownSessions.length) {
+    err.textContent = `${priorRes.unknownSessions.join(", ")} looks like a session id, not a mission id (m-…). Open the mission's Session tab to copy its mission id.`;
+    err.hidden = false;
+    return;
+  }
+  if (priorRes.mapped.length) {
+    $("f-prior").value = priorRes.text;
+    renderPriorPicks();
+  }
   const r = C.buildNewSession({
     workspace: $("f-workspace").value,
     message: $("f-message").value,
+    pack: $("f-pack").value,
     role: $("f-role").value,
+    startsAgents: !$("f-agent-model").disabled,
     model: $("f-model").value,
     agentModel: $("f-agent-model").value,
     title: $("f-title").value,
-    prior: $("f-prior").value,
+    prior: priorRes.text,
     unattended: $("f-unattended").checked,
     target: $("f-target").value,
     creds: $("f-creds-field").hidden ? "" : $("f-creds").value,
     // Only for a folder the operator chose to make: the picker's New folder, or the answer to the question below.
     createWorkspace: create || (pickerCreate !== null && workspace === pickerCreate),
   });
-  const err = $("f-error");
   hideCreateAsk();
   if (r.error) {
     err.textContent = r.error;
@@ -4116,7 +4705,10 @@ function setTab(t) {
 }
 
 function loadTab() {
-  if (S.tab === "ledger") loadLedger();
+  if (S.tab === "ledger") {
+    loadLedger();
+    if (!S.exch.loaded) loadExchanges();
+  }
   else if (S.tab === "models") loadModels();
   else if (S.tab === "context") loadWindow();
   else if (S.tab === "session") loadMcp();
@@ -4124,7 +4716,35 @@ function loadTab() {
     if (S.net.length === 0) loadNet();
     if (!S.exch.loaded) loadExchanges();
     if (S.ledger.stale || !S.ledger.model) loadLedger();
+    loadNoise();
+    loadRewriteRules();
   }
+}
+
+async function loadNoise() {
+  const request = ++S.requests.noise;
+  try {
+    const data = await api("GET", "/api/network/noise");
+    if (request !== S.requests.noise) return;
+    S.noise = { supported: true, data, error: null };
+  } catch (e) {
+    if (request !== S.requests.noise) return;
+    S.noise = { supported: e.status === 404 ? false : S.noise.supported, data: S.noise.data, error: e.status === 404 ? null : e.message };
+  }
+  if (S.tab === "network") want("right");
+}
+
+async function loadRewriteRules() {
+  const request = ++S.requests.rewrites;
+  try {
+    const list = await api("GET", "/api/traffic/rewrite-rules");
+    if (request !== S.requests.rewrites) return;
+    S.rewrites = { ...S.rewrites, supported: true, list: Array.isArray(list) ? list : [], error: null };
+  } catch (e) {
+    if (request !== S.requests.rewrites) return;
+    S.rewrites = { ...S.rewrites, supported: e.status === 404 ? false : S.rewrites.supported, error: e.status === 404 ? null : e.message };
+  }
+  if (S.tab === "network") want("right");
 }
 
 async function loadLedger() {
@@ -4425,11 +5045,14 @@ function renderModels(p, info) {
   }
   const refresh = btn("Refresh", "", () => loadModels());
   refresh.dataset.focusKey = "models:refresh";
+  const reload = btn("Reload profiles", "", reloadModelProfiles);
+  reload.dataset.focusKey = "models:reload";
+  reload.title = "Re-read [models] from config.toml without restarting the daemon.";
   parts.push(
     el("p", "dim", m.roles.length
-      ? "A choice is used for agents started from then on; a forked agent shares the lead's model. Profiles are the config's [models] (loom models reload)."
+      ? "A choice is used for agents started from then on; a forked agent shares the lead's model. Profiles are the config's [models]."
       : "This lead starts no agents."),
-    refresh,
+    add(el("div", "models-actions"), refresh, reload),
   );
   // The question is read out once when it opens; focus stays on the select.
   if (q && askSaid !== q.text) toast(q.text);
@@ -4794,13 +5417,270 @@ function renderContext(p) {
   preserveFocus(p, () => p.replaceChildren(frag));
 }
 
+function scopeGrantForm() {
+  const id = S.openId;
+  if (S.scopeForm && S.scopeForm.session === id) return S.scopeForm;
+  const box = el("div", "scope-grant");
+  const hostsIn = ruleInput("Host(s) to grant, e.g. api.example.com");
+  hostsIn.setAttribute("aria-label", "Hosts to grant");
+  const noteIn = ruleInput("Reason (optional)");
+  noteIn.setAttribute("aria-label", "Reason for host grant");
+  const noteEl = el("p", "rule-note dim");
+  noteEl.setAttribute("role", "status");
+  const grantBtn = btn("Grant hosts", "small", async () => {
+    const hosts = hostsIn.value.split(/[\s,]+/).map((h) => h.trim()).filter(Boolean);
+    const req = C.scopeRequest(id, hosts, noteIn.value);
+    if (req.error) { noteEl.className = "rule-note error"; noteEl.textContent = req.error; return; }
+    grantBtn.disabled = true;
+    noteEl.className = "rule-note dim";
+    noteEl.textContent = "Granting…";
+    try {
+      await api("POST", req.path, req.body);
+      hostsIn.value = "";
+      noteIn.value = "";
+      noteEl.className = "rule-note okc";
+      noteEl.textContent = `Granted: ${req.body.hosts.join(", ")}.`;
+      loadLedger();
+      loadNet();
+    } catch (e) {
+      noteEl.className = "rule-note error";
+      noteEl.textContent = e.message;
+    } finally {
+      grantBtn.disabled = false;
+    }
+  });
+  for (const input of [hostsIn, noteIn]) {
+    input.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.isComposing) { e.preventDefault(); grantBtn.click(); } });
+  }
+  add(box, add(el("div", "rule-row"), hostsIn, noteIn, grantBtn), noteEl);
+  S.scopeForm = { session: id, box };
+  return S.scopeForm;
+}
+
+function noiseSection() {
+  if (S.noise.supported !== true) return null;
+  const d = el("details", "net-extra");
+  const data = S.noise.data;
+  const hosts = Array.isArray(data?.hosts) ? data.hosts : [];
+  const head = el("summary", "", `Noise governor${data?.profile ? " · " + data.profile : ""}${hosts.length ? ` (${C.count(hosts.length, "host")})` : ""}`);
+  add(d, head);
+  const inner = el("div", "net-extra-body");
+  if (S.noise.error) inner.append(el("p", "error", S.noise.error));
+  if (data) {
+    inner.append(el("p", "dim field-note", `Profile: ${data.profile || "off"} · Assessment UA origins: ${C.num(data.assessment_ua_origins || 0)}`));
+    if (hosts.length) {
+      const t = el("table", "net");
+      const htr = el("tr");
+      add(htr, el("th", "", "Host"), el("th", "", "Sent"), el("th", "", "In-flight"), el("th", "", "Peak"), el("th", "", "Backoffs"));
+      t.append(htr);
+      for (const h of hosts) {
+        const tr = el("tr");
+        add(tr, el("td", "", h.host), el("td", "", C.num(h.sent)), el("td", "", C.num(h.inflight)), el("td", "", C.num(h.peak_inflight)), el("td", "", C.num(h.backoffs)));
+        t.append(tr);
+      }
+      inner.append(t);
+    } else inner.append(el("p", "dim field-note", "No per-host traffic recorded yet."));
+  }
+  const ref = btn("Refresh noise status", "small", loadNoise);
+  inner.append(ref);
+  d.append(inner);
+  return d;
+}
+
+function rewriteSection() {
+  if (S.rewrites.supported !== true) return null;
+  const R = S.rewrites;
+  const d = el("details", "net-extra");
+  if (R.editing || R.askDelete) d.open = true;
+  const enabledCount = R.list.filter((r) => r.enabled).length;
+  add(d, el("summary", "", `Proxy rewrite rules (${C.num(R.list.length)}${enabledCount ? `, ${enabledCount} enabled` : ""})`));
+  const inner = el("div", "net-extra-body");
+  if (R.error) inner.append(el("p", "error", R.error));
+  const topRow = el("div", "net-actions");
+  const addBtn = btn("Add rule", "small", () => {
+    R.editing = { id: 0, name: "", phase: "request", priority: 0, host: "", methods: "", url_regex: "", status: "", actionType: "set_header", headerName: "", regex: "", value: "", sensitive: false, note: "", enabled: false };
+    R.formError = null;
+    want("right");
+  });
+  addBtn.disabled = R.busy;
+  const refBtn = btn("Refresh", "small", loadRewriteRules);
+  add(topRow, addBtn, refBtn);
+  inner.append(topRow);
+  if (R.editing) {
+    const f = el("form", "rewrite-form");
+    const ed = R.editing;
+    const inp = (label, key, placeholder = "", type = "text") => {
+      const i = el("input");
+      i.type = type;
+      i.placeholder = placeholder;
+      i.value = ed[key] ?? "";
+      i.addEventListener("input", () => { ed[key] = i.value; });
+      const l = el("label", "", label);
+      l.append(i);
+      return l;
+    };
+    const sel = (label, key, opts) => {
+      const s = el("select");
+      for (const [v, t] of opts) s.append(new Option(t, v));
+      s.value = ed[key];
+      s.addEventListener("change", () => { ed[key] = s.value; want("right"); });
+      const l = el("label", "", label);
+      l.append(s);
+      return l;
+    };
+    add(f,
+      inp("Name", "name", "e.g. inject-staging-header"),
+      add(el("div", "form-row"),
+        sel("Phase", "phase", [["request", "Request"], ["response", "Response"]]),
+        inp("Priority", "priority", "0", "number"),
+      ),
+      inp("Host matcher (optional)", "host", "example.com or *.example.com"),
+      add(el("div", "form-row"),
+        inp("Methods (optional)", "methods", "GET POST"),
+        inp("URL regex (optional)", "url_regex", "/api/.*"),
+      ),
+      ed.phase === "response" ? inp("Status matcher (optional)", "status", "200 4xx") : null,
+      sel("Action", "actionType", [
+        ["set_header", "Set header"],
+        ["delete_header", "Delete header"],
+        ["replace_header", "Replace header (regex)"],
+        ["set_method", "Set method"],
+        ["set_path_query", "Set path/query"],
+        ["replace_url", "Replace URL (regex)"],
+        ["set_body", "Set body"],
+        ["replace_body", "Replace body (regex)"],
+        ["set_status", "Set status"],
+      ]),
+    );
+    if (["set_header", "delete_header", "replace_header"].includes(ed.actionType)) {
+      f.append(inp("Header name", "headerName", "X-Custom-Header"));
+    }
+    if (["replace_header", "replace_url", "replace_body"].includes(ed.actionType)) {
+      f.append(inp("Match regex", "regex", "pattern"));
+    }
+    if (ed.actionType !== "delete_header") {
+      const valPlaceholder = ed.actionType === "set_status"
+        ? "200 (200–599, excluding 204 and 304)"
+        : (ed.id > 0 && ed.sensitive && ed.hadSensitiveValue ? "stored (redacted) — leave blank to keep" : "value");
+      f.append(inp("Value", "value", valPlaceholder));
+    }
+    if (["set_header", "replace_header", "set_body", "replace_body"].includes(ed.actionType)) {
+      const cb = el("input");
+      cb.type = "checkbox";
+      cb.checked = !!ed.sensitive;
+      cb.addEventListener("change", () => { ed.sensitive = cb.checked; want("right"); });
+      f.append(add(el("label", "check"), cb, document.createTextNode(" Sensitive value (redacted on read)")));
+    }
+    f.append(inp("Note (optional)", "note", "Why this rule exists"));
+    if (R.formError) f.append(el("p", "error", R.formError));
+    const saveBtn = btn(R.busy ? "Saving…" : ed.id ? "Update rule" : "Create rule (disabled)", "small primary", () => {});
+    saveBtn.type = "submit";
+    saveBtn.disabled = R.busy;
+    const cancelBtn = btn("Cancel", "small", () => { R.editing = null; R.formError = null; want("right"); });
+    f.append(add(el("div", "net-actions"), saveBtn, cancelBtn));
+    f.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const built = C.buildRewriteRule(ed);
+      if (built.error) { R.formError = built.error; want("right"); return; }
+      R.busy = true;
+      R.formError = null;
+      want("right");
+      try {
+        if (ed.id) {
+          await api("PUT", "/api/traffic/rewrite-rules/" + ed.id, built.rule);
+          toast(`Updated rewrite rule "${built.rule.name}".`);
+        } else {
+          await api("POST", "/api/traffic/rewrite-rules", built.rule);
+          toast(`Created rewrite rule "${built.rule.name}" (starts disabled).`);
+        }
+        R.editing = null;
+        await loadRewriteRules();
+      } catch (err) {
+        R.formError = err.message;
+      } finally {
+        R.busy = false;
+        want("right");
+      }
+    });
+    inner.append(f);
+  }
+  if (!R.list.length) {
+    inner.append(el("p", "dim field-note", "No proxy rewrite rules configured."));
+  } else {
+    const ul = el("ul", "rewrite-list");
+    for (const rule of R.list) {
+      const item = el("li", "rewrite-item");
+      const head = el("div", "rewrite-head");
+      const toggle = btn(rule.enabled ? "Disable" : "Enable", "small", async () => {
+        try {
+          await api("POST", `/api/traffic/rewrite-rules/${rule.id}/toggle`, { enabled: !rule.enabled });
+          await loadRewriteRules();
+        } catch (err) { notice(err.message); }
+      });
+      const multiAction = Array.isArray(rule.actions) && rule.actions.length > 1;
+      const edit = btn("Edit", "small", () => {
+        if (multiAction) return;
+        const a0 = (rule.actions && rule.actions[0]) || { type: "set_header" };
+        const m = rule.matchers || {};
+        const extraMatchers = {};
+        if (Array.isArray(m.headers) && m.headers.length) extraMatchers.headers = m.headers;
+        if (m.body_regex) extraMatchers.body_regex = m.body_regex;
+        if (Array.isArray(m.resp_headers) && m.resp_headers.length) extraMatchers.resp_headers = m.resp_headers;
+        if (m.resp_body_regex) extraMatchers.resp_body_regex = m.resp_body_regex;
+        R.editing = {
+          id: rule.id, name: rule.name || "", enabled: !!rule.enabled, phase: rule.phase || "request",
+          priority: rule.priority || 0, host: m.host || "", methods: (m.methods || []).join(" "),
+          url_regex: m.url_regex || "", status: (m.status || []).join(" "),
+          extraMatchers,
+          actionType: a0.type || "set_header", headerName: a0.name || "", regex: a0.regex || "",
+          value: a0.value != null ? String(a0.value) : "",
+          sensitive: !!a0.sensitive,
+          hadSensitiveValue: !!(a0.sensitive && (a0.value_set || a0.value == null)),
+          note: rule.note || "",
+        };
+        R.formError = null;
+        want("right");
+      });
+      if (multiAction) {
+        edit.disabled = true;
+        edit.title = "Multi-action rule — edit via the CLI so all actions are preserved.";
+      }
+      const del = btn("Delete", "small danger", () => { R.askDelete = rule.id; want("right"); });
+      add(head, el("strong", "", rule.name || `#${rule.id}`), chip(rule.enabled ? "enabled" : "disabled", rule.enabled ? "ok" : "dim"), toggle, edit, del);
+      item.append(head, el("div", "dim mono rewrite-summary", C.rewriteRuleSummary(rule)));
+      if (rule.note) item.append(el("div", "dim field-note", rule.note));
+      if (R.askDelete === rule.id) {
+        item.append(confirmRow(
+          { text: `Delete rewrite rule "${rule.name}"?`, yes: "Delete", no: "Keep" },
+          async () => {
+            R.askDelete = null;
+            try {
+              await api("DELETE", `/api/traffic/rewrite-rules/${rule.id}`);
+              toast(`Deleted rewrite rule "${rule.name}".`);
+              await loadRewriteRules();
+            } catch (err) { notice(err.message); }
+          },
+          () => { R.askDelete = null; want("right"); },
+          `rw:${rule.id}:`,
+        ));
+      }
+      ul.append(item);
+    }
+    inner.append(ul);
+  }
+  d.append(inner);
+  return d;
+}
+
 function renderNetwork(p) {
   const sel = getSelection();
   if (sel && !sel.isCollapsed && sel.rangeCount && p.contains(sel.getRangeAt(0).commonAncestorContainer)) return;
+  const active = document.activeElement;
+  if (S.scopeForm && S.scopeForm.box.contains(active) && active.tagName === "INPUT") return;
   // A failed load (a damaged audit log among them) stays in view next to the decisions that arrive live.
   const error = S.netError ? [el("p", "error", S.netError)] : [];
   const granted = S.ledger.model ? [el("p", "dim", C.scopeLine(S.ledger.model))] : [];
-  const parts = [...granted];
+  const parts = [...granted, scopeGrantForm().box];
   if (S.net.length === 0) parts.push(...(error.length ? error : [el("p", "dim", "No network decisions recorded for this session.")]));
   else {
     const t = el("table", "net");
@@ -4812,14 +5692,65 @@ function renderNetwork(p) {
     parts.push(...error, t);
   }
   parts.push(requestsSection());
+  const noise = noiseSection();
+  if (noise) parts.push(noise);
+  const rewrites = rewriteSection();
+  if (rewrites) parts.push(rewrites);
   preserveFocus(p, () => p.replaceChildren(...parts));
 }
 
-/** The session's captured requests under its decisions: filterable by host and status, newest first (U2). */
+/** The session's captured requests under its decisions: filterable by host and status, newest first (U2), with HAR export/import. */
 function requestsSection() {
   const box = el("section", "net-requests");
   box.setAttribute("aria-label", "Requests");
-  box.append(el("h3", "", "Requests"));
+  const info = S.sessions.byId.get(S.openId);
+  const head = el("div", "section-heading");
+  add(head, el("h3", "", "Requests"));
+  if (info && info.mission) {
+    const harFile = el("input");
+    harFile.type = "file";
+    harFile.accept = ".har,.json,application/json";
+    harFile.hidden = true;
+    harFile.addEventListener("change", async () => {
+      const file = harFile.files && harFile.files[0];
+      harFile.value = "";
+      if (!file) return;
+      try {
+        const r = await fetch(`/api/missions/${encodeURIComponent(info.mission)}/har`, {
+          method: "POST",
+          credentials: "omit",
+          headers: authHeaders({ "Content-Type": "application/json" }),
+          body: file,
+        });
+        if (r.status === 401) { lost(); return; }
+        const txt = await r.text();
+        if (!r.ok) throw new Error(C.errorSentence(r.status, txt));
+        const res = txt ? JSON.parse(txt) : {};
+        toast(C.formatHarImport(res));
+        loadExchanges();
+      } catch (e) {
+        notice(e.message);
+      }
+    });
+    const exportHar = btn("Export HAR", "small", async (e) => {
+      const b = e.currentTarget;
+      b.disabled = true;
+      try {
+        const host = S.exFilter.host !== "all" ? S.exFilter.host : "";
+        await downloadAuthed(C.harUrl(info.mission, { host }), `${info.mission}${host ? "-" + host : ""}.har`);
+        toast("Downloaded HAR archive.");
+      } catch (err) {
+        notice(err.message);
+      } finally {
+        b.disabled = false;
+      }
+    });
+    exportHar.dataset.focusKey = "net:export-har";
+    const importHar = btn("Import HAR…", "small", () => harFile.click());
+    importHar.dataset.focusKey = "net:import-har";
+    add(head, add(el("div", "net-actions"), exportHar, importHar, harFile));
+  }
+  box.append(head);
   const all = allExchanges();
   if (S.exch.error) box.append(el("p", "error", S.exch.error));
   if (!all.length) { box.append(el("p", "dim", S.exch.loaded ? C.exchangeCountLine(0, 0) : "Loading requests…")); return box; }
@@ -4861,12 +5792,13 @@ function renderSessionTab(p, info) {
     else dd.textContent = v;
     kv.append(dd);
   };
-  row("id", info.id);
-  row("mission", info.mission);
+  const copyRow = (k, val, what) => row(k, add(el("span", "kv-copy"), el("span", "kv-val", val), copyButton("Copy " + what, () => val, { what, key: "session-copy:" + k })));
+  copyRow("id", info.id, "session id");
+  copyRow("mission", info.mission, "mission id");
   row("role", info.role);
   row("pack", info.pack);
   row("model", `${info.model} (${info.profile})`);
-  row("workspace", info.workspace);
+  copyRow("workspace", info.workspace, "workspace path");
   row("created", new Date(info.created_ms).toLocaleString());
   const b = S.rec && S.rec.start ? S.rec.start.budget : null;
   row("budget", b ? budgetWords(b) : "loading\u2026");
@@ -4900,7 +5832,21 @@ function renderSessionTab(p, info) {
   p.replaceChildren(...[kv, mcp, pref].filter(Boolean));
 }
 
-/** The MCP servers of a session: one card each (name, transport, state, tools expandable, a collapsed error and stderr block). */
+async function runMcpCheck(serverName) {
+  const info = S.sessions.byId.get(S.openId);
+  if (!info || !info.workspace) return;
+  S.mcpChecks.set(serverName, { busy: true, result: null, error: null });
+  want("right");
+  try {
+    const view = await api("POST", `/api/mcp/${encodeURIComponent(serverName)}/check`, { workspace: info.workspace });
+    S.mcpChecks.set(serverName, { busy: false, result: C.formatMcpCheck(view), error: null });
+  } catch (e) {
+    S.mcpChecks.set(serverName, { busy: false, result: null, error: e.message });
+  }
+  want("right");
+}
+
+/** The MCP servers of a session: one card each (name, transport, state, tools expandable, a collapsed error and stderr block, plus Check probe). */
 function mcpSection(servers) {
   if (!servers || !servers.length) return null;
   const box = el("section", "mcp-servers");
@@ -4911,9 +5857,26 @@ function mcpSection(servers) {
     card.dataset.server = m.name;
     const head = el("div", "mcp-head");
     const state = el("span", m.tone === "neutral" ? "capsule" : "capsule tone-" + m.tone, m.state);
+    const chk = S.mcpChecks.get(m.name);
+    const checkBtn = btn(chk?.busy ? "Checking…" : "Check", "small ghost", () => runMcpCheck(m.name));
+    checkBtn.disabled = !!chk?.busy;
+    checkBtn.dataset.focusKey = "mcp-check:" + m.name;
+    checkBtn.title = "Run a live handshake check against this MCP server using the session's workspace.";
     add(head, el("span", "name", m.name), el("span", "dim", m.transport), state);
     if (m.callsWords) add(head, el("span", "dim", m.callsWords));
+    add(head, checkBtn);
     add(card, head);
+    if (chk && !chk.busy) {
+      if (chk.error) add(card, el("div", "mcp-error", chk.error));
+      else if (chk.result) {
+        add(card, el("div", chk.result.ok ? "tnote okc" : "mcp-error", chk.result.summary));
+        if (chk.result.stderr.length) {
+          const sd = el("details", "mcp-detail");
+          sd.append(el("summary", "", "check stderr"), textBox(chk.result.stderr.join("\n"), "txt out mcp-stderr"));
+          add(card, sd);
+        }
+      }
+    }
     if (m.toolCount) {
       const d = el("details", "mcp-tools");
       d.append(el("summary", "", m.toolsWords));
@@ -4937,7 +5900,7 @@ function mcpSection(servers) {
 // ---------------------------------------------------------------------------------------------
 // Copy on select: a preference kept in this browser, off until the operator turns it on.
 
-const COPY_SELECT_KEY = "loom_copy_on_select";
+const COPY_SELECT_KEY = "ferret_copy_on_select";
 
 function storedCopyOnSelect() {
   try { return localStorage.getItem(COPY_SELECT_KEY) === "1"; } catch { return false; }
@@ -5334,6 +6297,10 @@ function addFiles(c, files) {
   const ws = c.workspace();
   if (!key || !files.length) return;
   if (!ws) { toast("Enter a workspace first: attached files are saved in it."); return; }
+  if (key === "new" && pickerCreate !== null && ws === pickerCreate) {
+    toast("Create the mission first to make this new folder, then attach files in the session.");
+    return;
+  }
   const list = attachList(key);
   attachments.set(key, list);
   for (const file of files) {
@@ -5397,14 +6364,23 @@ function wireAttach(c, { button, input, drops, paste, canDrop = () => true }) {
   });
 }
 
-/** The new-mission form: attaching waits for a workspace, and a changed workspace drops the files saved in the old one. */
+/** The new-mission form: attaching waits for an existing workspace, and a changed workspace drops the files saved in the old one. */
 function syncNewAttach() {
   const ws = $("f-workspace").value.trim();
-  $("f-attach").disabled = !ws;
-  $("f-attach").title = ws ? "Attach files; they are saved in the workspace" : "Enter a workspace first: attached files are saved in it.";
+  const pendingNewDir = pickerCreate !== null && ws === pickerCreate;
+  $("f-attach").disabled = !ws || pendingNewDir;
+  $("f-attach").title = !ws
+    ? "Enter a workspace first: attached files are saved in it."
+    : pendingNewDir
+      ? "Create the mission first to make this new folder, then attach files in the session."
+      : "Attach files; they are saved in the workspace";
   const list = attachList("new");
   const note = $("f-attach-note");
-  if (list.some(a => a.ws !== ws)) {
+  if (pendingNewDir) {
+    if (list.length) { attachments.delete("new"); renderChips(attachCtx.start); }
+    note.textContent = "Create the mission first to make this new folder, then attach files in the session.";
+    note.hidden = false;
+  } else if (list.some(a => a.ws !== ws)) {
     attachments.delete("new");
     renderChips(attachCtx.start);
     note.textContent = "The workspace changed, so the attached files were cleared. Attach them again.";
@@ -5424,7 +6400,7 @@ async function sendMessage(when = S.sendWhen || "now") {
     toast("Wait for the session record to finish loading before sending.");
     return;
   }
-  if (previous?.accepted && previous.recordedSeq === undefined && previous.state !== "failed") {
+  if (C.isPendingReceipt(previous)) {
     toast("Waiting for the previous message to be recorded…");
     return;
   }
@@ -5468,6 +6444,7 @@ function seatModels() {
 async function loadProfiles() {
   try { S.profiles = await api("GET", "/api/models"); } catch { /* /api/status still names the profiles */ }
   if (S.view === "session") want("header");
+  if (S.view === "new") renderNewModels();
 }
 
 
@@ -5556,12 +6533,14 @@ function renderQueue() {
       ta.rows = 3;
       ta.setAttribute("aria-label", "Edit queued message");
       ta.dataset.focusKey = "q-edit:" + item.id;
-      ta.addEventListener("input", () => { S.queued.editText = ta.value; });
+      const save = btn("Save", "small primary", () => queueAct(item, "save"));
+      const syncSave = () => { save.disabled = busy || (!S.queued.editText.trim() && !item.attachments.length); };
+      syncSave();
+      ta.addEventListener("input", () => { S.queued.editText = ta.value; syncSave(); });
       ta.addEventListener("keydown", (e) => {
         if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); S.queued.editing = null; renderQueue(); focusQueue("q-editbtn:" + item.id); }
+        else if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && !e.isComposing && !save.disabled) { e.preventDefault(); save.click(); }
       });
-      const save = btn("Save", "small primary", () => queueAct(item, "save"));
-      save.disabled = busy || !S.queued.editText.trim();
       const cancel = btn("Cancel", "small", () => { S.queued.editing = null; renderQueue(); focusQueue("q-editbtn:" + item.id); });
       add(li, ta, add(el("div", "queue-actions"), save, cancel));
     } else {
@@ -5621,10 +6600,10 @@ function newVisionOff() {
   const profile = want || (S.profiles && S.profiles.default_model) || "";
   return !!profile && C.modelVision(models, { profile }) === false;
 }
-/** Queue only a running lead's message that was asked to wait; anything else is sent now. */
+/** Queue only a running root session's message that was asked to wait; anything else is sent now. */
 function queueNow(id, when) {
   const info = S.sessions.byId.get(id);
-  return when === "after_turn" && !!info && C.sessionActions(info).running && C.rootNoun(info) === "lead";
+  return when === "after_turn" && C.canQueueSession(info);
 }
 
 /** The select shows the session's profile; another choice waits behind an inline confirmation. */
@@ -5790,9 +6769,10 @@ function setDrawer(side, open) {
   const panel = $(side);
   const narrow = matchMedia("(max-width: 1099px)").matches;
   const mobile = matchMedia("(max-width: 699px)").matches;
+  const wasOpen = document.body.classList.contains("show-" + side);
   const asked = nextOpener;
   nextOpener = null;
-  if (open) drawerOpener = asked || document.activeElement;
+  if (open && !wasOpen) drawerOpener = asked || document.activeElement;
   document.body.classList.toggle("show-" + side, open);
   const rightOpen = document.body.classList.contains("show-right");
   if (side === "right" && !narrow && S.view === "session") S.inspectorPref = rightOpen;
@@ -5806,7 +6786,7 @@ function setDrawer(side, open) {
     if (modal) { node.setAttribute("role", "dialog"); node.setAttribute("aria-modal", "true"); }
     else { node.removeAttribute("role"); node.removeAttribute("aria-modal"); }
   }
-  if (open && ((side === "right" && narrow) || (side === "left" && mobile))) {
+  if (open && !wasOpen && ((side === "right" && narrow) || (side === "left" && mobile))) {
     panel.querySelector("button, a, input")?.focus();
   } else if (!open && drawerOpener && panel.contains(document.activeElement) && document.contains(drawerOpener)) drawerOpener.focus({ preventScroll: true });
 }
@@ -6537,7 +7517,7 @@ function filesSync(st, { focus = false, loading = false, said = "" } = {}) {
 
 function filesActivate(st, entry, row) {
   if (!C.fileEntryOpens(entry)) {
-    filesSay(st, C.isHarnessEntry(entry) ? ".loom holds the harness's own files; they are not shown here." : `${entry.name}: ${C.fileEntryKind(entry)}.`);
+    filesSay(st, C.isHarnessEntry(entry) ? ".ferret holds the harness's own files; they are not shown here." : `${entry.name}: ${C.fileEntryKind(entry)}.`);
     return;
   }
   st.active = entry.name;
@@ -6740,8 +7720,23 @@ function wire() {
     updateJump();
     if (S.follow && !was) want("blocks");
   };
-  $("scroller").addEventListener("scroll", onScroll);
-  $("view-session").addEventListener("scroll", onScroll);
+  const disengageFollow = (target) => {
+    if (target !== chatScroller() || S.jumping || S.section !== "chat" || !S.follow) return;
+    S.follow = false;
+    pinOpenGroups();
+    updateJump();
+  };
+  let lastTouchY = null;
+  for (const node of [$("scroller"), $("view-session")]) {
+    node.addEventListener("scroll", onScroll);
+    node.addEventListener("wheel", (e) => { if (e.deltaY < 0) disengageFollow(e.currentTarget); }, { passive: true });
+    node.addEventListener("touchstart", (e) => { lastTouchY = e.touches && e.touches[0] ? e.touches[0].clientY : null; }, { passive: true });
+    node.addEventListener("touchmove", (e) => {
+      const y = e.touches && e.touches[0] ? e.touches[0].clientY : null;
+      if (y !== null && lastTouchY !== null && y - lastTouchY > 6) disengageFollow(e.currentTarget);
+      if (y !== null) lastTouchY = y;
+    }, { passive: true });
+  }
   const layoutChanged = () => { if (S.view === "session") want("blocks", "header"); };
   COMPACT.addEventListener("change", layoutChanged);
   COARSE.addEventListener("change", layoutChanged);
@@ -6776,7 +7771,7 @@ function wire() {
   $("b-rename").addEventListener("click", renameSession);
   $("b-rename").title = "Rename this mission.";
   $("b-stop").addEventListener("click", (e) => askHeaderConfirm("stop", S.sessions.byId.get(S.openId), e.currentTarget));
-  $("c-stop").addEventListener("click", (e) => askHeaderConfirm("stop", S.sessions.byId.get(S.openId), e.currentTarget));
+  $("c-stop").addEventListener("click", (e) => askComposerStop(S.sessions.byId.get(S.openId), e.currentTarget));
   $("b-stop").title = "Stop this session and cancel its descendant agents and tracked jobs.";
   $("b-resume").addEventListener("click", () => sessionAction("resume"));
   $("b-archive").addEventListener("click", (e) => askHeaderConfirm("archive", S.sessions.byId.get(S.openId), e.currentTarget));
@@ -6792,6 +7787,31 @@ function wire() {
   $("shead-confirm-cancel").addEventListener("click", () => cancelHeadConfirm());
   $("shead-confirm").addEventListener("keydown", (e) => {
     if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); cancelHeadConfirm(); }
+  });
+  noRepeat($("composer-stop-yes"));
+  $("composer-stop-yes").addEventListener("click", () => {
+    const ask = S.composerStopAsk;
+    if (!ask || ask.session !== S.openId) { hideComposerStopConfirm(); return; }
+    hideComposerStopConfirm();
+    sessionAction("stop");
+  });
+  $("composer-stop-cancel").addEventListener("click", () => cancelComposerStopConfirm());
+  $("composer-stop-confirm").addEventListener("keydown", (e) => {
+    if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); cancelComposerStopConfirm(); }
+  });
+  $("connection-wrap").addEventListener("click", (e) => openDaemonStatus(e.currentTarget));
+  $("daemon-status-close").addEventListener("click", closeDaemonStatus);
+  $("daemon-status-refresh").addEventListener("click", () => { loadStatus(); loadProfiles(); });
+  $("daemon-status").addEventListener("click", (e) => { if (e.target === $("daemon-status")) closeDaemonStatus(); });
+  $("daemon-status").addEventListener("close", () => {
+    const o = statusOpener;
+    statusOpener = null;
+    if (o && document.contains(o)) o.focus({ preventScroll: true });
+  });
+  $("offline-reconnect").addEventListener("click", reconnectNow);
+  $("btn-target-new").addEventListener("click", () => {
+    S.targetNew = S.targetNew ? null : { name: "", scope: "", exclude: "", upstream_insecure: "", intercept_passthrough: "", notes: "", busy: false, error: null };
+    renderTargets();
   });
   $("agent-go-lead").addEventListener("click", () => {
     const id = $("agent-go-lead").dataset.lead;
@@ -6824,7 +7844,10 @@ function wire() {
   $("f-message").addEventListener("keydown", (e) => {
     if (e.key === "Enter" && (e.metaKey || e.ctrlKey) && !e.isComposing) { e.preventDefault(); $("new-form").requestSubmit(); }
   });
-  $("composer").addEventListener("keydown", (e) => { if (e.key === "Escape" && S.seat && !S.seatBusy.has(S.seat.session)) { e.preventDefault(); cancelSeat(); } });
+  $("composer").addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && S.composerStopAsk) { e.preventDefault(); cancelComposerStopConfirm(); return; }
+    if (e.key === "Escape" && S.seat && !S.seatBusy.has(S.seat.session)) { e.preventDefault(); cancelSeat(); }
+  });
   const msg = $("msg");
   msg.addEventListener("input", () => { if (S.openId) C.setDraft(S.drafts, "message:" + S.openId, msg.value); renderHeader(); });
   $("send").addEventListener("click", () => sendMessage("now"));
@@ -6854,10 +7877,10 @@ function wire() {
     button: "attach-btn", input: "attach-file", drops: ["composer", "scroller"], paste: "msg",
     canDrop: () => !$("attach-btn").hidden && !$("msg").disabled,
   });
-  wireAttach(attachCtx.start, { button: "f-attach", input: "f-file", drops: ["new-form"], paste: "f-message" });
+  wireAttach(attachCtx.start, { button: "f-attach", input: "f-file", drops: ["new-form"], paste: "f-message", canDrop: () => !$("f-attach").disabled });
   msg.addEventListener("keydown", (e) => {
     const info = S.sessions.byId.get(S.openId);
-    const act = C.composerAction({ key: e.key, shiftKey: e.shiftKey, isComposing: e.isComposing, text: msg.value || (attachState("message:" + S.openId).paths.length ? "attached" : ""), coarse: COARSE.matches, mod: e.ctrlKey || e.metaKey, alt: e.altKey, running: !!info && C.sessionActions(info).running && C.rootNoun(info) === "lead" });
+    const act = C.composerAction({ key: e.key, shiftKey: e.shiftKey, isComposing: e.isComposing, text: msg.value || (attachState("message:" + S.openId).paths.length ? "attached" : ""), coarse: COARSE.matches, mod: e.ctrlKey || e.metaKey, alt: e.altKey, running: C.canQueueSession(info) });
     if (act !== "none") {
       e.preventDefault();
       if (act !== "ignore") sendMessage(act === "queue" ? "after_turn" : "now");
@@ -6865,7 +7888,7 @@ function wire() {
   });
 
   $("new-form").addEventListener("submit", submitNew);
-  $("f-model").addEventListener("change", (e) => { S.newForm.model = e.target.value; });
+  $("f-model").addEventListener("change", (e) => { S.newForm.model = e.target.value; renderChips(attachCtx.start); });
   $("f-agent-model").addEventListener("change", (e) => { S.newForm.agentModel = e.target.value; });
   $("f-workspace").addEventListener("input", () => { workspaceNote(); hideCreateAsk(); });
   $("f-browse").addEventListener("click", (e) => openPicker(e.currentTarget));
@@ -6904,10 +7927,20 @@ function wire() {
   $("picker-list").addEventListener("keydown", pickerListKeys);
 $("picker").addEventListener("keydown", pickerEmptyKeys);
   $("picker-use").addEventListener("click", usePicker);
-  // Coming back to the page is opening what it shows: the notifications about it are withdrawn.
+  // Coming back to the page withdraws seen notifications and probes/reconnects after sleep or offline periods.
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible") closeNotes(S.view === "inbox" ? { inbox: true } : S.view === "session" ? { session: S.openId } : {});
+    if (document.visibilityState === "hidden") {
+      S.hiddenAt = Date.now();
+    } else if (document.visibilityState === "visible") {
+      closeNotes(S.view === "inbox" ? { inbox: true } : S.view === "session" ? { session: S.openId } : {});
+      if (!streamStopped) {
+        if (!S.connected) reconnectNow();
+        else if (S.hiddenAt && Date.now() - S.hiddenAt > 15000) loadStatus();
+      }
+      S.hiddenAt = 0;
+    }
   });
+  window.addEventListener("online", () => { if (!S.connected && !streamStopped) reconnectNow(); });
   $("notif-btn").addEventListener("click", async () => {
     try {
       await Notification.requestPermission();
@@ -6922,10 +7955,39 @@ $("picker").addEventListener("keydown", pickerEmptyKeys);
   $("viewer-jump").addEventListener("click", viewerJump);
   $("viewer-find-next").addEventListener("click", () => viewerFind(1));
   $("viewer-find-prev").addEventListener("click", () => viewerFind(-1));
+  $("viewer-download").addEventListener("click", async () => {
+    const v = S.viewer;
+    if (!v) return;
+    const dl = $("viewer-download");
+    dl.disabled = true;
+    try {
+      if (!v.source.file) {
+        await downloadAuthed(C.rawUrl(v.blob), `out-${String(v.blob).slice(0, 12)}.txt`);
+        viewerStatus("Downloaded full stored output.");
+      } else {
+        const text = (v.lines || []).join("\n");
+        const base = String(v.source.file.path || "file.txt").split("/").pop() || "file.txt";
+        const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+        const obj = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = obj;
+        a.download = base;
+        document.body.append(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(obj), 60_000);
+        viewerStatus(v.done ? `Downloaded ${base}.` : `Downloaded loaded lines (${C.num(v.first)}–${C.num(v.last)} of ${C.num(v.total)}).`);
+      }
+    } catch (e) {
+      viewerStatus("Download failed: " + e.message);
+    } finally {
+      dl.disabled = false;
+    }
+  });
   $("viewer-copy").addEventListener("click", copyViewerReference);
   $("viewer-copy-lines").addEventListener("click", copyViewerLines);
   // Pressing these must not collapse the selection in the lines, which Copy lines reads.
-  for (const id of ["viewer-copy", "viewer-copy-lines"]) $(id).addEventListener("mousedown", (e) => e.preventDefault());
+  for (const id of ["viewer-download", "viewer-copy", "viewer-copy-lines"]) $(id).addEventListener("mousedown", (e) => e.preventDefault());
   S.copyOnSelect = storedCopyOnSelect();
   document.addEventListener("mouseup", copySelection);
   document.addEventListener("keyup", copySelection);
@@ -6968,6 +8030,7 @@ $("picker").addEventListener("keydown", pickerEmptyKeys);
       : matchMedia("(max-width: 699px)").matches && document.body.classList.contains("show-left") ? "left" : null;
     if (e.key === "Escape" && side) { e.preventDefault(); setDrawer(side, false); return; }
     if (e.key === "Escape" && !side && !e.defaultPrevented && S.view === "session") {
+      if (!$("composer-stop-confirm").hidden) { e.preventDefault(); cancelComposerStopConfirm(); return; }
       if (!$("shead-confirm").hidden) { e.preventDefault(); cancelHeadConfirm(); return; }
       if (!$("find-bar").hidden) { e.preventDefault(); closeFind(); return; }
     }
@@ -7139,7 +8202,7 @@ function renderExchange() {
   $("exview-info").textContent = info;
   const marks = $("exview-marks");
   marks.replaceChildren(...row.marks.map((m) => { const c = chip(m.text, "dim"); c.title = m.tip; return c; }));
-  const how = x.source === "proxy" ? "Captured by loom's proxy" : `Sent by ${x.tool || "a tool"}`;
+  const how = x.source === "proxy" ? "Captured by ferret's proxy" : `Sent by ${x.tool || "a tool"}`;
   $("exview-how").textContent = how + (x.call_id ? ` · call ${x.call_id}` : "");
   const reveal = $("exview-reveal");
   const secrets = v.req !== null && C.messageView(v.req).hasSecrets || v.res !== null && C.messageView(v.res).hasSecrets;
@@ -7214,11 +8277,72 @@ function showTargets() {
 
 function renderTargets() {
   const box = $("targets-body");
+  const newBtn = $("btn-target-new");
+  if (newBtn) {
+    newBtn.hidden = S.targets.supported !== true;
+    newBtn.textContent = S.targetNew ? "Cancel" : "New target";
+  }
   const frag = document.createDocumentFragment();
+  if (S.targetNew && S.targets.supported === true) {
+    const tn = S.targetNew;
+    const f = el("form", "form target-new-form");
+    const fld = (id, label, key, placeholder, multiline = false) => {
+      const ctrl = multiline ? el("textarea", "mono") : el("input");
+      ctrl.id = id;
+      if (!multiline) ctrl.type = "text";
+      else ctrl.rows = 3;
+      ctrl.placeholder = placeholder;
+      ctrl.value = tn[key] || "";
+      ctrl.addEventListener("input", () => { tn[key] = ctrl.value; });
+      const l = el("label", "field");
+      l.htmlFor = id;
+      add(l, el("span", "", label));
+      return add(el("div", "field"), l, ctrl);
+    };
+    add(f,
+      el("h2", "", "Create target"),
+      fld("tn-name", "Target name", "name", "e.g. acme-prod"),
+      fld("tn-scope", "In scope (one entry per line: host, *.domain, IP or CIDR)", "scope", "*.acme.test\n10.0.0.0/24", true),
+      fld("tn-exclude", "Excluded (optional)", "exclude", "payments.acme.test", true),
+      fld("tn-insecure", "Upstream insecure TLS hosts (optional)", "upstream_insecure", "staging.acme.test", true),
+      fld("tn-passthrough", "Intercept passthrough hosts (optional)", "intercept_passthrough", "pinned.acme.test", true),
+      fld("tn-notes", "Notes (optional)", "notes", "Engagement scope notes"),
+    );
+    if (tn.error) {
+      const err = el("p", "error", tn.error);
+      err.setAttribute("role", "alert");
+      f.append(err);
+    }
+    const save = btn(tn.busy ? "Creating…" : "Create target", "primary", () => {});
+    save.type = "submit";
+    save.disabled = tn.busy;
+    const cancel = btn("Cancel", "", () => { S.targetNew = null; renderTargets(); });
+    f.append(add(el("div", "form-row"), save, cancel));
+    f.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      const built = C.targetCreateBody(tn);
+      if (built.error) { tn.error = built.error; renderTargets(); return; }
+      tn.busy = true;
+      tn.error = null;
+      renderTargets();
+      try {
+        const created = await api("POST", "/api/targets", built.body);
+        S.targetNew = null;
+        await loadTargets();
+        toast(`Created target "${created.name}".`);
+        location.hash = C.targetHash(created.name);
+      } catch (e) {
+        tn.busy = false;
+        tn.error = e.message;
+        renderTargets();
+      }
+    });
+    frag.append(f);
+  }
   if (S.targets.error) frag.append(el("p", "error", S.targets.error));
   if (S.targets.supported === false) frag.append(el("p", "dim", "This daemon does not keep targets."));
   else if (S.targets.supported === null) frag.append(el("p", "dim", "Loading targets…"));
-  else if (!S.targets.list.length) frag.append(el("p", "dim", "No target yet. Create one with loom target add, then name it when you start a mission."));
+  else if (!S.targets.list.length) frag.append(el("p", "dim", "No targets yet. Use New target above (or ferret target add) to create one."));
   else {
     const ul = el("ul", "target-list");
     for (const t of S.targets.list) {
@@ -7378,13 +8502,16 @@ function targetFilterBar(tp) {
 
 function scopeEditor(tp) {
   const box = el("section", "tscope");
-  box.setAttribute("aria-label", "Scope");
-  const head = heading("h2", "Scope");
+  box.setAttribute("aria-label", "Scope and settings");
+  const head = heading("h2", "Scope and settings");
   box.append(head);
   const list = (title, entries) => add(el("div", "tscope-col"), el("div", "label", title), entries.length ? el("ul", "tscope-list mono", "") : el("p", "dim", "none"));
   if (!tp.edit) {
     const cols = el("div", "tscope-cols");
-    for (const [title, entries] of [["In scope", tp.cfg.scope], ["Left out", tp.cfg.exclude]]) {
+    const groups = [["In scope", tp.cfg.scope], ["Left out", tp.cfg.exclude]];
+    if (tp.cfg.upstream_insecure.length) groups.push(["Upstream insecure TLS", tp.cfg.upstream_insecure]);
+    if (tp.cfg.intercept_passthrough.length) groups.push(["Intercept passthrough", tp.cfg.intercept_passthrough]);
+    for (const [title, entries] of groups) {
       const col = list(title, entries);
       const ul = col.querySelector("ul");
       if (ul) for (const e of entries) ul.append(el("li", "", e));
@@ -7392,14 +8519,25 @@ function scopeEditor(tp) {
     }
     box.append(cols);
     if (tp.cfg.notes) box.append(el("p", "dim tnotes", tp.cfg.notes));
-    head.append(btn("Edit scope", "small", () => { tp.edit = { scope: C.scopeText(tp.cfg.scope), exclude: C.scopeText(tp.cfg.exclude), error: null, busy: false }; renderTargetPage(); }));
+    head.append(btn("Edit settings", "small", () => {
+      tp.edit = {
+        scope: C.scopeText(tp.cfg.scope),
+        exclude: C.scopeText(tp.cfg.exclude),
+        upstream_insecure: C.scopeText(tp.cfg.upstream_insecure),
+        intercept_passthrough: C.scopeText(tp.cfg.intercept_passthrough),
+        notes: tp.cfg.notes || "",
+        error: null,
+        busy: false,
+      };
+      renderTargetPage();
+    }));
     return box;
   }
   const f = el("form", "form tscope-form");
-  const area = (id, label, value, key) => {
-    const t = el("textarea", "mono");
+  const area = (id, label, value, key, rows = 4, mono = true) => {
+    const t = el("textarea", mono ? "mono" : "");
     t.id = id;
-    t.rows = 4;
+    t.rows = rows;
     t.value = value;
     t.addEventListener("input", () => { tp.edit[key] = t.value; });
     const l = el("label", "field");
@@ -7409,17 +8547,24 @@ function scopeEditor(tp) {
   };
   add(f,
     area("t-scope", "In scope: one entry per line (a name, *.name, an IP or a CIDR)", tp.edit.scope, "scope"),
-    area("t-exclude", "Left out: these win over the scope", tp.edit.exclude, "exclude"));
+    area("t-exclude", "Left out: these win over the scope", tp.edit.exclude, "exclude", 3),
+    area("t-insecure", "Upstream insecure TLS (optional): skip certificate verification for these hosts", tp.edit.upstream_insecure, "upstream_insecure", 2),
+    area("t-passthrough", "Intercept passthrough (optional): bypass MITM capture for these hosts", tp.edit.intercept_passthrough, "intercept_passthrough", 2),
+    area("t-notes", "Notes (optional)", tp.edit.notes, "notes", 2, false));
   const err = el("p", "error", tp.edit.error || "");
   err.setAttribute("role", "alert");
   err.hidden = !tp.edit.error;
-  const save = btn(tp.edit.busy ? "Saving…" : "Save scope", "primary", () => {});
+  const save = btn(tp.edit.busy ? "Saving…" : "Save settings", "primary", () => {});
   save.type = "submit";
   save.disabled = tp.edit.busy;
   add(f, err, add(el("div", "form-row"), save, btn("Cancel", "", () => { tp.edit = null; renderTargetPage(); })));
   f.addEventListener("submit", async (ev) => {
     ev.preventDefault();
-    const put = C.targetPut(tp.cfg, tp.edit.scope, tp.edit.exclude);
+    const put = C.targetPut(tp.cfg, tp.edit.scope, tp.edit.exclude, {
+      upstream_insecure: tp.edit.upstream_insecure,
+      intercept_passthrough: tp.edit.intercept_passthrough,
+      notes: tp.edit.notes,
+    });
     if (put.error) { tp.edit.error = put.error; renderTargetPage(); return; }
     tp.edit.busy = true;
     tp.edit.error = null;
@@ -7619,16 +8764,10 @@ function targetChanged(name) {
   if (S.targets.supported === true) loadTargets();
 }
 
-async function start() {
-  // A login address opened in a tab that already has the page changes only the fragment: load the
-  // page again, so that the code is exchanged and leaves the address bar. Also on the lost() page.
-  window.addEventListener("hashchange", () => {
-    if (C.codeFromHash(location.hash)) location.reload();
-  });
-  if (!(await signIn())) {
-    lost();
-    return;
-  }
+async function bootApp() {
+  if (S.appStarted) return;
+  S.appStarted = true;
+  streamStopped = false;
   wire();
   setTab("ledger");
   setSection("chat", false);
@@ -7648,6 +8787,20 @@ async function start() {
   setInterval(loadStatus, 60000);
   // The inbox is also read again on a timer, so a missed record cannot leave an item standing or missing.
   setInterval(loadInbox, 60000);
+}
+
+async function start() {
+  wireAuthOverlay();
+  // A login address opened in a tab that already has the page changes only the fragment: load the
+  // page again, so that the code is exchanged and leaves the address bar. Also when signed out.
+  window.addEventListener("hashchange", () => {
+    if (C.codeFromHash(location.hash)) location.reload();
+  });
+  if (!(await signIn())) {
+    lost(authLostReason || "expired");
+    return;
+  }
+  await bootApp();
 }
 
 start();

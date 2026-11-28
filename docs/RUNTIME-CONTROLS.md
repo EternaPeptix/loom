@@ -86,16 +86,32 @@ evidence since the last rejection) is unchanged. "New evidence" means the same i
 rejection. A reopened goal asks for execution recorded after the reopening, which comes after the
 rejection, so evidence that satisfies the goal also resets the stuck count.
 
-This happens at every rejection. Nothing is deleted: the attempt stays in the session log (`loom tail`,
+This happens at every rejection. Nothing is deleted: the attempt stays in the session log (`ferret tail`,
 the web UI) and its outputs in the store, and the model can still open them with `out_read`, `out_grep`
 and `log_search`. The fold starts a new cache epoch, like any re-weave. `fresh_start = false` restores
 the earlier behaviour: the conclusion stands, the rejection stays in the window as the result of the
 call, and only the objections hold the next finish. A mission the operator released is never reopened.
 
+## Periodic lead settlement fold
+
+`[agents] lead_fold_every_settlements` (default `0`, off) triggers an empty-tail compaction with reason
+`settlement_fold` on a lead session once that many `ChildSettled` records have arrived since the last
+compaction (and at least one step ran in the current epoch). Unlike `fresh_start`, it never reopens the
+goal or marks a verifier objection; it re-anchors the coordinator on the operator's messages, the sealed
+mission ledger brief, pinned outputs, the key table (including settled agents and their report handles),
+and a verified compaction note between delegation waves. The counter resets automatically after each
+compaction and survives restarts because it is derived purely from the session log. It never fires on
+child sessions, roles with empty `may_spawn`, or during budget wrap-up, and it is not counted under
+`fresh_starts` in `ferret score`.
+
 ## Measuring a change
 
-`loom score <session|mission> [--json]` prints what a mission's work took, one row per session and a
+`ferret score <session|mission> [--json]` prints what a mission's work took, one row per session and a
 total: steps, steps to the delivered finish, tool calls and malformed ones, refused finishes, refused
 quotes, verifier verdicts, fresh starts, and the uses of `hand_off` and `ask_for`. These are counts of log records, not judgements of the
-result. `cargo run -p loom-agent --example eval` prints the same card for scripted models played
+result. `cargo run -p ferret-agent --example eval` prints the same card for scripted models played
 against the mock server (no model, no network), for comparing two builds of the harness.
+
+To A/B-test specialized solver silos against a unified generalist worker pool on the same targets, compare
+runs of `packs/ctf` and `packs/ctf-generalist` (identical oracle/verifier contract, single 32-tool `solver`
+role) with `ferret score`.

@@ -83,7 +83,7 @@ unavailable measurements remain unknown. Debugger observations are not independe
 ## Dependency scanning
 
 `dep_scan` runs the operator-installed OWASP dep-scan `depscan` command under the session sandbox
-over a workspace directory or one CycloneDX SBOM file. Loom never installs dep-scan or starts its
+over a workspace directory or one CycloneDX SBOM file. Ferret never installs dep-scan or starts its
 server mode. All writes (reports, `HOME`, `VDB_HOME`, temp) go under the session temp dir so
 read-only roles can scan without polluting the workspace. A missing `depscan` is an error with
 install guidance, not an empty clean result. A first scan may download dep-scan's vulnerability

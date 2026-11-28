@@ -140,7 +140,7 @@ final class DaemonClient: @unchecked Sendable {
             switch http.statusCode {
             case 200:
                 if let c = parseLoginCode(data) { return .code(c) }
-                return .failed("the daemon answered the login request without a usable code. Update loom-desk and the daemon to matching versions.")
+                return .failed("the daemon answered the login request without a usable code. Update ferret-desk and the daemon to matching versions.")
             case 404:
                 return .failed("the daemon has no login-code route, so it is older than this app. Restart it on the new version.")
             case 401, 403:
@@ -201,9 +201,9 @@ final class DaemonClient: @unchecked Sendable {
         return bytes.map { String(format: "%02x", $0) }.joined()
     }
 
-    /// `HMAC-SHA256(key: the token's bytes, message: "loom-healthz-v1:" + nonce)` as lowercase hex.
+    /// `HMAC-SHA256(key: the token's bytes, message: "ferret-healthz-v1:" + nonce)` as lowercase hex.
     static func identityProof(token: String, nonce: String) -> String {
-        let mac = HMAC<SHA256>.authenticationCode(for: Data(("loom-healthz-v1:" + nonce).utf8),
+        let mac = HMAC<SHA256>.authenticationCode(for: Data(("ferret-healthz-v1:" + nonce).utf8),
                                                   using: SymmetricKey(data: Data(token.utf8)))
         return mac.map { String(format: "%02x", $0) }.joined()
     }
@@ -229,7 +229,7 @@ final class DaemonClient: @unchecked Sendable {
     static let identityModePrefix = "identity: "
 
     static func identityMismatchMessage(_ base: String) -> String {
-        "something answered on \(base) but did not prove it is the loom daemon for this token, so the token was not sent. "
+        "something answered on \(base) but did not prove it is the ferret daemon for this token, so the token was not sent. "
             + "If the daemon is older than this app, restart it on the new version; otherwise check the address and the token."
     }
 
@@ -247,7 +247,7 @@ final class DaemonClient: @unchecked Sendable {
                     + "so the token was not sent." + quote
             }
             return "something on \(baseURL) refused this address (HTTP 403), so the token was not sent. "
-                + "If it is the loom daemon, the local port must be the same as the daemon's port."
+                + "If it is the ferret daemon, the local port must be the same as the daemon's port."
         }
         return "something on \(baseURL) refused the request (HTTP 403), so the token was not sent. Check the address." + quote
     }
@@ -288,6 +288,46 @@ final class DaemonClient: @unchecked Sendable {
                         completionHandler: @escaping (URLRequest?) -> Void) {
             completionHandler(nil)
         }
+    }
+
+    /// Fast, unauthenticated `/healthz` reachability probe (used on system wake / network return and
+    /// local daemon detection). Never sends a token and never follows redirects.
+    static func quickHealthz(baseURL: String, timeout: TimeInterval = 2.5) async -> Bool {
+        guard let url = URL(string: baseURL + "/healthz") else { return false }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = timeout
+        req.cachePolicy = .reloadIgnoringLocalCacheData
+        let cfg = URLSessionConfiguration.ephemeral
+        cfg.timeoutIntervalForRequest = timeout
+        cfg.httpShouldSetCookies = false
+        cfg.httpCookieAcceptPolicy = .never
+        let session = URLSession(configuration: cfg, delegate: NoRedirectDelegate(), delegateQueue: nil)
+        defer { session.finishTasksAndInvalidate() }
+        guard let (_, resp) = try? await session.data(for: req),
+              let http = resp as? HTTPURLResponse else { return false }
+        return http.statusCode == 200
+    }
+
+    /// True when an identity mismatch came from HTTP 403 (Host/port refusal) rather than a rotated token.
+    static func isHostRefusal(_ outcome: IdentityOutcome) -> Bool {
+        if case .mismatch(let msg) = outcome { return msg.contains("(HTTP 403)") }
+        return false
+    }
+
+    /// Tolerant decode of `GET /api/status` daemon instance identity (`pid` + `started_ms` or `started_at_ms`),
+    /// so `ferret-desk` detects daemon restarts even when `~/.ferret/token` stayed the same.
+    static func parseStatusInstanceKey(_ data: Data) -> String? {
+        struct StatusIdentityLite: Decodable {
+            var pid: UInt64?
+            var started_ms: UInt64?
+            var started_at_ms: UInt64?
+        }
+        guard let s = try? JSONDecoder().decode(StatusIdentityLite.self, from: data) else { return nil }
+        let started = s.started_ms ?? s.started_at_ms
+        if let pid = s.pid, let started { return "\(pid):\(started)" }
+        if let pid = s.pid { return "\(pid)" }
+        if let started { return "started:\(started)" }
+        return nil
     }
 
     /// `GET <base>/healthz?nonce=<N>` (no token is sent): the daemon must answer with the HMAC proof for
@@ -484,6 +524,14 @@ final class DaemonClient: @unchecked Sendable {
         return out
     }
 
+    /// Preserved across reconnects of the SAME connection so resolved items still withdraw their
+    /// banners and blocking items opened while disconnected are not swallowed by `seeded = false`.
+    struct NotificationSeed: Sendable, Equatable {
+        var seen: Set<String>
+        var notified: Set<String>
+        var seeded: Bool
+    }
+
     // MARK: lifecycle
 
     private let lock = NSLock()
@@ -492,15 +540,21 @@ final class DaemonClient: @unchecked Sendable {
     /// `onMode` is diagnostic text; `onFeedStatus` reports whether the retained counts are current.
     func start(baseURL: String,
                token: String?,
+               initialNotifications: NotificationSeed? = nil,
                onCounts: @escaping @Sendable (Counts) -> Void,
                onNotify: @escaping @Sendable (InboxNotice) -> Void,
                onResolve: @escaping @Sendable (_ itemId: String) -> Void = { _ in },
                onMode: @escaping @Sendable (String) -> Void = { _ in },
-               onFeedStatus: @escaping @Sendable (FeedStatus) -> Void = { _ in }) {
+               onFeedStatus: @escaping @Sendable (FeedStatus) -> Void = { _ in },
+               onNotificationState: @escaping @Sendable (NotificationSeed) -> Void = { _ in },
+               onDaemonRestart: @escaping @Sendable () -> Void = {}) {
         stop()
         let runner = Runner(baseURL: baseURL, token: token,
+                            initialNotifications: initialNotifications,
                             onCounts: onCounts, onNotify: onNotify, onResolve: onResolve, onMode: onMode,
-                            onFeedStatus: onFeedStatus)
+                            onFeedStatus: onFeedStatus,
+                            onNotificationState: onNotificationState,
+                            onDaemonRestart: onDaemonRestart)
         let t = Task.detached { await runner.run() }
         lock.lock(); task = t; lock.unlock()
     }
@@ -596,20 +650,33 @@ final class DaemonClient: @unchecked Sendable {
         let onResolve: @Sendable (String) -> Void
         let onMode: @Sendable (String) -> Void
         let onFeedStatus: @Sendable (FeedStatus) -> Void
+        let onNotificationState: @Sendable (NotificationSeed) -> Void
+        let onDaemonRestart: @Sendable () -> Void
         let session: URLSession
 
         private let lock = NSLock()
         private var sync = SyncState()
+        private var lastInstanceKey: String? = nil
 
         init(baseURL: String, token: String?,
+             initialNotifications: NotificationSeed?,
              onCounts: @escaping @Sendable (Counts) -> Void,
              onNotify: @escaping @Sendable (InboxNotice) -> Void,
              onResolve: @escaping @Sendable (String) -> Void,
              onMode: @escaping @Sendable (String) -> Void,
-             onFeedStatus: @escaping @Sendable (FeedStatus) -> Void) {
+             onFeedStatus: @escaping @Sendable (FeedStatus) -> Void,
+             onNotificationState: @escaping @Sendable (NotificationSeed) -> Void,
+             onDaemonRestart: @escaping @Sendable () -> Void) {
             self.baseURL = baseURL; self.token = token
             self.onCounts = onCounts; self.onNotify = onNotify; self.onResolve = onResolve; self.onMode = onMode
             self.onFeedStatus = onFeedStatus
+            self.onNotificationState = onNotificationState
+            self.onDaemonRestart = onDaemonRestart
+            if let initialNotifications {
+                self.sync.seen = initialNotifications.seen
+                self.sync.notified = initialNotifications.notified
+                self.sync.seeded = initialNotifications.seeded
+            }
             let cfg = URLSessionConfiguration.ephemeral
             cfg.timeoutIntervalForRequest = 45      // the stream sends a keep-alive every 15 s
             cfg.httpShouldSetCookies = false
@@ -666,6 +733,19 @@ final class DaemonClient: @unchecked Sendable {
             return false
         }
 
+        /// Poll `/api/status` (tolerant: errors ignored) to detect daemon restarts (`pid`/`started_ms` changed)
+        /// even when the API token on disk stayed unchanged.
+        func checkDaemonInstance() async {
+            guard let data = try? await get("/api/status"),
+                  let key = DaemonClient.parseStatusInstanceKey(data) else { return }
+            let restarted: Bool = lock.withLock {
+                let prev = lastInstanceKey
+                lastInstanceKey = key
+                return prev != nil && prev != key
+            }
+            if restarted { onDaemonRestart() }
+        }
+
         func run() async {
             while !Task.isCancelled {
                 var reason = "stream ended"
@@ -687,6 +767,7 @@ final class DaemonClient: @unchecked Sendable {
                 // again before the snapshot below sends the token.
                 if !(await proven()) { continue }
                 onMode("polling (\(reason))")
+                await checkDaemonInstance()
                 await refresh(sessions: true, inbox: true)
                 try? await Task.sleep(nanoseconds: 4_000_000_000)
             }
@@ -703,6 +784,7 @@ final class DaemonClient: @unchecked Sendable {
             await early
             if let h = resp as? HTTPURLResponse, h.statusCode != 200 { throw HTTPError(status: h.statusCode) }
             // Subscribed, then snapshot again: nothing between the first snapshot and now is lost.
+            await checkDaemonInstance()
             await refresh(sessions: true, inbox: true)
             lock.withLock { sync.feed.mode = .live }
             publishFeed()
@@ -775,8 +857,13 @@ final class DaemonClient: @unchecked Sendable {
                     guard let list = DaemonClient.decodeList(InboxLite.self, from: data) else {
                         throw URLError(.cannotParseResponse)
                     }
-                    let result = lock.withLock { sync.completeInboxFetch(seq: seq, list: list, at: Date()) }
+                    let (result, seed): (([InboxNotice], [String])?, NotificationSeed) = lock.withLock {
+                        let res = sync.completeInboxFetch(seq: seq, list: list, at: Date())
+                        let s = NotificationSeed(seen: sync.seen, notified: sync.notified, seeded: sync.seeded)
+                        return (res, s)
+                    }
                     if let (fresh, resolved) = result {
+                        onNotificationState(seed)
                         for n in fresh { onNotify(n) }
                         for id in resolved { onResolve(id) }
                     } else {
@@ -947,7 +1034,7 @@ final class DaemonClient: @unchecked Sendable {
         // Daemon identity proof: a known token and nonce, constant-time comparison, answer parsing.
         let ptok = String(repeating: "ab12", count: 16)
         let pnonce = String(repeating: "0123456789abcdef", count: 4)
-        let want = "1fc539b8ca1872003953db475a0df90e51af1a8b13dbdc634a84b28a63c46fcb"
+        let want = "25b6f1d8a513e5a83fa9f07345d8ee1b45d872f6ee16c39fb84d38f89a9417a6"
         chk(identityProof(token: ptok, nonce: pnonce) == want, "identity proof: \(identityProof(token: ptok, nonce: pnonce))")
         chk(identityProof(token: ptok, nonce: pnonce + "0") != want, "proof ignores the nonce")
         chk(constantTimeEqual(want, want), "equal proofs differ")
@@ -978,7 +1065,7 @@ final class DaemonClient: @unchecked Sendable {
         chk(n1?.count == 64 && n1 != n2 && n1?.utf8.allSatisfy({ ($0 >= 0x30 && $0 <= 0x39) || ($0 >= 0x61 && $0 <= 0x66) }) == true,
             "nonce: \(n1 ?? "nil")")
         // A 403: the address is refused, the link fails (a mismatch, never retried), whatever the body says.
-        let hostRefusal = Data("{\"error\":\"This address is not the loom daemon's own (Host header).\"}".utf8)
+        let hostRefusal = Data("{\"error\":\"This address is not the ferret daemon's own (Host header).\"}".utf8)
         let lo = "http://127.0.0.1:7878"
         chk(cls(403, Data()) == .mismatch(refusedAddressMessage(Data(), baseURL: "http://h")), "identity 403 refused")
         chk(cls(403, okBody) == .mismatch(refusedAddressMessage(okBody, baseURL: "http://h")), "identity 403 never proves")
@@ -987,13 +1074,13 @@ final class DaemonClient: @unchecked Sendable {
         let r403 = refusedAddressMessage(hostRefusal, baseURL: lo)
         chk(r403.hasPrefix("the daemon refused this address (HTTP 403): the local port must be the same as the daemon's port")
             && r403.contains("the token was not sent"), "403 on loopback: \(r403)")
-        chk(r403.hasSuffix(" It said: \"This address is not the loom daemon's own (Host header).\""), "403 quote: \(r403)")
+        chk(r403.hasSuffix(" It said: \"This address is not the ferret daemon's own (Host header).\""), "403 quote: \(r403)")
         chk(!r403.contains(".\".") && !r403.contains(".)."), "403 doubled period: \(r403)")
         chk(!r403.contains("older than this app"), "403 is not a version problem")
         chk(refusedAddressMessage(Data("{\"error\":\"bad Host\"}".utf8), baseURL: lo).hasSuffix(" It said: \"bad Host\"."),
             "403 quote without a period")
         let r403bare = refusedAddressMessage(Data(), baseURL: lo)
-        chk(r403bare.contains("If it is the loom daemon, the local port must be the same") && !r403bare.contains("It said"),
+        chk(r403bare.contains("If it is the ferret daemon, the local port must be the same") && !r403bare.contains("It said"),
             "403 on loopback without the daemon's body: \(r403bare)")
         let r403proxy = refusedAddressMessage(hostRefusal, baseURL: "https://studio.example.com")
         chk(!r403proxy.contains("local port") && r403proxy.contains("refused the request (HTTP 403)"), "403 over https: \(r403proxy)")
@@ -1010,6 +1097,20 @@ final class DaemonClient: @unchecked Sendable {
         chk(!isLoopbackHTTP("https://127.0.0.1:7878") && !isLoopbackHTTP("http://127.0.0.1.evil.com") && !isLoopbackHTTP("http://h"),
             "not loopback http")
         chk(identityMismatchMessage("http://127.0.0.1:7878").contains("restart it on the new version"), "mismatch message")
+        chk(parseStatusInstanceKey(Data("{\"pid\":123,\"started_ms\":456}".utf8)) == "123:456", "status instance key started_ms")
+        chk(parseStatusInstanceKey(Data("{\"pid\":123,\"started_at_ms\":789}".utf8)) == "123:789", "status instance key started_at_ms")
+        chk(parseStatusInstanceKey(Data("{\"version\":\"0.1\"}".utf8)) == nil, "status instance key missing")
+        chk(isHostRefusal(cls(403, hostRefusal)), "403 not recognized as host refusal")
+        chk(!isHostRefusal(cls(200, noProof)), "proof mismatch misclassified as host refusal")
+        // Seeded SyncState carried across same-connection reconnect withdraws resolved items and notifies new ones.
+        var reconSync = SyncState()
+        reconSync.seen = ["i1"]
+        reconSync.notified = ["i1"]
+        reconSync.seeded = true
+        let reconSeq = reconSync.beginInboxFetch()
+        let i2 = InboxLite(session: "s1", title: "Mission", item: ItemLite(item_id: "i2", item_kind: "question", text: "New?", blocking: true, options: nil))
+        let reconRes = reconSync.completeInboxFetch(seq: reconSeq, list: [i2], at: initial)
+        chk(reconRes?.fresh.map(\.itemId) == ["i2"] && reconRes?.resolved == ["i1"], "reconnect seed sync failed")
         return f
     }
     #endif

@@ -1,32 +1,71 @@
 <p align="center">
-  <img src="docs/assets/loom-hero.png" alt="Loom — a local AI agent harness" width="100%">
+  <img src="docs/assets/ferret-hero.png" alt="Ferret — a local AI agent harness" width="100%">
 </p>
 
-# loom
+<h1 align="center">ferret</h1>
 
-An agent harness for long, unattended work on a model you host yourself.
+<p align="center">
+  <strong>A general-purpose local AI agent harness for long, unattended work on self-hosted models — with opt-in packs that turn it into a bounded cyber &amp; vulnerability-research harness.</strong>
+</p>
 
-loom is for the case the usual tools are not built for: one operator, an OpenAI-compatible server on
-your own network (vLLM and the like, with a large window, automatic prefix caching and several
-concurrent sequences), sessions that run for hours while nobody watches, and work where *what was
-actually observed* matters more than fluent prose. It is built around the ways long local runs go
-wrong: context silently compacted, tool output cut without a trace, questions that wait for hours
-because nothing says they are waiting, and state that lived only in the transcript and was lost when
-the window filled.
+<p align="center">
+  <code>Rust 1.88+</code> &middot; <code>macOS &amp; Linux</code> &middot; <code>Native macOS App</code> &middot; <code>Web UI</code> &middot; <code>Two-Way Signal</code> &middot; <code>Zero Telemetry</code> &middot; <code>MIT</code>
+</p>
 
-It inverts the cloud assumptions:
+---
 
-- **Tokens are cheap; rebuilding the prefix is what costs.** A cached prefix is free; an edited one is
-  re-read from the first change. So a session's request prefix only ever grows, except at explicit,
-  logged re-weaves; nothing is trimmed "to save tokens". On a server with prefix caching, a stable
-  prefix comes back almost entirely from cache on every later step.
-- **Forking is free.** A child that starts from its parent's exact prefix gets a full cache hit, so
-  fanning out, verifying and voting all begin with everything the parent already knows.
-- **The model is the weakest part, so it gets the smallest job.** The harness owns process, memory,
-  bookkeeping and verification; the model fills typed slots inside narrow steps. This does not slow a
-  strong model down, and it carries a smaller one.
+Ferret is built for the workflow most cloud agent tools ignore: one operator, an OpenAI-compatible model server on your own network (`vLLM`, `SGLang`, `MLX`, `llama.cpp`, and similar — with large windows, automatic prefix caching, and concurrent sequences), sessions that run for hours unattended, and work where *what was actually observed* matters more than fluent prose.
 
-`docs/DESIGN.md` is the specification; this README is the tour. `docs/RUN.md` is the runbook.
+Its core is strictly **general-purpose** — software engineering, debugging, systems work, and long multi-agent research — while modular **packs** (`vr`, `redteam`, `ctf`, `ctf-generalist`, `harnessmm`) layer domain roles, security tooling, and verification gates cleanly on top without polluting the base runtime.
+
+### Why Ferret Exists
+
+Ferret inverts the usual cloud-agent assumptions:
+
+- **Tokens are cheap; rebuilding the prefix is what costs.** A cached prefix is nearly free; mutating an earlier turn invalidates everything after it. A Ferret session's request prefix only grows between explicit, logged compactions — maximizing prefix-cache hits on local inference servers.
+- **Forking is free.** A child agent forked from its parent's exact prefix starts with a warm KV cache, making parallel fan-out, independent verification, and competing approaches practical even on local hardware.
+- **The harness owns rigor; the model fills typed slots.** Process control, memory, evidence grading, stop gates, and verification live in Rust outside the model's reach — accelerating strong models while keeping smaller local models disciplined.
+
+---
+
+## Core Capabilities
+
+| Area | What Ferret Provides |
+|---|---|
+| **Crash-Safe Event Log &amp; Weave** | Every session is an append-only, hash-chained log on disk. The prompt window is a pure function (`weave`) of that log — restarts, reconnects, and compactions rebuild identically from history. |
+| **Whole-Output Admission** | Full tool outputs are stored content-addressed before the model sees them. Truncations are explicit and addressable by handle (`out_read` / `out_grep`), and evicted turns leave traceable stubs instead of silent gaps. |
+| **HMAC-Sealed Mission Ledger** | Goals, constraints, plans, decisions, claims, graded evidence, approvals, and standing rules live in a tamper-evident journal outside the workspace. Claims are mechanically verified against verbatim stored tool output. |
+| **Mechanical Finish &amp; Verifier Gates** | Working roles cannot wander off because context feels long; turns end only via explicit actions (`finish`, `ask_user`, `report_blocker`, `wait`), and `finish` can require sign-off from an independent read-only verifier/judge. |
+| **Four Operator Surfaces** | Control missions seamlessly from the **CLI** (`ferret`), the embedded strict-CSP **Web UI**, the native macOS **`ferret-desk.app`**, or **two-way Signal** alerts and quote-replies on your phone. |
+| **Defense-in-Depth Sandboxing** | Local OS confinement (**macOS Seatbelt** / **Linux Bubblewrap**), loopback egress proxy with per-session scope grants, cleared daemon environment, plus optional **remote Docker/Colima container sandboxes (`[box]`)** over SSH with per-mission `iptables`/`ip6tables` isolation. |
+| **Prior-Mission Recall** | Seed new runs with `--prior <mission>` to carry forward sealed goals, operator rules, progress, and security findings without replaying raw transcripts. |
+| **Adversarial Monitor (Shadow)** | Specified in [`docs/MONITOR.md`](docs/MONITOR.md) and built in phases. This build has the floor (an infrastructure deny that no grant overrides, fetch-service and mach-lookup denies, a process census by sandbox identity, proxy cut/veto/SNI binding and canary users), model lineage with cross-family reviewer eligibility, and the deterministic tripwires over every record of every session, in shadow: they record and show what they find without steering, pausing or refusing anything. |
+| **Zero Telemetry** | Nothing leaves your network unless you explicitly configure a model endpoint, allowlist host, MCP server, email inbox, or Signal daemon. |
+
+---
+
+## Architecture
+
+```text
+┌──────────────────────── Operator Surfaces ────────────────────────┐
+│  ferret CLI (TTY / --json)   Web UI (SSE, strict CSP, mobile)     │
+│  ferret-desk.app (macOS)     Signal Bridge ([signal] two-way)     │
+└───────────────────────────────┬───────────────────────────────────┘
+                                │ 127.0.0.1:7878 (bearer token / SSH tunnel)
+┌───────────────────────────────▼───────────────────────────────────┐
+│                   ferret daemon (ferret-daemon)                   │
+│  Session Runtime · Sealed Ledger · Blob Store · Inbox · Mailbox   │
+│  Loopback Egress & MITM Proxy (ferret-net: HAR, rewrites, pacing) │
+└───────────┬───────────────────────────────────────────┬───────────┘
+            │ Local OS Sandbox                          │ Optional [box] (SSH-forwarded Docker socket)
+            ▼                                           ▼
+  Seatbelt (macOS) / Bubblewrap (Linux)       Remote Container Host (e.g. second Mac Studio / Linux)
+  Workspace-confined tools & jobs             Read-only container · tmpfs /work · per-mission iptables
+```
+
+State lives under `~/.ferret/` (override via `FERRET_HOME`), never inside target workspaces — keeping config, bearer tokens, HMAC journal keys, model API key files, interception CA keys, blobs, sessions, and mission journals completely unreadable to sandboxed commands.
+
+---
 
 ## Screenshots
 
@@ -34,300 +73,233 @@ It inverts the cloud assumptions:
   <tr>
     <td width="50%" valign="top">
       <img src="docs/screenshots/01-overview.png" alt="Missions grouped by workspace"><br>
-      <sub><b>Missions, grouped by workspace.</b> A pinned <b>Needs you</b> group floats whatever is waiting on you to the top.</sub>
+      <sub><b>Missions by workspace.</b> A pinned <b>Needs you</b> group floats questions, approvals, and parked blockers to the top.</sub>
     </td>
     <td width="50%" valign="top">
-      <img src="docs/screenshots/02-session-chat.png" alt="A session's chat with tool calls"><br>
-      <sub><b>A session is one conversation.</b> Tool calls fold into work groups you can open; every row has Copy&nbsp;command / Copy&nbsp;output. A chip names the model behind each reply, and a model switch is a visible line.</sub>
-    </td>
-  </tr>
-  <tr>
-    <td width="50%" valign="top">
-      <img src="docs/screenshots/03-fleet.png" alt="A mission's fleet of agents"><br>
-      <sub><b>A fleet, by role and state.</b> Lead, dispatcher, solvers, verifiers — each agent's effort is scored: steps, calls, malformed calls, refused finishes, verifier accepts and rejects.</sub>
-    </td>
-    <td width="50%" valign="top">
-      <img src="docs/screenshots/05-context.png" alt="The context card"><br>
-      <sub><b>What is in the model's window, right now.</b> Every segment counted, the cached and read-anew split, and the marks where the prefix would be re-woven.</sub>
+      <img src="docs/screenshots/02-session-chat.png" alt="A session chat with folded tool calls"><br>
+      <sub><b>Session conversation.</b> Folded tool groups with one-click copy, per-reply model chips, and live mid-session model switching.</sub>
     </td>
   </tr>
   <tr>
     <td width="50%" valign="top">
-      <img src="docs/screenshots/04-inbox.png" alt="The inbox"><br>
-      <sub><b>The inbox.</b> Questions, approvals and parked blockers, grouped by mission, each with its ways out — answer, fold the context, or switch the model.</sub>
+      <img src="docs/screenshots/03-fleet.png" alt="A mission fleet by role and state"><br>
+      <sub><b>Multi-agent fleet.</b> Live role hierarchy and effort scorecards: steps, tool calls, refused finishes, and verifier verdicts.</sub>
+    </td>
+    <td width="50%" valign="top">
+      <img src="docs/screenshots/05-context.png" alt="The context window card"><br>
+      <sub><b>Exact context visibility.</b> Every segment counted, cached vs. uncached split, and compaction boundaries.</sub>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <img src="docs/screenshots/04-inbox.png" alt="The operator inbox"><br>
+      <sub><b>Operator inbox.</b> Questions, host-scope requests, approvals, and blockers — answer, grant scope, compact, or swap models.</sub>
     </td>
     <td width="50%" valign="top" align="center">
-      <img src="docs/screenshots/06-phone.png" alt="The phone layout" width="55%"><br>
-      <sub><b>On a phone.</b> The same record in one scroll; the composer sticks to the bottom and a session's open question lands in view.</sub>
+      <img src="docs/screenshots/06-phone.png" alt="Mobile responsive web layout" width="55%"><br>
+      <sub><b>Mobile web &amp; Signal.</b> Single-column mobile UI plus native Signal alerts and quote-replies when you are away from your desk.</sub>
     </td>
   </tr>
 </table>
 
-<sub>All shots are from the UI's offline fixture (<code>node tools/ui-preview.mjs</code>): no daemon, model, credentials or real data.</sub>
+<sub>Generated from the offline UI fixture (<code>node tools/ui-preview.mjs</code>) with no live daemon or credentials.</sub>
+
+---
+
+## Packs — General-Purpose Core to Cyber Harness
+
+A **pack** defines roles, system prompts, allowed tools, and verification contracts on top of Ferret's runtime:
+
+| Pack | Purpose | Highlights |
+|---|---|---|
+| **`core`** *(built-in)* | General-purpose engineering &amp; research | `lead`, `worker`, `verifier` (read-only), and `chat`. Full coding, debugging, web/CVE lookup, MCP, and `[box]` support. |
+| **`vr`** ([README](packs/vr/README.md)) | Vulnerability research | Scope gates, graded evidence tiers, adversarial `judge` on finish, and report-readiness checks. |
+| **`redteam`** ([README](packs/redteam/README.md)) | Bounded adversary emulation | `commander`, `recon_operator`, `tactical_operator`, `lateral_operator`, and independent `op_judge` verification. |
+| **`ctf`** ([README](packs/ctf/README.md)) | Specialist CTF solving | `dispatcher` fanning out to `web_solver`, `binary_solver`, `crypto_solver`, and `solver` with `flag_judge` verification. |
+| **`ctf-generalist`** ([README](packs/ctf-generalist/README.md)) | Unified CTF A/B benchmark | Same safety/oracle/`flag_judge` contract as `ctf` with a single unified 32-tool `solver` for cross-domain chains. |
+| **`harnessmm`** ([docs](docs/HARNESSMM.md)) | Experimental continuations | Bounded guarded continuations for long-horizon evaluation protocols. |
+
+### Built-In Security &amp; Offensive-Engineering Primitives
+
+Opt-in cyber workflows layer directly onto Ferret's core daemon:
+
+- **Structured Security State &amp; SARIF 2.1.0:** Typed per-surface coverage provenance, CVSS/CWE findings with 3-axis fingerprint deduplication, and `ferret sarif` export ([`docs/SECURITY_STATE.md`](docs/SECURITY_STATE.md)).
+- **HTTPS Interception &amp; HAR 1.2 Interop:** Per-target credential injection, captured exchange inspection (`ferret traffic`), live operator-only proxy rewrite rules (`ferret rewrite`), and bidirectional Burp/ZAP/DevTools **HAR 1.2** import/export (`ferret har`).
+- **Egress Noise Governor &amp; Assessment Identity:** Configurable pacing profiles (`quiet` / `balanced` / `aggressive`), backoff telemetry (`ferret net --noise`), and origin-scoped `Ferret-Assessment/1.0` `User-Agent` headers.
+- **Scoped Read-Only Email Inbox (`[mail]`):** Optional IMAP/Maildir `inbox_read` tool gated by strict sender allowlists and authentication checks (`SPF`/`DKIM`/`DMARC`) for verification codes and bug-bounty platform mail.
+
+---
 
 ## Requirements
 
-- Rust 1.88 or newer (`rust-version` in `Cargo.toml`) to build.
-- macOS for Seatbelt (`/usr/bin/sandbox-exec`), or x86_64/aarch64 Linux with `/usr/bin/bwrap` for
-  `mode = "bubblewrap"` (deny-all shell networking; no proxy bridge). Explicit `mode = "none"` leaves
-  every shell command unconfined, including verifier roles. Missing sandbox support fails closed.
-- An OpenAI-compatible `/v1/chat/completions` server that streams.
-- Optional, for the `dep_scan` tool only: the `depscan` command (OWASP dep-scan) on the daemon's
-  `PATH` — e.g. `brew tap owasp-dep-scan/tap && brew install dep-scan`, a standalone release binary,
-  or `pip install owasp-depscan` with `npm install -g @cyclonedx/cdxgen`. Loom never installs it.
+- **Rust `1.88+`** (`rust-version` in [`Cargo.toml`](Cargo.toml))
+- **OS Sandbox:** macOS (`/usr/bin/sandbox-exec` Seatbelt) or Linux x86_64/aarch64 (`/usr/bin/bwrap` Bubblewrap); missing sandbox support fails closed unless `mode = "none"` is explicitly configured
+- **Model Server:** Any streaming OpenAI-compatible `/v1/chat/completions` endpoint
+- **Optional:**
+  - macOS `14+` with Xcode Command Line Tools (`swiftc`) for **`ferret-desk.app`**
+  - Remote or local Docker/Colima host over SSH for containerized **`[box]`** execution
+  - **`signal-cli`** HTTP daemon (`daemon --http 127.0.0.1:1337`) for two-way **`[signal]`** alerts &amp; phone replies
+  - OWASP **`depscan`** on `PATH` for the optional `dep_scan` tool
 
-## Quick start
+---
 
-```
-cargo build --release -p loom-daemon      # the binary is target/release/loom
-mkdir -p ~/.local/bin                     # or use any other directory on your PATH
-install -m 755 target/release/loom ~/.local/bin/loom
-loom config init                          # writes ~/.loom/config.toml
-$EDITOR ~/.loom/config.toml               # set base_url and model for your server
-loom config check                         # prints each profile's lineage, then "ok: <path>", or what is wrong
-loom models lineage [profile]             # each profile's family, alignment, recipient and who reviews it
-loom monitor                              # the watcher in shadow: what its tripwires have found (changes nothing for an agent)
-loom monitor replay --home /path/to/copy  # the tripwires over a home's history, read-only
-loom up                                   # start the daemon in the background
-loom status                               # the daemon, ✓ or ✗ for your model server, what is running
-loom run -w /path/to/workspace "your task in one sentence"
-```
+## Quick Start
 
-`~/.local/bin` must be on your `PATH` (add `export PATH="$HOME/.local/bin:$PATH"` to your shell's
-startup file if it is not). Until a session has been created since the daemon started, `loom status`
-shows the model and window written in the config; after that, the model id the server serves and the
-window it reported.
+### 1. Build &amp; Run the Daemon
 
-The daemon reads the config file only when it starts, so write and edit the config before `loom up`,
-and run `loom down` then `loom up` after changing it — except `[models]` and `default_model`, which
-`loom models reload` applies without a restart. `loom up` starts the program it was run from,
-so keep the binary where it is while the daemon runs. If the server cannot be reached when a session
-is created and the profile sets no `context_window`, creation is refused with a sentence naming the
-URL; set `context_window` or start the server.
+```bash
+cargo build --release -p ferret-daemon
+mkdir -p ~/.local/bin
+install -m 755 target/release/ferret ~/.local/bin/ferret
 
-By default the tools reach no network host (`[network] mode = "deny_all"`); see "Network" below.
-
-## What it does differently
-
-Each of these is a mechanism, not a line in a prompt.
-
-- **The log is the record; the window is a view.** Every session is an append-only, hash-chained
-  event log on disk. The request sent to the model is a pure function of that log (`weave`), so a
-  crash, a restart and a context eviction are the same operation: rebuild the view from the log.
-- **Window fullness never reaches the model.** It is told once that context is managed and is never
-  given a gauge, a message count or an elapsed time to reason about; none of those is ever a reason
-  to stop, defer or summarise. Budgets that *do* exist (steps, wall-clock) are named and shown
-  separately.
-- **Tool output is admitted whole.** The complete output is stored before the model sees any of it.
-  If it is too large to show in full, the cut is explicit (which lines were omitted, the sizes, the
-  exit status) and the whole thing stays addressable by a handle the model can page (`out_read`) and
-  search (`out_grep`). A later eviction replaces old output with a stub that keeps the same handle, so
-  "folded out of view" is always distinguishable from "never happened", and the model can pull any of
-  it back. Tool calls stay native and are never paraphrased; a call and its result are never
-  separated or reordered.
-- **State that must outlive the window lives in a sealed ledger.** Goal, constraints, plan, decisions,
-  dead ends, claims, evidence, obligations and approvals are typed, HMAC-chained records in a journal
-  outside the workspace, written at decision time. A claim may only quote lines the harness actually
-  put in front of the model, checked verbatim against the stored bytes, and each piece of evidence is
-  graded by how it was obtained — a command that ran, a static analysis, a file read, an external lookup —
-  so an analysis (a dependency scan, a decompilation) can never pass itself off as a *run* that concludes a
-  goal or settles a verifier's objection. The Markdown you read is a generated view, never parsed back.
-- **Stopping is an act.** A turn that ends without a tool call goes through a gate: for a working
-  role, if the ledger still has open steps, obligations or unverified claims, the harness says exactly
-  what is open and continues; "it has been a while" and "context" are not reasons to stop. Work ends
-  only through `finish` (mechanically checked, then, for a role that asks for it, attacked by an
-  independent verifier), `ask_user`, `report_blocker` or `wait`.
-- **Enforcement sits outside the agent's reach.** Keys, config, harness state and the tool set live
-  outside the sandbox's writable area, and the sandbox hides the whole loom home from reads, so a command
-  cannot reach another session's log, a stored output or a mission journal. The daemon's own API port is
-  refused to commands; Git config, hooks and worktree pointers cannot be planted where commands write; and
-  the daemon runs with a cleared environment, so a proxy or credential exported in the shell that started
-  it never reaches a model request or a command. Network scope is enforced by a loopback egress proxy plus
-  an OS sandbox that permits no other route, not by reading shell text.
-- **Nothing leaves the machine unless you configure it.** No telemetry, no analytics, no fallback
-  provider. Model requests go only to the server you named.
-- **Unattended is the default.** The daemon survives its own restarts (it resumes what was running
-  from the logs), stops cascade to every child, every child has a budget, and anything waiting on a
-  human raises a notification.
-- **A new mission can start from what earlier ones learned.** You name the missions to recall
-  (`loom run --prior <mission>`, repeatable, or the web form); before its first step the new lead is
-  handed each one's goal, your standing rules and answers, where its work stood when its ledger was last
-  written, and its security findings as counts and locators — read from the sealed journals, never
-  replayed from a transcript.
-
-## Shape
-
-One binary, `loom`:
-
-```
-loom daemon        the long-lived local process; owns everything below
-loom <command>     a thin client over the daemon's HTTP API (127.0.0.1, bearer token)
-web UI             served by the daemon at / (records, context and the inbox, made visible)
+ferret config init                  # writes ~/.ferret/config.toml
+$EDITOR ~/.ferret/config.toml       # configure [models.*] base_url and model
+ferret config check                 # validates config, keys, packs, integrations, and the model policy
+ferret up                           # starts the background daemon on 127.0.0.1:7878
+ferret status                       # verifies daemon, model reachability, Signal, disk
 ```
 
-Crates:
+Launch a mission or open the Web UI:
 
-| crate | what it owns |
+```bash
+ferret run -w /path/to/workspace "audit the auth middleware and add regression tests"
+ferret open                         # mints a one-time login code and opens the Web UI
+```
+
+> **Tip:** Edit `[models]` or `default_model` anytime and apply without restarting via `ferret models reload`, or switch a live session mid-flight with `ferret models set <session> <profile>`.
+
+### 2. Native macOS Desktop App (`ferret-desk.app`)
+
+`ferret-desk` wraps the Web UI in a hardened `WKWebView` with zero JS injection, built-in SSH tunneling to remote daemon hosts, Keychain token storage, menu bar &amp; Dock badges, native macOS notifications, file upload/download dialogs, find-in-page (`⌘F`), and sleep/wake tunnel recovery.
+
+```bash
+FERRET_BUILD_HOST=local bash gui/build.sh
+open gui/dist/ferret-desk.app
+```
+
+See [`gui/README.md`](gui/README.md) for code-signing, keyboard shortcuts, and remote daemon connection setup.
+
+### 3. Two-Way Signal Alerts (`[signal]`)
+
+Configure `[signal]` in `~/.ferret/config.toml` against a local `signal-cli` HTTP daemon (see [`docs/config.example.toml`](docs/config.example.toml) and [`docs/RUN.md`](docs/RUN.md#signal)):
+
+```bash
+ferret signal check                 # checks signal-cli HTTP health, account, and bridge state
+ferret signal test                  # sends a live test message to your configured recipient
+```
+
+From your phone you can **quote-reply** to any alert to answer questions, grant/deny host scope requests (`approve`, `1 2`, `deny`), steer a session, or run commands: `/inbox`, `/status`, `/tail`, `/scope`, `/dismiss`, `/stop`, `/resume`, `/approve`, `/rule`, `/release`, `/mute`, `/unmute`, `/help`.
+
+### 4. Split-Host Daemon + Remote Sandbox (`[box]`)
+
+Ferret natively supports running the daemon on one host and isolated Linux containers on a second host over a supervised SSH-forwarded Docker/Colima socket with digest-pinned `arm64`/`amd64` images and per-mission `iptables`/`ip6tables` chains (`FERRET-ALL` / `FERRET-<id>`, bridge `fb-<id>`). See [`docs/RUN.md`](docs/RUN.md) and [`docs/config.example.toml`](docs/config.example.toml) for the full `[box]` recipe.
+
+---
+
+## CLI Quick Reference
+
+Most commands accept a session/mission ID, prefix, unique 4+ char suffix, or `last`, and support `--json` (or JSONL on `tail`) for scripting.
+
+### Missions &amp; Sessions
+
+```bash
+ferret run -w <dir> "task" [--pack <name>] [--prior <mission>] [--create-workspace]
+ferret chat                                         # interactive terminal chat
+ferret ls [-a] [--wide] [--json]                    # sessions, mission IDs, state, context
+ferret tail <session> [-n <N>] [--no-follow] [-v] [--json]
+ferret send <session> "message" [--after-turn] [-d]
+ferret queued list|edit|send|rm <session>           # manage --after-turn queue
+ferret stop <session> | resume <session> | compact <session>
+ferret rename <session> "title" | archive <session> [--undo]
+```
+
+### Operator Inbox &amp; Governance
+
+```bash
+ferret inbox [--json]                               # open questions, scope requests, blockers
+ferret answer <item|last|.> ["..." | 1..N | --dismiss]   # also reads piped stdin
+ferret scope <session> <host>...                    # grant per-session egress hosts
+ferret scope revoke <mission> <host> --reason "..." # take a granted host back (recorded, cut at once)
+ferret rule <session> "text" | --withdraw <id> [--reason "..."]
+ferret approve <session> "text" [--scope "..."]
+ferret release <session> "reason"                   # close a blocked mission cleanly
+```
+
+### Inspection, Security &amp; Traffic
+
+```bash
+ferret ledger <session|mission> [--json]            # sealed mission ledger
+ferret score <session|mission> [--json]             # effort & verifier scorecard
+ferret window <session> [--json]                    # exact context-window breakdown
+ferret out <handle> [--lines a:b]                   # inspect stored tool outputs
+ferret findings <session|mission> [-a] [--severity <lvl>] [--json]
+ferret sarif <session|mission> [-o findings.sarif]  # SARIF 2.1.0 export
+ferret traffic <session> [--host <h>] [-n N] [--json]
+ferret har export <session> [-o out.har] | import <session> <file.har>
+ferret rewrite list|add|enable|disable|rm|example   # live proxy rewrite rules
+ferret net <session> [--json] | --noise             # egress log or noise-governor stats
+ferret target list|add|show|scope                   # shared target scopes & graphs
+ferret creds list|show|record|set|rm <target>       # in-scope target auth profiles
+ferret ca show | rotate                             # HTTPS interception CA
+```
+
+### Models, Packs, Integrations &amp; Daemon
+
+```bash
+ferret status [--json]                              # daemon, models, live Signal bridge, disk
+ferret packs [--json]                               # installed packs & roles
+ferret models list|reload|show|set|role             # hot-reload & mid-session switching
+ferret models lineage [profile]                     # family, alignment, recipient, and who reviews each profile
+ferret monitor [status] | log <mission> [--json]    # the monitor in shadow: state, tripwire hits, flags
+ferret monitor replay [--home DIR] [--json]         # the tripwires over a home's history, read-only
+ferret mcp list | check <server>                    # MCP server inspection
+ferret mail check                                   # scoped read-only inbox check
+ferret signal check | test [message...]             # two-way Signal bridge diagnostics
+ferret open [--print]                               # open Web UI with one-time code
+ferret gc [--apply]                                 # prune unreferenced blobs
+ferret up | down | service install                  # daemon & LaunchAgent lifecycle
+```
+
+---
+
+## Workspace Crates
+
+| Crate | Responsibility |
 |---|---|
-| `loom-core` | types, the event log, the blob store, the weave and eviction, admission, the ledger journal, config; all sync and pure |
-| `loom-model` | the OpenAI-compatible streaming client, a priority request limiter, retry across a server relaunch, a scripted mock server |
-| `loom-tools` | the tool trait and registry, the built-in tools, process and job control, the OS sandbox |
-| `loom-net` | the loopback egress proxy and its scope policy |
-| `loom-agent` | the session loop, the stop and finish gates, the state block, orchestration, the runtime that owns every session |
-| `loom-daemon` | the HTTP API, the embedded web UI, and the `loom` command |
+| [`ferret-core`](crates/ferret-core) | Domain types, hash-chained event log, content-addressed blob store, pure `weave`/compaction, output admission, HMAC-sealed ledger journal, SARIF 2.1.0, HAR 1.2, and config validation |
+| [`ferret-model`](crates/ferret-model) | Streaming OpenAI-compatible client, priority request limiter, restart-resilient retries, and scripted mock server |
+| [`ferret-tools`](crates/ferret-tools) | Tool registry, sandboxed `bash`/PTY/job control, file/search/web/CVE/binary/mail tools, OS sandboxes (`seatbelt`/`bwrap`), and remote `[box]` Docker controller |
+| [`ferret-net`](crates/ferret-net) | Loopback HTTP/HTTPS MITM egress proxy, scope policy, credential injection, rewrite rules, and noise governor |
+| [`ferret-agent`](crates/ferret-agent) | Session loop, stop/finish/verifier gates, multi-agent orchestration, pack loader, security state, and runtime |
+| [`ferret-daemon`](crates/ferret-daemon) | Bearer-authed HTTP/SSE API, embedded Web UI, two-way Signal bridge, terminal renderer, and `ferret` CLI |
 
-State lives under `~/.loom/` (override with `LOOM_HOME`), never inside a workspace: the config, the
-API token (`token`), the journal key (`keys/`), model API keys when you use `api_key_file`
-(`keys/models/`), one directory per session (its log, a small summary
-and its job files), the content-addressed blob store, one journal per mission, logs, and any packs you
-install.
+---
 
-## Tools and roles
+## Building &amp; Testing
 
-Built-in tools: `bash` (its own process group under the sandbox; a long call becomes a tracked
-background job rather than being killed, and with `wake_on` the session is resumed when the job
-prints a line matching a pattern, not only when it ends) with `job_wait`, `job_kill` and `job_list`; `read`, `write`
-and `edit` (regular files only; a write refuses when the file changed since the session last read
-it); `glob` and `grep`; `out_read` and `out_grep` (page and search any stored output); `web_fetch`
-(through the egress proxy); and `cve_lookup`, `cve_search` and `advisory_lookup` (public vulnerability
-databases, through the same proxy); and `dep_scan` (OWASP [dep-scan](https://github.com/owasp-dep-scan/dep-scan)
-over a project directory or a CycloneDX SBOM: it runs the operator-installed `depscan` command under
-the sandbox, and stores the generated SBOM and the full CycloneDX VDR like any other tool output, so
-its prioritized findings can be quoted as evidence). The runtime adds the ledger tools (`plan`, `step`, `note`, `claim`,
-`claim_update`, `evidence`, `ledger`, `pin`, `log_search`, `reflect`), the security-state tools (`security_record`,
-`security_query`, `security_ingest`), the agent tools (`agent_spawn`, `agent_fanout`, `attempt`, `agent_adopt`,
-`agent_message`, `agent_stop`, `decide`, `verify`), `request_scope` (ask the operator for hosts), `conclude` (state that
-the goal is met or cannot be met, with evidence) and the tools that end a turn (`finish`, `verdict`, `ask_user`,
-`ask_for`, `hand_off`, `report_blocker`, `wait`). Packs can also grant `pty_open`/`pty_exec`/`pty_close`, `http_send`,
-`http_repeat`, `codec_calc`, `bin_survey`, `bin_decompile`, `bin_xrefs`, `gdb_probe` and `oracle_check`. Which of them a
-session has depends on its role, and a role is shown only one tool per job: a tool another one covers (`out_read` by
-`read`, `claim_update` by `claim`, …) still runs if called but is not listed (`docs/TOOL-SHAPES.md` §4).
-
-A **pack** is a set of roles; a role is a prompt, a tool list and how it ends. The built-in `core`
-pack has `lead` (owns a mission, plans, delegates, finishes through the gate), `worker` (one
-assignment, returns quoted evidence), `verifier` (read-only; tries to refute a claim) and `chat` (a
-plain turn-by-turn assistant). Domain discipline, such as a research pipeline with its own stages and
-evidence tiers, is a pack, not core.
-
-## Commands
-
-```
-loom run -w /path/to/workspace "task"     start a lead session in that directory and follow it
-loom run ... --prior <mission>            also recall what one or more earlier missions learned
-loom run ... --create-workspace           make the workspace folder first if it does not exist
-loom chat                                 a turn-by-turn chat session on the terminal
-loom ls                                   sessions, their state and context size
-loom tail <session>                       follow a session's record
-loom send <session> "message"             add a message to a session
-loom stop <session> | resume <session>    stop the current turn, or let a stopped session carry on
-loom inbox                                questions, approvals and blockers waiting for you
-loom answer <item> "..."                  answer one
-loom rule <session> "text"                set a standing rule for the mission
-loom rule <session> --withdraw <rule-id> [--reason "..."]
-loom approve <session> "text" [--scope "..."]
-loom scope <session> <host>...            let the mission's tools reach these hosts (a session asks with request_scope)
-loom scope revoke <mission> <host> --reason "..."   take a granted host back (recorded, cut at once)
-loom release <session> "reason"           accept a blocked mission as it is and close it
-loom ledger <session>                     the mission ledger
-loom score <session> [--json]             what the mission's work took: steps, refused finishes, malformed calls
-loom window <session>                     what is in the model's context right now
-loom net <session>                        every network request and how it was decided
-loom open                                 open the web UI in a browser
-loom gc [--apply]                         delete stored outputs nothing refers to (dry run unless --apply)
-loom models list                          the model profiles in use and whether each server answers
-loom models reload                        read [models] from the config again — no restart
-loom models set <session> <profile>       switch a session to another model from its next step — no restart
-loom models show <session>                a mission's models: the lead's, each agent role's, the agents running
-loom models role <session> <role> <profile>  start the mission's agents of a role (or `all`) on a profile
-```
-
-A `<session>` is an id, the beginning of one, or `last`. `docs/RUN.md` lists every command and option.
-
-## Network
-
-The daemon binds `127.0.0.1` and every API request carries a bearer token, so it is reachable only
-from the machine it runs on. Commands the model runs can reach the network only through the
-daemon's egress proxy, and the proxy's policy comes from `[network]` in the config:
-
-- `deny_all` (the default): tools reach no host. Requests to your model server are not affected.
-- `allowlist`: only hosts matching `allow` are reachable.
-- `open`: any public host is reachable. Private, loopback and link-local addresses are still refused
-  unless listed in `allow_private`.
-
-Whatever the config says, you can let one session reach more: an agent that needs a host asks, the request
-waits in your inbox without stopping it, and `loom scope <session> <host>...` (or the Approve button)
-grants it for that session only.
-
-`web_fetch` and the vulnerability-lookup tools need a route, so with the default they fail with a
-refusal that names the policy. `docs/config.example.toml` shows an allowlist. `dep_scan` runs locally
-once installed, but a first scan downloads dep-scan's vulnerability database (and `cdxgen` may reach
-its ecosystem registries), so it needs a route for those hosts too.
-
-To use a daemon that runs on another machine, forward its port over SSH and give the client that
-daemon's token; `docs/RUN.md` has the recipe.
-
-## Seeing it: the web UI and the desktop app
-
-The daemon serves a web UI at `/`: missions grouped by workspace on the left, with a pinned *Needs you*
-group first; in the middle each session as one **chat** — the whole record as a conversation, tool calls
-folded into work groups you can open, a chip on every reply naming the model that produced it (a model
-switch is a visible line), and a composer with a model seat that moves the session to another model from
-its next step; on the right an inspector with the mission ledger, a **context card** that shows exactly
-what is in the model's window, by segment and with the fold marks, the inbox and the network decisions.
-An **Agents** tab shows a mission's fleet by role and state with each agent's score; a **Files** tab
-browses the session's workspace, read-only. Copy buttons sit on every reply, code block, tool command or
-output and quoted line, and it reads on a phone: one scroll, a sticky composer and a session-details
-sheet. The page is static, strict-CSP, has no build step, and updates live over SSE. Run `loom open` to open it: the command asks
-the daemon for a one-time login code and opens the page with it. The page needs no cookie; it keeps
-a secret in the tab's session storage and asks you to run `loom open` again when that is gone.
-
-**loom-desk** (`gui/`) is a small native macOS app around that UI, for leaving missions running and
-glancing at them. It manages connections (a named host, an SSH tunnel it opens for you, the token it
-fetches), shows running and waiting counts in the menu bar, and raises an OS notification the moment a
-mission needs you. See `gui/README.md`.
-
-## Packs
-
-A pack is a set of roles. `core` (built in) is general. `vr` (`packs/vr/`) is a vulnerability-research
-pipeline (scope gate, evidence tiers, a judge that attacks the researcher's finish, a report-readiness gate)
-expressed as roles, ledger records and the harness's own checks. It is not installed by default; see
-`packs/vr/README.md`. `packs/vr/workspace/AGENTS.md` is its standards file, to copy into an engagement
-workspace for the agents to read.
-
-`packs/ctf` and `packs/redteam` add bounded specialist roles, typed security state and independent
-operator-contract verification. They are opt-in and require explicit scope and acceptance setup;
-see [CTF](packs/ctf/README.md), [Redteam](packs/redteam/README.md), and the
-[qualification protocol](docs/SECURITY-EVAL.md). External model/corpus performance is unmeasured.
-
-`harnessmm` is an opt-in experimental pack for bounded guarded continuations. See
-[`docs/HARNESSMM.md`](docs/HARNESSMM.md) for its limits and evaluation protocol.
-
-The adversarial monitor (deterministic tripwires, a cross-family reviewer, a gate for irreversible actions, a durable
-pause, and the operator-armed "keep going") is specified in [`docs/MONITOR.md`](docs/MONITOR.md) and built in phases;
-this build has the floor (infrastructure deny, fetch-service and mach-lookup denies, process census, proxy controls),
-model lineage, and the tripwire monitor in shadow: the daemon runs it, and it records what it finds without steering,
-pausing or refusing anything. The reviewer, the action gate, the pause and "keep going" are later phases.
-
-## Building and testing
-
-```
-cargo build --release -p loom-daemon      # the `loom` binary, target/release/loom
-cargo test --workspace                    # the Rust suite
+```bash
+cargo build --release -p ferret-daemon              # target/release/ferret
+cargo test --workspace                              # full Rust test suite
 cargo clippy --workspace --all-targets -- -D warnings
-node --test ui/core.test.js               # the web UI's logic; needs Node.js 22.12 or newer
-cargo run -p loom-agent --example eval    # scripted models against the mock server: what each run took
+node --test ui/core.test.js                         # Web UI logic & security checks (Node 22.12+)
+python3 -B tools/security-eval.test.py              # eval tooling checks
+FERRET_BUILD_HOST=local bash gui/build.sh           # native macOS ferret-desk.app
 ```
 
-`./x` is an optional wrapper that runs cargo on another machine named by `LOOM_BUILD_HOST` (and
-`LOOM_BUILD_HOST=local` runs it here); you do not need it. It has no default host: when
-`LOOM_BUILD_HOST` is unset it stops with a message saying to set it. The
-desktop app builds with `gui/build.sh`, which requires `LOOM_BUILD_HOST`. `docs/IMPLEMENTING.md` is
-the contributor guide.
+---
 
-## Reporting a vulnerability
+## Documentation
 
-See `SECURITY.md`. Changes between versions are in `CHANGELOG.md`.
+- [`docs/DESIGN.md`](docs/DESIGN.md) — Architecture &amp; core specification
+- [`docs/RUN.md`](docs/RUN.md) — Operator runbook, CLI reference, Signal setup, and remote `[box]` guide
+- [`docs/config.example.toml`](docs/config.example.toml) — Complete annotated configuration reference
+- [`docs/SECURITY_STATE.md`](docs/SECURITY_STATE.md) — Findings, coverage provenance, SARIF/HAR, rewrite rules, `[mail]`, and `[signal]`
+- [`docs/RUNTIME-CONTROLS.md`](docs/RUNTIME-CONTROLS.md) — Runtime governance, compaction, and steering controls
+- [`docs/MONITOR.md`](docs/MONITOR.md) — The adversarial monitor: the floor, tripwires, model lineage, reviewer, gate, and their phases
+- [`docs/UI.md`](docs/UI.md) &amp; [`gui/README.md`](gui/README.md) — Web UI and macOS `ferret-desk` guides
+- [`docs/IMPLEMENTING.md`](docs/IMPLEMENTING.md) — Contributor guide
+- [`SECURITY.md`](SECURITY.md) &middot; [`CHANGELOG.md`](CHANGELOG.md) &middot; [`LICENSE`](LICENSE)
 
 ## License
 
-MIT.
+MIT — see [`LICENSE`](LICENSE).

@@ -1,6 +1,6 @@
-# loom — design
+# ferret — design
 
-loom is an agent harness for long, unattended work on a locally hosted model. It was designed after
+ferret is an agent harness for long, unattended work on a locally hosted model. It was designed after
 auditing an existing harness (DSH) and a research-discipline plugin (dsh-vr) and measuring their
 behaviour on real session logs. This document is normative: where code and this text disagree, one of
 them is a bug. Where a module's documentation is more detailed than a section here, that module
@@ -68,7 +68,7 @@ That inverts the usual cloud trade-offs:
     finding, so the harness never paraphrases, summarises or silently shortens it. What the model is
     shown is the stored text (after a lossless-by-line normalisation) inside an envelope that states
     the tool, the outcome, the size and the handle at both ends. The harness tracks which lines of
-    every stored output have actually been put in front of the model (`loom_core::observe`), lists
+    every stored output have actually been put in front of the model (`ferret_core::observe`), lists
     executions with unseen lines in the HUD, labels a pattern scan as a text match rather than a
     reading, and refuses evidence whose quote is not in the stored text.
 12. **Tool calls are replayed exactly.** Every complete call the model made is replayed with its
@@ -82,34 +82,34 @@ That inverts the usual cloud trade-offs:
 ## 3. Shape
 
 ```
-loom (one binary, built from loom-daemon)
-  loom daemon        long-lived local process; owns everything below
-  loom <command>     thin client over the daemon's HTTP API (loopback, bearer token)
+ferret (one binary, built from ferret-daemon)
+  ferret daemon        long-lived local process; owns everything below
+  ferret <command>     thin client over the daemon's HTTP API (loopback, bearer token)
   web UI             served by the daemon at /
 
 crates/
-  loom-core    types, event log, blob store, weave/eviction, admission, observation, ledger + journal,
+  ferret-core    types, event log, blob store, weave/eviction, admission, observation, ledger + journal,
                harness-tag safety, config and paths                                   (sync, pure)
-  loom-model   OpenAI-compatible streaming client, retry across server relaunch, request limiter,
+  ferret-model   OpenAI-compatible streaming client, retry across server relaunch, request limiter,
                mock server
-  loom-tools   Tool trait + registry, argument checking, built-in tools, process control and jobs,
+  ferret-tools   Tool trait + registry, argument checking, built-in tools, process control and jobs,
                sandbox
-  loom-net     egress proxy, scope policy, chained audit file
-  loom-agent   runtime: sessions and their step loop, stop and finish gates, runtime tools,
+  ferret-net     egress proxy, scope policy, chained audit file
+  ferret-agent   runtime: sessions and their step loop, stop and finish gates, runtime tools,
                orchestration, HUD, packs, operator notifications, the monitor (§15)
-  loom-daemon  HTTP/SSE API, authentication, CLI, embedded UI
+  ferret-daemon  HTTP/SSE API, authentication, CLI, embedded UI
 packs/         role packs: core (also built into the binary) and vr
 ui/            static web UI (no build step), embedded into the binary — docs/UI.md
-gui/           loom-desk, a macOS menu-bar app around the web UI — gui/DESIGN.md
-tools/         import-dsh.py: imports DSH sessions as ended, read-only loom sessions
+gui/           ferret-desk, a macOS menu-bar app around the web UI — gui/DESIGN.md
+tools/         import-dsh.py: imports DSH sessions as ended, read-only ferret sessions
 ```
 
-The command line (`loom --help`): `daemon`, `up`, `down`, `status`, `open`, `run`, `chat`, `ls`,
+The command line (`ferret --help`): `daemon`, `up`, `down`, `status`, `open`, `run`, `chat`, `ls`,
 `tail`, `send`, `stop`, `resume`, `compact`, `archive`, `rule`, `approve`, `gc`, `inbox`, `answer`,
 `ledger`, `window`, `net`, `out`, `config`, `service` (the module documentation of
-`loom_daemon::cli` is its specification).
+`ferret_daemon::cli` is its specification).
 
-The state root is `~/.loom/` (override `LOOM_HOME`), never inside a workspace. Every directory the harness
+The state root is `~/.ferret/` (override `FERRET_HOME`), never inside a workspace. Every directory the harness
 creates under it is 0700 and every file 0600, set at creation (the process umask is not changed, so commands
 keep the user's umask in the workspace); at start the daemon also tightens the home, `keys/`, `sessions/`,
 `missions/`, `blobs/` and `logs/` to 0700 when they exist with group or other access.
@@ -140,7 +140,7 @@ blobs/tmp/                           writes in progress, and blobs a collection 
 missions/<mid>/journal.jsonl         the ledger journal of one mission
 missions/<mid>/journal.jsonl.lock    its lock file
 missions/<mid>/journal.head          its sealed head record
-logs/loomd.log                       the daemon's output when started by `loom up` or as a service
+logs/ferretd.log                       the daemon's output when started by `ferret up` or as a service
 logs/net-unattributed.jsonl          proxy answers that name no session, hash-chained
 logs/box-counters.jsonl              per-minute deltas of the packet counters of each mission box's egress rules
 logs/floor.jsonl                     the floor's events (decoy hits, vetoes, squatted lab ports), one JSON line each, synced
@@ -156,7 +156,7 @@ nothing can reach outside the home.
 A **mission** is one goal pursued by one lead (root) session and the agents it starts. When the
 lead's role ends explicitly the mission keeps a ledger, which the lead and all its agents share.
 
-## 4. Events and the log (`loom-core::event`, `loom-core::log`)
+## 4. Events and the log (`ferret-core::event`, `ferret-core::log`)
 
 `event.rs` is the normative schema; `log.rs` documents the file contract precisely. One JSON object
 per line:
@@ -185,7 +185,7 @@ per line:
 - A record of a kind this build does not know is read as `Event::Unknown`: it stays in the file as
   written, advances the chain, and is ignored by the weave and by every fold of session state.
 - A line whose chain header is right but whose body this build cannot read otherwise (a value written
-  by a newer loom) is not damage: it is kept as an opaque record (also `Event::Unknown`), advances the
+  by a newer ferret) is not damage: it is kept as an opaque record (also `Event::Unknown`), advances the
   chain, and is ignored the same way — unless the next line has the next `seq` but does not chain to
   it, in which case it is damage. A log with opaque records, or whose `session_start` carries a
   higher schema than this build's, can be read but is refused for writing (`LogError::Newer`) and
@@ -202,7 +202,7 @@ per line:
   refused with a sentence naming that record and no child log is left, so a child never inherits a
   prefix that its next open would cut back together with its own records.
 
-## 5. The weave (`loom-core::weave`)
+## 5. The weave (`ferret-core::weave`)
 
 `weave(records) -> Weave` renders the stable request prefix. It is deterministic: same records,
 same bytes. The module documentation of `weave.rs` is the precise specification (pairing, merging,
@@ -223,7 +223,7 @@ Consecutive `user`-role items are merged into one message (blank line between) s
 reject consecutive user turns still work, except that a `user`-role item directly after a `tool`
 message starts its own message.
 
-**Harness blocks** (`loom-core::tagsafe`). Every `<harness …>` block, the resume block and the
+**Harness blocks** (`ferret-core::tagsafe`). Every `<harness …>` block, the resume block and the
 `<harness-state>` block are built by `tagsafe`, never by hand. What a block embeds from the log is a
 payload; at render time (stored records are never rewritten) the `<` of every `<harness` and
 `</harness` in a payload, in any letter case, is written `&lt;`, so no payload can close its block or
@@ -250,7 +250,7 @@ table; and the model's note, labelled as written by the model and not verified.
 latest request of the epoch plus what was added since), `refused` (the server refused the request for what it
 carries or for its size: empty tail, headers-only note request), `stall` (the same step request hit the
 profile's `stall_timeout_s` three times and its prompt is at least `compact_at / 2`), `operator` (`POST
-/api/sessions/{id}/compact`, alias `/reweave`; `loom compact`, alias `loom reweave`; on an idle session it
+/api/sessions/{id}/compact`, alias `/reweave`; `ferret compact`, alias `ferret reweave`; on an idle session it
 compacts without starting a turn) and `fresh_start` (a lead's `finish` its verifier did not accept; empty tail,
 the note request carries the verifier's objections). A compaction never fails the session and is never
 skipped for being small.
@@ -269,7 +269,7 @@ must exist. Unknown ones get one retry; still unknown, they are replaced by `[un
 `dropped_keys`. A failed, cancelled or empty note request gives `note: None` and the compaction goes ahead.
 
 **The key table** is built by the harness, deterministically, from the log, the ledger and the previous
-compaction's table (`loom-core::compaction`): outputs (the ones the ledger cites, the note cites, the last 40
+compaction's table (`ferret-core::compaction`): outputs (the ones the ledger cites, the note cites, the last 40
 calls before the tail and the previous table's rows; at most 400 rows, 800 with cited ones; the rest are counted
 in a "not listed" line), files changed by `edit`/`write` (shell commands are not tracked), agents, and jobs
 still running.
@@ -286,7 +286,7 @@ Compactions happen only between steps (or while idle, on operator request), neve
 outstanding. The model can `pin` a result it wants kept in view.
 
 **HUD (ephemeral tail).** Not part of the weave. Each step request ends with one `user`-role message
-`<harness-state>…</harness-state>` (`loom-agent::hud`) that is never part of the stable prefix, so the
+`<harness-state>…</harness-state>` (`ferret-agent::hud`) that is never part of the stable prefix, so the
 next request diverges from the cache only after the previous last stable message. It is stored as a
 blob named by the request's `model_request.hud`. It carries, each section only when non-empty: the
 current time (UTC, minutes); the mission state from the ledger brief (§7); where the work stands (what is established, ruled out with evidence, only set aside, open, and the attempts run); command outputs with at
@@ -299,7 +299,7 @@ and carries no guess: a repeat is listed only when the call and its result were 
 byte (an advisory "similar outcomes" line was tried and removed: a guess beside the exact signal
 weakens both).
 
-**Prefix guard** (`loom-core::prefix`). For each step request the session hands the stable messages to
+**Prefix guard** (`ferret-core::prefix`). For each step request the session hands the stable messages to
 `PrefixGuard::check`, which compares them with those of the previous request: unless the epoch
 changed, the previous stable messages must be a prefix of the new ones. The one allowed difference is
 text appended to the previous request's last stable message (a request whose reply was never recorded,
@@ -309,7 +309,7 @@ Opening a session primes the guard with the weave of its records up to the last 
 the first request after a restart is checked like any other; when that weave no longer hashes to what
 the record stored (an upgrade changed the rendering), one `cache_break` is appended saying so.
 
-## 6. Admission (`loom-core::admit`)
+## 6. Admission (`ferret-core::admit`)
 
 The module documentation of `admit.rs` is the precise specification; this is the overview.
 
@@ -346,18 +346,18 @@ in the blob store first. `admit` then builds what the model sees — always an e
   (`AdmitPolicy::view_chars`), ending at a whole line with `window ended at line N …; continue with
   start N+1`, and `out_grep` stops adding match groups at the bound and says how many it left out. A
   view or message that still exceeds it is cut by the harness at a line boundary, with the handle
-  (`loom-tools::finalize`). An oversized result in the recent region could not be folded and made
+  (`ferret-tools::finalize`). An oversized result in the recent region could not be folded and made
   every later request overflow.
 
 The outcome is stated first and last, so it is adjacent to wherever the model is reading. The lines
 shown are recorded on the `tool_result` (`meta.shown`); views record which blob they showed
-(`meta.of_blob`) and which of its lines. `loom_core::observe` folds these into "which lines of this
+(`meta.of_blob`) and which of its lines. `ferret_core::observe` folds these into "which lines of this
 output has the model been shown", which drives the HUD's list of executions with unseen output.
 
 Token estimates use `TokenEstimator`, a chars-per-token ratio calibrated against the server's
 reported `prompt_tokens` after every request (start 3.3).
 
-## 7. Ledger (`loom-core::ledger`, `loom-core::journal`)
+## 7. Ledger (`ferret-core::ledger`, `ferret-core::journal`)
 
 The module documentation of `journal.rs` and `ledger.rs` is the precise specification.
 
@@ -388,12 +388,12 @@ zeros before the first entry. Verification recomputes over the bytes on disk.
   and removed by the next append. A complete line that fails verification makes the journal
   `Tampered`: every ledger write refuses and the ledger view reports it; the agent cannot repair it.
 - **Newer entries.** An entry with a valid seal whose op this build cannot parse is kept in the chain
-  and skipped when folding; appends are refused (`NewerVersion`) and the model is told that loom must
+  and skipped when folding; appends are refused (`NewerVersion`) and the model is told that ferret must
   be upgraded before the mission can continue. Reads do not hide this: the ledger view (`LedgerView`:
   `skipped`, `skipped_detail`, `torn_tail`, `ahead_of_head`) reports skipped entries, an ignored torn
-  tail and entries the head record does not vouch for; `loom ledger` and the web UI show a line for each
+  tail and entries the head record does not vouch for; `ferret ledger` and the web UI show a line for each
   that is present, and the state block tells the model how many entries are not shown.
-- **Key.** `keys/journal.key`: 32 random bytes as hex, created 0600 (inside `keys/`, which is 0700 like the loom home) by
+- **Key.** `keys/journal.key`: 32 random bytes as hex, created 0600 (inside `keys/`, which is 0700 like the ferret home) by
   publishing a synced temporary file under the final name with a hard link and syncing the directory,
   so a crash never leaves a partial key and two creators end with the same one. An existing file that
   does not hold 64 hex characters is an error and is never replaced; an empty one tells the operator to
@@ -461,7 +461,7 @@ the first two are singletons.
 Network scope. A journal written before these records existed folds unchanged; the new state fields
 default to empty.
 
-**Evidence** (the `evidence` tool, `loom-agent::rtools::ledger`). The model names a claim, a stored
+**Evidence** (the `evidence` tool, `ferret-agent::rtools::ledger`). The model names a claim, a stored
 output by handle, a line range and a note, and either a quote or nothing more (a quote by lines, below).
 The harness:
 
@@ -490,7 +490,7 @@ The harness:
    the verified text without line-number prefixes. A quote that is a part of a line is recorded as the
    complete line or lines it lies on, with their numbers (a window of them on long lines, below).
 
-**Evidence grade** (`loom-core::event::EvidenceGrade`). What a quote can show is decided by the harness
+**Evidence grade** (`ferret-core::event::EvidenceGrade`). What a quote can show is decided by the harness
 from what produced it, never by the model: `run` (something was run and its behaviour observed: a
 command, a request, a debugger, an oracle), `analysis` (a tool's analysis of something it did not run: a
 dependency scan, a decompilation, cross-references), `read` (a file, a page, a listing) or `reference`
@@ -555,7 +555,7 @@ descriptions say to leave the text out only with line numbers read from a number
 with its text is checked as before.
 
 **Views.** `LedgerState::render_markdown()` is the full Markdown view (the `ledger` tool, the API's
-`markdown`, `loom ledger`). A mission whose lead keeps a ledger but has written nothing yet has an
+`markdown`, `ferret ledger`). A mission whose lead keeps a ledger but has written nothing yet has an
 empty one; for a mission whose lead keeps none the API answers `No ledger: this mission's lead does
 not keep one.` `LedgerState::brief()` is the compact text of the HUD and of the compaction
 brief: goal, constraints and approvals are the operator's words and never cut; every other line is
@@ -575,7 +575,7 @@ approvals remain with the lead; operator input addressed to a child cannot chang
 A verifier has read-only ledger access and returns its observations through its report or verdict.
 An unreadable mission journal stops a child before another model request.
 
-## 8. Agent loop and stop gate (`loom-agent::session`, `loom-agent::gate`)
+## 8. Agent loop and stop gate (`ferret-agent::session`, `ferret-agent::gate`)
 
 The module documentation of `session.rs` is the precise specification of the loop; `gate.rs` and
 `rtools/terminal.rs` specify the gates. One task per session:
@@ -625,7 +625,7 @@ without starting a turn; only a user message, an inbox answer or a resume runs i
 among inputs queued during a turn cancels the turn at the next step. The next turn begins with a note
 saying the previous one was stopped, by the operator during a turn, between turns, or by a restart.
 
-**Tool-call validation** (`loom-tools::schema`). An unknown tool gets an error result naming the
+**Tool-call validation** (`ferret-tools::schema`). An unknown tool gets an error result naming the
 nearest tool names. Arguments are checked against the tool's parameter schema: an unambiguous shape
 error is repaired and the repair is reported (`read "12" as the integer 12`); anything else is refused
 with the argument, what was received and what is expected, every problem at once; unknown arguments
@@ -648,7 +648,7 @@ on any tool result with status `ok`, a user message, or a new turn.
 reply streams, such a call starts as soon as the next call of the reply begins
 (`StreamEvent::ToolCallReady`, never sent for the last call), provided every earlier call of the attempt
 was ready and is of such a tool (a gap, or any other tool, ends early starts for the attempt), its
-arguments pass `loom_tools::prepare`, and fewer than 8 early tasks are running (discarded ones count
+arguments pass `ferret_tools::prepare`, and fewer than 8 early tasks are running (discarded ones count
 until they have ended). It runs in a task of its own, under the id the reply will keep (the server's id
 when it is non-empty and unused, else a fresh `call-…`), with a cancellation token under the turn's and a
 `FileTracker` of its own. When the reply is in, the rest of its leading run of such tools starts
@@ -713,7 +713,7 @@ only when every check passes and, where verification is required, a verifier acc
 - Findings tied to traffic. A role with `require_traffic = true` (the finishing roles of `ctf`, `redteam` and
   `vr`) cannot `finish`, or `conclude` with `met`, while a claim the answer relies on (the supported claims the
   `finish` evidence cites, or every supported claim when it cites none) names a network host that none of the
-  claim's attested, supporting evidence reached. The hosts a claim names come from `loom_core::target::claim_hosts`:
+  claim's attested, supporting evidence reached. The hosts a claim names come from `ferret_core::target::claim_hosts`:
   its `assets` (new optional field of `claim`; host, service and endpoint assets count, file and identity do not),
   URLs in its text, and, once a mission has a target, hosts of its text inside the target's scope. A host is reached
   when that evidence cites a call during which an exchange with the host (any port) was recorded with a status, or
@@ -766,7 +766,7 @@ only when every check passes and, where verification is required, a verifier acc
     own `meta.json` before its first turn, so a crash cannot turn it into an ordinary agent.
 
 Only `report_blocker` (objective class), budget exhaustion, the operator's own release and, once it is
-built, loom review (§15: the monitor's pause of a mission, whose item the operator answers) can park the
+built, ferret review (§15: the monitor's pause of a mission, whose item the operator answers) can park the
 operator: a rejected or unrunnable verification never opens a blocking item, and an operator's answer to
 an inbox item is never a release: it does not conclude the goal, settle an objection or move the count
 of rejections.
@@ -790,7 +790,7 @@ and partial result rather than claiming verification. See [runtime controls](RUN
 logs of 2026-11) and a model is left to manage its own pace. `agents.stall_steps` and
 `agents.idle_ledger_nudge` are still accepted in the config, so older configs load, and are ignored.
 
-**Repetition and staleness** (HUD, over the session's own records, `loom_core::observe`): the same tool
+**Repetition and staleness** (HUD, over the session's own records, `ferret_core::observe`): the same tool
 called with the same arguments and the same output at least 3 times (navigation, reads and commands);
 a file read before this session later wrote it; the latest command result older than a later write.
 
@@ -799,7 +799,7 @@ an error, fails the step: a child settles `failed` with the reason and its last 
 blocking `parked` inbox item stating the reason and the turn ends `error`. The model is not shown the
 server's error.
 
-## 9. Orchestration (`loom-agent`)
+## 9. Orchestration (`ferret-agent`)
 
 The module documentation of `runtime.rs` (*Children*, *Start*, *Shutdown*) and `rtools/agents.rs` is
 the precise specification.
@@ -819,11 +819,11 @@ the precise specification.
   assignment before starting any, starts them, waits for all and returns one result with a `=====`
   header per agent; a report line that starts with `=====` is prefixed `> `, so a report cannot forge
   a header.
-- **A copy of the workspace per agent** (`loom_tools::workcopy`, `runtime.rs` *Copies*). Agents share
+- **A copy of the workspace per agent** (`ferret_tools::workcopy`, `runtime.rs` *Copies*). Agents share
   their lead's workspace unless they are started with `workspace: "copy"` (`agent_spawn`,
   `agent_fanout`). Such an agent works in its own copy, made as it starts at
-  `<loom home>-copies/<mission>/<agent>` (`~/.loom-copies/…`): everything in the workspace but
-  `.loom`, build output and `.git` included, so that what ran in the workspace runs in the copy.
+  `<ferret home>-copies/<mission>/<agent>` (`~/.ferret-copies/…`): everything in the workspace but
+  `.ferret`, build output and `.git` included, so that what ran in the workspace runs in the copy.
   Files are cloned where the file system can (APFS), so a copy takes time proportional to the number
   of files — about ten thousand a second — and no space until files change. A workspace with more
   than `agents.copy_max_files` (300 000) files is refused, as is one with more than
@@ -882,9 +882,9 @@ the precise specification.
 - `verify {claim | statement, handles?}` runs the role's verifier on demand (it must be in
   `may_spawn`) and returns its verdict; it does not change the claim's status.
 - Agents share the mission's ledger (§7).
-- **Recall of earlier missions** (`loom_agent::prior`). Nothing carries from one mission to another by
+- **Recall of earlier missions** (`ferret_agent::prior`). Nothing carries from one mission to another by
   itself: there is no store of past work the model can search. The operator may name, when creating a
-  lead, up to 8 earlier missions for it to recall (`NewSession.prior`, `loom run --prior`, the web
+  lead, up to 8 earlier missions for it to recall (`NewSession.prior`, `ferret run --prior`, the web
   form), kept in its `meta.json`. Before the lead's first model request the harness writes one `info`
   note built from each named mission's sealed journal, verified and folded, never from its logs or
   outputs: its title and the time of its last ledger entry; the operator's goal, rules in force and
@@ -896,12 +896,12 @@ the precise specification.
   shown with the query, fragment and userinfo removed from every URL in it, but may still hold whatever
   was written there. Every line
   taken from an old ledger is quoted with `>`. A journal that fails verification or holds an entry
-  written by a newer loom is named unreadable and nothing from it is shown. The note says that the old
+  written by a newer ferret is named unreadable and nothing from it is shown. The note says that the old
   mission's outputs cannot be opened and its authorizations do not apply, and a compaction may take it out of view
   like any `info` note.
 - **Stop** cascades from a lead to its agents (§8). An archive settles a mission's agents `stopped`;
   unarchiving delivers what they settled with and restores those that had not settled.
-- **Request slots** (`loom-model::limit`): per model profile at most `max_concurrent` requests in
+- **Request slots** (`ferret-model::limit`): per model profile at most `max_concurrent` requests in
   flight, highest priority first and first come first served within a priority: `Lead` for root
   sessions (and their digests) above `Child` for agents and votes.
 - **Restart.** A child that a shutdown cut is resumed, not settled: at start every unsettled child of a
@@ -924,7 +924,7 @@ the precise specification.
   duplicate receipt nor wakes another turn. Legacy terminal logs without a typed result (and without
   a `settlement.json`) recover as explicitly incomplete rather than as successful summaries.
 
-## 10. Model access (`loom-model`)
+## 10. Model access (`ferret-model`)
 
 The module documentation of `client.rs`, `assemble.rs` and `request.rs` is the precise specification.
 
@@ -981,8 +981,8 @@ The module documentation of `client.rs`, `assemble.rs` and `request.rs` is the p
   A 404 asks the server again: when no id has been selected in this process yet (a session restored
   while the server was down), the new one is remembered and the request is sent again once; when one
   has (the server was relaunched with another model), the 404 is refused with a sentence naming the
-  model now served — loom never follows a new model by itself, because what a session recorded at its
-  start describes the old one (the operator switches it: `loom models set`, below).
+  model now served — ferret never follows a new model by itself, because what a session recorded at its
+  start describes the old one (the operator switches it: `ferret models set`, below).
 - **Context overflow.** A 400 or 413 whose message reads like an over-long prompt (`maximum context
   length`, `context length`, `too many tokens`, `prompt is too long`, `max_model_len`, llama.cpp's
   `exceeds the available context size`, `input is too long`) or whose error type or code is
@@ -1020,14 +1020,14 @@ The module documentation of `client.rs`, `assemble.rs` and `request.rs` is the p
 - No provider fallback. A session's profile settings, `extra_body` included, change only at a recorded
   `model_switched`, or when a session that had no task is next opened after a reload or a restart.
 - **Live model set.** The profiles in use are the daemon's own copy of `[models]` and `default_model`;
-  `loom models reload` (`POST /api/models/reload`) reads them from the configuration file again
+  `ferret models reload` (`POST /api/models/reload`) reads them from the configuration file again
   without a restart — nothing else in the file is reread. A new profile is usable at once; an
   unchanged one keeps its client, request slots and discovery; a changed one gets new ones, and every
   session on it that has not ended is switched to it again; a removed one is no longer offered (a
   session running on it keeps its client; an idle one is refused activation until it is switched). A
   reload that fails to load the file, has no `[models]`, or leaves a pack's role naming a missing
   profile changes nothing. The daemon's environment is the one it started with: a profile whose
-  `api_key_env` is unset there is reported. `loom models set <session> <profile>`
+  `api_key_env` is unset there is reported. `ferret models set <session> <profile>`
   (`POST /api/sessions/{id}/model`) switches one session — a lead or an agent; its agents keep their
   own models — after discovery as for a new session: `meta.json` first, then the running task, which
   applies it between steps (a running request finishes on the old model). The session records
@@ -1036,7 +1036,7 @@ The module documentation of `client.rs`, `assemble.rs` and `request.rs` is the p
   latest one for the whole history, and a switch is never reported as a cache break: a new model is
   a cold cache by nature. The model is not told.
 - **A mission's agents' models.** The operator chooses, per mission, the profile its agents of a
-  role start on: `loom models role <session> <role> <profile>` (`POST /api/sessions/{id}/role-model`,
+  role start on: `ferret models role <session> <role> <profile>` (`POST /api/sessions/{id}/role-model`,
   the web UI's Models tab), or at creation (`--agent-model ROLE=PROFILE`, the new-mission form's
   "Agents' model"). `all` (`*`) covers every role without a choice of its own, but not the finish
   gate's verifier, whose model is a separate decision (and refused on the lead's profile when the
@@ -1044,7 +1044,7 @@ The module documentation of `client.rs`, `assemble.rs` and `request.rs` is the p
   at each fresh spawn before the pack's `model`, `alloy_models` and `escalation_model`; a fork never
   takes one, since it shares the lead's prefix and model. A choice applies to agents started from
   then on; `--now` (the Models tab's checkbox) also switches the role's running, unforked agents as
-  `loom models set` would. `loom models show` (`GET /api/sessions/{id}/models`) shows the lead's
+  `ferret models set` would. `ferret models show` (`GET /api/sessions/{id}/models`) shows the lead's
   model, each role's choice or the pack's, and the agents running with their models.
 - **Review profiles and the infrastructure deny.** A profile with `purpose = "review"` (the monitor's,
   `docs/MONITOR.md` §2.6) never runs an agent: it is refused as a lead, a role choice, a switch, and in a
@@ -1056,9 +1056,9 @@ The module documentation of `client.rs`, `assemble.rs` and `request.rs` is the p
 ### Images
 
 A record can name images: `user_message` and `tool_result` carry `images`, a list of `{blob, mime, bytes, width,
-height, name?}` (`loom_core::ImageRef`; `blob` is the full 64-hex blob id; the key is left out when the list is empty,
+height, name?}` (`ferret_core::ImageRef`; `blob` is the full 64-hex blob id; the key is left out when the list is empty,
 so logs of sessions without images are byte-identical to before). PNG, JPEG, GIF and WebP are recognised by magic
-bytes and sized from the header (`loom_core::image`, no dependency). An image attachment of at most
+bytes and sized from the header (`ferret_core::image`, no dependency). An image attachment of at most
 `[tools] max_image_bytes` (5 MiB) is stored in the blob store and named in the user message besides its line in the
 attachment list; `read` of such a file returns a one-line text and the image in the result's `images` (tools hand
 them back with `ToolOutput::with_images`, carried to `finalize` in a reserved meta key); a larger image is only
@@ -1080,17 +1080,17 @@ as the "Images" part of the Context breakdown. A folded tool result gives its im
 image blob that some session's log names in an `images` entry (the logs are searched; anything else, tool output
 included, is 404), inline, with its mime type and `Cache-Control: private, max-age=31536000, immutable`.
 
-## 11. Tools, sandbox, network (`loom-tools`, `loom-net`)
+## 11. Tools, sandbox, network (`ferret-tools`, `ferret-net`)
 
 **Tools.** Built in (`Registry::builtin`): `bash`, `job_wait`, `job_kill`, `job_list`, `read`,
 `write`, `edit`, `glob`, `grep`, `out_read`, `out_grep`, `web_fetch`, `cve_lookup`, `cve_search`,
 `advisory_lookup`, `dep_scan`, and for the packs that list them `pty_open`, `pty_exec`, `pty_close`, `http_send`,
-`http_repeat`, `codec_calc`, `bin_survey`, `bin_decompile`, `bin_xrefs`, `gdb_probe`, `oracle_check`. Box tools (`rtools::BOX_NAMES`, `[box]` only): `box_exec`, `box_get`, `box_reset`. Runtime-owned (`loom-agent::rtools`, `NAMES`): `plan`, `step`, `note`, `claim`,
+`http_repeat`, `codec_calc`, `bin_survey`, `bin_decompile`, `bin_xrefs`, `gdb_probe`, `oracle_check`. Box tools (`rtools::BOX_NAMES`, `[box]` only): `box_exec`, `box_get`, `box_reset`. Runtime-owned (`ferret-agent::rtools`, `NAMES`): `plan`, `step`, `note`, `claim`,
 `claim_update`, `evidence`, `ledger`, `pin`, `log_search`, `reflect`, `security_record`, `security_query`,
 `security_ingest`, `finish`, `verdict`, `ask_user`, `ask_for`, `hand_off`, `report_blocker`, `wait`, `conclude`,
 `agent_spawn`, `agent_fanout`, `attempt`, `agent_adopt`, `agent_message`, `agent_stop`, `decide`, `verify`,
 `request_scope`, and `guarded_plan` (harnessmm). A role's `hidden_tools` are run when called but not listed to the model (`docs/TOOL-SHAPES.md` §4). A role lists the tools it has, in request order; a name in neither set is a pack error. The
-set is frozen in `session_start`. Every call goes through one pipeline (`loom_tools::prepare` → `run`
+set is frozen in `session_start`. Every call goes through one pipeline (`ferret_tools::prepare` → `run`
 → `finish`): lookup, argument check, run (a panic becomes an error result), store and admit. Each tool
 has a class — `Nav`, `Read`, `Exec`, `Write`, `State`, `Terminal` — which drives eviction order,
 the default evidence grade (§7) and staleness. Each module's documentation is the precise specification of its tools.
@@ -1117,7 +1117,7 @@ the default evidence grade (§7) and staleness. Each module's documentation is t
   a file returns `(new file)`, and one that replaces a file above 64 MiB says that there is no diff and
   why. Files above 64 MiB are not edited.
 - `out_read` / `out_grep` page and search a stored output by handle and record what they showed.
-- **Stored outputs are the mission's own** (`loom_tools::outputs`, `runtime.rs` *Outputs of a mission*).
+- **Stored outputs are the mission's own** (`ferret_tools::outputs`, `runtime.rs` *Outputs of a mission*).
   The blob store is shared by every mission and content-addressed, so a handle names the same bytes for
   anyone who learns it. Every tool that takes a handle from the model — `out_read`, `out_grep`, `pin`,
   `evidence` and `finish` quotes, `security_record` secret handles, `security_ingest`, the oracle's
@@ -1128,14 +1128,14 @@ the default evidence grade (§7) and staleness. Each module's documentation is t
   output never widens the set. A handle of another mission's output is refused with exactly the
   sentence of a handle that names nothing, and no refusal says whether such an output exists (a quote
   check never reports its line count or a closest line). The runtime answers from an in-memory index
-  fed by every record and filled once per mission from its logs. The operator's reads (`loom out`, the
+  fed by every record and filled once per mission from its logs. The operator's reads (`ferret out`, the
   API) are not scoped.
 - `bash` runs the command with `/bin/bash -c` under the sandbox, in its own process group, stdin
   `/dev/null`, stdout and stderr interleaved into one output file. It is over only when its whole
   process group is empty.
   - The shell directory persists: a call without `cwd` runs where the last call left the shell (at
     first the workspace), so `cd dir` carries over; environment variables do not. The script runs
-    behind an `EXIT` trap that writes `pwd -P` to `$LOOM_SHELL_CWD` (a file in the session temp dir);
+    behind an `EXIT` trap that writes `pwd -P` to `$FERRET_SHELL_CWD` (a file in the session temp dir);
     a foreground call that ended by status or signal and finished elsewhere than it started says
     `cwd now {dir}` and records it as meta `cwd`. A timeout, a job and `background` do not move it;
     a directory that has been removed resets it to the workspace with a fact; a session reopened from
@@ -1165,18 +1165,18 @@ the default evidence grade (§7) and staleness. Each module's documentation is t
   - Cancellation sends TERM to the whole group, then KILL after `tools.kill_grace_s` (5).
   - A process that leaves its command's process group (`setsid`, `daemon()`, `redis-server --daemonize
     yes`, `tmux new -d`) is not tracked: `job_kill`, stop, the end of the session and daemon shutdown do
-    not stop it, although it stays under the seatbelt profile. The 60 s census (`loom-agent::census`,
-    `loom-tools::sandbox::census`) finds it by that profile, with what it listens on, and
+    not stop it, although it stays under the seatbelt profile. The 60 s census (`ferret-agent::census`,
+    `ferret-tools::sandbox::census`) finds it by that profile, with what it listens on, and
     `POST /api/sessions/{id}/census/kill` stops it; nothing is stopped automatically, except that archiving a session
     stops what it still has running once its tasks have ended.
   - A sandboxed command's RLIMIT_NPROC is lowered to `limit - sandbox.nproc_headroom` (default 256; 0 sets none; a command is
     refused when the user already holds that many) before it starts, so a fork bomb stops while the daemon can still fork. Who
-    is in a command's group is read from the kernel (`loom-tools::procinfo`: libproc, `/proc`), never by running
+    is in a command's group is read from the kernel (`ferret-tools::procinfo`: libproc, `/proc`), never by running
     `ps`; a group that cannot be inspected is still signalled unless its leader was replaced, and a job whose group
     could not be confirmed stopped keeps its pid record for the next start.
   - In seatbelt mode a failure whose output mentions `Operation not permitted` gets a reminder fact
     about the sandbox.
-- **Jobs** (`loom-tools::jobs`, `proc`). Ids `j1`, `j2`, … per session. `job_wait` returns the output
+- **Jobs** (`ferret-tools::jobs`, `proc`). Ids `j1`, `j2`, … per session. `job_wait` returns the output
   written since the last look (waiting up to `tools.job_wait_s`, 120, by default), `job_kill` stops a
   job (TERM, then KILL), `job_list` lists them. When a job settles its complete output is stored, the
   session is told in a note unless the model already saw its end, and a session whose last turn
@@ -1211,7 +1211,7 @@ the default evidence grade (§7) and staleness. Each module's documentation is t
   `tools.web_fetch_max_bytes` (20 MiB, with a fact when the response is larger). HTML is rendered to
   text and the raw bytes are stored too (`meta.raw_blob`). Any HTTP response is an observation (status
   `ok`). A refusal by the proxy is reported as `denied`: for an http URL from the proxy's own marked
-  answer; for an https URL from a `LOOM-CHECK` asked before each request and again when it fails to
+  answer; for an https URL from a `FERRET-CHECK` asked before each request and again when it fails to
   connect (a marker inside a tunnel comes from the destination and is not trusted).
 - `cve_lookup` (NVD record with EPSS), `cve_search` (NVD, ranked by EPSS) and `advisory_lookup` (OSV)
   reach only `services.nvd.nist.gov`, `api.first.org` and `api.osv.dev`, through the proxy, so the
@@ -1230,15 +1230,15 @@ the default evidence grade (§7) and staleness. Each module's documentation is t
 - `pin {handle, reason, unpin?}` keeps a stored output and every view of it in view through compactions;
   `log_search {pattern, in?, max?}` searches the session's own record.
 
-**Sandbox** (`loom-tools::sandbox`; its module documentation holds the exact seatbelt profile). Mode
+**Sandbox** (`ferret-tools::sandbox`; its module documentation holds the exact seatbelt profile). Mode
 `seatbelt` (default) runs commands under `/usr/bin/sandbox-exec`; the daemon refuses to start when the
 mode cannot work on the host (not macOS, or no `sandbox-exec`). Mode `none` confines nothing, which the
 system prompt states. Linux `bubblewrap` is a separate deny-all command-network mode: it requires
 `/usr/bin/bwrap`, refuses loopback/Unix socket exceptions and host proxy bridges, uses isolated
 namespaces, a read-only host filesystem, private `/tmp`, `/var/tmp` and `/run`, and a seccomp filter
 that denies socket creation/connection (including filesystem Unix sockets and io_uring setup).
-Protected mounts are read-only. User home (with credential protection), Loom home, and workspace
-`.loom` are hidden by private mounts; scoped workspace/temp roots are restored from pinned sources.
+Protected mounts are read-only. User home (with credential protection), Ferret home, and workspace
+`.ferret` are hidden by private mounts; scoped workspace/temp roots are restored from pinned sources.
 This hides future oracle-secret/credential creation too. Missing explicit unreadable paths outside
 hidden parents are refused; a whole user-home writable root is refused. The session temp remains
 writable. It never falls back to `none`. In-process tools still use the daemon's network policy.
@@ -1250,12 +1250,12 @@ The Seatbelt policy:
 
 - writable: the workspace, the session temp dir, `sandbox.extra_writable`, and the device files
   commands need. Shared system temp directories are not writable by default;
-- never writable, even inside a writable root: `<workspace>/.loom`, the loom home, and
-  `sandbox.protected_paths`. The session temp dir (`<loom home>/sessions/<id>/tmp`) is the exception:
+- never writable, even inside a writable root: `<workspace>/.ferret`, the ferret home, and
+  `sandbox.protected_paths`. The session temp dir (`<ferret home>/sessions/<id>/tmp`) is the exception:
   what is in it can be written, and it tests as writable, but the directory itself cannot be removed,
-  renamed, replaced or swapped for a link. A temp dir that is `/`, or is or contains the loom home, is
+  renamed, replaced or swapped for a link. A temp dir that is `/`, or is or contains the ferret home, is
   refused;
-- not readable: the whole loom home (records, stored outputs, journals, logs, configuration, packs, token and
+- not readable: the whole ferret home (records, stored outputs, journals, logs, configuration, packs, token and
   keys) except the session temp dir and `<session dir>/analysis`, the harness's staging of binary-analysis
   inputs, which commands can read and never write (an isolated replay: its staged workspace and temp
   instead), for commands under Seatbelt (Bubblewrap already hides it) and for the file tools in every mode,
@@ -1265,11 +1265,11 @@ The Seatbelt policy:
   (`fsgetpath`), and denies `file-search` (`searchfs`) everywhere. The session's job output directory
   gives commands the metadata of its files only: each command's stdout and stderr is a file there, and
   `fstat` of an inherited descriptor is a metadata read, without which `cat` fails and Python loses its
-  output. A workspace that is or lies inside the loom home is refused at construction. A hard link from the
+  output. A workspace that is or lies inside the ferret home is refused at construction. A hard link from the
   temp dir to a file that is not readable reads nothing (probed on macOS 27: the link is refused, as the
   profile denies the read of its source);
 - not readable, and not writable either (renaming and removing included), wherever they lie, even in
-  the workspace: `<loom home>/token`, `<loom home>/keys`, `<workspace>/.loom/oracle-secrets`, `sandbox.unreadable_paths`, and, while
+  the workspace: `<ferret home>/token`, `<ferret home>/keys`, `<workspace>/.ferret/oracle-secrets`, `sandbox.unreadable_paths`, and, while
   `sandbox.protect_credentials` is on (default), the user's credential stores (`~/.ssh`, `~/.aws`,
   `~/.gnupg`, `~/.config/gh`, `~/.config/gcloud`, `~/.azure`, `~/.kube`, `~/.docker/config.json`,
   `~/.netrc`, `~/.npmrc`, `~/.pypirc`, cargo and git credentials, `~/.password-store`, `~/.config/op`,
@@ -1295,7 +1295,7 @@ The Seatbelt policy:
 - network: denied, except loopback connections to the session's own egress proxy listener, to `sandbox.loopback_ports` (or
   every loopback port with `loopback_all`) and to `sandbox.unix_sockets`; listening on loopback is
   allowed. The daemon's own port is refused whatever allows it, at every address (Seatbelt counts the
-  host's own addresses as loopback), so a command that reads a `loom open` login code from the process
+  host's own addresses as loopback), so a command that reads a `ferret open` login code from the process
   list cannot redeem it;
 - in every `network.mode` (unless `sandbox.allow_fetch_services`), the system services that fetch a URL for a
   process, outside its sandbox, cannot be reached: `com.apple.trustd.agent`, `com.apple.trustd` and `com.apple.ocspd`.
@@ -1306,8 +1306,8 @@ The Seatbelt policy:
   background URL session service (`com.apple.nsurlsessiond`) and WebKit's XPC services, which a command
   can drive from `osascript -l JavaScript` to fetch a URL, are denied too. `mach-lookup` is denied by default with an allowlist of the services the usual toolchains need
   (`MACH_LOOKUP_ALLOW` and the Chromium rendezvous prefixes `MACH_LOOKUP_ALLOW_PREFIXES`, plus `sandbox.mach_allow`). The daemon probes this at start and hourly against a local
-  listener (`loom_agent::egress`, `loom_tools::sandbox::selfprobe`) and shows `egress: bounded` or `UNBOUNDED`
-  in `loom status` and the web header; `allow_fetch_services` marks it unbounded and keep-going refuses it;
+  listener (`ferret_agent::egress`, `ferret_tools::sandbox::selfprobe`) and shows `egress: bounded` or `UNBOUNDED`
+  in `ferret status` and the web header; `allow_fetch_services` marks it unbounded and keep-going refuses it;
 - mounting is denied (`file-mount`, and the disk-image and DiskArbitration services that mount for a
   process: a command could otherwise attach an image of its own over `.git/hooks`, `~/.ssh` or
   `~/Library/LaunchAgents`), and so is writing preferences (`cfprefsd` writes `~/Library/Preferences`
@@ -1341,7 +1341,7 @@ add worktrees and submodules: the operator does that, and a bare clone used with
 links: every repository in the workspace (`.git` directories and bare ones), the targets of `.git`
 files and `commondir` pointers when they are repositories, the gitdirs in `worktrees/` and the
 repositories below `modules/` (and theirs, in turn); their config, hooks and pointers are protected paths
-too, and Bubblewrap mounts them read-only unless one is or contains the loom home or the user's home. Discovery refuses unreadable or excessive trees (100000 workspace
+too, and Bubblewrap mounts them read-only unless one is or contains the ferret home or the user's home. Discovery refuses unreadable or excessive trees (100000 workspace
 directories, 4096 repositories and recorded directories, 4096 bytes per pointer). Bubblewrap freezes
 discovered Git directories as a whole; it cannot reserve future `.git` names in writable directories,
 so new repositories must be created outside a session. These protections do not establish immunity to
@@ -1364,21 +1364,21 @@ relative to that descriptor. A file name that is itself a link is read and follo
 most 8 links, so the directory checked is the target's. A role with `read_only` gets no `extra_writable`
 and its workspace is added to the never-writable paths, so it can still write in its session temp dir,
 and to the device files, and nowhere else. This is a write policy; readable untrusted files remain
-untrusted inputs. In `none`, read-only roles do not constrain shell commands. Commands get the daemon's environment (which `loom up` limits, §12) without any variable whose
+untrusted inputs. In `none`, read-only roles do not constrain shell commands. Commands get the daemon's environment (which `ferret up` limits, §12) without any variable whose
 name (case-insensitive) contains `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`, `PASSPHRASE`,
 `CREDENTIAL`, `AUTH_TOKEN`, `COOKIE`, `SESSION_KEY` or `PRIVATE`, has `SESSION`, `AUTH`, `PASS`, `JWT`
 or `WEBHOOK` as a part delimited by `_` or the ends of the name, ends in `_PAT`, `_DSN`, `_PWD` or `_PW`,
-is `DATABASE_URL`, `SSH_AUTH_SOCK` or the `api_key_env` of any model profile, or starts with `LOOM_`, or
+is `DATABASE_URL`, `SSH_AUTH_SOCK` or the `api_key_env` of any model profile, or starts with `FERRET_`, or
 whose value holds, anywhere, a URL with a password in its user-info part (`scheme://user:password@host`)
 (unless listed in `sandbox.env_pass`), plus
 `TERM=dumb`, `NO_COLOR=1`, `PAGER=cat`, `GIT_PAGER=cat`, `GIT_TERMINAL_PROMPT=0`, `TMPDIR` = the temp
 dir, and the proxy variables.
 
-**Egress proxy** (`loom-net::proxy`, `policy`; their module documentation is the precise
+**Egress proxy** (`ferret-net::proxy`, `policy`; their module documentation is the precise
 specification). One HTTP/1.1 proxy: a shared listener on `127.0.0.1:daemon.proxy_port` (0 = any free
 port) for the in-process reference clients, and a listener of each session's own on a free loopback
 port. Every listener serves `CONNECT` tunnels, plain-HTTP forwarding of absolute `http://` URIs (one request per connection, proxy headers
-dropped, `Connection: close`), and the check `LOOM-CHECK`. Anything else, a head above 64 KiB, or no
+dropped, `Connection: close`), and the check `FERRET-CHECK`. Anything else, a head above 64 KiB, or no
 head within 10 s gets `400`.
 
 - Every session, also under `deny_all`, gets credentials (user = session id, a random password), a
@@ -1398,7 +1398,7 @@ head within 10 s gets `400`.
   that are IP literals or CIDR blocks match the resolved address, before any allow and before
   `allow_private`, in every mode; a private, loopback, link-local or otherwise special address is
   refused unless `allow_private` lists the name (pattern) or the address (literal or CIDR), or the
-  mission was granted exactly that private IP literal with a matching port (a `loom scope` grant of
+  mission was granted exactly that private IP literal with a matching port (a `ferret scope` grant of
   `127.0.0.1:19201` reaches only `127.0.0.1:19201`; names granted never unlock private resolution). The
   connection is made to the first allowed address, never by name again, so a second lookup cannot
   change the destination. Rules are reported as `deny {entry}`, `mode deny_all`, `not in allow list`,
@@ -1418,7 +1418,7 @@ head within 10 s gets `400`.
   2376) directly, also under `loopback_all`. `Runtime::start` refuses a `network.infrastructure` entry it cannot
   read; a `ssh_host` of the form `user@host` or `ssh://user@host:2222` is reduced to its host.
 - **Per-session scope grants.** The operator can authorize more hosts for a running mission without a
-  restart (`Runtime::grant_scope`, `POST /api/sessions/{id}/scope`, `loom scope`). The egress policy of
+  restart (`Runtime::grant_scope`, `POST /api/sessions/{id}/scope`, `ferret scope`). The egress policy of
   every running session of the mission becomes the configured network plus the granted hosts: under
   `deny_all` the granted hosts become an allowlist of exactly those hosts (the configured `allow` list,
   which `deny_all` keeps off, stays off), under `allowlist` they are added to `allow`, under `open`
@@ -1444,10 +1444,10 @@ head within 10 s gets `400`.
   they carry (an `allow_private` entry of that kind wider than /8 is refused at load); entries in 6to4
   form match 6to4 addresses only. Network-specific NAT64 prefixes are not unwrapped: listing one in
   `allow_private` admits every IPv4 address behind it.
-- **Answers.** A refusal is `403` with `X-Loom-Proxy: 1` and a text naming the destination, the rule,
+- **Answers.** A refusal is `403` with `X-Ferret-Proxy: 1` and a text naming the destination, the rule,
   and that the operator sets the policy; an unreachable destination is `502`. Every response the proxy
-  generates carries `X-Loom-Proxy: 1` and `Connection: close`; a destination's plain-HTTP response head
-  is re-written with CRLF line ends, without any `X-Loom-Proxy` header, and with the destination's
+  generates carries `X-Ferret-Proxy: 1` and `Connection: close`; a destination's plain-HTTP response head
+  is re-written with CRLF line ends, without any `X-Ferret-Proxy` header, and with the destination's
   `Connection`, `Keep-Alive` and `Proxy-Connection` headers replaced by `Connection: close` (one that
   does not parse, or whose `Content-Length` is invalid or conflicting, gets `502`). A forwarded
   connection carries one request and one response: the request body is forwarded up to its end, the
@@ -1455,10 +1455,10 @@ head within 10 s gets `400`.
   and trailers, `Content-Length` bytes, else the destination's close), and then the connection is
   closed, so a destination cannot answer a later request on it. When the client sends more than its
   request, a response that runs until the destination closes is cut after its head. The tools' HTTP
-  clients keep no idle connections. `LOOM-CHECK host:port` (or `http://host:port/`) applies the policy
+  clients keep no idle connections. `FERRET-CHECK host:port` (or `http://host:port/`) applies the policy
   and resolves the name but connects to nothing: `200` allowed, `403` refused, `502` the name does not
-  resolve, with the rule in `X-Loom-Rule`.
-- **Limits** (`loom_net::Limits` defaults, not configurable): 256 connections in all — at the limit a
+  resolve, with the rule in `X-Ferret-Rule`.
+- **Limits** (`ferret_net::Limits` defaults, not configurable): 256 connections in all — at the limit a
   new one takes the slot of the oldest connection that has not sent a head yet or is only being
   answered by the proxy itself, else `503` with `Retry-After: 5`; 64 per session (`429`, `Retry-After:
   5`); 16 name lookups at once, 4 per session, 10 s each; a 10-minute idle timeout with no byte either
@@ -1470,12 +1470,12 @@ head within 10 s gets `400`.
   could not be written, and the connection is closed. Refusals, unreachable destinations and the
   proxy's own `400`/`407`/`429`/`503` answers are recorded best effort. A connection on record as
   allowed that then fails gets a second decision with the rule suffixed `(failed after the allow:
-  …)`; a check is recorded with method `LOOM-CHECK` and the rule suffixed `(check only)`. Answers that
+  …)`; a check is recorded with method `FERRET-CHECK` and the rule suffixed `(check only)`. Answers that
   name no granted session go to `logs/net-unattributed.jsonl`, at most 10 a minute, the next one saying
   how many were left out; the API has no reader for that file, and these decisions are not published.
 - **Cut, veto, server names, decoys** (`docs/MONITOR.md` §2.2, E4). `Proxy::cut`/`cut_sessions` end a session's open
   tunnels and forwards (`Runtime::cut_mission` for a mission) within a second. A synchronous veto
-  (`Proxy::set_veto`, installed by `loom-agent::floor`) refuses decoy hosts and infrastructure before any lookup, with `502`
+  (`Proxy::set_veto`, installed by `ferret-agent::floor`) refuses decoy hosts and infrastructure before any lookup, with `502`
   and a fixed sentence. After the `200` of a `CONNECT` and before any byte goes upstream the proxy reads the client's first
   flight: a TLS ClientHello must name the destination or another name the session's policy allows (the record then carries
   `sni`), and an encrypted ClientHello, an unreadable one, or none for a destination that is a name is refused; a flight
@@ -1483,14 +1483,14 @@ head within 10 s gets `400`.
   fires a hook. For a loopback connection, a listener started inside another session's sandbox is refused. Each mission
   box's per-rule packet counters are read every minute into `logs/box-counters.jsonl`.
   Each decision attributed to a session is also published as a `net` event once its record is written.
-- **The audit file is a chain** (`loom-net::netlog`). Each line's `prev` is the SHA-256 of the previous
+- **The audit file is a chain** (`ferret-net::netlog`). Each line's `prev` is the SHA-256 of the previous
   line's bytes (64 zeros for the first); appends are serialised and each is synced. Lines written
   before the chain existed (no `prev`) still load, and the chain starts at the first line that has it.
   An unterminated final fragment that is not a JSON object is a torn append, not a break: it is cut off
   before the next append, and readers verify the lines before it. `GET /api/sessions/{id}/net` and
-  `loom net` verify the chain and refuse to serve a broken one, with a sentence naming the line.
+  `ferret net` verify the chain and refuse to serve a broken one, with a sentence naming the line.
 
-**Box** (`loom-tools::boxctl`, `loom-tools::boxfs`, `loom-agent::rtools::boxtools`, `[box]`). One container per mission on a
+**Box** (`ferret-tools::boxctl`, `ferret-tools::boxfs`, `ferret-agent::rtools::boxtools`, `[box]`). One container per mission on a
 Docker host the operator names, for what the local sandbox cannot do. The module documentation of each
 file is the specification; the invariants are:
 
@@ -1498,18 +1498,18 @@ file is the specification; the invariants are:
    (`proc::spawn_launched`, with `bash::run_launched` carrying `bash`'s whole procedure), with a fixed argv built
    by pure functions (`run_args`, `exec_args`, `kill_args`, `push_args`, `get_args`, `network_args`,
    `rules_args`, `rm_args`). The agent's script is the last argument of `/bin/bash -c` in the container. The
-   ssh-forwarded socket lives in `<loom home>/keys`.
+   ssh-forwarded socket lives in `<ferret home>/keys`.
 2. *Hardened container*: `--cap-drop ALL` plus the vetted `cap_add`, `no-new-privileges`, read-only root,
    tmpfs `/tmp` and `/work` (mounted `exec`: the box runs what is built in it), an init as PID 1 (`--init`,
    so stopped commands leave no zombies), user 1000, no mounts, devices, privileged mode or host namespaces.
 3. *Pinned images*: `name@sha256:...` or `sha256:...`.
-4. *Egress*: a bridge per mission without IPv6, DNS at an unroutable address, rules in a chain `LOOM-<id>` on
+4. *Egress*: a bridge per mission without IPv6, DNS at an unroutable address, rules in a chain `FERRET-<id>` on
    the Docker host installed by `helper_image` (`--network host --cap-add NET_ADMIN`), from the exact granted
    hosts and IPs after `Policy::check_addr`; wildcards are not applied; container after rules. Resolved
    names go to `docker run` as `--add-host name:ip` (the root is read-only, so Docker's `/etc/hosts` is
    too; no root exec exists); a name granted later is reachable by address at once and resolves after
    `box_reset` (`MissionBox::pending_hosts`, shown under every `box_exec` result meanwhile). A static
-   chain `LOOM-ALL` (jumped to from `DOCKER-USER` and `INPUT` for `lb-+`, one jump per mission, final `DROP`)
+   chain `FERRET-ALL` (jumped to from `DOCKER-USER` and `INPUT` for `fb-+`, one jump per mission, final `DROP`)
    drops a bridge that has no chain of its own; IPv6 is off in the container and dropped on the host; the
    rules of a running box are re-checked about once a minute.
 5. *Grants*: `grant_scope` and `release` re-apply the rules; stop, archive and the end of a mission tear the
@@ -1517,7 +1517,7 @@ file is the specification; the invariants are:
    leftovers of missions that are not running. Every change of one mission's box (create, reset, re-rule,
    teardown, a sweep of leftovers) takes the same per-mission lock, and the chain goes last, only after the
    container and the network are gone.
-6. *Files in*: only regular files the agent could read, no `.loom`/`.git`, no links, size limits.
+6. *Files in*: only regular files the agent could read, no `.ferret`/`.git`, no links, size limits.
 7. *Files out*: `boxfs::extract`, regular files and directories only, checked before writing, written by
    `fstools::write_file_checked`, the `write` tool's own path.
 
@@ -1526,7 +1526,7 @@ is an ordinary job, and killing it signals the process group in the container th
 (`proc::RemoteStop`). Not done: a box for an agent that has its own workspace copy; wildcard grants; IPv6;
 a remote stop for a box job adopted after a daemon restart (its record does not keep one).
 
-**Captured exchanges** (`loom-agent::traffic`, `loom-tools::traffic`). Every HTTP exchange of a session is a record
+**Captured exchanges** (`ferret-agent::traffic`, `ferret-tools::traffic`). Every HTTP exchange of a session is a record
 in its log: `Event::Exchange` with `id` (`ex-` and 12 base32 characters), `call_id`, `source` (`tool` or
 `proxy`), `tool`, `scheme`, `tls` (`plain`, `intercepted` or `tool`), `method`, `host`, `port`, `target`,
 `status`, `error`, `request` and `response` (blobs holding the HTTP/1.1 messages), byte counts, `truncated` and
@@ -1546,28 +1546,28 @@ status` with the keys of both messages.
 
 **HTTPS interception** (opt-in; `Runtime::decide_intercept`). `[network] intercept` is `"pack"` (default),
 `"always"` or `"never"`. With `"pack"` a mission intercepts when its pack says `intercept = true` (ctf, redteam,
-vr) unless it was started with `intercept: false` (API body, `loom run --no-intercept`); another pack's mission may
+vr) unless it was started with `intercept: false` (API body, `ferret run --no-intercept`); another pack's mission may
 be started with `intercept: true`. The choice is recorded in `session_start.intercept` and `SessionMeta.intercept`
 and every child inherits it. An intercepting session is granted with `Proxy::grant_with_capture`; the CA is
-`~/.loom/ca/loom-ca.{pem,key}` (`Ca::load_or_create`), created on first use, and a mission that was promised
+`~/.ferret/ca/ferret-ca.{pem,key}` (`Ca::load_or_create`), created on first use, and a mission that was promised
 decrypted traffic does not start when it cannot be loaded. The session's tmp dir gets `ca-bundle.pem` (system roots
-plus the loom CA) and the session's command environment sets `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`,
+plus the ferret CA) and the session's command environment sets `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`,
 `CURL_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`, `GIT_SSL_CAINFO`, `PIP_CERT` and `AWS_CA_BUNDLE` to it; nothing is added
-to any trust store. The loom home, CA key included, is never readable from the sandbox (`check_read`). A session
+to any trust store. The ferret home, CA key included, is never readable from the sandbox (`check_read`). A session
 with interception off and no capture is granted and run exactly as before.
 
-**Tool shapes.** Models are not fine-tuned for loom, so `read`, `write`, `edit`, `bash`, `grep` and `glob` are shown in Claude Code's argument names (`ToolsCfg.dialect`, default `trained`; `loom` shows loom's own), and calls in the shapes other widely trained harnesses use (Codex `apply_patch`, Cline `replace_in_file`, `str_replace_editor`, Gemini and Cursor names, `TodoWrite`, and so on) are converted to loom's tools before checking, with the repair named in the result. The tables and rules are in `TOOL-SHAPES.md`; the code is `loom-tools/src/dialect.rs`, called from `prepare`.
+**Tool shapes.** Models are not fine-tuned for ferret, so `read`, `write`, `edit`, `bash`, `grep` and `glob` are shown in Claude Code's argument names (`ToolsCfg.dialect`, default `trained`; `ferret` shows ferret's own), and calls in the shapes other widely trained harnesses use (Codex `apply_patch`, Cline `replace_in_file`, `str_replace_editor`, Gemini and Cursor names, `TodoWrite`, and so on) are converted to ferret's tools before checking, with the repair named in the result. The tables and rules are in `TOOL-SHAPES.md`; the code is `ferret-tools/src/dialect.rs`, called from `prepare`.
 
-**MCP servers.** A configured MCP server (`[mcp.servers.NAME]`) is offered to the model as ordinary tools named `mcp__{server}__{tool}`; its protocol is `loom-tools/src/mcp.rs`, its session wiring `loom-agent/src/mcp.rs`.
+**MCP servers.** A configured MCP server (`[mcp.servers.NAME]`) is offered to the model as ordinary tools named `mcp__{server}__{tool}`; its protocol is `ferret-tools/src/mcp.rs`, its session wiring `ferret-agent/src/mcp.rs`.
 
 - *Configuration (M1).* A server has exactly one of `command` (stdio) and `url` (Streamable HTTP); the name matches `[a-z0-9_-]{1,32}` and unknown keys are refused. Secret values in `env` and `headers` are `env:NAME` (the daemon's environment at session start), `file:/path` (trimmed) or a literal (allowed, and the daemon warns at start that a secret is written in the config). A source that is missing fails that server's start, not the daemon's. Values are never written to a log, a record or an API answer: records and routes carry names only. With no `[mcp]` or no servers, nothing below happens and no request changes.
 - *Where it runs (M3).* A stdio server is a child of the session's sandbox (argv run through `ctx.sandbox`, new process group, killed with the group), so a read-only session's server is read-only too. An HTTP server is reached the way `web_fetch` is, through the session's egress proxy, so the network policy decides and every connection is in `net.jsonl`. There is one connection per session per server, opened by the first call or the listing, closed after `idle_close_s` without a call, when the session ends or when it is archived; a call that finds the server dead restarts it once and its result says `server restarted`.
 - *Network (M4).* The `hosts` of a server are added to the allowed hosts of every session whose role gets that server, on top of `[network]` and mission grants (in `deny_all` too). **Threat note:** the proxy cannot tell the server's connections from the agent's, so a host granted for a server is reachable by that session's `bash` and `web_fetch` as well. Grant only hosts you would grant the agent.
 - *A call (M5).* The tool's class is `Read` when the server's `readOnlyHint` is true, else `Exec`, never speculative. The arguments are checked by `schema::check` only when the schema uses keywords it supports; otherwise the server validates. The content blocks become the body in order; an `isError` result or a JSON-RPC error is an `Error` outcome; a timeout is `Timeout`. The result is an ordinary stored output: admitted, cut, keyed (`out:`), readable with `read` and `grep`, quotable as evidence and readable by the verifier.
 - *Which session gets what (M6).* When a mission's lead starts, the runtime connects to every configured server whose `roles` match a role of the mission's pack, lists its tools and records the listings in `session_start.mcp` (a server that fails is recorded with its `error` and no tools). Children use their lead's listing and a reopened session its own record's, so a session's tool list and request prefix never change while it lives; changes on the server reach the next mission. A role gets the tools of each server whose `roles` name it (default: every role that is not read-only; a read-only role such as the verifier only when `read_only = true`), filtered by `tools`, after its own tools, in the server's order; once their definitions pass `max_schema_tokens` the rest are left out. A session with MCP tools gets one harness note at its start: per server the tool count, the hosts it added, what was left out (by `tools`, by the budget, by a name collision) and any start error. `hidden_tools`, the dialect layer and the tool-shape aliases do not apply to MCP tools.
-- *Daemon (M7).* `GET /api/sessions/{id}/mcp` shows the state of the session's servers; `POST /api/mcp/{server}/check` starts one in a scratch sandbox for a workspace, lists its tools and closes it; `loom mcp list` and `loom mcp check` use them.
+- *Daemon (M7).* `GET /api/sessions/{id}/mcp` shows the state of the session's servers; `POST /api/mcp/{server}/check` starts one in a scratch sandbox for a workspace, lists its tools and closes it; `ferret mcp list` and `ferret mcp check` use them.
 
-## 12. Daemon API (`loom-daemon`)
+## 12. Daemon API (`ferret-daemon`)
 
 The module documentation of `api.rs`, `auth.rs`, `serve.rs` and `client.rs` is the precise
 specification.
@@ -1578,28 +1578,28 @@ that resolves to none is refused). Every request passes three gates: the `Host` 
 `127.0.0.1:<port>`, `localhost:<port>` or `[::1]:<port>` with the bound port (else `403`); a request
 other than GET or HEAD with an `Origin` must come from `http://` and one of those hosts (else `403`);
 and every route except those marked open below needs `Authorization: Bearer <secret>`, where the secret
-is the API token (`~/.loom/token`) or a web-session secret (else `401`).
+is the API token (`~/.ferret/token`) or a web-session secret (else `401`).
 
 **Web login.** There are no authentication cookies (a cookie is sent to every port on the host,
-including a dev server an agent started). `loom open` asks for a login code with the API token and
+including a dev server an agent started). `ferret open` asks for a login code with the API token and
 opens `http://<bind>/#code=<code>`; the token is never printed or put on a process's argv. Codes are 32
 hex characters, single use, valid 60 s, compared in constant time, held in memory only, at most 16
 outstanding (the oldest dropped). The page trades the code for a web-session secret (32 hex, in memory
 until the daemon exits, at most 32, the oldest dropped), keeps it in `sessionStorage`, removes the
 fragment from the address bar, and sends it as the bearer of every request, event streams included
 (which it reads with `fetch`, since `EventSource` cannot send headers). After a daemon restart the page
-asks for `loom open` again. `GET /?token=<API token>` (older clients) answers `303` to
+asks for `ferret open` again. `GET /?token=<API token>` (older clients) answers `303` to
 `/#code=<fresh code>` and sets no cookie; the index page tells a browser that still holds an older
-daemon's `loom_token` cookie to drop it.
+daemon's `ferret_token` cookie to drop it.
 
 **Identity proof.** `GET /healthz?nonce=<32–128 hex>` answers `{"ok": true, "proof": hex(HMAC-SHA256(key
-= the token's bytes as stored (64 hex characters), "loom-healthz-v1:" + nonce))}`, which only a holder
+= the token's bytes as stored (64 hex characters), "ferret-healthz-v1:" + nonce))}`, which only a holder
 of the token can compute; without a nonce it answers `ok`, and a malformed nonce is `400`. The CLI
 (`Client::from_home`) asks for a fresh proof before every request that would carry the token, stream
 openings included, and compares it in constant time; a listener that cannot prove itself does not get
-the token, and the error says to restart an older daemon (`loom --unverified-daemon down`, then `loom
-up`). The global flag `--unverified-daemon` sends the token anyway with a warning. `loom up` and `loom
-daemon` do not take an unproven listener for the running daemon. loom-desk proves the daemon the same
+the token, and the error says to restart an older daemon (`ferret --unverified-daemon down`, then `ferret
+up`). The global flag `--unverified-daemon` sends the token anyway with a warning. `ferret up` and `ferret
+daemon` do not take an unproven listener for the running daemon. ferret-desk proves the daemon the same
 way (gui/DESIGN.md).
 
 **Routes.** JSON unless noted. The bodies of `crate::wire` and `NewSession` (at its top level) reject
@@ -1656,7 +1656,7 @@ GET  /api/blobs/{handle}                      → BlobRef {id, bytes, lines}
 GET  /api/blobs/{handle}/raw                  the stored bytes (application/octet-stream, attachment)
 GET  /api/blobs/{handle}/lines?start=&end=    → {text, first, last, total}  (1-based; default 1–2000, ≤ 5000 lines)
 GET  /api/fs/dirs?path=                       → DirsView {path, parent, home, entries: [{name, path, hidden, link}], more}
-                                              (folders only; default the daemon user's home; the loom home is refused)
+                                              (folders only; default the daemon user's home; the ferret home is refused)
 GET  /api/monitor                             → MonitorStatus   (the monitor in shadow)
 GET  /api/missions/{id}/monitor?after=&limit=&quiet=   → {entries, next_after}   (the monitor-log entries about a mission)
 GET  /api/monitor/reviews/{review}/input      → 404 until the reviewer exists (M6)
@@ -1668,13 +1668,13 @@ POST /api/shutdown                            → 202 {}
 **Folders and files.** `fs/dirs` and the two `files` routes are operator-side reads: they register no
 observation or evidence, write nothing and add nothing to a session's record. `fs/dirs` returns folder names
 only (at most 2,000, the rest counted in `more`; a link to a folder is listed with `link: true` and the folder
-it resolves to as `path`; the loom home is refused and entries that lead into it are left out). The `files`
+it resolves to as `path`; the ferret home is refused and entries that lead into it are left out). The `files`
 routes are confined to the session's canonical workspace: `..`, absolute paths and NUL are refused (409), a link
-that leads outside is shown as `link` and not followed, and the root's `.loom` is listed as a closed hidden entry
+that leads outside is shown as `link` and not followed, and the root's `.ferret` is listed as a closed hidden entry
 (`note: "harness files are not shown"`) and never opened by name, case or link. A file is opened with
-`loom_tools::files::open_readable`, which judges the real path of the descriptor; a binary file (a NUL in its
+`ferret_tools::files::open_readable`, which judges the real path of the descriptor; a binary file (a NUL in its
 first 8 KiB) answers `binary: true` with no lines. A session's workspace may be created by `POST /api/sessions`
-only after the path is checked (not relative, not in the loom home or its copies folder, not under a file).
+only after the path is checked (not relative, not in the ferret home or its copies folder, not under a file).
 
 **Monitor routes (three served, the rest specified).** The routes above are the ones this build serves, including `GET
 /api/monitor`, `GET /api/missions/{id}/monitor` and the `404` of `GET /api/monitor/reviews/{review}/input` (M2).
@@ -1713,20 +1713,20 @@ log, then its live records, deltas and statuses, without duplicates. A subscribe
 8 192 events behind gets `lagged` (a session stream then replays the records it missed from the log).
 Streams end when the daemon stops.
 
-**Running.** `loom up` starts the daemon in the background with a cleared environment
+**Running.** `ferret up` starts the daemon in the background with a cleared environment
 (`serve::daemon_env`: `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `LANG`, `LC_*`, `TZ`, `TMPDIR`,
-`LOOM_LOG`, `RUST_BACKTRACE`, the profiles' `api_key_env` variables and the `sandbox.env_pass` names, then
-`LOOM_HOME`), so the shell's other variables never reach the daemon, where commands could read them; it
+`FERRET_LOG`, `RUST_BACKTRACE`, the profiles' `api_key_env` variables and the `sandbox.env_pass` names, then
+`FERRET_HOME`), so the shell's other variables never reach the daemon, where commands could read them; it
 prints a warning for each profile with `api_key_env` (the key it passes on is readable by commands; an
 unset one sends no key). The daemon logs the same at start, and names the variables of its environment
-that look like secrets (a `loom daemon` run from a shell keeps that shell's environment). `loom service install` (a launchd agent that
-restarts the daemon after a crash; its plist gives `LOOM_HOME` and a fixed `PATH`) refuses a profile with
-`api_key_env`, which the agent would not have. `loom daemon` raises its open-file limit, creates the home and its top-level directories (0700, tightened if they exist looser) and
+that look like secrets (a `ferret daemon` run from a shell keeps that shell's environment). `ferret service install` (a launchd agent that
+restarts the daemon after a crash; its plist gives `FERRET_HOME` and a fixed `PATH`) refuses a profile with
+`api_key_env`, which the agent would not have. `ferret daemon` raises its open-file limit, creates the home and its top-level directories (0700, tightened if they exist looser) and
 takes an exclusive lock on `daemon.lock` for its lifetime, so a second daemon on the same home is
-refused (`A loom daemon is already running for <home> (pid N, <addr>).`) even when both start at once.
+refused (`A ferret daemon is already running for <home> (pid N, <addr>).`) even when both start at once.
 It then loads and checks the config, reads every `api_key_file`, checks that the sandbox mode can work on this host, creates or
 reads the token (0600, atomically, never replaced), binds, starts the runtime, writes `daemon.json`, and
-serves until SIGINT, SIGTERM or `POST /api/shutdown` (`loom down`), giving open requests 3 s.
+serves until SIGINT, SIGTERM or `POST /api/shutdown` (`ferret down`), giving open requests 3 s.
 
 **Start** (`Runtime::start`). Packs are loaded and every role's tools checked (a broken pack stops the
 daemon); then the journal key, blob store, model clients and proxy. Every session's `meta.json` and
@@ -1761,21 +1761,28 @@ it). The answer (`RuleReceipt`) names the lead and says whether it was in a turn
 the mission keeps a ledger (without one a rule is a note with no id), and the stock scope or reason
 recorded for a blank one. A withdrawal names a rule id the ledger has in force. `stop` reaches any
 session; `resume` and `archive` roots only; archiving is refused while the mission is running a turn.
-The same actions exist in the CLI (`loom send`, `rule`, `approve`, `rule --withdraw`, `stop`,
+The same actions exist in the CLI (`ferret send`, `rule`, `approve`, `rule --withdraw`, `stop`,
 `resume`, `compact`, `archive`, `answer`) and in the web UI.
 
-**Scope and release.** `POST /scope` (`loom scope`) is the only way a session's reachable hosts grow
+**The new-mission form.** Its Pack menu is filled from `GET /api/packs` (`runtime.packs`: each pack's
+name, description, default role and, per role, `starts_agents` and `top_level`; no prompts, tools or
+models; `core` first). The Role menu follows the pack: roles that start a mission first, the
+roles a pack's other roles start or verify in a second group, the pack's default role selected. The
+body names `pack` unless it is `core`, and the Agents' model is offered only for a role that starts
+agents. An older daemon without the route leaves `core` with `lead` and `chat`.
+
+**Scope and release.** `POST /scope` (`ferret scope`) is the only way a session's reachable hosts grow
 while it runs, and only the operator can call it: it goes to the mission's lead like a rule and is
 recorded as a `scope_grant` (and a standing rule); the grant lasts as long as the session. An agent asks
 with the `request_scope` tool, which opens a non-blocking inbox item (kind `approval`, the hosts as its
 `options`, the reason as its text) and does not stop the session; the UI and app show the hosts with an
-Approve button that calls `/scope` and then resolves the item, and `loom inbox` prints the `loom scope`
-command to run. Nothing is granted without that call. `POST /api/missions/{id}/scope/revoke` (`loom scope revoke
+Approve button that calls `/scope` and then resolves the item, and `ferret inbox` prints the `ferret scope`
+command to run. Nothing is granted without that call. `POST /api/missions/{id}/scope/revoke` (`ferret scope revoke
 <mission> <host> --reason`) takes one grant back: it is appended to the ledger first, the host leaves the egress
 policy of every running session of the mission at once, the open tunnels and forwards to it are cut
 (`Proxy::cut_hosts`), the mission's box rules are applied again, and the lead gets a protected note (no turn).
 A restored or later session is built without it. The infrastructure deny of §11 is not a grant and has nothing to
-revoke. `POST /release` (`loom release`) takes a reason,
+revoke. `POST /release` (`ferret release`) takes a reason,
 which must not be blank, records an `operator_release` and closes the mission; the outcome reads "closed
 by operator, goal not established", never "finished". A blocking blocker or park offers the choices
 "Keep working", "Keep working (more budget)" (budget parks), "Provide what's missing" (blockers) and
@@ -1783,24 +1790,24 @@ by operator, goal not established", never "finished". A blocking blocker or park
 carries `scope_grants`, `goal_met` and `release`, which the UI shows as the granted hosts and the outcome.
 
 **Notifications.** Every `inbox_opened` and every session that fails notifies the operator: with
-`notify.command` set, that program is run (no shell) with `LOOM_KIND`, `LOOM_SESSION`, `LOOM_TITLE` and
-`LOOM_TEXT` (500 characters) in its environment and killed after 30 s; otherwise, on macOS, a
+`notify.command` set, that program is run (no shell) with `FERRET_KIND`, `FERRET_SESSION`, `FERRET_TITLE` and
+`FERRET_TEXT` (500 characters) in its environment and killed after 30 s; otherwise, on macOS, a
 notification through `osascript` with the texts as arguments; on any other platform with no
 `notify.command`, nobody is notified, and the daemon logs one warning at start saying so and how to set
 `[notify] command`. With `notify.repeat_minutes` above 0 a blocking item is announced again at that
 interval while it stays open. The text of an item a tool call opened (written by the model) starts with
 `[From the agent, unverified] `; in an item the harness opened itself, the paragraph that quotes the
 ledger carries the same label. A child's title was written by the model and starts with `unverified: `.
-When the volume of the loom home turns low (under 5 GiB or 5 percent free, checked once a minute) one
+When the volume of the ferret home turns low (under 5 GiB or 5 percent free, checked once a minute) one
 notification of kind `disk` is raised, and no other until the disk has recovered and turned low again;
 the web UI shows a warning line while `GET /api/status` reports the disk as low. When the sandbox self-probe turns
-egress unbounded one notification of kind `egress` is raised (`LOOM_KIND=egress`), and a problem the probe finds is
+egress unbounded one notification of kind `egress` is raised (`FERRET_KIND=egress`), and a problem the probe finds is
 raised too even while `sandbox.allow_fetch_services` already holds egress unbounded; neither again until it cleared.
 A census that runs without sandbox identity although commands are confined raises one notification of kind `census`
-(`LOOM_KIND=census`), again only after identity returned.
+(`FERRET_KIND=census`), again only after identity returned.
 
 **Garbage collection.** Stored outputs are never deleted except by an explicit collection: `POST
-/api/gc {"apply": bool}` (default a dry run), `loom gc [--apply]`. A blob is kept when its full id
+/api/gc {"apply": bool}` (default a dry run), `ferret gc [--apply]`. A blob is kept when its full id
 appears (either case) in any file under `sessions/` and `missions/`, or a handle of it (`out:` and 8 to
 16 of its hex characters) does, or when it is younger than one hour; removing a session's directory is
 what makes its outputs collectable. The scan follows links only for the direct entries of those two
@@ -1813,7 +1820,7 @@ temporary file and rename, syncs the shard directory, rebuilds a missing or inco
 blob, refreshes a blob's age when the same bytes are stored again (or writes it anew when it cannot),
 and removes temporary files older than an hour when it opens.
 
-**Scorecard** (`loom-core::scorecard`, `GET /api/missions/{id}/score`, `loom score <session|mission>
+**Scorecard** (`ferret-core::scorecard`, `GET /api/missions/{id}/score`, `ferret score <session|mission>
 [--json]`). A change to the harness (a prompt, a gate, a tool's shape) is meant to make the model's work
 cheaper or its results better; whether it did is a question about runs. A scorecard is the counts that
 answer it, read from a session's own records and nothing else: steps, and the steps up to the first
@@ -1829,12 +1836,12 @@ the others' counts added: the result of a mission is its lead's, the cost is eve
 what the work took and how often the harness sent it back, never whether the result is right: that is
 the business of an oracle outside the session (`docs/SECURITY-EVAL.md`).
 
-**Status.** `GET /api/status` (`loom status`) reports the version, pid, address, proxy port, home, each
+**Status.** `GET /api/status` (`ferret status`) reports the version, pid, address, proxy port, home, each
 model profile (reachable, served model, window, `max_concurrent`), session and inbox counts, and `disk`
-(`{free_bytes, total_bytes}` of the volume that holds the home, or null); `loom status` warns when less
+(`{free_bytes, total_bytes}` of the volume that holds the home, or null); `ferret status` warns when less
 than 5 GiB or 5 percent of it is free.
 
-## 13. Packs (`loom-agent::pack`)
+## 13. Packs (`ferret-agent::pack`)
 
 A pack is a directory holding `pack.toml`, an optional preamble file and the role prompt files; the
 module documentation of `pack.rs` is the precise specification.
@@ -1860,7 +1867,7 @@ read_only = false
 
 Unknown keys are errors, file paths stay inside the pack directory, and an invalid pack stops the
 daemon rather than run without it. The built-in `core` pack (compiled into the binary) has `lead`,
-`worker`, `verifier` and `chat`; packs in `~/.loom/packs/` are loaded after it, and one named `core`
+`worker`, `verifier` and `chat`; packs in `~/.ferret/packs/` are loaded after it, and one named `core`
 replaces it. A role that needs a verifier (`verify_finish`, or an explicit `verifier`) must name a role
 of the same pack that is `read_only` and has `verdict` and `out_read` or `out_grep`. A pack with
 `requires_restricted_network = true` says in its prompts that the network is restricted, so its sessions
@@ -1893,29 +1900,29 @@ as workspace content.
 - No `unwrap`/`expect`/`panic!` outside tests, except on invariants established in the same function.
 - Errors are typed per crate with `thiserror`; messages that reach the model say what to do next.
 - Every module has unit tests; anything that touches disk uses `tempfile`. Tests never need the
-  network or a real model — use `loom_model::mock`.
+  network or a real model — use `ferret_model::mock`.
 - A change to what the model reads or to what the harness refuses is measured, not argued.
-  `loom-agent::evalkit` plays scripted models (one that does everything right, one that retypes its
+  `ferret-agent::evalkit` plays scripted models (one that does everything right, one that retypes its
   quotes wrong, one that finishes early, one whose calls are malformed, one whose finish is rejected,
   one that delegates, one that gives up) against the real runtime and the mock server on one small
-  task, and prints the scorecard of each (`cargo run -p loom-agent --example eval [--json]
+  task, and prints the scorecard of each (`cargo run -p ferret-agent --example eval [--json]
   [scenario…]`); its tests pin the counts, so a change that costs a scripted model a step fails one. A
-  script cannot say how a real model reacts: for that, compare `loom score --json` of recorded runs
+  script cannot say how a real model reacts: for that, compare `ferret score --json` of recorded runs
   before and after the change, on the same tasks, with their oracle's verdicts beside them.
 - No telemetry of any kind. No network access except what this document names.
-- Building is plain cargo: `cargo build --release -p loom-daemon`, `cargo test --workspace`,
+- Building is plain cargo: `cargo build --release -p ferret-daemon`, `cargo test --workspace`,
   `cargo clippy --workspace --all-targets -- -D warnings`. The UI's pure module is tested with
   `node --test ui/core.test.js`. `./x` is an optional wrapper that copies the tree to another host
-  named by `LOOM_BUILD_HOST` and runs cargo there (`LOOM_BUILD_HOST=local` runs it in place;
-  `LOOM_LANE` gives a run its own source copy and target directory on that host). Set
-  `LOOM_BUILD_HOST` before using it: unset, the script falls back to a host name of its author's.
+  named by `FERRET_BUILD_HOST` and runs cargo there (`FERRET_BUILD_HOST=local` runs it in place;
+  `FERRET_LANE` gives a run its own source copy and target directory on that host). Set
+  `FERRET_BUILD_HOST` before using it: unset, the script falls back to a host name of its author's.
 
-## 15. Monitor (`loom-agent::monitor`; specification `docs/MONITOR.md`)
+## 15. Monitor (`ferret-agent::monitor`; specification `docs/MONITOR.md`)
 
 *Status: specified in full in `docs/MONITOR.md`; phase P0 put the specification, the contracts and the vocabulary in the
 tree. Phase M2 makes the monitor **watch**: the daemon owns a monitor that reads every record of every session through
 persisted cursors and runs the 28 tripwires and the fleet joins in shadow, recording to `<home>/monitor/log.jsonl`,
-shown by `loom monitor` and `GET /api/monitor`, changing nothing an agent can see. Nothing else in this section is
+shown by `ferret monitor` and `GET /api/monitor`, changing nothing an agent can see. Nothing else in this section is
 enforced by the running daemon until the phase named for it in `docs/MONITOR.md` §9.1 lands; each such phase updates the
 text here in the same commit. Until then the residual risks of `SECURITY.md` apply unchanged.*
 
@@ -1960,7 +1967,7 @@ the lead parked without `stop_children`.
 - **7 (stopping is an act).** A pause, like `report_blocker`, ends a turn through the gate's own paths; it is a state the
   operator answers, never a nudge.
 - **8 (enforcement outside the agent's reach).** The monitor has no `Known` entry, no tools and no network except its model
-  endpoints; its state is under the hidden loom home; every response acts on harness state (proxy policy, tunnels, process
+  endpoints; its state is under the hidden ferret home; every response acts on harness state (proxy policy, tunnels, process
   groups, the box, the inbox, turn control) and never relies on the agent complying.
 - **9 (nothing leaves the machine unless configured).** A reviewer must be disjoint in model family from every profile a
   session can reach, must be declared stock, and must not add a data recipient the operator has not consented to for that
@@ -1981,20 +1988,20 @@ the review's own weakness) are residual risks X1 to X17 in `SECURITY.md` and `do
 **Where the detail is.** `docs/MONITOR.md` is the specification: threat model and taxonomy (§1), architecture, model
 policy and capacity (§2), the reviewer's contract (§3), the response ladder and the gate (§4), keep-going (§5), tripwires
 and canaries (§6), records, routes, commands and UI (§7), evaluation (§8), and the build plan with the operator's
-decisions and the residual risks (§9). The `CONTRACT` comments of `crates/loom-agent/src/monitor/` are the precise form of
+decisions and the residual risks (§9). The `CONTRACT` comments of `crates/ferret-agent/src/monitor/` are the precise form of
 each part, with signatures.
 
-## Targets (`loom-core::target`, `loom-agent::runtime::targets`)
+## Targets (`ferret-core::target`, `ferret-agent::runtime::targets`)
 
 A target is a named scope that missions share, with a graph of what they found (CONTRACTS-TRAFFIC-TARGETS T).
 
-- **Files (T1).** `~/.loom/targets/{name}/` (name `[a-z0-9][a-z0-9_-]{0,63}`) holds `target.toml` (`scope`,
+- **Files (T1).** `~/.ferret/targets/{name}/` (name `[a-z0-9][a-z0-9_-]{0,63}`) holds `target.toml` (`scope`,
   `exclude`, `upstream_insecure`, `intercept_passthrough`, `notes`) and `graph.jsonl`, append-only and
   hash-chained like the session log (`prev` is the SHA-256 of the previous line), written under an exclusive
   lock (`graph.lock`) so several missions can append. A scope entry is a host, a `*.` glob, an IP or a CIDR;
   `exclude` wins. Entries are validated when a target is written; a bad one is refused by name.
 - **Naming it (T2).** A mission names one target at start (`target` in the `POST /api/sessions` body,
-  `loom run --target NAME`). The lead's `session_start.target` records the scope, settings and the summary as of
+  `ferret run --target NAME`). The lead's `session_start.target` records the scope, settings and the summary as of
   that start; children inherit it; a restored session uses its record, never the file. The scope joins the
   mission's network policy in every mode but `open`: scope hosts, IPs and CIDR blocks are reachable even in
   `deny_all`, and `exclude` is refused whatever else would allow it (`open` included). The start note's network
@@ -2013,8 +2020,8 @@ A target is a named scope that missions share, with a graph of what they found (
   at most 40; findings, at most 20), computed once at the start and recorded. `security_query` view `target`
   (filters `kind`, `status`, `under`, `max`) reads the live graph.
 - **API (T7).** `GET/POST /api/targets`, `GET/PUT /api/targets/{name}`, `GET /api/targets/{name}/graph`,
-  `GET /api/targets/{name}/exchanges`, `GET /api/exchanges/{session}`; `loom target list|add|show|scope`,
-  `loom ca show|rotate`. The SSE stream sends `{type:"target", name}` at most once a second per target.
+  `GET /api/targets/{name}/exchanges`, `GET /api/exchanges/{session}`; `ferret target list|add|show|scope`,
+  `ferret ca show|rotate`. The SSE stream sends `{type:"target", name}` at most once a second per target.
 
 ## Security workflow extensions
 
@@ -2038,9 +2045,9 @@ relied on.
   (`[monitor]`, `[keep_going]`, the profile keys `family`, `alignment`, `recipient` and `purpose`,
   `sandbox.allow_fetch_services`), session-log records (`monitor_note`, `keep_going_set`, `keep_going`), routes
   (`GET /api/monitor`, `POST /api/sessions/{id}/keep-going`, the flag, review, halt and scope-revoke routes of
-  `docs/MONITOR.md` §7.5) and commands (`loom keep-going`, `loom monitor …`, `loom scope --lab`; `loom scope revoke` is served since phase E1).
-  `loom_agent::monitor` has the vocabulary and the contracts, and nothing calls it.
-- An MCP stdio client in `loom-tools`, and external MCP servers as tool providers.
+  `docs/MONITOR.md` §7.5) and commands (`ferret keep-going`, `ferret monitor …`, `ferret scope --lab`; `ferret scope revoke` is served since phase E1).
+  `ferret_agent::monitor` has the vocabulary and the contracts, and nothing calls it.
+- An MCP stdio client in `ferret-tools`, and external MCP servers as tool providers.
 - Pack plugin processes contributing tools and hooks (`pre_tool`, `hud`, `stop_gate`, `scope`).
 - An `evals/` directory of behavioural checks against the mock or a live model.
 - `tool_choice` or guided decoding per model profile, and forcing a tool call after repeated invalid
@@ -2049,7 +2056,7 @@ relied on.
   `agent_wait` and `agent_list` (the lead uses `wait` and the HUD).
 - Ledger obligations written by the runtime for running jobs, children, promoted jobs, questions or
   unverified edits, and recorded approval uses (the ops exist; nothing writes them).
-- Generated ledger views in the workspace (`<workspace>/.loom/`, `render_views(dir)`).
+- Generated ledger views in the workspace (`<workspace>/.ferret/`, `render_views(dir)`).
 - A stop-gate check of a role's return contract.
 - Project instruction files (such as `AGENTS.md`) in the system prompt.
 - A login route `GET /auth?token=` and an authentication cookie.

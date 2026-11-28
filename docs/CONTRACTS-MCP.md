@@ -4,7 +4,7 @@ Normative for the work merged with it. Each part names the files it owns. When t
 rules move into `docs/DESIGN.md` (a new section "MCP servers"), `docs/RUN.md` and `docs/UI.md`, and this
 file shrinks to a pointer.
 
-Goal: an operator's existing MCP servers become loom tools without weakening anything loom enforces.
+Goal: an operator's existing MCP servers become ferret tools without weakening anything ferret enforces.
 An MCP tool runs inside the session's sandbox and network policy, its result is a stored output like
 any other (admitted, cut, keyed, quotable as evidence, checked by the verifier), and the model sees it
 under the name models are trained on (`mcp__{server}__{tool}`, as Claude Code names them).
@@ -12,7 +12,7 @@ under the name models are trained on (`mcp__{server}__{tool}`, as Claude Code na
 Out of scope for this contract: MCP resources and prompts as their own features, sampling, elicitation,
 roots, OAuth flows, deferred tool loading. Each is refused or ignored as said below.
 
-## M1. Configuration (`loom-core/src/config.rs`, `docs/config.example.toml`)
+## M1. Configuration (`ferret-core/src/config.rs`, `docs/config.example.toml`)
 
 ```toml
 [mcp]
@@ -43,19 +43,19 @@ headers = { Authorization = "env:DOCS_MCP_AUTH" }
 - Values are never written to any log or record; records carry the names only.
 - `[mcp]` absent or `servers` empty: nothing below happens and no request changes.
 
-## M2. Protocol (`loom-tools/src/mcp.rs` and `loom-tools/src/mcp/` if it grows)
+## M2. Protocol (`ferret-tools/src/mcp.rs` and `ferret-tools/src/mcp/` if it grows)
 
 JSON-RPC 2.0, written by hand on `serde_json` and `reqwest` (no new dependency).
 
 - **Handshake.** `initialize` with `protocolVersion` the newest this client implements, `clientInfo
-  {name: "loom", version}` and `capabilities: {}`; then `notifications/initialized`. The client works
+  {name: "ferret", version}` and `capabilities: {}`; then `notifications/initialized`. The client works
   with servers answering `2024-11-05`, `2025-03-26`, `2025-06-18` or `2025-11-25`; any other answer ends
   the connection with an error naming the versions.
 - **Listing.** `tools/list`, following `nextCursor` until it is absent (at most 50 pages).
 - **Calls.** `tools/call {name, arguments}`. A JSON-RPC error answer is a failed call (M5), not a
   connection failure.
 - **Server to client.** `ping` is answered `{}`. Every other request is answered with error `-32601`
-  (method not found): loom offers no sampling, elicitation or roots. Notifications are read and dropped,
+  (method not found): ferret offers no sampling, elicitation or roots. Notifications are read and dropped,
   except `notifications/tools/list_changed`, which is recorded for the UI (M8) and changes nothing in a
   running session (M6).
 - **Cancel.** A call that times out or is stopped sends `notifications/cancelled {requestId, reason}`.
@@ -68,7 +68,7 @@ JSON-RPC 2.0, written by hand on `serde_json` and `reqwest` (no new dependency).
   messages above. HTTP 404 with a session id means the server forgot the session: initialize again once.
   On close, send `DELETE` with the session id (errors ignored). No GET listening stream.
 
-## M3. Where a server runs (`loom-tools/src/mcp.rs`)
+## M3. Where a server runs (`ferret-tools/src/mcp.rs`)
 
 - **stdio** servers run as a child of the session's sandbox: the program and arguments are the result of
   `ctx.sandbox.command("exec " + shell-quoted argv)`, the working directory is `cwd` resolved against the
@@ -94,7 +94,7 @@ configured server are added to the session's allowed hosts for every session who
 reachable by the agent's `bash` too. `docs/DESIGN.md` says so in its threat notes, and the session start
 note (M6) names the hosts each server added.
 
-## M5. A call and its result (`loom-tools/src/mcp.rs` `McpTool`)
+## M5. A call and its result (`ferret-tools/src/mcp.rs` `McpTool`)
 
 `McpTool` implements `Tool` for one tool of one server.
 
@@ -104,7 +104,7 @@ note (M6) names the hosts each server added.
   server's description, cut at 2,000 characters. Parameters: the server's `inputSchema` with a top-level
   `$schema` key removed; `{"type":"object","properties":{}}` when it is missing. Class `Read` when the
   server's annotation `readOnlyHint` is true, else `Exec`. Never speculative.
-- **arguments.** Loom's `schema::check` runs only when the schema uses nothing but the keywords it
+- **arguments.** Ferret's `schema::check` runs only when the schema uses nothing but the keywords it
   supports (new `schema::checkable(&Value) -> bool`); otherwise only "the arguments are a JSON object" is
   checked and the server validates. Unknown arguments follow the schema's `additionalProperties`.
 - **result.** The content blocks become the body, in order, blocks separated by a blank line:
@@ -126,7 +126,7 @@ note (M6) names the hosts each server added.
   compaction's key table. Nothing about the finish gate or the verifier changes for MCP: a claim a call
   supports is cited and quoted like any other.
 
-## M6. Which sessions get which tools (`loom-agent`: `runtime.rs`, `rtools/mod.rs`, `session.rs`)
+## M6. Which sessions get which tools (`ferret-agent`: `runtime.rs`, `rtools/mod.rs`, `session.rs`)
 
 - **Listing once per mission.** When a mission's lead session starts, the runtime connects to every
   configured server whose `roles` include any role of the mission's pack (in its sandbox), lists its
@@ -147,7 +147,7 @@ note (M6) names the hosts each server added.
   size budget, by a name collision) and any start error. No note when nothing is configured.
 - `hidden_tools`, the dialect layer and the tool-shape aliases do not apply to MCP tools.
 
-## M7. Daemon and CLI (`loom-daemon`: `api.rs`, `wire.rs`, `cli.rs`, `client.rs`)
+## M7. Daemon and CLI (`ferret-daemon`: `api.rs`, `wire.rs`, `cli.rs`, `client.rs`)
 
 - `GET /api/sessions/{id}/mcp` → `[{server, transport, state: "not started"|"running"|"closed"|"failed",
   tools: [name], error, stderr_tail: [line], list_changed: bool, calls, last_call_ms}]` for the servers
@@ -158,8 +158,8 @@ note (M6) names the hosts each server added.
   tools and closes it: `{protocol,
   server_name, server_version, tools: [{name, description, read_only_hint}], stderr_tail}` or the error
   with the stderr tail. Refused (409) for a workspace the daemon refuses elsewhere.
-- CLI: `loom mcp list` (the configured servers, their transport and roles, from the daemon's config) and
-  `loom mcp check <server> [--workspace DIR]` (the route above; prints the tools or the error and stderr).
+- CLI: `ferret mcp list` (the configured servers, their transport and roles, from the daemon's config) and
+  `ferret mcp check <server> [--workspace DIR]` (the route above; prints the tools or the error and stderr).
 
 ## M8. Web UI (`ui/`, `tools/ui-preview.mjs`, `docs/UI.md`)
 

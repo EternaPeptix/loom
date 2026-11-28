@@ -10,7 +10,7 @@ import Darwin
 ///    -o ControlMaster=no -o ControlPath=none -L 127.0.0.1:<port>:127.0.0.1:<port> <sshHost>` (the SAME
 ///   port number at both ends, because the daemon only accepts its own port in the Host/Origin headers;
 ///   a busy port is an error, never a different port), wait (poll-connect, ~10 s) until the
-///   forward answers, then (if `.fetchOverSsh`) `ssh -o BatchMode=yes <sshHost> cat ~/.loom/token`
+///   forward answers, then (if `.fetchOverSsh`) `ssh -o BatchMode=yes <sshHost> cat ~/.ferret/token`
 ///   (multiplexing off too), trim and validate it, and check the child is still running. Returns
 ///   `Ready(baseURL: "http://127.0.0.1:<port>", token:)` or throws a `TunnelError` whose message
 ///   includes ssh stderr.
@@ -31,10 +31,10 @@ final class Tunnel: @unchecked Sendable {
             case .forwardTimedOut(let s): return "the SSH tunnel did not come up: \(s)"
             case .badToken(let s): return "could not read the daemon token: \(s)"
             case .portBusy(let p):
-                return "local port \(p) is already in use. loom-desk needs 127.0.0.1:\(p) free for this connection: "
+                return "local port \(p) is already in use. ferret-desk needs 127.0.0.1:\(p) free for this connection: "
                     + "the daemon accepts only its own port number, so any forward must use port \(p) on both ends. "
                     + "Stop whatever is listening on port \(p) (`lsof -nP -iTCP:\(p) -sTCP:LISTEN` names it; a leftover "
-                    + "ssh from an earlier loom-desk run can hold it), or move one of the daemons to another port with "
+                    + "ssh from an earlier ferret-desk run can hold it), or move one of the daemons to another port with "
                     + "[daemon] bind in its config (if you move the remote one, change this connection's port to match)."
             case .exited(let s): return "the SSH tunnel closed: \(s)"
             }
@@ -124,7 +124,13 @@ final class Tunnel: @unchecked Sendable {
         }
     }
 
-    func open(_ connection: Connection) async throws -> Ready {
+    enum HealthzProbe: Equatable, Sendable {
+        case ok
+        case httpStatus(Int)
+        case unreachable
+    }
+
+    func open(_ connection: Connection, fetchRemoteToken: Bool? = nil) async throws -> Ready {
         guard connection.mode == .sshTunnel else {
             throw TunnelError.spawnFailed("not an SSH connection")
         }
@@ -157,7 +163,7 @@ final class Tunnel: @unchecked Sendable {
             let intentional = self.closing || self.ssh !== proc
             self.lock.unlock()
             if !intentional {
-                // Off Foundation's queue: let the pipe drain so the line ssh printed as it died is in.
+                // Off Foundation's queue: let the pipe drain so the line ssh prints as it died is in.
                 let isCurrent: @Sendable () -> Bool = { [weak self] in self?.isCurrent(proc) ?? false }
                 DispatchQueue.global().async {
                     sink.waitForEnd()
@@ -181,26 +187,42 @@ final class Tunnel: @unchecked Sendable {
         // Wait for the forward, and for the daemon behind it to answer /healthz.
         let deadline = Date().addingTimeInterval(Tunnel.forwardDeadline)
         var portUp = false
+        var lastHTTPStatus: Int? = nil
         while true {
-            try await failIfExited(p, sink: sink, port: forward.port)
+            try await failIfExited(p, sink: sink, port: forward.port, host: connection.sshHost)
             if Tunnel.canConnect(port: forward.port) {
                 portUp = true
-                if await Tunnel.healthz(port: forward.port) { break }
+                switch await Tunnel.probeHealthz(port: forward.port) {
+                case .ok:
+                    lastHTTPStatus = 200
+                case .httpStatus(let code):
+                    lastHTTPStatus = code
+                case .unreachable:
+                    break
+                }
+                // Stop immediately on 200 (ready) or 403 (Host/port refusal — verifyIdentity will report it clearly).
+                if lastHTTPStatus == 200 || lastHTTPStatus == 403 { break }
             }
-            try await failIfExited(p, sink: sink, port: forward.port)
+            try await failIfExited(p, sink: sink, port: forward.port, host: connection.sshHost)
             if Date() >= deadline {
                 let msg = sink.text
                 close(only: p)
-                let why = portUp
-                    ? "the forward is up but nothing answered on \(connection.sshHost):\(connection.remotePort) (is the daemon running?)"
-                    : "no answer within \(Int(Tunnel.forwardDeadline)) s"
+                let why: String
+                if let code = lastHTTPStatus {
+                    why = "the forward is up and \(connection.sshHost):\(connection.remotePort) answered HTTP \(code) instead of 200 (is something else listening on that port?)"
+                } else if portUp {
+                    why = "the forward is up but nothing answered on \(connection.sshHost):\(connection.remotePort) (is the daemon running?)"
+                } else {
+                    why = "no answer within \(Int(Tunnel.forwardDeadline)) s"
+                }
                 throw TunnelError.forwardTimedOut(msg.isEmpty ? why : "\(why) — \(msg)")
             }
             try? await Task.sleep(nanoseconds: 150_000_000)
         }
 
         var token: String? = nil
-        if connection.tokenSource == .fetchOverSsh {
+        let shouldFetch = fetchRemoteToken ?? (connection.tokenSource == .fetchOverSsh)
+        if shouldFetch && lastHTTPStatus == 200 {
             do { token = try await fetchToken(host: connection.sshHost) } catch {
                 close(only: p)
                 throw error
@@ -217,14 +239,18 @@ final class Tunnel: @unchecked Sendable {
         return Ready(baseURL: forward.baseURL, token: token)
     }
 
-    private func failIfExited(_ p: Process, sink: Sink, port: Int) async throws {
+    private func failIfExited(_ p: Process, sink: Sink, port: Int, host: String) async throws {
         if Task.isCancelled { close(only: p); throw CancellationError() }
         if !p.isRunning {
             await sink.awaitEnd()
             let msg = sink.text
             close(only: p)
             if Tunnel.isBindFailure(msg) { throw TunnelError.portBusy(port) }
-            throw TunnelError.forwardTimedOut(msg.isEmpty ? "ssh exited with status \(p.terminationStatus)" : msg)
+            let base = msg.isEmpty ? "ssh exited with status \(p.terminationStatus)" : msg
+            if let hint = Tunnel.sshAuthHint(stderr: base, host: host) {
+                throw TunnelError.forwardTimedOut("\(base) — \(hint)")
+            }
+            throw TunnelError.forwardTimedOut(base)
         }
     }
 
@@ -339,7 +365,7 @@ final class Tunnel: @unchecked Sendable {
     }
 
     /// Waits for children stopped by `close()` / `close(only:)` to exit (bounded: `stop()` SIGKILLs
-    /// after ~2 s), so that only a listener that is not loom-desk's own is reported as a busy port.
+    /// after ~2 s), so that only a listener that is not ferret-desk's own is reported as a busy port.
     private func waitForExitingChild() async {
         let pending = lock.withLock { Array(stopping.values) }
         guard !pending.isEmpty else { return }
@@ -352,11 +378,11 @@ final class Tunnel: @unchecked Sendable {
 
     // MARK: token
 
-    private func fetchToken(host: String) async throws -> String {
+    func fetchToken(host: String) async throws -> String {
         let tokenID = UUID()
         let r = await Tunnel.runCapture("/usr/bin/ssh",
                                         ["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"] + Tunnel.noMultiplexing
-                                            + ["--", host, "cat ~/.loom/token"],
+                                            + ["--", host, "cat ~/.ferret/token"],
                                         timeout: 20) { [weak self] proc in
             guard let self else { return }
             self.lock.withLock {
@@ -366,11 +392,14 @@ final class Tunnel: @unchecked Sendable {
         if Task.isCancelled { throw CancellationError() }
         guard r.status == 0 else {
             let m = r.stderr.isEmpty ? "ssh exited with status \(r.status)" : r.stderr
+            if let hint = Tunnel.sshAuthHint(stderr: m, host: host) {
+                throw TunnelError.badToken("\(m) — \(hint)")
+            }
             throw TunnelError.badToken(m)
         }
         let t = r.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
         guard ConnectionStore.isValidToken(t) else {
-            throw TunnelError.badToken("~/.loom/token on \(host) is not 64 lowercase hex characters")
+            throw TunnelError.badToken("~/.ferret/token on \(host) is not 64 lowercase hex characters")
         }
         return t
     }
@@ -486,13 +515,27 @@ final class Tunnel: @unchecked Sendable {
     static func forwardSpec(port: Int) -> String { "127.0.0.1:\(port):127.0.0.1:\(port)" }
 
     /// No connection sharing: with a ControlMaster/ControlPersist from the operator's ssh config the
-    /// forward's listener would live in a master that outlives the child loom-desk tracks and stops.
+    /// forward's listener would live in a master that outlives the child ferret-desk tracks and stops.
     static let noMultiplexing = ["-o", "ControlMaster=no", "-o", "ControlPath=none"]
 
     /// The tunnel child's arguments.
     static func tunnelArguments(host: String, port: Int) -> [String] {
-        ["-N", "-o", "BatchMode=yes", "-o", "ExitOnForwardFailure=yes", "-o", "ServerAliveInterval=15"]
+        ["-N", "-o", "BatchMode=yes", "-o", "ExitOnForwardFailure=yes",
+         "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=2"]
             + noMultiplexing + ["-L", forwardSpec(port: port), "--", host]
+    }
+
+    /// Actionable hint for common non-interactive (`BatchMode=yes`) SSH failures.
+    static func sshAuthHint(stderr: String, host: String) -> String? {
+        let low = stderr.lowercased()
+        if low.contains("host key verification failed") {
+            return "Run `ssh \(host)` once in Terminal to verify and trust its host key."
+        }
+        // Exclude local privileged-port bind failures (`bind [127.0.0.1]:80: Permission denied`).
+        if low.contains("permission denied") && !low.contains("bind") && !low.contains("cannot listen to port") {
+            return "Non-interactive SSH failed — test `ssh \(host)` in Terminal or load your key with `ssh-add --apple-use-keychain`."
+        }
+        return nil
     }
 
     /// True when ssh's stderr says the local end of the forward is taken. Other bind failures (e.g. a
@@ -559,9 +602,9 @@ final class Tunnel: @unchecked Sendable {
         return r == 0
     }
 
-    /// `GET /healthz` (no token needed) through the forward: true only when the daemon answers 200.
-    static func healthz(port: Int) async -> Bool {
-        guard let url = URL(string: "http://127.0.0.1:\(port)/healthz") else { return false }
+    /// `GET /healthz` (no token needed) through the forward, distinguishing HTTP errors from unreachable.
+    static func probeHealthz(port: Int) async -> HealthzProbe {
+        guard let url = URL(string: "http://127.0.0.1:\(port)/healthz") else { return .unreachable }
         var req = URLRequest(url: url)
         req.timeoutInterval = 2
         req.cachePolicy = .reloadIgnoringLocalCacheData
@@ -570,8 +613,13 @@ final class Tunnel: @unchecked Sendable {
         let session = URLSession(configuration: cfg)
         defer { session.finishTasksAndInvalidate() }
         guard let (_, resp) = try? await session.data(for: req),
-              let http = resp as? HTTPURLResponse else { return false }
-        return http.statusCode == 200
+              let http = resp as? HTTPURLResponse else { return .unreachable }
+        return http.statusCode == 200 ? .ok : .httpStatus(http.statusCode)
+    }
+
+    /// `GET /healthz` (no token needed) through the forward: true only when the daemon answers 200.
+    static func healthz(port: Int) async -> Bool {
+        await probeHealthz(port: port) == .ok
     }
 
     #if DEBUG
@@ -585,6 +633,10 @@ final class Tunnel: @unchecked Sendable {
         } else { f.append("Tunnel: no -L in the arguments") }
         if Array(args.suffix(2)) != ["--", "studio"] { f.append("Tunnel: host is not last after --") }
         if !args.contains("ControlPath=none") || !args.contains("ControlMaster=no") { f.append("Tunnel: multiplexing not off") }
+        check(args.contains("ServerAliveCountMax=2"), "ServerAliveCountMax=2 missing")
+        check(sshAuthHint(stderr: "Host key verification failed.", host: "studio")?.contains("ssh studio") == true, "missing host key hint")
+        check(sshAuthHint(stderr: "Permission denied (publickey).", host: "studio")?.contains("ssh-add") == true, "missing auth hint")
+        check(sshAuthHint(stderr: "bind [127.0.0.1]:80: Permission denied", host: "studio") == nil, "bind permission error misclassified as auth")
         if !isBindFailure("bind [127.0.0.1]:7878: Address already in use") { f.append("Tunnel: bind failure not recognised") }
         if isBindFailure("Permission denied (publickey).") { f.append("Tunnel: auth failure taken for bind failure") }
         if isBindFailure("bind [127.0.0.1]:80: Permission denied; channel_setup_fwd_listener_tcpip: cannot listen to port: 80; "

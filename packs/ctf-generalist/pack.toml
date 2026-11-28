@@ -1,0 +1,48 @@
+name = "ctf-generalist"
+description = "Evidence-linked CTF investigations with one unified generalist solver role for A/B comparison against specialized ctf roles via ferret score."
+default_role = "dispatcher"
+preamble = "harness.md"
+requires_restricted_network = true
+solvable = true
+command_guard = "offensive"
+target_concurrency = 2
+intercept = true
+
+[roles.dispatcher]
+require_traffic = true
+prompt = "roles/dispatcher.md"
+termination = "explicit"
+tools = ["bash", "read", "out_read", "plan", "step", "claim", "security_record", "security_query", "evidence", "agent_spawn", "agent_fanout", "agent_stop", "claim_update", "request_scope", "conclude", "finish", "report_blocker", "agent_message", "grep", "glob", "wait", "attempt", "agent_adopt", "ask_for"]
+hidden_tools = ["out_read", "claim_update", "step", "conclude", "ask_for"]
+may_spawn = ["solver", "observer", "flag_judge"]
+verify_finish = true
+verifier = "flag_judge"
+require_oracle = true
+max_exec_calls = 4
+flag_regex = "(?:flag|HTB|CTF)\\{[^}\\r\\n]{1,200}\\}"
+
+[roles.solver]
+require_traffic = true
+prompt = "roles/solver.md"
+termination = "explicit"
+tools = ["bash", "read", "write", "edit", "out_read", "http_send", "http_repeat", "bin_survey", "bin_decompile", "bin_xrefs", "gdb_probe", "codec_calc", "security_record", "security_query", "claim", "claim_update", "evidence", "finish", "report_blocker", "request_scope", "job_wait", "job_kill", "pty_open", "pty_exec", "pty_close", "grep", "glob", "wait", "hand_off", "box_exec", "box_get", "box_reset"]
+hidden_tools = ["out_read", "claim_update", "wait"]
+max_steps = 35
+flag_regex = "(?:flag|HTB|CTF)\\{[^}\\r\\n]{1,200}\\}"
+
+[roles.observer]
+prompt = "roles/observer.md"
+termination = "explicit"
+tools = ["read", "out_read", "log_search", "security_query", "finish", "report_blocker"]
+hidden_tools = ["out_read"]
+read_only = true
+max_steps = 8
+
+[roles.flag_judge]
+prompt = "roles/flag_judge.md"
+termination = "explicit"
+tools = ["read", "out_read", "oracle_check", "security_query", "security_record", "evidence", "verdict"]
+hidden_tools = ["out_read"]
+read_only = true
+max_steps = 12
+# model = "independent-judge" # operator-defined profile; also set lead require_distinct_verifier_profile = true when configured.

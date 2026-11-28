@@ -2,7 +2,7 @@
 
 This experiment applies one idea from [HarnessMM](https://arxiv.org/pdf/2610.32813v2): author an
 action once, then use observed execution conditions to decide whether to dispatch it without another
-model callback. The model's weights stay fixed. Loom's prototype is a small linear chain, not the
+model callback. The model's weights stay fixed. Ferret's prototype is a small linear chain, not the
 paper's full graph controller or recursive harness-optimization system.
 
 The feature is opt-in through the `guarded_plan` tool. The built-in `core` pack does not grant it.
@@ -12,12 +12,12 @@ remains unchanged. These files and mock tests establish no real-model latency or
 ## Enabling an isolated experiment
 
 Install `packs/harnessmm` as a subdirectory of the daemon's packs directory, normally
-`~/.loom/packs/harnessmm` (or `<LOOM_HOME>/packs/harnessmm`). Packs are loaded at daemon startup;
+`~/.ferret/packs/harnessmm` (or `<FERRET_HOME>/packs/harnessmm`). Packs are loaded at daemon startup;
 choose an appropriate restart window rather than changing a running session's tools. Then select it
 explicitly for a new mission:
 
 ```sh
-loom run --pack harnessmm -w /path/to/workspace "Check the parser and its tests"
+ferret run --pack harnessmm -w /path/to/workspace "Check the parser and its tests"
 ```
 
 Selecting `core` keeps ordinary execution. A custom pack can grant `guarded_plan` explicitly, but
@@ -96,7 +96,7 @@ never permission to skip evidence or finish gates.
 Use paired, held-out coding and research tasks with the same model, prompts, context policy, tools,
 verification, limits and server conditions. Compare at least:
 
-1. Ordinary Loom, including its existing multiple-tool replies and batched shell commands.
+1. Ordinary Ferret, including its existing multiple-tool replies and batched shell commands.
 2. The opt-in guarded continuation pack.
 
 Count complete tasks, including failures, authorship, guard inspection, remaining model calls,

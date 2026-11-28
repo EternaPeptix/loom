@@ -1,7 +1,7 @@
-# loom-desk — design
+# ferret-desk — design
 
-loom-desk is a native macOS app for watching and steering loom missions without a browser tab open.
-The daemon already serves a complete web UI; loom-desk does **not** reimplement it. It is a native
+ferret-desk is a native macOS app for watching and steering ferret missions without a browser tab open.
+The daemon already serves a complete web UI; ferret-desk does **not** reimplement it. It is a native
 shell that (1) manages the connection to a daemon that binds loopback on another host, (2) keeps a
 menu-bar presence with live running/waiting counts, (3) raises an OS notification the moment a
 mission needs a human, and (4) shows the daemon's own web UI in a `WKWebView`.
@@ -11,11 +11,11 @@ This document is normative. Where it and the code disagree, one is a bug.
 ## Why native, and why a shell
 
 - The daemon binds `127.0.0.1` with a bearer token on purpose (see the main DESIGN §2, §12): the API
-  is reachable only from the daemon's own machine. The operator runs loom on another host (where the
+  is reachable only from the daemon's own machine. The operator runs ferret on another host (where the
   model and the work are), so the app's real job is **connection management**: open an SSH port
   forward to that host, fetch the token, and point a webview at the forwarded port. The daemon still
   only ever accepts loopback requests; nothing about its security model changes.
-- The web UI is good and strict-CSP; wrapping it beats forking it. loom-desk adds exactly what a
+- The web UI is good and strict-CSP; wrapping it beats forking it. ferret-desk adds exactly what a
   browser tab cannot: a menu-bar glance, native notifications that fire while no window is focused,
   and tunnel lifecycle tied to the app.
 
@@ -24,8 +24,8 @@ This document is normative. Where it and the code disagree, one is a bug.
 - Swift 6, SwiftUI + AppKit + WebKit + UserNotifications, **system frameworks only — no SPM
   dependencies**, so it builds with `swiftc` against the system SDK with nothing to fetch.
 - Deployment target `MACOSX_DEPLOYMENT_TARGET=14.0`.
-- Normally built on the build host (`swiftc`), assembled into `loom-desk.app` by `gui/build.sh` (no
-  Xcode project), ad-hoc codesigned, and copied to the operator's Mac. `LOOM_BUILD_HOST=local` builds
+- Normally built on the build host (`swiftc`), assembled into `ferret-desk.app` by `gui/build.sh` (no
+  Xcode project), ad-hoc codesigned, and copied to the operator's Mac. `FERRET_BUILD_HOST=local` builds
   in place wherever the script runs and `swiftc` is available.
 
 ## Shape
@@ -34,11 +34,11 @@ This document is normative. Where it and the code disagree, one is a bug.
 gui/
   DESIGN.md            this file (normative)
   README.md            how to build, install, first connect
-  build.sh             swiftc → assemble loom-desk.app → ad-hoc codesign
+  build.sh             swiftc → assemble ferret-desk.app → ad-hoc codesign
   Info.plist           the app bundle's Info.plist (LSUIElement = false: a Dock icon as well as the menu-bar item)
   Resources/AppIcon.icns   the app icon; icon/make_icon.py draws it and icon/build_icns.sh packs it
   src/
-    App/LoomDeskApp.swift     @main: MenuBarExtra (counts + actions), the Window, app lifecycle, notifications
+    App/FerretDeskApp.swift   @main: MenuBarExtra (counts + actions), the Window, app lifecycle, notifications
     App/AppState.swift        the observable app state: connections, the active connection, counts, status line
     Model/Connection.swift    a saved connection profile; load/save to Application Support; Keychain for secrets
     Net/Tunnel.swift          the ssh -N -L child process, port readiness, token fetch, teardown
@@ -62,16 +62,17 @@ struct Connection: Codable, Identifiable {
     // .sshTunnel:
     var sshHost: String         // an ssh(1) destination: a Host alias or user@host
     var remotePort: Int         // the daemon's port on that host (default 7878)
-    var tokenSource: TokenSource // .fetchOverSsh (run `cat ~/.loom/token` there) or .manual
+    var tokenSource: TokenSource // .fetchOverSsh (run `cat ~/.ferret/token` there), .localFile, or .manual
     // .direct (daemon already reachable, e.g. local or an existing tunnel):
     var baseURL: String         // http://127.0.0.1:7878
     // secrets (token) are NOT in this struct; they live in the Keychain, keyed by id.
 }
 ```
 
-Connections persist to `~/Library/Application Support/loom-desk/connections.json` (0600). The token,
-when stored, goes to the login Keychain (`kSecClassGenericPassword`, service `com.loom.desk`, account
-= connection id), never to the JSON. A first run has no connections and shows the add-connection form.
+Connections persist to `~/Library/Application Support/ferret-desk/connections.json` (0600). The token,
+when stored, goes to the login Keychain (`kSecClassGenericPassword`, service `com.ferret.desk`, account
+= connection id), never to the JSON. A first run has no connections and shows the add-connection form
+(or one-click local connection when a local daemon is detected).
 
 ## Tunnel (`Net/Tunnel.swift`)
 
@@ -82,23 +83,25 @@ For a `.sshTunnel` connection, `connect()`:
    disagree. The daemon only
    accepts its own port in the `Host` and `Origin` headers, so a different local port would have every
    request refused. First it waits (bounded, ~3 s) for the ssh child of the previous tunnel to exit,
-   so that loom-desk's own dying listener is not taken for someone else's. If something then listens
+   so that ferret-desk's own dying listener is not taken for someone else's. If something then listens
    on 127.0.0.1:<port> (or ssh reports "Address already in use") the connection fails with a message
-   naming the port, saying loom-desk needs it free for this connection, and what to do: any forward
+   naming the port, saying ferret-desk needs it free for this connection, and what to do: any forward
    must use the daemon's own port number on both ends, so stop whatever listens on that port, or move
    one of the daemons to another port with `[daemon] bind` in its config (if the remote one moves,
    change the connection's port to match). It suggests no forward on another local port: the daemon
    would refuse every request through it. There is no random port and no pick-then-release. Other bind
    failures (e.g. "Permission denied" for a port below 1024) are reported with ssh's own words;
 2. spawns `ssh -N -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=15
-   -o ControlMaster=no -o ControlPath=none -L 127.0.0.1:<port>:127.0.0.1:<port> -- <sshHost>` as a
+   -o ServerAliveCountMax=2 -o ControlMaster=no -o ControlPath=none -L 127.0.0.1:<port>:127.0.0.1:<port> -- <sshHost>` as a
    `Process`, keeping the handle. Multiplexing is off so the listener always lives in this child,
    never in a ControlPersist master from the operator's ssh config that would outlive it and keep the
    port;
 3. waits (poll-connect to the local port, up to ~10 s) until the forward is up and `/healthz` answers;
    a dead child or a timeout is an error whose message includes the ssh stderr;
-4. if `tokenSource == .fetchOverSsh`, runs `ssh -o BatchMode=yes -o ConnectTimeout=10 -o ControlMaster=no
-   -o ControlPath=none -- <sshHost> cat ~/.loom/token`, trims it, and stores it (Keychain + memory). A token that is not 64
+4. if `tokenSource == .fetchOverSsh`, first checks any cached Keychain token against `/healthz?nonce=`
+   and only runs `ssh -o BatchMode=yes -o ConnectTimeout=10 -o ControlMaster=no
+   -o ControlPath=none -- <sshHost> cat ~/.ferret/token` if none is cached or the daemon rotated it,
+   trims it, and stores it (Keychain + memory). A token that is not 64
    lowercase-hex characters is an error. The child is checked again afterwards: if it exited during the
    fetch, the connect fails with ssh's last stderr line.
 
@@ -111,7 +114,7 @@ process (SIGTERM, then SIGKILL after a short grace). The tunnel is torn down on 
 on switching connections, and on app quit (`applicationWillTerminate`). Exactly one tunnel at a time.
 
 A `.direct` connection skips all of this: `baseURL` is the configured URL and the token comes from the
-Keychain or a prompt. The URL may use http only when its host is 127.0.0.1, localhost or [::1]; any other
+Keychain, `~/.ferret/token` (`.localFile`), or a prompt. The URL may use http only when its host is 127.0.0.1, localhost or [::1]; any other
 host must use https, because the token travels in every request. A saved connection that breaks this is
 shown as invalid, with the reason, and cannot be connected. `Info.plist` declares
 `NSAppTransportSecurity` / `NSAllowsLocalNetworking` = true (nothing broader), so loopback http works for
@@ -150,7 +153,7 @@ the token is not sent in any of these cases. Two jobs:
   brings the window forward and navigates the web pane to that session.
 
 The client never writes: answering, stopping, approving all happen in the web UI the operator is
-already looking at. loom-desk is a window and a notifier, not a second control surface. (A later
+already looking at. ferret-desk is a window and a notifier, not a second control surface. (A later
 version may add quick-answer from the notification; out of scope for v1.)
 
 ## Web pane (`UI/WebPane.swift`)
@@ -158,7 +161,7 @@ version may add quick-answer from the notification; out of scope for v1.)
 A `WKWebView` wrapped in `NSViewRepresentable`. It logs in with a one-time code. First the daemon proves
 its identity: `GET <baseURL>/healthz?nonce=<N>` (N = 64 random hex characters, no token sent) must
 answer `{"ok": true, "proof": "<hex>"}` with proof = HMAC-SHA256 keyed with the token's bytes over the
-ASCII `loom-healthz-v1:` followed by N, compared in constant time. This is done on connect, before every
+ASCII `ferret-healthz-v1:` followed by N, compared in constant time. This is done on connect, before every
 login code request, and at the start of every attempt of the daemon client and again before the snapshot
 that follows an ended stream (a wrong answer after connect turns the link to failed with that message).
 A 403 answer means the daemon refused the address: its `Host` check failed because the local port
@@ -197,21 +200,22 @@ with `fetch` too (not `EventSource`), through the tunnel. The pane:
 - shows a clear state when there is no connection, when the tunnel is connecting, and when the daemon
   is unreachable (with the error and a retry), rather than a blank white view.
 
-Do not inject scripts into the page or read its contents; the pane only navigates.
+Do not inject scripts into the page or read its contents; the pane only navigates and observes WebKit metadata (`title`, `url`, `canGoBack`, `canGoForward`).
 
-## App & menu bar (`App/LoomDeskApp.swift`, `App/AppState.swift`)
+## App & menu bar (`App/FerretDeskApp.swift`, `App/AppState.swift`)
 
 `@main` `App` with:
 
-- a `MenuBarExtra` whose label names missions, agents, and items needing an answer (e.g.
-  `2 missions · 4 agents · 1 needs you`), red when a current snapshot has blocking items. Unknown or
-  stale counts are labelled `loom · state unknown`; the menu retains their last-known values.
+- a `MenuBarExtra` whose label names missions, agents, and items needing an answer (compact notch-safe
+  by default, e.g. `!1 2m 4a`, or verbose `2 missions · 4 agents · 1 needs you`), red when a current
+  snapshot has blocking items. Unknown or stale counts are labelled `ferret · ?` / `ferret · state unknown`;
+  the menu retains their last-known values.
   Its menu: `Connection: <name>` (or `No connection`), the status line, and the data freshness;
-  **Open loom** (show / focus the window); a **Connections** submenu to switch (when any are saved);
-  **Disconnect** (while a link exists); **Enable notifications…**; **Quit loom-desk**. `LSUIElement`
-  is false, so the app also has a Dock icon (`Resources/AppIcon.icns`) and appears in the app switcher;
-  the main `Window` is opened on demand, on first launch and from the Dock, and closing it does not
-  quit the app.
+  **Open ferret** (show / focus the window); **Open Inbox**; a **Connections** submenu to switch or manage;
+  **Disconnect** (while a link exists); **Compact menu bar**; **Enable notifications…**; **Quit ferret-desk**.
+  `LSUIElement` is false, so the app also has a Dock icon (`Resources/AppIcon.icns`) with live waiting badge
+  and appears in the app switcher; the main `Window` is opened on demand, on first launch and from the Dock,
+  and closing it (`⌘W`) hides the window without quitting the app or tearing down the live view.
 - the main `Window` hosting `RootView` (a connection bar — active connection, state, reload — above
   the `WebPane`).
 - notification setup (an explicit **Enable notifications…** menu action requests authorization;
@@ -227,28 +231,24 @@ tunnel and client write counts/status back into it on the main actor.
 
 `gui/build.sh` (runs on the build host):
 
-1. `swiftc` all of `src/**/*.swift` into one executable, `-O`, `-target arm64-apple-macos14.0`,
+1. `swiftc` all of `src/**/*.swift` into one executable, `-O`, `-target <arch>-apple-macos14.0`,
    linking SwiftUI/AppKit/WebKit/UserNotifications (they come from the SDK; no extra flags beyond the
    frameworks). Treat warnings as warnings, not errors.
-2. assemble `dist/loom-desk.app/Contents/{MacOS/loom-desk, Info.plist, Resources/…}` and check the
-   plist with `plutil -lint`.
-3. `codesign --force --deep --sign - --options runtime dist/loom-desk.app` (ad-hoc), then
-   `codesign --verify --deep --strict`.
+2. assemble `dist/ferret-desk.app/Contents/{MacOS/ferret-desk, Info.plist, Resources/…}` in a staging
+   directory and check the plist with `plutil -lint`.
+3. `codesign --force --deep --sign "$SIGN_ID" --options runtime <staging>` (default ad-hoc `-`, or
+   `FERRET_CODESIGN_ID`), then `codesign --verify --deep --strict`, then atomically swap into place.
 4. print the bundle path and size.
 
-`LOOM_BUILD_HOST` is required (a build host, or `local`); the script stops with a message otherwise.
-Against a host it syncs `gui/` there and runs itself there with `LOOM_BUILD_HOST=local`; `--pull`
-copies the bundle back to `gui/dist/`. `LOOM_SWIFTFLAGS` (for example `-DDEBUG`) reaches the host
+`FERRET_BUILD_HOST` is required (a build host, or `local`); the script stops with a message otherwise.
+Against a host it syncs `gui/` there and runs itself there with `FERRET_BUILD_HOST=local`; `--pull`
+atomically copies the bundle back to `gui/dist/` and clears quarantine. `FERRET_SWIFTFLAGS` (for example `-DDEBUG`) reaches the host
 quoted with `printf %q`, so a quote or `;` in it runs nothing there.
-
-The app is copied to the operator's Mac with rsync (`--pull`); because it is ad-hoc signed and crosses machines,
-`README.md` tells the operator to clear the quarantine attribute (`xattr -dr com.apple.quarantine`)
-or open it once via right-click. No notarization (personal tool).
 
 ## What v1 does and does not do
 
 Does: one connection at a time; SSH-tunnel and direct connections; token fetch and Keychain storage;
-the web UI in a native window; menu-bar counts; notifications for blocking inbox items; tunnel tied to
+the web UI in a native window; menu-bar counts; Dock badge; notifications for blocking inbox items; tunnel tied to
 app lifecycle. Does not (later, if wanted): quick-answer from the notification, multiple simultaneous
 daemons, Windows/Linux (the web UI already serves those operators in a browser), auto-starting the
 remote daemon.
@@ -260,8 +260,8 @@ implementer verifies by hand on the build host where possible (a headless build 
 window, so: confirm it compiles and the bundle is well-formed with `codesign --verify` and
 `plutil -lint Info.plist`, and that `Tunnel` and `DaemonClient`'s pure parsing helpers — token
 validation, SSE line parsing, counts derivation — have small `#if DEBUG` self-checks or are factored
-so they can be exercised). A build with `LOOM_SWIFTFLAGS=-DDEBUG` has three such entry points:
-`loom-desk --self-check` (the pure helpers, the identity proof against a known answer, the
+so they can be exercised). A build with `FERRET_SWIFTFLAGS=-DDEBUG` has three such entry points:
+`ferret-desk --self-check` (the pure helpers, the identity proof against a known answer, the
 http/https host rule, the copied address), `--tunnel-check <sshHost>` (a real tunnel), and
 `--live-check <baseURL>` (the daemon client against a live daemon for a few seconds, token from
-`$LOOM_TOKEN`). State in the report what was and was not run.
+`$FERRET_TOKEN`). State in the report what was and was not run.

@@ -1,4 +1,4 @@
-// core.js: the pure half of the loom web UI. No DOM, no network, no clock (callers pass `now`).
+// core.js: the pure half of the ferret web UI. No DOM, no network, no clock (callers pass `now`).
 // Everything that can be wrong lives here and is exercised by `node --test ui/`.
 // app.js turns these results into DOM with textContent only.
 
@@ -64,7 +64,7 @@ export function pct(part, whole) {
 
 /** First `max` lines of `text`: {text, total, clipped}. A trailing newline does not add a line. */
 // Tool output is shown raw; these only choose a look for each line, never change its text.
-// Every stored result starts "[tool · facts]" and ends "[end of tool output · outcome]" (crates/loom-core admit.rs).
+// Every stored result starts "[tool · facts]" and ends "[end of tool output · outcome]" (crates/ferret-core admit.rs).
 const ENVELOPE_HEAD = /^\[[a-z][a-z0-9_]* · .*\]$/;
 const ENVELOPE_FOOT = /^\[end of [a-z][a-z0-9_]* output · .*\]$/;
 
@@ -807,6 +807,27 @@ export function sessionActions(info) {
   };
 }
 
+/** Whether a session can queue messages for after the current turn: any running operable root session, regardless of pack role name. */
+export function canQueueSession(info) {
+  if (!info || info.parent) return false;
+  const a = sessionActions(info);
+  return !!(a.send && a.running);
+}
+
+/** Whether a previous send is still waiting to land in the record. A message held in the after-turn queue does not block sending. */
+export function isPendingReceipt(message) {
+  return !!(message && message.accepted && message.recordedSeq === undefined && message.state !== "failed" && message.state !== "held");
+}
+
+/** Default model profile to pre-select on New mission: daemon default if present, else first reachable profile, else first profile. */
+export function defaultModelProfile(models, defaultModel = "") {
+  const list = Array.isArray(models) ? models.filter((m) => m && m.profile) : [];
+  if (!list.length) return "";
+  if (defaultModel && list.some((m) => m.profile === defaultModel)) return defaultModel;
+  const ok = list.find((m) => m.reachable !== false);
+  return (ok || list[0]).profile;
+}
+
 /** Human-readable activity from one recorded event; null for background bookkeeping. */
 export function recordActivity(record) {
   if (!record) return null;
@@ -1089,7 +1110,7 @@ export function diskWarning(disk) {
   const free = disk.free_bytes;
   if (!(free < LOW_DISK_BYTES || free * 100 < disk.total_bytes * LOW_DISK_PERCENT)) return null;
   const gib = (n) => (n / 1024 ** 3).toFixed(1) + " GiB";
-  return `Low disk space: ${gib(free)} free of ${gib(disk.total_bytes)}. Sessions will fail when the disk fills; run "loom gc" or free space.`;
+  return `Low disk space: ${gib(free)} free of ${gib(disk.total_bytes)}. Sessions will fail when the disk fills; run "ferret gc" or free space.`;
 }
 
 /**
@@ -1099,7 +1120,7 @@ export function diskWarning(disk) {
 export function egressWarning(egress) {
   if (!egress || egress.level !== "unbounded") return null;
   const reasons = Array.isArray(egress.reasons) ? egress.reasons : [];
-  const first = reasons.length ? reasons[0] : "see the self-probe in `loom status`";
+  const first = reasons.length ? reasons[0] : "see the self-probe in `ferret status`";
   const more = reasons.length > 1 ? ` (+${reasons.length - 1} more)` : "";
   return `Egress is unbounded: ${first}${more} Commands may reach the network outside the egress proxy, and keep-going cannot be turned on.`;
 }
@@ -1182,8 +1203,8 @@ export function inboxCounts(inbox) {
 }
 
 export function pageTitle({ open, blocking }) {
-  if (!open) return "loom";
-  return blocking ? `(${blocking}) needs you · loom` : `(${open}) loom`;
+  if (!open) return "ferret";
+  return blocking ? `(${blocking}) needs you · ferret` : `(${open}) ferret`;
 }
 
 export function inboxKindWords(kind) {
@@ -1206,7 +1227,7 @@ export function scopeRequestHosts(item) {
  */
 export function cardResolution(item, resolved, receipt, granted) {
   if (!resolved) return receipt || null;
-  if (receipt && receipt.approved) return { ...resolved, approved: receipt.approved };
+  if (receipt && Array.isArray(receipt.approved) && receipt.approved.length > 0) return { ...resolved, approved: receipt.approved };
   const hosts = scopeRequestHosts(item);
   if (hosts && resolved.answer === "" && Array.isArray(granted)) {
     const have = new Set(granted.map((h) => String(h).toLowerCase()));
@@ -1481,7 +1502,7 @@ function step(store, rec) {
         ts: rec.ts_ms,
         images: imageList(rec.images),
       };
-      // A call sent under another harness's name (`Read`, `shell`, …) runs as a loom tool; the result names that
+      // A call sent under another harness's name (`Read`, `shell`, …) runs as a ferret tool; the result names that
       // tool. The row shows the tool that ran and keeps the sent name for its tooltip (TOOL-SHAPES §3).
       if (rec.name && b.name && rec.name !== b.name) {
         b.ran = rec.name;
@@ -2206,7 +2227,7 @@ export function ledgerModel(view) {
   const notices = [];
   if (n > 0) {
     const detail = view.skipped_detail ? ` (first: ${view.skipped_detail})` : "";
-    notices.push(`${n} ledger ${n === 1 ? "entry" : "entries"} written by a newer loom ${n === 1 ? "is" : "are"} not shown${detail}. Upgrade loom to see ${n === 1 ? "it" : "them"}.`);
+    notices.push(`${n} ledger ${n === 1 ? "entry" : "entries"} written by a newer ferret ${n === 1 ? "is" : "are"} not shown${detail}. Upgrade ferret to see ${n === 1 ? "it" : "them"}.`);
   }
   if (view && view.torn_tail) notices.push("The ledger ends in an interrupted write, which is ignored; the next entry written removes it.");
   if (ahead > 0) notices.push(`${ahead} ledger ${ahead === 1 ? "entry is" : "entries are"} not vouched for by the ledger's head record, so removing ${ahead === 1 ? "it" : "them"} would go unnoticed.`);
@@ -2476,13 +2497,77 @@ export function planEvent(ev, ctx) {
 // ---------------------------------------------------------------------------------------------
 // New session form
 
+/** The roles offered when GET /api/packs is unavailable (an older daemon): core's two that an operator starts. */
 export const ROLES = ["lead", "chat"];
+
+/** The pack list of that fallback: just `core`, with the roles above (the lead starts agents). */
+export function fallbackPacks() {
+  return [{
+    name: "core", description: "", default_role: "lead", intercept: false, requires_restricted_network: false,
+    roles: ROLES.map((name) => ({ name, description: "", starts_agents: name === "lead", top_level: true })),
+  }];
+}
+
+/**
+ * The Role select's groups for a pack from GET /api/packs: `[{label, roles: [{name, title}]}]`. The daemon
+ * orders the roles (default first, then by name); this keeps that order. An empty group is left out.
+ */
+export function roleGroups(pack) {
+  const roles = (pack && pack.roles) || [];
+  const pick = (top) => roles.filter((r) => !!r.top_level === top).map((r) => ({ name: r.name, title: r.description || "" }));
+  return [
+    { label: "Starts a mission", roles: pick(true) },
+    { label: "Usually started by another role", roles: pick(false) },
+  ].filter((g) => g.roles.length > 0);
+}
+
+/** The dim line under the Pack and Role selects: the chosen pack's description, "" for none. */
+export function packNote(pack) {
+  return pack && pack.description ? String(pack.description).trim() : "";
+}
+
+/** Detailed Pack + Role metadata for the New mission form: pack description, selected role description, flags, and open-network warning. */
+export function packRoleSummary(pack, roleName = "", daemonNetwork = "") {
+  const desc = packNote(pack);
+  const role = pack && Array.isArray(pack.roles) ? pack.roles.find((r) => r && r.name === roleName) : null;
+  const roleDesc = role && role.description ? String(role.description).trim() : "";
+  const flags = [];
+  if (pack && pack.intercept) flags.push("MITM proxy intercept");
+  if (pack && pack.requires_restricted_network) flags.push("Requires restricted network");
+  const warning = pack && pack.requires_restricted_network && daemonNetwork === "open"
+    ? "This pack requires a restricted network mode (allowlist or deny_all), but the daemon is running in open mode — starting a mission will be refused until config.network.mode is restricted."
+    : null;
+  return { desc, roleDesc, flags, warning };
+}
+
+/** Map pasted session ids (`s-...`) to their mission ids when known in `sessionsById`, leaving valid mission ids intact. */
+export function resolvePriorInput(raw, sessionsById = null) {
+  const words = String(raw || "").split(/[\s,]+/).filter(Boolean);
+  const out = [];
+  const mapped = [];
+  const unknownSessions = [];
+  for (const w of words) {
+    let next = w;
+    if (w.startsWith("s-")) {
+      const info = sessionsById && typeof sessionsById.get === "function" ? sessionsById.get(w) : null;
+      if (info && info.mission) {
+        next = info.mission;
+        mapped.push({ from: w, to: next });
+      } else {
+        unknownSessions.push(w);
+      }
+    }
+    if (!out.includes(next)) out.push(next);
+  }
+  return { text: out.join(" "), mapped, unknownSessions };
+}
 
 /** The most earlier missions one new mission may name (the daemon's `prior::MAX_PRIOR`). */
 export const MAX_PRIOR = 8;
 
 /**
  * Validate the form; returns {body} for POST /api/sessions or {error}.
+ * `form.pack` (optional; sent unless empty or `core`) and `form.startsAgents` (the chosen role may start agents; gates `role_models`).
  * `form.prior` (optional text): earlier missions for the new one to recall. Split on whitespace and commas;
  * each must be a mission id as the daemon names them (1 to 128 of A-Z a-z 0-9 _ . -, not starting with `.`),
  * else `"{word}" is not a mission id; mission ids look like m-….`; repeats dropped (first kept); more than 8 →
@@ -2503,8 +2588,10 @@ export function buildNewSession(form) {
   // A credential profile (S3) goes with a target only; "none" or empty sends nothing.
   const creds = String(form.creds || "").trim();
   if (target && creds && creds !== "none") body.creds = creds;
-  // Only a lead starts agents: the choice for every role goes with it, before its first agent.
-  if (form.agentModel && role === "lead") body.role_models = { "*": form.agentModel };
+  // `core` is the daemon's default pack: a core mission's body names none.
+  if (form.pack && form.pack !== "core") body.pack = String(form.pack);
+  // Only a role that starts agents has an agents' model: the choice for every role goes with it, before its first agent.
+  if (form.agentModel && form.startsAgents) body.role_models = { "*": form.agentModel };
   const title = String(form.title || "").trim();
   if (title) body.title = title;
   const prior = [];
@@ -2564,7 +2651,7 @@ export function errorSentence(status, bodyText) {
   return bodyText && bodyText.trim() ? oneLine(bodyText, 300) : `The request failed (${status}).`;
 }
 
-export const LOST_TOKEN = 'This page is not signed in. Run "loom open" again.';
+export const LOST_TOKEN = 'This page is not signed in. Run "ferret open" again.';
 
 /** The login code of a URL fragment (`#code=<hex>`), or null. Anything else in the fragment is not a code. */
 export function codeFromHash(hash) {
@@ -3616,44 +3703,130 @@ export function sendStateText({ loaded = true, seat = null, message = null } = {
 // ---------------------------------------------------------------------------------------------
 // Pass 2: prose, switcher, quiet indicator, endings and notifications, agents, find, progress, inbox triage
 
+function safeHttpUrl(raw) {
+  try {
+    const u = new URL(String(raw));
+    if (u.protocol === "http:" || u.protocol === "https:") return u.href;
+  } catch { /* invalid URL stays literal */ }
+  return null;
+}
+
+function splitTableRow(line) {
+  const trimmed = line.trim();
+  const inner = trimmed.replace(/^\|/, "").replace(/\|$/, "");
+  const cells = [];
+  let cur = "";
+  for (let i = 0; i < inner.length; i++) {
+    if (inner[i] === "\\" && inner[i + 1] === "|") { cur += "|"; i++; }
+    else if (inner[i] === "|") { cells.push(cur.trim()); cur = ""; }
+    else cur += inner[i];
+  }
+  cells.push(cur.trim());
+  return cells;
+}
+
+const TABLE_SEP = /^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$/;
+const TABLE_SEP_SINGLE = /^\s*\|\s*:?-{3,}:?\s*\|\s*$/;
+const HR_LINE = /^\s*(?:-{3,}|_{3,}|\*{3,})\s*$/;
+
 /**
  * proseTree(text): the prose subset as a tree, in one pass over the lines (a fenced block is collected, not re-read per line).
- * Returns blocks: {type:"p"|"h", inline} | {type:"ul"|"ol", items: inline[]} | {type:"pre", text}; `inline` is a list of
- * {type:"text"|"strong"|"code", text}. Nothing here is HTML: the caller makes elements and text nodes.
+ * Returns blocks:
+ *   {type:"p", inline}
+ * | {type:"h", level:2|3|4, inline}
+ * | {type:"ul"|"ol", items: inline[]}
+ * | {type:"blockquote", inline}
+ * | {type:"hr"}
+ * | {type:"table", headers: inline[], rows: inline[][]}
+ * | {type:"pre", text}
+ * `inline` is a list of {type:"text"|"strong"|"em"|"code", text} or {type:"a", text, href}.
+ * Nothing here is HTML: the caller makes elements and text nodes.
  */
 export function proseTree(text) {
   const out = [];
-  let paragraph = [], list = null, code = null;
+  let paragraph = [], list = null, quote = null, code = null;
+  const pushText = (parts, t) => {
+    if (!t) return;
+    const prev = parts[parts.length - 1];
+    if (prev && prev.type === "text") prev.text += t;
+    else parts.push({ type: "text", text: t });
+  };
   const inline = (value) => {
     const parts = [];
     let from = 0;
-    for (const m of value.matchAll(/(\*\*[^*\n]+\*\*|`[^`\n]+`)/g)) {
-      if (m.index > from) parts.push({ type: "text", text: value.slice(from, m.index) });
-      const bold = m[0].startsWith("**");
-      parts.push({ type: bold ? "strong" : "code", text: m[0].slice(bold ? 2 : 1, bold ? -2 : -1) });
-      from = m.index + m[0].length;
+    for (const m of value.matchAll(/(`[^`\n]+`|\*\*[^*\n]+\*\*|\[([^\]\n]+)\]\((https?:\/\/[^\s)<>]+)\)|\*[^\s*\n](?:[^*\n]*[^\s*\n])?\*)/g)) {
+      if (m.index > from) pushText(parts, value.slice(from, m.index));
+      const raw = m[0];
+      if (raw.startsWith("`")) {
+        parts.push({ type: "code", text: raw.slice(1, -1) });
+      } else if (raw.startsWith("**")) {
+        parts.push({ type: "strong", text: raw.slice(2, -2) });
+      } else if (raw.startsWith("[")) {
+        const href = safeHttpUrl(m[3]);
+        if (href) parts.push({ type: "a", text: m[2], href });
+        else pushText(parts, raw);
+      } else {
+        const prevCh = m.index > 0 ? value[m.index - 1] : "";
+        const nextCh = m.index + raw.length < value.length ? value[m.index + raw.length] : "";
+        const okBefore = !prevCh || /[\s(\[{"'—–,;:!?/]/.test(prevCh);
+        const okAfter = !nextCh || /[\s)\]}"'.,;:!?—–/]/.test(nextCh);
+        if (okBefore && okAfter) parts.push({ type: "em", text: raw.slice(1, -1) });
+        else pushText(parts, raw);
+      }
+      from = m.index + raw.length;
     }
-    if (from < value.length) parts.push({ type: "text", text: value.slice(from) });
+    if (from < value.length) pushText(parts, value.slice(from));
     return parts;
   };
   const flush = () => {
     if (paragraph.length) { out.push({ type: "p", inline: inline(paragraph.join("\n")) }); paragraph = []; }
+    if (quote && quote.length) { out.push({ type: "blockquote", inline: inline(quote.join("\n")) }); quote = null; }
   };
-  for (const line of String(text ?? "").split("\n")) {
+  const lines = String(text ?? "").split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
     if (/^\s*```/.test(line)) {
       flush(); list = null;
       if (code) { out.push({ type: "pre", text: code.join("\n") }); code = null; } else code = [];
-    } else if (code) code.push(line);
-    else if (/^#{1,6}\s+/.test(line)) {
+    } else if (code) {
+      code.push(line);
+    } else if (/^#{1,6}\s+/.test(line)) {
       flush(); list = null;
-      out.push({ type: "h", inline: inline(line.replace(/^#{1,6}\s+/, "")) });
+      const hashes = line.match(/^(#{1,6})\s+/)[1].length;
+      const level = hashes <= 1 ? 2 : hashes === 2 ? 3 : 4;
+      out.push({ type: "h", level, inline: inline(line.replace(/^#{1,6}\s+/, "")) });
+    } else if (line.includes("|") && i + 1 < lines.length && (TABLE_SEP.test(lines[i + 1]) || TABLE_SEP_SINGLE.test(lines[i + 1]))) {
+      flush(); list = null;
+      const headers = splitTableRow(line).map(inline);
+      i++; // consume separator row
+      const rows = [];
+      while (i + 1 < lines.length && lines[i + 1].includes("|") && !/^\s*```/.test(lines[i + 1]) && lines[i + 1].trim() !== "") {
+        i++;
+        const cells = splitTableRow(lines[i]);
+        while (cells.length < headers.length) cells.push("");
+        rows.push(cells.slice(0, headers.length).map(inline));
+      }
+      out.push({ type: "table", headers, rows });
+    } else if (HR_LINE.test(line)) {
+      flush(); list = null;
+      out.push({ type: "hr" });
+    } else if (/^\s*>\s?/.test(line)) {
+      if (paragraph.length) { out.push({ type: "p", inline: inline(paragraph.join("\n")) }); paragraph = []; }
+      list = null;
+      if (!quote) quote = [];
+      quote.push(line.replace(/^\s*>\s?/, ""));
     } else if (/^\s*(?:[-*+]\s+|\d+[.)]\s+)/.test(line)) {
       flush();
       const type = /^\s*\d/.test(line) ? "ol" : "ul";
       if (!list || list.type !== type) { list = { type, items: [] }; out.push(list); }
       list.items.push(inline(line.replace(/^\s*(?:[-*+]\s+|\d+[.)]\s+)/, "")));
-    } else if (!line.trim()) { flush(); list = null; }
-    else { list = null; paragraph.push(line); }
+    } else if (!line.trim()) {
+      flush(); list = null;
+    } else {
+      if (quote) flush();
+      list = null;
+      paragraph.push(line);
+    }
   }
   flush();
   if (code) out.push({ type: "pre", text: code.join("\n") }); // a fence left open runs to the end, as it is read
@@ -4135,7 +4308,22 @@ export function findFields(b, kind = "all") {
     }
     case "inbox": return [["text", b.item && b.item.text, b.seq], ["answer", b.resolved && b.resolved.answer, b.resolved && b.resolved.seq]];
     case "child_settled": return [["text", b.report, b.seq]];
-    case "child_spawned": return [["text", typeof b.brief === "string" ? b.brief : b.brief && (b.brief.task || b.brief.text || b.brief.goal), b.seq]];
+    case "child_spawned": {
+      if (typeof b.brief === "string") return [["text", b.brief, b.seq]];
+      const br = b.brief || {};
+      const out = [
+        ["role", b.role, b.seq],
+        ["child", b.child, b.seq],
+        ["question", br.question || br.task || br.text || br.goal, b.seq],
+        ["hypothesis", br.hypothesis, b.seq],
+        ["scope", br.scope, b.seq],
+        ["do_not", br.do_not, b.seq],
+        ["return", br.return, b.seq],
+        ["stop_when", br.stop_when, b.seq],
+        ["context", br.context, b.seq],
+      ];
+      return out.filter(([, v]) => typeof v === "string" && v.trim());
+    }
     case "tool": return [["call", `${toolShownName(b.name || "")} ${b.argsLine || ""}`, Number.isInteger(b.callSeq) ? b.callSeq : b.seq], ["result", b.result && b.result.text, b.result && b.result.seq]];
     case "reweave": return [["text", b.summary, b.seq]];
     case "compaction": return [["text", b.head, b.seq], ["note", b.note, b.seq], ["table", b.table, b.seq]];
@@ -4614,7 +4802,7 @@ export function openFileTarget(block, workspace) {
   return arg === null ? null : workspaceRelative(workspace, arg);
 }
 
-/** Is this entry the workspace's closed harness folder? The daemon marks it with a `note` (only the root's `.loom`; a nested `.loom` is an ordinary folder). */
+/** Is this entry the workspace's closed harness folder? The daemon marks it with a `note` (only the root's `.ferret`; a nested `.ferret` is an ordinary folder). */
 export function isHarnessEntry(entry) {
   return !!entry && typeof entry.note === "string" && entry.note !== "";
 }
@@ -4642,7 +4830,7 @@ export function fileEntryOpens(entry) {
 
 /**
  * The rows the Files tab shows for a listing: hidden (dot) entries only when asked for, then those whose name holds
- * `query` (literal, ignoring case). Order is the daemon's (folders first). `.loom` counts as hidden, so it appears only
+ * `query` (literal, ignoring case). Order is the daemon's (folders first). `.ferret` counts as hidden, so it appears only
  * with Show hidden, as a closed entry.
  */
 export function fileRows(entries, { query = "", showHidden = false } = {}) {
@@ -5024,8 +5212,8 @@ export function exchangeRow(ex) {
   const size = ex.status === null ? "" : ex.response_bytes ? byteSize(ex.response_bytes) : "empty";
   const time = ex.duration_ms ? seconds(ex.duration_ms) : "";
   const marks = [];
-  if (ex.tls === "intercepted") marks.push({ key: "intercepted", text: "intercepted", tip: "HTTPS that loom's proxy opened to record it (interception is on for this mission)." });
-  if (ex.upstream_unverified) marks.push({ key: "unverified", text: "server not verified", tip: "loom did not verify this server's certificate: the target lists it as upstream_insecure." });
+  if (ex.tls === "intercepted") marks.push({ key: "intercepted", text: "intercepted", tip: "HTTPS that ferret's proxy opened to record it (interception is on for this mission)." });
+  if (ex.upstream_unverified) marks.push({ key: "unverified", text: "server not verified", tip: "ferret did not verify this server's certificate: the target lists it as upstream_insecure." });
   if (ex.truncated) marks.push({ key: "cut", text: "cut", tip: "A body passed the capture limit and was stored only up to it; the sizes are the true ones." });
   const head = `${ex.method} ${exchangeWhere(ex)}`;
   return {
@@ -5107,7 +5295,7 @@ export function messageView(text, { revealed = false } = {}) {
   return { start: m.start, rows, hasSecrets: rows.some((r) => r.sensitive), body: cut ? m.body.slice(0, EXCHANGE_BODY_CAP) : m.body, fullBody: m.body, cut, bodyWords: m.body ? byteSize(new TextEncoder().encode(m.body).length) : "no body" };
 }
 
-// -- hosts of a claim (a port of claim_hosts in crates/loom-core/src/target.rs)
+// -- hosts of a claim (a port of claim_hosts in crates/ferret-core/src/target.rs)
 
 function normHost(h) {
   let s = String(h).trim().replace(/\.+$/, "").replace(/[A-Z]/g, (c) => c.toLowerCase());
@@ -5435,14 +5623,30 @@ export function scopeFromText(text) {
   return { entries };
 }
 
-/** The body of PUT /api/targets/{name} for an edited scope: the whole configuration, the other lists as loaded. */
-export function targetPut(cfg, scope, exclude) {
+/** The body of PUT /api/targets/{name} for an edited scope: the whole configuration, the other lists as loaded (or updated via `extra`). */
+export function targetPut(cfg, scope, exclude, extra = null) {
   const s = scopeFromText(scope);
   if (s.error) return { error: s.error };
   const x = scopeFromText(exclude);
   if (x.error) return { error: x.error };
   if (!s.entries.length) return { error: "A target needs at least one scope entry." };
-  return { body: { scope: s.entries, exclude: x.entries, upstream_insecure: cfg.upstream_insecure || [], intercept_passthrough: cfg.intercept_passthrough || [], notes: cfg.notes || "" } };
+  let upstream = cfg.upstream_insecure || [];
+  let passthrough = cfg.intercept_passthrough || [];
+  let notes = cfg.notes || "";
+  if (extra && typeof extra === "object") {
+    if (extra.upstream_insecure !== undefined) {
+      const u = scopeFromText(extra.upstream_insecure);
+      if (u.error) return { error: u.error + " (in upstream insecure)" };
+      upstream = u.entries;
+    }
+    if (extra.intercept_passthrough !== undefined) {
+      const p = scopeFromText(extra.intercept_passthrough);
+      if (p.error) return { error: p.error + " (in intercept passthrough)" };
+      passthrough = p.entries;
+    }
+    if (extra.notes !== undefined) notes = String(extra.notes);
+  }
+  return { body: { scope: s.entries, exclude: x.entries, upstream_insecure: upstream, intercept_passthrough: passthrough, notes } };
 }
 
 /** A target of GET /api/targets as the list shows it. */
@@ -5521,7 +5725,7 @@ export function credShow(r) {
 
 /** The two commands that add a profile; the UI never takes a secret itself. */
 export function credCommands(target) {
-  return [`loom creds record --target ${target}`, `loom creds set --target ${target} --host \u2026 --cookie '\u2026'`];
+  return [`ferret creds record --target ${target}`, `ferret creds set --target ${target} --host \u2026 --cookie '\u2026'`];
 }
 
 /** The `creds` of a `session_start`: `{profile, summary, dropped}` or null. */
@@ -5529,4 +5733,272 @@ export function credsRefOf(start) {
   const c = start && start.creds;
   if (!c || !c.profile) return null;
   return { profile: String(c.profile), summary: String(c.summary || ""), dropped: Number(c.dropped) || 0 };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Additional operator helpers: brief details, exports, daemon/Signal/noise/rewrite/GC/MCP/targets
+
+const BRIEF_EXTRA_FIELDS = [
+  ["hypothesis", "Hypothesis"],
+  ["scope", "Scope"],
+  ["do_not", "Do not"],
+  ["return", "Return"],
+  ["stop_when", "Stop when"],
+  ["context", "Context"],
+];
+
+/** Non-empty secondary fields of a `child_spawned` brief, in display order. */
+export function briefDetails(brief) {
+  if (!brief || typeof brief !== "object") return [];
+  const out = [];
+  for (const [key, label] of BRIEF_EXTRA_FIELDS) {
+    const val = typeof brief[key] === "string" ? brief[key].trim() : "";
+    if (val) out.push({ key, label, text: val });
+  }
+  return out;
+}
+
+/** URL for downloading a mission's SARIF 2.1.0 report. */
+export function sarifUrl(mission) {
+  return `/api/missions/${encodeURIComponent(mission)}/sarif`;
+}
+
+/** URL for downloading a mission's HAR 1.2 archive (optional host filter and entry limit). */
+export function harUrl(mission, { host = "", limit = null } = {}) {
+  const q = [];
+  const h = String(host || "").trim();
+  if (h && h !== "all") q.push("host=" + encodeURIComponent(h));
+  if (Number.isInteger(limit) && limit > 0) q.push("limit=" + limit);
+  return `/api/missions/${encodeURIComponent(mission)}/har` + (q.length ? "?" + q.join("&") : "");
+}
+
+/** Validate and build the body for `POST /api/targets`. */
+export function targetCreateBody(form = {}) {
+  const name = String(form.name ?? "").trim();
+  if (!name) return { error: "Target name is required." };
+  if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(name)) {
+    return { error: "Target name must start with a letter or digit and use only letters, digits, '.', '_' or '-'." };
+  }
+  const put = targetPut({}, form.scope || "", form.exclude || "", {
+    upstream_insecure: form.upstream_insecure ?? "",
+    intercept_passthrough: form.intercept_passthrough ?? "",
+    notes: form.notes ?? "",
+  });
+  if (put.error) return { error: put.error };
+  return { body: { name, ...put.body } };
+}
+
+/** One-line summary of a `POST /api/missions/{id}/har` import result. */
+export function formatHarImport(res) {
+  if (!res || typeof res !== "object") return "HAR imported.";
+  const parts = [`${num(res.imported || 0)} imported`];
+  if (res.skipped) parts.push(`${num(res.skipped)} skipped`);
+  if (res.failed) parts.push(`${num(res.failed)} failed`);
+  if (res.truncated) parts.push("truncated");
+  return "HAR import: " + parts.join(" · ") + ".";
+}
+
+/** One-line summary of a `POST /api/models/reload` report. */
+export function formatReloadReport(r) {
+  if (!r || typeof r !== "object") return "Model profiles reloaded.";
+  const parts = [];
+  if (Array.isArray(r.added) && r.added.length) parts.push(`added: ${r.added.join(", ")}`);
+  if (Array.isArray(r.changed) && r.changed.length) parts.push(`changed: ${r.changed.join(", ")}`);
+  if (Array.isArray(r.removed) && r.removed.length) parts.push(`removed: ${r.removed.join(", ")}`);
+  if (Array.isArray(r.rebound) && r.rebound.length) parts.push(`${count(r.rebound.length, "session")} rebound`);
+  if (r.default_model) parts.push(`default: ${r.default_model}`);
+  const summary = parts.length ? "Profiles reloaded (" + parts.join(" · ") + ")." : "Profiles reloaded; no changes.";
+  const notes = Array.isArray(r.notes) ? r.notes.filter(Boolean) : [];
+  return notes.length ? summary + " " + notes.join(" ") : summary;
+}
+
+/** Summary of a `POST /api/gc` SweepReport (dry-run or applied). */
+export function formatGcReport(r) {
+  if (!r || typeof r !== "object") return "GC complete.";
+  const col = Number(r.collected) || 0;
+  const bytes = byteSize(r.collected_bytes || 0);
+  const kept = Number(r.kept) || 0;
+  const examined = Number(r.examined) || 0;
+  if (r.applied) {
+    return col > 0
+      ? `GC removed ${count(col, "blob")} (${bytes} freed); ${count(kept, "blob")} kept of ${num(examined)} examined.`
+      : `GC ran: nothing to remove (${count(kept, "blob")} kept).`;
+  }
+  return col > 0
+    ? `GC preview: ${count(col, "blob")} reclaimable (${bytes}); ${count(kept, "blob")} kept of ${num(examined)} examined.`
+    : `GC preview: nothing reclaimable (${count(kept, "blob")} kept of ${num(examined)} examined).`;
+}
+
+/** Summary of a `POST /api/mcp/{server}/check` response. */
+export function formatMcpCheck(v) {
+  if (!v || typeof v !== "object") return { ok: false, summary: "No response from check.", tools: [], stderr: [] };
+  const tools = Array.isArray(v.tools) ? v.tools : [];
+  const stderr = Array.isArray(v.stderr_tail) ? v.stderr_tail.filter(Boolean) : [];
+  if (v.error) {
+    return { ok: false, summary: `Check failed: ${v.error}`, tools, stderr };
+  }
+  const ident = [v.server_name, v.server_version].filter(Boolean).join(" ");
+  const parts = [ident || v.server || "MCP server"];
+  if (v.protocol) parts.push(`protocol ${v.protocol}`);
+  parts.push(count(tools.length, "tool"));
+  return { ok: true, summary: "OK · " + parts.join(" · "), tools, stderr };
+}
+
+/** Summary of `status.signal` (optional field from GET /api/status). */
+export function formatSignalStatus(signal, now = Date.now()) {
+  if (!signal || typeof signal !== "object") {
+    return { available: false, state: "Disabled", tone: "dim", rows: [] };
+  }
+  if (!signal.enabled) {
+    return { available: true, state: "Disabled", tone: "dim", rows: [] };
+  }
+  const connected = !!signal.connected;
+  const muted = Number.isFinite(signal.muted_until_ms) && signal.muted_until_ms > now;
+  const state = connected ? (muted ? "Connected (muted)" : "Connected") : "Disconnected";
+  const tone = connected ? (signal.last_error ? "warn" : "ok") : "bad";
+  const rows = [];
+  if (signal.account) rows.push(["Account", String(signal.account)]);
+  if (signal.recipient) rows.push(["Recipient", String(signal.recipient)]);
+  if (signal.last_event_ms) rows.push(["Last event", age(now, signal.last_event_ms) === "now" ? "just now" : age(now, signal.last_event_ms) + " ago"]);
+  if (signal.last_send_ms) rows.push(["Last send", age(now, signal.last_send_ms) === "now" ? "just now" : age(now, signal.last_send_ms) + " ago"]);
+  if (muted) rows.push(["Muted until", new Date(signal.muted_until_ms).toLocaleTimeString()]);
+  if (signal.pending_sends) rows.push(["Pending sends", num(signal.pending_sends)]);
+  if (signal.dropped_events) rows.push(["Dropped events", num(signal.dropped_events)]);
+  if (signal.last_error) rows.push(["Last error", String(signal.last_error)]);
+  return { available: true, state, tone, rows };
+}
+
+/** One-line description of a proxy rewrite rule (`RewriteRule`). */
+export function rewriteRuleSummary(rule) {
+  if (!rule || typeof rule !== "object") return "";
+  const m = rule.matchers || {};
+  const when = [];
+  if (m.host) when.push("host=" + m.host);
+  if (Array.isArray(m.methods) && m.methods.length) when.push(m.methods.join("/"));
+  if (m.url_regex) when.push("url=/" + oneLine(m.url_regex, 40) + "/");
+  if (Array.isArray(m.status) && m.status.length) when.push("status=" + m.status.join(","));
+  const acts = (Array.isArray(rule.actions) ? rule.actions : []).map((a) => {
+    if (!a || !a.type) return "";
+    switch (a.type) {
+      case "set_header": return `set header ${a.name}${a.sensitive ? " (secret)" : a.value != null ? "=" + oneLine(a.value, 30) : ""}`;
+      case "delete_header": return `delete header ${a.name}`;
+      case "replace_header": return `replace header ${a.name}`;
+      case "set_method": return `set method ${a.value}`;
+      case "set_path_query": return `set path ${oneLine(a.value, 30)}`;
+      case "replace_url": return `replace url`;
+      case "set_body": return a.sensitive ? "set body (secret)" : "set body";
+      case "replace_body": return a.sensitive ? "replace body (secret)" : "replace body";
+      case "set_status": return `set status ${a.value}`;
+      default: return a.type.replace(/_/g, " ");
+    }
+  }).filter(Boolean);
+  return [rule.phase || "request", when.length ? when.join(" ") : "any request", acts.join(", ")].filter(Boolean).join(" · ");
+}
+
+/** Build and validate a `RewriteRule` body for `POST /api/traffic/rewrite-rules` or `PUT /api/traffic/rewrite-rules/{id}`. */
+export function buildRewriteRule(form = {}) {
+  const name = String(form.name ?? "").trim();
+  if (!name) return { error: "Rule name is required." };
+  if (Array.isArray(form.extraActions) && form.extraActions.length > 0) {
+    return { error: "Multi-action rewrite rules must be edited via the CLI so extra actions are preserved." };
+  }
+  const id = Number(form.id) || 0;
+  const phase = form.phase === "response" ? "response" : "request";
+  const priority = Number.isFinite(Number(form.priority)) ? Math.trunc(Number(form.priority)) : 0;
+  const matchers = {};
+  const extra = form.extraMatchers && typeof form.extraMatchers === "object" ? form.extraMatchers : null;
+  if (extra) {
+    if (Array.isArray(extra.headers) && extra.headers.length) matchers.headers = extra.headers;
+    if (typeof extra.body_regex === "string" && extra.body_regex) matchers.body_regex = extra.body_regex;
+    if (Array.isArray(extra.resp_headers) && extra.resp_headers.length) matchers.resp_headers = extra.resp_headers;
+    if (typeof extra.resp_body_regex === "string" && extra.resp_body_regex) matchers.resp_body_regex = extra.resp_body_regex;
+  }
+  const host = String(form.host ?? "").trim();
+  if (host) matchers.host = host;
+  const methods = String(form.methods ?? "").split(/[\s,]+/).map((m) => m.trim().toUpperCase()).filter(Boolean);
+  if (methods.length) matchers.methods = methods;
+  const urlRegex = String(form.url_regex ?? "").trim();
+  if (urlRegex) matchers.url_regex = urlRegex;
+  const status = String(form.status ?? "").split(/[\s,]+/).map((s) => s.trim()).filter(Boolean);
+  if (status.length) matchers.status = status;
+
+  const actionType = String(form.actionType || "set_header");
+  const headerName = String(form.headerName ?? "").trim();
+  const regex = String(form.regex ?? "");
+  const value = String(form.value ?? "");
+  const sensitive = !!form.sensitive;
+  // On update of an existing sensitive rule, leaving `value` blank sends `null` so the daemon retains the stored secret.
+  const keepSecret = id > 0 && sensitive && value === "" && form.hadSensitiveValue !== false;
+  const secretOrValue = keepSecret ? null : value;
+  let action;
+  switch (actionType) {
+    case "set_header":
+      if (!headerName) return { error: "Header name is required." };
+      action = { type: "set_header", name: headerName, value: secretOrValue, sensitive };
+      break;
+    case "delete_header":
+      if (!headerName) return { error: "Header name is required." };
+      action = { type: "delete_header", name: headerName };
+      break;
+    case "replace_header":
+      if (!headerName) return { error: "Header name is required." };
+      if (!regex) return { error: "Match regex is required." };
+      action = { type: "replace_header", name: headerName, regex, value: secretOrValue, sensitive };
+      break;
+    case "set_method":
+      if (!value.trim()) return { error: "Method is required." };
+      action = { type: "set_method", value: value.trim().toUpperCase() };
+      break;
+    case "set_path_query":
+      if (!value.trim()) return { error: "Path/query is required." };
+      action = { type: "set_path_query", value: value.trim() };
+      break;
+    case "replace_url":
+      if (!regex) return { error: "Match regex is required." };
+      action = { type: "replace_url", regex, value };
+      break;
+    case "set_body":
+      action = { type: "set_body", value: secretOrValue, sensitive };
+      break;
+    case "replace_body":
+      if (!regex) return { error: "Match regex is required." };
+      action = { type: "replace_body", regex, value: secretOrValue, sensitive };
+      break;
+    case "set_status": {
+      if (phase !== "response") return { error: "Set status is only valid in the response phase." };
+      const code = Number(value.trim());
+      if (!Number.isInteger(code) || code < 200 || code > 599 || code === 204 || code === 304) {
+        return { error: "HTTP status must be an integer between 200 and 599 excluding 204 and 304." };
+      }
+      action = { type: "set_status", value: code };
+      break;
+    }
+    default:
+      return { error: `Unknown action type "${actionType}".` };
+  }
+  return {
+    rule: {
+      id,
+      name,
+      enabled: !!form.enabled,
+      phase,
+      priority,
+      matchers,
+      actions: [action],
+      note: String(form.note ?? "").trim(),
+    },
+  };
+}
+
+/** Classify user input pasted into the sign-in recovery box: a full `ferret open` URL (`#code=...`), a login code, or a bearer secret/token. */
+export function classifyAuthInput(raw) {
+  const s = String(raw ?? "").trim();
+  if (!s) return { error: "Paste a login URL, login code, or access token." };
+  const fromHash = codeFromHash(s.includes("#") ? s.slice(s.indexOf("#")) : "#" + s);
+  if (fromHash) return { kind: "code", value: fromHash };
+  // A standalone hex code from `ferret open` / web-session redemption vs an arbitrary bearer token.
+  // Login codes minted by the daemon are lowercase hex (32-64 chars); bearer tokens may be hex too,
+  // so try redeeming hex strings as login codes first and fall back to bearer test if 401.
+  if (/^[0-9a-f]{16,128}$/i.test(s)) return { kind: "code_or_token", value: s };
+  return { kind: "token", value: s };
 }

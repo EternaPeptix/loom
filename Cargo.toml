@@ -1,12 +1,12 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/loom-core",
-    "crates/loom-model",
-    "crates/loom-tools",
-    "crates/loom-net",
-    "crates/loom-agent",
-    "crates/loom-daemon",
+    "crates/ferret-core",
+    "crates/ferret-model",
+    "crates/ferret-tools",
+    "crates/ferret-net",
+    "crates/ferret-agent",
+    "crates/ferret-daemon",
 ]
 
 [workspace.package]
@@ -16,11 +16,11 @@ license = "MIT"
 rust-version = "1.88"
 
 [workspace.dependencies]
-loom-core = { path = "crates/loom-core" }
-loom-model = { path = "crates/loom-model" }
-loom-tools = { path = "crates/loom-tools" }
-loom-net = { path = "crates/loom-net" }
-loom-agent = { path = "crates/loom-agent" }
+ferret-core = { path = "crates/ferret-core" }
+ferret-model = { path = "crates/ferret-model" }
+ferret-tools = { path = "crates/ferret-tools" }
+ferret-net = { path = "crates/ferret-net" }
+ferret-agent = { path = "crates/ferret-agent" }
 
 serde = { version = "1", features = ["derive"] }
 # float_roundtrip: a float parsed from JSON is the exact value written, so a line re-serialized to check its MAC

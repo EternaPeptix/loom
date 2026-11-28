@@ -10,6 +10,7 @@ may_spawn = ["worker", "verifier"]
 verify_finish = true
 tools = [
   "bash", "job_wait", "job_kill", "job_list", "read", "write", "edit", "glob", "grep", "out_read", "out_grep", "web_fetch", "dep_scan",
+  "box_exec", "box_get", "box_reset",
   "plan", "step", "note", "claim", "claim_update", "evidence", "ledger", "pin", "log_search", "reflect",
   "agent_spawn", "agent_fanout", "attempt", "agent_adopt", "agent_message", "agent_stop", "decide", "verify",
   "request_scope", "conclude", "finish", "ask_user", "report_blocker", "wait", "ask_for",
@@ -22,6 +23,7 @@ prompt = "roles/worker.md"
 termination = "explicit"
 tools = [
   "bash", "job_wait", "job_kill", "job_list", "read", "write", "edit", "glob", "grep", "out_read", "out_grep", "web_fetch", "dep_scan",
+  "box_exec", "box_get", "box_reset",
   "note", "claim", "claim_update", "evidence", "ledger", "pin", "log_search", "reflect",
   "finish", "report_blocker", "wait", "hand_off",
 ]
@@ -45,6 +47,7 @@ prompt = "roles/chat.md"
 termination = "free"
 tools = [
   "bash", "job_wait", "job_kill", "job_list", "read", "write", "edit", "glob", "grep", "out_read", "out_grep", "web_fetch", "dep_scan",
+  "box_exec", "box_get", "box_reset",
   "pin", "log_search", "request_scope",
 ]
 hidden_tools = ["out_read", "out_grep", "job_list", "pin"]

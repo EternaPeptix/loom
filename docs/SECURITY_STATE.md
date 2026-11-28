@@ -1,7 +1,7 @@
 # Durable security state
 
 Security state is an additive projection of the sealed mission journal. Existing journals and ledger
-snapshots remain readable. New `security` journal entries contain a typed `action`; an older Loom
+snapshots remain readable. New `security` journal entries contain a typed `action`; an older Ferret
 build refuses to append after an unknown action rather than dropping it. No security observation
 grants network scope, approves an action, or establishes a vulnerability by itself.
 
@@ -56,6 +56,67 @@ Every evidence record carries the grade the harness gave the output it quotes (`
 accept any attested grade. The goal-met conclusion, a verifier's objection and stuck detection accept
 only a run, so a scanner verdict, a decompilation, an imported scan or an advisory can locate a lead
 and support a claim, but cannot by itself show that the goal is met.
+
+## Per-`(surface, risk_area)` coverage & evidence provenance
+
+In addition to asset-level `coverage_set`, `security_record` supports per-`(surface, risk_area)`
+coverage entries (`cv-<sha256>`) with five explicit dispositions:
+
+- `reported`: confirmed issue backed by at least one attested evidence ID (`evidence:[eN]`).
+- `no_issue_found`: tested thoroughly and found nothing (requires attested `evidence` or a nonblank `reason`).
+- `ruled_out`: disproved a specific candidate; requires both `control` (the specific defense/guard) and `location` (file:line, handler, or config where it runs).
+- `not_applicable`: risk cannot apply to this surface; requires a nonblank `reason`.
+- `needs_follow_up`: plausible but unresolved; requires a nonblank `reason` naming the specific proof gap or blocker.
+
+Entries are uniquely keyed by case-insensitive trimmed `(surface, risk_area)`. Attempting to call
+`coverage_record` on an existing `(surface, risk_area)` is rejected with the existing entry's ID,
+author, and current outcome, directing the agent to call `coverage_update` instead. `coverage_update`
+updates the row in place while preserving every prior state in `history` (keeping `surface`,
+`risk_area`, and `recorded_by` immutable).
+
+`security_query {view:"coverage"}` keeps legacy `mandatory_open` and `assets` fields while
+separating `agent_reported` coverage entries (with per-entry resolved `evidence_provenance`) from
+`machine_observed` runtime facts (attested evidence grade counts, mandatory assets still open,
+worker child sessions that recorded no coverage under `silent_children`, and `gaps.unbacked_clears`
+flagging any `no_issue_found`/`ruled_out` claim that has no attested `run` evidence). Optional
+filters `outcome` and `surface` narrow the returned entries.
+
+## Structured findings & SARIF 2.1.0 export
+
+`security_record` records structured security findings (`fn-<sha256>`) via `finding_record` and
+revises or withdraws them via `finding_update` (keeping a per-update `revisions` audit trail):
+
+- Required quality gates: `title`, `description`, `impact`, `target`, attested `evidence:[eN]`
+  (or inline `out:` handles synthesized automatically), `counterevidence` (strongest case against
+  the finding or controls checked), `confidence` (`high|medium|low`, with `confidence_rationale`
+  required whenever confidence is not `high`), `severity_change_conditions`, and either an 8-metric
+  CVSS 3.1 `cvss_breakdown` (from which `cvss`, `cvss_vector`, and `severity` are computed
+  mechanically per FIRST CVSS v3.1) or an explicit `severity` (`critical|high|medium|low|info`).
+- Optional structured fields: `technical_analysis`, `remediation_steps`, `assumptions`,
+  `poc_description`, `poc_handle` (an `out:` handle to a stored PoC — raw exploit payloads are
+  never embedded into SARIF), `fix_effort`, `endpoint`, `method`, `cwe` (`CWE-NNN`), `cve`
+  (`CVE-YYYY-NNNN+`), `http_exchanges`, `asset`, `claim`, and repo-relative POSIX `code_locations`
+  (`{file, start_line, end_line, snippet?, label?, fix_before?, fix_after?}`). Whenever any
+  `code_locations` item carries `fix_after`, `fix_verification` is required.
+- Duplicate findings are rejected with the existing `fn-` ID so updates go through `finding_update`.
+- `security_query {view:"findings", severity?:...}` lists findings with resolved
+  `evidence_provenance` and active/withdrawn severity counts.
+
+Export or inspect any mission's active findings and per-surface coverage provenance (OASIS SARIF 2.1.0,
+compatible with GitHub Code Scanning `upload-sarif` and ASPM tools):
+
+- CLI inspect: `ferret findings <session|mission> [-a/--all] [--severity <critical|high|medium|low|info>] [--json]`
+- CLI export: `ferret sarif <session|mission> [-o findings.sarif] [--repo-name owner/repo --repo-uri ... --commit ... --branch ... --git-ref ...]`
+- HTTP API: `GET /api/missions/{id}/sarif`
+
+SARIF rules are keyed on canonical `CWE-NNN` (with `helpUri`, `security-severity`, and `stride:<leg>`
+tags), physical locations drop unsafe paths and anchor locationless DAST findings to `SECURITY.md`
+with `properties.synthetic_location: true`, verified `fix_before`/`fix_after` pairs emit SARIF
+`fixes`, deterministic `partialFingerprints.primaryLocationLineHash` and `ferret_vuln_class_hash`
+enable cross-run alert reconciliation, non-`reported` coverage entries ride as `pass` /
+`notApplicable` / `open` results (`level: "none"`), and `run.invocations[0]` sets
+`executionSuccessful: false` with warning notifications whenever follow-up gaps, untested mandatory
+assets, silent children, or operator release leave coverage incomplete.
 
 ## How `security_record` reads near misses
 
@@ -138,3 +199,102 @@ reject the entire import. A single atomic sealed batch makes assets and their co
 relationships durable. Scanner severity, credentials, group membership, and exploitability claims
 are not imported as verified facts. Unsupported scanner versions/formats fail visibly rather than
 guessing their meaning.
+
+## Deterministic 3-axis finding deduplication
+
+Every structured finding (`finding_record`) computes a deterministic SHA-256 `fingerprint` across three
+canonical axes:
+1. normalized vulnerability class (canonical `CWE-NNN` when present, otherwise normalized `vuln_class`);
+2. canonical host / asset locator (stripping credentials and trailing dots); and
+3. normalized endpoint path plus sorted query parameter names (or primary `code_location` when no URL is given).
+
+Recording a second active finding with the same fingerprint is rejected so agents refine the existing
+`fn-...` record via `finding_update` instead of creating reworded duplicates. Withdrawn findings do not
+block recording a newly substantiated finding.
+
+## HAR 1.2 traffic export and import
+
+Operators can inspect captured mission HTTP traffic live or round-trip it with Burp Suite, OWASP ZAP, or browser DevTools:
+- `ferret traffic <session> [--host HOST] [--after SEQ] [-n N] [--json]` (or `ferret traffic --target <name> [--node NODE] [-n N] [--json]`)
+- `GET /api/missions/{id}/har?host=&limit=` or `ferret har export <session|mission> [-o out.har] [--host HOST] [--limit N]`
+- `POST /api/missions/{id}/har` or `ferret har import <session|mission> traffic.har`
+
+URL userinfo is always stripped; binary bodies use `encoding: "base64"`; imported exchanges get preserved
+`_ferretExchangeId` values or deterministic `ex-har-*` IDs so repeated imports skip duplicates idempotently.
+
+## Egress noise governor, assessment `User-Agent`, and operator-only rewrite rules
+
+- **`[network] noise_profile`**: `"off"` (default passthrough) | `"quiet"` (2 rps, concurrency 1/host, 8 global) |
+  `"balanced"` (5 rps, 2/host, 16 global) | `"aggressive"` (20 rps, 4/host, 32 global). Enforced mechanically in
+  the egress proxy with jitter and `429`/`503` (`Retry-After`) per-host backoff; non-`off` profiles also inject
+  a code-owned low-and-slow CLI scanner flags block into the session prompt. Inspect live counters with
+  `ferret net --noise [--json]` or `GET /api/network/noise`.
+- **`[network.assessment_ua]`**: optional `{ origins = ["https://app.example.test"], reference = "bb-42" }`.
+  Attaches `User-Agent: Ferret-Assessment/1.0 (engagement=bb-42)` ONLY on exact approved `(scheme, host, port)`
+  origins when a request has no explicit `User-Agent`, never leaking across cross-origin redirects.
+- **Operator-only proxy rewrite rules**: managed exclusively via `/api/traffic/rewrite-rules` and
+  `ferret rewrite list [--json]|add|enable|disable|rm|example` (never exposed as an agent tool). Rules are created disabled,
+  stored atomically in `<ferret home>/rewrite_rules.json` (0600), refuse mutating framing/hop/`Host`/`Proxy-*`
+  headers or `CONNECT`, mask `sensitive: true` values on API reads, and reload live without restarting.
+
+## Operator-scoped read-only email inbox (`[mail]` / `inbox_read`)
+
+Disabled by default. Operators who want agents to activate bug bounty platform or target test accounts and
+read OTP / confirmation links without exposing personal mail can configure `[mail]` in `config.toml`:
+
+```toml
+[mail]
+enabled = true
+backend = "imaps"                        # or "maildir" (with maildir_path = "/path/to/maildir") for local labs
+host = "imap.gmail.com"
+port = 993
+username = "researcher@gmail.com"
+password_file = "~/.ferret/keys/mail.pass" # must be chmod 600; never inline
+auth = "login"                           # or "xoauth2"
+folder = "INBOX"
+allow_senders = ["*@hackerone.com", "*@bugcrowd.com", "*@intigriti.com", "*@yeswehack.com", "*@*.target.example"]
+allow_recipients = ["researcher+bb-*@gmail.com"] # optional plus-address filter
+require_auth_pass = true                 # default false; true requires Authentication-Results dkim=pass or spf=pass
+max_age_minutes = 120                    # only recent mail (0 = unbounded)
+max_messages = 20                        # 1..=50
+# roles = ["lead", "worker"]             # optional; empty = every non-read-only role
+```
+
+- `allow_senders` is mandatory and cannot be `*` or `*@*`. Display-name spoofing (`"security@hackerone.com" <phish@evil.test>`) is stripped before matching.
+- IMAPS opens the mailbox strictly read-only (`EXAMINE` + `BODY.PEEK[...]`), checks policy on headers BEFORE fetching any body, and never reveals non-matching messages.
+- `inbox_read` is dynamically registered ONLY when `[mail] enabled = true`; verify setup with `ferret mail check`.
+
+## Two-way Signal notifications and replies (`[signal]`)
+
+Disabled by default. Connects natively from `ferret daemon` to a local `signal-cli daemon --http` instance
+(outbound JSON-RPC `/api/v1/rpc`, inbound SSE `/api/v1/events`) so operators receive `blocker`, `question`,
+`approval`, `parked`, `finished`, `error`, and optional `disk` alerts on Signal (plus `[notify] repeat_minutes`
+and post-restart open-blocker reminders) and can answer or steer missions directly from their phone:
+
+- **Strict sender & group allowlists:** `allow_from` is mandatory, validated at config check time (explicit
+  E.164 phone numbers like `+15550199` or Signal ACI/PNI UUIDs; `*` is refused), and unauthorized senders are
+  ignored (logged at `warn`). `allow_groups` accepts raw `<groupId>` or `group:<groupId>` (normalized on
+  load; a `group:<groupId>` `recipient` is allowed automatically).
+- **Phone Number Privacy (PNP):** When Signal hides phone numbers, inbound envelopes may carry only
+  `sourceUuid`. Discover your ACI UUID via `signal-cli -a +15550100 listContacts --all-recipients` and
+  include it in `allow_from` (and `recipient` if needed); plain `<uuid>`, `u:<uuid>`, and `PNI:<uuid>` are
+  accepted.
+- **Safety-number trust (`UNTRUSTED_IDENTITY`):** After a Signal reinstall or device change, inspect pending
+  identities with `signal-cli -a +15550100 listIdentities` and trust the verified safety number with
+  `signal-cli -a +15550100 trust -v "<safety-number>" <recipient>` (or `trust -a <recipient>` for your own
+  re-linked device), then verify with `ferret signal test`.
+- **Safe routing & scope approvals:** Quote-replying to an alert routes directly to that inbox item
+  (`Runtime::answer`, expanding option numbers `1..N`), grants/denies `request_scope` approvals
+  (`approve`/`yes`/`all`, host numbers like `1 2`, or `deny`/`no`/`dismiss`), or sends a follow-up to that
+  session (`Runtime::send_message`) for `finished`/`error` alerts, persisted across restarts in
+  `<ferret home>/signal_sent.json` (mode `0600`). Unmatched quote-replies never fall through to answer a
+  different mission's open blocker.
+- **Commands & diagnostics:** Plain DM replies answer an unambiguous sole open blocking item (group chatter
+  is ignored unless quoted, `@<id>`-addressed, or a slash command); `/inbox`, `/status`, `/tail [id|#n] [count]`,
+  `/scope <id|#n> [host...]`, `/dismiss [id|#n]`, `/stop [id|#n]`, `/resume [id|#n]`, `/approve <id|#n> <text>`,
+  `/rule <id|#n> <text>`, `/release <id|#n> <reason>`, `/mute [15m|2h|off]`, `/unmute`, and `/help` (`/start`)
+  work from Signal. Verify setup with `ferret signal check` and `ferret signal test`, and monitor live bridge
+  health in `ferret status` / `GET /api/status`. See `docs/RUN.md` ("Signal") for step-by-step setup and
+  troubleshooting.
+
+

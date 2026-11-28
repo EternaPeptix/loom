@@ -5,3 +5,7 @@
 
 # built app bundle
 gui/dist/
+
+# python bytecode
+__pycache__/
+*.pyc

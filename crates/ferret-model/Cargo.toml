@@ -1,0 +1,25 @@
+[package]
+name = "ferret-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "ferret: OpenAI-compatible streaming client, request limiter, scripted mock server"
+
+[dependencies]
+ferret-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+futures-util.workspace = true
+bytes.workspace = true
+reqwest.workspace = true
+axum.workspace = true
+rand.workspace = true
+base64.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
