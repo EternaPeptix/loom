@@ -798,6 +798,9 @@ fn try_enqueue_job(
 }
 
 fn dec_pending(pending: &AtomicUsize, health: &SignalHealth) {
+    // Rust 1.100 deprecated `fetch_update` in favour of `try_update`. The old name builds on every toolchain the
+    // workspace supports (rust-version 1.88), which the new one is not known to, so it stays.
+    #[allow(deprecated)]
     let prev = pending.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some(v.saturating_sub(1))).unwrap_or(0);
     health.set_pending_sends(prev.saturating_sub(1));
 }
