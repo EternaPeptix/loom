@@ -105,43 +105,56 @@ struct RootView: View {
 
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
-        ToolbarItemGroup(placement: .navigation) {
+        // Keep text/menu labels out of macOS 26+ Liquid Glass icon platters so text never overflows a circular bezel.
+        ToolbarItem(placement: .navigation) {
             connectionMenu
+        }
+        .hideGlassPlatterIfAvailable()
+
+        ToolbarItemGroup(placement: .navigation) {
             if state.isConnected {
-                ControlGroup {
-                    Button { state.goBack() } label: {
-                        Image(systemName: "chevron.left")
-                    }
-                    .disabled(!state.canGoBack)
-                    .help("Back (⌘[)")
-                    .accessibilityLabel("Back")
-                    Button { state.goForward() } label: {
-                        Image(systemName: "chevron.right")
-                    }
-                    .disabled(!state.canGoForward)
-                    .help("Forward (⌘])")
-                    .accessibilityLabel("Forward")
+                Button { state.goBack() } label: {
+                    Image(systemName: "chevron.left")
                 }
+                .disabled(!state.canGoBack)
+                .help("Back (⌘[)")
+                .accessibilityLabel("Back")
+
+                Button { state.goForward() } label: {
+                    Image(systemName: "chevron.right")
+                }
+                .disabled(!state.canGoForward)
+                .help("Forward (⌘])")
+                .accessibilityLabel("Forward")
             }
         }
 
-        ToolbarItemGroup(placement: .primaryAction) {
-            toolbarStatusCluster
-            if state.isConnected && abs(state.pageZoom - 1.0) > 0.01 {
-                Button {
-                    state.zoomReset()
-                    state.focusWebPane()
-                } label: {
-                    Text("\(Int((state.pageZoom * 100).rounded()))%")
-                        .font(.caption.monospacedDigit().weight(.medium))
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(.quaternary.opacity(0.75), in: Capsule())
+        // Status text and custom pill badges live in their own platter-free toolbar item (macOS 26+).
+        ToolbarItem(placement: .primaryAction) {
+            HStack(spacing: 8) {
+                toolbarStatusCluster
+                if state.isConnected && abs(state.pageZoom - 1.0) > 0.01 {
+                    Button {
+                        state.zoomReset()
+                        state.focusWebPane()
+                    } label: {
+                        Text("\(Int((state.pageZoom * 100).rounded()))%")
+                            .font(.caption.monospacedDigit().weight(.medium))
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 3)
+                            .background(.quaternary.opacity(0.75), in: Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .help("Reset zoom to 100% (⌘0)")
+                    .accessibilityLabel("Zoom \(Int((state.pageZoom * 100).rounded())) percent. Click to reset.")
                 }
-                .buttonStyle(.plain)
-                .help("Reset zoom to 100% (⌘0)")
-                .accessibilityLabel("Zoom \(Int((state.pageZoom * 100).rounded())) percent. Click to reset.")
             }
+            .padding(.horizontal, 4)
+        }
+        .hideGlassPlatterIfAvailable()
+
+        // Pure SF Symbol buttons only inside the native Liquid Glass action group.
+        ToolbarItemGroup(placement: .primaryAction) {
             if state.notifStatus == .notDetermined || state.notifStatus == .denied {
                 Button {
                     if state.notifStatus == .denied {
@@ -229,7 +242,8 @@ struct RootView: View {
                     .lineLimit(1)
                     .truncationMode(.tail)
             }
-            .padding(.horizontal, 4)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 3)
         }
         .menuStyle(.borderlessButton)
         .fixedSize()
@@ -240,6 +254,7 @@ struct RootView: View {
     @ViewBuilder
     private var toolbarStatusCluster: some View {
         let countsStale = state.feedStatus.stale || state.daemonUnreachable
+        let showLiveLabel = state.isConnected && !state.daemonUnreachable && !state.feedStatus.stale
         HStack(spacing: 8) {
             if state.feedStatus.lastUpdated != nil {
                 ViewThatFits(in: .horizontal) {
@@ -259,8 +274,8 @@ struct RootView: View {
                             .font(.caption.weight(.semibold))
                             .foregroundStyle(countsStale ? Color.secondary : Color.orange)
                             .lineLimit(1)
-                            .padding(.horizontal, 7)
-                            .padding(.vertical, 2)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
                             .background((countsStale ? Color.secondary : Color.orange).opacity(0.16), in: Capsule())
                     }
                     .buttonStyle(.plain)
@@ -277,8 +292,8 @@ struct RootView: View {
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                                 .lineLimit(1)
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 3)
                                 .background(.quaternary.opacity(0.6), in: Capsule())
                         }
                         .buttonStyle(.plain)
@@ -288,12 +303,19 @@ struct RootView: View {
                     }
                 }
             }
-            if state.isConnected && !state.daemonUnreachable && !state.feedStatus.stale {
+            if showLiveLabel {
+                if state.feedStatus.lastUpdated != nil {
+                    Text("·")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                        .accessibilityHidden(true)
+                }
                 TimelineView(.periodic(from: .now, by: 5)) { context in
                     Text(state.feedStatus.label(at: context.date))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
+                        .fixedSize()
                 }
                 .help(state.feedStatus.detail.isEmpty ? state.status : state.feedStatus.detail)
             } else if !state.isConnected && state.link != .none {
@@ -301,6 +323,7 @@ struct RootView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
+                    .fixedSize()
                     .help(state.status)
             }
         }
@@ -739,5 +762,20 @@ struct WindowCloseHider: NSViewRepresentable {
             }
             return super.forwardingTarget(for: aSelector)
         }
+    }
+}
+
+private extension ToolbarContent {
+    @ToolbarContentBuilder
+    func hideGlassPlatterIfAvailable() -> some ToolbarContent {
+        #if compiler(>=6.2)
+        if #available(macOS 26.0, *) {
+            self.sharedBackgroundVisibility(.hidden)
+        } else {
+            self
+        }
+        #else
+        self
+        #endif
     }
 }
