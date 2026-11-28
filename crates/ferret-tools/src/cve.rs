@@ -94,8 +94,8 @@
 use crate::web::{ProxyVerdict, Tunnel};
 use crate::{Body, Tool, ToolCtx, ToolOutput};
 use async_trait::async_trait;
-use futures_util::StreamExt;
 use ferret_core::event::{ToolClass, ToolSpec, ToolStatus, META_EVIDENCE_GRADE, META_RAW_BLOB};
+use futures_util::StreamExt;
 use reqwest::{redirect, Client, Proxy, RequestBuilder};
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
@@ -1814,7 +1814,8 @@ mod tests {
         };
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let proxy = ferret_net::Proxy::start(0, tx).await.unwrap();
-        let grant = proxy.grant(&ferret_core::SessionId::from("s-cve"), ferret_net::Policy::new(&cfg).unwrap()).unwrap();
+        let grant =
+            proxy.grant(&ferret_core::SessionId::from("s-cve"), ferret_net::Policy::new(&cfg).unwrap()).unwrap();
         let mut e = env();
         e.ctx.env = Arc::new(grant.env());
         seamed(&mut e, "https://nvd.blocked.test");

@@ -16,8 +16,8 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     Engine,
 };
-use hmac::{Hmac, KeyInit, Mac};
 use ferret_core::event::{ToolClass, ToolSpec};
+use hmac::{Hmac, KeyInit, Mac};
 use serde_json::{json, Map, Value};
 use sha1::Sha1;
 

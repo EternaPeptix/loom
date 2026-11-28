@@ -188,8 +188,7 @@ impl Runtime {
             ));
         }
         let imported = ferret_core::ingest::parse_bounty_scope(input, format)?;
-        let (cfg, added_scope, added_exclude) =
-            store.merge_scope(name, &imported.in_scope, &imported.out_of_scope)?;
+        let (cfg, added_scope, added_exclude) = store.merge_scope(name, &imported.in_scope, &imported.out_of_scope)?;
         if added_scope > 0 || added_exclude > 0 {
             self.inner.publish(BusEvent::Target { name: name.to_string() });
         }
@@ -352,9 +351,9 @@ impl Runtime {
             let found = self.exchanges_of(
                 &s,
                 |x| {
-                    norm_filter.as_deref().is_none_or(|want| {
-                        x.host.trim().trim_end_matches('.').eq_ignore_ascii_case(want)
-                    })
+                    norm_filter
+                        .as_deref()
+                        .is_none_or(|want| x.host.trim().trim_end_matches('.').eq_ignore_ascii_case(want))
                 },
                 None,
                 usize::MAX,
@@ -367,11 +366,7 @@ impl Runtime {
         if let Some(n) = limit.filter(|&n| n > 0) {
             opts.max_entries = n.min(ferret_core::har::DEFAULT_MAX_IMPORT_ENTRIES);
         }
-        let extra_secrets = if sanitize {
-            self.inner.rewrites.snapshot().sensitive_values()
-        } else {
-            Vec::new()
-        };
+        let extra_secrets = if sanitize { self.inner.rewrites.snapshot().sensitive_values() } else { Vec::new() };
         ferret_core::har::export_har_sanitized(&pairs, &self.inner.blobs, &opts, &extra_secrets, sanitize)
     }
 
@@ -401,13 +396,8 @@ impl Runtime {
                 existing.insert(e.exchange.id);
             }
         }
-        if let Some(mt) = self
-            .inner
-            .mission_traffic
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(mission)
-            .and_then(Weak::upgrade)
+        if let Some(mt) =
+            self.inner.mission_traffic.lock().unwrap_or_else(|p| p.into_inner()).get(mission).and_then(Weak::upgrade)
         {
             for x in mt.all() {
                 existing.insert(x.id);
@@ -424,13 +414,8 @@ impl Runtime {
             return Ok(result);
         }
 
-        let active_traffic = self
-            .inner
-            .traffic
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(&lead)
-            .and_then(Weak::upgrade);
+        let active_traffic =
+            self.inner.traffic.lock().unwrap_or_else(|p| p.into_inner()).get(&lead).and_then(Weak::upgrade);
 
         if let Some(traffic) = active_traffic {
             for item in imported {

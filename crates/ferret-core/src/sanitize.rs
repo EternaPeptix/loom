@@ -246,7 +246,11 @@ pub fn sanitize_url(raw: &str, extra_secrets: &[String]) -> String {
         }
     }
 
-    if changed { u.to_string() } else { stripped }
+    if changed {
+        u.to_string()
+    } else {
+        stripped
+    }
 }
 
 /// Sanitize an `application/x-www-form-urlencoded` body: redacts sensitive parameter values and
@@ -628,7 +632,19 @@ mod tests {
              keys: {ghp} {sk} {aws} {custom} Bearer tok_standalone_999"
         );
         let once = sanitize_text(&sample, &[custom.to_string()]).into_owned();
-        for leaked in [jwt, ghp, sk, aws, custom, "secret-key-val", "csrf123", "sess999", "hunter2", "tok_live_987654321", "tok_standalone_999"] {
+        for leaked in [
+            jwt,
+            ghp,
+            sk,
+            aws,
+            custom,
+            "secret-key-val",
+            "csrf123",
+            "sess999",
+            "hunter2",
+            "tok_live_987654321",
+            "tok_standalone_999",
+        ] {
             assert!(!once.contains(leaked), "leaked `{leaked}` in: {once}");
         }
         assert!(once.contains("Authorization: Bearer [redacted]'"), "{once}");
@@ -662,7 +678,13 @@ mod tests {
             "https://u:p@shop.example.test/cb?next=%2Fadmin&access_token=tok999&api_key=k123#id_token=idt555",
             &[],
         );
-        assert!(!dirty_url.contains("u:p") && !dirty_url.contains("tok999") && !dirty_url.contains("k123") && !dirty_url.contains("idt555"), "{dirty_url}");
+        assert!(
+            !dirty_url.contains("u:p")
+                && !dirty_url.contains("tok999")
+                && !dirty_url.contains("k123")
+                && !dirty_url.contains("idt555"),
+            "{dirty_url}"
+        );
         assert!(dirty_url.contains("next=%2Fadmin"), "{dirty_url}");
         assert!(dirty_url.contains("access_token=[redacted]"), "{dirty_url}");
     }

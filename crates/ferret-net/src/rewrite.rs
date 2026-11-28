@@ -40,23 +40,18 @@ pub const MAX_REGEX_BYTES: usize = 1024;
 pub const MAX_VALUE_BYTES: usize = 1024 * 1024;
 pub const MAX_REWRITE_BODY_BYTES: usize = 1024 * 1024;
 
-const FORBIDDEN_HEADERS: &[&str] = &[
-    "host",
-    "content-length",
-    "transfer-encoding",
-    "connection",
-    "keep-alive",
-    "te",
-    "trailer",
-    "expect",
-    "upgrade",
-];
+const FORBIDDEN_HEADERS: &[&str] =
+    &["host", "content-length", "transfer-encoding", "connection", "keep-alive", "te", "trailer", "expect", "upgrade"];
 
 fn effective_port(scheme: &str, port: u16) -> u16 {
     if port != 0 {
         return port;
     }
-    if scheme.eq_ignore_ascii_case("https") { 443 } else { 80 }
+    if scheme.eq_ignore_ascii_case("https") {
+        443
+    } else {
+        80
+    }
 }
 
 /// Origin-scoped assessment identification header (`Ferret-Assessment/1.0 ...`).
@@ -418,7 +413,9 @@ impl RewriteRule {
                         return Err("`set_path_query` is only valid in the request phase.".into());
                     }
                     if !value.starts_with('/') || !no_crlf_nul(value) || value.contains(' ') {
-                        return Err("`set_path_query` must start with `/` and contain no spaces or control characters.".into());
+                        return Err(
+                            "`set_path_query` must start with `/` and contain no spaces or control characters.".into(),
+                        );
                     }
                     check_value_size(value, "set_path_query")?;
                 }
@@ -1066,14 +1063,8 @@ impl RewriteSet {
                 let mut cap_s = cur_status;
                 let mut next_cap_headers = cap_headers.clone();
                 let mut next_cap_body = cap_body.clone();
-                if apply_response_actions(
-                    &rule.actions,
-                    &mut cap_s,
-                    &mut next_cap_headers,
-                    &mut next_cap_body,
-                    true,
-                )
-                .is_err()
+                if apply_response_actions(&rule.actions, &mut cap_s, &mut next_cap_headers, &mut next_cap_body, true)
+                    .is_err()
                 {
                     // Never fall back to unredacted bytes when capture-side expansion exceeds bounds.
                     if rule.has_sensitive && this_body_changed {
@@ -1453,11 +1444,7 @@ impl RewriteStore {
     /// Replace an existing rule, preserving stored sensitive values only when `host` stays identical.
     pub fn update(&self, id: u64, mut incoming: RewriteRule) -> Result<RewriteRule, String> {
         let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        let idx = st
-            .rules
-            .iter()
-            .position(|r| r.id == id)
-            .ok_or_else(|| format!("There is no rewrite rule {id}."))?;
+        let idx = st.rules.iter().position(|r| r.id == id).ok_or_else(|| format!("There is no rewrite rule {id}."))?;
         let old = st.rules[idx].clone();
         incoming.id = id;
 
@@ -1539,11 +1526,7 @@ impl RewriteStore {
                 return Err(format!("Maximum of {MAX_ENABLED_RULES} enabled rewrite rules reached."));
             }
         }
-        let idx = st
-            .rules
-            .iter()
-            .position(|r| r.id == id)
-            .ok_or_else(|| format!("There is no rewrite rule {id}."))?;
+        let idx = st.rules.iter().position(|r| r.id == id).ok_or_else(|| format!("There is no rewrite rule {id}."))?;
         if enabled {
             st.rules[idx].validate()?;
         }
@@ -1600,13 +1583,10 @@ fn save_persisted(path: &Path, key_path: &Path, st: &PersistedRules) -> Result<(
             Err(e) => return Err(format!("Could not save `{}`: {e}", path.display())),
         }
     };
-    let write_res = f
-        .write_all(&bytes)
-        .and_then(|()| f.sync_all())
-        .and_then(|()| {
-            drop(f);
-            std::fs::rename(&tmp, path)
-        });
+    let write_res = f.write_all(&bytes).and_then(|()| f.sync_all()).and_then(|()| {
+        drop(f);
+        std::fs::rename(&tmp, path)
+    });
     if let Err(e) = write_res {
         let _ = std::fs::remove_file(&tmp);
         return Err(format!("Could not save `{}`: {e}", path.display()));
@@ -1659,7 +1639,11 @@ mod tests {
                 ..Default::default()
             },
             actions: vec![
-                RewriteAction::SetHeader { name: "Authorization".into(), value: Some("Bearer supersecret".into()), sensitive: true },
+                RewriteAction::SetHeader {
+                    name: "Authorization".into(),
+                    value: Some("Bearer supersecret".into()),
+                    sensitive: true,
+                },
                 RewriteAction::ReplaceUrl { regex: "^/v1/".into(), value: "/v2/".into() },
             ],
             note: "test".into(),
@@ -1680,7 +1664,9 @@ mod tests {
         let mut same = created.clone();
         same.actions[0] = RewriteAction::SetHeader { name: "Authorization".into(), value: None, sensitive: true };
         let updated = store.update(created.id, same).unwrap();
-        assert!(matches!(&updated.actions[0], RewriteAction::SetHeader { value: Some(v), .. } if v == "Bearer supersecret"));
+        assert!(
+            matches!(&updated.actions[0], RewriteAction::SetHeader { value: Some(v), .. } if v == "Bearer supersecret")
+        );
 
         store.toggle(created.id, true).unwrap();
         let set = store.snapshot();
@@ -1711,11 +1697,7 @@ mod tests {
             priority: 1,
             matchers: RewriteMatcher { host: Some("api.example.test".into()), ..Default::default() },
             actions: vec![
-                RewriteAction::SetHeader {
-                    name: "Authorization".into(),
-                    value: Some(secret.into()),
-                    sensitive: true,
-                },
+                RewriteAction::SetHeader { name: "Authorization".into(), value: Some(secret.into()), sensitive: true },
                 RewriteAction::SetHeader {
                     name: "X-Public-Tag".into(),
                     value: Some("visible-tag".into()),
@@ -1862,11 +1844,7 @@ mod tests {
                         value: Some("9876".into()),
                         sensitive: true,
                     },
-                    RewriteAction::SetHeader {
-                        name: "X-Public".into(),
-                        value: Some("hello".into()),
-                        sensitive: false,
-                    },
+                    RewriteAction::SetHeader { name: "X-Public".into(), value: Some("hello".into()), sensitive: false },
                 ],
                 note: String::new(),
             },
@@ -1937,11 +1915,7 @@ mod tests {
                         value: Some("4242".into()),
                         sensitive: true,
                     },
-                    RewriteAction::SetHeader {
-                        name: "X-Public".into(),
-                        value: Some("ok".into()),
-                        sensitive: false,
-                    },
+                    RewriteAction::SetHeader { name: "X-Public".into(), value: Some("ok".into()), sensitive: false },
                     RewriteAction::ReplaceBody {
                         regex: "DENIED".into(),
                         value: Some("secret-payload-7777".into()),
@@ -1959,7 +1933,10 @@ mod tests {
                 matchers: RewriteMatcher {
                     host: Some("api.test".into()),
                     status: vec!["200".into()],
-                    resp_headers: vec![HeaderMatch { name: "X-Secret-Token".into(), value_regex: "resp-secret".into() }],
+                    resp_headers: vec![HeaderMatch {
+                        name: "X-Secret-Token".into(),
+                        value_regex: "resp-secret".into(),
+                    }],
                     ..Default::default()
                 },
                 actions: vec![RewriteAction::SetHeader {
@@ -1982,10 +1959,7 @@ mod tests {
         ));
         assert!(!set.needs_response_body("other.test", "GET", "/item", &[], &[]));
 
-        let resp_hdrs = vec![
-            ("X-Remove".into(), b"bye".to_vec()),
-            ("Content-Type".into(), b"text/plain".to_vec()),
-        ];
+        let resp_hdrs = vec![("X-Remove".into(), b"bye".to_vec()), ("Content-Type".into(), b"text/plain".to_vec())];
         let rw = set
             .apply_response_for_capture("api.test", "GET", "/item", &[], 403, &resp_hdrs, Some(b"status=DENIED"))
             .unwrap();

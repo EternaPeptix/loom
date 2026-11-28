@@ -19,7 +19,14 @@
 //!   `daemon.json` names a live pid (a daemon still shutting down), only the second wait.
 //! - `status`: `render::status`. Exit 1 when the daemon is not running (with the usual sentence).
 //! - `open`: request a login code and open `http://{bind}/#code={code}` (`/usr/bin/open` on macOS,
-//!   `xdg-open` elsewhere); `--print` only prints it. The API token is never printed or passed on argv.
+//!   `xdg-open` elsewhere); `--print` only prints it. The API token is never printed or passed on argv, and
+//!   neither is the login code: the opener is given the path of a page file (`<home>/login/login-{random}.html`,
+//!   mode 0600 in a private directory, a refresh and `location.replace` to the address, no referrer) and
+//!   not the address; pages older than five minutes are removed by the next `open`. A file that cannot be
+//!   written, or an opener that fails, is an error that says to use `ferret open --print`. The opener gets a
+//!   `.html` file, which the desktop opens with whatever handles `.html` (not always a browser), so after a
+//!   successful hand-over one line is printed: `OPENED_NOTE`, which says to run `ferret open --print` when an
+//!   editor opened instead.
 //! - `run [options] <message…>`: start a session and follow it. The message is the arguments
 //!   joined by spaces; `-` or no message reads standard input to its end. Options → `NewSession`
 //!   (`--workspace` defaults to the current directory; `--attended` sets `unattended: false`;
@@ -53,10 +60,20 @@
 //!   the lead is in a turn and records it at its next step, not while a tool call is running; check
 //!   with ferret ledger {lead}`). It also names a stock scope or reason that was recorded for a blank
 //!   one, and says when the mission keeps no ledger (the rule is then a note without an id).
-//! - `scope <session> <host>… [--note <text>]`: `client.grant_scope`, one host per argument (`'*.example.com'`
+//! - `scope <session> <host>… [--note <text>] [--json]` (also `scope grant <session> <host>…`): `client.grant_scope`,
+//!   one host per argument (`'*.example.com'`
 //!   quoted); the operator's grant of network hosts to the mission, for the session's lifetime. Prints
 //!   `scope granted for {lead}: a, b` (`scope_line`, from the daemon's receipt), and says when the mission
 //!   keeps no ledger. The command an agent's scope request (`ferret inbox`) asks the operator to run.
+//! - `scope revoke <mission|session> <host>… [--reason <text>] [--json]` (`--note` is the same flag):
+//!   `client.revoke_scope` to the session `client.lead_of` names (an `m-` id: its lead; a session word: that
+//!   session, whose lead the daemon takes); the operator revokes hosts, a grant written as it was granted or any
+//!   host, `*.suffix`, address or CIDR block. Prints `scope revoked for {lead}: a, b; {n} session(s) narrowed, {n}
+//!   connection(s) cut` (`scope_revoke_line`), then the hosts that were not granted by themselves, and says when
+//!   the mission keeps no ledger or a grant was not in the ledger yet. `--json` prints the receipt.
+//! - `panic [--reason <text>] [--json]`: `client.panic_stop_all`; prints `panic stop complete: …` (`panic_line`):
+//!   connections cut, sessions stopped (their ids), boxes torn down, rewrite rules disabled, and the processes the
+//!   census stopped under the sessions' sandboxes when there were any.
 //!   `release <session> <reason…>` (`-` = standard input): `client.release`; the operator closes the mission
 //!   without the goal established. Prints `closed by operator, goal not established: release sent to {lead}`
 //!   (`release_line`). A blank reason is refused.
@@ -73,16 +90,37 @@
 //!   time, without `--lines`), passed through `render::clean`.
 //! - `config path` prints the config file's path; `config check` loads and checks it, reads every
 //!   `api_key_file` (`check_model_keys`) and runs the daemon's other start-up checks (sandbox preflight, box
-//!   paths): `ok: {path}`, or the error (naming the file) and exit 1; with `ok`, each line of
-//!   `key_env_warnings` judged against this shell's environment on stderr as `warning: {line}`; `config init` writes [`DEFAULT_CONFIG`] if no file exists (refuses to
-//!   overwrite: `{path} already exists.`).
+//!   paths, the `[mail]` password file, the infrastructure deny: `ferret_agent::runtime::check_infrastructure`, the
+//!   packs: `packs: {error}`): the error (naming the file when it is the file's) and exit 1 for any of them. Then it
+//!   checks the model policy against the packs
+//!   (`ferret_agent::monitor::lineage::check_config`): one line per profile with its resolved family, alignment and
+//!   recipient and where each came from (stdout), each note on stderr as `note: {line}`, and, when a problem is found
+//!   (an agent profile with no eligible reviewer that is not in `[monitor] tripwires_only_profiles`, an unknown
+//!   family or recipient, a reviewer whose family, alignment or recipient is not declared, a policy that cannot be
+//!   evaluated), the error `The model policy is not settled (n to fix):`
+//!   with each problem and the exact lines to add, exit 1; else `ok: {path}`, and each line of `key_env_warnings` judged
+//!   against this shell's environment on stderr as `warning: {line}`. `config init` writes [`DEFAULT_CONFIG`] if no
+//!   file exists (refuses to overwrite: `{path} already exists.`). `DEFAULT_CONFIG` leaves `tripwires_only_profiles`
+//!   commented out, so a first `config check` fails and lays out the three choices: not LLM-reviewed is a choice the
+//!   operator makes, never a default.
 //! - `models list`: `render::models_table` of `GET /api/models`. `models reload`: `POST
 //!   /api/models/reload`, `render::models_reload` of the report. `models set <session> <profile>`:
 //!   resolves the session, `POST /api/sessions/{id}/model`, `render::model_switch_line`. `models show
 //!   <session>`: `render::mission_models_table` of `GET /api/sessions/{id}/models`. `models role
 //!   <session> <role> <profile> [--now]` / `--clear`: `POST /api/sessions/{id}/role-model` (`all` sent
 //!   as `*`), `render::role_model_receipt`. None needs a restart; the daemon refuses with its sentence
-//!   (an unknown profile names the configured ones).
+//!   (an unknown profile names the configured ones). `models lineage [profile]` prints the lines of `config check`
+//!   with, for each agent profile and pack, who reviews it (`lineage::show_lines`); it reads the configuration
+//!   and the packs and needs no daemon.
+//! - `monitor [status]`: `client.monitor_status`; the monitor's state (`shadow`, `degraded`, `down` with its reason), what it
+//!   has read, its open flags, the faults of its sources and one row per tripwire with its hits by severity
+//!   (`monitor_status_lines`; every line goes through `render::clean` and has no line break, since a tripwire's detail and key carry strings an agent chose). `monitor log <mission|session> [--json] [--since 90m|12h|7d|<ms>] [--all] [-n N]`:
+//!   `client.monitor_log` (`mission_of` resolves the word), paged until N entries; one line per entry in words
+//!   (`monitor_entry_line`), or the stored JSON per line with `--json`; `--all` includes `cursor` and `heartbeat`.
+//!   `monitor replay [--since …] [--positives FILE] [--home DIR] [--no-journal-key] [--json]`: runs
+//!   `ferret_agent::monitor::replay::run` in this process over the home (the current one, or a copy), read-only and with
+//!   no daemon; reads `keys/journal.key` unless `--no-journal-key`; prints the report as a table with notes, or as JSON.
+//!   A `--since` that is not `90m`, `12h`, `7d` or milliseconds is an error that says so (`parse_since`).
 //! - `service install|uninstall|status` (macOS; elsewhere `This command is for macOS (launchd).`):
 //!   `install` first loads the config and refuses (nothing written) a profile that sets `api_key_env`: a
 //!   launchd agent does not have the shell's variables, so its requests would carry no key, and putting
@@ -173,6 +211,12 @@ allow_private = []
 max_children = 6
 verify_finish = true
 unavailable_notice_s = 300   # tell you (inbox item, notification) when a request has retried this long; 0 = never
+
+[monitor]
+# Who may review whose missions is a model-policy choice (docs/MONITOR.md). A profile with no reviewer must be named here
+# on purpose; its missions are then watched by the deterministic tripwires only. `ferret config check` says what to add
+# (a reviewer, or this line), and `ferret models lineage` shows who reviews what. Uncommenting the line is that choice:
+# tripwires_only_profiles = ["local"]
 "#;
 
 const CLI_AFTER_HELP: &str = "\
@@ -253,7 +297,7 @@ pub enum Command {
     Rule(RuleArgs),
     /// Record an approval for a mission
     Approve(ApproveArgs),
-    /// Let a mission's tools reach hosts, or revoke previously granted hosts (`ferret scope revoke <session> <host>...`)
+    /// Let a mission's tools reach hosts, or revoke hosts (`ferret scope revoke <mission|session> <host>...`)
     Scope(ScopeArgs),
     /// Emergency kill-switch: sever all proxy tunnels, stop all active sessions, tear down boxes, and disable rewrites
     Panic(PanicArgs),
@@ -333,7 +377,9 @@ pub enum Command {
         #[command(subcommand)]
         action: ConfigAction,
     },
-    /// The model profiles: list them, reload them from the config, switch a session's model
+    /// The adversarial monitor in shadow: its state, its log, a replay over history
+    Monitor(MonitorArgs),
+    /// The model profiles: list them, reload them from the config, switch a session's model, and who reviews them
     Models {
         #[command(subcommand)]
         action: ModelsAction,
@@ -808,42 +854,113 @@ pub struct ApproveArgs {
 }
 
 #[derive(Args, Debug)]
+#[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
 pub struct ScopeArgs {
-    /// A session id, the beginning of one, `last`, or `revoke` (`ferret scope revoke <session> <host>...`)
-    pub session: String,
-    /// Why the hosts are granted or revoked (kept in the ledger)
+    #[command(subcommand)]
+    pub action: Option<ScopeAction>,
+    /// A session id, the beginning of one, or `last`
+    #[arg(required = true)]
+    pub session: Option<String>,
+    /// Why the hosts are granted (kept in the ledger)
     #[arg(long)]
     pub note: Option<String>,
     /// Output raw JSON
     #[arg(long)]
     pub json: bool,
-    /// The hosts, one per argument (or `<session> <host>...` after `revoke` / `grant`)
+    /// The hosts, one per argument, such as api.example.com or '*.example.com'
     #[arg(required = true)]
     pub hosts: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ScopeOp<'a> {
-    Grant { session: &'a str, hosts: &'a [String] },
-    Revoke { session: &'a str, hosts: &'a [String] },
+#[derive(Subcommand, Debug)]
+pub enum ScopeAction {
+    /// Let a mission's tools reach hosts: `ferret scope grant <session> <host>...` is `ferret scope <session> <host>...`
+    Grant(ScopeGrantArgs),
+    /// Revoke hosts from a mission: refused at once whatever else allows them, open connections cut, recorded
+    Revoke(ScopeRevokeArgs),
 }
 
-impl ScopeArgs {
-    fn resolved(&self) -> Result<ScopeOp<'_>, String> {
-        if self.session.eq_ignore_ascii_case("revoke") {
-            if self.hosts.len() < 2 {
-                return Err("Usage: `ferret scope revoke <session> <host>... [--note <text>] [--json]`.".to_string());
-            }
-            return Ok(ScopeOp::Revoke { session: &self.hosts[0], hosts: &self.hosts[1..] });
-        }
-        if self.session.eq_ignore_ascii_case("grant") {
-            if self.hosts.len() < 2 {
-                return Err("Usage: `ferret scope grant <session> <host>... [--note <text>] [--json]`.".to_string());
-            }
-            return Ok(ScopeOp::Grant { session: &self.hosts[0], hosts: &self.hosts[1..] });
-        }
-        Ok(ScopeOp::Grant { session: &self.session, hosts: &self.hosts })
-    }
+#[derive(Args, Debug)]
+pub struct ScopeGrantArgs {
+    /// A session id, the beginning of one, or `last`
+    pub session: String,
+    /// The hosts, one per argument, such as api.example.com or '*.example.com'
+    #[arg(required = true)]
+    pub hosts: Vec<String>,
+    /// Why the hosts are granted (kept in the ledger)
+    #[arg(long)]
+    pub note: Option<String>,
+    /// Output raw JSON
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct ScopeRevokeArgs {
+    /// A mission id (`m-…`), or a session id, the beginning of one, or `last`
+    pub target: String,
+    /// The hosts, one per argument: a grant as it was granted, or any host, '*.suffix', address or CIDR block
+    #[arg(required = true)]
+    pub hosts: Vec<String>,
+    /// Why (kept in the ledger and shown to the lead; left out, the ledger says `no reason given`)
+    #[arg(long, visible_alias = "note")]
+    pub reason: Option<String>,
+    /// Output raw JSON
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct MonitorArgs {
+    #[command(subcommand)]
+    pub action: Option<MonitorAction>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum MonitorAction {
+    /// The monitor's state, its open flags and what each tripwire has fired (the default)
+    Status,
+    /// The monitor-log entries about a mission
+    Log(MonitorLogArgs),
+    /// Run the tripwires over the history of a ferret home, read-only, and report per tripwire
+    Replay(MonitorReplayArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct MonitorLogArgs {
+    /// A mission id (`m-…`), or a session id, the beginning of one, or `last`
+    pub target: String,
+    /// One JSON object per line, as stored
+    #[arg(long)]
+    pub json: bool,
+    /// Only entries newer than this: `90m`, `12h`, `7d`, or a time in milliseconds since the epoch
+    #[arg(long)]
+    pub since: Option<String>,
+    /// Include the housekeeping entries (`cursor`, `heartbeat`)
+    #[arg(long)]
+    pub all: bool,
+    /// At most this many entries
+    #[arg(short = 'n', long, default_value_t = 200)]
+    pub limit: usize,
+}
+
+#[derive(Args, Debug)]
+pub struct MonitorReplayArgs {
+    /// Only hits newer than this: `90m`, `12h`, `7d`, or a time in milliseconds since the epoch
+    #[arg(long)]
+    pub since: Option<String>,
+    /// The report as JSON
+    #[arg(long)]
+    pub json: bool,
+    /// A file of mission ids, one per line, known to be positives: precision and recall are reported against them
+    #[arg(long)]
+    pub positives: Option<PathBuf>,
+    /// Replay this ferret home instead of the current one (a copy of one; it is only read)
+    #[arg(long)]
+    pub home: Option<PathBuf>,
+    /// Do not read `keys/journal.key`: the ledgers are read unverified
+    #[arg(long)]
+    pub no_journal_key: bool,
 }
 
 #[derive(Args, Debug, Clone, Default, PartialEq, Eq)]
@@ -1140,6 +1257,12 @@ pub enum ModelsAction {
     Show(ModelsShowArgs),
     /// Choose the model a mission starts its agents of a role on (`all` for every role), or clear it
     Role(ModelsRoleArgs),
+    /// Each profile's family, alignment and recipient (and where each came from), and who reviews its missions
+    /// (reads the configuration and the packs; needs no daemon)
+    Lineage {
+        /// Only this profile
+        profile: Option<String>,
+    },
 }
 
 #[derive(Args, Debug, Clone, PartialEq, Eq)]
@@ -1298,8 +1421,7 @@ fn format_score_text(view: &ferret_agent::runtime::ScoreView, style: &Style) -> 
 }
 
 fn json_out<T: serde::Serialize>(value: &T) -> Result<i32, String> {
-    let text = serde_json::to_string_pretty(value)
-        .map_err(|e| format!("Could not format JSON output ({e})."))?;
+    let text = serde_json::to_string_pretty(value).map_err(|e| format!("Could not format JSON output ({e})."))?;
     block(&text).map(|()| 0)
 }
 
@@ -1407,8 +1529,7 @@ fn style() -> Style {
     let is_tty = std::io::stdout().is_terminal();
     let no_color = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
     let dumb = is_dumb_term();
-    let explicit_cols =
-        std::env::var("COLUMNS").ok().and_then(|v| v.trim().parse::<usize>().ok()).filter(|&n| n > 0);
+    let explicit_cols = std::env::var("COLUMNS").ok().and_then(|v| v.trim().parse::<usize>().ok()).filter(|&n| n > 0);
     let width = explicit_cols.unwrap_or_else(|| if is_tty { terminal_width() } else { usize::MAX });
     Style { color: is_tty && !no_color && !dumb, width }
 }
@@ -1476,15 +1597,37 @@ fn scope_line(r: &ScopeReceipt) -> String {
     line
 }
 
-/// The line printed once the daemon accepted a scope revocation.
+/// The line printed once the daemon accepted a scope revoke: what was revoked and cut, then what the ledger holds of it.
 fn scope_revoke_line(r: &ScopeRevokeReceipt) -> String {
     let plural = if r.connections_cut == 1 { "connection" } else { "connections" };
-    format!(
-        "scope revoked for {}: {} ({} {plural} cut)",
-        r.session.as_str(),
+    let mut line = format!(
+        "scope revoked for {}: {}; {} session(s) narrowed, {} {plural} cut",
+        r.lead.as_str(),
         r.revoked.join(", "),
+        r.sessions,
         r.connections_cut
-    )
+    );
+    if !r.not_granted.is_empty() {
+        line.push_str(&format!(
+            "; not granted by itself (refused from now on, no ledger record): {}",
+            r.not_granted.join(", ")
+        ));
+    }
+    let pending: Vec<&str> = r
+        .revoked
+        .iter()
+        .filter(|h| !r.recorded.contains(h) && !r.not_granted.contains(h))
+        .map(String::as_str)
+        .collect();
+    if !r.ledger {
+        line.push_str("; this mission keeps no ledger, so the revoke is not listed (it is kept across a restart)");
+    } else if !pending.is_empty() {
+        line.push_str(&format!(
+            "; the grant of {} was not in the ledger yet, so the revoke is not recorded there: run it again once `ferret ledger` lists the grant",
+            pending.join(", ")
+        ));
+    }
+    line
 }
 
 /// The line printed once the emergency panic kill-switch finished.
@@ -1499,13 +1642,24 @@ fn panic_line(r: &PanicReport) -> String {
         let ids: Vec<&str> = r.sessions_stopped.iter().map(SessionId::as_str).collect();
         format!(" ({})", ids.join(", "))
     };
-    format!(
+    let mut line = format!(
         "panic stop complete: {} {conn_w} cut, {} {sess_w} stopped{stopped_list}, {} {box_w} torn down, {} {rw_w} disabled",
         r.connections_cut,
         r.sessions_stopped.len(),
         r.boxes_torn_down,
         r.rewrites_disabled
-    )
+    );
+    // What only the census finds (E3): said when there was any.
+    if r.processes_killed > 0 || r.processes_left > 0 {
+        line.push_str(&format!(", {} process(es) left under the sandboxes stopped", r.processes_killed));
+        if r.processes_left > 0 {
+            line.push_str(&format!(
+                ", {} could not be stopped (the daemon's log names them; `GET /api/census` lists them)",
+                r.processes_left
+            ));
+        }
+    }
+    line
 }
 
 /// The line printed once the daemon accepted a release: the outcome in words, then what the lead was sent.
@@ -2128,6 +2282,7 @@ async fn dispatch(command: Command) -> Result<i32, String> {
         Command::Config { action } => cmd_config(&paths, action),
         Command::Models { action } => cmd_models(&paths, action).await,
         Command::Mcp { action } => cmd_mcp(&paths, action).await,
+        Command::Monitor(a) => cmd_monitor(&paths, a).await,
         Command::Service { action } => cmd_service(&paths, action),
         Command::Status(a) => {
             let view = client_of(&paths)?.status().await?;
@@ -2266,26 +2421,34 @@ async fn dispatch(command: Command) -> Result<i32, String> {
             let receipt = c.approve(&id, &text, a.scope.as_deref().unwrap_or("")).await?;
             outln(&receipt_line("approval", "scope", &receipt)).map(|()| 0)
         }
+        Command::Scope(ScopeArgs { action: Some(ScopeAction::Revoke(a)), .. }) => {
+            let c = client_of(&paths)?;
+            let id = c.lead_of(&a.target).await?;
+            let receipt = c.revoke_scope(&id, &a.hosts, a.reason.as_deref()).await?;
+            if a.json {
+                return json_out(&receipt);
+            }
+            outln(&scope_revoke_line(&receipt)).map(|()| 0)
+        }
+        Command::Scope(ScopeArgs { action: Some(ScopeAction::Grant(a)), .. }) => {
+            let c = client_of(&paths)?;
+            let id = c.resolve(&a.session).await?;
+            let receipt = c.grant_scope(&id, &a.hosts, a.note.as_deref()).await?;
+            if a.json {
+                return json_out(&receipt);
+            }
+            outln(&scope_line(&receipt)).map(|()| 0)
+        }
         Command::Scope(a) => {
             let c = client_of(&paths)?;
-            match a.resolved()? {
-                ScopeOp::Grant { session, hosts } => {
-                    let id = c.resolve(session).await?;
-                    let receipt = c.grant_scope(&id, hosts, a.note.as_deref()).await?;
-                    if a.json {
-                        return json_out(&receipt);
-                    }
-                    outln(&scope_line(&receipt)).map(|()| 0)
-                }
-                ScopeOp::Revoke { session, hosts } => {
-                    let id = c.resolve(session).await?;
-                    let receipt = c.revoke_scope(&id, hosts, a.note.as_deref()).await?;
-                    if a.json {
-                        return json_out(&receipt);
-                    }
-                    outln(&scope_revoke_line(&receipt)).map(|()| 0)
-                }
+            let word =
+                a.session.as_deref().ok_or("Name the session to grant the hosts to: ferret scope <session> <host>…")?;
+            let id = c.resolve(word).await?;
+            let receipt = c.grant_scope(&id, &a.hosts, a.note.as_deref()).await?;
+            if a.json {
+                return json_out(&receipt);
             }
+            outln(&scope_line(&receipt)).map(|()| 0)
         }
         Command::Panic(a) => {
             let c = client_of(&paths)?;
@@ -2352,9 +2515,7 @@ async fn dispatch(command: Command) -> Result<i32, String> {
             if let Some(sev) = a.severity.as_deref() {
                 let s = sev.trim().to_ascii_lowercase();
                 if !matches!(s.as_str(), "critical" | "high" | "medium" | "low" | "info") {
-                    return Err(format!(
-                        "Unknown severity `{sev}`. Use one of: critical, high, medium, low, info."
-                    ));
+                    return Err(format!("Unknown severity `{sev}`. Use one of: critical, high, medium, low, info."));
                 }
             }
             let c = client_of(&paths)?;
@@ -2515,10 +2676,8 @@ async fn dispatch(command: Command) -> Result<i32, String> {
                             .map_err(|e| format!("`{}` is not valid JSON: {e}", file.display()))?;
                         let created = c.rewrite_create(rule).await?;
                         let id = created["id"].as_u64().unwrap_or(0);
-                        outln(&format!(
-                            "created disabled rewrite rule {id} (enable with `ferret rewrite enable {id}`)"
-                        ))
-                        .map(|()| 0)
+                        outln(&format!("created disabled rewrite rule {id} (enable with `ferret rewrite enable {id}`)"))
+                            .map(|()| 0)
                     }
                     RewriteCliAction::Enable { id } => {
                         let updated = c.rewrite_toggle(id, true).await?;
@@ -2822,34 +2981,114 @@ async fn open_with(
         put(out, &format!("{url}\n"))?;
     } else {
         launch(&url)?;
+        put(out, OPENED_NOTE)?;
     }
     Ok(0)
 }
 
-/// Hand `url` to the desktop's opener.
-fn launch_browser(url: &str) -> Result<(), String> {
-    let program = if cfg!(target_os = "macos") { "/usr/bin/open" } else { "xdg-open" };
-    let status = std::process::Command::new(program)
-        .arg(url)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map_err(|e| {
-            format!("Cannot start {program} ({e}). Run `ferret open --print` and open the address in a browser yourself.")
-        })?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("{program} could not open the address. Run `ferret open --print` and open it in a browser yourself."))
+/// Printed after the login page was handed to the desktop's opener.
+const OPENED_NOTE: &str = "Opened the ferret login page. If an editor opened instead of a browser (your .html files open there), run `ferret open --print` and open the address in a browser.\n";
+
+/// How long a login page stays on disk before the next `open` removes it (its code is dead long before).
+const LOGIN_PAGE_KEEP: Duration = Duration::from_secs(300);
+
+/// The page that sends the browser to `url` (which holds the login code in its fragment), as a file in
+/// `dir` (a private directory under the ferret home) that only this user can read. The opener is given the
+/// path of this file and never the address, so the code is not in any process's arguments, where another
+/// local process could read it while the opener runs. Pages older than [`LOGIN_PAGE_KEEP`] are removed.
+fn write_login_page(dir: &Path, url: &str) -> Result<PathBuf, String> {
+    ferret_core::config::ensure_private_dir(dir).map_err(|e| {
+        format!(
+            "Cannot create {} ({e}). Run `ferret open --print` and open the address in a browser yourself.",
+            dir.display()
+        )
+    })?;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let old = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age > LOGIN_PAGE_KEEP);
+            if old && entry.file_name().to_string_lossy().starts_with("login-") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
     }
+    let escaped = url.replace('&', "&amp;").replace('"', "&quot;").replace('<', "&lt;").replace('>', "&gt;");
+    let script = serde_json::to_string(url).map_err(|e| format!("The address cannot be encoded ({e})."))?;
+    let page = format!(
+        "<!doctype html><meta charset=\"utf-8\"><meta name=\"referrer\" content=\"no-referrer\"><title>ferret</title>\n\
+         <meta http-equiv=\"refresh\" content=\"0;url={escaped}\">\n\
+         <script>location.replace({script});</script>\n\
+         <p>Opening ferret. If nothing happens, <a href=\"{escaped}\">continue</a>.</p>\n"
+    );
+    let path = dir.join(format!("login-{}.html", hex::encode(rand::random::<[u8; 16]>())));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(&path).map_err(|e| {
+        format!(
+            "Cannot write {} ({e}). Run `ferret open --print` and open the address in a browser yourself.",
+            path.display()
+        )
+    })?;
+    file.write_all(page.as_bytes()).map_err(|e| {
+        format!(
+            "Cannot write {} ({e}). Run `ferret open --print` and open the address in a browser yourself.",
+            path.display()
+        )
+    })?;
+    Ok(path)
+}
+
+/// Hand `url` to the desktop's opener, through a page file in `dir` so that the address (with its login
+/// code) is not on the opener's command line. `run(program, page)` starts the opener.
+fn launch_browser_with(
+    dir: &Path,
+    url: &str,
+    run: impl FnOnce(&str, &Path) -> std::io::Result<bool>,
+) -> Result<(), String> {
+    let program = if cfg!(target_os = "macos") { "/usr/bin/open" } else { "xdg-open" };
+    let page = write_login_page(dir, url)?;
+    match run(program, &page) {
+        Ok(true) => Ok(()),
+        Ok(false) => {
+            let _ = std::fs::remove_file(&page);
+            Err(format!(
+                "{program} could not open the address. Run `ferret open --print` and open it in a browser yourself."
+            ))
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&page);
+            Err(format!(
+                "Cannot start {program} ({e}). Run `ferret open --print` and open the address in a browser yourself."
+            ))
+        }
+    }
+}
+
+/// Hand `url` to the desktop's opener (see [`launch_browser_with`]).
+fn launch_browser(dir: &Path, url: &str) -> Result<(), String> {
+    launch_browser_with(dir, url, |program, page| {
+        std::process::Command::new(program)
+            .arg(page)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+    })
 }
 
 async fn cmd_open(paths: &Paths, a: &OpenArgs) -> Result<i32, String> {
     let c = client_of(paths)?;
     // Say "not running" here rather than hand the browser an address nothing answers on.
     c.status().await?;
-    open_with(&c, a, &mut StdoutSink, launch_browser).await
+    let dir = paths.home.join("login");
+    open_with(&c, a, &mut StdoutSink, |url| launch_browser(&dir, url)).await
 }
 
 async fn cmd_run(paths: &Paths, a: RunArgs) -> Result<i32, String> {
@@ -2977,22 +3216,29 @@ async fn cmd_mcp(paths: &Paths, action: McpAction) -> Result<i32, String> {
 }
 
 async fn cmd_models(paths: &Paths, action: ModelsAction) -> Result<i32, String> {
-    let c = client_of(paths)?;
     match action {
+        // Read from the configuration and the packs, so it works with no daemon running.
+        ModelsAction::Lineage { profile } => cmd_models_lineage(paths, profile.as_deref()),
         ModelsAction::List { json } => {
+            let c = client_of(paths)?;
             let view = c.models().await?;
             if json {
                 return json_out(&view);
             }
             block(&render::models_table(&view, &style())).map(|()| 0)
         }
-        ModelsAction::Reload => block(&render::models_reload(&c.reload_models().await?)).map(|()| 0),
+        ModelsAction::Reload => {
+            let c = client_of(paths)?;
+            block(&render::models_reload(&c.reload_models().await?)).map(|()| 0)
+        }
         ModelsAction::Set(a) => {
+            let c = client_of(paths)?;
             let id = c.resolve(&a.session).await?;
             let receipt = c.set_model(&id, &a.profile).await?;
             outln(&render::model_switch_line(&receipt)).map(|()| 0)
         }
         ModelsAction::Show(a) => {
+            let c = client_of(paths)?;
             let id = c.resolve(&a.session).await?;
             let view = c.mission_models(&id).await?;
             if a.json {
@@ -3001,6 +3247,7 @@ async fn cmd_models(paths: &Paths, action: ModelsAction) -> Result<i32, String> 
             block(&render::mission_models_table(&view, &style())).map(|()| 0)
         }
         ModelsAction::Role(a) => {
+            let c = client_of(paths)?;
             let id = c.resolve(&a.session).await?;
             let role = cli_role(&a.role);
             let receipt = c.set_role_model(&id, &role, a.profile.as_deref(), a.now).await?;
@@ -3089,18 +3336,13 @@ async fn cmd_target(paths: &Paths, action: TargetAction) -> Result<i32, String> 
 const SCOPE_IMPORT_MAX_BYTES: usize = 4 * 1024 * 1024;
 
 fn read_scope_import_file(path: &Path) -> Result<String, String> {
-    let f = std::fs::File::open(path)
-        .map_err(|e| format!("Could not read scope file `{}`: {e}", path.display()))?;
+    let f = std::fs::File::open(path).map_err(|e| format!("Could not read scope file `{}`: {e}", path.display()))?;
     let mut bytes = Vec::new();
     f.take((SCOPE_IMPORT_MAX_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
         .map_err(|e| format!("Could not read scope file `{}`: {e}", path.display()))?;
     if bytes.len() > SCOPE_IMPORT_MAX_BYTES {
-        return Err(format!(
-            "Scope file `{}` exceeds the {} MiB limit.",
-            path.display(),
-            SCOPE_IMPORT_MAX_BYTES >> 20
-        ));
+        return Err(format!("Scope file `{}` exceeds the {} MiB limit.", path.display(), SCOPE_IMPORT_MAX_BYTES >> 20));
     }
     String::from_utf8(bytes).map_err(|e| format!("Scope file `{}` is not valid UTF-8: {e}", path.display()))
 }
@@ -3250,10 +3492,7 @@ fn cmd_config(paths: &Paths, action: ConfigAction) -> Result<i32, String> {
         ConfigAction::Path => outln(&file.display().to_string()).map(|()| 0),
         ConfigAction::Check => {
             if !file.exists() {
-                return Err(format!(
-                    "No config file at {}. Create one with `ferret config init`.",
-                    file.display()
-                ));
+                return Err(format!("No config file at {}. Create one with `ferret config init`.", file.display()));
             }
             let cfg = load_config_named(paths)?;
             // Run the same deterministic checks the daemon runs at startup, so `check` never prints
@@ -3266,7 +3505,23 @@ fn cmd_config(paths: &Paths, action: ConfigAction) -> Result<i32, String> {
                     ferret_tools::mail::read_password_file(pw_path)?;
                 }
             }
-            ferret_agent::pack::Packs::load(&paths.packs_dir()).map_err(|e| format!("packs: {e}"))?;
+            ferret_agent::runtime::check_infrastructure(&cfg)?;
+            let packs = ferret_agent::pack::Packs::load(&paths.packs_dir()).map_err(|e| format!("packs: {e}"))?;
+            // Then the model policy, which the daemon does not refuse to start on: who reviews each profile.
+            let report = ferret_agent::monitor::lineage::check_config(&cfg, &packs);
+            for line in &report.table {
+                outln(line)?;
+            }
+            for note in &report.notes {
+                errln(&format!("note: {note}"));
+            }
+            if !report.problems.is_empty() {
+                return Err(format!(
+                    "The model policy is not settled ({} to fix):\n\n{}",
+                    report.problems.len(),
+                    report.problems.join("\n\n")
+                ));
+            }
             outln(&format!("ok: {}", file.display()))?;
             if cfg.models.is_empty() {
                 errln("warning: no [models.*] profiles are configured; sessions cannot run until you add one");
@@ -3299,6 +3554,192 @@ fn cmd_config(paths: &Paths, action: ConfigAction) -> Result<i32, String> {
             Ok(0)
         }
     }
+}
+
+/// `5m`, `12h`, `7d` (before `now_ms`), or a time in milliseconds since the epoch.
+pub(crate) fn parse_since(word: &str, now_ms: u64) -> Result<u64, String> {
+    let w = word.trim();
+    let bad = || format!("--since \"{word}\" is not a time. Use 90m, 12h or 7d, or milliseconds since the epoch.");
+    if let Some((n, unit)) = w.char_indices().last().and_then(|(i, u)| w.get(..i).map(|n| (n, u))) {
+        let mult: Option<u64> = match unit {
+            'm' => Some(60_000),
+            'h' => Some(3_600_000),
+            'd' => Some(86_400_000),
+            _ => None,
+        };
+        if let (Some(m), Ok(n)) = (mult, n.parse::<u64>()) {
+            return Ok(now_ms.saturating_sub(n.saturating_mul(m)));
+        }
+    }
+    w.parse::<u64>().map_err(|_| bad())
+}
+
+/// One line for the terminal: every control and bidirectional override replaced (a tripwire's detail and key carry
+/// strings an agent chose), and no line break inside it.
+fn terminal_line(text: &str) -> String {
+    render::clean(text).replace(['\n', '\t'], "·")
+}
+
+fn monitor_status_lines(m: &ferret_agent::monitor::core::MonitorStatus) -> Vec<String> {
+    monitor_status_raw(m).iter().map(|l| terminal_line(l)).collect()
+}
+
+fn monitor_status_raw(m: &ferret_agent::monitor::core::MonitorStatus) -> Vec<String> {
+    let mut l = vec![format!(
+        "monitor: {} ({} mode){}",
+        m.state,
+        m.mode,
+        m.down_reason.as_deref().map_or(String::new(), |r| format!(": {r}"))
+    )];
+    l.push(format!(
+        "read {} records, {} net decisions and {} floor events from {} sessions; {} open flags; {} paused, {} halted",
+        m.counts.records,
+        m.counts.net,
+        m.counts.floor,
+        m.sources,
+        m.open_flags,
+        m.paused.len(),
+        m.halts.len()
+    ));
+    if m.egress_unbounded {
+        l.push("egress: UNBOUNDED (the sandbox self-probe found a route outside the proxy)".to_string());
+    }
+    for f in &m.faults {
+        l.push(format!("source fault: {f}"));
+    }
+    l.push(format!(
+        "{:<6} {:<34} {:<9} {:>6} {:>5} {:>5} {:>5} {:>5}",
+        "id", "tripwire", "starts", "fired", "S1", "S2", "S3", "S4"
+    ));
+    for t in &m.tripwires {
+        l.push(format!(
+            "{:<6} {:<34} {:<9} {:>6} {:>5} {:>5} {:>5} {:>5}",
+            t.id, t.name, t.start, t.fired, t.by_severity[1], t.by_severity[2], t.by_severity[3], t.by_severity[4]
+        ));
+    }
+    l.push(
+        "Every tripwire is in shadow: a finding is recorded and shown, and changes nothing for any agent.".to_string(),
+    );
+    l
+}
+
+fn monitor_entry_line(e: &ferret_agent::monitor::log::Entry) -> String {
+    terminal_line(&monitor_entry_raw(e))
+}
+
+fn monitor_entry_raw(e: &ferret_agent::monitor::log::Entry) -> String {
+    let get = |k: &str| e.fields.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let when = e.ts_ms / 1000;
+    match e.kind.slug() {
+        "tripwire" => format!(
+            "#{} {when} {} {} {} would {}{} {} ({})",
+            e.seq,
+            get("id"),
+            get("severity"),
+            get("session"),
+            get("would"),
+            if e.fields.get("precision").and_then(|v| v.as_bool()).unwrap_or(false) { " precision-list" } else { "" },
+            get("detail"),
+            get("category")
+        ),
+        "flag" => format!(
+            "#{} {when} flag {} {} {} x{} {} [{}]",
+            e.seq,
+            get("flag"),
+            get("severity"),
+            get("category"),
+            e.fields.get("count").and_then(|v| v.as_u64()).unwrap_or(0),
+            get("key"),
+            e.fields.get("causes").map_or(String::new(), |c| c.to_string())
+        ),
+        "response" => format!(
+            "#{} {when} response {} would {} {}",
+            e.seq,
+            get("level"),
+            get("would"),
+            e.fields.get("causes").map_or(String::new(), |c| c.to_string())
+        ),
+        other => format!("#{} {when} {other} {}", e.seq, serde_json::to_string(&e.fields).unwrap_or_default()),
+    }
+}
+
+async fn cmd_monitor(paths: &Paths, args: MonitorArgs) -> Result<i32, String> {
+    match args.action.unwrap_or(MonitorAction::Status) {
+        MonitorAction::Status => {
+            let m = client_of(paths)?.monitor_status().await?;
+            for line in monitor_status_lines(&m) {
+                outln(&line)?;
+            }
+            Ok(0)
+        }
+        MonitorAction::Log(a) => {
+            let c = client_of(paths)?;
+            let mission = c.mission_of(&a.target).await?;
+            let since = a.since.as_deref().map(|w| parse_since(w, ferret_core::now_ms())).transpose()?;
+            let mut after = 0;
+            let mut left = a.limit.max(1);
+            loop {
+                let page = c.monitor_log(&mission, after, left.min(2000), !a.all).await?;
+                for e in &page.entries {
+                    if since.is_some_and(|s| e.ts_ms < s) {
+                        continue;
+                    }
+                    if a.json {
+                        outln(&serde_json::to_string(e).map_err(|x| x.to_string())?)?;
+                    } else {
+                        outln(&monitor_entry_line(e))?;
+                    }
+                    left = left.saturating_sub(1);
+                }
+                match page.next_after {
+                    Some(n) if left > 0 => after = n,
+                    _ => break,
+                }
+            }
+            Ok(0)
+        }
+        MonitorAction::Replay(a) => {
+            let home = a.home.as_ref().map_or_else(|| paths.clone(), |h| Paths::at(h.clone()));
+            let since = a.since.as_deref().map(|w| parse_since(w, ferret_core::now_ms())).transpose()?;
+            let positives = match &a.positives {
+                Some(f) => std::fs::read_to_string(f)
+                    .map_err(|e| format!("{} cannot be read: {e}.", f.display()))?
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                    .map(MissionId::from)
+                    .collect(),
+                None => Default::default(),
+            };
+            let key =
+                if a.no_journal_key { None } else { ferret_core::journal::load_existing_key(&home.journal_key()) };
+            let report = tokio::task::spawn_blocking(move || {
+                let env = ferret_agent::monitor::replay::env_for_home(&home)?;
+                let opts = ferret_agent::monitor::replay::ReplayOpts { since_ms: since, positives };
+                Ok::<_, String>(ferret_agent::monitor::replay::run(&home, std::sync::Arc::new(env), key, &opts))
+            })
+            .await
+            .map_err(|e| format!("The replay stopped: {e}."))??;
+            if a.json {
+                outln(&serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?)?;
+            } else {
+                for line in report.lines() {
+                    outln(&line)?;
+                }
+            }
+            Ok(0)
+        }
+    }
+}
+
+/// `ferret models lineage [profile]`: reads the configuration and the packs; needs no daemon.
+fn cmd_models_lineage(paths: &Paths, profile: Option<&str>) -> Result<i32, String> {
+    let config = Config::load(&paths.config_file()).map_err(|e| e.to_string())?;
+    let packs = ferret_agent::pack::Packs::load(&paths.packs_dir())?;
+    for line in ferret_agent::monitor::lineage::show_lines(&config, &packs, profile)? {
+        outln(&line)?;
+    }
+    Ok(0)
 }
 
 /// Run `launchctl` and return its output when it succeeds, else its complaint.
@@ -3401,6 +3842,134 @@ mod tests {
     }
 
     #[test]
+    fn monitor_commands_parse_and_since_reads_a_duration_or_a_time() {
+        assert!(matches!(ok(&["monitor"]), Command::Monitor(MonitorArgs { action: None })));
+        assert!(matches!(
+            ok(&["monitor", "status"]),
+            Command::Monitor(MonitorArgs { action: Some(MonitorAction::Status) })
+        ));
+        match ok(&["monitor", "log", "m-1", "--json", "--since", "7d", "--all", "-n", "5"]) {
+            Command::Monitor(MonitorArgs { action: Some(MonitorAction::Log(a)) }) => {
+                assert_eq!((a.target.as_str(), a.json, a.all, a.limit), ("m-1", true, true, 5));
+                assert_eq!(a.since.as_deref(), Some("7d"));
+            }
+            other => panic!("not log: {other:?}"),
+        }
+        match ok(&["monitor", "replay", "--positives", "p.txt", "--home", "/h", "--no-journal-key", "--json"]) {
+            Command::Monitor(MonitorArgs { action: Some(MonitorAction::Replay(a)) }) => {
+                assert_eq!((a.json, a.no_journal_key), (true, true));
+                assert_eq!(a.positives.as_deref(), Some(std::path::Path::new("p.txt")));
+                assert_eq!(a.home.as_deref(), Some(std::path::Path::new("/h")));
+            }
+            other => panic!("not replay: {other:?}"),
+        }
+        assert!(Cli::try_parse_from(["ferret", "monitor", "log"]).is_err(), "log needs a mission or session");
+        let now = 10_000_000_000u64;
+        assert_eq!(parse_since("90m", now).ok(), Some(now - 90 * 60_000));
+        assert_eq!(parse_since("12h", now).ok(), Some(now - 12 * 3_600_000));
+        assert_eq!(parse_since("7d", now).ok(), Some(now - 7 * 86_400_000));
+        assert_eq!(parse_since("1234567", now).ok(), Some(1_234_567));
+        let e = parse_since("soon", now).err().unwrap_or_default();
+        assert!(e.contains("90m, 12h or 7d"), "{e}");
+        assert_eq!(parse_since("99999d", 5).ok(), Some(0), "a window longer than the history starts at the beginning");
+    }
+
+    #[test]
+    fn monitor_status_and_entries_print_in_words() {
+        let t = ferret_agent::monitor::core::TwStatus {
+            id: "TW-10".into(),
+            name: "other sessions and processes".into(),
+            start: "precision".into(),
+            state: "shadow".into(),
+            fired: 3,
+            by_severity: [0, 0, 1, 2, 0],
+            missions: 2,
+        };
+        let m = ferret_agent::monitor::core::MonitorStatus {
+            state: "degraded".into(),
+            mode: "shadow".into(),
+            enabled: true,
+            egress_unbounded: true,
+            open_flags: 2,
+            paused: vec![],
+            halts: vec![],
+            backlog_s: 0,
+            heartbeat_ms: 1,
+            last_seq: 9,
+            sources: 4,
+            counts: Default::default(),
+            tripwires: vec![t],
+            faults: vec!["a log does not continue its chain".into()],
+            fleet_runs: 0,
+            fleet_hits: 0,
+            reviewers: vec![],
+            down_reason: None,
+        };
+        let text = monitor_status_lines(&m).join("\n");
+        assert!(text.contains("monitor: degraded (shadow mode)") && text.contains("2 open flags"), "{text}");
+        assert!(text.contains("egress: UNBOUNDED") && text.contains("source fault: a log does not continue"), "{text}");
+        assert!(text.contains("TW-10") && text.contains("changes nothing for any agent"), "{text}");
+        let mut fields = serde_json::Map::new();
+        fields.insert("id".into(), "TW-09".into());
+        fields.insert("severity".into(), "s3".into());
+        fields.insert("session".into(), "s-1".into());
+        fields.insert("would".into(), "r3".into());
+        fields.insert("precision".into(), true.into());
+        fields.insert("detail".into(), "writes a hook".into());
+        fields.insert("category".into(), "harness_attack".into());
+        let e = ferret_agent::monitor::log::Entry {
+            seq: 7,
+            ts_ms: 5_000,
+            prev: String::new(),
+            mac: String::new(),
+            kind: ferret_agent::monitor::log::EntryKind::Tripwire,
+            fields,
+        };
+        let line = monitor_entry_line(&e);
+        assert_eq!(line, "#7 5 TW-09 s3 s-1 would r3 precision-list writes a hook (harness_attack)");
+        // What an agent chose reaches the terminal as text: no escape, no OSC, no bidi override, no line break.
+        let mut hostile = e.clone();
+        hostile
+            .fields
+            .insert("detail".into(), "x\u{1b}[2K\u{1b}[1Ahidden\u{1b}]52;c;ZWNobyBoaQ==\u{7}\u{202e}\nTW-99".into());
+        hostile.fields.insert("key".into(), "k\u{1b}[2J".into());
+        let line = monitor_entry_line(&hostile);
+        assert!(!line.chars().any(|c| c.is_control() || ('\u{202a}'..='\u{202e}').contains(&c)), "{line:?}");
+        assert!(!line.contains('\n'), "{line:?}");
+        let mut flag = hostile.clone();
+        flag.kind = ferret_agent::monitor::log::EntryKind::Flag;
+        let line = monitor_entry_line(&flag);
+        assert!(!line.chars().any(char::is_control), "{line:?}");
+        m_faults_are_clean();
+    }
+
+    fn m_faults_are_clean() {
+        let m = ferret_agent::monitor::core::MonitorStatus {
+            state: "degraded".into(),
+            mode: "shadow".into(),
+            enabled: true,
+            egress_unbounded: false,
+            open_flags: 0,
+            paused: vec![],
+            halts: vec![],
+            backlog_s: 0,
+            heartbeat_ms: 1,
+            last_seq: 1,
+            sources: 1,
+            counts: Default::default(),
+            tripwires: vec![],
+            faults: vec!["bad\u{1b}[2Jfault\nnext".into()],
+            fleet_runs: 0,
+            fleet_hits: 0,
+            reviewers: vec![],
+            down_reason: Some("why\u{1b}]52;c;AAAA\u{7}".into()),
+        };
+        for line in monitor_status_lines(&m) {
+            assert!(!line.chars().any(char::is_control), "{line:?}");
+        }
+    }
+
+    #[test]
     fn the_unverified_daemon_flag_is_global() {
         assert!(!parse(&["status"]).unwrap().unverified_daemon);
         assert!(parse(&["--unverified-daemon", "down"]).unwrap().unverified_daemon);
@@ -3421,7 +3990,10 @@ mod tests {
         assert!(matches!(ok(&["open"]), Command::Open(OpenArgs { print: false })));
         assert!(matches!(ok(&["open", "--print"]), Command::Open(OpenArgs { print: true })));
         assert!(matches!(ok(&["ls"]), Command::Ls(LsArgs { all: false, wide: false, json: false })));
-        assert!(matches!(ok(&["list", "--wide", "--json"]), Command::Ls(LsArgs { all: false, wide: true, json: true })));
+        assert!(matches!(
+            ok(&["list", "--wide", "--json"]),
+            Command::Ls(LsArgs { all: false, wide: true, json: true })
+        ));
         assert!(matches!(ok(&["ls", "-a"]), Command::Ls(LsArgs { all: true, wide: false, json: false })));
         assert!(matches!(ok(&["ls", "--all"]), Command::Ls(LsArgs { all: true, wide: false, json: false })));
         rejected(&[]);
@@ -3526,7 +4098,9 @@ mod tests {
         assert!(matches!(ok(&["resume", "s-1"]), Command::Resume(_)));
         assert!(matches!(ok(&["compact", "s-1"]), Command::Compact(_)));
         assert!(matches!(ok(&["ledger", "m-1"]), Command::Ledger(_)));
-        let Command::Sarif(a) = ok(&["sarif", "m-1", "-o", "findings.sarif", "--repo-name", "acme/app", "--commit", "abc123"]) else {
+        let Command::Sarif(a) =
+            ok(&["sarif", "m-1", "-o", "findings.sarif", "--repo-name", "acme/app", "--commit", "abc123"])
+        else {
             panic!("not sarif")
         };
         assert_eq!(a.session, "m-1");
@@ -3543,10 +4117,19 @@ mod tests {
         assert_eq!(h.host.as_deref(), Some("app.test"));
         assert_eq!(h.limit, Some(50));
         assert!(matches!(ok(&["har", "import", "m-1", "in.har"]), Command::Har { action: HarAction::Import(_) }));
-        assert!(matches!(ok(&["rewrite", "list"]), Command::Rewrite { action: RewriteCliAction::List { json: false } }));
-        assert!(matches!(ok(&["rewrite", "ls", "--json"]), Command::Rewrite { action: RewriteCliAction::List { json: true } }));
+        assert!(matches!(
+            ok(&["rewrite", "list"]),
+            Command::Rewrite { action: RewriteCliAction::List { json: false } }
+        ));
+        assert!(matches!(
+            ok(&["rewrite", "ls", "--json"]),
+            Command::Rewrite { action: RewriteCliAction::List { json: true } }
+        ));
         assert!(matches!(ok(&["rewrite", "example"]), Command::Rewrite { action: RewriteCliAction::Example }));
-        assert!(matches!(ok(&["rewrite", "enable", "3"]), Command::Rewrite { action: RewriteCliAction::Enable { id: 3 } }));
+        assert!(matches!(
+            ok(&["rewrite", "enable", "3"]),
+            Command::Rewrite { action: RewriteCliAction::Enable { id: 3 } }
+        ));
         assert!(matches!(ok(&["rewrite", "remove", "3"]), Command::Rewrite { action: RewriteCliAction::Rm { id: 3 } }));
         assert!(matches!(ok(&["mail", "check"]), Command::Mail { action: MailAction::Check }));
         assert!(matches!(ok(&["signal", "check"]), Command::Signal { action: SignalAction::Check }));
@@ -3554,7 +4137,10 @@ mod tests {
         assert!(matches!(ok(&["window", "s-1"]), Command::Window(WindowArgs { json: false, .. })));
         assert!(matches!(ok(&["window", "s-1", "--json"]), Command::Window(WindowArgs { json: true, .. })));
         assert!(matches!(ok(&["ledger", "m-1", "--json"]), Command::Ledger(LedgerArgs { json: true, .. })));
-        for cmd in ["stop", "resume", "compact", "archive", "ledger", "findings", "sarif", "score", "window", "net", "traffic", "answer", "out"] {
+        for cmd in [
+            "stop", "resume", "compact", "archive", "ledger", "findings", "sarif", "score", "window", "net", "traffic",
+            "answer", "out",
+        ] {
             rejected(&[cmd]);
         }
         let Command::Score(a) = ok(&["score", "last"]) else { panic!("not score") };
@@ -3590,11 +4176,27 @@ mod tests {
         assert_eq!((a.text, a.scope.as_deref()), (words(&["ship", "it"]), Some("staging")));
         rejected(&["approve"]);
         let Command::Scope(a) = ok(&["scope", "last", "docs.example.test", "*.cdn.test"]) else { panic!("not scope") };
-        assert_eq!((a.session.as_str(), a.hosts, a.note), ("last", words(&["docs.example.test", "*.cdn.test"]), None));
+        assert_eq!(
+            (a.session.as_deref(), a.hosts, a.note),
+            (Some("last"), words(&["docs.example.test", "*.cdn.test"]), None)
+        );
         let Command::Scope(a) = ok(&["scope", "s-1", "a.test", "--note", "for the docs"]) else { panic!("not scope") };
         assert_eq!((a.hosts, a.note.as_deref()), (words(&["a.test"]), Some("for the docs")));
         rejected(&["scope"]);
         rejected(&["scope", "s-1"]);
+        let Command::Scope(a) = ok(&["scope", "revoke", "m-1", "a.test", "--reason", "wrong target"]) else {
+            panic!("not scope revoke")
+        };
+        let Some(ScopeAction::Revoke(r)) = a.action else { panic!("not revoke") };
+        assert_eq!(
+            (r.target.as_str(), r.hosts, r.reason.as_deref()),
+            ("m-1", words(&["a.test"]), Some("wrong target"))
+        );
+        // The reason may be left out (the ledger records the stock one); a host may not.
+        let Command::Scope(a) = ok(&["scope", "revoke", "m-1", "a.test"]) else { panic!("not scope revoke") };
+        let Some(ScopeAction::Revoke(r)) = a.action else { panic!("not revoke") };
+        assert_eq!(r.reason, None);
+        rejected(&["scope", "revoke", "m-1", "--reason", "x"]);
         let Command::Release(a) = ok(&["release", "s-1", "target", "is", "gone"]) else { panic!("not release") };
         assert_eq!((a.session.as_str(), a.reason), ("s-1", words(&["target", "is", "gone"])));
         rejected(&["release"]);
@@ -3626,6 +4228,15 @@ mod tests {
         assert!(matches!(ok(&["config", "path"]), Command::Config { action: ConfigAction::Path }));
         assert!(matches!(ok(&["config", "check"]), Command::Config { action: ConfigAction::Check }));
         assert!(matches!(ok(&["config", "init"]), Command::Config { action: ConfigAction::Init }));
+        assert!(matches!(
+            ok(&["models", "lineage"]),
+            Command::Models { action: ModelsAction::Lineage { profile: None } }
+        ));
+        assert!(matches!(
+            ok(&["models", "lineage", "dsv41"]),
+            Command::Models { action: ModelsAction::Lineage { profile: Some(p) } } if p == "dsv41"
+        ));
+        rejected(&["models", "show"]); // a session: `models show` is a mission's models
         assert!(matches!(ok(&["service", "install"]), Command::Service { action: ServiceAction::Install }));
         assert!(matches!(ok(&["service", "uninstall"]), Command::Service { action: ServiceAction::Uninstall }));
         assert!(matches!(ok(&["service", "status"]), Command::Service { action: ServiceAction::Status }));
@@ -3640,7 +4251,10 @@ mod tests {
         rejected(&["mcp"]);
         rejected(&["mcp", "check"]);
         assert!(matches!(ok(&["models", "list"]), Command::Models { action: ModelsAction::List { json: false } }));
-        assert!(matches!(ok(&["models", "ls", "--json"]), Command::Models { action: ModelsAction::List { json: true } }));
+        assert!(matches!(
+            ok(&["models", "ls", "--json"]),
+            Command::Models { action: ModelsAction::List { json: true } }
+        ));
         assert!(matches!(ok(&["models", "reload"]), Command::Models { action: ModelsAction::Reload }));
         let Command::Models { action: ModelsAction::Set(a) } = ok(&["models", "set", "last", "big"]) else {
             panic!("not models set")
@@ -3784,6 +4398,28 @@ mod tests {
         assert_eq!(config.daemon.bind, "127.0.0.1:7878");
         assert_eq!(config.network.mode, ferret_core::config::NetworkMode::DenyAll);
         assert_eq!(config.agents.unavailable_notice_s, 300);
+        assert!(config.monitor.tripwires_only_profiles.is_empty(), "not LLM-reviewed is the operator's choice");
+    }
+
+    #[test]
+    fn a_fresh_config_fails_the_check_until_the_operator_chooses() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::at(dir.path().join("home"));
+        assert_eq!(cmd_config(&paths, ConfigAction::Init), Ok(0));
+        // The start-up checks run before the model policy, and the default sandbox is the system's own (seatbelt,
+        // or bubblewrap with its binary): with no OS sandbox they pass on every host, so the check reaches the
+        // policy everywhere. The generated config has a `[sandbox]` table, with its `mode` commented out.
+        let init = std::fs::read_to_string(paths.config_file()).unwrap();
+        let none = init.replacen("\n[sandbox]\n", "\n[sandbox]\nmode = \"none\"\n", 1);
+        assert_ne!(none, init, "the generated config has a [sandbox] table");
+        std::fs::write(paths.config_file(), none).unwrap();
+        let err = cmd_config(&paths, ConfigAction::Check).unwrap_err();
+        assert!(err.starts_with("The model policy is not settled"), "{err}");
+        let text = std::fs::read_to_string(paths.config_file()).unwrap();
+        let chosen = text.replace("# tripwires_only_profiles", "tripwires_only_profiles");
+        let rest = chosen.replace("[models.local]", "[models.local]\nfamily = [\"qwen\"]\nrecipient = \"local\"");
+        std::fs::write(paths.config_file(), rest).unwrap();
+        assert_eq!(cmd_config(&paths, ConfigAction::Check), Ok(0));
     }
 
     #[test]
@@ -3814,13 +4450,69 @@ mod tests {
         assert_eq!(script.seen[0].auth.as_deref(), Some("Bearer tok-123"));
     }
 
+    #[test]
+    fn the_login_code_is_in_a_private_page_file_and_not_on_the_openers_command_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let login = dir.path().join("login");
+        let url = "http://127.0.0.1:7878/#code=c0de1234&x=\"<y>";
+        let mut argv: Vec<String> = Vec::new();
+        let mut page_text = String::new();
+        let res = launch_browser_with(&login, url, |program, page| {
+            argv = vec![program.to_string(), page.display().to_string()];
+            page_text = std::fs::read_to_string(page).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(std::fs::metadata(page).unwrap().permissions().mode() & 0o777, 0o600);
+                assert_eq!(std::fs::metadata(page.parent().unwrap()).unwrap().permissions().mode() & 0o077, 0);
+            }
+            Ok(true)
+        });
+        assert_eq!(res, Ok(()));
+        // Nothing the opener is started with holds the code or the address.
+        assert!(argv.iter().all(|a| !a.contains("c0de1234") && !a.contains("127.0.0.1:7878")), "{argv:?}");
+        assert!(argv[1].starts_with(login.to_str().unwrap()) && argv[1].ends_with(".html"), "{argv:?}");
+        // The page sends the browser on, with the address escaped where it is markup.
+        assert!(page_text.contains("http://127.0.0.1:7878/#code=c0de1234&amp;x=&quot;&lt;y&gt;"), "{page_text}");
+        assert!(page_text.contains("location.replace(") && page_text.contains("no-referrer"), "{page_text}");
+        // Another page is another file; an old page is removed by the next open, a fresh one is not.
+        let old = login.join("login-old.html");
+        std::fs::write(&old, "x").unwrap();
+        let aged = std::time::SystemTime::now() - Duration::from_secs(3600);
+        std::fs::File::options().write(true).open(&old).unwrap().set_modified(aged).unwrap();
+        let keep = login.join("notes.txt");
+        std::fs::write(&keep, "mine").unwrap();
+        assert_eq!(launch_browser_with(&login, url, |_, _| Ok(true)), Ok(()));
+        assert!(!old.exists(), "a stale page is removed");
+        assert!(keep.exists(), "other files are left alone");
+        assert_eq!(
+            std::fs::read_dir(&login)
+                .unwrap()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with("login-"))
+                .count(),
+            2
+        );
+        // An opener that fails leaves no page and says what to do.
+        let before = std::fs::read_dir(&login).unwrap().count();
+        let err = launch_browser_with(&login, url, |_, _| Ok(false)).unwrap_err();
+        assert!(err.contains("ferret open --print"), "{err}");
+        let err = launch_browser_with(&login, url, |_, _| Err(std::io::Error::other("no opener"))).unwrap_err();
+        assert!(err.contains("no opener") && err.contains("ferret open --print"), "{err}");
+        assert_eq!(std::fs::read_dir(&login).unwrap().count(), before);
+        // A directory that cannot be made is an error that says what to do.
+        std::fs::write(dir.path().join("file"), "x").unwrap();
+        let err = launch_browser_with(&dir.path().join("file").join("login"), url, |_, _| Ok(true)).unwrap_err();
+        assert!(err.contains("ferret open --print"), "{err}");
+    }
+
     #[tokio::test]
     async fn open_writes_the_address_only_with_print() {
         let script = Script::default().route("POST", "/api/login-codes", 200, r#"{"code":"c0de","expires_in_s":60}"#);
         let (c, _) = start(script).await;
         let url = format!("{}/#code=c0de", c.base());
 
-        // Without --print the browser gets the address and nothing is written.
+        // Without --print the browser gets the address; the one line written says what to do if an editor opened.
         let mut out = Vec::new();
         let mut launched = Vec::new();
         let code = open_with(&c, &OpenArgs { print: false }, &mut out, |u| {
@@ -3830,7 +4522,9 @@ mod tests {
         .await;
         assert_eq!(code, Ok(0));
         assert_eq!(launched, [url.as_str()]);
-        assert_eq!(String::from_utf8(out).unwrap(), "");
+        let note = String::from_utf8(out).unwrap();
+        assert_eq!(note, OPENED_NOTE);
+        assert!(note.contains("ferret open --print") && !note.contains("c0de"), "{note}");
 
         // With --print it is written and nothing is started.
         let mut out = Vec::new();
@@ -3900,14 +4594,14 @@ mod tests {
             cmd_config(&paths, ConfigAction::Init).unwrap_err(),
             format!("{} already exists.", paths.config_file().display())
         );
-        // `check` runs the start-up checks, so the default sandbox (seatbelt) passes only where `up` would
-        // accept it; on any other host it is refused with the sentence `up` gives.
-        let check = cmd_config(&paths, ConfigAction::Check);
-        if cfg!(target_os = "macos") {
-            assert_eq!(check, Ok(0));
-        } else {
-            let err = check.unwrap_err();
-            assert!(err.contains("seatbelt") && err.contains("not macOS"), "{err}");
+        // `check` runs the start-up checks first, so it fails where `up` would: the generated file leaves the
+        // sandbox at this OS's default, and a host that cannot run it is refused with the sentence `up` gives.
+        // Past them, the generated file does not choose "not LLM-reviewed" for the operator: the check asks.
+        let err = cmd_config(&paths, ConfigAction::Check).unwrap_err();
+        let generated = Config::load(&paths.config_file()).unwrap();
+        match ferret_tools::sandbox::preflight(&generated.sandbox) {
+            Ok(()) => assert!(err.starts_with("The model policy is not settled (2 to fix)"), "{err}"),
+            Err(refusal) => assert_eq!(err, refusal),
         }
         std::fs::write(paths.config_file(), "default_model = [").unwrap();
         assert!(cmd_config(&paths, ConfigAction::Check).unwrap_err().contains("config.toml"));
@@ -3921,6 +4615,27 @@ mod tests {
         std::fs::write(paths.config_file(), "[models.m]\napi_key_file = \"m\"\n").unwrap();
         let err = cmd_config(&paths, ConfigAction::Check).unwrap_err();
         assert!(err.starts_with("models.m: ") && err.contains(&paths.model_keys_dir().join("m").display().to_string()));
+    }
+
+    #[test]
+    fn config_check_fails_on_a_profile_nobody_reviews_and_says_what_to_add() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::at(dir.path().join("home"));
+        std::fs::create_dir_all(&paths.home).unwrap();
+        // The start-up checks run before the model policy, and seatbelt (the default) is macOS's: with no OS
+        // sandbox they pass on every host, so the check reaches the policy on Linux too.
+        let text = "[sandbox]\nmode = \"none\"\n\n[models.dsv41]\nbase_url = \"http://10.0.0.5:8000/v1\"\nfamily = [\"deepseek\"]\nalignment = \"stock\"\nrecipient = \"lan\"\n";
+        std::fs::write(paths.config_file(), text).unwrap();
+        let err = cmd_config(&paths, ConfigAction::Check).unwrap_err();
+        assert!(err.contains("models.dsv41 has no eligible reviewer in the core pack"), "{err}");
+        assert!(err.contains("tripwires_only_profiles = [\"dsv41\"]"), "{err}");
+        std::fs::write(paths.config_file(), format!("{text}[monitor]\ntripwires_only_profiles = [\"dsv41\"]\n"))
+            .unwrap();
+        assert_eq!(cmd_config(&paths, ConfigAction::Check), Ok(0));
+        assert_eq!(cmd_models_lineage(&paths, None), Ok(0));
+        assert_eq!(cmd_models_lineage(&paths, Some("dsv41")), Ok(0));
+        let err = cmd_models_lineage(&paths, Some("nope")).unwrap_err();
+        assert!(err.contains("\"nope\"") && err.contains("dsv41"), "{err}");
     }
 
     #[test]
@@ -4329,14 +5044,7 @@ mod tests {
     }
 
     fn tail_args(since: Option<u64>, no_follow: bool) -> TailArgs {
-        TailArgs {
-            session: "s-1".into(),
-            since,
-            last: None,
-            no_follow,
-            json: false,
-            show: ShowOpts::default(),
-        }
+        TailArgs { session: "s-1".into(), since, last: None, no_follow, json: false, show: ShowOpts::default() }
     }
 
     fn detail_with(phase: Phase, last_end: Option<TurnEndReason>, outcome: Option<SessionOutcome>) -> String {
@@ -4614,10 +5322,14 @@ mod tests {
         assert_eq!((f.session.as_str(), f.all, f.severity.as_deref(), f.json), ("last", true, Some("high"), true));
 
         // traffic + alias `exchanges`
-        let Command::Traffic(t) = ok(&["exchanges", "s-1", "--host", "api.test", "--after", "9", "-n", "12", "--json"]) else {
+        let Command::Traffic(t) = ok(&["exchanges", "s-1", "--host", "api.test", "--after", "9", "-n", "12", "--json"])
+        else {
             panic!("not traffic");
         };
-        assert_eq!((t.session.as_deref(), t.host.as_deref(), t.after, t.limit, t.json), (Some("s-1"), Some("api.test"), Some(9), 12, true));
+        assert_eq!(
+            (t.session.as_deref(), t.host.as_deref(), t.after, t.limit, t.json),
+            (Some("s-1"), Some("api.test"), Some(9), 12, true)
+        );
         let Command::Traffic(t) = ok(&["traffic", "--target", "acme", "--node", "n-1"]) else {
             panic!("not traffic --target");
         };
@@ -4626,10 +5338,22 @@ mod tests {
         rejected(&["traffic", "s-1", "--node", "n-1"]);
 
         // queued
-        assert!(matches!(ok(&["queued", "ls", "last", "--json"]), Command::Queued { action: QueuedAction::List { json: true, .. } }));
-        assert!(matches!(ok(&["queued", "edit", "last", "q-1", "updated", "text"]), Command::Queued { action: QueuedAction::Edit { .. } }));
-        assert!(matches!(ok(&["queued", "send", "last", "q-1"]), Command::Queued { action: QueuedAction::Send { .. } }));
-        assert!(matches!(ok(&["queued", "delete", "last", "q-1"]), Command::Queued { action: QueuedAction::Rm { .. } }));
+        assert!(matches!(
+            ok(&["queued", "ls", "last", "--json"]),
+            Command::Queued { action: QueuedAction::List { json: true, .. } }
+        ));
+        assert!(matches!(
+            ok(&["queued", "edit", "last", "q-1", "updated", "text"]),
+            Command::Queued { action: QueuedAction::Edit { .. } }
+        ));
+        assert!(matches!(
+            ok(&["queued", "send", "last", "q-1"]),
+            Command::Queued { action: QueuedAction::Send { .. } }
+        ));
+        assert!(matches!(
+            ok(&["queued", "delete", "last", "q-1"]),
+            Command::Queued { action: QueuedAction::Rm { .. } }
+        ));
 
         // tail -n/--last, --json/--jsonl, --no-exchanges
         let Command::Tail(t) = ok(&["tail", "s-1", "-n", "25", "--jsonl", "--no-exchanges"]) else {
@@ -4639,9 +5363,10 @@ mod tests {
         rejected(&["tail", "s-1", "--since", "5", "--last", "10"]);
 
         // target show filters + --json
-        let Command::Target { action: TargetAction::Show(ts) } =
-            ok(&["target", "show", "acme", "--nodes", "--status", "untested", "--kind", "endpoint", "--under", "h1", "--json"])
-        else {
+        let Command::Target { action: TargetAction::Show(ts) } = ok(&[
+            "target", "show", "acme", "--nodes", "--status", "untested", "--kind", "endpoint", "--under", "h1",
+            "--json",
+        ]) else {
             panic!("not target show");
         };
         assert_eq!(
@@ -4662,7 +5387,9 @@ mod tests {
         rejected(&["creds", "list", "acme", "--target", "acme"]);
         rejected(&["creds", "list"]);
 
-        let Command::Creds { action: CredsAction::Show(c) } = ok(&["creds", "show", "acme", "--profile", "admin", "--json"]) else {
+        let Command::Creds { action: CredsAction::Show(c) } =
+            ok(&["creds", "show", "acme", "--profile", "admin", "--json"])
+        else {
             panic!("not creds show");
         };
         assert_eq!((c.target(), c.profile.as_str(), c.json), ("acme", "admin", true));
@@ -4674,7 +5401,10 @@ mod tests {
 
         // Top-level help mentions env vars and exit codes; internal doc tags stripped from creds/ca help.
         let top_help = parse(&["--help"]).unwrap_err().to_string();
-        assert!(top_help.contains("FERRET_HOME") && top_help.contains("EXIT CODES") && top_help.contains("130"), "{top_help}");
+        assert!(
+            top_help.contains("FERRET_HOME") && top_help.contains("EXIT CODES") && top_help.contains("130"),
+            "{top_help}"
+        );
         assert!(!top_help.contains("CONTRACTS-TRAFFIC-TARGETS"), "{top_help}");
     }
 
@@ -4726,7 +5456,7 @@ mod tests {
         assert_eq!(live.draw(80, false, &id), "a    b");
         let mut live = Live::default();
         live.push(&Delta::Text { text: "你好世界你好".into() }); // 6 CJK chars = 12 display cols
-        // width 11 -> w = 10 -> 5 CJK chars (10 cols) on row 1, 1 CJK char on row 2.
+                                                                 // width 11 -> w = 10 -> 5 CJK chars (10 cols) on row 1, 1 CJK char on row 2.
         assert_eq!(live.draw(11, false, &id), "你好世界你\n好");
     }
 
@@ -4767,7 +5497,11 @@ mod tests {
                 move |Query(q): Query<HashMap<String, String>>| async move {
                     // Simulate pre-Wave-1 daemon returning empty page for unclamped huge `before=`.
                     if q.contains_key("before") {
-                        return json(&crate::wire::RecordsPage { records: vec![], next_after: None, prev_before: None });
+                        return json(&crate::wire::RecordsPage {
+                            records: vec![],
+                            next_after: None,
+                            prev_before: None,
+                        });
                     }
                     let after = q.get("after").and_then(|v| v.parse::<Seq>().ok());
                     let limit = q.get("limit").and_then(|v| v.parse::<usize>().ok()).unwrap_or(500);
@@ -4844,21 +5578,24 @@ mod tests {
 
     #[test]
     fn scope_revoke_panic_and_include_secrets_parse_and_format() {
-        let Command::Scope(a) = ok(&["scope", "revoke", "s-1", "api.example.test", "cdn.example.test", "--note", "done", "--json"]) else {
-            panic!("not scope")
+        let Command::Scope(ScopeArgs { action: Some(ScopeAction::Revoke(a)), .. }) =
+            ok(&["scope", "revoke", "s-1", "api.example.test", "cdn.example.test", "--note", "done", "--json"])
+        else {
+            panic!("not scope revoke")
         };
-        assert_eq!(a.note.as_deref(), Some("done"));
+        assert_eq!(a.reason.as_deref(), Some("done"), "--note is --reason");
         assert!(a.json);
-        assert_eq!(
-            a.resolved().unwrap(),
-            ScopeOp::Revoke { session: "s-1", hosts: &["api.example.test".into(), "cdn.example.test".into()] }
-        );
+        assert_eq!((a.target.as_str(), a.hosts), ("s-1", vec!["api.example.test".into(), "cdn.example.test".into()]));
 
-        let Command::Scope(missing_host) = ok(&["scope", "revoke", "s-1"]) else { panic!("not scope") };
-        assert!(missing_host.resolved().is_err());
+        // A revoke names at least one host.
+        rejected(&["scope", "revoke", "s-1"]);
 
-        let Command::Scope(grant_explicit) = ok(&["scope", "grant", "last", "a.test"]) else { panic!("not scope") };
-        assert_eq!(grant_explicit.resolved().unwrap(), ScopeOp::Grant { session: "last", hosts: &["a.test".into()] });
+        let Command::Scope(ScopeArgs { action: Some(ScopeAction::Grant(g)), .. }) =
+            ok(&["scope", "grant", "last", "a.test"])
+        else {
+            panic!("not scope grant")
+        };
+        assert_eq!((g.session.as_str(), g.hosts, g.note), ("last", vec!["a.test".to_string()], None));
 
         let Command::Panic(p) = ok(&["panic"]) else { panic!("not panic") };
         assert_eq!(p, PanicArgs { reason: None, json: false });
@@ -4881,21 +5618,50 @@ mod tests {
         assert!(s.include_secrets);
 
         let rev = ScopeRevokeReceipt {
-            session: SessionId::from("s-1"),
+            lead: SessionId::from("s-1"),
             revoked: vec!["a.test".into(), "b.test".into()],
+            ledger: true,
+            recorded: vec!["a.test".into(), "b.test".into()],
+            not_granted: vec![],
+            sessions: 1,
             connections_cut: 2,
         };
-        assert_eq!(scope_revoke_line(&rev), "scope revoked for s-1: a.test, b.test (2 connections cut)");
+        assert_eq!(
+            scope_revoke_line(&rev),
+            "scope revoked for s-1: a.test, b.test; 1 session(s) narrowed, 2 connections cut"
+        );
+        // A carve-out, a grant the ledger does not list yet, and a mission without a ledger are each said.
+        let partial = ScopeRevokeReceipt {
+            recorded: vec!["a.test".into()],
+            not_granted: vec!["x.b.test".into()],
+            revoked: vec!["a.test".into(), "late.test".into(), "x.b.test".into()],
+            connections_cut: 1,
+            ..rev.clone()
+        };
+        let line = scope_revoke_line(&partial);
+        assert!(line.contains("1 connection cut") && line.contains("no ledger record): x.b.test"), "{line}");
+        assert!(line.contains("the grant of late.test was not in the ledger yet"), "{line}");
+        let no_ledger = ScopeRevokeReceipt { ledger: false, recorded: vec![], ..rev.clone() };
+        assert!(scope_revoke_line(&no_ledger).contains("keeps no ledger"));
 
         let rep = PanicReport {
             connections_cut: 4,
             sessions_stopped: vec![SessionId::from("s-1")],
             boxes_torn_down: 1,
             rewrites_disabled: 3,
+            processes_killed: 0,
+            processes_left: 0,
         };
         assert_eq!(
             panic_line(&rep),
             "panic stop complete: 4 connections cut, 1 session stopped (s-1), 1 box torn down, 3 rewrite rules disabled"
+        );
+        // What the census stopped under the sessions' sandboxes is said when there was any.
+        let census = PanicReport { processes_killed: 2, processes_left: 1, ..rep };
+        let line = panic_line(&census);
+        assert!(
+            line.contains("2 process(es) left under the sandboxes stopped") && line.contains("1 could not"),
+            "{line}"
         );
     }
 

@@ -1034,7 +1034,8 @@ mod tests {
         ];
 
         let many = Secrets::for_many_items(user_a.iter().chain(admin.iter()));
-        let text = "a=user-a-session b=user-a-session-extended-admin c=Bearer shared-token-admin-99 d=shared-token e=tiny";
+        let text =
+            "a=user-a-session b=user-a-session-extended-admin c=Bearer shared-token-admin-99 d=shared-token e=tiny";
         assert_eq!(many.redact(text), "a=[redacted] b=[redacted] c=[redacted] d=[redacted] e=tiny");
 
         let s_a = Secrets::for_items(&user_a);

@@ -14,6 +14,8 @@
 //! intercept = false             # missions decrypt HTTPS by default ([network] intercept = "pack")
 //! requires_restricted_network = false  # optional; true = refuse to start sessions while the network mode is open
 //! solvable = false              # optional; true = the operator built this mission to be solvable (see below)
+//! live_targets = false          # optional; true = the pack works on the operator's live systems (a bug bounty):
+//!                               # the monitor never counts its restricted network as a lab (docs/MONITOR.md D16)
 //!
 //! [roles.lead]
 //! description = "…"             # optional
@@ -149,6 +151,10 @@ pub struct Pack {
     /// The operator built missions of this pack to be solvable: roles are told so, and `conclude`
     /// refuses `unreachable`.
     pub solvable: bool,
+    /// The pack works on the operator's live systems (main's `webapp`: a bug bounty): its restricted network is not a
+    /// lab, so the monitor judges its missions as real-target missions by the usual rule (`docs/MONITOR.md` D16).
+    /// Nothing else reads it.
+    pub live_targets: bool,
     pub command_guard: bool,
     pub target_concurrency: u32,
     /// Missions of this pack intercept HTTPS unless started without it (CONTRACTS-TRAFFIC-TARGETS I1).
@@ -315,6 +321,8 @@ struct RawPack {
     requires_restricted_network: bool,
     #[serde(default)]
     solvable: bool,
+    #[serde(default)]
+    live_targets: bool,
     command_guard: Option<String>,
     target_concurrency: Option<u32>,
     #[serde(default)]
@@ -587,6 +595,7 @@ fn parse_pack(
         preamble,
         requires_restricted_network: raw.requires_restricted_network,
         solvable: raw.solvable,
+        live_targets: raw.live_targets,
         command_guard,
         target_concurrency,
         intercept: raw.intercept,
@@ -689,11 +698,14 @@ impl Packs {
         for pack in self.packs.values() {
             for role in pack.roles.values() {
                 for name in role.model.iter().chain(role.escalation_model.iter()).chain(role.alloy_models.iter()) {
-                    if !models.contains_key(name) {
-                        return Err(format!(
-                            "pack {} role {}: model profile \"{}\" is not configured; add [models.{}] or change the role",
-                            pack.name, role.name, name, name
-                        ));
+                    match models.get(name) {
+                        None => {
+                            return Err(format!("pack {} role {}: model profile \"{}\" is not configured; add [models.{}] or change the role", pack.name, role.name, name, name));
+                        }
+                        Some(m) if m.purpose == Some(ferret_core::config::ProfilePurpose::Review) => {
+                            return Err(format!("pack {} role {}: model profile \"{}\" has purpose = \"review\", which is a reviewer's and not an agent's, so its sessions would run unreviewed; name an agent profile", pack.name, role.name, name));
+                        }
+                        Some(_) => {}
                     }
                 }
             }
@@ -818,6 +830,11 @@ mod tests {
         assert!(webapp.command_guard);
         assert!(webapp.intercept);
         assert!(!webapp.solvable);
+        // Its restricted network is not a lab: it works on live bug-bounty targets (the monitor's D16).
+        assert!(webapp.live_targets);
+        for other in ["core", "vr", "redteam", "ctf", "ctf-generalist", "harnessmm"] {
+            assert!(p.get(other).is_none_or(|o| !o.live_targets), "{other}");
+        }
         assert!(!webapp.preamble.is_empty());
         for r in ["lead", "recon_mapper", "authz_tester", "exploit_worker", "triage_judge"] {
             assert!(!webapp.roles[r].prompt.is_empty(), "webapp/{r} prompt empty");
@@ -1266,6 +1283,12 @@ mod tests {
             models.insert(name.into(), Default::default());
         }
         packs.check_profiles(&models).unwrap();
+        // A reviewer's profile is never a role's model: its sessions would run unreviewed.
+        if let Some(m) = models.get_mut("strong") {
+            m.purpose = Some(ferret_core::config::ProfilePurpose::Review);
+        }
+        let e = packs.check_profiles(&models).unwrap_err();
+        assert!(e.contains("\"strong\"") && e.contains("purpose = \"review\""), "{e}");
         for extra in ["command_guard = \"typo\"", "target_concurrency = 0"] {
             assert!(Packs::load(mk(&format!("{extra}\n{GOOD}")).path()).is_err());
         }
@@ -1289,7 +1312,8 @@ mod tests {
 
     /// TOOL-SHAPES section 4.3: the wire tools the model is shown, in presented form.
     fn shown_specs(role: &RoleDef, dialect: ferret_core::config::Dialect) -> Vec<ferret_core::event::ToolSpec> {
-        let rig = crate::rtools::testkit::rig_with(role.clone(), false, true, ferret_core::config::AgentsCfg::default());
+        let rig =
+            crate::rtools::testkit::rig_with(role.clone(), false, true, ferret_core::config::AgentsCfg::default());
         rig.registry
             .specs()
             .into_iter()
@@ -1523,10 +1547,7 @@ mod tests {
         // The generalist solver carries the full union of ctf's specialized solver tools.
         for specialist in ["solver", "web_solver", "binary_solver", "crypto_solver"] {
             for tool in &ctf.roles.get(specialist).unwrap().tools {
-                assert!(
-                    solver.tools.contains(tool),
-                    "ctf-generalist/solver missing `{tool}` from ctf/{specialist}"
-                );
+                assert!(solver.tools.contains(tool), "ctf-generalist/solver missing `{tool}` from ctf/{specialist}");
             }
         }
         // Prose names only tools present on the pack / respective role.
@@ -1657,10 +1678,7 @@ mod tests {
                 "bin_xrefs",
                 "gdb_probe",
             ] {
-                assert!(
-                    vr.roles[role_name].tools.iter().any(|t| t == tool),
-                    "vr/{role_name} missing `{tool}`"
-                );
+                assert!(vr.roles[role_name].tools.iter().any(|t| t == tool), "vr/{role_name} missing `{tool}`");
             }
         }
         assert!(vr.roles["judge"].read_only);
@@ -1728,7 +1746,10 @@ mod tests {
                         role.name
                     );
                     assert!(
-                        !role.tools.iter().any(|t| t.starts_with("box_") || t.starts_with("oast_") || t == "http_authz_matrix"),
+                        !role
+                            .tools
+                            .iter()
+                            .any(|t| t.starts_with("box_") || t.starts_with("oast_") || t == "http_authz_matrix"),
                         "{pack_name}/{}: read_only role must not have box_*/oast_*/http_authz_matrix tools",
                         role.name
                     );

@@ -155,9 +155,7 @@ fn resolve_op(state: &SecurityState, op: &mut SecurityOp) -> Result<(), String> 
         // Full content IDs may be introduced earlier in this batch. Core validation still requires
         // the referenced record to exist at the exact point of use, under the journal lock.
         if s.len() == 67
-            && ["as-", "cr-", "fh-", "cs-", "hy-", "rl-", "ft-", "ru-", "cv-", "fn-"]
-                .iter()
-                .any(|p| s.starts_with(p))
+            && ["as-", "cr-", "fh-", "cs-", "hy-", "rl-", "ft-", "ru-", "cv-", "fn-"].iter().any(|p| s.starts_with(p))
         {
             return Ok(());
         }
@@ -862,10 +860,8 @@ impl Tool for SecurityRecord {
                 }
                 if !cross_mission_dups.is_empty() {
                     let count = cross_mission_dups.len();
-                    let prior_missions: Vec<&str> = cross_mission_dups
-                        .iter()
-                        .filter_map(|d| d.get("mission").and_then(Value::as_str))
-                        .collect();
+                    let prior_missions: Vec<&str> =
+                        cross_mission_dups.iter().filter_map(|d| d.get("mission").and_then(Value::as_str)).collect();
                     result.insert(
                         "duplicate_note".into(),
                         json!(format!(
@@ -1023,11 +1019,8 @@ async fn coverage_view(shared: &Shared, ledger: &LedgerState, args: &Map<String,
     let state = &ledger.security;
     let ev_by_id: HashMap<&str, &Evidence> = ledger.evidence.iter().map(|e| (e.id.as_str(), e)).collect();
     let want_outcome = args.get("outcome").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
-    let want_surface = args
-        .get("surface")
-        .and_then(Value::as_str)
-        .map(|s| s.trim().to_ascii_lowercase())
-        .filter(|s| !s.is_empty());
+    let want_surface =
+        args.get("surface").and_then(Value::as_str).map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty());
 
     let mut entries: Vec<Value> = Vec::new();
     let mut sessions_recorded: BTreeSet<String> = BTreeSet::new();
@@ -1357,12 +1350,7 @@ impl Tool for SecurityIngest {
         if raw_bytes.len() > 2 * 1024 * 1024 {
             return ToolOutput::error("The scanner output exceeds 2 MiB; nothing was imported.");
         }
-        let secrets = ctx
-            .capabilities
-            .secrets
-            .get()
-            .or_else(|| self.0.traffic.secrets.get())
-            .filter(|s| !s.is_empty());
+        let secrets = ctx.capabilities.secrets.get().or_else(|| self.0.traffic.secrets.get()).filter(|s| !s.is_empty());
         let bytes = match secrets {
             Some(s) => s.redact_bytes(&raw_bytes).into_owned(),
             None => raw_bytes,
@@ -1370,16 +1358,11 @@ impl Tool for SecurityIngest {
         let format = args.get("format").and_then(Value::as_str).unwrap_or("");
         let source_url = args.get("source_url").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
         let fallback_origin = infer_fallback_origin(&self.0, &ledger);
-        let parsed = match scanners::parse_with_options(
-            format,
-            &bytes,
-            &evidence,
-            source_url,
-            fallback_origin.as_deref(),
-        ) {
-            Ok(v) => v,
-            Err(e) => return ToolOutput::error(e),
-        };
+        let parsed =
+            match scanners::parse_with_options(format, &bytes, &evidence, source_url, fallback_origin.as_deref()) {
+                Ok(v) => v,
+                Err(e) => return ToolOutput::error(e),
+            };
         let count = parsed.assets.len();
         let sample_endpoints: Vec<String> = parsed
             .sample_endpoints
@@ -1943,7 +1926,8 @@ mod tests {
     #[tokio::test]
     async fn coverage_provenance_and_structured_findings_work_end_to_end() {
         let r = rig("lead", false, true);
-        let run_out = r.output("HTTP/1.1 500 Internal Server Error\nSQLITE_ERROR near syntax\n", "bash", ToolClass::Exec);
+        let run_out =
+            r.output("HTTP/1.1 500 Internal Server Error\nSQLITE_ERROR near syntax\n", "bash", ToolClass::Exec);
         let read_out = r.output("fn check_auth(user: &User) -> bool { user.is_admin }\n", "read", ToolClass::Read);
         let poc_out = r.output("#!/usr/bin/env python3\nprint('poc')\n", "read", ToolClass::Read);
 
@@ -2101,12 +2085,7 @@ mod tests {
         assert_eq!(rec.status, Status::Error, "{}", rec.text);
         assert!(rec.text.to_ascii_lowercase().contains("read-only"), "{}", rec.text);
 
-        let ing = r
-            .call(
-                "security_ingest",
-                json!({"format": "nuclei", "handle": h, "evidence": ["e1"]}),
-            )
-            .await;
+        let ing = r.call("security_ingest", json!({"format": "nuclei", "handle": h, "evidence": ["e1"]})).await;
         assert_eq!(ing.status, Status::Error, "{}", ing.text);
         assert!(ing.text.to_ascii_lowercase().contains("read-only"), "{}", ing.text);
 
@@ -2135,9 +2114,7 @@ mod tests {
             ToolClass::Exec,
         );
         evidence(&r, &oa);
-        let res = r
-            .call("security_ingest", json!({"format": "openapi", "handle": oa, "evidence": ["e1"]}))
-            .await;
+        let res = r.call("security_ingest", json!({"format": "openapi", "handle": oa, "evidence": ["e1"]})).await;
         assert_eq!(res.status, Status::Ok, "{}", res.text);
         let body = body_json(&res.text);
         assert_eq!(body["format"], "openapi");
@@ -2172,7 +2149,8 @@ mod tests {
         assert_eq!(res.status, Status::Ok, "{}", res.text);
         let body = body_json(&res.text);
         assert_eq!(body["discovered_surfaces"], 2);
-        let locs: Vec<String> = r.shared.ledger().unwrap().security.assets.values().map(|a| a.locator.clone()).collect();
+        let locs: Vec<String> =
+            r.shared.ledger().unwrap().security.assets.values().map(|a| a.locator.clone()).collect();
         assert!(locs.iter().any(|l| l == "https://api.acme.test/graphql#query:invoice"), "{locs:?}");
         assert!(locs.iter().any(|l| l == "https://api.acme.test/graphql#mutation:deleteInvoice"), "{locs:?}");
 
@@ -2195,7 +2173,8 @@ mod tests {
             )
             .await;
         assert_eq!(res.status, Status::Ok, "{}", res.text);
-        let locs: Vec<String> = r.shared.ledger().unwrap().security.assets.values().map(|a| a.locator.clone()).collect();
+        let locs: Vec<String> =
+            r.shared.ledger().unwrap().security.assets.values().map(|a| a.locator.clone()).collect();
         assert!(locs.iter().any(|l| l == "https://app.acme.test/api/internal/billing"), "{locs:?}");
 
         // 4. `.map` URLs in ffuf scanner output remain mandatory (not demoted as static assets).

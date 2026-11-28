@@ -507,7 +507,12 @@ fn spec_follows_the_listing() {
     let trusted_tool = McpTool {
         handle: h_trusted,
         name: "mcp__gh__t".into(),
-        def: McpToolDef { name: "t".into(), description: String::new(), input_schema: Value::Null, read_only_hint: Some(true) },
+        def: McpToolDef {
+            name: "t".into(),
+            description: String::new(),
+            input_schema: Value::Null,
+            read_only_hint: Some(true),
+        },
     };
     assert_eq!(trusted_tool.spec().class, ferret_core::event::ToolClass::Read);
 }
@@ -707,7 +712,12 @@ async fn http_traffic_capture_redacts_extra_auth_headers_and_echoed_secrets() {
     let tool = McpTool {
         handle: h,
         name: tool_name("web", "echo"),
-        def: McpToolDef { name: "echo".into(), description: String::new(), input_schema: Value::Null, read_only_hint: None },
+        def: McpToolDef {
+            name: "echo".into(),
+            description: String::new(),
+            input_schema: Value::Null,
+            read_only_hint: None,
+        },
     };
     let out = tool.run(&t.ctx, &serde_json::Map::new()).await;
     assert_eq!(out.status, ToolStatus::Ok);

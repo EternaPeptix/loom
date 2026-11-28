@@ -75,7 +75,8 @@ impl SessionTools {
     /// Sorted names of all mounted credential profiles (excluding `"anon"`).
     pub fn mounted_profile_names(&self) -> Vec<String> {
         if let Some(map) = self.creds_profiles.get() {
-            let mut names: Vec<String> = map.keys().filter(|k| !k.is_empty() && k.as_str() != "anon").cloned().collect();
+            let mut names: Vec<String> =
+                map.keys().filter(|k| !k.is_empty() && k.as_str() != "anon").cloned().collect();
             names.sort();
             names.dedup();
             return names;
@@ -116,12 +117,8 @@ impl SessionTools {
                     return Ok((Some(inject.clone()), format!("profile:{name}")));
                 }
             } else if let Some(inject) = self.creds.get() {
-                let default_name = self
-                    .default_profile
-                    .get()
-                    .map(String::as_str)
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or("default");
+                let default_name =
+                    self.default_profile.get().map(String::as_str).filter(|s| !s.is_empty()).unwrap_or("default");
                 if name == default_name {
                     return Ok((Some(inject.clone()), format!("profile:{name}")));
                 }
@@ -132,10 +129,7 @@ impl SessionTools {
                     "Unknown credential profile `{name}`: no credential profiles are mounted in this session (only `anon` is available)."
                 ))
             } else {
-                Err(format!(
-                    "Unknown credential profile `{name}`. Available profiles: anon, {}.",
-                    mounted.join(", ")
-                ))
+                Err(format!("Unknown credential profile `{name}`. Available profiles: anon, {}.", mounted.join(", ")))
             };
         }
         let default_name =
@@ -321,10 +315,7 @@ mod tests {
         let user_b = make_inject("tok-b");
         multi.creds.set(user_a.clone()).unwrap();
         multi.default_profile.set("user_a".into()).unwrap();
-        multi
-            .creds_profiles
-            .set(BTreeMap::from([("user_a".into(), user_a), ("user_b".into(), user_b)]))
-            .unwrap();
+        multi.creds_profiles.set(BTreeMap::from([("user_a".into(), user_a), ("user_b".into(), user_b)])).unwrap();
         assert_eq!(multi.mounted_profile_names(), vec!["user_a".to_string(), "user_b".to_string()]);
 
         let (inj, tag) = multi.resolve_profile(None, false).unwrap();

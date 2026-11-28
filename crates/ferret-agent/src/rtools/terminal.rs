@@ -417,8 +417,7 @@ fn check_security_coverage(state: &LedgerState) -> Result<(), String> {
     }
     let unbacked_findings = state.security.unbacked_high_confidence_findings(&state.evidence);
     if !unbacked_findings.is_empty() {
-        let items: Vec<String> =
-            unbacked_findings.iter().map(|f| format!("{} ({})", f.id, f.title)).collect();
+        let items: Vec<String> = unbacked_findings.iter().map(|f| format!("{} ({})", f.id, f.title)).collect();
         return Err(format!(
             "High-confidence security findings lack attested supporting run-grade execution evidence: {}. Attach attested execution evidence or downgrade/withdraw each finding with security_record finding_update before finishing.",
             items.join(", ")
@@ -2544,7 +2543,8 @@ mod tests {
             "s-judge",
             Some("verifier"),
         );
-        let cfg = ferret_core::config::SandboxCfg { mode: ferret_core::config::SandboxMode::None, ..Default::default() };
+        let cfg =
+            ferret_core::config::SandboxCfg { mode: ferret_core::config::SandboxMode::None, ..Default::default() };
         r.env.ctx.sandbox = Arc::new(
             ferret_tools::sandbox::Sandbox::new(
                 &cfg,
@@ -3220,7 +3220,10 @@ mod tests {
         assert_eq!(res.status, Status::Error, "{}", res.text);
         assert!(res.text.contains("p1 (todo): try the other parser"), "{}", res.text);
         assert!(res.text.contains("Close each route with `plan`"), "{}", res.text);
-        assert_eq!(r.shared.ledger().unwrap().goal_met.map(|g| g.status), Some(ferret_core::ledger::GoalMetStatus::Open));
+        assert_eq!(
+            r.shared.ledger().unwrap().goal_met.map(|g| g.status),
+            Some(ferret_core::ledger::GoalMetStatus::Open)
+        );
         // With the routes closed, the conclusion is accepted.
         r.model_op(LedgerOp::PlanUpdate {
             id: "p1".into(),
@@ -3301,7 +3304,10 @@ mod tests {
             "{}",
             res.text
         );
-        assert_eq!(r.shared.ledger().unwrap().goal_met.map(|g| g.status), Some(ferret_core::ledger::GoalMetStatus::Open));
+        assert_eq!(
+            r.shared.ledger().unwrap().goal_met.map(|g| g.status),
+            Some(ferret_core::ledger::GoalMetStatus::Open)
+        );
     }
 
     #[tokio::test]
@@ -4975,7 +4981,8 @@ mod tests {
         assert_eq!(open_ref.meta.get(META_REFUSAL), Some(&json!(REFUSAL_CEREMONY)));
 
         // With compact_tools = true and status omitted: auto-concludes Supported when run quote is given.
-        let r_compact = lead_with_goal_cfg(ferret_core::config::AgentsCfg { compact_tools: true, ..Default::default() });
+        let r_compact =
+            lead_with_goal_cfg(ferret_core::config::AgentsCfg { compact_tools: true, ..Default::default() });
         let h_run = r_compact.output("build succeeded\n", "bash", ToolClass::Exec);
         r_compact.orch.settle("s-kid1", ChildOutcome::Returned, "verified", accepted_payload());
         let ok = r_compact
@@ -5191,22 +5198,13 @@ mod tests {
         // 1. Non-security `core` session with empty security state stays completely unaffected.
         let mut core_lead = crate::rtools::testkit::core_role("lead");
         core_lead.verify_finish = false;
-        let core = crate::rtools::testkit::rig_with(
-            core_lead.clone(),
-            false,
-            true,
-            ferret_core::config::AgentsCfg::default(),
-        );
+        let core =
+            crate::rtools::testkit::rig_with(core_lead.clone(), false, true, ferret_core::config::AgentsCfg::default());
         let core_res = core.call("finish", json!({"answer": "done without security state"})).await;
         assert_eq!(core_res.status, Status::Ok, "{}", core_res.text);
 
         // 2. Security state with static-only `ruled_out` clear -> finish refused naming the cv-* ID.
-        let r = crate::rtools::testkit::rig_with(
-            core_lead,
-            false,
-            true,
-            ferret_core::config::AgentsCfg::default(),
-        );
+        let r = crate::rtools::testkit::rig_with(core_lead, false, true, ferret_core::config::AgentsCfg::default());
         r.model_op(LedgerOp::ClaimAdd { text: "surface check".into(), assets: vec![] });
         let read_blob = r.env.ctx.blobs.put_bytes(b"fn check_auth() {}\n").unwrap();
         r.model_op(LedgerOp::EvidenceAdd(EvidenceInput {

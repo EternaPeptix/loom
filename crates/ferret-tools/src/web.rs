@@ -54,8 +54,8 @@
 
 use crate::{params, traffic, Body, Tool, ToolCtx, ToolOutput};
 use async_trait::async_trait;
-use futures_util::StreamExt;
 use ferret_core::event::{ToolClass, ToolSpec, ToolStatus, META_EVIDENCE_GRADE, META_RAW_BLOB};
+use futures_util::StreamExt;
 use reqwest::header::HeaderMap;
 use reqwest::{header, redirect, Client, Method, Proxy};
 use serde_json::{json, Map, Value};
@@ -254,7 +254,8 @@ pub(crate) async fn proxy_verdict(client: &Client, url: &Url) -> Option<ProxyVer
     if resp.headers().get("x-ferret-proxy").and_then(|v| v.to_str().ok()) != Some("1") {
         return None;
     }
-    let rule = resp.headers().get(ferret_net::RULE_HEADER).and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
+    let rule =
+        resp.headers().get(ferret_net::RULE_HEADER).and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
     let status = resp.status().as_u16();
     let (body, _) = read_body(resp, PROXY_BODY_MAX).await;
     let text = String::from_utf8_lossy(&body).trim().to_string();
@@ -987,7 +988,8 @@ mod tests {
         };
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let proxy = ferret_net::Proxy::start(0, tx).await.unwrap();
-        let grant = proxy.grant(&ferret_core::SessionId::from("s-web"), ferret_net::Policy::new(&cfg).unwrap()).unwrap();
+        let grant =
+            proxy.grant(&ferret_core::SessionId::from("s-web"), ferret_net::Policy::new(&cfg).unwrap()).unwrap();
         (proxy, grant)
     }
 
@@ -1181,8 +1183,11 @@ mod tests {
     async fn the_marker_counts_only_on_the_answer_to_an_http_url_through_the_proxy() {
         let e = env();
         let answer = || {
-            let resp =
-                axum::http::Response::builder().status(403).header("x-ferret-proxy", "1").body("origin says no").unwrap();
+            let resp = axum::http::Response::builder()
+                .status(403)
+                .header("x-ferret-proxy", "1")
+                .body("origin says no")
+                .unwrap();
             reqwest::Response::from(resp)
         };
         let raw_body = |r: &ToolOutput| match &r.body {
@@ -1191,24 +1196,46 @@ mod tests {
         };
         // Inside the tunnel of an https URL only the origin speaks: its 403 is an observation.
         let https = [Url::parse("https://origin.test/x").unwrap()];
-        let r =
-            finish(&e.ctx, answer(), &https, false, true, false, (b"", std::time::Instant::now(), &mut Vec::new(), "anon"))
-                .await;
+        let r = finish(
+            &e.ctx,
+            answer(),
+            &https,
+            false,
+            true,
+            false,
+            (b"", std::time::Instant::now(), &mut Vec::new(), "anon"),
+        )
+        .await;
         assert_eq!(
             (r.status, r.outcome.as_str(), raw_body(&r).as_str()),
             (ToolStatus::Ok, "HTTP 403", "origin says no")
         );
         // The answer to an http URL through the proxy is the proxy's.
         let http = [Url::parse("http://origin.test/x").unwrap()];
-        let r =
-            finish(&e.ctx, answer(), &http, false, true, false, (b"", std::time::Instant::now(), &mut Vec::new(), "anon"))
-                .await;
+        let r = finish(
+            &e.ctx,
+            answer(),
+            &http,
+            false,
+            true,
+            false,
+            (b"", std::time::Instant::now(), &mut Vec::new(), "anon"),
+        )
+        .await;
         assert_eq!(r.status, ToolStatus::Denied);
         // Without a proxy there is no proxy to answer.
         assert_eq!(
-            finish(&e.ctx, answer(), &http, false, false, false, (b"", std::time::Instant::now(), &mut Vec::new(), "anon"))
-                .await
-                .status,
+            finish(
+                &e.ctx,
+                answer(),
+                &http,
+                false,
+                false,
+                false,
+                (b"", std::time::Instant::now(), &mut Vec::new(), "anon")
+            )
+            .await
+            .status,
             ToolStatus::Ok
         );
     }

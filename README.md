@@ -39,6 +39,7 @@ Ferret inverts the usual cloud-agent assumptions:
 | **Four Operator Surfaces** | Control missions seamlessly from the **CLI** (`ferret`), the embedded strict-CSP **Web UI**, the native macOS **`ferret-desk.app`**, or **two-way Signal** alerts and quote-replies on your phone. |
 | **Defense-in-Depth Sandboxing** | Local OS confinement (**macOS Seatbelt** / **Linux Bubblewrap**), loopback egress proxy with per-session scope grants, cleared daemon environment, plus optional **remote Docker/Colima container sandboxes (`[box]`)** over SSH with per-mission `iptables`/`ip6tables` isolation. |
 | **Prior-Mission Recall** | Seed new runs with `--prior <mission>` to carry forward sealed goals, operator rules, progress, and security findings without replaying raw transcripts. |
+| **Adversarial Monitor (Shadow)** | Specified in [`docs/MONITOR.md`](docs/MONITOR.md) and built in phases. This build has the floor (an infrastructure deny that no grant overrides, fetch-service and mach-lookup denies, a process census by sandbox identity, proxy cut/veto/SNI binding and canary users), model lineage with cross-family reviewer eligibility, and the deterministic tripwires over every record of every session, in shadow: they record and show what they find without steering, pausing or refusing anything. |
 | **Zero Telemetry** | Nothing leaves your network unless you explicitly configure a model endpoint, allowlist host, MCP server, email inbox, or Signal daemon. |
 
 ---
@@ -153,7 +154,7 @@ install -m 755 target/release/ferret ~/.local/bin/ferret
 
 ferret config init                  # writes ~/.ferret/config.toml
 $EDITOR ~/.ferret/config.toml       # configure [models.*] base_url and model
-ferret config check                 # validates config, keys, packs, and integrations
+ferret config check                 # validates config, keys, packs, integrations, and the model policy
 ferret up                           # starts the background daemon on 127.0.0.1:7878
 ferret status                       # verifies daemon, model reachability, Signal, disk
 ```
@@ -218,6 +219,8 @@ ferret rename <session> "title" | archive <session> [--undo]
 ferret inbox [--json]                               # open questions, scope requests, blockers
 ferret answer <item|last|.> ["..." | 1..N | --dismiss]   # also reads piped stdin
 ferret scope <session> <host>...                    # grant per-session egress hosts
+ferret scope revoke <mission|session> <host>... [--reason "..."]  # take hosts back (refused and cut at once, recorded)
+ferret panic [--reason "..."]                       # kill-switch: cut every tunnel, stop every session and box
 ferret rule <session> "text" | --withdraw <id> [--reason "..."]
 ferret approve <session> "text" [--scope "..."]
 ferret release <session> "reason"                   # close a blocked mission cleanly
@@ -247,6 +250,9 @@ ferret ca show | rotate                             # HTTPS interception CA
 ferret status [--json]                              # daemon, models, live Signal bridge, disk
 ferret packs [--json]                               # installed packs & roles
 ferret models list|reload|show|set|role             # hot-reload & mid-session switching
+ferret models lineage [profile]                     # family, alignment, recipient, and who reviews each profile
+ferret monitor [status] | log <mission> [--json]    # the monitor in shadow: state, tripwire hits, flags
+ferret monitor replay [--home DIR] [--json]         # the tripwires over a home's history, read-only
 ferret mcp list | check <server>                    # MCP server inspection
 ferret mail check                                   # scoped read-only inbox check
 ferret signal check | test [message...]             # two-way Signal bridge diagnostics
@@ -290,6 +296,7 @@ FERRET_BUILD_HOST=local bash gui/build.sh           # native macOS ferret-desk.a
 - [`docs/config.example.toml`](docs/config.example.toml) — Complete annotated configuration reference
 - [`docs/SECURITY_STATE.md`](docs/SECURITY_STATE.md) — Findings, coverage provenance, SARIF/HAR, rewrite rules, `[mail]`, and `[signal]`
 - [`docs/RUNTIME-CONTROLS.md`](docs/RUNTIME-CONTROLS.md) — Runtime governance, compaction, and steering controls
+- [`docs/MONITOR.md`](docs/MONITOR.md) — The adversarial monitor: the floor, tripwires, model lineage, reviewer, gate, and their phases
 - [`docs/UI.md`](docs/UI.md) &amp; [`gui/README.md`](gui/README.md) — Web UI and macOS `ferret-desk` guides
 - [`docs/IMPLEMENTING.md`](docs/IMPLEMENTING.md) — Contributor guide
 - [`SECURITY.md`](SECURITY.md) &middot; [`CHANGELOG.md`](CHANGELOG.md) &middot; [`LICENSE`](LICENSE)

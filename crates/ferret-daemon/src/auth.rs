@@ -238,12 +238,7 @@ impl Default for AuthRateLimiter {
 
 impl AuthRateLimiter {
     pub fn new(limit: usize, window: Duration) -> Self {
-        Self {
-            limit,
-            window,
-            bearer: Mutex::new(VecDeque::new()),
-            login: Mutex::new(VecDeque::new()),
-        }
+        Self { limit, window, bearer: Mutex::new(VecDeque::new()), login: Mutex::new(VecDeque::new()) }
     }
 
     fn prune(q: &mut VecDeque<Instant>, window: Duration, now: Instant) {
@@ -253,10 +248,8 @@ impl AuthRateLimiter {
     }
 
     fn retry_after_secs(q: &VecDeque<Instant>, window: Duration, now: Instant) -> u64 {
-        let remaining = q
-            .front()
-            .map(|oldest| window.saturating_sub(now.saturating_duration_since(*oldest)))
-            .unwrap_or(window);
+        let remaining =
+            q.front().map(|oldest| window.saturating_sub(now.saturating_duration_since(*oldest))).unwrap_or(window);
         let secs = remaining.as_millis().div_ceil(1_000);
         u64::try_from(secs).unwrap_or(u64::MAX).max(1)
     }

@@ -36,9 +36,9 @@ pub mod misc;
 pub mod scope;
 pub mod security;
 pub mod terminal;
-pub mod traffic_tools;
 #[cfg(test)]
 pub(crate) mod testkit;
+pub mod traffic_tools;
 
 use crate::pack::RoleDef;
 use async_trait::async_trait;
@@ -307,7 +307,10 @@ pub trait Orchestrator: Send + Sync {
     fn ledger_appended(&self, _session: &SessionId, _op: &LedgerOp, _state: &LedgerState) {}
     /// The target of the mission of `session` with its nodes (T5, `security_query` view `target`):
     /// `None` when the mission has no target.
-    fn target_nodes(&self, _session: &SessionId) -> Option<Result<(String, Vec<ferret_core::target::NodeView>), String>> {
+    fn target_nodes(
+        &self,
+        _session: &SessionId,
+    ) -> Option<Result<(String, Vec<ferret_core::target::NodeView>), String>> {
         None
     }
     /// Look up prior-mission findings in the mission target's graph matching the 3-axis key

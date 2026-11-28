@@ -409,6 +409,65 @@ async fn a_tls_stream_that_is_not_http_is_relayed_and_recorded_as_tls() {
     assert!(c.upstream_unverified && c.response.is_none());
 }
 
+#[tokio::test]
+async fn a_cut_ends_an_intercepted_tunnel_within_a_second() {
+    let e = env(intercepting()).await;
+    let port = https_server().await;
+    let mut s = tunnel_tls(&e, port, true).await.expect("the client trusts the ferret CA");
+    let r = roundtrip(&mut s, "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await;
+    assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+    assert_eq!(e.proxy.cut(&SessionId::from("s-capture")), 1);
+    let mut gone = Vec::new();
+    let ended = timeout(Duration::from_secs(1), s.read_to_end(&mut gone)).await;
+    assert!(ended.is_ok(), "a cut tunnel must close within a second, intercepted or not");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let seen = lock(&e.seen).clone();
+    let reason = "(failed after the allow: the session's connections were closed by ferret)";
+    assert!(seen.iter().any(|d| d.method == "CONNECT" && d.rule.ends_with(reason)), "{seen:?}");
+}
+
+#[tokio::test]
+async fn a_hello_for_another_name_is_refused_before_it_is_intercepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let ca = Ca::load_or_create(dir.path()).unwrap();
+    let (dtx, _drx) = unbounded_channel();
+    let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+    let log = seen.clone();
+    let audit: AuditFn = Arc::new(move |_s, d| {
+        lock(&log).push(d.clone());
+        Ok(())
+    });
+    let proxy = Proxy::start_with(0, dtx, Some(audit), Limits::default()).await.unwrap();
+    let (tx, rx) = unbounded_channel();
+    let sid = SessionId::from("s-capture");
+    let cfg = NetworkCfg {
+        mode: NetworkMode::Open,
+        deny: vec!["fronted.test".to_string()],
+        allow_private: vec!["127.0.0.1".to_string()],
+        ..NetworkCfg::default()
+    };
+    let grant =
+        proxy.grant_with_capture(&sid, Policy::new(&cfg).unwrap(), intercepting(), tx, Some(ca.clone())).unwrap();
+    let mut e = Env { proxy, grant, ca, rx, seen, _dir: dir };
+    let port = https_server().await;
+    let s = connect(&e, port).await;
+    let mut roots = RootCertStore::empty();
+    roots.add(e.ca.cert_der()).unwrap();
+    let client = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    // The ferret CA would sign a leaf for the destination; the hello names another host, which the policy denies.
+    let name = ServerName::try_from("fronted.test".to_string()).unwrap();
+    assert!(timeout(T, TlsConnector::from(Arc::new(client)).connect(name, s)).await.unwrap().is_err());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let seen = lock(&e.seen).clone();
+    let rule = "deny the server name fronted.test, which is not the destination 127.0.0.1: deny fronted.test";
+    assert!(seen.iter().any(|d| !d.allowed && d.rule == rule && d.sni.as_deref() == Some("fronted.test")), "{seen:?}");
+    assert!(e.rx.try_recv().is_err(), "nothing was intercepted, so nothing was captured");
+}
+
 #[test]
 fn host_patterns() {
     let l = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
@@ -733,11 +792,7 @@ async fn sensitive_rewrite_injects_real_secret_on_wire_but_redacts_plain_http_ca
                 value: Some(format!("sid={cookie_secret}")),
                 sensitive: true,
             },
-            RewriteAction::SetHeader {
-                name: "X-Short-Pin".into(),
-                value: Some("1234".into()),
-                sensitive: true,
-            },
+            RewriteAction::SetHeader { name: "X-Short-Pin".into(), value: Some("1234".into()), sensitive: true },
             RewriteAction::SetHeader {
                 name: "X-Public".into(),
                 value: Some("non-sensitive-tag".into()),
@@ -819,16 +874,8 @@ async fn sensitive_rewrite_injects_real_secret_on_wire_but_redacts_intercepted_h
                 value: Some(bearer_secret.into()),
                 sensitive: true,
             },
-            RewriteAction::SetHeader {
-                name: "X-Short".into(),
-                value: Some("abcd".into()),
-                sensitive: true,
-            },
-            RewriteAction::SetHeader {
-                name: "X-Visible".into(),
-                value: Some("ok-tag".into()),
-                sensitive: false,
-            },
+            RewriteAction::SetHeader { name: "X-Short".into(), value: Some("abcd".into()), sensitive: true },
+            RewriteAction::SetHeader { name: "X-Visible".into(), value: Some("ok-tag".into()), sensitive: false },
         ],
         note: String::new(),
     }]));
@@ -917,21 +964,9 @@ async fn plain_http_response_rewrite_mutates_wire_redacts_capture_and_emits_pass
         matchers: RewriteMatcher { host: Some("127.0.0.1".into()), status: vec!["403".into()], ..Default::default() },
         actions: vec![
             RewriteAction::SetStatus { value: 200 },
-            RewriteAction::SetHeader {
-                name: "X-Resp-Secret".into(),
-                value: Some(resp_secret.into()),
-                sensitive: true,
-            },
-            RewriteAction::SetHeader {
-                name: "X-Short-Resp".into(),
-                value: Some("7777".into()),
-                sensitive: true,
-            },
-            RewriteAction::SetHeader {
-                name: "X-Resp-Tag".into(),
-                value: Some("rewritten".into()),
-                sensitive: false,
-            },
+            RewriteAction::SetHeader { name: "X-Resp-Secret".into(), value: Some(resp_secret.into()), sensitive: true },
+            RewriteAction::SetHeader { name: "X-Short-Resp".into(), value: Some("7777".into()), sensitive: true },
+            RewriteAction::SetHeader { name: "X-Resp-Tag".into(), value: Some("rewritten".into()), sensitive: false },
             RewriteAction::ReplaceBody {
                 regex: "PLACEHOLDER".into(),
                 value: Some(body_secret.into()),
@@ -963,7 +998,10 @@ async fn plain_http_response_rewrite_mutates_wire_redacts_capture_and_emits_pass
     assert!(cap_resp.contains("X-Short-Resp: [redacted]\r\n"), "{cap_resp}");
     assert!(cap_resp.contains("X-Resp-Tag: rewritten\r\n"), "{cap_resp}");
     assert!(cap_resp.ends_with("\r\n\r\n<html>[redacted]</html>"), "{cap_resp}");
-    assert!(!cap_resp.contains(resp_secret) && !cap_resp.contains(body_secret) && !cap_resp.contains("7777"), "{cap_resp}");
+    assert!(
+        !cap_resp.contains(resp_secret) && !cap_resp.contains(body_secret) && !cap_resp.contains("7777"),
+        "{cap_resp}"
+    );
 
     // Passive signals are computed on the post-redaction exchange and never contain raw secrets.
     assert!(c.passive_signals.iter().any(|s| s.kind == "cookie_insecure"), "{:?}", c.passive_signals);
@@ -986,28 +1024,16 @@ async fn intercepted_https_response_rewrite_reframes_chunked_keep_alive_redacts_
         enabled: true,
         phase: RewritePhase::Response,
         priority: 1,
-        matchers: RewriteMatcher { host: Some("127.0.0.1".into()), url_regex: Some("^/api".into()), ..Default::default() },
+        matchers: RewriteMatcher {
+            host: Some("127.0.0.1".into()),
+            url_regex: Some("^/api".into()),
+            ..Default::default()
+        },
         actions: vec![
-            RewriteAction::SetHeader {
-                name: "X-Mitm-Secret".into(),
-                value: Some(mitm_secret.into()),
-                sensitive: true,
-            },
-            RewriteAction::SetHeader {
-                name: "X-Mitm-Pin".into(),
-                value: Some("3333".into()),
-                sensitive: true,
-            },
-            RewriteAction::SetHeader {
-                name: "X-Mitm-Public".into(),
-                value: Some("ok".into()),
-                sensitive: false,
-            },
-            RewriteAction::ReplaceBody {
-                regex: "SECRET_SLOT".into(),
-                value: Some(aws_synth.clone()),
-                sensitive: true,
-            },
+            RewriteAction::SetHeader { name: "X-Mitm-Secret".into(), value: Some(mitm_secret.into()), sensitive: true },
+            RewriteAction::SetHeader { name: "X-Mitm-Pin".into(), value: Some("3333".into()), sensitive: true },
+            RewriteAction::SetHeader { name: "X-Mitm-Public".into(), value: Some("ok".into()), sensitive: false },
+            RewriteAction::ReplaceBody { regex: "SECRET_SLOT".into(), value: Some(aws_synth.clone()), sensitive: true },
         ],
         note: String::new(),
     }]));
@@ -1046,7 +1072,10 @@ async fn intercepted_https_response_rewrite_reframes_chunked_keep_alive_redacts_
     assert!(cap_resp.contains("X-Mitm-Pin: [redacted]\r\n"), "{cap_resp}");
     assert!(cap_resp.contains("X-Mitm-Public: ok\r\n"), "{cap_resp}");
     assert!(cap_resp.ends_with("\r\n\r\n<html>[redacted]</html>"), "{cap_resp}");
-    assert!(!cap_resp.contains(mitm_secret) && !cap_resp.contains("3333") && !cap_resp.contains(&aws_synth), "{cap_resp}");
+    assert!(
+        !cap_resp.contains(mitm_secret) && !cap_resp.contains("3333") && !cap_resp.contains(&aws_synth),
+        "{cap_resp}"
+    );
 
     // Post-redaction passive analysis catches CORS, insecure cookie, and missing security headers,
     // while NEVER re-triggering secret_leak on the redacted [redacted] replacement!

@@ -257,10 +257,7 @@ impl Inner {
                 return;
             }
         }
-        self.target_write(
-            &t,
-            vec![GraphLine::Resolves { host, ip, mission, at_ms: ts, prev: String::new() }],
-        );
+        self.target_write(&t, vec![GraphLine::Resolves { host, ip, mission, at_ms: ts, prev: String::new() }]);
     }
 
     /// An exchange of a session whose mission has a target (T4 + Wave B passive signals): the host, its
@@ -316,11 +313,7 @@ impl Inner {
                     return;
                 }
                 let surface = extract_dead_end_surface(what_t);
-                let summary = if why_t.is_empty() {
-                    what_t.to_string()
-                } else {
-                    format!("{what_t}: {why_t}")
-                };
+                let summary = if why_t.is_empty() { what_t.to_string() } else { format!("{what_t}: {why_t}") };
                 l.out.push(GraphLine::DeadEnd {
                     mission: l.mission.clone(),
                     surface,
@@ -421,18 +414,16 @@ pub(crate) fn finding_dedup_axes(
             .unwrap_or_else(|| title.trim().to_string())
     };
 
-    let raw_ep = endpoint.map(str::trim).filter(|s| !s.is_empty()).map(|ep| {
-        match ep.split_once(char::is_whitespace) {
-            Some((m, rest))
-                if matches!(
-                    m.to_ascii_uppercase().as_str(),
-                    "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS" | "TRACE"
-                ) =>
-            {
-                rest.trim()
-            }
-            _ => ep,
+    let raw_ep = endpoint.map(str::trim).filter(|s| !s.is_empty()).map(|ep| match ep.split_once(char::is_whitespace) {
+        Some((m, rest))
+            if matches!(
+                m.to_ascii_uppercase().as_str(),
+                "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS" | "TRACE"
+            ) =>
+        {
+            rest.trim()
         }
+        _ => ep,
     });
 
     let surface = match raw_ep {
@@ -518,13 +509,8 @@ fn push_security_finding_line(l: &mut Lines, f: &Finding) {
     if f.status != FindingStatus::Active {
         return;
     }
-    let (vuln_class, surface, param_or_sink) = finding_dedup_axes(
-        f.cwe.as_deref(),
-        &f.title,
-        &f.target,
-        f.endpoint.as_deref(),
-        &f.code_locations,
-    );
+    let (vuln_class, surface, param_or_sink) =
+        finding_dedup_axes(f.cwe.as_deref(), &f.title, &f.target, f.endpoint.as_deref(), &f.code_locations);
     l.out.push(GraphLine::SecurityFinding {
         id: f.id.clone(),
         mission: l.mission.clone(),
@@ -683,11 +669,10 @@ fn security_lines(l: &mut Lines, op: &SecurityOp, state: &LedgerState) {
             }
         }
         SecurityOp::FindingUpdate { update } => {
-            let finding = state
-                .security
-                .findings
-                .get(&update.id)
-                .or_else(|| state.security.resolve(&update.id).ok().and_then(|rid| state.security.findings.get(&rid)));
+            let finding =
+                state.security.findings.get(&update.id).or_else(|| {
+                    state.security.resolve(&update.id).ok().and_then(|rid| state.security.findings.get(&rid))
+                });
             if let Some(f) = finding {
                 push_security_finding_line(l, f);
             }

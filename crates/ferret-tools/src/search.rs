@@ -62,9 +62,9 @@
 use crate::files::{open_dir_readable, open_readable, NotOpened};
 use crate::{params, Body, Tool, ToolCtx, ToolOutput};
 use async_trait::async_trait;
+use ferret_core::event::{ToolClass, ToolSpec, ToolStatus};
 use globset::{GlobBuilder, GlobMatcher};
 use ignore::WalkBuilder;
-use ferret_core::event::{ToolClass, ToolSpec, ToolStatus};
 use regex::{Regex, RegexBuilder};
 use serde_json::{Map, Value};
 use std::collections::HashSet;

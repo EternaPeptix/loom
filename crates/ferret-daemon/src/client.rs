@@ -24,6 +24,9 @@
 //!   sessions (archived included): the one whose id equals `word`; else those whose id starts with
 //!   `word` or with `s-{word}`. One → it. None → `No session matches `{word}`.` Several → `` `{word}`
 //!   matches {n} sessions: {ids, at most 5, then "…"}. Give more of the id. ``
+//! - `revoke_scope(id, hosts, reason)`: `POST /api/sessions/{id}/scope/revoke` (`ScopeRevokeBody`), the
+//!   `ScopeRevokeReceipt`. `lead_of(word)`: the lead of a mission named by its `m-` id (`missions`, its `root`), or the
+//!   session `resolve` names (the runtime takes a child's id to its lead). `panic_stop_all(reason)`: `POST /api/panic`.
 //! - `grant_scope(id, hosts, note)`: `POST /api/sessions/{id}/scope`, the `ScopeReceipt`. `release(id, reason)`:
 //!   `POST /api/sessions/{id}/release`, the `RuleReceipt`. Both are the operator's, like `add_rule`.
 //! - `mission_of(word)`: a word starting with `m-` is taken as a mission id as it is; otherwise
@@ -66,7 +69,8 @@ use crate::wire::{
     AnswerBody, ApprovalBody, ArchiveBody, CreatedSession, DaemonFile, ErrorBody, GcBody, LinesView, McpCheckBody,
     McpCheckView, McpServerView, MessageBody, MessageWhen, ModelBody, ModelsView, PanicBody, PanicReport,
     QueuedEditBody, RecordsPage, ReleaseBody, RenameBody, RoleModelBody, RuleBody, ScopeBody, ScopeImportBody,
-    ScopeImportResult, ScopeReceipt, ScopeRevokeReceipt, SessionDetail, StatusView, UploadView, WithdrawBody,
+    ScopeImportResult, ScopeReceipt, ScopeRevokeBody, ScopeRevokeReceipt, SessionDetail, StatusView, UploadView,
+    WithdrawBody,
 };
 use ferret_agent::runtime::{
     BusEvent, ExchangeEntry, InboxEntry, LedgerView, MissionInfo, MissionModels, ModelSwitchReceipt, ModelsReload,
@@ -603,17 +607,17 @@ impl Client {
         self.call(Method::POST, &format!("/api/sessions/{}/scope", segment(id.as_str())), &[], Some(body)).await
     }
 
-    /// Revoke `hosts` from the mission of `id`, cutting matching live proxy tunnels immediately.
+    /// Revoke `hosts` from the mission of `id` (the operator's revoke), for `reason`: the hosts are refused at once,
+    /// their open connections cut and the revoke recorded where the ledger holds the grant.
     pub async fn revoke_scope(
         &self,
         id: &SessionId,
         hosts: &[String],
-        note: Option<&str>,
+        reason: Option<&str>,
     ) -> Result<ScopeRevokeReceipt, String> {
-        let body = serde_json::to_value(ScopeBody { hosts: hosts.to_vec(), note: note.map(str::to_string) })
+        let body = serde_json::to_value(ScopeRevokeBody { hosts: hosts.to_vec(), reason: reason.map(str::to_string) })
             .map_err(|e| format!("The scope revocation cannot be encoded ({e})."))?;
-        self.call(Method::POST, &format!("/api/sessions/{}/scope/revoke", segment(id.as_str())), &[], Some(body))
-            .await
+        self.call(Method::POST, &format!("/api/sessions/{}/scope/revoke", segment(id.as_str())), &[], Some(body)).await
     }
 
     /// Emergency panic kill-switch: sever all proxy tunnels, stop all active sessions, tear down
@@ -738,6 +742,23 @@ impl Client {
         self.call(Method::GET, &format!("/api/sessions/{}/net", segment(id.as_str())), &query, None).await
     }
 
+    /// The monitor's status (`GET /api/monitor`).
+    pub async fn monitor_status(&self) -> Result<ferret_agent::monitor::core::MonitorStatus, String> {
+        self.call(Method::GET, "/api/monitor", &[], None).await
+    }
+
+    /// The monitor-log entries about a mission (`GET /api/missions/{id}/monitor`).
+    pub async fn monitor_log(
+        &self,
+        mission: &MissionId,
+        after: u64,
+        limit: usize,
+        quiet: bool,
+    ) -> Result<ferret_agent::monitor::LogPage, String> {
+        let query = [("after", after.to_string()), ("limit", limit.to_string()), ("quiet", quiet.to_string())];
+        self.call(Method::GET, &format!("/api/missions/{}/monitor", segment(mission.as_str())), &query, None).await
+    }
+
     pub async fn targets(&self) -> Result<Vec<TargetView>, String> {
         self.call(Method::GET, "/api/targets", &[], None).await
     }
@@ -763,11 +784,8 @@ impl Client {
         format: &str,
         payload: &str,
     ) -> Result<ScopeImportResult, String> {
-        let body = serde_json::to_value(ScopeImportBody {
-            format: format.to_string(),
-            payload: payload.to_string(),
-        })
-        .map_err(|e| format!("The scope import request cannot be encoded ({e})."))?;
+        let body = serde_json::to_value(ScopeImportBody { format: format.to_string(), payload: payload.to_string() })
+            .map_err(|e| format!("The scope import request cannot be encoded ({e})."))?;
         self.call(Method::POST, &format!("/api/targets/{}/import-scope", segment(name)), &[], Some(body)).await
     }
 
@@ -842,12 +860,8 @@ impl Client {
     }
 
     pub async fn queued_remove(&self, id: &SessionId, qid: &str) -> Result<(), String> {
-        self.call_unit(
-            Method::DELETE,
-            &format!("/api/sessions/{}/queued/{}", segment(id.as_str()), segment(qid)),
-            None,
-        )
-        .await
+        self.call_unit(Method::DELETE, &format!("/api/sessions/{}/queued/{}", segment(id.as_str()), segment(qid)), None)
+            .await
     }
 
     pub async fn queued_send(&self, id: &SessionId, qid: &str) -> Result<(), String> {
@@ -1071,6 +1085,22 @@ impl Client {
         pick_session(list, word)
     }
 
+    /// The session to address a mission's operator action to: the lead of the mission an `m-` id names (its
+    /// `root`), else the session `resolve` names.
+    pub async fn lead_of(&self, word: &str) -> Result<SessionId, String> {
+        let trimmed = word.trim();
+        if trimmed.starts_with("m-") {
+            let list = self.missions().await?;
+            let mission = pick_mission(list.clone(), trimmed)?;
+            return list
+                .into_iter()
+                .find(|m| m.id == mission)
+                .map(|m| m.root)
+                .ok_or_else(|| format!("There is no mission {}.", mission.as_str()));
+        }
+        self.resolve(trimmed).await
+    }
+
     pub async fn mission_of(&self, word: &str) -> Result<MissionId, String> {
         let trimmed = word.trim();
         if trimmed.starts_with("m-") {
@@ -1125,7 +1155,8 @@ fn pick_mission(list: Vec<MissionInfo>, word: &str) -> Result<MissionId, String>
     if let Some(m) = list.iter().find(|m| m.id.as_str() == word) {
         return Ok(m.id.clone());
     }
-    let mut hits: Vec<MissionId> = list.iter().filter(|m| m.id.as_str().starts_with(word)).map(|m| m.id.clone()).collect();
+    let mut hits: Vec<MissionId> =
+        list.iter().filter(|m| m.id.as_str().starts_with(word)).map(|m| m.id.clone()).collect();
     let tail = word.strip_prefix("m-").unwrap_or(word);
     if hits.is_empty() && tail.len() >= 4 {
         hits = list.into_iter().filter(|m| m.id.as_str().ends_with(tail)).map(|m| m.id).collect();
@@ -1154,10 +1185,7 @@ pub(crate) fn pick_inbox_item(list: Vec<InboxEntry>, word: &str) -> Result<Inbox
         return Err("Nothing is waiting for you.".to_string());
     }
     if word == "last" {
-        return list
-            .into_iter()
-            .max_by_key(|e| e.opened_ms)
-            .ok_or_else(|| "Nothing is waiting for you.".to_string());
+        return list.into_iter().max_by_key(|e| e.opened_ms).ok_or_else(|| "Nothing is waiting for you.".to_string());
     }
     if word == "." || word == "sole" {
         let mut blocking: Vec<InboxEntry> = list.iter().filter(|e| e.item.blocking).cloned().collect();
@@ -1175,11 +1203,8 @@ pub(crate) fn pick_inbox_item(list: Vec<InboxEntry>, word: &str) -> Result<Inbox
                 ids.join(", ")
             ));
         }
-        let mut actionable: Vec<InboxEntry> = list
-            .iter()
-            .filter(|e| e.item.kind != ferret_core::event::InboxKind::Finished)
-            .cloned()
-            .collect();
+        let mut actionable: Vec<InboxEntry> =
+            list.iter().filter(|e| e.item.kind != ferret_core::event::InboxKind::Finished).cloned().collect();
         if actionable.len() == 1 {
             return Ok(actionable.remove(0));
         }
@@ -1485,6 +1510,8 @@ mod tests {
             sessions_active: 1,
             sessions_running: 1,
             inbox_open: 0,
+            egress: None,
+            monitor: None,
             default_model: None,
             signal: None,
         }
@@ -1956,10 +1983,7 @@ mod tests {
             "`aa` matches 2 sessions: s-aaa1, s-aab2. Give more of the id."
         );
         // Suffix fallback (>= 4 chars) resolves time-prefixed sessions by their random tail.
-        let timed = vec![
-            info("s-1jk2a0000k7m2p1a", 1, false),
-            info("s-1jk2a0000x9q4r8b", 2, false),
-        ];
+        let timed = vec![info("s-1jk2a0000k7m2p1a", 1, false), info("s-1jk2a0000x9q4r8b", 2, false)];
         let (c_timed, _) = start(Script::default().route("GET", "/api/sessions", 200, json(&timed))).await;
         assert_eq!(c_timed.resolve("2p1a").await.unwrap().as_str(), "s-1jk2a0000k7m2p1a");
         assert_eq!(c_timed.resolve("4r8b").await.unwrap().as_str(), "s-1jk2a0000x9q4r8b");
@@ -2171,7 +2195,8 @@ mod tests {
                 "POST",
                 "/api/sessions/s-1/scope/revoke",
                 200,
-                serde_json::json!({"session": "s-0", "revoked": ["a.test"], "connections_cut": 3}).to_string(),
+                serde_json::json!({"lead": "s-0", "revoked": ["a.test"], "ledger": true, "connections_cut": 3})
+                    .to_string(),
             )
             .route(
                 "POST",
@@ -2189,7 +2214,7 @@ mod tests {
         let (client, shared) = start(script).await;
 
         let rev = client.revoke_scope(&SessionId::from("s-1"), &["a.test".to_string()], Some("done")).await.unwrap();
-        assert_eq!(rev.session, SessionId::from("s-0"));
+        assert_eq!(rev.lead, SessionId::from("s-0"));
         assert_eq!(rev.revoked, vec!["a.test".to_string()]);
         assert_eq!(rev.connections_cut, 3);
 
@@ -2206,7 +2231,7 @@ mod tests {
         assert_eq!(seen[0].target, "/api/sessions/s-1/scope/revoke");
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&seen[0].body).unwrap(),
-            serde_json::json!({"hosts": ["a.test"], "note": "done"})
+            serde_json::json!({"hosts": ["a.test"], "reason": "done"})
         );
         assert_eq!(seen[1].target, "/api/panic");
         assert_eq!(

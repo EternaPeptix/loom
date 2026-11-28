@@ -45,7 +45,8 @@ except `[models]` and `default_model`, which `ferret models reload` applies to t
 ```
 ferret config init       # writes a starting file; refuses to overwrite an existing one
 ferret config path       # prints the path
-ferret config check      # validates syntax, keys, packs, sandbox preflight and box paths: "ok: <path>" (+ warnings), or error and exit 1
+ferret config check      # validates syntax, keys, packs, sandbox preflight, box paths and the infrastructure deny, then
+                         # the model policy: prints each profile's lineage, then "ok: <path>" (+ warnings), or the error and exit 1
 ```
 
 Edit `base_url` (the server's `/v1` URL) and `model` in the `[models.<name>]` table. If the server
@@ -78,6 +79,26 @@ default. Unknown keys are errors, so a typo does not go unnoticed. The values th
   whole reply has arrived.
 - `reasoning_effort` and the other `extra_body` fields are fixed for a session's life (the chat
   template may render them into the prompt head, so changing them mid-session would break the cache).
+
+### Who may review whom (model policy)
+
+The adversarial monitor (`docs/MONITOR.md`) reviews a mission with a model of another family than any model the
+mission can reach, so each profile says what it is:
+
+```toml
+[models.dsv41]
+family = ["deepseek"]      # a set; a distill lists both. Left out, ferret infers it from the model id
+alignment = "stock"        # "stock", "relaxed" or "unknown"; only a declared stock model can review
+recipient = "lan"          # "local", "lan" (a host you own) or a provider name such as "alibaba"
+```
+
+A loopback `base_url` has the recipient `unknown` until you declare it (it could be a tunnel to anyone's cloud). Under
+`[monitor]`, `reviewers` lists review profiles in preference order, `[monitor.recipients]` consents, per pack, to a
+provider that does not receive the transcripts yet, and `tripwires_only_profiles` names the profiles that have no
+reviewer on purpose (their missions are "not LLM-reviewed"). `ferret config check` prints each profile's resolved values
+and where each came from, and **fails** on a profile that has no eligible reviewer and is not listed, with the lines to
+add; `ferret models lineage [profile]` shows who reviews what in each pack. `docs/config.example.toml` holds one operator's
+fleet as a worked example.
 
 ### Model API keys
 
@@ -138,15 +159,60 @@ against the resolved address too. Private, loopback and link-local destinations 
 listed in `allow_private`. Every decision is recorded in the session's audit log (`ferret net <session>`).
 A pack that sets `requires_restricted_network` (`vr` does) is refused while the mode is `open`.
 
+Some destinations are refused to every command whatever you grant or allow (`deny infrastructure: …` in `ferret net`):
+cloud metadata addresses and names, the DevTools and inspector ports 9222 and 9229 and the Docker API ports 2375 and
+2376 on this machine, the daemon's own port, every model endpoint of the configuration, the Signal bridge's `signal-cli`
+(`signal.http_url`, when `[signal]` is enabled) and the mail inbox's IMAP server (`mail.host` on `mail.port`, when
+`[mail]` is enabled with `imaps`), each on its own port, and the box's Docker host.
+These are refused by name and by the addresses the daemon resolves for them (at start and every five minutes), so the
+same host reached by its IP address, a short name or a tailnet alias is refused too, and this machine's own LAN, tailnet
+and global addresses count as this machine. The box's Docker host is the host of `ssh_host` (`user@host` and
+`ssh://user@host:2222` work) and the `HostName` that `ssh -G` resolves it to. A grant that names one is refused when you
+make it. The proxy is not the only door: the sandbox also refuses the DevTools, inspector and Docker API ports and the
+loopback ports of model endpoints, of `signal-cli` and of `network.infrastructure` entries directly, also with
+`loopback_all = true` or a `loopback_ports` entry (config refuses listing those ports, and Docker, containerd and Podman
+sockets in `unix_sockets`), and it hides the services' files from commands and file tools: `mail.password_file` and
+`mail.maildir_path` wherever they lie, and signal-cli's account store (`~/.local/share/signal-cli`, or
+`$XDG_DATA_HOME/signal-cli` when the daemon has that variable; keep another `--config` directory in
+`sandbox.unreadable_paths`). A destination with no listing here is not protected: add it to `network.infrastructure`.
+List more with `network.infrastructure` (same syntax as `deny`: hosts, `host:port`, CIDR blocks), for example a tailnet
+machine or a desktop app's debugging port. `ferret open` hands the desktop's opener a short-lived page file instead of the address,
+so the login code is never on a command line; if your `.html` files open in an editor, it prints a line saying to use
+`ferret open --print`.
+
 A session can also be given hosts by you while it runs. When it needs one it does not have, the agent
 calls `request_scope`; an item naming the hosts and why waits in your inbox, and the session keeps
 working. `ferret scope <session> <host>...` grants them (the UI and the app have an Approve button on the
-item). `ferret scope revoke <session> <host>... [--note <text>] [--json]` revokes previously granted hosts
-and immediately severs any matching live proxy tunnels (and re-syncs `[box]` egress rules). For an immediate
-daemon-wide emergency halt, `ferret panic [--reason <text>] [--json]` (or the confirmed Panic button in the
-web UI / `/panic` on Signal) severs all live proxy tunnels, disables all proxy rewrite rules, stops all active
-sessions, and tears down all active `[box]` containers. The grant is recorded in the mission's ledger, applies
-to that mission only, and ends with the session. `ferret net <session>` lists the hosts granted so far. Under `deny_all` a grant allows exactly the
+item). The grant is recorded in the mission's ledger, applies to that mission only, and ends with the
+session. `ferret scope revoke <mission|session> <host>... [--reason <text>] [--json]` (`--note` is the same flag;
+the mission is an `m-` id or any session of it; the web UI's Revoke button beside a granted host and Signal's
+`/scope revoke` do the same) takes hosts back: a grant, written as it was granted, is recorded in the ledger (with
+`no reason given` when you give none); any other host, `*.suffix`, address or CIDR block (a name under a wildcard
+grant, a host `mode open`, `network.allow` or the target's scope reaches) is revoked too, without a ledger record.
+Each is refused to the mission's sessions and its MCP servers at once (also under a wildcard grant that covers it,
+`network.allow`, `allow_private` and `mode open`: it is refused as `deny revoked <host>` until you grant it again),
+their open connections to it are cut (by name and by the address a connection was opened to), and the box rules
+follow. The revoke is kept on disk, so a restart does not bring the host back, whatever the ledger says of a grant
+recorded later. The cut comes before the ledger record: when the ledger cannot be written (a full disk) or read, the
+host is cut and refused all the same, and the command says it is not recorded; run it again once the disk has room to
+record it. Granting the host again gives it back to the sessions and their MCP servers at once. The reference client's
+own credential (`network.reference_hosts`) is not narrowed by a revoke (its open connections are cut). For an
+immediate daemon-wide halt, `ferret panic [--reason <text>] [--json]` (or the confirmed Panic
+button in the web UI / `/panic` on Signal) cuts every proxy tunnel, disables every proxy rewrite rule, begins tearing
+down every `[box]` container at once, stops every active session (closing its MCP servers' connections), stops what
+the sessions left running under their sandboxes (found by the process census), and returns once the boxes are gone.
+
+The proxy also looks at the name a command asks an HTTPS server for. A tunnel's TLS ClientHello must name the host the command
+connected to, or another host its policy allows; a hello that hides the name (an encrypted ClientHello naming another host),
+cannot be read (a TLS alert or a record with an odd version in front of it included), or names
+nothing for a host given by name is refused, and the refusal is recorded in the session's `net.jsonl` with the name it asked for
+(`sni`). Programs that are not TLS (ssh, plain HTTP) are not affected. Headless Chromium (Playwright, Puppeteer) sends a placeholder
+encrypted-ClientHello extension with the real name in the clear on every hello; that passes when the name is the host it connected to,
+so browsers work through the proxy without a switch. A decoy host or a ferret-internal address the daemon
+vetoes answers `502` ("closed to this mission by ferret's own rules"), and a lab port on this machine that another mission's sandboxed
+process listens on is refused with `403`. A grant
+the lead has not recorded yet is revoked without a ledger entry (it is not in the receipt's `recorded`); run the
+revoke again once `ferret ledger` lists the grant and it is recorded. `ferret net <session>` lists the hosts granted so far. Under `deny_all` a grant allows exactly the
 granted hosts; the `allow` list stays off. `*`, a wildcard over a whole top-level domain (`*.com`) or
 over IP addresses (`*.0.1`), the unspecified address (`0.0.0.0`, `::`) and a loopback address without a
 port (`127.0.0.1`; write `127.0.0.1:8080`) cannot be requested or granted: name the hosts, or a wildcard
@@ -175,7 +241,25 @@ With `[sandbox] mode = "seatbelt"` (the default) commands run under a macOS sand
   else, so output works but cannot be read back from a command. A workspace inside `~/.ferret` is refused at
   start. `unreadable_paths` are neither readable nor writable;
 - no network except the egress proxy (plus `loopback_ports`, `loopback_all`, `unix_sockets`);
-- no LaunchServices opens, Apple Events or launchd jobs.
+- no LaunchServices opens, Apple Events or launchd jobs;
+- only the Mach services the usual toolchains need (Spotlight's `mdfind`, the clipboard, the keychain and audio fail): a
+  tool that needs one more is fixed with `[sandbox] mach_allow` (not the keychain or the clipboard while
+  `protect_credentials` is on: they are denied after the allows). Headless Chromium (Playwright, Puppeteer) finds its child
+  processes through `org.chromium.Chromium`, `com.google.Chrome` and `com.google.chrome.for.testing` rendezvous names, which
+  are allowed (the launch itself was not run on the gate host); another build (Edge, Electron) needs
+  `mach_allow = ["<bundle id>.MachPortRendezvousServer.*"]`;
+- a limit on how many processes a command can start: `[sandbox] nproc_headroom` (default 256, 0 for none) is how many
+  of the user's process slots (RLIMIT_NPROC) a command leaves unused, so a fork bomb stops before the daemon cannot
+  start the processes that stop it. If the user already holds that many processes (leftovers: see the census), a command
+  does not start, and the error says to stop them or lower the headroom.
+
+The daemon finds what every session left running, whatever it did to its process group and environment, every minute:
+`GET /api/census` (`?now=true` takes one) lists each session's processes and the ports they listen on, the daemon's log
+warns once about what an ended or stopped session left, and `POST /api/sessions/<id>/census/kill` stops them. Nothing
+is stopped on its own. Archiving a session stops what it still has running under its sandbox once its tasks have ended (the census no
+longer lists archived sessions), and logs it. If the macOS query it uses does not work on a host (or `sandbox.mode` is `none`), the census falls back to
+an environment variable and the known process groups, says so (`identity_detail`), is logged and notified once
+(`FERRET_KIND=census`) when commands are confined, and never reports a session as having no processes.
 
 Git config/hooks and metadata pointers are protected, including existing nested repositories and
 linked worktrees. Normal source edits still work. Commands that explicitly write shared `/tmp` or
@@ -206,7 +290,8 @@ file tools: `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/gh`, `~/.config/gcloud`, 
 `~/Library/Keychains`, `~/Library/Cookies`, the profile directories of Chrome, Chromium, Brave, Edge,
 Arc, Vivaldi, Opera, Firefox and Safari, and many more: model-hub, AI-tool, database, cloud, registry,
 password-manager, wallet and chat stores (`~/.cache/huggingface`, `~/.claude.json`, `~/.pgpass`,
-`~/.vault-token`, `~/.m2/settings.xml`, `~/.config/rclone`, `~/Library/Mail`, ...; the list is in
+`~/.vault-token`, `~/.m2/settings.xml`, `~/.config/rclone`, `~/Library/Mail`, signal-cli's and Signal Desktop's, ...;
+the list is in
 `docs/DESIGN.md`). Add other stores to `unreadable_paths`. A
 listed directory that is or contains the workspace is skipped. This needs a home directory: with
 `HOME` unset, every session fails to build its sandbox and the message names `HOME` and
@@ -443,8 +528,12 @@ outbound alerts) will fail with `UNTRUSTED_IDENTITY`. To trust the updated ident
 
 - **Quote-reply** to an alert to answer that exact inbox item (option numbers `1..N` expand to the option
   text), grant or deny a `request_scope` approval (`approve`/`yes`/`all`, host numbers such as `1 2`, or
-  `deny`/`no`/`dismiss`), or send a follow-up message to a finished/errored mission. Sent message mappings
-  persist across daemon restarts in `~/.ferret/signal_sent.json` (mode `0600`).
+  `deny`/`no`/`dismiss`), or send a follow-up message to a finished/errored mission. An approval from Signal grants
+  only hosts the alert showed in full: when a long request cut a host short (`…`) or left hosts out (`… +N more`),
+  `approve` (and `/scope <item>`, `/approve <item>`) grants nothing and says so, and so does the number of such a host;
+  give the numbers of hosts shown in full, write the names out with `/scope <session> <host>...`, or approve it in the
+  web UI or with `ferret scope`. Sent message mappings persist across daemon restarts in `~/.ferret/signal_sent.json`
+  (mode `0600`).
 - **Plain reply** (in a direct message, never in a group) answers the sole open blocking item directly.
 - **`@<id> <text>`** answers an open inbox item or messages a mission by ID prefix/suffix (or short `#n`
   index shown by `/inbox` and `/status`).
@@ -508,7 +597,8 @@ owner_name = "Jordan"
 ```
 ferret up                # start the daemon in the background; log: ~/.ferret/logs/ferretd.log
 ferret daemon            # or run it in the foreground
-ferret status            # the daemon, each model server and whether it answered, what is running, free disk space
+ferret status            # the daemon, each model server and whether it answered, what is running, free disk space, and whether
+                       # commands can reach the network outside the proxy ("egress: bounded" or "UNBOUNDED, <reason>")
 ferret down              # stop it; sessions resume when it starts again
 ```
 
@@ -521,7 +611,14 @@ and window it prints come from the config until a session of that profile has be
 daemon started (`window unknown` when `context_window` is not set); from then on they are the model id
 the server serves and the window it reported. When `[signal]` is enabled it also shows live Signal bridge
 health (connected/error/muted/pending), and it prints the free space on the volume of the ferret home and
-warns when it is under 5 GiB or 5 percent.
+warns when it is under 5 GiB or 5 percent. The `egress:` line is the sandbox
+self-probe (at start, then hourly): `bounded` when no command reached the network outside the egress proxy,
+`UNBOUNDED` with the reason when one did, a probe could not run, `sandbox.allow_fetch_services` is set or
+`sandbox.mode` is `none`. The web header shows the same as a banner, and the last probe is in
+`<ferret home>/egress-probe.json`. `STALE` means the probe stopped recording (more than two hours old); `bounded (...; fetch
+routes not exercised)` means this host did not fetch for any control, so those routes were not judged; `grants:` lists
+loopback and unix-socket grants, which the probe runs without. `unix_sockets` naming `/var/run/mDNSResponder` is unbounded:
+DNS leaves outside the proxy. Unbounded egress stops nothing; keep-going will refuse to turn on.
 
 On macOS `ferret service install` makes the daemon a login service (a LaunchAgent) and
 `ferret service uninstall` removes it; `ferret service status` says whether it is loaded.
@@ -593,7 +690,11 @@ Exit status of `run` and `send`: 0 after `Finished` or `Yielded`; 2 when you are
 | command | does |
 |---|---|
 | `ferret daemon` / `up` / `down` | run the daemon in the foreground / in the background / stop it |
-| `ferret status [--json]` | the daemon, each model profile and whether its server answered, live Signal bridge state, counts, free disk space |
+| `ferret models lineage [profile]` | each model profile's family, alignment and recipient, and who reviews its missions in each pack (needs no daemon) |
+| `ferret monitor [status]` | the monitor in shadow: its state, open flags, how often each of the 28 tripwires fired by severity, the faults of its sources |
+| `ferret monitor log <mission\|session> [--json] [--since 7d] [--all] [-n N]` | the monitor-log entries about a mission: hits, flags, what each would earn once promoted |
+| `ferret monitor replay [--since 7d] [--positives FILE] [--home DIR] [--json]` | the tripwires over the history of a home, read-only and without a daemon: per-tripwire hits, would-be pauses per 100 active hours, precision and recall against known positives |
+| `ferret status [--json]` | the daemon, each model profile and whether its server answered, live Signal bridge state, counts, free disk space, the sandbox self-probe's egress line |
 | `ferret open [--print]` | open the web UI in the browser (`--print` prints the address instead) |
 | `ferret run [options] [--file PATH]... <task...>` | start a session and follow it; `-d` starts it and returns; `--file` attaches files (the workspace must already exist) |
 | `ferret chat [options]` | turn-by-turn `chat` session; `--session <id>` continues one (reprinting recent context); `/quit` leaves |
@@ -608,9 +709,9 @@ Exit status of `run` and `send`: 0 after `Finished` or `Yielded`; 2 when you are
 | `ferret rule <session> <text...>` | set a standing rule (a ledger constraint) for the mission |
 | `ferret rule <session> --withdraw <rule-id> [--reason <text>]` | withdraw a rule |
 | `ferret approve <session> <text...> [--scope <text>]` | record an approval |
-| `ferret scope <session> <host>... [--note <text>] [--json]` | let the mission's tools reach these hosts (one host per argument) |
-| `ferret scope revoke <session> <host>... [--note <text>] [--json]` | revoke previously granted hosts and immediately cut matching live proxy tunnels |
-| `ferret panic [--reason <text>] [--json]` | emergency kill-switch: sever all proxy tunnels, stop all active sessions, tear down active boxes, and disable all rewrite rules |
+| `ferret scope <session> <host>... [--note <text>] [--json]` | let the mission's tools reach these hosts (one host per argument; also `ferret scope grant <session> <host>...`) |
+| `ferret scope revoke <mission\|session> <host>... [--reason <text>] [--json]` | take hosts back: refused at once whatever else allows them, open connections cut, recorded in the ledger when they were grants (`--note` is `--reason`) |
+| `ferret panic [--reason <text>] [--json]` | emergency kill-switch: sever all proxy tunnels, stop all active sessions and what they left running under their sandboxes, tear down active boxes, and disable all rewrite rules |
 | `ferret release <session> <reason...>` | accept a blocked mission as it is and close it: "closed by operator, goal not established" |
 | `ferret inbox [--json]` | list questions, approvals, scope requests and blockers waiting for you |
 | `ferret answer <item> [text... \| --dismiss]` | answer or dismiss an inbox item (`<item>`: id, prefix, unique 4+ char suffix, `last`, or `.` for the sole waiting item; bare `1..N` selects a numbered option; reads piped stdin when `text` is omitted; `--dismiss` or empty on TTY dismisses non-blocking items) |
@@ -635,7 +736,7 @@ Exit status of `run` and `send`: 0 after `Finished` or `Yielded`; 2 when you are
 | `ferret config path` / `check` / `init` | the configuration file |
 | `ferret models list [--json]` (alias `ls`) | the model profiles in use (the default marked), each server ✓/✗ |
 | `ferret models reload` | read `[models]` and `default_model` from the config again and use them now, without a restart; sessions on a changed profile move to its new settings |
-| `ferret models set <session> <profile>` | switch a session (lead or agent) to another model profile from its next step, without a restart; logged as `model_switched` |
+| `ferret models set <session> <profile>` | switch a session (lead or agent) to another model profile from its next step, without a restart; logged as `model_switched`; a profile with `purpose = "review"` is refused |
 | `ferret models show <session> [--json]` | a mission's models: the lead's, the choice for each role of its agents (or what the pack picks), the agents running and their models |
 | `ferret models role <session> <role> <profile> [--now]` | start the mission's new agents of `role` (`all`: every role without a choice of its own, not the finish gate's verifier) on `profile`; `--now` also moves its running agents of that role (not forked ones) |
 | `ferret models role <session> <role> --clear` | drop that choice: the pack picks again for agents started later |
@@ -803,10 +904,14 @@ ferret run --pack webapp --target acme --creds user_a --creds-profile user_a --c
   UDP DNS listener on `dns_bind`, advertised via optional `public_host`) or `mode = "external"`
   (`external_poll_url` over `https://` or loopback `http://`, with optional mode-`0600` `external_token_file`).
   Agents mint mission-scoped callback URLs/DNS names with `oast_mint` and await interactions with `oast_poll`.
+  Every endpoint of the broker (its listeners, the poll endpoint, the callback host and the names under its domain)
+  is infrastructure: no command reaches it, whatever is granted, so a callback comes from the target only.
 
 ## Files
 
 Under the ferret home: `config.toml`, `token`, `daemon.json`, `daemon.lock`, `keys/`, `ca/`, `logs/ferretd.log`,
+`logs/net-unattributed.jsonl`, `logs/floor.jsonl` (decoy hits, vetoes and squatted lab ports, one line each) and
+`logs/box-counters.jsonl` (the box's per-rule packet counts, one line a minute per box that counted something),
 `packs/`, `targets/`, `blobs/` (stored outputs), `rewrite_rules.json` (0600, operator proxy rewrites),
 `signal_sent.json` (0600, Signal quote-reply map), `signal_guests.json` (0600, Signal guest approvals, blocks, and isolated chat histories), `sessions/<id>/` (`log.jsonl`, `meta.json`, `status.json`, `jobs/`,
 `tmp/`, `queued/`, `net.jsonl`, and for a child `settlement.json` and, when it works in its own copy

@@ -501,6 +501,18 @@ test("diskWarning: a sentence below 5 GiB or 5 percent free, null otherwise or w
   assert.equal(C.diskWarning({ free_bytes: 0, total_bytes: 0 }), null);
 });
 
+test("egressWarning: a sentence only when egress is unbounded", () => {
+  assert.equal(C.egressWarning(null), null);
+  assert.equal(C.egressWarning(undefined), null);
+  assert.equal(C.egressWarning({ level: "bounded", reasons: [] }), null);
+  assert.equal(C.egressWarning({ level: "unprobed", reasons: ["The first self-probe has not finished."] }), null);
+  const one = C.egressWarning({ level: "unbounded", reasons: ["sandbox.allow_fetch_services is set."] });
+  assert.match(one, /^Egress is unbounded: sandbox\.allow_fetch_services is set\. Commands may reach the network outside the egress proxy/);
+  assert.doesNotMatch(one, /more\)/);
+  assert.match(C.egressWarning({ level: "unbounded", reasons: ["a.", "b.", "c."] }), /a\. \(\+2 more\)/);
+  assert.match(C.egressWarning({ level: "unbounded" }), /self-probe in `ferret status`/);
+});
+
 // ---- inbox ----
 
 test("inbox: records open and resolve items, blocking first, titles", () => {
@@ -4890,11 +4902,11 @@ test("Wave A helpers: sanitized HAR/SARIF URLs, scope revocation, and panic kill
     { host: "cdn.test", revoked: false },
   ]);
   assert.equal(
-    C.formatScopeRevoke({ session: "s-1", revoked: ["api.test"], connections_cut: 2 }),
+    C.formatScopeRevoke({ lead: "s-1", revoked: ["api.test"], connections_cut: 2 }),
     "Revoked api.test (2 connections cut).",
   );
   assert.equal(
-    C.formatScopeRevoke({ session: "s-1", revoked: ["api.test"], connections_cut: 1 }),
+    C.formatScopeRevoke({ lead: "s-1", revoked: ["api.test"], connections_cut: 1 }),
     "Revoked api.test (1 connection cut).",
   );
 
@@ -4907,6 +4919,14 @@ test("Wave A helpers: sanitized HAR/SARIF URLs, scope revocation, and panic kill
   assert.equal(
     C.formatPanicReport({ connections_cut: 0, sessions_stopped: [], boxes_torn_down: 0, rewrites_disabled: 0 }),
     "Panic stop complete: 0 connections cut · 0 sessions stopped · 0 boxes torn down · 0 rewrite rules disabled.",
+  );
+  assert.equal(
+    C.formatPanicReport({ connections_cut: 1, sessions_stopped: ["s-1"], boxes_torn_down: 0, rewrites_disabled: 0, processes_killed: 2, processes_left: 1 }),
+    "Panic stop complete: 1 connection cut · 1 session stopped · 0 boxes torn down · 0 rewrite rules disabled · 2 processes left under the sandboxes stopped (1 could not be).",
+  );
+  assert.equal(
+    C.formatScopeRevoke({ lead: "s-1", revoked: ["a.test", "x.b.test"], not_granted: ["x.b.test"], connections_cut: 0 }),
+    "Revoked a.test, x.b.test (0 connections cut). Not granted by itself, refused from now on: x.b.test.",
   );
 });
 

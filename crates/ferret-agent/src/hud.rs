@@ -263,7 +263,10 @@ fn security_sections(sections: &mut Vec<String>, state: &SecurityState, now_ms: 
         .map(|c| {
             let short_id: String = c.id.chars().take(12).collect();
             let gap = c.reason.as_deref().unwrap_or("open proof gap");
-            format!("- {short_id} ({} / {}): {gap} — update with security_record coverage_update", c.surface, c.risk_area)
+            format!(
+                "- {short_id} ({} / {}): {gap} — update with security_record coverage_update",
+                c.surface, c.risk_area
+            )
         })
         .collect();
     push_list(sections, "Open surface coverage follow-ups", "", follow_ups);
@@ -273,11 +276,13 @@ fn security_sections(sections: &mut Vec<String>, state: &SecurityState, now_ms: 
             .into_iter()
             .map(|f| {
                 let short_id: String = f.id.chars().take(12).collect();
-                let score = f
-                    .cvss
-                    .map(|s| format!(" CVSS {}", s.format_one_decimal()))
-                    .unwrap_or_default();
-                format!("- {short_id} [{}{score}, confidence: {}]: {}", f.severity.as_str(), f.confidence.as_str(), f.title)
+                let score = f.cvss.map(|s| format!(" CVSS {}", s.format_one_decimal())).unwrap_or_default();
+                format!(
+                    "- {short_id} [{}{score}, confidence: {}]: {}",
+                    f.severity.as_str(),
+                    f.confidence.as_str(),
+                    f.title
+                )
             })
             .collect();
         push_list(sections, "Recorded security findings", "", items);

@@ -290,6 +290,8 @@ impl Stdio {
         let Some(argv) = server.cfg.command.as_ref().filter(|c| !c.is_empty()) else {
             return Err("the server has no command".into());
         };
+        // Asked first, as for every sandboxed command: a server that cannot be given room leaves nothing behind.
+        let nproc = ctx.sandbox.nproc_limit()?;
         let quoted = shlex::try_join(argv.iter().map(String::as_str))
             .map_err(|_| "the command contains a NUL byte".to_string())?;
         let script = format!("exec {quoted}");
@@ -309,6 +311,12 @@ impl Stdio {
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
             .process_group(0);
+        if let Some(limit) = nproc {
+            // SAFETY: the hook only calls setrlimit(2), which is safe between fork and exec.
+            unsafe {
+                cmd.pre_exec(move || crate::procinfo::set_nproc(limit));
+            }
+        }
         let mut child = cmd.spawn().map_err(|e| format!("could not start {}: {e}", argv[0]))?;
         let pid = child.id().unwrap_or(0);
         let (Some(stdin), Some(stdout), Some(stderr)) = (child.stdin.take(), child.stdout.take(), child.stderr.take())

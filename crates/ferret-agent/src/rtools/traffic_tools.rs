@@ -85,12 +85,7 @@ const VOLATILE_JSON_KEYS: &[&str] = &[
 ];
 
 fn active_secrets(shared: &Shared, ctx: &ToolCtx) -> Option<Arc<Secrets>> {
-    ctx.capabilities
-        .secrets
-        .get()
-        .or_else(|| shared.traffic.secrets.get())
-        .filter(|s| !s.is_empty())
-        .cloned()
+    ctx.capabilities.secrets.get().or_else(|| shared.traffic.secrets.get()).filter(|s| !s.is_empty()).cloned()
 }
 
 fn redact_bytes(secrets: Option<&Secrets>, bytes: &[u8]) -> Vec<u8> {
@@ -168,12 +163,7 @@ fn matches_principal(actual: Option<&str>, want: &str) -> bool {
     false
 }
 
-fn exchange_matches_search(
-    x: &Exchange,
-    needle_low: &str,
-    ctx: &ToolCtx,
-    secrets: Option<&Secrets>,
-) -> bool {
+fn exchange_matches_search(x: &Exchange, needle_low: &str, ctx: &ToolCtx, secrets: Option<&Secrets>) -> bool {
     let target_clean = redact_str(secrets, &x.target);
     let in_meta = x.id.to_ascii_lowercase().contains(needle_low)
         || x.host.to_ascii_lowercase().contains(needle_low)
@@ -205,12 +195,7 @@ fn format_signals_compact(signals: &[PassiveSignal]) -> String {
     if signals.is_empty() {
         return "-".into();
     }
-    signals
-        .iter()
-        .take(4)
-        .map(|s| format!("{}:{}", s.severity, s.kind))
-        .collect::<Vec<_>>()
-        .join(",")
+    signals.iter().take(4).map(|s| format!("{}:{}", s.severity, s.kind)).collect::<Vec<_>>().join(",")
 }
 
 #[async_trait]
@@ -238,7 +223,8 @@ impl Tool for TrafficQuery {
     }
 
     async fn run(&self, ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
-        let host_f = args.get("host").and_then(Value::as_str).map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty());
+        let host_f =
+            args.get("host").and_then(Value::as_str).map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty());
         let method_f = args.get("method").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
         let path_f = args
             .get("path_contains")
@@ -259,11 +245,8 @@ impl Tool for TrafficQuery {
             .and_then(Value::as_str)
             .map(|s| s.trim().to_ascii_lowercase())
             .filter(|s| !s.is_empty());
-        let search_f = args
-            .get("search")
-            .and_then(Value::as_str)
-            .map(|s| s.trim().to_ascii_lowercase())
-            .filter(|s| !s.is_empty());
+        let search_f =
+            args.get("search").and_then(Value::as_str).map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty());
         let limit = args
             .get("limit")
             .and_then(Value::as_u64)
@@ -296,17 +279,13 @@ impl Tool for TrafficQuery {
                     && signal_sev_f
                         .as_deref()
                         .is_none_or(|sev| x.passive_signals.iter().any(|s| s.severity.eq_ignore_ascii_case(sev)))
-                    && search_f
-                        .as_deref()
-                        .is_none_or(|q| exchange_matches_search(x, q, ctx, secrets.as_deref()))
+                    && search_f.as_deref().is_none_or(|q| exchange_matches_search(x, q, ctx, secrets.as_deref()))
             })
             .collect();
 
         let matched_total = matched.len();
         if matched_total == 0 {
-            let msg = format!(
-                "No captured exchanges matched the query (0 of {total} mission exchange(s))."
-            );
+            let msg = format!("No captured exchanges matched the query (0 of {total} mission exchange(s)).");
             return ToolOutput::ok("traffic query", Body::Message(msg));
         }
 
@@ -450,11 +429,7 @@ fn unified_text_diff(left: &str, right: &str) -> (bool, String) {
     let mut dp = vec![vec![0u16; m + 1]; n + 1];
     for i in (0..n).rev() {
         for j in (0..m).rev() {
-            dp[i][j] = if a[i] == b[j] {
-                dp[i + 1][j + 1].saturating_add(1)
-            } else {
-                dp[i + 1][j].max(dp[i][j + 1])
-            };
+            dp[i][j] = if a[i] == b[j] { dp[i + 1][j + 1].saturating_add(1) } else { dp[i + 1][j].max(dp[i][j + 1]) };
         }
     }
     let mut ops: Vec<(char, &str)> = Vec::new();
@@ -524,10 +499,7 @@ fn unified_text_diff(left: &str, right: &str) -> (bool, String) {
     (false, out)
 }
 
-fn diff_headers(
-    left: &BTreeMap<String, Vec<String>>,
-    right: &BTreeMap<String, Vec<String>>,
-) -> Value {
+fn diff_headers(left: &BTreeMap<String, Vec<String>>, right: &BTreeMap<String, Vec<String>>) -> Value {
     let mut added = Map::new();
     let mut removed = Map::new();
     let mut changed = Map::new();
@@ -599,7 +571,8 @@ fn diff_bodies(left_body: &[u8], right_body: &[u8]) -> Value {
         });
     }
 
-    let is_binary = lb.contains(&0) || rb.contains(&0) || std::str::from_utf8(lb).is_err() || std::str::from_utf8(rb).is_err();
+    let is_binary =
+        lb.contains(&0) || rb.contains(&0) || std::str::from_utf8(lb).is_err() || std::str::from_utf8(rb).is_err();
     if is_binary {
         return json!({
             "kind": "binary",
@@ -623,9 +596,7 @@ fn diff_passive_signals(left: &[PassiveSignal], right: &[PassiveSignal]) -> Valu
     let key = |s: &PassiveSignal| (s.kind.clone(), s.severity.clone(), s.summary.clone());
     let lset: BTreeSet<(String, String, String)> = left.iter().map(key).collect();
     let rset: BTreeSet<(String, String, String)> = right.iter().map(key).collect();
-    let render = |(kind, severity, summary): &(String, String, String)| {
-        json!({ "kind": kind, "severity": severity, "summary": summary })
-    };
+    let render = |(kind, severity, summary): &(String, String, String)| json!({ "kind": kind, "severity": severity, "summary": summary });
     json!({
         "only_left": lset.difference(&rset).map(render).collect::<Vec<_>>(),
         "only_right": rset.difference(&lset).map(render).collect::<Vec<_>>(),
@@ -845,15 +816,14 @@ mod tests {
         );
 
         // Filter by signal_kind + signal_severity.
-        let by_sig = r
-            .call("traffic_query", json!({"signal_kind": "cors_misconfig", "signal_severity": "high"}))
-            .await;
+        let by_sig = r.call("traffic_query", json!({"signal_kind": "cors_misconfig", "signal_severity": "high"})).await;
         assert_eq!(by_sig.status, Status::Ok, "{}", by_sig.text);
         assert!(by_sig.text.contains("ex-query0000001") && !by_sig.text.contains("ex-query0000002"), "{}", by_sig.text);
         assert!(!by_sig.text.contains(secret), "secret leaked: {}", by_sig.text);
 
         // Filter by principal shorthand (`user_a` matches `profile:user_a`) and status range.
-        let by_princ = r.call("traffic_query", json!({"principal": "user_a", "status_min": 200, "status_max": 299})).await;
+        let by_princ =
+            r.call("traffic_query", json!({"principal": "user_a", "status_min": 200, "status_max": 299})).await;
         assert!(by_princ.text.contains("ex-query0000001") && !by_princ.text.contains("ex-query0000002"));
 
         // Search works on visible body content ("alice")...

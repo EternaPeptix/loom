@@ -941,6 +941,8 @@ function renderDaemonStatus() {
     ["Proxy port", st.proxy_port ? String(st.proxy_port) : ""],
     ["Sandbox", st.sandbox || "unknown"],
     ["Network mode", st.network || "unknown"],
+    ["Egress", st.egress ? st.egress.level : ""],
+    ["Monitor", st.monitor ? `${st.monitor.state} · ${C.num(st.monitor.open_flags)} open flags` : ""],
     ["Default model", defaultModel],
     ["Sessions", `${C.num(st.sessions_total)} total · ${C.num(st.sessions_active)} active · ${C.num(st.sessions_running)} running`],
     ["Inbox open", C.num(st.inbox_open)],
@@ -1055,6 +1057,14 @@ function renderDaemonStatus() {
     const safe = body.querySelector('[data-focus-key="panic:ask:no"]');
     if (safe) safe.focus({ preventScroll: true });
   }
+}
+
+function renderEgressWarning() {
+  const box = $("egress-warning");
+  if (!box) return;
+  const text = C.egressWarning(S.status && S.status.egress);
+  box.textContent = text || "";
+  box.hidden = !text;
 }
 
 function updateInboxBadge() {
@@ -1634,6 +1644,7 @@ async function loadStatus() {
     S.statusError = null;
     renderDot();
     renderDiskWarning();
+    renderEgressWarning();
     if (S.view === "new") { renderPackRoleNotes(); renderNewModels(); }
     if ($("daemon-status")?.open) renderDaemonStatus();
   } catch (e) {

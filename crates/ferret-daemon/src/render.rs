@@ -89,7 +89,9 @@
 //!   {preview}`.
 //! - `status(view, style)`: the daemon line; the free space of the volume of the ferret home (`{free}
 //!   GiB free of {total} GiB ({pct}%) on the volume of the ferret home`, or `unknown`) and, when it is low
-//!   (`DiskSpace::is_low`), a warning that sessions will fail when the disk fills (bold yellow); one
+//!   (`DiskSpace::is_low`), a warning that sessions will fail when the disk fills (bold yellow); when the
+//!   daemon reports it (`view.egress`), the egress line of the sandbox self-probe (`EgressView::line`: `egress:
+//!   bounded (…)` plain, `egress: UNBOUNDED, …` bold yellow, `egress: not probed yet` plain); one
 //!   line per model (`✓`/`✗`, base URL, model, window, detail when unreachable); the counts.
 //! - `models_table(view, style)`: one line per live profile, `✓`/`✗ {profile}[ (default)] · {model} ·
 //!   {base_url} · window {window} · {max_concurrent} at once · vision {yes|no}[ · {detail}]`; then a line when no
@@ -477,7 +479,8 @@ pub fn record(rec: &Record, style: &Style, opts: &RecordOpts) -> String {
             push_block(&mut out, style, None, text, "");
             if !images.is_empty() {
                 let n = images.len();
-                let label = if n == 1 { "  [1 image attached]".to_string() } else { format!("  [{n} images attached]") };
+                let label =
+                    if n == 1 { "  [1 image attached]".to_string() } else { format!("  [{n} images attached]") };
                 out.push(paint(style, DIM, &label));
             }
         }
@@ -577,8 +580,10 @@ pub fn record(rec: &Record, style: &Style, opts: &RecordOpts) -> String {
                 // One line per captured exchange.
                 let status =
                     x.status.map(|c| c.to_string()).or_else(|| x.error.clone()).unwrap_or_else(|| "no response".into());
-                let mut line =
-                    format!("⇄ {} {} {}://{}{} · {} · {}", x.id, x.method, x.scheme, x.host, x.target, status, x.source);
+                let mut line = format!(
+                    "⇄ {} {} {}://{}{} · {} · {}",
+                    x.id, x.method, x.scheme, x.host, x.target, status, x.source
+                );
                 if let Some(p) = x.principal.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
                     line.push_str(&format!(" · {}", flat(p)));
                 }
@@ -1101,6 +1106,14 @@ pub fn status(view: &StatusView, style: &Style) -> String {
         }
         None => out.push(cut("free space on the volume of the ferret home: unknown", width)),
     }
+    if let Some(egress) = &view.egress {
+        let line = cut(&flat(&egress.line(ferret_core::now_ms())), width);
+        out.push(if egress.level == ferret_agent::egress::Level::Unbounded {
+            paint(style, BOLD_YELLOW, &line)
+        } else {
+            line
+        });
+    }
     if view.models.is_empty() {
         out.push("no models configured".to_string());
     }
@@ -1108,12 +1121,8 @@ pub fn status(view: &StatusView, style: &Style) -> String {
         let mark = if m.reachable { paint(style, GREEN, "✓") } else { paint(style, RED, "✗") };
         let default = if view.default_model.as_deref() == Some(m.profile.as_str()) { " (default)" } else { "" };
         let window = m.context_window.map_or_else(|| "unknown".to_string(), tokens);
-        let text = format!(
-            "{}{default} · {} · {} · window {window}",
-            flat(&m.profile),
-            flat(&m.model),
-            flat(&m.base_url),
-        );
+        let text =
+            format!("{}{default} · {} · {} · window {window}", flat(&m.profile), flat(&m.model), flat(&m.base_url),);
         // The mark takes two columns; the rest of the line is cut to what is left.
         out.push(format!("{mark} {}", cut(&text, width.saturating_sub(2))));
         // Never truncate failure details — put them intact on an indented continuation line.
@@ -1512,11 +1521,8 @@ pub fn packs_list(packs: &[PackView], style: &Style) -> String {
                 tags.push("spawns");
             }
             let tag_str = if tags.is_empty() { String::new() } else { format!(" ({})", tags.join(", ")) };
-            let desc = if r.description.trim().is_empty() {
-                String::new()
-            } else {
-                format!(" — {}", flat(&r.description))
-            };
+            let desc =
+                if r.description.trim().is_empty() { String::new() } else { format!(" — {}", flat(&r.description)) };
             out.push(cut(&format!("  {}{tag_str}{desc}", flat(&r.name)), width));
         }
     }
@@ -1579,15 +1585,10 @@ pub fn findings_table(
                 ]
             })
             .collect();
-        out.push_str(&table(
-            style,
-            &["ID", "SEVERITY", "CVSS", "CONF", "STATUS", "CWE", "TARGET", "TITLE"],
-            &rows,
-        ));
+        out.push_str(&table(style, &["ID", "SEVERITY", "CVSS", "CONF", "STATUS", "CWE", "TARGET", "TITLE"], &rows));
     }
-    let summary = format!(
-        "findings: {active_total} active, {withdrawn_total} withdrawn · surface coverage rows: {cov_total}"
-    );
+    let summary =
+        format!("findings: {active_total} active, {withdrawn_total} withdrawn · surface coverage rows: {cov_total}");
     out.push_str(&paint(style, DIM, &cut(&summary, width_of(style))));
     out.push('\n');
     out
@@ -1626,11 +1627,8 @@ pub fn traffic_table(entries: &[ExchangeEntry], style: &Style) -> String {
 
 /// `ferret net --noise`: egress noise governor profile and per-host pacing metrics.
 pub fn noise_status(view: &NoiseStatusView, style: &Style) -> String {
-    let mut out = format!(
-        "noise profile: {} · assessment_ua origins: {}\n",
-        flat(&view.profile),
-        view.assessment_ua_origins
-    );
+    let mut out =
+        format!("noise profile: {} · assessment_ua origins: {}\n", flat(&view.profile), view.assessment_ua_origins);
     if view.hosts.is_empty() {
         out.push_str("No host traffic paced yet.\n");
         return out;
@@ -1660,12 +1658,7 @@ pub fn queued_list(items: &[QueuedMessage], now_ms: u64, style: &Style) -> Strin
     let rows: Vec<Vec<String>> = items
         .iter()
         .map(|q| {
-            vec![
-                flat(&q.id),
-                age(now_ms.saturating_sub(q.created_ms)),
-                q.attachments.len().to_string(),
-                flat(&q.text),
-            ]
+            vec![flat(&q.id), age(now_ms.saturating_sub(q.created_ms)), q.attachments.len().to_string(), flat(&q.text)]
         })
         .collect();
     table(style, &["ID", "AGE", "FILES", "TEXT"], &rows)
@@ -1680,13 +1673,11 @@ pub fn rewrite_rules_table(rules: &[serde_json::Value], style: &Style) -> String
         .iter()
         .map(|r| {
             let id = r.get("id").and_then(|v| v.as_u64()).map(|n| n.to_string()).unwrap_or_else(|| "-".into());
-            let enabled = if r.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false) {
-                "enabled"
-            } else {
-                "disabled"
-            };
+            let enabled =
+                if r.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false) { "enabled" } else { "disabled" };
             let phase = r.get("phase").and_then(|v| v.as_str()).map(flat).unwrap_or_else(|| "-".into());
-            let priority = r.get("priority").and_then(|v| v.as_i64()).map(|n| n.to_string()).unwrap_or_else(|| "0".into());
+            let priority =
+                r.get("priority").and_then(|v| v.as_i64()).map(|n| n.to_string()).unwrap_or_else(|| "0".into());
             let name = r.get("name").and_then(|v| v.as_str()).map(flat).unwrap_or_default();
             let actions = r.get("actions").and_then(|v| v.as_array()).map_or(0, Vec::len).to_string();
             let note = r.get("note").and_then(|v| v.as_str()).map(flat).unwrap_or_default();
@@ -1831,7 +1822,7 @@ mod tests {
                 pack: s.into(),
                 role: s.into(),
                 termination: Termination::Explicit,
-                model: ModelRef { profile: s.into(), model: s.into(), context_window: 1000 },
+                model: ModelRef { profile: s.into(), model: s.into(), context_window: 1000, lineage: None },
                 reasoning_replay: ReasoningReplay::All,
                 system_prompt: s.into(),
                 tools: vec![],
@@ -1955,14 +1946,26 @@ mod tests {
                 allowed: false,
                 rule: s.into(),
                 resolved: None,
+                sni: None,
+                paced_ms: None,
             }),
             Event::CacheBreak { req_id: s.into(), first_diff_message: 2, detail: s.into() },
             Event::Interrupted { reason: s.into() },
             Event::TurnEnd { reason: TurnEndReason::Finished },
             Event::SessionEnd { outcome: SessionOutcome::Failed, detail: s.into() },
             Event::ModelSwitched(ferret_core::event::ModelSwitched {
-                from: ferret_core::event::ModelRef { profile: s.into(), model: s.into(), context_window: 1000 },
-                to: ferret_core::event::ModelRef { profile: s.into(), model: s.into(), context_window: 0 },
+                from: ferret_core::event::ModelRef {
+                    profile: s.into(),
+                    model: s.into(),
+                    context_window: 1000,
+                    lineage: None,
+                },
+                to: ferret_core::event::ModelRef {
+                    profile: s.into(),
+                    model: s.into(),
+                    context_window: 0,
+                    lineage: None,
+                },
                 reasoning_replay: ferret_core::event::ReasoningReplay::None,
                 reason: s.into(),
             }),
@@ -1974,7 +1977,8 @@ mod tests {
 
     #[test]
     fn no_raw_escape_survives_for_any_kind() {
-        let opts = RecordOpts { reasoning: true, full: true, verbose: true, hide_exchanges: false, max_output_lines: 40 };
+        let opts =
+            RecordOpts { reasoning: true, full: true, verbose: true, hide_exchanges: false, max_output_lines: 40 };
         let known = [RESET, DIM, BOLD, RED, YELLOW, GREEN, CYAN];
         for event in one_of_each(EVIL) {
             for style in [MONO, COLOR] {
@@ -2084,7 +2088,7 @@ mod tests {
             pack: "core".into(),
             role: "lead".into(),
             termination: Termination::Free,
-            model: ModelRef { profile: "local".into(), model: "mm".into(), context_window: 1 },
+            model: ModelRef { profile: "local".into(), model: "mm".into(), context_window: 1, lineage: None },
             reasoning_replay: ReasoningReplay::All,
             system_prompt: String::new(),
             tools: vec![],
@@ -2473,6 +2477,8 @@ mod tests {
             allowed: true,
             rule: "r".into(),
             resolved: None,
+            sni: None,
+            paced_ms: None,
         });
         assert_eq!(record(&rec(Author::Harness, net), &MONO, &verbose), "");
         assert_eq!(record(&rec(Author::Harness, Event::Unknown), &MONO, &verbose), "");
@@ -2821,7 +2827,12 @@ mod tests {
 
         let receipt = |live: bool| ModelSwitchReceipt {
             session: SessionId::from("s-1"),
-            model: ferret_core::event::ModelRef { profile: "fast".into(), model: "m".into(), context_window: 200_000 },
+            model: ferret_core::event::ModelRef {
+                profile: "fast".into(),
+                model: "m".into(),
+                context_window: 200_000,
+                lineage: None,
+            },
             live,
         };
         assert_eq!(model_switch_line(&receipt(true)), "s-1 now uses fast (m, window 200.0k), from its next step");
@@ -2858,6 +2869,7 @@ mod tests {
                 profile: "big".into(),
                 model: "b".into(),
                 context_window: 1_000_000,
+                lineage: None,
             },
             any_role: None,
             roles: vec![worker, solver, verifier],
@@ -2907,6 +2919,8 @@ mod tests {
             sessions_active: 2,
             sessions_running: 1,
             inbox_open: 3,
+            egress: None,
+            monitor: None,
             default_model: Some("local".into()),
             signal: None,
         };
@@ -2981,6 +2995,46 @@ mod tests {
     }
 
     #[test]
+    fn status_shows_the_egress_line_when_the_daemon_reports_one() {
+        use ferret_agent::egress::{EgressView, Level};
+        let mut view = StatusView {
+            version: "0.1.0".into(),
+            pid: 1,
+            started_ms: 0,
+            bind: "127.0.0.1:7878".into(),
+            proxy_port: 7879,
+            home: "/h".into(),
+            sandbox: "seatbelt".into(),
+            network: "deny_all".into(),
+            disk: None,
+            models: vec![],
+            sessions_total: 0,
+            sessions_active: 0,
+            sessions_running: 0,
+            inbox_open: 0,
+            egress: None,
+            monitor: None,
+            default_model: None,
+            signal: None,
+        };
+        assert!(!status(&view, &MONO).contains("egress"), "an older daemon says nothing");
+        view.egress = Some(EgressView { level: Level::Unprobed, ..EgressView::default() });
+        assert!(status(&view, &MONO).contains("egress: not probed yet\n"));
+        view.egress = Some(EgressView {
+            level: Level::Unbounded,
+            reasons: vec!["sandbox.allow_fetch_services is set".into(), "second".into()],
+            ..EgressView::default()
+        });
+        let plain = status(&view, &MONO);
+        assert!(plain.contains("egress: UNBOUNDED, sandbox.allow_fetch_services is set (+1 more)\n"), "{plain}");
+        assert!(status(&view, &COLOR).contains("\x1b[1m\x1b[33megress: UNBOUNDED"), "{}", status(&view, &COLOR));
+        let narrow = status(&view, &Style { color: false, width: 20 });
+        for line in narrow.lines() {
+            assert!(line.chars().count() <= 20, "{line}");
+        }
+    }
+
+    #[test]
     fn wrap_display_rows_handles_tabs_wide_chars_and_uncut_inbox_commands() {
         let rows = wrap_display_rows("a\tb", 8);
         assert_eq!(rows, vec!["a    b"]);
@@ -2991,11 +3045,8 @@ mod tests {
         let mut e = entry(0);
         e.item.kind = InboxKind::Approval;
         e.item.blocking = false;
-        e.item.options = vec![
-            "api.staging.example.com".into(),
-            "auth.staging.example.com".into(),
-            "cdn.staging.example.com".into(),
-        ];
+        e.item.options =
+            vec!["api.staging.example.com".into(), "auth.staging.example.com".into(), "cdn.staging.example.com".into()];
         let narrow = inbox_list(&[e], 5_000, &Style { color: false, width: 40 });
         assert!(
             narrow.contains(
@@ -3128,7 +3179,9 @@ mod tests {
         assert!(pt.contains("core (default role: lead)") && pt.contains("lead (default, spawns)"), "{pt}");
         assert_eq!(rewrite_rules_table(&[], &MONO), "No proxy rewrite rules configured.\n");
         let rt = rewrite_rules_table(
-            &[serde_json::json!({"id": 1, "enabled": true, "phase": "request", "priority": 0, "name": "auth", "actions": [{}], "note": "n"})],
+            &[
+                serde_json::json!({"id": 1, "enabled": true, "phase": "request", "priority": 0, "name": "auth", "actions": [{}], "note": "n"}),
+            ],
             &MONO,
         );
         assert!(rt.contains("enabled") && rt.contains("auth"), "{rt}");
@@ -3157,6 +3210,8 @@ mod tests {
             sessions_active: 0,
             sessions_running: 0,
             inbox_open: 0,
+            egress: None,
+            monitor: None,
             default_model: None,
             signal: None,
         };
@@ -3168,7 +3223,10 @@ mod tests {
             assert_eq!(disk.is_low(), low, "{disk:?}");
             let text = status(&with(Some(disk)), &MONO);
             let lines: Vec<&str> = text.lines().collect();
-            assert!(lines[1].contains(" free of ") && lines[1].ends_with(" on the volume of the ferret home"), "{text}");
+            assert!(
+                lines[1].contains(" free of ") && lines[1].ends_with(" on the volume of the ferret home"),
+                "{text}"
+            );
             assert_eq!(text.contains(warning), low, "{text}");
             if low {
                 assert_eq!(format!("{}\n", lines[2]), warning);
@@ -3197,6 +3255,8 @@ mod tests {
                 allowed,
                 rule: "default deny".into(),
                 resolved: None,
+                sni: None,
+                paced_ms: None,
             },
         };
         let text = net_table(&[e(3_723_000, false), e(86_400_000 + 59_000, true)], &MONO);

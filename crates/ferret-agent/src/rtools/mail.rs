@@ -60,10 +60,7 @@ impl Tool for InboxRead {
         };
         let id = args.get("id").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
         let query = args.get("query").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
-        let limit = args
-            .get("limit")
-            .and_then(Value::as_u64)
-            .map(|n| usize::try_from(n).unwrap_or(usize::MAX));
+        let limit = args.get("limit").and_then(Value::as_u64).map(|n| usize::try_from(n).unwrap_or(usize::MAX));
 
         let client = MailClient::new((**cfg).clone());
 
@@ -109,10 +106,7 @@ impl Tool for InboxRead {
             return ToolOutput {
                 status: ToolStatus::Ok,
                 outcome: format!("read email {}", msg.id),
-                more: vec![
-                    format!("{} links", msg.links.len()),
-                    format!("{} codes", msg.codes.len()),
-                ],
+                more: vec![format!("{} links", msg.links.len()), format!("{} codes", msg.codes.len())],
                 body: Body::Raw(out.into_bytes()),
                 meta: Map::new(),
             };

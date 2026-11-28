@@ -221,9 +221,7 @@ fn filter() -> io::Result<Vec<u8>> {
     } else if cfg!(target_arch = "aarch64") {
         Ok(filter_for_arch(SeccompArch::Aarch64))
     } else {
-        Err(invalid(
-            "Bubblewrap seccomp supports x86_64 and aarch64 Linux only. Use a supported host.".to_string(),
-        ))
+        Err(invalid("Bubblewrap seccomp supports x86_64 and aarch64 Linux only. Use a supported host.".to_string()))
     }
 }
 
@@ -541,7 +539,10 @@ mod tests {
         let ws = ws.canonicalize().unwrap();
         let tmp = tmp.canonicalize().unwrap();
         let home = home.canonicalize().unwrap();
+        // Built as seatbelt and switched to bubblewrap below, so no bwrap binary or reserved `.ferret` is needed:
+        // the default mode is this OS's (bubblewrap on Linux), so it is named here.
         let cfg = SandboxCfg {
+            mode: SandboxMode::Seatbelt,
             protect_credentials: false,
             protected_paths: vec![ws.display().to_string()],
             ..SandboxCfg::default()
@@ -642,20 +643,17 @@ mod tests {
                 .as_chunks::<8>()
                 .0
                 .iter()
-                .map(|c| {
-                    (
-                        u16::from_ne_bytes([c[0], c[1]]),
-                        c[2],
-                        c[3],
-                        u32::from_ne_bytes([c[4], c[5], c[6], c[7]]),
-                    )
-                })
+                .map(|c| (u16::from_ne_bytes([c[0], c[1]]), c[2], c[3], u32::from_ne_bytes([c[4], c[5], c[6], c[7]])))
                 .collect();
             let arch = insns[1].3;
             let has_x32 = insns.iter().any(|&(op, _, _, k)| op == 0x45 && k == 0x4000_0000);
             let mut denied = Vec::new();
             for pair in insns.windows(2) {
-                if pair[0].0 == 0x15 && pair[0].1 == 0 && pair[0].2 == 1 && pair[1] == (0x06, 0, 0, 0x0005_0000 | LINUX_EPERM) {
+                if pair[0].0 == 0x15
+                    && pair[0].1 == 0
+                    && pair[0].2 == 1
+                    && pair[1] == (0x06, 0, 0, 0x0005_0000 | LINUX_EPERM)
+                {
                     denied.push(pair[0].3);
                 }
             }

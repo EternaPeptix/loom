@@ -148,6 +148,13 @@ pub enum LedgerOp {
         #[serde(default)]
         note: Option<String>,
     },
+    /// The operator withdraws one host of an earlier grant, exactly as it was granted (compared ignoring
+    /// ASCII case). Operator only; refused when the host is not granted now. A later `ScopeGrant` of the
+    /// same host grants it again.
+    ScopeRevoke {
+        host: String,
+        reason: String,
+    },
     /// Additive typed security observations; no change to existing op shapes.
     Security(crate::security_state::SecurityOp),
 }
@@ -419,6 +426,16 @@ pub struct ScopeGrantRecord {
     pub n: u64,
 }
 
+/// One operator withdrawal of a granted host.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScopeRevokeRecord {
+    pub id: String,
+    /// The host as it was granted.
+    pub host: String,
+    pub reason: String,
+    pub n: u64,
+}
+
 /// The folded state of a mission. Ids are assigned by `fold`: constraints `k1…`, plan steps `p1…`,
 /// decisions `d1…`, dead ends `x1…`, reflections `r1…`, claims `c1…`, evidence `e1…`, obligations `o1…`,
 /// approvals `a1…`, questions `q1…`, finish claims `f1…`, scope grants `s1…`.
@@ -450,6 +467,9 @@ pub struct LedgerState {
     /// Operator grants of network hosts, in order. Never evicted.
     #[serde(default)]
     pub scope_grants: Vec<ScopeGrantRecord>,
+    /// Operator withdrawals of granted hosts, in order. Never evicted. Absent in older snapshots.
+    #[serde(default)]
+    pub scope_revokes: Vec<ScopeRevokeRecord>,
     /// The session that recorded each claim, in creation order (`claims[i]` was added by
     /// `claim_sessions[i]`). Kept so that a rule can be checked under the journal's append lock
     /// without a second read. Absent in older snapshots.
@@ -541,7 +561,15 @@ pub struct LedgerState {
 // grant; the letter `s` is used for nothing else). Hosts are kept as written and are not parsed; `validate`
 // requires a non-empty list, no blank entry, and no entry containing whitespace or a comma (one host per
 // entry). `granted_hosts()` returns every host granted so far, de-duplicated ignoring ASCII case, in
-// first-seen order. Release and grants are never evicted.
+// first-seen order, leaving out a host revoked after the grant that named it (below). Release and grants
+// are never evicted.
+//
+// Scope revoke (`ScopeRevoke{host, reason}`, `from_user` only): appends a `ScopeRevokeRecord` with id `v{i}`.
+// `validate` refuses a blank or whitespace/comma host or reason, and a host that is not granted now (compared
+// ignoring ASCII case, as the entry was written): the sentence lists the hosts granted now, and when a
+// wildcard grant covers the host it names that grant and says to revoke it. A grant is live unless a revoke
+// of the same host (ignoring case) has a later journal position (`n`) than the grant, so granting a host again
+// after revoking it grants it again. Revokes are never evicted; the Markdown view lists them.
 //
 // `open_items()`: plan steps `Todo`/`Doing`; obligations with no outcome; claims with status `Open`;
 // questions with `blocking` and no answer.
@@ -977,15 +1005,23 @@ impl LedgerState {
                 let id = next_id("s", self.scope_grants.len());
                 self.scope_grants.push(ScopeGrantRecord { id, hosts: hosts.clone(), note: note.clone(), n });
             }
+            LedgerOp::ScopeRevoke { host, reason } => {
+                let id = next_id("v", self.scope_revokes.len());
+                self.scope_revokes.push(ScopeRevokeRecord { id, host: host.clone(), reason: reason.clone(), n });
+            }
         }
     }
 
-    /// Every host the operator has granted so far, de-duplicated (ignoring ASCII case) in first-seen order.
+    /// Every host the operator has granted and not revoked since, de-duplicated (ignoring ASCII case) in
+    /// first-seen order. A revoke withdraws the grants before it, not one made after it.
     pub fn granted_hosts(&self) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
-        for host in self.scope_grants.iter().flat_map(|g| g.hosts.iter()) {
-            if !out.iter().any(|h| h.eq_ignore_ascii_case(host)) {
-                out.push(host.clone());
+        for g in &self.scope_grants {
+            for host in &g.hosts {
+                let revoked = self.scope_revokes.iter().any(|r| r.n > g.n && r.host.eq_ignore_ascii_case(host));
+                if !revoked && !out.iter().any(|h| h.eq_ignore_ascii_case(host)) {
+                    out.push(host.clone());
+                }
             }
         }
         out
@@ -1296,6 +1332,36 @@ impl LedgerState {
                     return Err(needs_text("the release", "reason"));
                 }
             }
+            LedgerOp::ScopeRevoke { host, reason } => {
+                if !from_user {
+                    return Err(user_only("A network scope revoke"));
+                }
+                if blank(host) || host.chars().any(|c| c.is_whitespace() || c == ',') {
+                    return Err(format!("The host entry `{host}` is blank or contains whitespace or a comma. Give the one host to revoke, exactly as it was granted."));
+                }
+                if blank(reason) {
+                    return Err(needs_text("a scope revoke", "reason"));
+                }
+                let granted = self.granted_hosts();
+                if !granted.iter().any(|h| h.eq_ignore_ascii_case(host)) {
+                    let covering = granted.iter().find(|g| {
+                        g.strip_prefix("*.").is_some_and(|suffix| {
+                            let h = host.to_ascii_lowercase();
+                            let h = h.rsplit_once(':').map_or(h.as_str(), |(n, _)| n);
+                            h.len() > suffix.len() && h.ends_with(&format!(".{}", suffix.to_ascii_lowercase()))
+                        })
+                    });
+                    let now = if granted.is_empty() {
+                        "no host is granted now".to_string()
+                    } else {
+                        format!("granted now: {}", granted.join(", "))
+                    };
+                    return Err(match covering {
+                        Some(g) => format!("The host `{host}` is not granted by itself; the grant `{g}` covers it. Revoke `{g}` (a revoke names a grant exactly as it was written), then grant the hosts that should stay. ({now})"),
+                        None => format!("The host `{host}` is not granted, so there is nothing to revoke ({now}). Write the host exactly as it was granted."),
+                    });
+                }
+            }
             LedgerOp::ScopeGrant { hosts, .. } => {
                 if !from_user {
                     return Err(user_only("A network scope grant"));
@@ -1466,7 +1532,7 @@ impl LedgerState {
             sections.push(format!("Goal: {goal}"));
         }
 
-        if self.goal.is_some() || !self.scope_grants.is_empty() {
+        if self.goal.is_some() || !self.scope_grants.is_empty() || !self.scope_revokes.is_empty() {
             let mut s = String::new();
             if let Some(gm) = &self.goal_met {
                 if gm.status == GoalMetStatus::Open {
@@ -1828,6 +1894,16 @@ impl LedgerState {
             o.push('\n');
         }
 
+        for r in &self.scope_revokes {
+            o.push_str(&format!(
+                "- **{}** (entry {}): revoked {} — {}\n",
+                r.id,
+                r.n,
+                md_inline(&r.host),
+                md_inline(&r.reason)
+            ));
+        }
+
         o.push_str("\n## Finish claims\n\n");
         if self.finishes.is_empty() {
             o.push_str("(none)\n");
@@ -1902,6 +1978,7 @@ impl LedgerState {
             LedgerOp::ScopeGrant { hosts, note } => {
                 format!("scope granted: {}{}", hosts.join(", "), suffix(note.as_deref().unwrap_or("")))
             }
+            LedgerOp::ScopeRevoke { host, reason } => format!("scope revoked: {host}{}", suffix(reason)),
         };
         line(&s, 200)
     }
@@ -2162,6 +2239,7 @@ mod tests {
                 hosts: vec!["a.example".into(), "b.example".into()],
                 note: Some("for the crawl".into()),
             },
+            LedgerOp::ScopeRevoke { host: "b.example".into(), reason: "out of scope".into() },
         ]
     }
 
@@ -3412,6 +3490,67 @@ mod tests {
         assert!(build(vec![LedgerOp::GoalSet { text: "g".into() }])
             .render_markdown()
             .contains("authorized hosts: none granted"));
+    }
+
+    #[test]
+    fn a_scope_revoke_is_operator_only_withdraws_the_grant_and_a_regrant_restores_it() {
+        let grant =
+            |hosts: &[&str]| LedgerOp::ScopeGrant { hosts: hosts.iter().map(|h| h.to_string()).collect(), note: None };
+        let revoke = |host: &str, reason: &str| LedgerOp::ScopeRevoke { host: host.into(), reason: reason.into() };
+        let s =
+            build(vec![LedgerOp::GoalSet { text: "g".into() }, grant(&["a.example", "*.b.example", "127.0.0.1:9"])]);
+        // A tool call cannot revoke.
+        let m = refusal(&s, revoke("a.example", "r"), false);
+        assert!(m.contains("operator's own words") && m.contains("cannot be written by a tool call"), "{m}");
+        // Blank or malformed entries and a blank reason.
+        assert!(refusal(&s, revoke(" ", "r"), true).contains("blank"));
+        assert!(refusal(&s, revoke("a.example b.example", "r"), true).contains("whitespace"));
+        assert!(refusal(&s, revoke("a.example", " "), true).contains("reason"));
+        // A host that is not granted: the sentence lists what is granted.
+        let m = refusal(&s, revoke("c.example", "r"), true);
+        assert!(m.contains("not granted") && m.contains("granted now: a.example, *.b.example, 127.0.0.1:9"), "{m}");
+        // A host a wildcard grant covers: the sentence names the grant to revoke.
+        let m = refusal(&s, revoke("x.b.example", "r"), true);
+        assert!(m.contains("`*.b.example` covers it") && m.contains("Revoke `*.b.example`"), "{m}");
+        let m = refusal(&s, revoke("x.b.example:8080", "r"), true);
+        assert!(m.contains("`*.b.example` covers it"), "{m}");
+        assert!(s.validate(&revoke("A.Example", "scope"), true).is_ok(), "compared ignoring case");
+        // The fold: the host leaves granted_hosts, the others stay, the record is kept.
+        let s = build(vec![
+            LedgerOp::GoalSet { text: "g".into() },
+            grant(&["a.example", "*.b.example"]),
+            revoke("A.example", "wrong target"),
+        ]);
+        assert_eq!(s.granted_hosts(), ["*.b.example"]);
+        assert_eq!(s.scope_revokes.len(), 1);
+        assert_eq!((s.scope_revokes[0].id.as_str(), s.scope_revokes[0].n), ("v1", 3));
+        assert!(s.brief(&BriefOpts::default()).contains("authorized hosts: *.b.example"));
+        let md = s.render_markdown();
+        assert!(md.contains("- **v1** (entry 3): revoked A.example — wrong target"), "{md}");
+        // Revoked twice is refused the second time.
+        assert!(refusal(&s, revoke("a.example", "again"), true).contains("not granted"));
+        // Granting it again, later, grants it again; an earlier revoke does not withdraw the later grant.
+        let s = build(vec![
+            LedgerOp::GoalSet { text: "g".into() },
+            grant(&["a.example"]),
+            revoke("a.example", "r"),
+            grant(&["a.example", "d.example"]),
+        ]);
+        assert_eq!(s.granted_hosts(), ["a.example", "d.example"]);
+        // Only the revoked host of a multi-host grant leaves.
+        let s = build(vec![
+            LedgerOp::GoalSet { text: "g".into() },
+            grant(&["x.example", "y.example"]),
+            revoke("x.example", "r"),
+        ]);
+        assert_eq!(s.granted_hosts(), ["y.example"]);
+        // The wire form.
+        let op: Result<LedgerOp, _> = serde_json::from_str(r#"{"op":"scope_revoke","host":"a.example","reason":"r"}"#);
+        assert!(matches!(op, Ok(LedgerOp::ScopeRevoke { .. })));
+        // A snapshot written before revokes existed folds with none.
+        let old = r#"{"goal":"g","constraints":[],"plan":[],"decisions":[],"dead_ends":[],"claims":[],"evidence":[],"obligations":[],"approvals":[],"questions":[],"finishes":[],"entries":1}"#;
+        let st: LedgerState = serde_json::from_str(old).unwrap_or_else(|e| panic!("{e}"));
+        assert!(st.scope_revokes.is_empty());
     }
 
     #[test]

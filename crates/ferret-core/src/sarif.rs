@@ -143,9 +143,7 @@ fn stride_legs_for_cwe(cwe: Option<&str>) -> &'static [&'static str] {
         // Repudiation
         "117" | "223" | "778" => &["R"],
         // Information disclosure
-        "200" | "201" | "209" | "256" | "311" | "319" | "327" | "328" | "522" | "525" | "532" | "538" | "598" => {
-            &["I"]
-        }
+        "200" | "201" | "209" | "256" | "311" | "319" | "327" | "328" | "522" | "525" | "532" | "538" | "598" => &["I"],
         // Denial of service
         "400" | "770" | "1333" => &["D"],
         // Elevation of privilege
@@ -281,10 +279,7 @@ pub fn build_sarif_report(ledger: &LedgerState, opts: &SarifOptions) -> Value {
 
     let mut driver = Map::new();
     driver.insert("name".into(), json!(TOOL_NAME));
-    driver.insert(
-        "version".into(),
-        json!(opts.tool_version.as_deref().unwrap_or(env!("CARGO_PKG_VERSION"))),
-    );
+    driver.insert("version".into(), json!(opts.tool_version.as_deref().unwrap_or(env!("CARGO_PKG_VERSION"))));
     driver.insert("rules".into(), Value::Array(rules));
 
     let mut run = Map::new();
@@ -301,8 +296,7 @@ pub fn build_sarif_report(ledger: &LedgerState, opts: &SarifOptions) -> Value {
     }
     if dropped_unsafe_location_total > 0 {
         run_properties.insert("droppedUnsafeLocationCount".into(), json!(dropped_unsafe_location_total));
-        run_properties
-            .insert("droppedUnsafeLocationFindings".into(), Value::Array(dropped_unsafe_location_findings));
+        run_properties.insert("droppedUnsafeLocationFindings".into(), Value::Array(dropped_unsafe_location_findings));
     }
     if withdrawn_count > 0 {
         run_properties.insert("withdrawnFindingCount".into(), json!(withdrawn_count));
@@ -327,17 +321,13 @@ pub fn build_sarif_report(ledger: &LedgerState, opts: &SarifOptions) -> Value {
 }
 
 /// Write a SARIF 2.1.0 report atomically to `output_path` via a sibling temp file + rename.
-pub fn write_sarif_report(
-    output_path: &Path,
-    ledger: &LedgerState,
-    opts: &SarifOptions,
-) -> std::io::Result<()> {
+pub fn write_sarif_report(output_path: &Path, ledger: &LedgerState, opts: &SarifOptions) -> std::io::Result<()> {
     if let Some(parent) = output_path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)?;
     }
     let sarif = build_sarif_report(ledger, opts);
-    let mut bytes = serde_json::to_vec_pretty(&sarif)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let mut bytes =
+        serde_json::to_vec_pretty(&sarif).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     bytes.push(b'\n');
 
     let file_name = output_path.file_name().and_then(|n| n.to_str()).unwrap_or("findings.sarif");
@@ -355,7 +345,11 @@ pub fn write_sarif_report(
     write_res
 }
 
-fn apply_repository_context(run: &mut Map<String, Value>, run_properties: &mut Map<String, Value>, ctx: &RepositoryContext) {
+fn apply_repository_context(
+    run: &mut Map<String, Value>,
+    run_properties: &mut Map<String, Value>,
+    ctx: &RepositoryContext,
+) {
     let full_name = ctx.repository_full_name.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let uri = ctx.repository_uri.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let commit = ctx.commit_sha.as_deref().map(str::trim).filter(|s| !s.is_empty());
@@ -420,12 +414,8 @@ fn build_finding_rule(rule_id: &str, finding: &Finding, scrub: &Scrubber<'_>) ->
     let title = scrub.text(&finding.title);
     let description = scrub.text(&finding.description);
     let impact = scrub.text(&finding.impact);
-    let rem_clean = finding
-        .remediation_steps
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| scrub.text(s));
+    let rem_clean =
+        finding.remediation_steps.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(|s| scrub.text(s));
     let help_text = {
         let mut parts: Vec<&str> = Vec::new();
         if !description.trim().is_empty() {
@@ -437,7 +427,11 @@ fn build_finding_rule(rule_id: &str, finding: &Finding, scrub: &Scrubber<'_>) ->
         if let Some(rem) = rem_clean.as_deref() {
             parts.push(rem);
         }
-        if parts.is_empty() { title.to_string() } else { parts.join("\n\n") }
+        if parts.is_empty() {
+            title.to_string()
+        } else {
+            parts.join("\n\n")
+        }
     };
 
     let mut tags = vec!["security".to_string()];
@@ -589,11 +583,8 @@ fn build_finding_result(
 ) -> Value {
     let title = scrub.text(&finding.title);
     let description = scrub.text(&finding.description);
-    let message_text = if description.trim().is_empty() {
-        title.into_owned()
-    } else {
-        format!("{title}\n\n{description}")
-    };
+    let message_text =
+        if description.trim().is_empty() { title.into_owned() } else { format!("{title}\n\n{description}") };
 
     let mut result = Map::new();
     result.insert("ruleId".into(), json!(rule_id));
@@ -835,10 +826,7 @@ fn build_invocation(ledger: &LedgerState, opts: &SarifOptions, scrub: &Scrubber<
         inv.insert(
             "toolExecutionNotifications".into(),
             Value::Array(
-                caveats
-                    .into_iter()
-                    .map(|text| json!({ "level": "warning", "message": { "text": text } }))
-                    .collect(),
+                caveats.into_iter().map(|text| json!({ "level": "warning", "message": { "text": text } })).collect(),
             ),
         );
     }
@@ -846,12 +834,8 @@ fn build_invocation(ledger: &LedgerState, opts: &SarifOptions, scrub: &Scrubber<
 }
 
 fn build_coverage_provenance_summary(ledger: &LedgerState, ev_by_id: &HashMap<&str, &Evidence>) -> Value {
-    let mut grade_counts: BTreeMap<&'static str, usize> = BTreeMap::from([
-        ("run", 0),
-        ("analysis", 0),
-        ("read", 0),
-        ("reference", 0),
-    ]);
+    let mut grade_counts: BTreeMap<&'static str, usize> =
+        BTreeMap::from([("run", 0), ("analysis", 0), ("read", 0), ("reference", 0)]);
     for e in ledger.evidence.iter().filter(|e| e.input.attested) {
         *grade_counts.entry(e.input.grade_or_kind().as_str()).or_default() += 1;
     }
@@ -862,7 +846,9 @@ fn build_coverage_provenance_summary(ledger: &LedgerState, ev_by_id: &HashMap<&s
         .filter(|c| matches!(c.outcome, SurfaceOutcome::NoIssueFound | SurfaceOutcome::RuledOut))
         .filter(|c| {
             c.evidence.iter().any(|id| {
-                ev_by_id.get(id.as_str()).is_some_and(|e| e.input.attested && e.input.grade_or_kind() == EvidenceGrade::Run)
+                ev_by_id
+                    .get(id.as_str())
+                    .is_some_and(|e| e.input.attested && e.input.grade_or_kind() == EvidenceGrade::Run)
             })
         })
         .count();
@@ -914,12 +900,7 @@ pub fn resolve_evidence_provenance(ids: &[String], ev_by_id: &HashMap<&str, &Evi
         .collect()
 }
 
-fn primary_fingerprint(
-    rule_id: &str,
-    finding: &Finding,
-    locations: &[Value],
-    is_synthetic: bool,
-) -> Option<String> {
+fn primary_fingerprint(rule_id: &str, finding: &Finding, locations: &[Value], is_synthetic: bool) -> Option<String> {
     let first_phys = locations.iter().find_map(|l| l.get("physicalLocation"));
     let uri = first_phys
         .and_then(|p| p.get("artifactLocation"))
@@ -1005,7 +986,11 @@ fn slugify(value: &str) -> String {
         }
     }
     let trimmed = out.trim_matches('-');
-    if trimmed.is_empty() { "unspecified".to_string() } else { trimmed.to_string() }
+    if trimmed.is_empty() {
+        "unspecified".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -1195,7 +1180,8 @@ mod tests {
         let cwe_rule = rules.iter().find(|r| r["id"] == "CWE-89").unwrap();
         assert_eq!(cwe_rule["properties"]["security-severity"], "9.8");
         assert_eq!(cwe_rule["helpUri"], "https://cwe.mitre.org/data/definitions/89.html");
-        let tags: Vec<&str> = cwe_rule["properties"]["tags"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+        let tags: Vec<&str> =
+            cwe_rule["properties"]["tags"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
         assert!(tags.contains(&"security") && tags.contains(&"CWE-89") && tags.contains(&"stride:T"));
 
         let results = run["results"].as_array().unwrap();
@@ -1208,8 +1194,10 @@ mod tests {
         assert!(alert["properties"]["ferret_vuln_class_hash"].as_str().unwrap().len() == 64);
         assert_eq!(alert["locations"][0]["physicalLocation"]["artifactLocation"]["uri"], "src/db/users.py");
         assert_eq!(alert["locations"][1]["logicalLocations"][0]["fullyQualifiedName"], "/api/users");
-        assert_eq!(alert["fixes"][0]["artifactChanges"][0]["replacements"][0]["insertedContent"]["text"],
-            "cur.execute(\"SELECT * FROM users WHERE name = %s\", (q,))");
+        assert_eq!(
+            alert["fixes"][0]["artifactChanges"][0]["replacements"][0]["insertedContent"]["text"],
+            "cur.execute(\"SELECT * FROM users WHERE name = %s\", (q,))"
+        );
         // PoC never leaks handle/body, only script_available
         assert_eq!(alert["properties"]["ferret"]["poc"]["script_available"], true);
         assert!(alert["properties"]["ferret"]["poc"].get("poc_handle").is_none());
@@ -1380,7 +1368,9 @@ mod tests {
             technical_analysis: Some("Cookie: sid=live-session-abc leaked in logs.".into()),
             remediation_steps: Some("Strip Authorization headers before logging.".into()),
             assumptions: None,
-            poc_description: Some(format!("curl -H 'X-Api-Key: secret-api-key-1' -H 'Authorization: Bearer {jwt}' https://api.example.test/me")),
+            poc_description: Some(format!(
+                "curl -H 'X-Api-Key: secret-api-key-1' -H 'Authorization: Bearer {jwt}' https://api.example.test/me"
+            )),
             poc_handle: None,
             fix_effort: Some(FixEffort::Low),
             endpoint: Some("/api/me?access_token=qs-secret-token".into()),

@@ -250,9 +250,8 @@ fn locator_host(locator: &str) -> String {
 /// Narrow by design so security claims like `"CSRF is not enforced on api.acme.test"` or
 /// `"api.acme.test does not check auth"` still require traffic to `api.acme.test`.
 fn is_preceded_by_negation(prefix: &str) -> bool {
-    let trimmed = prefix.trim_end_matches(|c: char| {
-        c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '(' | '[' | '<' | ':')
-    });
+    let trimmed =
+        prefix.trim_end_matches(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '(' | '[' | '<' | ':'));
     if trimmed.is_empty() {
         return false;
     }
@@ -273,21 +272,64 @@ fn is_preceded_by_negation(prefix: &str) -> bool {
     }
     const PREPS: &[&str] = &["on", "at", "to", "from", "via", "by", "for", "in", "through", "over"];
     const VERBS: &[&str] = &[
-        "use", "uses", "used", "using",
-        "hit", "hits", "hitting",
-        "call", "calls", "calling",
-        "reach", "reaches", "reached", "reaching",
-        "contact", "contacts", "contacted", "contacting",
-        "query", "queries", "queried", "querying",
-        "request", "requests", "requested", "requesting",
-        "target", "targets", "targeted", "targeting",
-        "connect", "connects", "connected", "connecting",
-        "talk", "talks", "talked", "talking",
-        "send", "sends", "sent", "sending",
-        "route", "routes", "routed", "routing",
-        "point", "points", "pointed", "pointing",
-        "hosted", "served", "proxied", "forwarded",
-        "redirect", "redirects", "redirected", "redirecting",
+        "use",
+        "uses",
+        "used",
+        "using",
+        "hit",
+        "hits",
+        "hitting",
+        "call",
+        "calls",
+        "calling",
+        "reach",
+        "reaches",
+        "reached",
+        "reaching",
+        "contact",
+        "contacts",
+        "contacted",
+        "contacting",
+        "query",
+        "queries",
+        "queried",
+        "querying",
+        "request",
+        "requests",
+        "requested",
+        "requesting",
+        "target",
+        "targets",
+        "targeted",
+        "targeting",
+        "connect",
+        "connects",
+        "connected",
+        "connecting",
+        "talk",
+        "talks",
+        "talked",
+        "talking",
+        "send",
+        "sends",
+        "sent",
+        "sending",
+        "route",
+        "routes",
+        "routed",
+        "routing",
+        "point",
+        "points",
+        "pointed",
+        "pointing",
+        "hosted",
+        "served",
+        "proxied",
+        "forwarded",
+        "redirect",
+        "redirects",
+        "redirected",
+        "redirecting",
         "going",
     ];
     let mut end = words.len();
@@ -367,9 +409,8 @@ fn looks_like_host_token(token: &str) -> bool {
 /// explicitly states were NOT used. Any non-negated mention of the same host elsewhere in `text`
 /// stays intact.
 fn strip_negated_hosts(text: &str) -> String {
-    let is_delim = |c: char| {
-        c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '(' | ')' | '<' | '>' | ',' | ';' | '[' | ']')
-    };
+    let is_delim =
+        |c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '(' | ')' | '<' | '>' | ',' | ';' | '[' | ']');
     let mut out = String::with_capacity(text.len());
     let mut cursor = 0usize;
     let mut iter = text.char_indices().peekable();
@@ -560,12 +601,8 @@ pub fn check_traffic(
     let active_findings = state.security.active_findings();
     // Every active finding citing `http_exchanges` must reference real exchange IDs in this mission.
     for finding in &active_findings {
-        let missing: Vec<&str> = finding
-            .http_exchanges
-            .iter()
-            .map(String::as_str)
-            .filter(|id| traffic.mission.find(id).is_none())
-            .collect();
+        let missing: Vec<&str> =
+            finding.http_exchanges.iter().map(String::as_str).filter(|id| traffic.mission.find(id).is_none()).collect();
         if !missing.is_empty() {
             return Err(format!(
                 "{tool} cannot be accepted yet: finding {} cites http_exchanges ({}) that do not exist in this mission's traffic log. Cite real captured exchange IDs from this mission or update the finding with `security_record`.",
@@ -637,10 +674,7 @@ pub fn check_traffic(
             ));
         }
         if !finding.http_exchanges.is_empty()
-            && finding
-                .http_exchanges
-                .iter()
-                .all(|id| traffic.mission.find(id).is_none_or(|x| x.status.is_none()))
+            && finding.http_exchanges.iter().all(|id| traffic.mission.find(id).is_none_or(|x| x.status.is_none()))
         {
             return Err(format!(
                 "{tool} cannot be accepted yet: high-confidence finding {} ({}) cites http_exchanges ({}) that never received a response. Capture an answered exchange or downgrade/withdraw the finding with `security_record`.",
@@ -821,8 +855,8 @@ mod tests {
 
     #[test]
     fn check_traffic_uses_target_scope_for_bare_in_scope_hosts() {
-        use ferret_core::ledger::{ClaimStatus, Entry, EvidenceInput, EvidenceKind, LedgerOp, LedgerState};
         use ferret_core::ids::SessionId;
+        use ferret_core::ledger::{ClaimStatus, Entry, EvidenceInput, EvidenceKind, LedgerOp, LedgerState};
 
         let dir = tempfile::tempdir().unwrap();
         let blobs = BlobStore::open(dir.path()).unwrap();
@@ -871,9 +905,9 @@ mod tests {
 
     #[test]
     fn check_traffic_verifies_active_findings_exchanges_and_high_confidence_corroboration() {
+        use ferret_core::ids::SessionId;
         use ferret_core::ledger::{Entry, EvidenceInput, EvidenceKind, LedgerOp, LedgerState};
         use ferret_core::security_state::{FindingConfidence, FindingInput, SecurityOp};
-        use ferret_core::ids::SessionId;
 
         let dir = tempfile::tempdir().unwrap();
         let blobs = BlobStore::open(dir.path()).unwrap();
@@ -1003,13 +1037,7 @@ mod tests {
         let traffic = Traffic::none();
         let scope = ferret_core::target::Scope::parse(&["*.acme.test".into(), "*.idp.test".into()], &[]).unwrap();
         let _ = traffic.target_scope.set(scope);
-        traffic.mission.add(&make_exchange(
-            &blobs,
-            "ex-222222222222",
-            "wallet.acme.test",
-            Some("call-1"),
-            Some(200),
-        ));
+        traffic.mission.add(&make_exchange(&blobs, "ex-222222222222", "wallet.acme.test", Some("call-1"), Some(200)));
 
         let build_state = |text: &str| {
             let mut state = LedgerState::default();

@@ -16,6 +16,7 @@
 //! - [`observe`] what the model has been shown: coverage, repetition, staleness, quote checks
 //! - [`sarif`]   SARIF 2.1.0 export for structured security findings and surface coverage
 //! - [`scorecard`] what a session's work took: steps, malformed calls, refusals, verdicts
+//! - [`lineage`] a model profile's family, alignment and data recipient
 //! - [`config`]  configuration file and on-disk layout
 //! - [`ingest`]  pure-Rust parsers for bounty scopes, OpenAPI/Swagger, GraphQL introspection, and JS sourcemaps
 
@@ -32,6 +33,7 @@ pub mod image;
 pub mod ingest;
 pub mod journal;
 pub mod ledger;
+pub mod lineage;
 pub mod log;
 pub mod message;
 pub mod observe;

@@ -37,6 +37,14 @@ pub struct StatusView {
     /// Sessions in the middle of a turn.
     pub sessions_running: usize,
     pub inbox_open: usize,
+    /// Whether sandboxed commands can reach the network outside the egress proxy, from the sandbox self-probe (E2);
+    /// `null` from a daemon that predates it.
+    #[serde(default)]
+    pub egress: Option<ferret_agent::egress::EgressView>,
+    /// What the monitor says in a word, from `GET /api/monitor`'s `MonitorStatus`; `null` when `[monitor] enabled =
+    /// false` or from a daemon that predates it.
+    #[serde(default)]
+    pub monitor: Option<MonitorBrief>,
     /// Live default model profile name (when configured).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
@@ -173,6 +181,15 @@ impl SignalHealth {
         w.guests_approved = approved;
         w.guests_pending = pending;
     }
+}
+
+/// The monitor in one line of `ferret status`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MonitorBrief {
+    /// `shadow`, `degraded` or `down`.
+    pub state: String,
+    pub open_flags: u64,
+    pub egress_unbounded: bool,
 }
 
 /// Free space below which `ferret status` warns that sessions will soon fail to write: 5 GiB, or 5 percent of the
@@ -424,8 +441,21 @@ pub struct ScopeBody {
 
 /// The answer to `POST /api/sessions/{id}/scope`.
 pub use ferret_agent::runtime::ScopeReceipt;
-/// The answers to `POST /api/sessions/{id}/scope/revoke` (`DELETE /api/sessions/{id}/scope`),
-/// `POST /api/panic`, and `POST /api/targets/{name}/import-scope`.
+/// Body of `POST /api/sessions/{id}/scope/revoke`: the operator revokes hosts from the mission of the session.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopeRevokeBody {
+    /// One host per entry: a grant as it was granted (compared ignoring case), or any host, `*.suffix`, address or
+    /// CIDR block, optionally with `:port`. Required (an empty list is refused by the runtime).
+    pub hosts: Vec<String>,
+    /// Why; kept in the ledger and shown to the lead. Left out, the ledger records `no reason given`. `note` is the
+    /// same field.
+    #[serde(default, alias = "note")]
+    pub reason: Option<String>,
+}
+
+/// The answers to `POST /api/sessions/{id}/scope/revoke`, `POST /api/panic` and
+/// `POST /api/targets/{name}/import-scope`.
 pub use ferret_agent::{PanicReport, ScopeImportResult, ScopeRevokeReceipt};
 
 fn default_auto() -> String {
@@ -582,8 +612,7 @@ mod tests {
         assert_eq!(b.format, "auto");
         assert_eq!(b.payload, "a.test");
 
-        let explicit: ScopeImportBody =
-            serde_json::from_str(r#"{"format":"hackerone","payload":"{}"}"#).unwrap();
+        let explicit: ScopeImportBody = serde_json::from_str(r#"{"format":"hackerone","payload":"{}"}"#).unwrap();
         assert_eq!(explicit.format, "hackerone");
 
         assert!(serde_json::from_str::<ScopeImportBody>(r#"{"payload":"a.test","extra":1}"#).is_err());

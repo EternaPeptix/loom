@@ -210,24 +210,18 @@ fn parse_surface_artifact(
                     (AssetKind::Endpoint, surface.path.clone(), mand)
                 } else if let Some(host) = surface.host.as_deref().map(str::trim).filter(|h| !h.is_empty()) {
                     let scheme = origin.as_ref().map_or("https", |(s, _, _)| s.as_str());
-                    let path = if surface.path.starts_with('/') {
-                        surface.path.clone()
-                    } else {
-                        format!("/{}", surface.path)
-                    };
+                    let path =
+                        if surface.path.starts_with('/') { surface.path.clone() } else { format!("/{}", surface.path) };
                     let url = format!("{scheme}://{host}{path}");
-                    let mand = ferret_tools::http::quarantined_locator(&url).is_none()
-                        && !is_non_sourcemap_static_asset(&url);
+                    let mand =
+                        ferret_tools::http::quarantined_locator(&url).is_none() && !is_non_sourcemap_static_asset(&url);
                     (AssetKind::Endpoint, url, mand)
                 } else if let Some((scheme, host_port, _)) = &origin {
-                    let path = if surface.path.starts_with('/') {
-                        surface.path.clone()
-                    } else {
-                        format!("/{}", surface.path)
-                    };
+                    let path =
+                        if surface.path.starts_with('/') { surface.path.clone() } else { format!("/{}", surface.path) };
                     let url = format!("{scheme}://{host_port}{path}");
-                    let mand = ferret_tools::http::quarantined_locator(&url).is_none()
-                        && !is_non_sourcemap_static_asset(&url);
+                    let mand =
+                        ferret_tools::http::quarantined_locator(&url).is_none() && !is_non_sourcemap_static_asset(&url);
                     (AssetKind::Endpoint, url, mand)
                 } else {
                     (AssetKind::File, format!("{} {}", surface.method, surface.path), true)
@@ -235,11 +229,8 @@ fn parse_surface_artifact(
             }
         };
 
-        let sample_label = if kind == AssetKind::Endpoint {
-            format!("{} {}", surface.method, locator)
-        } else {
-            locator.clone()
-        };
+        let sample_label =
+            if kind == AssetKind::Endpoint { format!("{} {}", surface.method, locator) } else { locator.clone() };
         if sample_endpoints.len() < SAMPLE_ENDPOINTS_LIMIT && !sample_endpoints.contains(&sample_label) {
             sample_endpoints.push(sample_label);
         }
@@ -324,8 +315,7 @@ fn add(
     assets: &mut BTreeMap<String, AssetInput>,
 ) -> Result<String, String> {
     let mandatory = kind != AssetKind::Endpoint
-        || (ferret_tools::http::quarantined_locator(locator).is_none()
-            && !is_non_sourcemap_static_asset(locator));
+        || (ferret_tools::http::quarantined_locator(locator).is_none() && !is_non_sourcemap_static_asset(locator));
     let input = AssetInput { kind, locator: locator.into(), evidence: evidence.to_vec(), mandatory, parent };
     let id = input.id()?;
     if !assets.contains_key(&id) && assets.len() >= MAX_ASSETS {

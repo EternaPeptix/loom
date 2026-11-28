@@ -387,13 +387,18 @@ fn spawn(ctx: &ToolCtx, script: &str, pid_file: std::path::PathBuf) -> Result<Pt
         .stdin(Stdio::from(slave.try_clone().map_err(|e| e.to_string())?))
         .stdout(Stdio::from(slave.try_clone().map_err(|e| e.to_string())?))
         .stderr(Stdio::from(slave));
+    let nproc = ctx.sandbox.nproc_limit().map_err(|e| format!("PTY process did not start: {e}"))?;
     unsafe {
-        command.pre_exec(|| {
+        command.pre_exec(move || {
             if libc::setsid() < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             if libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
                 return Err(std::io::Error::last_os_error());
+            }
+            // The terminal's commands are held to the same process limit as every other command.
+            if let Some(limit) = nproc {
+                crate::procinfo::set_nproc(limit)?;
             }
             Ok(())
         });
@@ -632,7 +637,7 @@ mod tests {
     async fn eof_removes_an_exited_terminal_without_using_a_slot() {
         let env = crate::testutil::env();
         let out = PtyOpen.run(&env.ctx, json!({"command":"exit 0", "timeout_s":1}).as_object().unwrap()).await;
-        assert_eq!(out.status, ToolStatus::Ok);
+        assert_eq!(out.status, ToolStatus::Ok, "{out:?}");
         assert!(env.ctx.capabilities.ptys.ids().is_empty());
     }
 

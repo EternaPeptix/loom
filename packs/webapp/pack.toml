@@ -3,6 +3,9 @@ description = "Live bug-bounty and web AppSec assessments: multi-principal autho
 default_role = "lead"
 preamble = "harness.md"
 requires_restricted_network = true
+# The targets are the operator's live systems (bug-bounty scope): the monitor does not count this pack's restricted
+# network as a lab.
+live_targets = true
 command_guard = "offensive"
 target_concurrency = 2
 intercept = true

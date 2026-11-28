@@ -35,6 +35,10 @@ pub const META_ALSO_STORED: &str = "also_stored";
 pub const META_CWD: &str = "cwd";
 /// `ToolResult::meta` key: id of the background job a call turned into or started.
 pub const META_JOB: &str = "job";
+/// `ToolResult::meta` key on a box tool's result (`box_exec`, `box_get`, `box_reset`, a box-shell `bash`) when the
+/// mission's box has the proxy bridge (`[box] proxy_bridge`): the session whose proxy grant the bridge carries, so
+/// whose net decisions what a program in the box sends over HTTP(S) is recorded as.
+pub const META_BOX_BRIDGE: &str = "box_bridge";
 /// Output was admitted for a stored action; coverage awaits an actual actor callback.
 pub const META_DEFERRED_OBSERVATION: &str = "deferred_observation";
 /// `ToolResult::meta` key: which check of the harness refused the call, for the refusals a
@@ -170,6 +174,8 @@ pub struct Record {
     pub event: Event,
 }
 
+// `SessionStart` is the largest variant (the model's lineage, the target, the MCP listing), and there is one per log.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Event {
@@ -541,6 +547,10 @@ pub struct ModelRef {
     pub profile: String,
     pub model: String,
     pub context_window: u64,
+    /// What the monitor knew of the profile's family, alignment and recipient when this was recorded
+    /// (`lineage::resolve`). Absent in records written before the monitor's model policy (M1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lineage: Option<crate::lineage::Lineage>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -804,6 +814,8 @@ pub struct ToolCall {
     pub name: String,
     /// Parsed arguments (`null` when the model's JSON was invalid).
     pub args: Value,
+    /// The class of the tool the call runs: the executor's adaptation of `name` and `args` (`ferret_tools::run_class`;
+    /// `Pty_Exec` runs `pty_exec`, `shell` with an `apply_patch` argv writes). `State` when nothing would run.
     pub class: ToolClass,
 }
 
@@ -1062,6 +1074,16 @@ pub struct NetDecision {
     pub rule: String,
     #[serde(default)]
     pub resolved: Option<String>,
+    /// The server name the TLS ClientHello of a `CONNECT` tunnel carried, when the proxy read it and it was
+    /// not the destination's own name (another granted name, or the name of a refused tunnel). Absent from
+    /// older records and from every record whose tunnel named its own destination.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sni: Option<String>,
+    /// How long, in milliseconds, the connection waited for the egress noise governor before it was judged: the
+    /// client connected that long before the time this decision was recorded. Absent when it did not wait (the
+    /// governor is off, it was not paced, it was let through at once) and from older records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paced_ms: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1200,7 +1222,7 @@ mod tests {
                     pack: "core".into(),
                     role: "lead".into(),
                     termination: Termination::Explicit,
-                    model: ModelRef { profile: "local".into(), model: "m".into(), context_window: 1000 },
+                    model: ModelRef { profile: "local".into(), model: "m".into(), context_window: 1000, lineage: None },
                     reasoning_replay: ReasoningReplay::All,
                     system_prompt: "sys".into(),
                     tools: vec![ToolSpec {
@@ -1438,6 +1460,8 @@ mod tests {
                     allowed: false,
                     rule: "deny".into(),
                     resolved: Some("1.2.3.4".into()),
+                    sni: None,
+                    paced_ms: None,
                 }),
             ),
             ("cache_break", Event::CacheBreak { req_id: "r-1".into(), first_diff_message: 2, detail: "d".into() }),
@@ -1447,8 +1471,8 @@ mod tests {
             (
                 "model_switched",
                 Event::ModelSwitched(ModelSwitched {
-                    from: ModelRef { profile: "a".into(), model: "m1".into(), context_window: 1000 },
-                    to: ModelRef { profile: "b".into(), model: "m2".into(), context_window: 2000 },
+                    from: ModelRef { profile: "a".into(), model: "m1".into(), context_window: 1000, lineage: None },
+                    to: ModelRef { profile: "b".into(), model: "m2".into(), context_window: 2000, lineage: None },
                     reasoning_replay: ReasoningReplay::None,
                     reason: "operator".into(),
                 }),
@@ -1638,9 +1662,13 @@ mod tests {
         };
         let empty_start_json = serde_json::to_string(&record(Event::SessionStart(start.clone()))).unwrap();
         assert!(!empty_start_json.contains("creds_profiles"), "{empty_start_json}");
-        assert_eq!(serde_json::from_str::<Record>(&empty_start_json).unwrap().event, Event::SessionStart(start.clone()));
+        assert_eq!(
+            serde_json::from_str::<Record>(&empty_start_json).unwrap().event,
+            Event::SessionStart(start.clone())
+        );
 
-        let p1 = CredsRef { profile: "user_a".into(), summary: "user_a · 1 cookie · api.acme.test".into(), dropped: 0 };
+        let p1 =
+            CredsRef { profile: "user_a".into(), summary: "user_a · 1 cookie · api.acme.test".into(), dropped: 0 };
         let p2 = CredsRef { profile: "admin".into(), summary: "admin · 1 header · api.acme.test".into(), dropped: 0 };
         start.creds = Some(p1.clone());
         start.creds_profiles = vec![p1, p2];

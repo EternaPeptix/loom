@@ -210,7 +210,10 @@ fn in_uploads(parts: &[&OsStr]) -> bool {
 /// The sentence for a target that is, or leads into, the ferret home.
 fn home_note(text: &str, ferret_home: &Path) -> String {
     let what = if text.is_empty() { "The workspace root" } else { text };
-    format!("{what} is inside the ferret home ({}), which holds the daemon's keys: it is not shown.", ferret_home.display())
+    format!(
+        "{what} is inside the ferret home ({}), which holds the daemon's keys: it is not shown.",
+        ferret_home.display()
+    )
 }
 
 /// The target of `rel` inside `root` (canonical), resolved, with its normalised relative text.
@@ -600,7 +603,9 @@ mod tests {
         assert!(read_file_lines(&root, &lh(&root), "escape/pw", None, None)
             .unwrap_err()
             .contains("outside the workspace"));
-        for rel in [".ferret", ".ferret/secret", ".FERRET/secret", "into-ferret", "into-ferret/secret", "./.ferret/secret"] {
+        for rel in
+            [".ferret", ".ferret/secret", ".FERRET/secret", "into-ferret", "into-ferret/secret", "./.ferret/secret"]
+        {
             let e = list_files(&root, &lh(&root), rel).unwrap_err();
             assert!(e.contains(HARNESS_NOTE), "{rel}: {e}");
             let e = read_file_lines(&root, &lh(&root), rel, None, None).unwrap_err();

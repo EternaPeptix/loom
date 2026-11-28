@@ -109,9 +109,7 @@ impl MailClient {
         };
         if let Some(q) = query.map(str::trim).filter(|s| !s.is_empty()) {
             let ql = q.to_ascii_lowercase();
-            items.retain(|m| {
-                m.subject.to_ascii_lowercase().contains(&ql) || m.from.to_ascii_lowercase().contains(&ql)
-            });
+            items.retain(|m| m.subject.to_ascii_lowercase().contains(&ql) || m.from.to_ascii_lowercase().contains(&ql));
         }
         items.sort_by(|a, b| b.ts_secs.cmp(&a.ts_secs).then_with(|| b.id.cmp(&a.id)));
         items.truncate(cap);
@@ -171,11 +169,8 @@ impl MailClient {
     // -------------------------------------------------------------------------
 
     fn maildir_files(&self) -> Result<Vec<(String, PathBuf)>, String> {
-        let raw_dir = self
-            .cfg
-            .maildir_path
-            .as_deref()
-            .ok_or_else(|| "mail.maildir_path is not configured.".to_string())?;
+        let raw_dir =
+            self.cfg.maildir_path.as_deref().ok_or_else(|| "mail.maildir_path is not configured.".to_string())?;
         let root = expand_tilde(raw_dir);
         if !root.is_dir() {
             return Err(format!("Configured maildir `{}` does not exist or is not a directory.", root.display()));
@@ -226,9 +221,7 @@ impl MailClient {
     }
 
     fn maildir_read(&self, id: &str, now_secs: i64) -> Result<MailMessage, String> {
-        let rel = id
-            .strip_prefix("md:")
-            .ok_or_else(|| format!("No permitted email with id `{id}` was found."))?;
+        let rel = id.strip_prefix("md:").ok_or_else(|| format!("No permitted email with id `{id}` was found."))?;
         if rel.is_empty() || rel.contains("..") || rel.contains('\\') || rel.starts_with('/') {
             return Err(format!("No permitted email with id `{id}` was found."));
         }
@@ -253,10 +246,7 @@ impl MailClient {
 
     async fn imaps_connect(&self) -> Result<ImapConn<tokio_rustls::client::TlsStream<TcpStream>>, String> {
         let secret = read_password_file(
-            self.cfg
-                .password_file
-                .as_deref()
-                .ok_or_else(|| "mail.password_file is not configured.".to_string())?,
+            self.cfg.password_file.as_deref().ok_or_else(|| "mail.password_file is not configured.".to_string())?,
         )?;
         let tcp = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect((self.cfg.host.as_str(), self.cfg.port)))
             .await
@@ -632,16 +622,9 @@ pub fn auth_results_pass_for(headers: &[(String, String)], pinned_authserv_id: O
                 return true;
             }
         } else if method == "dkim" && result == "pass" {
-            let signing_domain = props
-                .iter()
-                .find(|(k, _)| k == "header.d")
-                .map(|(_, v)| v.as_str())
-                .or_else(|| {
-                    props
-                        .iter()
-                        .find(|(k, _)| k == "header.i")
-                        .and_then(|(_, v)| v.rsplit_once('@').map(|(_, d)| d))
-                });
+            let signing_domain = props.iter().find(|(k, _)| k == "header.d").map(|(_, v)| v.as_str()).or_else(|| {
+                props.iter().find(|(k, _)| k == "header.i").and_then(|(_, v)| v.rsplit_once('@').map(|(_, d)| d))
+            });
             if let Some(sd) = signing_domain {
                 if from_domains.iter().all(|fd| domains_aligned(sd, fd)) {
                     return true;
@@ -827,7 +810,8 @@ fn organizational_domain(raw: &str) -> Option<String> {
         "firebaseapp.com",
         "web.app",
     ];
-    let is_two_level_suffix = (tld.len() == 2 && CCTLD_SLDS.contains(&sld)) || MULTI_TENANT_2L.contains(&last2.as_str());
+    let is_two_level_suffix =
+        (tld.len() == 2 && CCTLD_SLDS.contains(&sld)) || MULTI_TENANT_2L.contains(&last2.as_str());
     if is_two_level_suffix {
         if labels.len() < 3 {
             return None;
@@ -1153,13 +1137,7 @@ fn now_unix_secs() -> i64 {
 }
 
 fn file_mtime_secs(path: &Path) -> Option<i64> {
-    std::fs::metadata(path)
-        .ok()?
-        .modified()
-        .ok()?
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .map(|d| d.as_secs() as i64)
+    std::fs::metadata(path).ok()?.modified().ok()?.duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs() as i64)
 }
 
 fn read_bounded_file(path: &Path, max_bytes: usize) -> std::io::Result<Vec<u8>> {
@@ -1304,7 +1282,8 @@ pub fn parse_imap_internaldate(raw: &str) -> Option<i64> {
     if dmy.len() != 3 {
         return None;
     }
-    let reassembled = format!("{} {} {} {} {}", dmy[0], dmy[1], dmy[2], parts[1], parts.get(2).copied().unwrap_or("+0000"));
+    let reassembled =
+        format!("{} {} {} {} {}", dmy[0], dmy[1], dmy[2], parts[1], parts.get(2).copied().unwrap_or("+0000"));
     parse_rfc2822_timestamp(&reassembled)
 }
 
@@ -1538,11 +1517,7 @@ mod tests {
             enabled: true,
             backend: MailBackend::Maildir,
             maildir_path: Some(dir.display().to_string()),
-            allow_senders: vec![
-                "*@hackerone.com".into(),
-                "*@bugcrowd.com".into(),
-                "*@*.target.example".into(),
-            ],
+            allow_senders: vec!["*@hackerone.com".into(), "*@bugcrowd.com".into(), "*@*.target.example".into()],
             allow_recipients: vec!["me+bb-*@gmail.com".into()],
             require_auth_pass: true,
             max_age_minutes: 0,
@@ -1627,10 +1602,7 @@ mod tests {
         // 4. Pinned authserv-id is strictly enforced when configured.
         let valid_dmarc = vec![
             ("From".into(), "no-reply@hackerone.com".into()),
-            (
-                "Authentication-Results".into(),
-                "mx.google.com; dmarc=pass (p=REJECT) header.from=hackerone.com".into(),
-            ),
+            ("Authentication-Results".into(), "mx.google.com; dmarc=pass (p=REJECT) header.from=hackerone.com".into()),
         ];
         assert!(auth_results_pass_for(&valid_dmarc, Some("mx.google.com")));
         assert!(auth_results_pass_for(&valid_dmarc, Some("MX.GOOGLE.COM.")));
@@ -1821,7 +1793,10 @@ mod tests {
                     r.get_mut().write_all(format!("{tag} OK LOGIN ok\r\n").as_bytes()).await.unwrap();
                 } else if rest.starts_with("EXAMINE ") {
                     saw_examine = true;
-                    r.get_mut().write_all(format!("* 1 EXISTS\r\n{tag} OK [READ-ONLY] EXAMINE ok\r\n").as_bytes()).await.unwrap();
+                    r.get_mut()
+                        .write_all(format!("* 1 EXISTS\r\n{tag} OK [READ-ONLY] EXAMINE ok\r\n").as_bytes())
+                        .await
+                        .unwrap();
                 } else if rest.starts_with("UID SEARCH ") {
                     r.get_mut().write_all(format!("* SEARCH 7\r\n{tag} OK SEARCH ok\r\n").as_bytes()).await.unwrap();
                 } else if rest.starts_with("UID FETCH 7 (UID INTERNALDATE") {

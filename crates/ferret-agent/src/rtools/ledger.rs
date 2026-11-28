@@ -1812,7 +1812,10 @@ mod tests {
             )
             .await;
         assert_eq!(r_bad_quote.status, ToolStatus::Error);
-        assert_eq!(r_bad_quote.meta.get(ferret_core::event::META_REFUSAL), Some(&json!(ferret_core::event::REFUSAL_QUOTE)));
+        assert_eq!(
+            r_bad_quote.meta.get(ferret_core::event::META_REFUSAL),
+            Some(&json!(ferret_core::event::REFUSAL_QUOTE))
+        );
         assert!(rig.shared.ledger().unwrap().claims.is_empty());
 
         let r_bad_prod = rig
@@ -1827,7 +1830,10 @@ mod tests {
             )
             .await;
         assert_eq!(r_bad_prod.status, ToolStatus::Error);
-        assert_eq!(r_bad_prod.meta.get(ferret_core::event::META_REFUSAL), Some(&json!(ferret_core::event::REFUSAL_QUOTE)));
+        assert_eq!(
+            r_bad_prod.meta.get(ferret_core::event::META_REFUSAL),
+            Some(&json!(ferret_core::event::REFUSAL_QUOTE))
+        );
         assert!(rig.shared.ledger().unwrap().claims.is_empty());
 
         // `status: "supported"` without `handle` leaves zero stray claims.

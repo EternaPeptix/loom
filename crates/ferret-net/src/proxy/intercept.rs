@@ -15,7 +15,7 @@
 //!
 //! Interception. For an allowed `CONNECT host:port` of a session whose grant has `intercept` and a CA, unless
 //! the host (`host` or `host:port`, `*`, `*.suffix`) is in `passthrough`, or the client sent bytes ahead of the
-//! `200`, or it does not start a TLS handshake within 3 s (a server-first protocol, or not TLS at all, which is
+//! `200`, or its first flight is not a TLS ClientHello (a server-first protocol, or not TLS at all, which is
 //! then tunneled as bytes), the proxy
 //! 1. connects to the destination with TLS (SNI = host, ALPN `http/1.1`; roots = Mozilla roots plus
 //!    [`Proxy::set_upstream_roots`]; no verification for a host in `upstream_insecure`, whose exchanges all
@@ -34,7 +34,9 @@
 //!    `error: "not HTTP/1.1: {up} bytes out, {down} bytes in, not stored"` is sent when it ends.
 //!
 //! The decision for the CONNECT (allow or refusal, address) is made and recorded once, before any of this, by
-//! the same path as an opaque tunnel.
+//! the same path as an opaque tunnel. So is the binding of the tunnel to its name (E4c): the first flight is read
+//! and judged before one byte goes upstream, and a ClientHello the binding refuses is never intercepted. A cut
+//! (E4a) or a shutdown ends an intercepted tunnel as it ends an opaque one; the exchange in flight is not captured.
 
 use super::*;
 use crate::capture::{CaptureGrant, CaptureSink, Captured, Transport};
@@ -264,7 +266,8 @@ impl Tap {
                 }
                 let head_len = clean_head.len() as u64;
                 clean_head.extend_from_slice(&clean_body);
-                let total = if resp_truncated { head_len.saturating_add(resp_body_total) } else { clean_head.len() as u64 };
+                let total =
+                    if resp_truncated { head_len.saturating_add(resp_body_total) } else { clean_head.len() as u64 };
                 (Some(clean_head), total)
             } else {
                 let clean = self.secrets.redact_bytes(&d.resp).into_owned();
@@ -306,56 +309,42 @@ impl Tap {
 pub(super) enum Ended {
     /// Served (or refused) and closed.
     Done,
-    /// The client does not speak TLS (or nothing): the streams, for an opaque tunnel.
-    Opaque(TcpStream, TcpStream),
+    /// The destination cannot be named to a TLS server: the client's first flight, for an opaque tunnel.
+    Opaque(Vec<u8>),
 }
 
-/// Intercepts an allowed tunnel whose `200` has been sent (see the module contract).
+/// The client's side of an intercepted tunnel: the first flight that the SNI binding read (its ClientHello), then
+/// the connection.
+type ClientIo<'a> = tokio::io::Join<tokio::io::Chain<&'a [u8], ReadHalf<'a>>, WriteHalf<'a>>;
+
+/// Intercepts an allowed tunnel whose `200` has been sent and whose first flight `hello`, a TLS ClientHello, the
+/// SNI binding has read and bound to the destination (see the module contract). The caller ends it on a shutdown
+/// or a cut; `cancel` (the shutdown) only ends a wait of the noise governor's pacing early.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run(
-    client: TcpStream,
-    up: TcpStream,
+    client: &mut TcpStream,
+    hello: Vec<u8>,
+    up: &mut TcpStream,
     cx: &Ctx<'_>,
     allowed: &Allowed,
     cap: &CaptureCfg,
     inject: Option<&Inject>,
     cancel: &CancellationToken,
-    proxy_cancel: &CancellationToken,
 ) -> Ended {
-    let Some(ca) = cap.ca.as_ref() else { return Ended::Opaque(client, up) };
-    let mut first = [0u8; 1];
-    let peek = tokio::select! {
-        r = tokio::time::timeout(FIRST_BYTES, client.peek(&mut first)) => r,
-        _ = cancel.cancelled() => {
-            drop((client, up));
-            cx.failed_after_allow(allowed, cancel_reason(proxy_cancel)).await;
-            return Ended::Done;
-        }
-    };
-    match peek {
-        Ok(Ok(1)) if first[0] == 0x16 => {}
-        Ok(Ok(0) | Err(_)) => return Ended::Done,
-        _ => return Ended::Opaque(client, up),
-    }
+    let Some(ca) = cap.ca.as_ref() else { return Ended::Opaque(hello) };
+    let Ok(name) = ServerName::try_from(cx.host.to_string()) else { return Ended::Opaque(hello) };
+    let (r, w) = client.split();
+    let client: ClientIo<'_> = tokio::io::join(hello.as_slice().chain(r), w);
     let limits = &cx.shared.limits;
     let insecure = cap.insecure(cx.host, cx.port);
     let config = lock(&cx.shared.upstream_tls).get(!insecure);
-    let (config, name) = match (config, ServerName::try_from(cx.host.to_string())) {
-        (Ok(c), Ok(n)) => (c, n),
-        (Err(why), _) => return refuse_client(client, cx, allowed, cap, &why, insecure).await,
-        (_, Err(_)) => return Ended::Opaque(client, up),
+    let config = match config {
+        Ok(c) => c,
+        Err(why) => return refuse_client(client, cx, allowed, cap, &why, insecure).await,
     };
 
     // The destination first: a certificate that does not verify refuses the client before it sends anything.
-    let upstream = tokio::select! {
-        r = tokio::time::timeout(CONNECT_TIMEOUT, TlsConnector::from(config).connect(name, up)) => Some(r),
-        _ = cancel.cancelled() => None,
-    };
-    let Some(upstream) = upstream else {
-        drop(client);
-        cx.failed_after_allow(allowed, cancel_reason(proxy_cancel)).await;
-        return Ended::Done;
-    };
+    let upstream = tokio::time::timeout(CONNECT_TIMEOUT, TlsConnector::from(config).connect(name, up)).await;
     let up_tls = match upstream {
         Ok(Ok(s)) => s,
         other => {
@@ -375,34 +364,20 @@ pub(super) async fn run(
             return Ended::Done;
         }
     };
-    let accepted = tokio::select! {
-        r = tokio::time::timeout(limits.head_timeout, TlsAcceptor::from(leaf).accept(client)) => Some(r),
-        _ = cancel.cancelled() => None,
-    };
-    let Some(accepted) = accepted else {
-        drop(up_tls);
-        cx.failed_after_allow(allowed, cancel_reason(proxy_cancel)).await;
-        return Ended::Done;
-    };
+    let accepted = tokio::time::timeout(limits.head_timeout, TlsAcceptor::from(leaf).accept(client)).await;
     let Ok(Ok(client_tls)) = accepted else {
         let rule = format!("client refused the interception certificate for {}", cx.host);
         cx.record_best_effort(true, rule, Some(allowed.ip)).await;
         return Ended::Done;
     };
-    let cancelled = tokio::select! {
-        _ = serve(client_tls, up_tls, cx, cap, inject, insecure, cancel) => false,
-        _ = cancel.cancelled() => true,
-    };
-    if cancelled {
-        cx.failed_after_allow(allowed, cancel_reason(proxy_cancel)).await;
-    }
+    serve(client_tls, up_tls, cx, cap, inject, insecure, cancel).await;
     Ended::Done
 }
 
 /// The destination cannot be spoken to as a TLS client: record the decision and the capture with `why`, and
 /// end the client's handshake with an alert.
 async fn refuse_client(
-    client: TcpStream,
+    client: ClientIo<'_>,
     cx: &Ctx<'_>,
     allowed: &Allowed,
     cap: &CaptureCfg,
@@ -419,8 +394,8 @@ async fn refuse_client(
     Ended::Done
 }
 
-type Cs = tokio_rustls::server::TlsStream<TcpStream>;
-type Us = tokio_rustls::client::TlsStream<TcpStream>;
+type Cs<'a> = tokio_rustls::server::TlsStream<ClientIo<'a>>;
+type Us<'a> = tokio_rustls::client::TlsStream<&'a mut TcpStream>;
 
 /// What reading a request head gave.
 enum Req {
@@ -484,8 +459,8 @@ async fn bad_request_tls<W: AsyncWrite + Unpin>(w: &mut W, why: &str, idle: Dura
 
 /// The decrypted stream of an intercepted tunnel: requests one by one, then closed.
 async fn serve(
-    client: Cs,
-    up: Us,
+    client: Cs<'_>,
+    up: Us<'_>,
     cx: &Ctx<'_>,
     cap: &CaptureCfg,
     inject: Option<&Inject>,
@@ -517,7 +492,8 @@ async fn serve(
             return;
         }
         // S3, S6: decided again for every request of the connection, on the tunnel's destination.
-        let mut raw = match inject.filter(|i| i.applies_to(cx.host)).and_then(|i| apply_head(i.items(), cx.host, &raw)) {
+        let mut raw = match inject.filter(|i| i.applies_to(cx.host)).and_then(|i| apply_head(i.items(), cx.host, &raw))
+        {
             Some(injected) => injected,
             None => raw,
         };
@@ -563,11 +539,8 @@ async fn serve(
             rewrites.max_secret_len(),
         );
         let resp_rewrite = rewrites.has_response_rules().then(|| {
-            let req_headers = try_parse(&raw)
-                .ok()
-                .flatten()
-                .map(|(h, _)| h.headers)
-                .unwrap_or_else(|| head.headers.clone());
+            let req_headers =
+                try_parse(&raw).ok().flatten().map(|(h, _)| h.headers).unwrap_or_else(|| head.headers.clone());
             RespRewriteCtx {
                 rewrites: rewrites.clone(),
                 host: cx.host.to_string(),
@@ -593,7 +566,10 @@ async fn serve(
             resp_rewrite.as_ref(),
         );
         let out = x.await;
-        cap.send(cx, tap.finish(cx.host, Transport::Intercepted, &req_method, &req_target, out.error.clone(), unverified));
+        cap.send(
+            cx,
+            tap.finish(cx.host, Transport::Intercepted, &req_method, &req_target, out.error.clone(), unverified),
+        );
         if out.upgraded {
             let _ = pump(&mut cr, &mut cw, &mut ur, &mut uw, idle).await;
             return;
@@ -933,7 +909,7 @@ where
                                     }
                                     Ok(Ok(_) | Err(_)) => {
                                         return Err(
-                                            "the destination's connection ended in the middle of the response".into(),
+                                            "the destination's connection ended in the middle of the response".into()
                                         )
                                     }
                                     Err(_) => {
@@ -967,12 +943,8 @@ where
                             );
                             let (wire_head, cap_head, final_code, final_ra) = match rw {
                                 Some(rw) => {
-                                    let len_ovr = body_len_for_status_change(
-                                        head_request,
-                                        h.code,
-                                        rw.status,
-                                        &rw.wire_headers,
-                                    );
+                                    let len_ovr =
+                                        body_len_for_status_change(head_request, h.code, rw.status, &rw.wire_headers);
                                     let wh = render_response_head(
                                         h.version,
                                         h.code,
@@ -1139,8 +1111,7 @@ where
                     );
                     let (wire_head, cap_head, final_code, final_ra) = match rw {
                         Some(rw) => {
-                            let len_ovr =
-                                body_len_for_status_change(head_request, h.code, rw.status, &rw.wire_headers);
+                            let len_ovr = body_len_for_status_change(head_request, h.code, rw.status, &rw.wire_headers);
                             let wh = render_response_head(
                                 h.version,
                                 h.code,

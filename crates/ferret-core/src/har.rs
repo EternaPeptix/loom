@@ -226,7 +226,12 @@ fn parse_rfc3339_ms(raw: &str) -> Result<u64, String> {
     let hh: i64 = s[11..13].parse().map_err(|_| format!("invalid startedDateTime `{raw}`"))?;
     let mm: i64 = s[14..16].parse().map_err(|_| format!("invalid startedDateTime `{raw}`"))?;
     let ss: i64 = s[17..19].parse().map_err(|_| format!("invalid startedDateTime `{raw}`"))?;
-    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || !(0..=23).contains(&hh) || !(0..=59).contains(&mm) || !(0..=60).contains(&ss) {
+    if !(1..=12).contains(&m)
+        || !(1..=31).contains(&d)
+        || !(0..=23).contains(&hh)
+        || !(0..=59).contains(&mm)
+        || !(0..=60).contains(&ss)
+    {
         return Err(format!("invalid startedDateTime `{raw}`"));
     }
     let mut rest = &s[19..];
@@ -262,13 +267,7 @@ fn parse_rfc3339_ms(raw: &str) -> Result<u64, String> {
     Ok(u64::try_from(total_ms).unwrap_or(0))
 }
 
-fn build_har_entry(
-    ts_ms: u64,
-    ex: &Exchange,
-    req_raw: &[u8],
-    resp_raw: &[u8],
-    opts: &HarExportOptions,
-) -> Value {
+fn build_har_entry(ts_ms: u64, ex: &Exchange, req_raw: &[u8], resp_raw: &[u8], opts: &HarExportOptions) -> Value {
     let default_port = (ex.scheme == "http" && ex.port == 80) || (ex.scheme == "https" && ex.port == 443);
     let authority = if default_port { ex.host.clone() } else { format!("{}:{}", ex.host, ex.port) };
     let path_query = if ex.target.starts_with('/') { ex.target.clone() } else { format!("/{}", ex.target) };
@@ -426,11 +425,8 @@ fn parse_wire_request(raw: &[u8]) -> (String, Vec<(String, String)>, usize, &[u8
             Some(0) => "HTTP/1.0",
             _ => "HTTP/1.1",
         };
-        let headers = req
-            .headers
-            .iter()
-            .map(|h| (h.name.to_string(), String::from_utf8_lossy(h.value).to_string()))
-            .collect();
+        let headers =
+            req.headers.iter().map(|h| (h.name.to_string(), String::from_utf8_lossy(h.value).to_string())).collect();
         return (ver.into(), headers, n, &raw[n..]);
     }
     ("HTTP/1.1".into(), Vec::new(), 0, raw)
@@ -451,11 +447,8 @@ fn parse_wire_response(raw: &[u8]) -> WireResponse<'_> {
         };
         let code = resp.code.map(i64::from).unwrap_or(0);
         let reason = resp.reason.unwrap_or("").to_string();
-        let headers = resp
-            .headers
-            .iter()
-            .map(|h| (h.name.to_string(), String::from_utf8_lossy(h.value).to_string()))
-            .collect();
+        let headers =
+            resp.headers.iter().map(|h| (h.name.to_string(), String::from_utf8_lossy(h.value).to_string())).collect();
         return (ver.into(), code, reason, headers, n, &raw[n..]);
     }
     ("HTTP/1.1".into(), 0, String::new(), Vec::new(), 0, raw)
@@ -600,8 +593,26 @@ struct RawHarContent {
 
 fn valid_token(s: &str) -> bool {
     !s.is_empty()
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'))
+        && s.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
 }
 
 fn no_crlf_nul(s: &str) -> bool {
@@ -610,9 +621,7 @@ fn no_crlf_nul(s: &str) -> bool {
 
 fn valid_exchange_id(id: &str) -> bool {
     let s = id.trim();
-    s.starts_with("ex-")
-        && s.len() <= 128
-        && s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    s.starts_with("ex-") && s.len() <= 128 && s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
 }
 
 /// Parse a HAR 1.2 JSON document, store wire messages into `blobs`, and return new exchanges
@@ -751,11 +760,8 @@ fn parse_har_entry(entry: RawHarEntry) -> Result<ParsedHarEntry, String> {
     if scheme != "http" && scheme != "https" {
         return Err(format!("unsupported URL scheme `{scheme}`"));
     }
-    let host = url
-        .host_str()
-        .ok_or_else(|| "request URL has no host".to_string())?
-        .trim_end_matches('.')
-        .to_ascii_lowercase();
+    let host =
+        url.host_str().ok_or_else(|| "request URL has no host".to_string())?.trim_end_matches('.').to_ascii_lowercase();
     let port = url.port_or_known_default().unwrap_or(if scheme == "https" { 443 } else { 80 });
     let _ = url.set_username("");
     let _ = url.set_password(None);
@@ -982,8 +988,20 @@ mod tests {
     fn har_import_rejects_bad_version_trailing_json_and_caps() {
         let dir = tempfile::tempdir().unwrap();
         let blobs = BlobStore::open(dir.path()).unwrap();
-        assert!(import_har(b"{\"log\":{\"version\":\"1.1\",\"entries\":[]}}", &blobs, &HashSet::new(), &HarImportOptions::default()).is_err());
-        assert!(import_har(b"{\"log\":{\"version\":\"1.2\",\"entries\":[]}} trailing", &blobs, &HashSet::new(), &HarImportOptions::default()).is_err());
+        assert!(import_har(
+            b"{\"log\":{\"version\":\"1.1\",\"entries\":[]}}",
+            &blobs,
+            &HashSet::new(),
+            &HarImportOptions::default()
+        )
+        .is_err());
+        assert!(import_har(
+            b"{\"log\":{\"version\":\"1.2\",\"entries\":[]}} trailing",
+            &blobs,
+            &HashSet::new(),
+            &HarImportOptions::default()
+        )
+        .is_err());
     }
 
     #[test]
@@ -1080,14 +1098,11 @@ mod tests {
         assert_eq!(entry["request"]["cookies"][0]["value"], "[redacted]");
         assert_eq!(entry["response"]["cookies"][0]["name"], "session");
         assert_eq!(entry["response"]["cookies"][0]["value"], "[redacted]");
-        let set_cookie = entry["response"]["headers"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|h| h["name"] == "Set-Cookie")
-            .unwrap()["value"]
-            .as_str()
-            .unwrap();
+        let set_cookie =
+            entry["response"]["headers"].as_array().unwrap().iter().find(|h| h["name"] == "Set-Cookie").unwrap()
+                ["value"]
+                .as_str()
+                .unwrap();
         assert_eq!(set_cookie, "session=[redacted]; HttpOnly; Secure");
 
         // Explicit opt-out (`sanitize = false`) preserves raw values for authorized debugging.
@@ -1101,6 +1116,10 @@ mod tests {
         .unwrap();
         assert_eq!(har_raw["log"]["_sanitized"], false);
         let raw_serialized = serde_json::to_string(&har_raw).unwrap();
-        assert!(raw_serialized.contains(jwt) && raw_serialized.contains("header-api-key-val") && raw_serialized.contains(extra));
+        assert!(
+            raw_serialized.contains(jwt)
+                && raw_serialized.contains("header-api-key-val")
+                && raw_serialized.contains(extra)
+        );
     }
 }

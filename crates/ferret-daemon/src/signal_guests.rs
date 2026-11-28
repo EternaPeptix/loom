@@ -208,15 +208,8 @@ impl Drop for InFlightGuard {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SenderClassification {
-    Blocked {
-        id: String,
-    },
-    Approved {
-        id: String,
-        address: String,
-        display_name: String,
-        is_static: bool,
-    },
+    Blocked { id: String },
+    Approved { id: String, address: String, display_name: String, is_static: bool },
     Unknown,
 }
 
@@ -402,11 +395,8 @@ impl GuestStore {
             let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
 
             // 1. Blocked ALWAYS takes precedence over static or dynamic approval.
-            if let Some(rec) = g
-                .data
-                .guests
-                .iter()
-                .find(|r| r.status == GuestStatus::Blocked && r.matches_any(normalized_candidates))
+            if let Some(rec) =
+                g.data.guests.iter().find(|r| r.status == GuestStatus::Blocked && r.matches_any(normalized_candidates))
             {
                 return SenderClassification::Blocked { id: rec.id.clone() };
             }
@@ -414,12 +404,8 @@ impl GuestStore {
             let is_static = is_static_allowed_candidates(cfg, normalized_candidates);
             let existing_idx = g.data.guests.iter().position(|r| r.matches_any(normalized_candidates));
 
-            let clean_uuid = source_uuid
-                .map(normalize_guest_id)
-                .filter(|s| !s.is_empty());
-            let clean_name = source_name
-                .map(|s| sanitize_inline(s, GUEST_LABEL_MAX_CHARS))
-                .filter(|s| !s.is_empty());
+            let clean_uuid = source_uuid.map(normalize_guest_id).filter(|s| !s.is_empty());
+            let clean_name = source_name.map(|s| sanitize_inline(s, GUEST_LABEL_MAX_CHARS)).filter(|s| !s.is_empty());
 
             if let Some(idx) = existing_idx {
                 let rec = &mut g.data.guests[idx];
@@ -501,9 +487,7 @@ impl GuestStore {
         let cooldown_ms = cfg.guests.unknown_cooldown_hours.saturating_mul(3_600_000);
         let preview = sanitize_inline(raw_preview, GUEST_PREVIEW_MAX_CHARS);
         let clean_uuid = source_uuid.map(normalize_guest_id).filter(|s| !s.is_empty());
-        let clean_name = source_name
-            .map(|s| sanitize_inline(s, GUEST_LABEL_MAX_CHARS))
-            .filter(|s| !s.is_empty());
+        let clean_name = source_name.map(|s| sanitize_inline(s, GUEST_LABEL_MAX_CHARS)).filter(|s| !s.is_empty());
 
         let outcome = {
             let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -511,10 +495,7 @@ impl GuestStore {
                 if rec.status == GuestStatus::Blocked {
                     return UnknownContactOutcome::CooldownActive;
                 }
-                if rec
-                    .last_unknown_notice_ms
-                    .is_some_and(|last| now_ms.saturating_sub(last) < cooldown_ms)
-                {
+                if rec.last_unknown_notice_ms.is_some_and(|last| now_ms.saturating_sub(last) < cooldown_ms) {
                     return UnknownContactOutcome::CooldownActive;
                 }
                 let is_repeat = rec.last_unknown_notice_ms.is_some();
@@ -597,13 +578,7 @@ impl GuestStore {
         q.push_back(now_ms);
         g.in_flight.insert(guest_id.to_string());
         let gen = *g.history_generation.get(guest_id).unwrap_or(&0);
-        let history = g
-            .data
-            .guests
-            .iter()
-            .find(|r| r.id == guest_id)
-            .map(|r| r.history.clone())
-            .unwrap_or_default();
+        let history = g.data.guests.iter().find(|r| r.id == guest_id).map(|r| r.history.clone()).unwrap_or_default();
         Ok((InFlightGuard { store: self.clone(), guest_id: guest_id.to_string() }, gen, history))
     }
 
@@ -661,11 +636,7 @@ impl GuestStore {
     /// Check whether a guest ID is currently approved (used before sending async replies/notes).
     pub fn is_approved_id(&self, cfg: &SignalCfg, guest_id: &str) -> bool {
         let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        g.data
-            .guests
-            .iter()
-            .find(|r| r.id == guest_id)
-            .is_some_and(|r| r.is_effectively_approved(cfg))
+        g.data.guests.iter().find(|r| r.id == guest_id).is_some_and(|r| r.is_effectively_approved(cfg))
     }
 
     /// Clear conversation history for one guest by ID (guest `/reset` or `/clear`).
@@ -898,9 +869,7 @@ impl GuestStore {
         allow_new_address: bool,
         now_ms: u64,
     ) -> Result<ApprovedOutcome, String> {
-        let clean_nick = nickname
-            .map(|s| sanitize_inline(s, GUEST_LABEL_MAX_CHARS))
-            .filter(|s| !s.is_empty());
+        let clean_nick = nickname.map(|s| sanitize_inline(s, GUEST_LABEL_MAX_CHARS)).filter(|s| !s.is_empty());
 
         let outcome = {
             let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -908,7 +877,10 @@ impl GuestStore {
                 ResolvedTarget::RecordIdx(idx) => {
                     let rec = &mut g.data.guests[idx];
                     if is_operator_address(cfg, &rec.address, rec.uuid.as_deref()) {
-                        return Err(format!("`{}` is already an authorized operator in signal.allow_from.", rec.address));
+                        return Err(format!(
+                            "`{}` is already an authorized operator in signal.allow_from.",
+                            rec.address
+                        ));
                     }
                     let already = rec.status == GuestStatus::Approved && rec.owner_approved;
                     rec.status = GuestStatus::Approved;
@@ -1014,12 +986,9 @@ impl GuestStore {
                         still_static,
                     }
                 }
-                ResolvedTarget::StaticAddress(addr) => RevokedOutcome {
-                    id: None,
-                    address: addr.clone(),
-                    display_name: addr,
-                    still_static: true,
-                },
+                ResolvedTarget::StaticAddress(addr) => {
+                    RevokedOutcome { id: None, address: addr.clone(), display_name: addr, still_static: true }
+                }
                 ResolvedTarget::NotFound => {
                     return Err(format!("No guest matches `{token}`. Send /guests to list contacts."));
                 }
@@ -1167,12 +1136,9 @@ impl GuestStore {
                         removed_turns: removed,
                     }
                 }
-                ResolvedTarget::StaticAddress(addr) => ClearedOutcome {
-                    id: None,
-                    address: addr.clone(),
-                    display_name: addr,
-                    removed_turns: 0,
-                },
+                ResolvedTarget::StaticAddress(addr) => {
+                    ClearedOutcome { id: None, address: addr.clone(), display_name: addr, removed_turns: 0 }
+                }
                 ResolvedTarget::NotFound => {
                     return Err(format!("No guest matches `{token}`. Send /guests to list contacts."));
                 }
@@ -1616,11 +1582,8 @@ pub fn format_new_contact_alert(
         None => address.to_string(),
     };
     let clean_preview = sanitize_inline(preview, GUEST_PREVIEW_MAX_CHARS);
-    let preview_line = if clean_preview.is_empty() {
-        "(empty message)".to_string()
-    } else {
-        format!("\"{clean_preview}\"")
-    };
+    let preview_line =
+        if clean_preview.is_empty() { "(empty message)".to_string() } else { format!("\"{clean_preview}\"") };
     let body = format!(
         "[Ferret · NEW CONTACT · {guest_id}] {who}\n\
          [Untrusted external contact]\n\
@@ -1647,11 +1610,7 @@ pub fn format_triaged_guest_note_alert(
     let mut out = format!("[Ferret · GUEST NOTE · {guest_id} · {note_id} from {label}]\n{clean_note}");
 
     if let Some(t) = triage {
-        let suggested_reply = t
-            .suggested_reply
-            .as_deref()
-            .map(|r| sanitize_inline(r, 240))
-            .filter(|s| !s.is_empty());
+        let suggested_reply = t.suggested_reply.as_deref().map(|r| sanitize_inline(r, 240)).filter(|s| !s.is_empty());
         let is_actionable = t.actionable && !t.proposed_task.trim().is_empty();
 
         if is_actionable {
@@ -1831,7 +1790,8 @@ mod tests {
         assert!(help.contains("/help"));
         assert!(help.contains("/reset"));
         assert!(help.contains("/note"));
-        for forbidden in ["/inbox", "/status", "/scope", "/stop", "/resume", "/guests", "/guest ", "/rule", "/release"] {
+        for forbidden in ["/inbox", "/status", "/scope", "/stop", "/resume", "/guests", "/guest ", "/rule", "/release"]
+        {
             assert!(!help.contains(forbidden), "guest help leaked operator command {forbidden}: {help}");
         }
     }
@@ -1851,7 +1811,14 @@ mod tests {
         // Unknown sender first contact -> Notify + persisted 0600.
         let cands = vec!["+15550155".to_string(), "00000000-0000-4000-8000-000000000001".to_string()];
         assert_eq!(
-            store.classify_sender(&cfg, &cands, "+15550155", Some("00000000-0000-4000-8000-000000000001"), Some("Pat"), 1_000),
+            store.classify_sender(
+                &cfg,
+                &cands,
+                "+15550155",
+                Some("00000000-0000-4000-8000-000000000001"),
+                Some("Pat"),
+                1_000
+            ),
             SenderClassification::Unknown
         );
         let first = store.record_unknown_contact(
@@ -1992,7 +1959,8 @@ mod tests {
         drop(guard3);
 
         // Stale generation guard: if /reset happens mid-flight, commit does NOT resurrect old history.
-        let (g_reset, gen_before_reset, _) = store.try_begin_chat_turn(&app.id, 10, 20_000 + GUEST_CHAT_WINDOW_MS).unwrap();
+        let (g_reset, gen_before_reset, _) =
+            store.try_begin_chat_turn(&app.id, 10, 20_000 + GUEST_CHAT_WINDOW_MS).unwrap();
         store.reset_guest_history(&app.id, 20_100 + GUEST_CHAT_WINDOW_MS);
         let outcome = store.commit_chat_turn(
             &cfg,
@@ -2052,7 +2020,14 @@ mod tests {
             suggested_reply: Some("Sounds great, see you Thursday at 5!".into()),
         };
 
-        let a1 = store.record_note_action("g-1", "+15550155", "Alex\u{202e}", "Dinner Thu at 5?", Some(triage.clone()), 1_000);
+        let a1 = store.record_note_action(
+            "g-1",
+            "+15550155",
+            "Alex\u{202e}",
+            "Dinner Thu at 5?",
+            Some(triage.clone()),
+            1_000,
+        );
         assert_eq!(a1.note_id, "n-1");
         assert_eq!(a1.guest_name, "Alex");
         assert_eq!(a1.executed_session, None);
@@ -2084,7 +2059,8 @@ mod tests {
 
         // Bounded ring keeps at most MAX_NOTE_ACTIONS newest entries with monotonic IDs.
         for i in 0..(MAX_NOTE_ACTIONS + 10) {
-            let rec = reloaded.record_note_action("g-1", "+15550155", "Alex", &format!("note {i}"), None, 3_000 + i as u64);
+            let rec =
+                reloaded.record_note_action("g-1", "+15550155", "Alex", &format!("note {i}"), None, 3_000 + i as u64);
             assert!(rec.note_id.starts_with("n-"));
         }
         assert!(reloaded.get_note_action("n-1").is_none(), "oldest note must be evicted past MAX_NOTE_ACTIONS");
@@ -2114,7 +2090,8 @@ mod tests {
 
         // 2. Actionable without suggested reply.
         let no_reply = NoteTriage { suggested_reply: None, ..full.clone() };
-        let msg2 = format_triaged_guest_note_alert("g-1", "n-8", "Alex", "Remind me to buy milk", Some(&no_reply), 3500);
+        let msg2 =
+            format_triaged_guest_note_alert("g-1", "n-8", "Alex", "Remind me to buy milk", Some(&no_reply), 3500);
         assert!(msg2.starts_with("[Ferret · GUEST NOTE · g-1 · n-8 from Alex]\n"));
         assert!(msg2.contains("\"do\""), "{msg2}");
         assert!(!msg2.contains("\"do + reply\""), "{msg2}");

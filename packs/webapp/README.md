@@ -19,6 +19,7 @@ ferret run --pack webapp --target <target> -w <workspace> "Assess authorized web
 ```
 
 - **Restricted network & MITM capture:** `requires_restricted_network = true` and `intercept = true` are enabled by default; sessions refuse to start under `[network] mode = "open"`.
+- **Live targets:** `live_targets = true`: the monitor does not count this pack's restricted network as a lab, so a mission with a named target or an unmarked grant is a real-target mission (keep-going needs `--real-targets`; see `docs/MONITOR.md`). Its `[monitor.recipients]` consent needs a `webapp` line of its own.
 - **Multi-principal authz:** Mount named credential profiles (`user_a`, `user_b`, `admin`, etc.) so `http_authz_matrix`, `http_send`, and `http_repeat` inject credentials via proxy without exposing raw secrets to model context.
 - **OAST & Mail (optional):** Configure `[oast]` for blind SSRF/XXE/XSS/SSTI callback verification and `[mail]` for read-only OTP/activation link verification via `inbox_read`.
 - **Container bridge (optional):** Enable `[box] proxy_bridge = true` so `box_exec` tools inherit the mission egress proxy and MITM CA bundle.

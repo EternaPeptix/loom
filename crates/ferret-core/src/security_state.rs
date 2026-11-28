@@ -389,11 +389,7 @@ impl CvssBreakdown {
         );
 
         let iss = 1.0 - (1.0 - c) * (1.0 - i) * (1.0 - a);
-        let impact = if scope_changed {
-            7.52 * (iss - 0.029) - 3.25 * (iss - 0.02).powi(15)
-        } else {
-            6.42 * iss
-        };
+        let impact = if scope_changed { 7.52 * (iss - 0.029) - 3.25 * (iss - 0.02).powi(15) } else { 6.42 * iss };
         let tenths = if impact <= 0.0 {
             0u8
         } else {
@@ -684,22 +680,18 @@ pub fn finding_fingerprint_from_parts(
     };
 
     // Axis 3: normalized endpoint path + sorted query param names, else primary code location.
-    let raw_ep = endpoint
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .or_else(|| {
-            url::Url::parse(target.trim()).ok().and_then(|u| {
-                let p = u.path();
-                if p.is_empty() || p == "/" {
-                    None
-                } else if let Some(q) = u.query() {
-                    Some(format!("{p}?{q}"))
-                } else {
-                    Some(p.to_string())
-                }
-            })
-        });
+    let raw_ep = endpoint.map(str::trim).filter(|s| !s.is_empty()).map(|s| s.to_string()).or_else(|| {
+        url::Url::parse(target.trim()).ok().and_then(|u| {
+            let p = u.path();
+            if p.is_empty() || p == "/" {
+                None
+            } else if let Some(q) = u.query() {
+                Some(format!("{p}?{q}"))
+            } else {
+                Some(p.to_string())
+            }
+        })
+    });
     let axis3 = if let Some(ep) = raw_ep {
         let stripped = if let Ok(u) = url::Url::parse(&ep) {
             match u.query() {
@@ -1806,7 +1798,16 @@ impl SecurityState {
                     CoverageDisposition::Untested => {}
                 }
             }
-            SecurityOp::CoverageRecord { surface, risk_area, outcome, control, location, reason, evidence: ev, asset: asset_id } => {
+            SecurityOp::CoverageRecord {
+                surface,
+                risk_area,
+                outcome,
+                control,
+                location,
+                reason,
+                evidence: ev,
+                asset: asset_id,
+            } => {
                 text(surface, "coverage surface")?;
                 text(risk_area, "coverage risk area")?;
                 let id = surface_coverage_id(surface, risk_area);
@@ -1917,7 +1918,9 @@ impl SecurityState {
                 }
                 if let Some(cid) = f.claim.as_deref() {
                     if !ledger.claims.iter().any(|c| c.id == cid) {
-                        return Err(format!("Claim `{cid}` does not exist; record the claim before linking a finding."));
+                        return Err(format!(
+                            "Claim `{cid}` does not exist; record the claim before linking a finding."
+                        ));
                     }
                 }
                 let id = f.id();
@@ -1978,11 +1981,8 @@ impl SecurityState {
                     prose(v, "confidence_rationale", 4096)?;
                 }
                 let next_conf = u.confidence.unwrap_or(existing.confidence);
-                let next_rationale =
-                    u.confidence_rationale.as_deref().or(existing.confidence_rationale.as_deref());
-                if next_conf != FindingConfidence::High
-                    && !next_rationale.is_some_and(|s| !s.trim().is_empty())
-                {
+                let next_rationale = u.confidence_rationale.as_deref().or(existing.confidence_rationale.as_deref());
+                if next_conf != FindingConfidence::High && !next_rationale.is_some_and(|s| !s.trim().is_empty()) {
                     return Err(
                         "Field `confidence_rationale` is required when `confidence` is not `high`: name the specific gap."
                             .into(),
@@ -2030,8 +2030,7 @@ impl SecurityState {
                     prose(v, "fix_verification", 8192)?;
                 }
                 if let Some(locs) = &u.code_locations {
-                    let effective_verif =
-                        u.fix_verification.as_deref().or(existing.fix_verification.as_deref());
+                    let effective_verif = u.fix_verification.as_deref().or(existing.fix_verification.as_deref());
                     validate_code_locations(locs, effective_verif)?;
                 }
                 if u.http_exchanges.len() > 64 {
@@ -3125,7 +3124,10 @@ mod tests {
             .validate(&LedgerOp::Security(SecurityOp::FindingRecord { finding: Box::new(f.clone()) }), false)
             .unwrap_err()
             .contains("fix_verification"));
-        f.fix_verification = Some("1. Closure: escape encodes <>\"'&. 2. Checked sibling templates. 3. Plain queries preserved. 4. Reasoned.".into());
+        f.fix_verification = Some(
+            "1. Closure: escape encodes <>\"'&. 2. Checked sibling templates. 3. Plain queries preserved. 4. Reasoned."
+                .into(),
+        );
 
         // Unsafe path traversal in code_locations is refused
         let mut bad_path = f.clone();

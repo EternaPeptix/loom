@@ -1127,6 +1127,18 @@ export function diskWarning(disk) {
   return `Low disk space: ${gib(free)} free of ${gib(disk.total_bytes)}. Sessions will fail when the disk fills; run "ferret gc" or free space.`;
 }
 
+/**
+ * The banner for the sandbox self-probe's egress state (`status.egress`): a sentence when egress is unbounded (a
+ * command may reach the network outside the egress proxy), else null (bounded, not probed yet, or an older daemon).
+ */
+export function egressWarning(egress) {
+  if (!egress || egress.level !== "unbounded") return null;
+  const reasons = Array.isArray(egress.reasons) ? egress.reasons : [];
+  const first = reasons.length ? reasons[0] : "see the self-probe in `ferret status`";
+  const more = reasons.length > 1 ? ` (+${reasons.length - 1} more)` : "";
+  return `Egress is unbounded: ${first}${more} Commands may reach the network outside the egress proxy, and keep-going cannot be turned on.`;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Inbox
 
@@ -1278,7 +1290,10 @@ export function formatScopeRevoke(receipt) {
   if (!receipt || typeof receipt !== "object") return "Scope revoked.";
   const hosts = Array.isArray(receipt.revoked) && receipt.revoked.length ? receipt.revoked.join(", ") : "scope";
   const cut = Number(receipt.connections_cut) || 0;
-  return `Revoked ${hosts} (${count(cut, "connection")} cut).`;
+  const carved = Array.isArray(receipt.not_granted) && receipt.not_granted.length
+    ? ` Not granted by itself, refused from now on: ${receipt.not_granted.join(", ")}.`
+    : "";
+  return `Revoked ${hosts} (${count(cut, "connection")} cut).${carved}`;
 }
 
 /** Request payload for `POST /api/panic`. */
@@ -1294,7 +1309,13 @@ export function formatPanicReport(report) {
   const stopped = Array.isArray(report.sessions_stopped) ? report.sessions_stopped.length : 0;
   const boxes = Number(report.boxes_torn_down) || 0;
   const rewrites = Number(report.rewrites_disabled) || 0;
-  return `Panic stop complete: ${count(cut, "connection")} cut · ${count(stopped, "session")} stopped · ${count(boxes, "box", "boxes")} torn down · ${count(rewrites, "rewrite rule")} disabled.`;
+  // What the census stopped under the sessions' sandboxes (processes that left their group), when there was any.
+  const killed = Number(report.processes_killed) || 0;
+  const left = Number(report.processes_left) || 0;
+  const census = killed || left
+    ? ` · ${count(killed, "process", "processes")} left under the sandboxes stopped${left ? ` (${left} could not be)` : ""}`
+    : "";
+  return `Panic stop complete: ${count(cut, "connection")} cut · ${count(stopped, "session")} stopped · ${count(boxes, "box", "boxes")} torn down · ${count(rewrites, "rewrite rule")} disabled${census}.`;
 }
 
 /** The choice that closes a blocked session without the goal established. */

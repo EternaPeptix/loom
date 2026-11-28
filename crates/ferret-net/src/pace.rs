@@ -279,10 +279,7 @@ impl Governor {
         let mut h = hs.lock().unwrap_or_else(|p| p.into_inner());
         if status == 429 || status == 503 {
             let p = &self.inner.profile;
-            let parsed_ra = retry_after
-                .map(str::trim)
-                .and_then(|s| s.parse::<u64>().ok())
-                .map(Duration::from_secs);
+            let parsed_ra = retry_after.map(str::trim).and_then(|s| s.parse::<u64>().ok()).map(Duration::from_secs);
             let delay = match parsed_ra {
                 Some(d) => d.min(p.max_backoff),
                 None => {

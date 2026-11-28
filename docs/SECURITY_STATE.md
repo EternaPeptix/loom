@@ -226,8 +226,8 @@ Exports are **sanitized by default** (`sanitize=true`, setting `log._sanitized =
 
 ## Dynamic scope revocation and emergency panic kill-switch
 
-- **Per-host live scope revocation:** `ferret scope revoke <session> <host>... [--note <text>] [--json]`, `POST /api/sessions/{id}/scope/revoke` (and `DELETE /api/sessions/{id}/scope`), Signal `/scope revoke <id|#n> <host>...`, and the per-host **Revoke** buttons in the Web UI Network panel remove the named hosts from the mission's active policy, immediately sever matching open proxy tunnels (HTTP, CONNECT, and intercepted HTTPS), and re-sync any active `[box]` firewall rules.
-- **Emergency panic kill-switch:** `ferret panic [--reason <text>] [--json]`, `POST /api/panic`, Signal `/panic [reason]`, and the two-step confirmed **Panic** button in the Web UI header / Daemon status dialog immediately sever ALL active proxy tunnels across all sessions, disable every enabled proxy rewrite rule, stop all active sessions and jobs (recording the optional reason), and tear down all active `[box]` containers, returning a `PanicReport` (`connections_cut`, `sessions_stopped`, `boxes_torn_down`, `rewrites_disabled`).
+- **Per-host live scope revocation:** `ferret scope revoke <mission|session> <host>... [--reason <text>] [--json]` (`--note` is the same flag), `POST /api/sessions/{id}/scope/revoke` (the one route; body `{hosts, reason?}`, `note` accepted for `reason`), Signal `/scope revoke <id|#n> <host>...`, and the per-host **Revoke** buttons in the Web UI Network panel revoke the named hosts from the mission, the cut first and the record after it (a ledger that cannot be read or written, such as on a full disk, does not keep the host open: the call says the revoke is applied and not recorded): a grant is recorded in the ledger (`ScopeRevoke`), any other host, `*.suffix`, address or CIDR block is carved out of what the mission reaches, every entry is kept in `<mission>/scope_revoked.json` and refused (`deny revoked …`) by every policy of the mission's sessions and MCP servers (a lead's still listing its servers included), also after a restart and under a later wildcard grant, until the host is granted again (which gives it back to the sessions and their MCP servers' grants alike; the reference credential keeps its own policy, its open connections cut); matching open proxy tunnels (HTTP, CONNECT, and intercepted HTTPS) are severed at once, by name and by the address they were opened to, and any active `[box]` firewall rules are re-synced. The receipt is `{lead, revoked, ledger, recorded, not_granted, sessions, connections_cut}`.
+- **Emergency panic kill-switch:** `ferret panic [--reason <text>] [--json]`, `POST /api/panic`, Signal `/panic [reason]`, and the two-step confirmed **Panic** button in the Web UI header / Daemon status dialog immediately sever ALL active proxy tunnels across all sessions, disable every enabled proxy rewrite rule, stop all active sessions and jobs (recording the optional reason), stop by sandbox identity what the sessions left running that only the process census finds, and tear down all active `[box]` containers, returning a `PanicReport` (`connections_cut`, `sessions_stopped`, `boxes_torn_down`, `rewrites_disabled`, `processes_killed`, `processes_left`).
 - **Auth-failure rate limiting:** The daemon API enforces an in-memory sliding-window lockout (`10` failed attempts per `60s` window → `429 Too Many Requests` with `Retry-After`) independently across bearer auth and login-code redemption (`POST /api/web-sessions`), without blocking legitimate valid-token requests.
 
 ## Egress noise governor, assessment `User-Agent`, and operator-only rewrite rules
@@ -302,6 +302,13 @@ Disabled by default. When `[oast] enabled = true` is configured in `config.toml`
   64 KiB body cap) are strictly isolated per mission. `oast_mint` is a `Read` tool; `oast_poll` is an `Exec`
   tool that sets `EvidenceGrade::Run` only when at least one real callback interaction is observed (and
   `Read` on zero interactions or errors), and is never granted to `read_only` verifier roles.
+- **Infrastructure (E1, `docs/MONITOR.md` §2.2):** the broker's endpoints are refused to every command whatever is
+  granted: its HTTP and DNS listeners on the addresses they are bound to (the broker starts before anything else and a
+  port `0` is written back), the external poll host and the callback host (on every port, by name and by the addresses
+  they resolve to; one on this machine on its own port) and every name under its DNS domain
+  (`deny infrastructure: oast.bind …`); the sandbox refuses their loopback ports and `external_token_file` is
+  unreadable to commands. A recorded callback therefore came from the target, never from ferret's own commands (a lab
+  the agent runs in its own sandbox cannot call back either).
 
 ## Container proxy bridge & MITM CA injection (`[box] proxy_bridge`)
 
@@ -320,6 +327,13 @@ Disabled by default (`proxy_bridge = false`). When `[box] proxy_bridge = true` i
   `box_reset`, and `box_exec` injects proxy and CA environment variables (`HTTP_PROXY`, `HTTPS_PROXY`,
   `SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`). Non-bridge mode remains
   byte-for-byte unchanged.
+- **Under the floor (`docs/MONITOR.md` §2.2):** a bridged request is a request of the session whose grant the bridge
+  carries (the lead's): its policy (the infrastructure deny, the mission's revoked hosts, a hold), the veto, SNI
+  binding and the canary and lab-listener checks apply, it is recorded in that session's `net.jsonl`, and the proxy's
+  one live registry ends it on a cut, a revoke, a policy change or a panic. The box's direct egress stays the mission
+  chain's, built from the same policy; the chain's counters do not see bridged requests. The bridge credential is in
+  every box program's environment, so a program of any session that reaches the bridge acts as the lead (under the
+  lead's policy).
 
 ## Operator-scoped read-only email inbox (`[mail]` / `inbox_read`)
 

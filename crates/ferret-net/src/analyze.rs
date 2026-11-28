@@ -67,20 +67,21 @@ pub fn analyze_exchange(
     } else {
         req.header("host").map(strip_host_port).map(norm_host).unwrap_or_default()
     };
-    let effective_target = if target.contains('?') || req.target.is_none() {
-        target
-    } else {
-        req.target.as_deref().unwrap_or(target)
-    };
+    let effective_target =
+        if target.contains('?') || req.target.is_none() { target } else { req.target.as_deref().unwrap_or(target) };
 
     let content_type = resp.header("content-type").unwrap_or("");
     let media_type = parse_media_type(content_type);
-    let compressed = resp.headers.iter().any(|(n, v)| {
-        n.eq_ignore_ascii_case("content-encoding") && !v.trim().eq_ignore_ascii_case("identity")
-    });
-    let chunked = resp.headers.iter().rev().find(|(n, _)| n.eq_ignore_ascii_case("transfer-encoding")).is_some_and(
-        |(_, v)| v.rsplit(',').next().is_some_and(|c| c.trim().eq_ignore_ascii_case("chunked")),
-    );
+    let compressed = resp
+        .headers
+        .iter()
+        .any(|(n, v)| n.eq_ignore_ascii_case("content-encoding") && !v.trim().eq_ignore_ascii_case("identity"));
+    let chunked = resp
+        .headers
+        .iter()
+        .rev()
+        .find(|(n, _)| n.eq_ignore_ascii_case("transfer-encoding"))
+        .is_some_and(|(_, v)| v.rsplit(',').next().is_some_and(|c| c.trim().eq_ignore_ascii_case("chunked")));
 
     let body_text = if compressed || is_binary_media_type(&media_type) || resp.body.is_empty() {
         None
@@ -445,9 +446,8 @@ fn check_cors(req: &ParsedRequest, resp: &ParsedResponse<'_>, target_host: &str,
     let Some(acao) = resp.header("access-control-allow-origin").map(str::trim).filter(|s| !s.is_empty()) else {
         return;
     };
-    let acac_true = resp
-        .header("access-control-allow-credentials")
-        .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"));
+    let acac_true =
+        resp.header("access-control-allow-credentials").is_some_and(|v| v.trim().eq_ignore_ascii_case("true"));
     if !acac_true {
         return;
     }
@@ -501,18 +501,8 @@ fn is_session_cookie_name(name: &str) -> bool {
     if lower.is_empty() {
         return false;
     }
-    const SUBSTRS: &[&str] = &[
-        "session",
-        "sess",
-        "token",
-        "auth",
-        "jwt",
-        "csrf",
-        "xsrf",
-        "connect.sid",
-        "phpsessid",
-        "jsessionid",
-    ];
+    const SUBSTRS: &[&str] =
+        &["session", "sess", "token", "auth", "jwt", "csrf", "xsrf", "connect.sid", "phpsessid", "jsessionid"];
     if SUBSTRS.iter().any(|k| lower.contains(k)) {
         return true;
     }
@@ -589,11 +579,8 @@ fn check_cookies(resp: &ParsedResponse<'_>, out: &mut SignalCollector) {
                 missing.push("Secure");
             }
             if !missing.is_empty() {
-                let severity = if missing == ["HttpOnly"] && is_csrf_cookie_name(cookie_name) {
-                    "low"
-                } else {
-                    "medium"
-                };
+                let severity =
+                    if missing == ["HttpOnly"] && is_csrf_cookie_name(cookie_name) { "low" } else { "medium" };
                 out.push(
                     "cookie_insecure",
                     severity,
@@ -965,7 +952,10 @@ fn check_secret_leak(body: &str, out: &mut SignalCollector) {
                 "secret_leak",
                 "high",
                 format!("Unredacted {label} detected in response body"),
-                format!("Matched {label} pattern ({prefix_hint}, len={}) in response body; secret value omitted", matched.len()),
+                format!(
+                    "Matched {label} pattern ({prefix_hint}, len={}) in response body; secret value omitted",
+                    matched.len()
+                ),
             );
         }
     }
@@ -1012,10 +1002,8 @@ fn check_sourcemap(
     }
 
     let path = target.split(['?', '#']).next().unwrap_or(target).to_ascii_lowercase();
-    let is_js = is_js_media_type(media_type)
-        || path.ends_with(".js")
-        || path.ends_with(".mjs")
-        || path.ends_with(".cjs");
+    let is_js =
+        is_js_media_type(media_type) || path.ends_with(".js") || path.ends_with(".mjs") || path.ends_with(".cjs");
     if is_js {
         if let Some(body) = body {
             if let Some(caps) = sourcemap_comment_regex().captures(body) {
@@ -1113,10 +1101,7 @@ mod tests {
         // Reflected cross-origin Origin + credentials
         let refl_resp = http_resp(
             "200 OK",
-            &[
-                ("Access-Control-Allow-Origin", "https://evil.test"),
-                ("Access-Control-Allow-Credentials", "true"),
-            ],
+            &[("Access-Control-Allow-Origin", "https://evil.test"), ("Access-Control-Allow-Credentials", "true")],
             b"{}",
         );
         let sigs = analyze_exchange("GET", "api.example.test", "/api", Some(200), &req, Some(&refl_resp));
@@ -1171,10 +1156,8 @@ mod tests {
     #[test]
     fn reflected_input_flags_non_trivial_unencoded_html_reflection_and_skips_noise() {
         let req = http_req("GET /search HTTP/1.1", &[("Host", "app.test")]);
-        let html_headers = &[
-            ("Content-Type", "text/html; charset=utf-8"),
-            ("Content-Security-Policy", "default-src 'self'"),
-        ];
+        let html_headers =
+            &[("Content-Type", "text/html; charset=utf-8"), ("Content-Security-Policy", "default-src 'self'")];
 
         // Reflected non-trivial probe with HTML characters
         let body = b"<html><body>Results for <probe_token></body></html>";
@@ -1194,31 +1177,32 @@ mod tests {
 
         // Properly HTML-encoded output -> NOT flagged
         let encoded_resp = http_resp("200 OK", html_headers, b"<html>&lt;probe_token&gt;</html>");
-        assert!(
-            analyze_exchange("GET", "app.test", "/search?q=%3Cprobe_token%3E", Some(200), &req, Some(&encoded_resp))
-                .is_empty()
-        );
+        assert!(analyze_exchange(
+            "GET",
+            "app.test",
+            "/search?q=%3Cprobe_token%3E",
+            Some(200),
+            &req,
+            Some(&encoded_resp)
+        )
+        .is_empty());
 
         // JSON response -> NOT flagged
         let json_resp = http_resp("200 OK", &[("Content-Type", "application/json")], b"{\"q\":\"<probe_token>\"}");
-        assert!(
-            analyze_exchange("GET", "app.test", "/search?q=%3Cprobe_token%3E", Some(200), &req, Some(&json_resp))
-                .is_empty()
-        );
+        assert!(analyze_exchange("GET", "app.test", "/search?q=%3Cprobe_token%3E", Some(200), &req, Some(&json_resp))
+            .is_empty());
 
         // Pure numbers, stopwords, and [redacted] are skipped
         let noise_resp = http_resp("200 OK", html_headers, b"<html>12345 false [redacted]</html>");
-        assert!(
-            analyze_exchange(
-                "GET",
-                "app.test",
-                "/search?id=12345&flag=false&tok=[redacted]",
-                Some(200),
-                &req,
-                Some(&noise_resp),
-            )
-            .is_empty()
-        );
+        assert!(analyze_exchange(
+            "GET",
+            "app.test",
+            "/search?id=12345&flag=false&tok=[redacted]",
+            Some(200),
+            &req,
+            Some(&noise_resp),
+        )
+        .is_empty());
     }
 
     #[test]
@@ -1258,11 +1242,7 @@ mod tests {
         let signed_jwt = format!("{hs256_hdr}.{payload}.dummysig123456");
 
         // In Set-Cookie
-        let resp = http_resp(
-            "200 OK",
-            &[("Set-Cookie", &format!("auth={unsigned_jwt}; HttpOnly; Secure"))],
-            b"ok",
-        );
+        let resp = http_resp("200 OK", &[("Set-Cookie", &format!("auth={unsigned_jwt}; HttpOnly; Secure"))], b"ok");
         let sigs = analyze_exchange("GET", "app.test", "/auth", Some(200), &req, Some(&resp));
         assert!(sigs.iter().any(|s| s.kind == "weak_jwt" && s.severity == "high" && s.summary.contains("Set-Cookie")));
         assert!(!sigs.iter().any(|s| s.detail.contains(&unsigned_jwt)));
@@ -1339,11 +1319,8 @@ mod tests {
         assert_eq!((sigs[0].kind.as_str(), sigs[0].severity.as_str()), ("missing_security_headers", "info"));
 
         // Present X-Frame-Options OR CSP -> no missing_security_headers signal
-        let html_xfo = http_resp(
-            "200 OK",
-            &[("Content-Type", "text/html"), ("X-Frame-Options", "DENY")],
-            b"<html>hi</html>",
-        );
+        let html_xfo =
+            http_resp("200 OK", &[("Content-Type", "text/html"), ("X-Frame-Options", "DENY")], b"<html>hi</html>");
         assert!(analyze_exchange("GET", "app.test", "/", Some(200), &req, Some(&html_xfo)).is_empty());
 
         // Non-2xx HTML -> no missing_security_headers signal
@@ -1388,7 +1365,9 @@ mod tests {
         assert_eq!(sigs.len(), PASSIVE_MAX_SIGNALS);
 
         // Arbitrary invalid UTF-8 / truncated bytes never panic
-        assert!(analyze_exchange("GET", "app.test", "/", None, &[0xff, 0xfe, 0x00], Some(&[0xff, 0x00, 0x80])).is_empty());
+        assert!(
+            analyze_exchange("GET", "app.test", "/", None, &[0xff, 0xfe, 0x00], Some(&[0xff, 0x00, 0x80])).is_empty()
+        );
         assert!(analyze_exchange("GET", "app.test", "/", None, b"", None).is_empty());
     }
 
@@ -1421,9 +1400,6 @@ mod tests {
             b"void 0;\n//# sourceMappingURL=data:application/json;base64,eyJ2ZXJzaW9uIjozfQ==\n",
         );
         let sigs = analyze_exchange("GET", "app.test", "/bundle.js", Some(200), &req, Some(&inline_js));
-        assert!(
-            sigs.iter().any(|s| s.kind == "sourcemap_exposed" && s.detail.contains("inline data:")),
-            "{sigs:?}"
-        );
+        assert!(sigs.iter().any(|s| s.kind == "sourcemap_exposed" && s.detail.contains("inline data:")), "{sigs:?}");
     }
 }

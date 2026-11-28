@@ -42,7 +42,30 @@ pub fn pack_servers<'a>(cfg: &'a McpCfg, roles: &[(&str, bool)]) -> Vec<&'a str>
     cfg.servers.iter().filter(|(_, s)| roles.iter().any(|(r, ro)| serves(s, r, *ro))).map(|(n, _)| n.as_str()).collect()
 }
 
-/// The hosts the servers of a role add to its sessions' allowed hosts (M4), without repeats.
+/// The marker in the proxy grant id of an MCP server's isolated egress grant: `<session>__mcp__<server>` (P0-7).
+pub const GRANT_MARK: &str = "__mcp__";
+
+/// The proxy grant id of MCP server `server` of `session`: a grant of its own, isolated from the session's policy.
+pub fn grant_id(session: &ferret_core::SessionId, server: &str) -> ferret_core::SessionId {
+    ferret_core::SessionId::from(format!("{}{GRANT_MARK}{server}", session.as_str()))
+}
+
+/// The server an MCP server's isolated grant id was made for; `None` for a session's own grant.
+pub fn grant_server(grant: &ferret_core::SessionId) -> Option<&str> {
+    grant.as_str().split_once(GRANT_MARK).map(|(_, server)| server)
+}
+
+/// The session a proxy grant id belongs to: the session itself, or the one an MCP server's isolated grant was made
+/// for. What a grant does is the session's: its net records, its floor events, its mission's own listeners.
+pub fn grant_owner(grant: &ferret_core::SessionId) -> ferret_core::SessionId {
+    match grant.as_str().split_once(GRANT_MARK) {
+        Some((base, _)) => ferret_core::SessionId::from(base),
+        None => grant.clone(),
+    }
+}
+
+/// The hosts the servers of a role declare (M4), without repeats: what their isolated proxy grants may reach (P0-7;
+/// never the session's own policy) and what the monitor's authorization counts as the tools' backends.
 pub fn hosts_for_role(cfg: &McpCfg, role: &str, read_only: bool) -> Vec<String> {
     let mut hosts: Vec<String> = Vec::new();
     for name in role_servers(cfg, role, read_only) {

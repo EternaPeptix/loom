@@ -214,7 +214,10 @@ impl Orchestrator for FakeOrch {
         lock(&self.producers).get(blob).cloned()
     }
 
-    fn target_nodes(&self, _session: &SessionId) -> Option<Result<(String, Vec<ferret_core::target::NodeView>), String>> {
+    fn target_nodes(
+        &self,
+        _session: &SessionId,
+    ) -> Option<Result<(String, Vec<ferret_core::target::NodeView>), String>> {
         lock(&self.target).clone().map(Ok)
     }
 

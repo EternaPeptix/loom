@@ -128,9 +128,9 @@
 use crate::assemble::{AssembleError, Assembler, Completion, SseParser, StreamEvent};
 use crate::request::ChatRequest;
 use bytes::Bytes;
-use futures_util::StreamExt;
 use ferret_core::config::{read_model_key, ModelProfile};
 use ferret_core::event::{FinishReason, Timing, Usage};
+use futures_util::StreamExt;
 use rand::RngExt;
 use serde_json::Value;
 use std::path::Path;

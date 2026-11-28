@@ -78,6 +78,30 @@
 //! ([`rules_check_args`]); a missing chain or jump is installed again before the command runs, and when that
 //! fails the container is removed and the command is refused.
 //!
+//! ## Counters (E4f)
+//! Every rule of the mission's chain counts the packets it saw. `MissionBox::poll_counters` runs the helper with a
+//! fixed script (`iptables -w 5 -nvx -L "$1"`, [`rules_counters_args`]) and returns, for each rule whose counters
+//! moved since the last poll, a [`RuleCount`] with the **delta**: `rule` (`{target} {protocol} {destination}`
+//! and the match text, e.g. `ACCEPT tcp 203.0.113.7 tcp dpt:443`; the final `DROP` is `DROP all 0.0.0.0/0`),
+//! packets, bytes and `drop` (the target is `DROP`). An ACCEPT delta is traffic the grants allow; a DROP delta
+//! is an attempt the box's chain refused, which the monitor counts as an attempt. `parse_counters(text)` reads the
+//! helper's output (protocols written as names or numbers; anything that is not a rule line is ignored) and
+//! `counter_deltas(previous, now)` is the arithmetic: a counter below its previous value means the chain was
+//! installed again (a grant changed) and counts from zero. The rules are installed with an explicit flush, so
+//! every install resets the counters; when a poll has happened before, the counters are read just before an
+//! install and banked, so what the box did since the last poll is reported by the next one, not lost (every
+//! window between installs too, however many installs come between two polls). A poll and an install exclude each
+//! other from the read of the counters to the update of the baseline, so a reading of the old chain is never
+//! combined with the baseline of the new one. `Ok(None)` when the
+//! mission has no running box (nothing to poll), `Err` with a sentence when the helper cannot be run or the chain is
+//! missing. A paused box is polled too. The counters say how much, not what: the box has no per-connection
+//! record (`docs/MONITOR.md` X5). With main's proxy bridge ([`BoxProxyBridge`]) the box's HTTP(S) requests go to the
+//! Docker host's gateway (`INPUT`, the bridge's one accept rule), not through the mission's chain: the counters do not
+//! see them, and the proxy records each one as a net decision of the session whose grant the bridge carries. The
+//! accept rule is the interface's only one: installing it removes every other `INPUT -i fb-<short> … -j ACCEPT` (the
+//! bridge port follows the lead's proxy port, new in every daemon life, so a box adopted after a restart would keep the
+//! old one), and the check fails while another is there.
+//!
 //! ## Life of a box (`MissionBox`, I5)
 //! One per mission, created by the runtime with a source of the mission's grants and effective policy.
 //! Everything that creates, changes or removes a mission's box (`ready`, `reset`, `resync`, `teardown`,
@@ -117,7 +141,10 @@
 //! unpacked is in `boxfs` (I6, I7).
 //!
 //! Tests required: exact argv of `run`, `exec`, the tar push and get, `network create`, `rm`, the helper run and the
-//! kill (I1, I2, I4); the three helper scripts run against stand-ins for `iptables` (R1, R2); a hostile script reaches the launcher as one argv element; the egress plan for a grant
+//! kill (I1, I2, I4); counters: the helper's argv, `parse_counters` on output with names and with numbers for the
+//! protocols and on junk, `counter_deltas` for growth, no change and a reset, `poll_counters` through the fake
+//! (first poll, a poll with no change, one after growth, `None` without a box, `Err` for a missing chain, the
+//! counters banked across an install); the three helper scripts run against stand-ins for `iptables` (R1, R2); a hostile script reaches the launcher as one argv element; the egress plan for a grant
 //! set (private address refused without `allow_private`, wildcard skipped and noticed once, IPv6 skipped,
 //! ports kept); the rules text; names and labels; the ssh argv and the forward supervisor with a fake
 //! `ssh` (stale socket removed, restarted after an exit); container life with a fake `docker` (created
@@ -135,7 +162,7 @@ use std::ffi::OsStr;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -213,7 +240,8 @@ impl BoxProxyBridge {
         if let Some((user, pass)) = &self.proxy_auth {
             let bad = |s: &str| {
                 s.is_empty()
-                    || s.chars().any(|c| c.is_whitespace() || c.is_control() || matches!(c, '@' | ':' | '/' | '?' | '#'))
+                    || s.chars()
+                        .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '@' | ':' | '/' | '?' | '#'))
             };
             if bad(user) {
                 return Err("BoxProxyBridge.proxy_auth username must be non-empty and contain no URL delimiters, whitespace, or control characters.".into());
@@ -240,9 +268,9 @@ impl BoxProxyBridge {
         if gw.is_empty() {
             return Ok(None);
         }
-        let ip = gw
-            .parse::<Ipv4Addr>()
-            .map_err(|_| format!("BoxProxyBridge.bridge_gateway_ip `{}` is not a valid IPv4 address.", self.bridge_gateway_ip))?;
+        let ip = gw.parse::<Ipv4Addr>().map_err(|_| {
+            format!("BoxProxyBridge.bridge_gateway_ip `{}` is not a valid IPv4 address.", self.bridge_gateway_ip)
+        })?;
         if ip.is_unspecified() {
             return Err("BoxProxyBridge.bridge_gateway_ip must not be 0.0.0.0.".into());
         }
@@ -252,8 +280,9 @@ impl BoxProxyBridge {
     /// Validate a resolved bridge (requiring a concrete non-empty IPv4 `bridge_gateway_ip`) so nothing
     /// untrusted ever enters iptables, ssh argv, or listener binds.
     pub fn validate(&self) -> Result<Ipv4Addr, String> {
-        self.validate_config()?
-            .ok_or_else(|| "BoxProxyBridge.bridge_gateway_ip is empty; resolve the Docker network gateway first.".into())
+        self.validate_config()?.ok_or_else(|| {
+            "BoxProxyBridge.bridge_gateway_ip is empty; resolve the Docker network gateway first.".into()
+        })
     }
 
     /// HTTP proxy URL reachable from inside the container (`http://[user:pass@]<bridge_gateway_ip>:<bridge_port>`).
@@ -781,13 +810,20 @@ for c in INPUT FORWARD; do while ip6tables -w 5 -D \"$c\" -i \"$2\" -j DROP 2>/d
 
 /// Bridge-enabled variant of [`RULES_APPLY`]: inserts ONE tightly-scoped `INPUT 1` rule allowing TCP from
 /// this mission's bridge `$2` (`fb-<short>`) ONLY to `<bridge_gateway_ip>` (`$3`) port `<bridge_port>` (`$4`)
-/// strictly BEFORE the unconditional `INPUT -i fb-+ -j DROP`. All other host ports and IPv6 remain dropped.
+/// strictly BEFORE the unconditional `INPUT -i fb-+ -j DROP`. All other host ports and IPv6 remain dropped. Every other
+/// `INPUT -i $2 ... -j ACCEPT` goes first, as [`RULES_REMOVE`] sweeps them: the bridge port follows the lead's proxy
+/// port, which is new in every daemon life, so a box adopted after a restart would otherwise keep the old port's
+/// accept rule, a path to whatever holds that port on the Docker host that neither the chain nor the proxy sees.
 const RULES_APPLY_BRIDGE: &str = ": ferret-rules-apply; \
 iptables -w 5 -N FERRET-ALL 2>/dev/null; \
 iptables -w 5 -C FERRET-ALL -j DROP 2>/dev/null || iptables -w 5 -A FERRET-ALL -j DROP || exit 1; \
 iptables -w 5 -C DOCKER-USER -i 'fb-+' -j FERRET-ALL 2>/dev/null || iptables -w 5 -I DOCKER-USER 1 -i 'fb-+' -j FERRET-ALL || exit 1; \
 while iptables -w 5 -D INPUT -i 'fb-+' -j FERRET-ALL 2>/dev/null; do :; done; \
 iptables -w 5 -C INPUT -i 'fb-+' -j DROP 2>/dev/null || iptables -w 5 -I INPUT 1 -i 'fb-+' -j DROP || exit 1; \
+( iface=$2; iptables -w 5 -S INPUT 2>/dev/null | while IFS= read -r r; do \
+case \"$r\" in \"-A INPUT \"*) b=${r#-A INPUT }; \
+case \" $b \" in *\" -i $iface \"*\" -j ACCEPT \"*) set -f; set -- $b; set +f; iptables -w 5 -D INPUT \"$@\" 2>/dev/null || : ;; esac ;; \
+esac; done ); \
 while iptables -w 5 -D INPUT -i \"$2\" -p tcp -d \"$3\" --dport \"$4\" -j ACCEPT 2>/dev/null; do :; done; \
 iptables -w 5 -I INPUT 1 -i \"$2\" -p tcp -d \"$3\" --dport \"$4\" -j ACCEPT || exit 1; \
 iptables-restore -w 5 --noflush || exit 1; \
@@ -797,13 +833,17 @@ ip6tables -w 5 -C FERRET-ALL6 -j DROP 2>/dev/null || ip6tables -w 5 -A FERRET-AL
 for c in INPUT FORWARD; do ip6tables -w 5 -C \"$c\" -i 'fb-+' -j FERRET-ALL6 2>/dev/null || ip6tables -w 5 -I \"$c\" 1 -i 'fb-+' -j FERRET-ALL6 || exit 1; done; \
 for c in INPUT FORWARD; do ip6tables -w 5 -C \"$c\" -i \"$2\" -j DROP 2>/dev/null || ip6tables -w 5 -I \"$c\" 1 -i \"$2\" -j DROP || exit 1; done";
 
-/// Bridge-enabled variant of [`RULES_CHECK`]: verifies the mission's tightly-scoped `INPUT` bridge rule
-/// alongside all standard `FERRET-ALL`, `INPUT DROP`, and `FERRET-ALL6` invariants.
+/// Bridge-enabled variant of [`RULES_CHECK`]: verifies the mission's tightly-scoped `INPUT` bridge rule, and that it is
+/// the interface's only `INPUT` accept rule, alongside all standard `FERRET-ALL`, `INPUT DROP`, and `FERRET-ALL6`
+/// invariants.
 const RULES_CHECK_BRIDGE: &str = ": ferret-rules-check; \
 iptables -w 5 -C FERRET-ALL -j DROP && \
 iptables -w 5 -C DOCKER-USER -i 'fb-+' -j FERRET-ALL && \
 iptables -w 5 -C INPUT -i 'fb-+' -j DROP && \
 iptables -w 5 -C INPUT -i \"$2\" -p tcp -d \"$3\" --dport \"$4\" -j ACCEPT && \
+iptables -w 5 -S INPUT 2>/dev/null | { n=0; while IFS= read -r r; do \
+case \"$r\" in \"-A INPUT \"*) case \" ${r#-A INPUT } \" in *\" -i $2 \"*\" -j ACCEPT \"*) n=$((n+1)) ;; esac ;; esac; \
+done; [ \"$n\" -eq 1 ]; } && \
 ! iptables -w 5 -C INPUT -i 'fb-+' -j FERRET-ALL 2>/dev/null && \
 iptables -w 5 -C FERRET-ALL -i \"$2\" -j \"$1\" && iptables -w 5 -C \"$1\" -j DROP && \
 ip6tables -w 5 -C FERRET-ALL6 -j DROP && \
@@ -860,11 +900,7 @@ pub fn rules_args(cfg: &BoxCfg, n: &Names) -> Vec<String> {
 }
 
 /// [`rules_args`] with optional [`BoxProxyBridge`] `INPUT 1` accept rule strictly before `INPUT -i fb-+ -j DROP`.
-pub fn rules_args_with_bridge(
-    cfg: &BoxCfg,
-    n: &Names,
-    bridge: Option<&BoxProxyBridge>,
-) -> Result<Vec<String>, String> {
+pub fn rules_args_with_bridge(cfg: &BoxCfg, n: &Names, bridge: Option<&BoxProxyBridge>) -> Result<Vec<String>, String> {
     match bridge {
         None => Ok(rules_args(cfg, n)),
         Some(b) => {
@@ -877,6 +913,14 @@ pub fn rules_args_with_bridge(
 /// The helper run that removes the mission's jump, chain and IPv6 drops.
 pub fn rules_remove_args(cfg: &BoxCfg, n: &Names) -> Vec<String> {
     helper_args(cfg, false, RULES_REMOVE, n)
+}
+
+/// The script that prints the mission's chain with its counters (`$1` is the chain).
+const RULES_COUNTERS: &str = ": ferret-rules-counters; iptables -w 5 -nvx -L \"$1\"";
+
+/// The helper run that prints the mission's chain with the packet and byte counter of each rule.
+pub fn rules_counters_args(cfg: &BoxCfg, n: &Names) -> Vec<String> {
+    helper_args(cfg, false, RULES_COUNTERS, n)
 }
 
 /// [`rules_remove_args`] with optional [`BoxProxyBridge`] `INPUT` accept rule cleanup.
@@ -897,6 +941,78 @@ pub fn rules_remove_args_with_bridge(
 /// The helper run that checks that the mission's rules are all in place (its status says).
 pub fn rules_check_args(cfg: &BoxCfg, n: &Names) -> Vec<String> {
     helper_args(cfg, false, RULES_CHECK, n)
+}
+
+/// What one rule of the mission's chain counted (see *Counters* in the module contract).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RuleCount {
+    /// `{target} {protocol} {destination}` and the match text, e.g. `ACCEPT tcp 203.0.113.7 tcp dpt:443`.
+    pub rule: String,
+    pub packets: u64,
+    pub bytes: u64,
+    /// The rule's target is `DROP`: what it counted was refused.
+    pub drop: bool,
+}
+
+/// The rules of `iptables -nvx -L <chain>` output, each with its counters as printed (not deltas).
+pub fn parse_counters(text: &str) -> Vec<RuleCount> {
+    let mut out: Vec<RuleCount> = Vec::new();
+    let mut in_rules = false;
+    for line in text.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.first() == Some(&"pkts") {
+            in_rules = true;
+            continue;
+        }
+        if !in_rules || f.len() < 9 {
+            continue;
+        }
+        let (Some(packets), Some(bytes)) =
+            (f.first().and_then(|x| x.parse::<u64>().ok()), f.get(1).and_then(|x| x.parse::<u64>().ok()))
+        else {
+            continue;
+        };
+        let (target, proto, dest) =
+            (f.get(2).copied().unwrap_or(""), f.get(3).copied().unwrap_or(""), f.get(8).copied().unwrap_or(""));
+        let proto = match proto {
+            "6" => "tcp",
+            "17" => "udp",
+            "0" => "all",
+            other => other,
+        };
+        let rest = f.get(9..).map(|r| r.join(" ")).unwrap_or_default();
+        let mut rule = format!("{target} {proto} {dest}");
+        if !rest.is_empty() {
+            rule.push(' ');
+            rule.push_str(&rest);
+        }
+        match out.iter_mut().find(|r| r.rule == rule) {
+            Some(same) => {
+                same.packets = same.packets.saturating_add(packets);
+                same.bytes = same.bytes.saturating_add(bytes);
+            }
+            None => out.push(RuleCount { rule, packets, bytes, drop: target == "DROP" }),
+        }
+    }
+    out
+}
+
+/// The rules of `now` whose counters moved since `previous`, as deltas; `previous` becomes `now`. A counter below
+/// its previous value (the chain was installed again) counts from zero; a rule that is gone is forgotten.
+pub fn counter_deltas(previous: &mut BTreeMap<String, (u64, u64)>, now: &[RuleCount]) -> Vec<RuleCount> {
+    let mut out = Vec::new();
+    for r in now {
+        let (p, b) = previous.get(&r.rule).copied().unwrap_or((0, 0));
+        let reset = r.packets < p || r.bytes < b;
+        let (dp, db) =
+            if reset { (r.packets, r.bytes) } else { (r.packets.saturating_sub(p), r.bytes.saturating_sub(b)) };
+        if dp > 0 || db > 0 {
+            out.push(RuleCount { rule: r.rule.clone(), packets: dp, bytes: db, drop: r.drop });
+        }
+    }
+    previous.clear();
+    previous.extend(now.iter().map(|r| (r.rule.clone(), (r.packets, r.bytes))));
+    out
 }
 
 /// [`rules_check_args`] with optional [`BoxProxyBridge`] `INPUT` accept rule verification.
@@ -1225,11 +1341,7 @@ fn write_seccomp_profile(keys: &Path) -> Result<PathBuf, String> {
     use std::os::unix::fs::OpenOptionsExt;
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let path = keys.join(SECCOMP_FILE);
-    let tmp = keys.join(format!(
-        ".{SECCOMP_FILE}.{}.{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
+    let tmp = keys.join(format!(".{SECCOMP_FILE}.{}.{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
     let res = (|| -> std::io::Result<()> {
         let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
         f.write_all(BOX_SECCOMP_PROFILE.as_bytes())?;
@@ -1631,6 +1743,15 @@ pub struct MissionBox {
     state: Mutex<State>,
     wildcards: StdMutex<Vec<String>>,
     told: StdMutex<HashSet<String>>,
+    /// The counters at the last poll, by rule (see *Counters*).
+    counted: StdMutex<BTreeMap<String, (u64, u64)>>,
+    /// Deltas read just before the rules were installed again, for the next poll to report.
+    banked: StdMutex<Vec<RuleCount>>,
+    /// Whether a poll has run: only then does an install read and bank the counters it is about to reset.
+    polling: AtomicBool,
+    /// Held by a poll from its read of the counters to its deltas, and by an install from its read to the reset of
+    /// the baseline, so a poll never combines a reading of the old chain with the baseline of the new one.
+    counter_gate: Mutex<()>,
 }
 
 impl Drop for MissionBox {
@@ -1662,10 +1783,7 @@ impl MissionBox {
     ) -> Arc<MissionBox> {
         let home = host.home_hash();
         let names = names(mission);
-        let initial_resolved = bridge
-            .as_ref()
-            .filter(|b| !b.bridge_gateway_ip.trim().is_empty())
-            .cloned();
+        let initial_resolved = bridge.as_ref().filter(|b| !b.bridge_gateway_ip.trim().is_empty()).cloned();
         Arc::new(MissionBox {
             lifecycle: host.mission_lock(&names.short),
             names,
@@ -1678,7 +1796,47 @@ impl MissionBox {
             state: Mutex::new(State::default()),
             wildcards: StdMutex::new(Vec::new()),
             told: StdMutex::new(HashSet::new()),
+            counted: StdMutex::new(BTreeMap::new()),
+            banked: StdMutex::new(Vec::new()),
+            polling: AtomicBool::new(false),
+            counter_gate: Mutex::new(()),
         })
+    }
+
+    /// The counters of the chain now, as printed.
+    async fn read_counts(&self) -> Result<Vec<RuleCount>, String> {
+        let out = self
+            .host
+            .run_ok("Reading the box's rule counters", &rules_counters_args(&self.host.cfg, &self.names), None)
+            .await?;
+        Ok(parse_counters(&String::from_utf8_lossy(&out.stdout)))
+    }
+
+    /// What the rules of the mission's chain counted since the last poll; see *Counters* in the module contract.
+    pub async fn poll_counters(&self) -> Result<Option<Vec<RuleCount>>, String> {
+        {
+            let st = self.state.lock().await;
+            if !st.up || st.closed {
+                return Ok(None);
+            }
+        }
+        let _gate = self.counter_gate.lock().await;
+        let now = self.read_counts().await?;
+        self.polling.store(true, Ordering::SeqCst);
+        let banked = std::mem::take(&mut *self.banked.lock().unwrap_or_else(|p| p.into_inner()));
+        let fresh = counter_deltas(&mut self.counted.lock().unwrap_or_else(|p| p.into_inner()), &now);
+        let mut deltas: Vec<RuleCount> = Vec::new();
+        for d in banked.into_iter().chain(fresh) {
+            match deltas.iter_mut().find(|x| x.rule == d.rule) {
+                Some(same) => {
+                    same.packets = same.packets.saturating_add(d.packets);
+                    same.bytes = same.bytes.saturating_add(d.bytes);
+                }
+                None => deltas.push(d),
+            }
+        }
+        deltas.sort_by(|a, b| a.rule.cmp(&b.rule));
+        Ok(Some(deltas))
     }
 
     pub fn proxy_bridge(&self) -> Option<&BoxProxyBridge> {
@@ -1688,19 +1846,12 @@ impl MissionBox {
     /// The resolved [`BoxProxyBridge`] with a concrete IPv4 bridge gateway (available immediately when
     /// configured explicitly, or after `ready()` discovers the per-mission Docker bridge IPAM gateway).
     pub fn resolved_proxy_bridge(&self) -> Option<BoxProxyBridge> {
-        self.resolved_bridge
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+        self.resolved_bridge.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
     }
 
     fn effective_bridge(&self) -> Option<BoxProxyBridge> {
-        self.resolved_proxy_bridge().or_else(|| {
-            self.bridge
-                .as_ref()
-                .filter(|b| !b.bridge_gateway_ip.trim().is_empty())
-                .cloned()
-        })
+        self.resolved_proxy_bridge()
+            .or_else(|| self.bridge.as_ref().filter(|b| !b.bridge_gateway_ip.trim().is_empty()).cloned())
     }
 
     /// Resolve the bridge gateway IP (from explicit config or `docker network inspect`) after the mission's
@@ -1765,12 +1916,8 @@ impl MissionBox {
         let forward = if self.host.cfg.docker_socket.is_empty() {
             let args = reverse_proxy_forward_args(&self.host.cfg, bridge)?;
             let stop = Arc::new(tokio::sync::Notify::new());
-            let (program, run_dir, stop2, mission) = (
-                self.host.ssh_program.clone(),
-                self.host.run_dir.clone(),
-                stop.clone(),
-                self.names.mission.clone(),
-            );
+            let (program, run_dir, stop2, mission) =
+                (self.host.ssh_program.clone(), self.host.run_dir.clone(), stop.clone(), self.names.mission.clone());
             let task = tokio::spawn(async move {
                 let mut backoff = Duration::from_secs(1);
                 loop {
@@ -1919,7 +2066,20 @@ impl MissionBox {
         let bridge = self.effective_bridge();
         let args = rules_args_with_bridge(&self.host.cfg, &self.names, bridge.as_ref())?;
         let text = rules_text(&self.names, &plan.allowed).into_bytes();
-        self.host.run_ok("Installing the egress rules", &args, Some(text)).await.map(|_| ())
+        // The install flushes the chain and so resets its counters: what they counted since the last poll is
+        // read first (only once polling has begun), and banked for the next one.
+        let _gate = self.counter_gate.lock().await;
+        if self.polling.load(Ordering::SeqCst) {
+            if let Ok(now) = self.read_counts().await {
+                let fresh = counter_deltas(&mut self.counted.lock().unwrap_or_else(|p| p.into_inner()), &now);
+                self.banked.lock().unwrap_or_else(|p| p.into_inner()).extend(fresh);
+            }
+        }
+        let done = self.host.run_ok("Installing the egress rules", &args, Some(text)).await.map(|_| ());
+        if done.is_ok() {
+            self.counted.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        }
+        done
     }
 
     /// Remove the container so that it never runs with rules that are not the grants' (best effort).
@@ -2105,7 +2265,13 @@ impl MissionBox {
         self.install_rules(&plan).await?;
         self.run_ok(
             "Starting the box",
-            run_args_with_seccomp(&self.host.cfg, &self.names, &self.home, &plan.hosts, Some(self.host.seccomp_profile())),
+            run_args_with_seccomp(
+                &self.host.cfg,
+                &self.names,
+                &self.home,
+                &plan.hosts,
+                Some(self.host.seccomp_profile()),
+            ),
         )
         .await?;
         st.forget();
@@ -2295,7 +2461,8 @@ impl MissionBox {
     pub fn launcher(&self, call_id: &str, cwd: Option<&str>, script: &str) -> Result<Launcher, String> {
         let dir = work_dir(cwd)?;
         let bridge = self.effective_bridge();
-        let (program, args) = self.host.argv(&exec_args_with_bridge(&self.names, call_id, &dir, script, bridge.as_ref()));
+        let (program, args) =
+            self.host.argv(&exec_args_with_bridge(&self.names, call_id, &dir, script, bridge.as_ref()));
         let pid = pid_file(call_id);
         let (host, n) = (self.host.clone(), self.names.clone());
         let stop = move |sig: i32| {
@@ -2531,8 +2698,8 @@ async fn teardown_names_locked_with_bridge(host: &DockerHost, n: &Names, bridge:
             return;
         }
     }
-    let rm_rules_args = rules_remove_args_with_bridge(&host.cfg, n, bridge)
-        .unwrap_or_else(|_| rules_remove_args(&host.cfg, n));
+    let rm_rules_args =
+        rules_remove_args_with_bridge(&host.cfg, n, bridge).unwrap_or_else(|_| rules_remove_args(&host.cfg, n));
     match host.docker(&rm_rules_args, None, SMALL_OUT).await {
         Ok(o) if o.ok() => {}
         Ok(o) => tracing::warn!(mission = %n.mission, "box: the egress chain was not removed: {}", o.why()),
@@ -2623,6 +2790,10 @@ case "$sub" in
         case "$*" in
           *": ferret-rules-check;"*)
             [ -f "$D/chain-$chain" ] || { echo "iptables: Bad rule (does a matching rule exist in that chain?)" >&2; exit 1; }
+            exit 0;;
+          *": ferret-rules-counters;"*)
+            [ -f "$D/chain-$chain" ] || { echo "iptables: No chain/target/match by that name." >&2; exit 1; }
+            [ -f "$D/counters-$chain" ] && cat "$D/counters-$chain"
             exit 0;;
           *": ferret-rules-remove;"*)
             [ -f "$D/slow.remove" ] && sleep 1
@@ -2951,8 +3122,13 @@ mod tests {
         .collect();
         assert_eq!(args, expected);
         // With an explicit seccomp profile path, `--security-opt seccomp=<path>` follows `no-new-privileges`.
-        let with_seccomp =
-            run_args_with_seccomp(&sample_cfg(), &n, "HOMEHASH", &sample_hosts(), Some(Path::new("/k/box-seccomp.json")));
+        let with_seccomp = run_args_with_seccomp(
+            &sample_cfg(),
+            &n,
+            "HOMEHASH",
+            &sample_hosts(),
+            Some(Path::new("/k/box-seccomp.json")),
+        );
         assert!(
             with_seccomp.windows(2).any(|w| w == ["--security-opt", "seccomp=/k/box-seccomp.json"]),
             "{with_seccomp:?}"
@@ -3398,10 +3574,12 @@ mod tests {
         b.ready().await.unwrap();
         assert!(b.pending_hosts().await.is_empty());
         // A grant after creation: the rules follow at once, the name resolves only after a reset.
-        grants.lock().unwrap().push("localhost".to_string());
+        // With a port: some ports of this machine's loopback are infrastructure (E1), so a name that resolves there
+        // cannot be granted on every port.
+        grants.lock().unwrap().push("localhost:8080".to_string());
         b.resync().await;
         let rules = std::fs::read_to_string(f.dir.join("rules.in")).unwrap();
-        assert!(rules.contains("-d 127.0.0.1/32 -p tcp -j ACCEPT"), "{rules}");
+        assert!(rules.contains("-d 127.0.0.1/32 -p tcp -m tcp --dport 8080 -j ACCEPT"), "{rules}");
         let pending = b.pending_hosts().await;
         assert_eq!(pending, [("localhost".to_string(), vec!["127.0.0.1".parse::<Ipv4Addr>().unwrap()])]);
         // A second resync does not change that.
@@ -4063,6 +4241,108 @@ exit 2
         assert!(!own.iter().any(|l| l.contains("ESTABLISHED")), "{own:?}");
     }
 
+    const COUNTERS: &str = "Chain FERRET-abc (1 references)\n    pkts      bytes target     prot opt in     out     source               destination\n       3      180 ACCEPT     tcp  --  *      *       0.0.0.0/0            203.0.113.7          tcp dpt:443\n       0        0 ACCEPT     udp  --  *      *       0.0.0.0/0            203.0.113.7          udp dpt:443\n      12      720 DROP       all  --  *      *       0.0.0.0/0            0.0.0.0/0           \n";
+
+    #[test]
+    fn counters_are_parsed_from_the_listing_and_read_as_deltas() {
+        let now = parse_counters(COUNTERS);
+        assert_eq!(now.len(), 3, "{now:?}");
+        assert_eq!(
+            now[0],
+            RuleCount { rule: "ACCEPT tcp 203.0.113.7 tcp dpt:443".into(), packets: 3, bytes: 180, drop: false }
+        );
+        assert_eq!(now[2], RuleCount { rule: "DROP all 0.0.0.0/0".into(), packets: 12, bytes: 720, drop: true });
+        // Protocols written as numbers (iptables-nft) read as names; junk lines and a missing header read as nothing.
+        let numeric =
+            COUNTERS.replace(" tcp  --", " 6    --").replace(" udp  --", " 17   --").replace(" all  --", " 0    --");
+        assert_eq!(parse_counters(&numeric), now);
+        assert!(parse_counters("iptables: No chain/target/match by that name.\n3 180 ACCEPT tcp -- * * a b").is_empty());
+        assert!(parse_counters("").is_empty());
+        // First reading: everything counted so far (a rule that counted nothing is left out). Unchanged: nothing. Growth: the difference. A reset: from zero.
+        let mut prev = BTreeMap::new();
+        assert_eq!(counter_deltas(&mut prev, &now).len(), 2, "the rule that counted nothing is not a delta");
+        assert!(counter_deltas(&mut prev, &now).is_empty());
+        let mut grown = now.clone();
+        grown[2].packets = 20;
+        grown[2].bytes = 1200;
+        let d = counter_deltas(&mut prev, &grown);
+        assert_eq!(d, vec![RuleCount { rule: "DROP all 0.0.0.0/0".into(), packets: 8, bytes: 480, drop: true }]);
+        let mut reset = now.clone();
+        reset[0].packets = 1;
+        reset[0].bytes = 60;
+        let d = counter_deltas(&mut prev, &reset);
+        assert!(d.iter().any(|r| r.rule.starts_with("ACCEPT tcp") && r.packets == 1 && r.bytes == 60), "{d:?}");
+        // The helper's argv is fixed: the chain is an argument of a fixed script, never text in it.
+        let cfg = FakeDocker::new(tempfile::tempdir().unwrap().path()).cfg();
+        let args = rules_counters_args(&cfg, &names("m-1"));
+        assert!(args.iter().any(|a| a.starts_with(": ferret-rules-counters;")), "{args:?}");
+        assert_eq!(args[args.len() - 2], names("m-1").chain);
+    }
+
+    #[tokio::test]
+    async fn the_counters_of_a_running_box_are_polled_as_deltas_and_survive_an_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = FakeDocker::new(dir.path());
+        let host = f.host();
+        let b = MissionBox::new(host.clone(), "m-1", source(&["203.0.113.7"]));
+        // No box yet: nothing to poll, and no docker call made.
+        let mark = f.calls().len();
+        assert_eq!(b.poll_counters().await.unwrap(), None);
+        assert_eq!(f.calls().len(), mark);
+        b.ready().await.unwrap();
+        let counters = f.dir.join(format!("counters-{}", b.names().chain));
+        let tcp = "ACCEPT tcp 203.0.113.7 tcp dpt:443";
+        std::fs::write(&counters, COUNTERS).unwrap();
+        let first = b.poll_counters().await.unwrap().unwrap();
+        assert_eq!(first.len(), 2, "{first:?}");
+        assert!(b.poll_counters().await.unwrap().unwrap().is_empty(), "nothing moved");
+        // Growth since the last poll, then an install (a grant changed) that resets the chain's counters: what
+        // the old chain counted after the last poll is banked and reported with what the new chain counts.
+        std::fs::write(&counters, COUNTERS.replace("       3      180", "       9      540")).unwrap();
+        b.resync().await;
+        std::fs::write(&counters, COUNTERS.replace("       3      180", "       2      120")).unwrap();
+        let after = b.poll_counters().await.unwrap().unwrap();
+        let tcp_row = after.iter().find(|r| r.rule == tcp).unwrap_or_else(|| panic!("{after:?}"));
+        assert_eq!((tcp_row.packets, tcp_row.bytes), (6 + 2, 360 + 120), "{after:?}");
+        assert!(after.iter().all(|r| r.rule == tcp || r.drop || r.packets > 0), "{after:?}");
+        // A chain that is gone is an error with a sentence, not an empty answer.
+        std::fs::remove_file(f.dir.join(format!("chain-{}", b.names().chain))).unwrap();
+        let err = b.poll_counters().await.unwrap_err();
+        assert!(err.contains("rule counters") && err.contains("No chain"), "{err}");
+        // A torn-down box has nothing to poll.
+        b.teardown().await;
+        assert_eq!(b.poll_counters().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn counters_survive_two_installs_between_polls_and_a_poll_waits_for_an_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = FakeDocker::new(dir.path());
+        let b = MissionBox::new(f.host(), "m-1", source(&["203.0.113.7"]));
+        b.ready().await.unwrap();
+        let counters = f.dir.join(format!("counters-{}", b.names().chain));
+        let tcp = "ACCEPT tcp 203.0.113.7 tcp dpt:443";
+        let with = |packets: u64| COUNTERS.replace("       3      180", &format!("{packets:>8} {:>8}", packets * 60));
+        std::fs::write(&counters, with(3)).unwrap();
+        b.poll_counters().await.unwrap();
+        // The old chain counted 6 more, then an install; the new chain counted 4, then a second install; the
+        // newest chain counted 1: the poll reports every window, not only the first.
+        std::fs::write(&counters, with(9)).unwrap();
+        b.resync().await;
+        std::fs::write(&counters, with(4)).unwrap();
+        b.resync().await;
+        std::fs::write(&counters, with(1)).unwrap();
+        let after = b.poll_counters().await.unwrap().unwrap();
+        let row = after.iter().find(|r| r.rule == tcp).unwrap_or_else(|| panic!("{after:?}"));
+        assert_eq!((row.packets, row.bytes), (6 + 4 + 1, 660), "{after:?}");
+        // A poll and an install exclude each other: while one holds the gate the other waits.
+        let gate = b.counter_gate.lock().await;
+        let waiting = tokio::time::timeout(Duration::from_millis(300), b.poll_counters()).await;
+        assert!(waiting.is_err(), "a poll read the counters while an install held the gate");
+        drop(gate);
+        assert!(b.poll_counters().await.is_ok());
+    }
+
     #[tokio::test]
     async fn r4_a_running_box_has_its_rules_checked_again_and_put_back_or_the_command_is_refused() {
         let dir = tempfile::tempdir().unwrap();
@@ -4546,9 +4826,7 @@ exit 2
                 "NetworkSettings": {"Networks": {"ferret-m-1": {}}}
             })
         };
-        let check = |v: serde_json::Value| {
-            inspect_container(&serde_json::to_vec(&v).unwrap(), &n, "H", &cfg).unwrap()
-        };
+        let check = |v: serde_json::Value| inspect_container(&serde_json::to_vec(&v).unwrap(), &n, "H", &cfg).unwrap();
         assert_eq!(check(base()), ContainerFound::Ours { paused: false });
         // Empty IpcMode is also accepted.
         let mut empty_ipc = base();
@@ -4594,11 +4872,45 @@ exit 2
         for (label, mutate) in cases {
             let mut v = base();
             mutate(&mut v);
-            assert!(
-                matches!(check(v), ContainerFound::Stale(_)),
-                "expected Stale for {label}"
-            );
+            assert!(matches!(check(v), ContainerFound::Stale(_)), "expected Stale for {label}");
         }
+    }
+
+    /// The bridge port follows the lead's proxy port, which is new in every daemon life: a box adopted after a restart
+    /// gets its rules applied again with another port. The accept rule of the old port goes (Linux's canonical `-S`
+    /// form too), so the interface keeps one accept rule; the check fails while another accept rule of the interface
+    /// is there, and a sibling mission's rule is never touched.
+    #[test]
+    fn a_bridge_port_that_changed_leaves_no_stale_accept_rule() {
+        let t = Tables::new();
+        let (n, n2) = (names("m-bridge"), names("m-bridge-other"));
+        let gw = "172.28.0.1";
+        let rule = |port: &str| format!("-i {} -p tcp -d {gw} --dport {port} -j ACCEPT", n.iface);
+        let sibling = format!("-i {} -p tcp -d 172.29.0.1 --dport 18081 -j ACCEPT", n2.iface);
+        assert!(t.run_with_extra(
+            RULES_APPLY_BRIDGE,
+            &n2,
+            &["172.29.0.1", "18081"],
+            &rules_text(&n2, &BTreeSet::new())
+        ));
+        assert!(t.run_with_extra(RULES_APPLY_BRIDGE, &n, &[gw, "18080"], &rules_text(&n, &BTreeSet::new())));
+        // The next daemon life: the same box, another bridge port.
+        assert!(t.run_with_extra(RULES_APPLY_BRIDGE, &n, &[gw, "18090"], &rules_text(&n, &BTreeSet::new())));
+        assert_eq!(t.chain("iptables", "INPUT"), [rule("18090"), sibling.clone(), "-i fb-+ -j DROP".to_string()]);
+        assert!(t.run_with_extra(RULES_CHECK_BRIDGE, &n, &[gw, "18090"], ""));
+        // An accept rule of the interface that is not the bridge's (here in Linux's canonical form) fails the check, and
+        // the next apply sweeps it.
+        {
+            let p = t.dir.join("iptables.rules");
+            let cur = std::fs::read_to_string(&p).unwrap();
+            let stale = format!("INPUT|-d {gw}/32 -i {} -p tcp -m tcp --dport 18080 -j ACCEPT\n{cur}", n.iface);
+            std::fs::write(&p, stale).unwrap();
+        }
+        assert!(!t.run_with_extra(RULES_CHECK_BRIDGE, &n, &[gw, "18090"], ""), "a second accept rule of the interface");
+        assert!(t.run_with_extra(RULES_APPLY_BRIDGE, &n, &[gw, "18090"], &rules_text(&n, &BTreeSet::new())));
+        assert_eq!(t.chain("iptables", "INPUT"), [rule("18090"), sibling, "-i fb-+ -j DROP".to_string()]);
+        assert!(t.run_with_extra(RULES_CHECK_BRIDGE, &n, &[gw, "18090"], ""));
+        assert!(t.run_with_extra(RULES_CHECK_BRIDGE, &n2, &["172.29.0.1", "18081"], ""));
     }
 
     #[test]
@@ -4681,10 +4993,7 @@ exit 2
 
         // proxy_url embeds Basic auth credentials when configured.
         assert_eq!(bridge.proxy_url(), "http://sess-user:top-secret-pw-9876@172.28.0.1:18080");
-        assert_eq!(
-            BoxProxyBridge { proxy_auth: None, ..bridge.clone() }.proxy_url(),
-            "http://172.28.0.1:18080"
-        );
+        assert_eq!(BoxProxyBridge { proxy_auth: None, ..bridge.clone() }.proxy_url(), "http://172.28.0.1:18080");
 
         // validate_config allows empty bridge_gateway_ip (auto-discovery), whereas validate requires a concrete IP.
         let auto = BoxProxyBridge { bridge_gateway_ip: String::new(), ..bridge.clone() };
@@ -4701,9 +5010,7 @@ exit 2
             Some(("u".into(), "p w".into())),
             Some(("u".into(), "p\nw".into())),
         ] {
-            assert!(
-                BoxProxyBridge { proxy_auth: bad_auth, ..bridge.clone() }.validate_config().is_err()
-            );
+            assert!(BoxProxyBridge { proxy_auth: bad_auth, ..bridge.clone() }.validate_config().is_err());
         }
 
         // inspect_network_gateway parses Docker IPAM Config Gateway (object or array) and rejects missing/0.0.0.0.
@@ -4808,10 +5115,7 @@ exit 2
             ("CURL_CA_BUNDLE", "/tmp/ferret-ca.pem"),
         ] {
             let pair = format!("{k}={v}");
-            assert!(
-                argv.windows(2).any(|w| w == ["--env", pair.as_str()]),
-                "missing --env {pair} in {argv:?}"
-            );
+            assert!(argv.windows(2).any(|w| w == ["--env", pair.as_str()]), "missing --env {pair} in {argv:?}");
         }
 
         // 4. Reset removes & recreates the container and re-stages /tmp/ferret-ca.pem.

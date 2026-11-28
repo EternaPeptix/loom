@@ -1427,11 +1427,7 @@ fn summary_with_lines(_name: &str, cfg: &TargetCfg, nodes: &[NodeView], lines: &
     }
     let dead_ends = extract_dead_ends(lines);
     if !dead_ends.is_empty() {
-        s.push_str(&format!(
-            "Dead ends ({} of {}):\n",
-            dead_ends.len().min(SUMMARY_DEAD_ENDS),
-            dead_ends.len()
-        ));
+        s.push_str(&format!("Dead ends ({} of {}):\n", dead_ends.len().min(SUMMARY_DEAD_ENDS), dead_ends.len()));
         for d in dead_ends.iter().take(SUMMARY_DEAD_ENDS) {
             s.push_str(&format!(
                 "- {}: {} (mission {})\n",
@@ -1443,11 +1439,7 @@ fn summary_with_lines(_name: &str, cfg: &TargetCfg, nodes: &[NodeView], lines: &
     }
     let resolves = extract_resolves(lines);
     if !resolves.is_empty() {
-        s.push_str(&format!(
-            "Resolutions ({} of {}):\n",
-            resolves.len().min(SUMMARY_RESOLVES),
-            resolves.len()
-        ));
+        s.push_str(&format!("Resolutions ({} of {}):\n", resolves.len().min(SUMMARY_RESOLVES), resolves.len()));
         for r in resolves.iter().take(SUMMARY_RESOLVES) {
             s.push_str(&format!("- {} -> {}\n", r.host, r.ip));
         }
@@ -1854,7 +1846,12 @@ mod tests {
 
         // Cross-mission 3-axis duplicate matching (case-insensitive, normalized CWE + path template + param).
         let dups = s
-            .find_duplicate_findings("acme", "cwe_0639", "https://API.ACME.TEST:443/v1/orders/999/?debug=1", " ORDER_ID ")
+            .find_duplicate_findings(
+                "acme",
+                "cwe_0639",
+                "https://API.ACME.TEST:443/v1/orders/999/?debug=1",
+                " ORDER_ID ",
+            )
             .unwrap();
         assert_eq!(dups.len(), 1);
         assert_eq!(dups[0].id, "fn-001");
@@ -1895,11 +1892,11 @@ mod tests {
             .merge_scope(
                 "acme",
                 &[
-                    "ACME.TEST.".into(),       // duplicate of existing acme.test
-                    "*.acme.test".into(),      // duplicate of existing *.acme.test
-                    "beta.acme.org".into(),    // new
-                    "BETA.ACME.ORG".into(),    // duplicate within same batch
-                    "198.51.100.0/24".into(),  // new CIDR
+                    "ACME.TEST.".into(),      // duplicate of existing acme.test
+                    "*.acme.test".into(),     // duplicate of existing *.acme.test
+                    "beta.acme.org".into(),   // new
+                    "BETA.ACME.ORG".into(),   // duplicate within same batch
+                    "198.51.100.0/24".into(), // new CIDR
                 ],
                 &[
                     "VPN.ACME.TEST".into(),    // duplicate of existing vpn.acme.test

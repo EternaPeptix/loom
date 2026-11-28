@@ -19,8 +19,8 @@ use crate::{
 };
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine};
-use futures_util::{future::join_all, StreamExt};
 use ferret_core::event::{ToolClass, ToolSpec, ToolStatus};
+use futures_util::{future::join_all, StreamExt};
 use reqwest::{
     cookie::{CookieStore, Jar},
     header::{HeaderMap, HeaderName, HeaderValue},
@@ -267,14 +267,7 @@ fn stored_request(ctx: &ToolCtx, id: &str) -> Result<Request, String> {
         let host = if x.port == default_port { x.host.clone() } else { format!("{}:{}", x.host, x.port) };
         format!("{}://{host}{}", x.scheme, x.target)
     };
-    let mut r = Request {
-        url,
-        method,
-        headers: filtered_headers,
-        body: String::new(),
-        body_base64: None,
-        json: None,
-    };
+    let mut r = Request { url, method, headers: filtered_headers, body: String::new(), body_base64: None, json: None };
     if !body.is_empty() {
         r.body_base64 = Some(STANDARD.encode(&body));
     }
@@ -1196,11 +1189,7 @@ fn compare_responses(
                 }
                 if let Some(pv) = pleaves.get(k) {
                     if bv != pv {
-                        highlights.push(format!(
-                            "~{k}: {} -> {}",
-                            crate::preview(bv, 40),
-                            crate::preview(pv, 40)
-                        ));
+                        highlights.push(format!("~{k}: {} -> {}", crate::preview(bv, 40), crate::preview(pv, 40)));
                     }
                 }
             }
@@ -1209,11 +1198,7 @@ fn compare_responses(
     }
 
     let exact = base_body == probe_body;
-    let similarity = if exact {
-        1.0
-    } else {
-        jaccard_sets(&text_tokens(base_body), &text_tokens(probe_body))
-    };
+    let similarity = if exact { 1.0 } else { jaccard_sets(&text_tokens(base_body), &text_tokens(probe_body)) };
     if !exact {
         highlights.push(format!("bytes {} -> {}", base_body.len(), probe_body.len()));
         if let Some((bl, pl)) = base_body.lines().zip(probe_body.lines()).find(|(a, b)| a != b) {
@@ -1397,7 +1382,8 @@ impl Tool for HttpAuthzMatrix {
             }
         }
 
-        let baseline_name = match args.get("baseline").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
+        let baseline_name = match args.get("baseline").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty())
+        {
             Some(b) => {
                 if !principal_names.iter().any(|p| p == b) {
                     return ToolOutput::error(format!(
@@ -1432,11 +1418,7 @@ impl Tool for HttpAuthzMatrix {
                 let iso_client = match client(ctx, iso_jar, insecure) {
                     Ok(c) => c,
                     Err(e) => {
-                        results.push(ProbeResult {
-                            name: name.clone(),
-                            principal_tag: tag.clone(),
-                            outcome: Err(e),
-                        });
+                        results.push(ProbeResult { name: name.clone(), principal_tag: tag.clone(), outcome: Err(e) });
                         continue;
                     }
                 };
@@ -1495,11 +1477,8 @@ impl Tool for HttpAuthzMatrix {
         let baseline_probe = results.iter().find(|r| r.name == baseline_name);
         let baseline_ex = baseline_probe.and_then(|r| r.outcome.as_ref().ok());
         let baseline_status = baseline_ex.map(|e| e.status);
-        let baseline_ct = baseline_ex
-            .and_then(|e| e.headers.get("content-type").map(String::as_str))
-            .unwrap_or("");
-        let baseline_is_auth_2xx =
-            baseline_name != "anon" && baseline_status.is_some_and(|s| (200..300).contains(&s));
+        let baseline_ct = baseline_ex.and_then(|e| e.headers.get("content-type").map(String::as_str)).unwrap_or("");
+        let baseline_is_auth_2xx = baseline_name != "anon" && baseline_status.is_some_and(|s| (200..300).contains(&s));
 
         let mut rows_json = Vec::new();
         let mut anomalies: Vec<Value> = Vec::new();
@@ -1532,14 +1511,8 @@ impl Tool for HttpAuthzMatrix {
                     let (sim_str, similarity_opt, exact_opt, highlights) = if is_baseline {
                         ("1.00 (baseline)".to_string(), Some(1.0), Some(true), Vec::new())
                     } else if let Some(bex) = baseline_ex {
-                        let cmp = compare_responses(
-                            bex.status,
-                            baseline_ct,
-                            &bex.body_text,
-                            ex.status,
-                            ct,
-                            &ex.body_text,
-                        );
+                        let cmp =
+                            compare_responses(bex.status, baseline_ct, &bex.body_text, ex.status, ct, &ex.body_text);
                         let same_ct_class = {
                             let bc = content_type_class(baseline_ct);
                             let pc = content_type_class(ct);
@@ -1584,7 +1557,8 @@ impl Tool for HttpAuthzMatrix {
                         if !clean_highlights.is_empty() {
                             diff_lines.push(format!("- {}: {}", r.name, clean_highlights.join("; ")));
                         } else if cmp.exact_normalized_match {
-                            diff_lines.push(format!("- {}: identical normalized structure to `{baseline_name}`", r.name));
+                            diff_lines
+                                .push(format!("- {}: identical normalized structure to `{baseline_name}`", r.name));
                         }
                         (
                             format!("{:.2}", cmp.similarity),
@@ -1625,11 +1599,7 @@ impl Tool for HttpAuthzMatrix {
             if anomalies.is_empty() {
                 "none".to_string()
             } else {
-                anomalies
-                    .iter()
-                    .filter_map(|a| a.get("reason").and_then(Value::as_str))
-                    .collect::<Vec<_>>()
-                    .join("; ")
+                anomalies.iter().filter_map(|a| a.get("reason").and_then(Value::as_str)).collect::<Vec<_>>().join("; ")
             },
             table_lines.join("\n"),
         );
@@ -1653,7 +1623,10 @@ impl Tool for HttpAuthzMatrix {
         ToolOutput {
             status: if any_err { ToolStatus::Error } else { ToolStatus::Ok },
             outcome,
-            more: vec!["isolated per-principal cookie jars; redirects not followed; auth headers stripped before injection".into()],
+            more: vec![
+                "isolated per-principal cookie jars; redirects not followed; auth headers stripped before injection"
+                    .into(),
+            ],
             body: Body::Raw(report.into_bytes()),
             meta,
         }
@@ -1881,7 +1854,13 @@ mod tests {
         let tool_req = b"GET /api/data HTTP/1.1\r\nHost: target.example\r\nAuthorization: [redacted]\r\nCookie: sid=ok\r\nX-Custom: keep\r\n\r\n";
         let tool_blob = ctx.blobs.put_bytes(tool_req).unwrap();
 
-        let make_ex = |id: &str, source: &str, tls: &str, scheme: &str, port: u16, tool: Option<&str>, blob: ferret_core::blob::BlobRef| {
+        let make_ex = |id: &str,
+                       source: &str,
+                       tls: &str,
+                       scheme: &str,
+                       port: u16,
+                       tool: Option<&str>,
+                       blob: ferret_core::blob::BlobRef| {
             ferret_core::event::Exchange {
                 id: id.into(),
                 call_id: None,
@@ -2012,11 +1991,23 @@ mod tests {
                 get(|h: HeaderMap| async move {
                     let auth = h.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("");
                     if auth == SECRET_A {
-                        (StatusCode::OK, [("content-type", "application/json")], json!({"secret": "alice-only"}).to_string())
+                        (
+                            StatusCode::OK,
+                            [("content-type", "application/json")],
+                            json!({"secret": "alice-only"}).to_string(),
+                        )
                     } else if auth == SECRET_B {
-                        (StatusCode::FORBIDDEN, [("content-type", "application/json")], json!({"error": "forbidden"}).to_string())
+                        (
+                            StatusCode::FORBIDDEN,
+                            [("content-type", "application/json")],
+                            json!({"error": "forbidden"}).to_string(),
+                        )
                     } else {
-                        (StatusCode::UNAUTHORIZED, [("content-type", "application/json")], json!({"error": "login required"}).to_string())
+                        (
+                            StatusCode::UNAUTHORIZED,
+                            [("content-type", "application/json")],
+                            json!({"error": "login required"}).to_string(),
+                        )
                     }
                 }),
             )
@@ -2034,11 +2025,21 @@ mod tests {
 
         let e = crate::testutil::env();
         let items_a = vec![
-            Item { kind: ItemKind::Header, name: "Authorization".into(), value: SECRET_A.into(), host: "127.0.0.1".into() },
+            Item {
+                kind: ItemKind::Header,
+                name: "Authorization".into(),
+                value: SECRET_A.into(),
+                host: "127.0.0.1".into(),
+            },
             Item { kind: ItemKind::Cookie, name: "sid".into(), value: COOKIE_A.into(), host: "127.0.0.1".into() },
         ];
         let items_b = vec![
-            Item { kind: ItemKind::Header, name: "Authorization".into(), value: SECRET_B.into(), host: "127.0.0.1".into() },
+            Item {
+                kind: ItemKind::Header,
+                name: "Authorization".into(),
+                value: SECRET_B.into(),
+                host: "127.0.0.1".into(),
+            },
             Item { kind: ItemKind::Cookie, name: "sid".into(), value: COOKIE_B.into(), host: "127.0.0.1".into() },
         ];
         let all_items: Vec<Item> = items_a.iter().chain(items_b.iter()).cloned().collect();
@@ -2091,15 +2092,16 @@ mod tests {
         assert_eq!(as_b.status, ToolStatus::Ok, "{}", as_b.text);
         assert_eq!(as_b.exchanges[0].principal.as_deref(), Some("profile:user_b"));
         assert!(!as_b.text.contains("jar_sid"), "user_a jar must not bleed into user_b: {}", as_b.text);
-        assert!(!as_b.text.contains("tok-bob") && !as_b.text.contains("bob-cookie"), "no raw secret leak: {}", as_b.text);
+        assert!(
+            !as_b.text.contains("tok-bob") && !as_b.text.contains("bob-cookie"),
+            "no raw secret leak: {}",
+            as_b.text
+        );
         assert!(as_b.text.contains("auth=[redacted]|cookie=sid=[redacted]"), "{}", as_b.text);
 
         // `http_authz_matrix` detects BOLA on `/api/invoices/42` despite differing volatile keys, with ZERO secret leak!
         let bola = e
-            .call(
-                "http_authz_matrix",
-                json!({"url": format!("http://{addr}/api/invoices/42"), "baseline": "user_a"}),
-            )
+            .call("http_authz_matrix", json!({"url": format!("http://{addr}/api/invoices/42"), "baseline": "user_a"}))
             .await;
         assert_eq!(bola.status, ToolStatus::Ok, "{}", bola.text);
         assert_eq!(bola.exchanges.len(), 3, "one Exchange per principal");
@@ -2126,10 +2128,7 @@ mod tests {
 
         // Properly protected endpoint raises ZERO BOLA flags.
         let safe = e
-            .call(
-                "http_authz_matrix",
-                json!({"url": format!("http://{addr}/api/private/42"), "baseline": "user_a"}),
-            )
+            .call("http_authz_matrix", json!({"url": format!("http://{addr}/api/private/42"), "baseline": "user_a"}))
             .await;
         assert_eq!(safe.status, ToolStatus::Ok, "{}", safe.text);
         assert!(!safe.text.contains("potential_bola_idor"), "{}", safe.text);
@@ -2146,10 +2145,7 @@ mod tests {
         assert!(bad_p.text.contains("nope") && bad_p.text.contains("user_a"), "{}", bad_p.text);
 
         let too_few = e
-            .call(
-                "http_authz_matrix",
-                json!({"url": format!("http://{addr}/api/private/42"), "principals": ["anon"]}),
-            )
+            .call("http_authz_matrix", json!({"url": format!("http://{addr}/api/private/42"), "principals": ["anon"]}))
             .await;
         assert_eq!(too_few.status, ToolStatus::Error);
         assert!(too_few.text.contains("at least 2"), "{}", too_few.text);

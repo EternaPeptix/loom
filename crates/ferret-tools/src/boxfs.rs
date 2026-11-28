@@ -307,7 +307,8 @@ impl Walk<'_> {
         names.sort();
         for name in names {
             let lossy = name.to_string_lossy();
-            if lossy.eq_ignore_ascii_case(".git") || (rel.as_os_str().is_empty() && lossy.eq_ignore_ascii_case(".ferret"))
+            if lossy.eq_ignore_ascii_case(".git")
+                || (rel.as_os_str().is_empty() && lossy.eq_ignore_ascii_case(".ferret"))
             {
                 continue;
             }

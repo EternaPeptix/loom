@@ -172,10 +172,8 @@ pub fn detect(bytes: &[u8]) -> Option<ImageInfo> {
         ("image/jpeg", "JPEG", s)
     } else if let Some(s) = gif(bytes) {
         ("image/gif", "GIF", s)
-    } else if let Some(s) = webp(bytes) {
-        ("image/webp", "WEBP", s)
     } else {
-        return None;
+        ("image/webp", "WEBP", webp(bytes)?)
     };
     (size.0 > 0 && size.1 > 0).then_some(ImageInfo { mime, format, width: size.0, height: size.1 })
 }

@@ -21,7 +21,9 @@
 //!     `/scope revoke`, `/panic [reason]`, `/dismiss [id|#n]`, `/tail [id|#n]`, `/mute [dur]`,
 //!     `/unmute`, `/release`, `/approve`, `/rule`, `/help`.
 //!   - Quote-reply (`dataMessage.quote.id` matching a sent alert, with `quote.text` fallback):
-//!     grants/denies `request_scope` approvals via `Runtime::grant_scope`, answers open inbox items
+//!     grants/denies `request_scope` approvals via `Runtime::grant_scope` (only hosts the request's alert shows in
+//!     full: an `approve`, `/scope <item>` or `/approve <item>` of a request whose alert cuts a host short or leaves
+//!     hosts out, or the number of such a host, grants nothing and says how to approve it), answers open inbox items
 //!     with strict `1..=N` option expansion and confirmation echo, or sends a follow-up to the
 //!     mission's lead session when resolved or an error alert. Unmatched quotes NEVER fall through
 //!     to unquoted routing.
@@ -39,7 +41,6 @@ use crate::signal_guests::{
     GUEST_NOTE_MAX_CHARS,
 };
 use crate::wire::SignalHealth;
-use futures_util::StreamExt;
 use ferret_agent::runtime::{
     BusEvent, InboxEntry, NewSession, NoteTriage, NoticeEvent, NoticeSource, Runtime, SessionInfo, LOW_DISK_NOTICE,
 };
@@ -47,6 +48,7 @@ use ferret_agent::session::Phase;
 use ferret_core::config::{valid_e164, valid_signal_uuid, Paths, SignalCfg};
 use ferret_core::event::{Event, InboxItem, InboxKind, Record, ToolStatus, TurnEndReason};
 use ferret_core::SessionId;
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -162,7 +164,10 @@ impl SentStore {
             },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
-                tracing::warn!("signal: could not read {} ({e}); starting with empty quote-reply store", path.display());
+                tracing::warn!(
+                    "signal: could not read {} ({e}); starting with empty quote-reply store",
+                    path.display()
+                );
             }
         }
         Self { path, inner: Arc::new(Mutex::new(inner)) }
@@ -211,10 +216,8 @@ impl SentStore {
                 matched = true;
             }
         }
-        if let Some(pos) = g
-            .pending_echo
-            .iter()
-            .position(|(tgt, h, _)| *h == hash && echo_targets_match(&g, tgt, &norm_target))
+        if let Some(pos) =
+            g.pending_echo.iter().position(|(tgt, h, _)| *h == hash && echo_targets_match(&g, tgt, &norm_target))
         {
             g.pending_echo.remove(pos);
             matched = true;
@@ -614,8 +617,7 @@ fn config_sanity_warnings(cfg: &SignalCfg) -> Vec<String> {
     let rec = cfg.recipient.trim();
     if !rec.starts_with("group:") {
         let norm_rec = SignalCfg::normalize_signal_id(rec);
-        let in_allow =
-            cfg.allow_from.iter().any(|a| SignalCfg::normalize_signal_id(a).eq_ignore_ascii_case(norm_rec));
+        let in_allow = cfg.allow_from.iter().any(|a| SignalCfg::normalize_signal_id(a).eq_ignore_ascii_case(norm_rec));
         if !in_allow {
             warnings.push(format!(
                 "signal.recipient ({rec}) is not in signal.allow_from; outbound alerts will send, but replies from that recipient will be ignored."
@@ -796,6 +798,9 @@ fn try_enqueue_job(
 }
 
 fn dec_pending(pending: &AtomicUsize, health: &SignalHealth) {
+    // Rust 1.100 deprecated `fetch_update` in favour of `try_update`. The old name builds on every toolchain the
+    // workspace supports (rust-version 1.88), which the new one is not known to, so it stays.
+    #[allow(deprecated)]
     let prev = pending.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some(v.saturating_sub(1))).unwrap_or(0);
     health.set_pending_sends(prev.saturating_sub(1));
 }
@@ -1156,14 +1161,8 @@ async fn outbound_sender_loop(
                 }
                 let (title, is_child, lead) = session_meta_summary(&runtime, &session);
                 let display_title = if is_child { format!("unverified: {title}") } else { title.clone() };
-                let text = format_inbox_alert(
-                    &kind,
-                    &session,
-                    &display_title,
-                    &item,
-                    client.config().max_chars,
-                    is_reminder,
-                );
+                let text =
+                    format_inbox_alert(&kind, &session, &display_title, &item, client.config().max_chars, is_reminder);
                 let scope_req = is_scope_request(&item);
                 let res = send_with_retry(&client, &store, &text, timing.retry_delays, &shutdown).await;
                 match res {
@@ -1317,7 +1316,10 @@ async fn send_with_retry(
                 }
                 let delay = retry_delays[attempt];
                 attempt += 1;
-                tracing::warn!("signal outbound transient error (retry {attempt}/{} in {delay:?}): {e}", retry_delays.len());
+                tracing::warn!(
+                    "signal outbound transient error (retry {attempt}/{} in {delay:?}): {e}",
+                    retry_delays.len()
+                );
                 tokio::select! {
                     _ = shutdown.cancelled() => return Err(e),
                     _ = tokio::time::sleep(delay) => {}
@@ -1509,15 +1511,9 @@ async fn process_sse_payload(
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum InboundContent {
-    Text {
-        text: String,
-        quote_ts: Option<u64>,
-        quote_text: Option<String>,
-    },
+    Text { text: String, quote_ts: Option<u64>, quote_text: Option<String> },
     AttachmentOnly,
-    Reaction {
-        emoji: String,
-    },
+    Reaction { emoji: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1565,12 +1561,8 @@ fn parse_envelope(cfg: &SignalCfg, store: &SentStore, raw: &Value) -> Option<Par
 
     let source_num = env.get("sourceNumber").and_then(Value::as_str);
     let source_uuid = env.get("sourceUuid").and_then(Value::as_str);
-    let source_name = env
-        .get("sourceName")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
+    let source_name =
+        env.get("sourceName").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
     store.remember_identity(source_num, source_uuid);
 
     let (is_note_to_self, data_msg) = if let Some(sync) = env.get("syncMessage") {
@@ -1580,11 +1572,8 @@ fn parse_envelope(cfg: &SignalCfg, store: &SentStore, raw: &Value) -> Option<Par
             .and_then(Value::as_str)
             .or_else(|| sent.get("destination").and_then(Value::as_str));
         let dest_uuid = sent.get("destinationUuid").and_then(Value::as_str);
-        let group_opt = sent
-            .get("groupInfo")
-            .and_then(|g| g.get("groupId"))
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty());
+        let group_opt =
+            sent.get("groupInfo").and_then(|g| g.get("groupId")).and_then(Value::as_str).filter(|s| !s.is_empty());
         let is_self_dest = dest_num.is_some_and(|d| d.eq_ignore_ascii_case(account))
             || dest_uuid.is_some_and(|du| {
                 let norm_du = SignalCfg::normalize_signal_id(du);
@@ -1613,9 +1602,7 @@ fn parse_envelope(cfg: &SignalCfg, store: &SentStore, raw: &Value) -> Option<Par
         }
         (true, sent)
     } else {
-        let dm = env
-            .get("dataMessage")
-            .or_else(|| env.get("editMessage").and_then(|e| e.get("dataMessage")))?;
+        let dm = env.get("dataMessage").or_else(|| env.get("editMessage").and_then(|e| e.get("dataMessage")))?;
         (false, dm)
     };
 
@@ -1639,11 +1626,7 @@ fn parse_envelope(cfg: &SignalCfg, store: &SentStore, raw: &Value) -> Option<Par
     let text = data_msg.get("message").and_then(Value::as_str).unwrap_or("").trim().to_string();
     let content = if !text.is_empty() {
         let quote_ts = data_msg.get("quote").and_then(|q| q.get("id")).and_then(Value::as_u64);
-        let quote_text = data_msg
-            .get("quote")
-            .and_then(|q| q.get("text"))
-            .and_then(Value::as_str)
-            .map(str::to_string);
+        let quote_text = data_msg.get("quote").and_then(|q| q.get("text")).and_then(Value::as_str).map(str::to_string);
         InboundContent::Text { text, quote_ts, quote_text }
     } else if let Some(reaction) = data_msg.get("reaction") {
         let is_remove = reaction.get("isRemove").and_then(Value::as_bool).unwrap_or(false);
@@ -1767,10 +1750,8 @@ async fn send_signal_text(
 /// `Thursday, 2026-11-27 19:07 -07:00`) for guest note triage so relative dates resolve cleanly.
 /// Falls back to UTC if local timezone conversion is unavailable.
 fn local_datetime_for_triage() -> String {
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+    let now_secs =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
     #[cfg(unix)]
     {
         let t = now_secs as libc::time_t;
@@ -1779,9 +1760,7 @@ fn local_datetime_for_triage() -> String {
         // SAFETY: `t` and `tm` are valid stack pointers for the duration of `localtime_r`.
         let ok = unsafe { !libc::localtime_r(&t, &mut tm).is_null() };
         if ok {
-            const WEEKDAYS: [&str; 7] = [
-                "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
-            ];
+            const WEEKDAYS: [&str; 7] = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
             let wday = WEEKDAYS.get(usize::try_from(tm.tm_wday).unwrap_or(0)).copied().unwrap_or("Unknown");
             let year = i64::from(tm.tm_year) + 1900;
             let month = tm.tm_mon + 1;
@@ -1793,18 +1772,14 @@ fn local_datetime_for_triage() -> String {
             let abs_mins = off_secs.unsigned_abs() / 60;
             let off_h = abs_mins / 60;
             let off_m = abs_mins % 60;
-            return format!(
-                "{wday}, {year:04}-{month:02}-{day:02} {hour:02}:{min:02} {sign}{off_h:02}:{off_m:02}"
-            );
+            return format!("{wday}, {year:04}-{month:02}-{day:02} {hour:02}:{min:02} {sign}{off_h:02}:{off_m:02}");
         }
     }
     format_utc_datetime_for_triage(now_secs)
 }
 
 fn format_utc_datetime_for_triage(unix_secs: i64) -> String {
-    const WEEKDAYS: [&str; 7] = [
-        "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
-    ];
+    const WEEKDAYS: [&str; 7] = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
     let days = unix_secs.div_euclid(86_400);
     let sec_of_day = unix_secs.rem_euclid(86_400);
     let hour = sec_of_day / 3600;
@@ -1869,14 +1844,8 @@ async fn deliver_guest_note_to_owner(
         return Ok(());
     }
 
-    let action = guests.record_note_action(
-        guest_id,
-        guest_address,
-        display_name,
-        clean_note,
-        triage,
-        ferret_core::now_ms(),
-    );
+    let action =
+        guests.record_note_action(guest_id, guest_address, display_name, clean_note, triage, ferret_core::now_ms());
     let alert = format_triaged_guest_note_alert(
         guest_id,
         &action.note_id,
@@ -1962,12 +1931,7 @@ fn resolve_sender_identity(store: &SentStore, msg: &ParsedInbound) -> (String, O
         store
             .number_for_uuid(&msg.sender)
             .filter(|n| valid_e164(n))
-            .or_else(|| {
-                msg.sender_uuid
-                    .as_deref()
-                    .and_then(|u| store.number_for_uuid(u))
-                    .filter(|n| valid_e164(n))
-            })
+            .or_else(|| msg.sender_uuid.as_deref().and_then(|u| store.number_for_uuid(u)).filter(|n| valid_e164(n)))
     };
     let preferred_address = preferred_e164.unwrap_or_else(|| msg.sender.clone());
 
@@ -2261,7 +2225,9 @@ async fn handle_approved_guest_dm(
                     store,
                     health,
                     &msg.reply_target,
-                    &format!("You've reached the hourly message limit ({limit} messages/hour). Please check back later!"),
+                    &format!(
+                        "You've reached the hourly message limit ({limit} messages/hour). Please check back later!"
+                    ),
                 )
                 .await;
                 return;
@@ -2447,7 +2413,7 @@ async fn dispatch_inbound(
                 "Usage: `@<item_or_session_id> <message>` (or `@#1 <message>` after /inbox or /status).".to_string(),
             );
         }
-        return Some(handle_addressed_reply(runtime, store, id_token, body).await);
+        return Some(handle_addressed_reply(runtime, store, id_token, body, cfg.max_chars).await);
     }
 
     // 4. Plain unquoted reply: ignored in groups so casual chatter never hijacks blockers; in DMs
@@ -2605,10 +2571,7 @@ fn parse_guest_quote_header(text: &str) -> GuestQuoteHeader<'_> {
     }
     if let Some(rest) = first.strip_prefix("[Ferret · GUEST NOTE") {
         if let Some(after_sep) = rest.strip_prefix(" · ") {
-            let guest_tok = after_sep
-                .split(|c: char| c.is_whitespace() || c == ']')
-                .next()
-                .unwrap_or("");
+            let guest_tok = after_sep.split(|c: char| c.is_whitespace() || c == ']').next().unwrap_or("");
             let remainder = &after_sep[guest_tok.len()..];
             // Require a terminating space or `]` after the digits so mid-number truncation
             // (e.g. `g-12` cut to `g-1`) can never misroute to another guest.
@@ -2616,10 +2579,8 @@ fn parse_guest_quote_header(text: &str) -> GuestQuoteHeader<'_> {
             if has_guest_delim && is_valid_guest_record_id(guest_tok) {
                 if remainder.trim_start().starts_with('·') {
                     if let Some(after_note_sep) = remainder.strip_prefix(" · ") {
-                        let note_tok = after_note_sep
-                            .split(|c: char| c.is_whitespace() || c == ']')
-                            .next()
-                            .unwrap_or("");
+                        let note_tok =
+                            after_note_sep.split(|c: char| c.is_whitespace() || c == ']').next().unwrap_or("");
                         let after_note = &after_note_sep[note_tok.len()..];
                         // Require a terminating space or `]` after `n-<digits>` so `n-12` truncated
                         // to `n-1` can NEVER execute the wrong pending note action.
@@ -2636,11 +2597,7 @@ fn parse_guest_quote_header(text: &str) -> GuestQuoteHeader<'_> {
                 }
                 // Legacy `[Ferret · GUEST NOTE · g-N from ...]` (or closed `[Ferret · GUEST NOTE · g-N]`).
                 if remainder.starts_with(']') || remainder.starts_with(" from ") || remainder == " from" {
-                    return GuestQuoteHeader::Valid {
-                        kind: "guest_note",
-                        guest_id: guest_tok,
-                        note_id: None,
-                    };
+                    return GuestQuoteHeader::Valid { kind: "guest_note", guest_id: guest_tok, note_id: None };
                 }
             }
         }
@@ -2676,9 +2633,7 @@ fn parse_mission_quote_header(text: &str) -> Option<MissionQuoteKind> {
     let rest = rest.strip_prefix("REMINDER · ").unwrap_or(rest);
     let (badge, _) = rest.split_once(']')?;
     match badge {
-        "BLOCKER" | "QUESTION" | "APPROVAL" | "SCOPE APPROVAL" | "PARKED" | "FINISHED" => {
-            Some(MissionQuoteKind::Inbox)
-        }
+        "BLOCKER" | "QUESTION" | "APPROVAL" | "SCOPE APPROVAL" | "PARKED" | "FINISHED" => Some(MissionQuoteKind::Inbox),
         "ERROR" => Some(MissionQuoteKind::Error),
         _ => None,
     }
@@ -2690,10 +2645,7 @@ fn is_valid_quote_id_token(tok: &str) -> bool {
 
 /// Extract `(item_tok, session_tok)` strictly from the final non-empty footer line of a Ferret
 /// mission alert (`item: <id> · session: <sid>` for inbox alerts, `session: <sid>` for errors).
-fn parse_anchored_mission_footer(
-    text: &str,
-    kind: MissionQuoteKind,
-) -> Option<(Option<&str>, Option<&str>)> {
+fn parse_anchored_mission_footer(text: &str, kind: MissionQuoteKind) -> Option<(Option<&str>, Option<&str>)> {
     let mut lines = text.lines().map(str::trim).filter(|l| !l.is_empty());
     let first = lines.next()?;
     let last = lines.next_back()?;
@@ -2762,7 +2714,11 @@ fn neutralize_alert_body_lines(raw: &str) -> String {
             }
         })
         .collect();
-    if changed { lines.join("\n") } else { raw.to_string() }
+    if changed {
+        lines.join("\n")
+    } else {
+        raw.to_string()
+    }
 }
 
 async fn handle_quoted_reply(
@@ -2780,11 +2736,12 @@ async fn handle_quoted_reply(
     if target.kind == "guest_note" {
         return handle_guest_note_quote_reply(client, runtime, store, guests, health, target, text).await;
     }
+    let max_chars = client.config().max_chars;
     if let Some(item_id) = &target.item_id {
         let inbox = runtime.inbox();
         if let Some(entry) = inbox.iter().find(|e| e.item.item_id == *item_id) {
             if is_scope_request(&entry.item) {
-                return handle_scope_reply(runtime, entry, text).await;
+                return handle_scope_reply(runtime, entry, text, max_chars).await;
             }
             return answer_with_options(runtime, entry, text).await;
         }
@@ -2822,10 +2779,12 @@ async fn handle_guest_request_quote_reply(
     if matches!(verb.as_str(), "approve" | "yes" | "y" | "allow" | "ok") {
         let nickname = (!rest.is_empty()).then_some(rest);
         let res = match target.guest_id.as_deref() {
-            Some(gid) => guests.approve(cfg, gid, nickname, false, now_ms).or_else(|_| match target.guest_target.as_deref() {
-                Some(addr) => guests.approve(cfg, addr, nickname, true, now_ms),
-                None => Err(format!("No guest matches `{gid}`. Send /guests.")),
-            }),
+            Some(gid) => {
+                guests.approve(cfg, gid, nickname, false, now_ms).or_else(|_| match target.guest_target.as_deref() {
+                    Some(addr) => guests.approve(cfg, addr, nickname, true, now_ms),
+                    None => Err(format!("No guest matches `{gid}`. Send /guests.")),
+                })
+            }
             None => guests.approve(cfg, lookup_tok, nickname, true, now_ms),
         };
         match res {
@@ -2887,11 +2846,7 @@ enum NoteQuoteCommand<'a> {
 /// `"Let's do 6 instead"`.
 fn parse_note_quote_command(raw: &str) -> NoteQuoteCommand<'_> {
     let trimmed = raw.trim();
-    let collapsed = trimmed
-        .split_whitespace()
-        .map(str::to_ascii_lowercase)
-        .collect::<Vec<_>>()
-        .join(" ");
+    let collapsed = trimmed.split_whitespace().map(str::to_ascii_lowercase).collect::<Vec<_>>().join(" ");
     if matches!(collapsed.as_str(), "do + reply" | "do+reply" | "do and reply") {
         return NoteQuoteCommand::DoAndReply;
     }
@@ -2944,15 +2899,10 @@ impl Drop for NoteClaimGuard {
 /// segments in non-existent paths, and any path inside `<ferret home>` or its copies folder.
 fn validate_action_workspace(raw_ws: &Path, ferret_home: Option<&Path>) -> Result<PathBuf, String> {
     if !raw_ws.is_absolute() {
-        return Err(format!(
-            "Action workspace {} must be an absolute path (or start with ~/).",
-            raw_ws.display()
-        ));
+        return Err(format!("Action workspace {} must be an absolute path (or start with ~/).", raw_ws.display()));
     }
     if !raw_ws.exists()
-        && raw_ws
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::CurDir))
+        && raw_ws.components().any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::CurDir))
     {
         return Err(format!(
             "Action workspace {} does not exist and contains . or .. . Write the path out in full.",
@@ -3122,10 +3072,8 @@ async fn handle_guest_note_quote_reply(
                     tail_id(existing_sid)
                 );
             }
-            let is_actionable = peeked
-                .triage
-                .as_ref()
-                .is_some_and(|t| t.actionable && !t.proposed_task.trim().is_empty());
+            let is_actionable =
+                peeked.triage.as_ref().is_some_and(|t| t.actionable && !t.proposed_task.trim().is_empty());
             if !is_actionable {
                 return format!(
                     "✗ Note {} has no suggested action to run. Quote-reply with a message to reply to {} directly.",
@@ -3192,8 +3140,10 @@ async fn handle_guest_note_quote_reply(
                 if let Some(suggested) = triage.suggested_reply.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
                     match guests.resolve_for_say(cfg, &action.guest_id) {
                         Ok(guest_info) => {
-                            let outbound =
-                                truncate_chars(&format!("Message from {owner}: {suggested}"), cfg.guests.max_reply_chars);
+                            let outbound = truncate_chars(
+                                &format!("Message from {owner}: {suggested}"),
+                                cfg.guests.max_reply_chars,
+                            );
                             match send_signal_text(client, store, health, &guest_info.address, &outbound).await {
                                 Ok(_) => format!(
                                     "✓ Started task [{sid}] ({title}) for note {} and sent suggested reply to {}.",
@@ -3223,18 +3173,55 @@ async fn handle_guest_note_quote_reply(
     }
 }
 
-async fn handle_scope_reply(runtime: &Runtime, entry: &InboxEntry, raw_reply: &str) -> String {
+/// Which of a scope request's hosts its Signal alert shows in full (in the alert as `format_inbox_alert` writes it for
+/// a reminder, whose longer header cuts the most): a host that is cut short (`…`) or left out (`… +N more`) is not.
+fn hosts_shown_in_full(runtime: &Runtime, entry: &InboxEntry, max_chars: usize) -> Vec<bool> {
+    let (title, is_child, _) = session_meta_summary(runtime, &entry.session);
+    let title = if is_child { format!("unverified: {title}") } else { title };
+    let alert = format_inbox_alert("approval", &entry.session, &title, &entry.item, max_chars, true);
+    let lines: Vec<&str> = alert.lines().collect();
+    (1..=entry.item.options.len())
+        .zip(&entry.item.options)
+        .map(|(i, host)| {
+            let line = format!("  {i}. {}", host.trim());
+            // A line followed by another: the last line of a cut alert may itself be cut.
+            lines.iter().position(|l| *l == line).is_some_and(|at| at + 1 < lines.len())
+        })
+        .collect()
+}
+
+/// The refusal of a Signal approval that names a host its alert did not show in full: an approval grants what the
+/// operator saw, and the monitor counts every grant as the operator's (`docs/MONITOR.md` §2.4).
+fn hidden_hosts_refusal(entry: &InboxEntry, hidden: &[&String]) -> String {
+    format!(
+        "✗ Nothing granted on {}: the alert could not show {} of the {} requested hosts in full ({}), and an approval from \
+         Signal grants only hosts it showed. Reply with the numbers of hosts shown in full, send `/scope <session> \
+         <host>...` with the names written out, or approve it in the web UI or with `ferret scope`.",
+        entry.title,
+        hidden.len(),
+        entry.item.options.len(),
+        hidden.iter().map(|h| truncate_chars(h, 48)).collect::<Vec<_>>().join(", ")
+    )
+}
+
+async fn handle_scope_reply(runtime: &Runtime, entry: &InboxEntry, raw_reply: &str, max_chars: usize) -> String {
     let reply = raw_reply.trim();
     let lower = reply.to_ascii_lowercase();
     let hosts = &entry.item.options;
 
     if matches!(lower.as_str(), "deny" | "reject" | "no" | "n" | "dismiss" | "cancel") {
         return match runtime.answer(&entry.item.item_id, "").await {
-            Ok(()) => format!("✓ Denied & dismissed scope request [{}] on {}.", tail_id(&entry.item.item_id), entry.title),
+            Ok(()) => {
+                format!("✓ Denied & dismissed scope request [{}] on {}.", tail_id(&entry.item.item_id), entry.title)
+            }
             Err(e) => format!("✗ Could not dismiss scope request [{}]: {e}", tail_id(&entry.item.item_id)),
         };
     }
 
+    let shown = hosts_shown_in_full(runtime, entry, max_chars);
+    let hidden_of = |list: &[String]| -> Vec<&String> {
+        hosts.iter().zip(&shown).filter(|(h, full)| !**full && list.contains(h)).map(|(h, _)| h).collect()
+    };
     let selected: Vec<String> = if matches!(lower.as_str(), "approve" | "yes" | "y" | "allow" | "grant" | "all") {
         hosts.clone()
     } else if let Some(chosen) = parse_host_indices(reply, hosts) {
@@ -3250,6 +3237,10 @@ async fn handle_scope_reply(runtime: &Runtime, entry: &InboxEntry, raw_reply: &s
         );
     };
 
+    let hidden = hidden_of(&selected);
+    if !hidden.is_empty() {
+        return hidden_hosts_refusal(entry, &hidden);
+    }
     match runtime.grant_scope(&entry.session, &selected, Some("approved via Signal")).await {
         Ok(receipt) => {
             let _ = runtime.answer(&entry.item.item_id, "").await;
@@ -3294,7 +3285,13 @@ fn parse_host_indices(reply: &str, hosts: &[String]) -> Option<Result<Vec<String
     Some(Ok(selected))
 }
 
-async fn handle_addressed_reply(runtime: &Runtime, store: &SentStore, token: &str, body: &str) -> String {
+async fn handle_addressed_reply(
+    runtime: &Runtime,
+    store: &SentStore,
+    token: &str,
+    body: &str,
+    max_chars: usize,
+) -> String {
     let inbox = runtime.inbox();
 
     // 1. `#N` or numeric alias from `/inbox` or multi-blocker prompt.
@@ -3302,7 +3299,7 @@ async fn handle_addressed_reply(runtime: &Runtime, store: &SentStore, token: &st
         if let Some(item_id) = store.inbox_alias(n) {
             if let Some(entry) = inbox.iter().find(|e| e.item.item_id == item_id) {
                 return if is_scope_request(&entry.item) {
-                    handle_scope_reply(runtime, entry, body).await
+                    handle_scope_reply(runtime, entry, body, max_chars).await
                 } else {
                     answer_with_options(runtime, entry, body).await
                 };
@@ -3322,7 +3319,7 @@ async fn handle_addressed_reply(runtime: &Runtime, store: &SentStore, token: &st
     if item_matches.len() == 1 {
         let entry = item_matches[0];
         return if is_scope_request(&entry.item) {
-            handle_scope_reply(runtime, entry, body).await
+            handle_scope_reply(runtime, entry, body, max_chars).await
         } else {
             answer_with_options(runtime, entry, body).await
         };
@@ -3420,7 +3417,7 @@ async fn handle_slash_command(
         "/panic" => cmd_panic(runtime, arg).await,
         "/resume" => cmd_resume(runtime, store, arg).await,
         "/dismiss" => cmd_dismiss(runtime, store, arg).await,
-        "/scope" => cmd_scope(runtime, store, arg).await,
+        "/scope" => cmd_scope(runtime, store, arg, cfg.max_chars).await,
         "/tail" => cmd_tail(runtime, store, arg, cfg.max_chars),
         "/mute" => cmd_mute(store, health, arg),
         "/unmute" => {
@@ -3428,7 +3425,7 @@ async fn handle_slash_command(
             "✓ Signal alerts unmuted.".to_string()
         }
         "/release" => cmd_release(runtime, store, arg).await,
-        "/approve" => cmd_approve(runtime, store, arg).await,
+        "/approve" => cmd_approve(runtime, store, arg, cfg.max_chars).await,
         "/rule" => cmd_rule(runtime, store, arg).await,
         "/guests" => cmd_guests(guests, cfg),
         "/guest" => cmd_guest(client, store, guests, health, cfg, arg).await,
@@ -3515,7 +3512,10 @@ async fn cmd_guest(
                             outcome.display_name, outcome.address, outcome.address, outcome.address
                         )
                     } else {
-                        format!("✓ Revoked guest {} ({}) and wiped conversation history.", outcome.display_name, outcome.address)
+                        format!(
+                            "✓ Revoked guest {} ({}) and wiped conversation history.",
+                            outcome.display_name, outcome.address
+                        )
                     }
                 }
                 Err(e) => format!("✗ {e}"),
@@ -3607,11 +3607,8 @@ fn cmd_inbox(runtime: &Runtime, store: &SentStore, max_chars: usize) -> String {
             format!("SCOPE · {} host(s)", e.item.options.len())
         } else {
             let tag = if e.item.blocking { "BLOCKING" } else { "info" };
-            let opts = if e.item.options.is_empty() {
-                String::new()
-            } else {
-                format!(" · {} opts", e.item.options.len())
-            };
+            let opts =
+                if e.item.options.is_empty() { String::new() } else { format!(" · {} opts", e.item.options.len()) };
             format!("{} · {tag}{opts}", inbox_kind_str(e.item.kind))
         };
         let line = format!(
@@ -3658,14 +3655,16 @@ fn cmd_status(runtime: &Runtime, store: &SentStore, health: &SignalHealth, max_c
     ordered.extend(roots.iter().copied().filter(|s| s.status.phase == Phase::Running));
     ordered.extend(roots.iter().copied().filter(|s| s.status.phase != Phase::Running && is_waiting_session(s)));
     ordered.extend(
-        roots.iter().copied().filter(|s| {
-            s.status.phase != Phase::Running && !is_waiting_session(s) && is_resumable_session(s)
-        }),
+        roots
+            .iter()
+            .copied()
+            .filter(|s| s.status.phase != Phase::Running && !is_waiting_session(s) && is_resumable_session(s)),
     );
     ordered.extend(
-        roots.iter().copied().filter(|s| {
-            s.status.phase != Phase::Running && !is_waiting_session(s) && !is_resumable_session(s)
-        }),
+        roots
+            .iter()
+            .copied()
+            .filter(|s| s.status.phase != Phase::Running && !is_waiting_session(s) && !is_resumable_session(s)),
     );
 
     let shown = ordered.len().min(12);
@@ -3724,8 +3723,22 @@ async fn cmd_panic(runtime: &Runtime, arg: &str) -> String {
                 let ids: Vec<String> = report.sessions_stopped.iter().map(|s| tail_id(s.as_str())).collect();
                 format!(" ({})", ids.join(", "))
             };
+            // What the census stopped under the sessions' sandboxes (E3), when there was any.
+            let census = if report.processes_killed > 0 || report.processes_left > 0 {
+                format!(
+                    " · {} process(es) left under the sandboxes stopped{}",
+                    report.processes_killed,
+                    if report.processes_left > 0 {
+                        format!(", {} could not be", report.processes_left)
+                    } else {
+                        String::new()
+                    }
+                )
+            } else {
+                String::new()
+            };
             format!(
-                "✓ Panic stop complete: {} connection(s) cut · {} session(s) stopped{stopped_ids} · {} box(es) torn down · {} rewrite(s) disabled.",
+                "✓ Panic stop complete: {} connection(s) cut · {} session(s) stopped{stopped_ids} · {} box(es) torn down · {} rewrite(s) disabled{census}.",
                 report.connections_cut,
                 report.sessions_stopped.len(),
                 report.boxes_torn_down,
@@ -3746,8 +3759,7 @@ async fn cmd_resume(runtime: &Runtime, store: &SentStore, arg: &str) -> String {
             [] => return "No stopped or parked session to resume. Send /status to list missions.".to_string(),
             many => {
                 store.set_session_aliases(many.iter().take(8).map(|s| s.meta.id.as_str().to_string()).collect());
-                let mut msg =
-                    String::from("Multiple stopped/parked sessions — send `/resume #1` (or `/resume <id>`):");
+                let mut msg = String::from("Multiple stopped/parked sessions — send `/resume #1` (or `/resume <id>`):");
                 for (i, s) in many.iter().take(8).enumerate() {
                     msg.push_str(&format!(
                         "\n• #{} ({}) [{}] {}",
@@ -3825,12 +3837,11 @@ async fn cmd_dismiss(runtime: &Runtime, store: &SentStore, arg: &str) -> String 
     }
 }
 
-async fn cmd_scope(runtime: &Runtime, store: &SentStore, arg: &str) -> String {
+async fn cmd_scope(runtime: &Runtime, store: &SentStore, arg: &str, max_chars: usize) -> String {
     let tokens: Vec<&str> = arg.split_whitespace().collect();
     if tokens.is_empty() {
         // Convenience: if exactly 1 scope request is open, show how to approve it.
-        let scopes: Vec<InboxEntry> =
-            runtime.inbox().into_iter().filter(|e| is_scope_request(&e.item)).collect();
+        let scopes: Vec<InboxEntry> = runtime.inbox().into_iter().filter(|e| is_scope_request(&e.item)).collect();
         if let [only] = scopes.as_slice() {
             return format!(
                 "Usage: `/scope <session|#n> <host>...`, `/scope revoke <session|#n> <host>...`, or `/scope {}` to approve [{}]: {}",
@@ -3853,12 +3864,17 @@ async fn cmd_scope(runtime: &Runtime, store: &SentStore, arg: &str) -> String {
             Err(e) => return e,
         };
         let hosts: Vec<String> = tokens[2..].iter().map(|h| (*h).to_string()).collect();
-        return match runtime.revoke_scope(&target.meta.id, hosts, Some("revoked via Signal".to_string())).await {
+        return match runtime.revoke_scope(&target.meta.id, &hosts, Some("revoked via Signal")).await {
             Ok(receipt) => format!(
-                "✓ Revoked scope on {}: {} ({} connection(s) cut)",
+                "✓ Revoked scope on {}: {} ({} connection(s) cut){}",
                 target.meta.title,
                 receipt.revoked.join(", "),
-                receipt.connections_cut
+                receipt.connections_cut,
+                if receipt.not_granted.is_empty() {
+                    String::new()
+                } else {
+                    format!("; not granted by itself, refused from now on: {}", receipt.not_granted.join(", "))
+                }
             ),
             Err(e) => format!("✗ Could not revoke scope on {}: {e}", target.meta.title),
         };
@@ -3869,7 +3885,7 @@ async fn cmd_scope(runtime: &Runtime, store: &SentStore, arg: &str) -> String {
         let inbox = runtime.inbox();
         if let Ok(entry) = resolve_inbox_token(&inbox, store, tokens[0]) {
             if is_scope_request(&entry.item) {
-                return handle_scope_reply(runtime, entry, "approve").await;
+                return handle_scope_reply(runtime, entry, "approve", max_chars).await;
             }
             return format!(
                 "✗ Item [{}] is not a network scope request. Use `/scope <session|#n> <host>...`.",
@@ -4080,7 +4096,7 @@ async fn cmd_release(runtime: &Runtime, store: &SentStore, arg: &str) -> String 
     }
 }
 
-async fn cmd_approve(runtime: &Runtime, store: &SentStore, arg: &str) -> String {
+async fn cmd_approve(runtime: &Runtime, store: &SentStore, arg: &str, max_chars: usize) -> String {
     let mut split = arg.splitn(2, char::is_whitespace);
     let token = split.next().unwrap_or("").trim();
     let text = split.next().unwrap_or("").trim();
@@ -4092,7 +4108,7 @@ async fn cmd_approve(runtime: &Runtime, store: &SentStore, arg: &str) -> String 
         let inbox = runtime.inbox();
         if let Ok(entry) = resolve_inbox_token(&inbox, store, token) {
             if is_scope_request(&entry.item) {
-                return handle_scope_reply(runtime, entry, "approve").await;
+                return handle_scope_reply(runtime, entry, "approve", max_chars).await;
             }
         }
         return "Usage: `/approve <session|#n> <what is approved>`.".to_string();
@@ -4181,16 +4197,14 @@ fn resolve_session_token<'a>(
     }
     match match_root_session(roots, token) {
         SessionMatch::One(s) => Ok(s),
-        SessionMatch::Many => Err(format!("✗ `{token}` matches multiple sessions; use `#N` from /status or a longer ID.")),
+        SessionMatch::Many => {
+            Err(format!("✗ `{token}` matches multiple sessions; use `#N` from /status or a longer ID."))
+        }
         SessionMatch::None => Err(format!("✗ No session matches `{token}`. Send /status to list missions.")),
     }
 }
 
-fn resolve_inbox_token<'a>(
-    inbox: &'a [InboxEntry],
-    store: &SentStore,
-    token: &str,
-) -> Result<&'a InboxEntry, String> {
+fn resolve_inbox_token<'a>(inbox: &'a [InboxEntry], store: &SentStore, token: &str) -> Result<&'a InboxEntry, String> {
     if let Some(n) = parse_alias_index(token) {
         if let Some(id) = store.inbox_alias(n) {
             if let Some(found) = inbox.iter().find(|e| e.item.item_id == id) {
@@ -4239,10 +4253,7 @@ fn is_resumable_session(s: &SessionInfo) -> bool {
         && matches!(
             s.status.last_end,
             Some(
-                TurnEndReason::Stopped
-                    | TurnEndReason::Parked
-                    | TurnEndReason::Error
-                    | TurnEndReason::BudgetExhausted
+                TurnEndReason::Stopped | TurnEndReason::Parked | TurnEndReason::Error | TurnEndReason::BudgetExhausted
             )
         )
 }
@@ -4365,11 +4376,7 @@ fn format_inbox_alert(
 
     let untrusted = item.call_id.is_some();
     let cleaned_body = neutralize_alert_body_lines(item.text.trim());
-    let body_raw = if untrusted {
-        format!("[From the agent, unverified] {cleaned_body}")
-    } else {
-        cleaned_body
-    };
+    let body_raw = if untrusted { format!("[From the agent, unverified] {cleaned_body}") } else { cleaned_body };
 
     // Build options/hosts block, capping per-option length if `max_chars` is tight.
     let options_block = if item.options.is_empty() {
@@ -4442,7 +4449,11 @@ fn format_error_alert(session: &str, title: &str, message: &str, max_chars: usiz
     }
     out.push_str("\n\n");
     out.push_str(&footer);
-    if out.chars().count() <= max_chars { out } else { truncate_chars(&out, max_chars) }
+    if out.chars().count() <= max_chars {
+        out
+    } else {
+        truncate_chars(&out, max_chars)
+    }
 }
 
 fn format_error_burst(entries: &[(String, String, String)], max_chars: usize) -> String {
@@ -4641,11 +4652,7 @@ mod tests {
         assert!(sender_authorized(&cfg, &store, &parsed));
 
         // UUID-only PNP message matching remembered number AND normalized `u:` / `PNI:` entries
-        for uuid in [
-            "uuid-owner-1",
-            "00000000-0000-4000-8000-000000000001",
-            "11111111-2222-3333-4444-555555555555",
-        ] {
+        for uuid in ["uuid-owner-1", "00000000-0000-4000-8000-000000000001", "11111111-2222-3333-4444-555555555555"] {
             let uuid_only = json!({
                 "envelope": {
                     "sourceUuid": uuid,
@@ -4781,7 +4788,8 @@ mod tests {
             call_id: None,
             reference: None,
         };
-        let rendered = format_inbox_alert("question", &SessionId::from("s-019a2b3c4d5e6f7g"), "Release", &item, 220, false);
+        let rendered =
+            format_inbox_alert("question", &SessionId::from("s-019a2b3c4d5e6f7g"), "Release", &item, 220, false);
         assert!(rendered.chars().count() <= 220, "exceeded max_chars: {}", rendered.chars().count());
         let lines: Vec<&str> = rendered.lines().collect();
         assert_eq!(lines[0], "[Ferret · QUESTION] Release");
@@ -4798,14 +4806,8 @@ mod tests {
             call_id: Some(ferret_core::CallId::from("c1")),
             reference: None,
         };
-        let scope_rendered = format_inbox_alert(
-            "approval",
-            &SessionId::from("s-019a2b3c4d5e6f7g"),
-            "Audit",
-            &scope_item,
-            600,
-            false,
-        );
+        let scope_rendered =
+            format_inbox_alert("approval", &SessionId::from("s-019a2b3c4d5e6f7g"), "Audit", &scope_item, 600, false);
         assert!(scope_rendered.contains("[Ferret · SCOPE APPROVAL] Audit"), "{scope_rendered}");
         assert!(scope_rendered.contains("Requested hosts:"), "{scope_rendered}");
         assert!(!scope_rendered.contains("Options:"), "{scope_rendered}");
@@ -4828,40 +4830,38 @@ mod tests {
     async fn signal_client_check_list_accounts_and_untrusted_identity_remediation() {
         let received = Arc::new(Mutex::new(Vec::<Value>::new()));
         let rec_clone = received.clone();
-        let app = Router::new()
-            .route("/api/v1/check", get(|| async { axum::http::StatusCode::OK }))
-            .route(
-                "/api/v1/rpc",
-                post(move |axum::Json(body): axum::Json<Value>| {
-                    let rec = rec_clone.clone();
-                    async move {
-                        rec.lock().unwrap().push(body.clone());
-                        match body["method"].as_str() {
-                            Some("listAccounts") => axum::Json(json!({
-                                "jsonrpc": "2.0",
-                                "result": [{ "number": "+15550100" }],
-                                "id": "1"
-                            })),
-                            Some("send") if body["params"]["message"] == "trigger-untrusted" => axum::Json(json!({
-                                "jsonrpc": "2.0",
-                                "result": {
-                                    "timestamp": 1764280000112u64,
-                                    "results": [{
-                                        "type": "UNTRUSTED_IDENTITY",
-                                        "recipientAddress": { "number": "+15550199" }
-                                    }]
-                                },
-                                "id": "2"
-                            })),
-                            _ => axum::Json(json!({
-                                "jsonrpc": "2.0",
-                                "result": { "timestamp": 1764280000111u64, "results": [{ "type": "SUCCESS" }] },
-                                "id": "3"
-                            })),
-                        }
+        let app = Router::new().route("/api/v1/check", get(|| async { axum::http::StatusCode::OK })).route(
+            "/api/v1/rpc",
+            post(move |axum::Json(body): axum::Json<Value>| {
+                let rec = rec_clone.clone();
+                async move {
+                    rec.lock().unwrap().push(body.clone());
+                    match body["method"].as_str() {
+                        Some("listAccounts") => axum::Json(json!({
+                            "jsonrpc": "2.0",
+                            "result": [{ "number": "+15550100" }],
+                            "id": "1"
+                        })),
+                        Some("send") if body["params"]["message"] == "trigger-untrusted" => axum::Json(json!({
+                            "jsonrpc": "2.0",
+                            "result": {
+                                "timestamp": 1764280000112u64,
+                                "results": [{
+                                    "type": "UNTRUSTED_IDENTITY",
+                                    "recipientAddress": { "number": "+15550199" }
+                                }]
+                            },
+                            "id": "2"
+                        })),
+                        _ => axum::Json(json!({
+                            "jsonrpc": "2.0",
+                            "result": { "timestamp": 1764280000111u64, "results": [{ "type": "SUCCESS" }] },
+                            "id": "3"
+                        })),
                     }
-                }),
-            );
+                }
+            }),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -4903,11 +4903,10 @@ mod tests {
     async fn scope_approval_unmatched_quote_guard_shortcuts_and_slash_commands() {
         let script = Script::new(|_, step| match step {
             // Turn 0 (session 1): request_scope
-            0 => Reply::tool(
-                "request_scope",
-                r#"{"hosts":["api.example.test","cdn.example.test"],"why":"Fetch docs"}"#,
-            )
-            .into(),
+            0 => {
+                Reply::tool("request_scope", r#"{"hosts":["api.example.test","cdn.example.test"],"why":"Fetch docs"}"#)
+                    .into()
+            }
             // Turn 1 (session 1): ask blocking question with options
             1 => Reply::tool(
                 "ask_user",
@@ -4954,7 +4953,8 @@ mod tests {
         assert!(env.rt.inbox().iter().any(|e| e.item.item_id == q_entry.item.item_id), "blocker must stay open!");
 
         // 2. Fallback quote-reply via `quote.text` footer resolves even when ts isn't in SentStore
-        let fallback_text = format!("[Ferret · SCOPE APPROVAL] Alpha\nitem: {} · session: {}", scope_entry.item.item_id, info.meta.id);
+        let fallback_text =
+            format!("[Ferret · SCOPE APPROVAL] Alpha\nitem: {} · session: {}", scope_entry.item.item_id, info.meta.id);
         let partial_grant = text_inbound("1", Some(888888), Some(&fallback_text), None);
         let reply = dispatch_inbound(&client, &env.rt, &store, &guests, &health, &partial_grant).await.unwrap();
         assert!(reply.contains("✓ Granted scope on Alpha Mission: api.example.test"), "{reply}");
@@ -4972,36 +4972,43 @@ mod tests {
         assert!(env.rt.inbox().iter().any(|e| e.item.item_id == q_entry.item.item_id));
 
         // 5. `/inbox` assigns `#1`, and `@#1 2.` expands option #2 and echoes resolved text
-        let inbox_out = dispatch_inbound(&client, &env.rt, &store, &guests, &health, &text_inbound("/inbox", None, None, None))
-            .await
-            .unwrap();
+        let inbox_out =
+            dispatch_inbound(&client, &env.rt, &store, &guests, &health, &text_inbound("/inbox", None, None, None))
+                .await
+                .unwrap();
         assert!(inbox_out.contains("#1"), "{inbox_out}");
         let ans_out =
-            dispatch_inbound(&client, &env.rt, &store, &guests, &health, &text_inbound("@#1 2.", None, None, None)).await.unwrap();
+            dispatch_inbound(&client, &env.rt, &store, &guests, &health, &text_inbound("@#1 2.", None, None, None))
+                .await
+                .unwrap();
         assert!(ans_out.contains("✓ Answered question") && ans_out.contains("→ \"prod\""), "{ans_out}");
         wait_for(|| !env.rt.inbox().iter().any(|e| e.item.item_id == q_entry.item.item_id)).await;
 
         // 6. `/status` lists non-running sessions with `#1`; `/tail #1` returns recent activity;
         // `/mute 15m` updates SignalHealth; `/unmute` clears it; `/approve`, `/rule`, `/release` work
-        let status_out = dispatch_inbound(&client, &env.rt, &store, &guests, &health, &text_inbound("/status", None, None, None))
-            .await
-            .unwrap();
+        let status_out =
+            dispatch_inbound(&client, &env.rt, &store, &guests, &health, &text_inbound("/status", None, None, None))
+                .await
+                .unwrap();
         assert!(status_out.contains("#1") && status_out.contains("Alpha Mission"), "{status_out}");
 
-        let tail_out = dispatch_inbound(&client, &env.rt, &store, &guests, &health, &text_inbound("/tail #1", None, None, None))
-            .await
-            .unwrap();
+        let tail_out =
+            dispatch_inbound(&client, &env.rt, &store, &guests, &health, &text_inbound("/tail #1", None, None, None))
+                .await
+                .unwrap();
         assert!(tail_out.contains("Recent activity for Alpha Mission"), "{tail_out}");
 
-        let mute_out = dispatch_inbound(&client, &env.rt, &store, &guests, &health, &text_inbound("/mute 15m", None, None, None))
-            .await
-            .unwrap();
+        let mute_out =
+            dispatch_inbound(&client, &env.rt, &store, &guests, &health, &text_inbound("/mute 15m", None, None, None))
+                .await
+                .unwrap();
         assert!(mute_out.contains("Muted Signal alerts for 15m"), "{mute_out}");
         assert!(health.snapshot().muted_until_ms.is_some());
 
-        let unmute_out = dispatch_inbound(&client, &env.rt, &store, &guests, &health, &text_inbound("/unmute", None, None, None))
-            .await
-            .unwrap();
+        let unmute_out =
+            dispatch_inbound(&client, &env.rt, &store, &guests, &health, &text_inbound("/unmute", None, None, None))
+                .await
+                .unwrap();
         assert!(unmute_out.contains("unmuted"), "{unmute_out}");
         assert!(health.snapshot().muted_until_ms.is_none());
 
@@ -5044,9 +5051,10 @@ mod tests {
         assert!(release_out.contains("✓ Release"), "{release_out}");
 
         // Bare `/resume` does NOT blindly resume a non-stopped mission
-        let resume_none = dispatch_inbound(&client, &env.rt, &store, &guests, &health, &text_inbound("/resume", None, None, None))
-            .await
-            .unwrap();
+        let resume_none =
+            dispatch_inbound(&client, &env.rt, &store, &guests, &health, &text_inbound("/resume", None, None, None))
+                .await
+                .unwrap();
         assert!(resume_none.contains("No stopped or parked session"), "{resume_none}");
 
         // `/scope <session> <host>` grants explicit hosts directly
@@ -5068,6 +5076,67 @@ mod tests {
         let recovered = SentStore::open(corrupt_path);
         assert!(recovered.lookup(1).is_none());
 
+        env.rt.shutdown().await;
+    }
+
+    /// A Signal approval grants only the hosts its alert showed in full: the monitor counts every grant as the
+    /// operator's, so `approve` (all) of a request whose alert cut a host short or left hosts out grants nothing, and
+    /// neither does the number of a host shown cut; the number of a host shown in full still grants it.
+    #[tokio::test]
+    async fn a_signal_approval_grants_only_hosts_its_alert_showed_in_full() {
+        const LONG: &str = "api.target.example.com.cdn-edge-cache-node-0042.prod-global.attacker.test";
+        let script = Script::new(|_, step| match step {
+            0 => {
+                let mut hosts = vec![LONG.to_string()];
+                hosts.extend((2..=12).map(|i| format!("h{i:02}.example.test")));
+                let args = json!({"hosts": hosts, "why": "Fetch docs"}).to_string();
+                Reply::tool("request_scope", &args).into()
+            }
+            _ => Reply::text("done").into(),
+        });
+        let env = start_test_runtime(script).await;
+        let dir = tempfile::tempdir().unwrap();
+        let store = SentStore::open(dir.path().join("signal_sent.json"));
+        let guests = GuestStore::open(dir.path().join("signal_guests.json"));
+        let cfg = SignalCfg { max_chars: 400, ..sample_cfg("http://127.0.0.1:1337") };
+        let client = SignalClient::new(cfg.clone()).unwrap();
+        let health = SignalHealth::from_config(&cfg);
+        let info = env.rt.create_session(new_session(&env.ws, "lead", "Gamma Mission", "go")).await.unwrap();
+        wait_for(|| env.rt.inbox().iter().any(|e| is_scope_request(&e.item))).await;
+        let entry = env.rt.inbox().into_iter().find(|e| is_scope_request(&e.item)).unwrap();
+        let alert = format_inbox_alert("approval", &info.meta.id, &info.meta.title, &entry.item, 400, false);
+        assert!(!alert.contains(LONG) && alert.contains("more"), "{alert}");
+        store.record_outbound(OutboundRef {
+            timestamp: 3003,
+            kind: "approval".into(),
+            item_id: Some(entry.item.item_id.clone()),
+            session: info.meta.id.as_str().into(),
+            title: info.meta.title.clone(),
+            options: entry.item.options.clone(),
+            is_scope_request: true,
+            lead_session: None,
+            guest_id: None,
+            guest_target: None,
+            note_id: None,
+        });
+        let reply = |text: &str| text_inbound(text, Some(3003), None, None);
+        for text in ["approve", "1", "2 12"] {
+            let out = dispatch_inbound(&client, &env.rt, &store, &guests, &health, &reply(text)).await.unwrap();
+            assert!(out.contains("✗ Nothing granted") && !out.contains("✓"), "{text}: {out}");
+            assert!(env.rt.inbox().iter().any(|e| e.item.item_id == entry.item.item_id), "the request stays open");
+        }
+        for text in ["/approve #1", "/scope #1"] {
+            let out =
+                dispatch_inbound(&client, &env.rt, &store, &guests, &health, &text_inbound("/inbox", None, None, None))
+                    .await;
+            assert!(out.is_some());
+            let out =
+                dispatch_inbound(&client, &env.rt, &store, &guests, &health, &text_inbound(text, None, None, None))
+                    .await;
+            assert!(out.as_deref().is_some_and(|o| o.contains("✗ Nothing granted")), "{text}: {out:?}");
+        }
+        let out = dispatch_inbound(&client, &env.rt, &store, &guests, &health, &reply("2")).await.unwrap();
+        assert!(out.contains("✓ Granted scope on Gamma Mission: h02.example.test"), "{out}");
         env.rt.shutdown().await;
     }
 
@@ -5115,10 +5184,7 @@ mod tests {
             dispatch_inbound(&client, &env.rt, &store, &guests, &health, &text_inbound("/dismiss", None, None, None))
                 .await
                 .unwrap();
-        assert!(
-            dismiss_out.contains("✓ Dismissed") || dismiss_out.contains("Inbox is empty."),
-            "{dismiss_out}"
-        );
+        assert!(dismiss_out.contains("✓ Dismissed") || dismiss_out.contains("Inbox is empty."), "{dismiss_out}");
 
         // Attachment and reaction DMs get helpful hints (while groups stay silent)
         let att_dm = ParsedInbound {
@@ -5263,7 +5329,8 @@ mod tests {
         assert_eq!(retry_calls.load(Ordering::SeqCst), 2, "transient failure should retry once and succeed");
 
         let before = retry_calls.load(Ordering::SeqCst);
-        let perm_err = send_with_retry(&rclient, &rstore, "permanent", fast, &CancellationToken::new()).await.unwrap_err();
+        let perm_err =
+            send_with_retry(&rclient, &rstore, "permanent", fast, &CancellationToken::new()).await.unwrap_err();
         assert!(perm_err.contains("UNTRUSTED_IDENTITY"));
         assert_eq!(retry_calls.load(Ordering::SeqCst), before + 1, "permanent error must not retry");
 
@@ -5307,10 +5374,8 @@ mod tests {
         let (tx, rx) = mpsc::channel(16);
         let pending = Arc::new(AtomicUsize::new(0));
 
-        let timing = SenderTiming {
-            coalesce_window: Duration::from_millis(80),
-            retry_delays: [Duration::from_millis(10); 3],
-        };
+        let timing =
+            SenderTiming { coalesce_window: Duration::from_millis(80), retry_delays: [Duration::from_millis(10); 3] };
         let sender = tokio::spawn(outbound_sender_loop(
             client,
             env.rt.clone(),
@@ -5352,7 +5417,9 @@ mod tests {
 
         let msgs = sent_msgs.lock().unwrap().clone();
         assert_eq!(msgs.len(), 2, "expected 1 coalesced error burst + 1 disk alert: {msgs:?}");
-        assert!(msgs[0].contains("[Ferret · ERROR (3 alerts)]") && msgs[0].contains("err-1") && msgs[0].contains("err-3"));
+        assert!(
+            msgs[0].contains("[Ferret · ERROR (3 alerts)]") && msgs[0].contains("err-1") && msgs[0].contains("err-3")
+        );
         assert!(msgs[1].contains("[Ferret · DISK] Low disk space"));
         let snap = health.snapshot();
         assert!(snap.last_send_ms.is_some());
@@ -5739,8 +5806,16 @@ mod tests {
             })
         };
 
-        handle_envelope(&client, &env.rt, &store, &guests, &health, &shutdown, &owner_cmd("/guest approve +15550155 Alex"))
-            .await;
+        handle_envelope(
+            &client,
+            &env.rt,
+            &store,
+            &guests,
+            &health,
+            &shutdown,
+            &owner_cmd("/guest approve +15550155 Alex"),
+        )
+        .await;
         assert_eq!(health.snapshot().guests_approved, 2); // static +15550101 + dynamic Alex
 
         // 1. Approved guest tries operator slash commands, attachments, reactions, and >2000 chars ->
@@ -5809,21 +5884,29 @@ mod tests {
 
         // 3. Turn 2 -> carries turn 1 history AND triggers `leave_note_for_owner` tool note delivery to owner!
         let sends_before_t2 = sent.lock().unwrap().len();
-        handle_envelope(&client, &env.rt, &store, &guests, &health, &shutdown, &guest_dm("Tell Jordan to call after 5pm"))
-            .await;
+        handle_envelope(
+            &client,
+            &env.rt,
+            &store,
+            &guests,
+            &health,
+            &shutdown,
+            &guest_dm("Tell Jordan to call after 5pm"),
+        )
+        .await;
         // Expect 2 sends: [Ferret · GUEST NOTE from Alex] to owner + chat reply to guest.
         wait_for(|| sent.lock().unwrap().len() >= sends_before_t2 + 2).await;
         let (note_ts, note_alert_msg) = {
             let log = sent.lock().unwrap();
             let note_send = log[sends_before_t2..]
                 .iter()
-                .find(|s| s.recipient == "+15550199" && s.message.contains("[Ferret · GUEST NOTE · g-1 · n-1 from Alex]"))
+                .find(|s| {
+                    s.recipient == "+15550199" && s.message.contains("[Ferret · GUEST NOTE · g-1 · n-1 from Alex]")
+                })
                 .expect("expected GUEST NOTE alert to owner");
             assert!(note_send.message.contains("Alex asks to call back after 5pm"));
-            let reply_send = log[sends_before_t2..]
-                .iter()
-                .find(|s| s.recipient == "+15550155")
-                .expect("expected reply to Alex");
+            let reply_send =
+                log[sends_before_t2..].iter().find(|s| s.recipient == "+15550155").expect("expected reply to Alex");
             assert!(reply_send.message.contains("passed that message along"));
             (note_send.timestamp, note_send.message.clone())
         };
@@ -5858,8 +5941,16 @@ mod tests {
         // 5. Guest `/note` shares the 3-per-15m quota (1 already used by tool call above -> 2 more allowed, 4th rejected!).
         for n in 2..=3 {
             let before = sent.lock().unwrap().len();
-            handle_envelope(&client, &env.rt, &store, &guests, &health, &shutdown, &guest_dm(&format!("/note note #{n}")))
-                .await;
+            handle_envelope(
+                &client,
+                &env.rt,
+                &store,
+                &guests,
+                &health,
+                &shutdown,
+                &guest_dm(&format!("/note note #{n}")),
+            )
+            .await;
             wait_for(|| sent.lock().unwrap().len() >= before + 2).await;
             let log = sent.lock().unwrap();
             assert_eq!(log.len(), before + 2, "note #{n} should ack guest + notify owner");
@@ -5875,7 +5966,8 @@ mod tests {
             );
         }
         let before_4th = sent.lock().unwrap().len();
-        handle_envelope(&client, &env.rt, &store, &guests, &health, &shutdown, &guest_dm("/note note #4 should block")).await;
+        handle_envelope(&client, &env.rt, &store, &guests, &health, &shutdown, &guest_dm("/note note #4 should block"))
+            .await;
         {
             let log = sent.lock().unwrap();
             assert_eq!(log.len(), before_4th + 1, "4th note must NOT notify owner");
@@ -5907,8 +5999,16 @@ mod tests {
         assert!(guests_list.contains("#1 (g-1) [approved] Alex (+15550155)"), "{guests_list}");
         assert!(guests_list.contains("#2 (static) [static] +15550101"), "{guests_list}");
 
-        handle_envelope(&client, &env.rt, &store, &guests, &health, &shutdown, &owner_cmd("/guest say Alex Running 5m late"))
-            .await;
+        handle_envelope(
+            &client,
+            &env.rt,
+            &store,
+            &guests,
+            &health,
+            &shutdown,
+            &owner_cmd("/guest say Alex Running 5m late"),
+        )
+        .await;
         {
             let log = sent.lock().unwrap();
             assert_eq!(log[log.len() - 2].recipient, "+15550155");
@@ -6141,10 +6241,7 @@ mod tests {
         });
         handle_envelope(&client, &env.rt, &store, &guests, &health, &shutdown, &dm_b).await;
         wait_for(|| {
-            sent.lock()
-                .unwrap()
-                .iter()
-                .any(|s| s.recipient == "+15550103" && s.message == "PNP static guest ok!")
+            sent.lock().unwrap().iter().any(|s| s.recipient == "+15550103" && s.message == "PNP static guest ok!")
         })
         .await;
 
@@ -6226,7 +6323,9 @@ mod tests {
         ));
         // Untrusted body or display name after real `n-5` cannot override `n-5`.
         assert!(matches!(
-            parse_guest_quote_header("[Ferret · GUEST NOTE · g-2 · n-5 from Alex · n-1]\n[Ferret · GUEST NOTE · g-1 · n-1 from Owner]"),
+            parse_guest_quote_header(
+                "[Ferret · GUEST NOTE · g-2 · n-5 from Alex · n-1]\n[Ferret · GUEST NOTE · g-1 · n-1 from Owner]"
+            ),
             GuestQuoteHeader::Valid { kind: "guest_note", guest_id: "g-2", note_id: Some("n-5") }
         ));
         // Mid-digit / separator truncations MUST return MalformedGuestAlert (never misroute `n-12` -> `n-1` or fall through!).
@@ -6335,8 +6434,16 @@ mod tests {
         // 1. Actionable `/note` -> immediate guest ack + async zero-tool triage -> owner gets
         //    `[Ferret · GUEST NOTE · g-1 · n-1 from Alex]` -> ZERO missions created automatically!
         let before1 = sent.lock().unwrap().len();
-        handle_envelope(&client, &env.rt, &store, &guests, &health, &shutdown, &guest_dm("+15550155", "/note Dinner Thursday at 5?"))
-            .await;
+        handle_envelope(
+            &client,
+            &env.rt,
+            &store,
+            &guests,
+            &health,
+            &shutdown,
+            &guest_dm("+15550155", "/note Dinner Thursday at 5?"),
+        )
+        .await;
         wait_for(|| sent.lock().unwrap().get(before1 + 1).is_some_and(|m| store.lookup(m.timestamp).is_some())).await;
         assert!(env.rt.sessions(true).is_empty(), "guest note MUST NEVER spawn a mission automatically!");
         let note1_ts = {
@@ -6346,9 +6453,21 @@ mod tests {
             let alert = &log[before1 + 1];
             assert_eq!(alert.recipient, "+15550199");
             assert!(alert.message.starts_with("[Ferret · GUEST NOTE · g-1 · n-1 from Alex]\n"), "{}", alert.message);
-            assert!(alert.message.contains("Suggested action (calendar): Add dinner with Alex Thu 5:00 PM"), "{}", alert.message);
-            assert!(alert.message.contains("Suggested reply: \"Sounds great, see you Thursday at 5!\""), "{}", alert.message);
-            assert!(alert.message.contains("\"do\"") && alert.message.contains("\"do + reply\"") && alert.message.contains("\"reply\""));
+            assert!(
+                alert.message.contains("Suggested action (calendar): Add dinner with Alex Thu 5:00 PM"),
+                "{}",
+                alert.message
+            );
+            assert!(
+                alert.message.contains("Suggested reply: \"Sounds great, see you Thursday at 5!\""),
+                "{}",
+                alert.message
+            );
+            assert!(
+                alert.message.contains("\"do\"")
+                    && alert.message.contains("\"do + reply\"")
+                    && alert.message.contains("\"reply\"")
+            );
             alert.timestamp
         };
         // Verify triage LLM call had ZERO tools!
@@ -6356,7 +6475,9 @@ mod tests {
             let reqs = env._server.requests();
             let triage_req = reqs
                 .iter()
-                .find(|r| r["messages"][0]["content"].as_str().is_some_and(|s| s.contains("read-only note triage classifier")))
+                .find(|r| {
+                    r["messages"][0]["content"].as_str().is_some_and(|s| s.contains("read-only note triage classifier"))
+                })
                 .expect("expected triage LLM request");
             assert!(
                 triage_req.get("tools").is_none() || triage_req["tools"].as_array().is_some_and(|t| t.is_empty()),
@@ -6420,25 +6541,45 @@ mod tests {
             })
             .expect("expected initial mission UserMessage");
         assert!(first_user_msg.contains("OWNER-CONFIRMED TASK"), "{first_user_msg}");
-        assert!(first_user_msg.contains("Add calendar event: Dinner with Alex on Thursday at 17:00."), "{first_user_msg}");
+        assert!(
+            first_user_msg.contains("Add calendar event: Dinner with Alex on Thursday at 17:00."),
+            "{first_user_msg}"
+        );
         assert!(first_user_msg.contains("make it 6pm"), "{first_user_msg}");
         assert!(first_user_msg.contains("UNTRUSTED REFERENCE CONTEXT"), "{first_user_msg}");
-        assert!(first_user_msg.contains("<<<UNTRUSTED_GUEST_NOTE>>>\nDinner Thursday at 5?\n<<<END_UNTRUSTED_GUEST_NOTE>>>"), "{first_user_msg}");
+        assert!(
+            first_user_msg
+                .contains("<<<UNTRUSTED_GUEST_NOTE>>>\nDinner Thursday at 5?\n<<<END_UNTRUSTED_GUEST_NOTE>>>"),
+            "{first_user_msg}"
+        );
 
         // 4. Second `"do"` on the SAME note `n-1` -> refused cleanly, ZERO duplicate mission!
         let before_dup = sent.lock().unwrap().len();
-        handle_envelope(&client, &env.rt, &store, &guests, &health, &shutdown, &owner_quote(note1_ts, None, "do")).await;
+        handle_envelope(&client, &env.rt, &store, &guests, &health, &shutdown, &owner_quote(note1_ts, None, "do"))
+            .await;
         assert_eq!(env.rt.sessions(true).len(), 1, "second \"do\" MUST NOT spawn a duplicate mission!");
         {
             let log = sent.lock().unwrap();
             let dup_ack = &log[before_dup];
-            assert!(dup_ack.message.contains("Already started task") && dup_ack.message.contains(mission1.meta.id.as_str()), "{}", dup_ack.message);
+            assert!(
+                dup_ack.message.contains("Already started task") && dup_ack.message.contains(mission1.meta.id.as_str()),
+                "{}",
+                dup_ack.message
+            );
         }
 
         // 5. Actionable note `n-2` + owner quote-reply `"do + reply"` -> spawns 2nd mission AND sends suggested reply!
         let before2 = sent.lock().unwrap().len();
-        handle_envelope(&client, &env.rt, &store, &guests, &health, &shutdown, &guest_dm("+15550155", "/note Pick up coffee beans please"))
-            .await;
+        handle_envelope(
+            &client,
+            &env.rt,
+            &store,
+            &guests,
+            &health,
+            &shutdown,
+            &guest_dm("+15550155", "/note Pick up coffee beans please"),
+        )
+        .await;
         wait_for(|| sent.lock().unwrap().get(before2 + 1).is_some_and(|m| store.lookup(m.timestamp).is_some())).await;
         let note2_ts = sent.lock().unwrap()[before2 + 1].timestamp;
 
@@ -6459,13 +6600,25 @@ mod tests {
             assert_eq!(log.len(), before_do_reply + 2);
             assert_eq!(log[before_do_reply].recipient, "+15550155");
             assert_eq!(log[before_do_reply].message, "Message from Jordan: On it — I'll grab coffee beans!");
-            assert!(log[before_do_reply + 1].message.contains("and sent suggested reply to Alex"), "{}", log[before_do_reply + 1].message);
+            assert!(
+                log[before_do_reply + 1].message.contains("and sent suggested reply to Alex"),
+                "{}",
+                log[before_do_reply + 1].message
+            );
         }
 
         // 6. Reply-only note `n-3` + owner quote-reply `"reply"` -> sends suggested reply WITHOUT spawning a mission!
         let before3 = sent.lock().unwrap().len();
-        handle_envelope(&client, &env.rt, &store, &guests, &health, &shutdown, &guest_dm("+15550155", "/note Thanks for yesterday!"))
-            .await;
+        handle_envelope(
+            &client,
+            &env.rt,
+            &store,
+            &guests,
+            &health,
+            &shutdown,
+            &guest_dm("+15550155", "/note Thanks for yesterday!"),
+        )
+        .await;
         wait_for(|| sent.lock().unwrap().get(before3 + 1).is_some_and(|m| store.lookup(m.timestamp).is_some())).await;
         let note3_ts = sent.lock().unwrap()[before3 + 1].timestamp;
         let before_reply_only = sent.lock().unwrap().len();
@@ -6477,7 +6630,11 @@ mod tests {
             assert_eq!(log.len(), before_reply_only + 2);
             assert_eq!(log[before_reply_only].recipient, "+15550155");
             assert_eq!(log[before_reply_only].message, "Message from Jordan: Anytime, glad you had fun!");
-            assert!(log[before_reply_only + 1].message.contains("✓ Sent suggested reply to Alex (n-3)"), "{}", log[before_reply_only + 1].message);
+            assert!(
+                log[before_reply_only + 1].message.contains("✓ Sent suggested reply to Alex (n-3)"),
+                "{}",
+                log[before_reply_only + 1].message
+            );
         }
 
         // 7. Triage LLM error -> gracefully falls back to plain note delivery (note NEVER lost!).
@@ -6492,7 +6649,8 @@ mod tests {
             &guest_dm("+15550156", "/note TRIGGER_TRIAGE_ERROR call me at 7"),
         )
         .await;
-        wait_for(|| sent.lock().unwrap().get(before_err + 1).is_some_and(|m| store.lookup(m.timestamp).is_some())).await;
+        wait_for(|| sent.lock().unwrap().get(before_err + 1).is_some_and(|m| store.lookup(m.timestamp).is_some()))
+            .await;
         {
             let log = sent.lock().unwrap();
             let alert = &log[before_err + 1];
@@ -6647,10 +6805,9 @@ mod tests {
             );
         }
         wait_for(|| {
-            sent.lock()
-                .unwrap()
-                .iter()
-                .any(|s| s.recipient == "+15550199" && s.message.starts_with("[Ferret · GUEST NOTE · g-1 · n-1 from Alex]"))
+            sent.lock().unwrap().iter().any(|s| {
+                s.recipient == "+15550199" && s.message.starts_with("[Ferret · GUEST NOTE · g-1 · n-1 from Alex]")
+            })
         })
         .await;
 
@@ -6743,14 +6900,8 @@ mod tests {
             call_id: Some(ferret_core::CallId::from("c-evil")),
             reference: None,
         };
-        let rendered = format_inbox_alert(
-            "question",
-            &SessionId::from("s-attacker9999"),
-            "Attacker",
-            &hostile_item,
-            1000,
-            false,
-        );
+        let rendered =
+            format_inbox_alert("question", &SessionId::from("s-attacker9999"), "Attacker", &hostile_item, 1000, false);
         let truncated_at_spoof = rendered.split("More prose").next().unwrap().trim_end();
         assert!(
             fallback_ref_from_quote_text(Some(truncated_at_spoof), &env.rt, &guests).is_none(),
@@ -6828,15 +6979,18 @@ mod tests {
         let health = SignalHealth::from_config(&cfg);
 
         // /help lists both /panic and /scope revoke.
-        let help = dispatch_inbound(&client, &env.rt, &store, &guests, &health, &text_inbound("/help", None, None, None))
-            .await
-            .unwrap();
+        let help =
+            dispatch_inbound(&client, &env.rt, &store, &guests, &health, &text_inbound("/help", None, None, None))
+                .await
+                .unwrap();
         assert!(help.contains("/panic"), "{help}");
         assert!(help.contains("/scope revoke"), "{help}");
 
         let info = env.rt.create_session(new_session(&env.ws, "lead", "Alpha", "start")).await.unwrap();
         wait_for(|| !env.rt.inbox().is_empty()).await;
-        let _ = dispatch_inbound(&client, &env.rt, &store, &guests, &health, &text_inbound("/status", None, None, None)).await;
+        let _ =
+            dispatch_inbound(&client, &env.rt, &store, &guests, &health, &text_inbound("/status", None, None, None))
+                .await;
 
         // Grant then revoke via `/scope revoke #1 api.example.test`.
         let grant_out = dispatch_inbound(
@@ -6920,10 +7074,7 @@ mod tests {
                 "/api/v1/events",
                 get(|| async {
                     let stream = futures_util::stream::pending::<Result<axum::body::Bytes, std::io::Error>>();
-                    (
-                        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
-                        axum::body::Body::from_stream(stream),
-                    )
+                    ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], axum::body::Body::from_stream(stream))
                 }),
             )
             .route(
@@ -6962,7 +7113,10 @@ mod tests {
             let (rpc_url, sent) = start_mock_delay_signal_rpc().await;
             let script = Script::new(|_, step| match step {
                 0 => Reply::tool("ask_user", r#"{"question":"Answer at computer?","blocking":true}"#).into(),
-                _ => Reply::tool("ask_user", r#"{"question":"Second hold","blocking":true}"#).into(),
+                1 => Reply::tool("ask_user", r#"{"question":"Second hold","blocking":true}"#).into(),
+                // Answered, the lead stops asking: a third question would open after the answers below and race
+                // the delay on a slow machine.
+                _ => Reply::text("done").into(),
             });
             let env = start_test_runtime(script).await;
             let dir = tempfile::tempdir().unwrap();
@@ -7038,7 +7192,8 @@ mod tests {
         //     - Fresh item (< 2s old) waits remaining time and sends 0 if answered first!
         {
             let (rpc_url, sent) = start_mock_delay_signal_rpc().await;
-            let script = Script::new(|_, _| Reply::tool("ask_user", r#"{"question":"Preexisting","blocking":true}"#).into());
+            let script =
+                Script::new(|_, _| Reply::tool("ask_user", r#"{"question":"Preexisting","blocking":true}"#).into());
             let env = start_test_runtime(script).await;
             let _ = env.rt.create_session(new_session(&env.ws, "lead", "AlreadyStale", "go")).await.unwrap();
             wait_for(|| !env.rt.inbox().is_empty()).await;
@@ -7065,7 +7220,12 @@ mod tests {
         }
         {
             let (rpc_url, sent) = start_mock_delay_signal_rpc().await;
-            let script = Script::new(|_, _| Reply::tool("ask_user", r#"{"question":"FreshOnBoot","blocking":true}"#).into());
+            // One question: answered, the lead replies instead of asking again, so no new item can open after
+            // the answer and outlast the delay on a slow machine.
+            let script = Script::new(|_, step| match step {
+                0 => Reply::tool("ask_user", r#"{"question":"FreshOnBoot","blocking":true}"#).into(),
+                _ => Reply::text("done").into(),
+            });
             let env = start_test_runtime(script).await;
             let _ = env.rt.create_session(new_session(&env.ws, "lead", "FreshBoot", "go")).await.unwrap();
             wait_for(|| !env.rt.inbox().is_empty()).await;
@@ -7098,7 +7258,8 @@ mod tests {
         // (d) inbox_delay_secs == 0 stays immediate.
         {
             let (rpc_url, sent) = start_mock_delay_signal_rpc().await;
-            let script = Script::new(|_, _| Reply::tool("ask_user", r#"{"question":"Immediate","blocking":true}"#).into());
+            let script =
+                Script::new(|_, _| Reply::tool("ask_user", r#"{"question":"Immediate","blocking":true}"#).into());
             let env = start_test_runtime(script).await;
             let dir = tempfile::tempdir().unwrap();
             let mut cfg = sample_cfg(&rpc_url);

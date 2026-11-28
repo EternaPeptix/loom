@@ -86,7 +86,11 @@ impl std::fmt::Debug for McpServer {
 
 /// Read a private (`0600`, owner UID matching effective UID, regular file, no symlink follow) secret file
 /// up to `max_bytes`. Never includes file content in error messages.
-pub(crate) fn read_private_secret_file(path: &std::path::Path, label: &str, max_bytes: usize) -> Result<String, String> {
+pub(crate) fn read_private_secret_file(
+    path: &std::path::Path,
+    label: &str,
+    max_bytes: usize,
+) -> Result<String, String> {
     use std::io::Read;
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true);
@@ -141,8 +145,7 @@ pub(crate) fn read_private_secret_file(path: &std::path::Path, label: &str, max_
     if buf.len() > max_bytes {
         return Err(format!("{label}: the file {} exceeds the {max_bytes}-byte cap", path.display()));
     }
-    String::from_utf8(buf)
-        .map_err(|_| format!("{label}: the file {} is not valid UTF-8", path.display()))
+    String::from_utf8(buf).map_err(|_| format!("{label}: the file {} is not valid UTF-8", path.display()))
 }
 
 /// One `env`/`headers` value: `env:NAME`, `file:/path` (trimmed, private `0600` regular file, `O_NOFOLLOW`,

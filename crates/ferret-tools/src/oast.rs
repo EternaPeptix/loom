@@ -21,6 +21,11 @@
 //! - `oast_poll` stores raw redacted interaction payloads in the `BlobStore` and carries
 //!   `META_EVIDENCE_GRADE = "run"` (with `ToolClass::Exec`) when `>= 1` callback interaction is observed,
 //!   or `"read"` when no callback has arrived yet.
+//! - The broker's endpoints are infrastructure (`docs/MONITOR.md` §2.2, E1; `ferret_agent::runtime::oast_endpoints`):
+//!   the runtime starts the broker before anything else, takes `http_addr()` / `dns_addr()` as the addresses bound, and
+//!   refuses them, the external poll host and the callback host (on every port, by name and by address) and the names
+//!   under its DNS domain to every command whatever is granted. A callback is evidence only because no command of
+//!   ferret's can send one.
 
 use crate::{
     params::{opt, spec},
@@ -225,15 +230,10 @@ impl OastBroker {
                 let listener = TcpListener::bind(bind)
                     .await
                     .map_err(|e| format!("OAST HTTP listener could not bind `{bind}`: {e}."))?;
-                let http_addr = listener
-                    .local_addr()
-                    .map_err(|e| format!("OAST HTTP listener address could not be read: {e}."))?;
-                let http_task = tokio::spawn(run_http_listener(
-                    listener,
-                    state.clone(),
-                    notify.clone(),
-                    cancel.clone(),
-                ));
+                let http_addr =
+                    listener.local_addr().map_err(|e| format!("OAST HTTP listener address could not be read: {e}."))?;
+                let http_task =
+                    tokio::spawn(run_http_listener(listener, state.clone(), notify.clone(), cancel.clone()));
                 tasks.push(http_task);
 
                 let dns_addr = if let Some(dns_bind) = cfg.dns_bind.as_deref().map(str::trim).filter(|s| !s.is_empty())
@@ -337,11 +337,8 @@ impl OastBroker {
             }
         };
         let bucket = st.missions.entry(mission.to_string()).or_default();
-        let evicted = if bucket.token_order.len() >= MAX_TOKENS_PER_MISSION {
-            bucket.token_order.pop_front()
-        } else {
-            None
-        };
+        let evicted =
+            if bucket.token_order.len() >= MAX_TOKENS_PER_MISSION { bucket.token_order.pop_front() } else { None };
         bucket.token_order.push_back(token.clone());
         if let Some(old_token) = evicted {
             st.tokens.remove(&old_token);
@@ -431,11 +428,8 @@ impl OastBroker {
                 return self.poll(mission, token, since_seq).await;
             }
             let remaining = deadline.saturating_duration_since(now);
-            let step = if self.mode == OastMode::External {
-                remaining.min(Duration::from_millis(500))
-            } else {
-                remaining
-            };
+            let step =
+                if self.mode == OastMode::External { remaining.min(Duration::from_millis(500)) } else { remaining };
             tokio::select! {
                 biased;
                 _ = cancel.cancelled() => return Err("OAST poll was cancelled.".into()),
@@ -482,10 +476,7 @@ impl OastBroker {
         if let Some(tok) = &ext.token {
             req = req.bearer_auth(tok);
         }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| format!("OAST external poll failed: {e}."))?;
+        let resp = req.send().await.map_err(|e| format!("OAST external poll failed: {e}."))?;
         let status = resp.status();
         if !status.is_success() {
             return Err(format!("OAST external poll returned HTTP {}.", status.as_u16()));
@@ -495,17 +486,15 @@ impl OastBroker {
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| format!("OAST external poll body read failed: {e}."))?;
             if body.len().saturating_add(chunk.len()) > MAX_EXTERNAL_POLL_BYTES {
-                return Err(format!(
-                    "OAST external poll response exceeded the {MAX_EXTERNAL_POLL_BYTES}-byte cap."
-                ));
+                return Err(format!("OAST external poll response exceeded the {MAX_EXTERNAL_POLL_BYTES}-byte cap."));
             }
             body.extend_from_slice(&chunk);
         }
         if body.is_empty() {
             return Ok(());
         }
-        let parsed: Value = serde_json::from_slice(&body)
-            .map_err(|e| format!("OAST external poll returned invalid JSON: {e}."))?;
+        let parsed: Value =
+            serde_json::from_slice(&body).map_err(|e| format!("OAST external poll returned invalid JSON: {e}."))?;
         let items: Vec<&Value> = match &parsed {
             Value::Array(arr) => arr.iter().collect(),
             Value::Object(map) => map
@@ -539,11 +528,7 @@ impl OastBroker {
             if !remember_external(bucket, dedup_key) {
                 continue;
             }
-            let protocol = obj
-                .get("protocol")
-                .and_then(Value::as_str)
-                .unwrap_or("http")
-                .to_ascii_lowercase();
+            let protocol = obj.get("protocol").and_then(Value::as_str).unwrap_or("http").to_ascii_lowercase();
             let remote_addr = obj
                 .get("remote-address")
                 .or_else(|| obj.get("remote_addr"))
@@ -551,22 +536,18 @@ impl OastBroker {
                 .and_then(Value::as_str)
                 .unwrap_or("unknown")
                 .to_string();
-            let summary = obj
-                .get("summary")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .unwrap_or_else(|| {
-                    let qname = obj.get("qname").or_else(|| obj.get("full-id")).and_then(Value::as_str).unwrap_or("");
-                    let method = obj.get("method").and_then(Value::as_str).unwrap_or("");
-                    let path = obj.get("path").and_then(Value::as_str).unwrap_or("");
-                    if !method.is_empty() || !path.is_empty() {
-                        format!("{protocol} {method} {path}").trim().to_string()
-                    } else if !qname.is_empty() {
-                        format!("{protocol} {qname}")
-                    } else {
-                        format!("{protocol} interaction for {tok}")
-                    }
-                });
+            let summary = obj.get("summary").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| {
+                let qname = obj.get("qname").or_else(|| obj.get("full-id")).and_then(Value::as_str).unwrap_or("");
+                let method = obj.get("method").and_then(Value::as_str).unwrap_or("");
+                let path = obj.get("path").and_then(Value::as_str).unwrap_or("");
+                if !method.is_empty() || !path.is_empty() {
+                    format!("{protocol} {method} {path}").trim().to_string()
+                } else if !qname.is_empty() {
+                    format!("{protocol} {qname}")
+                } else {
+                    format!("{protocol} interaction for {tok}")
+                }
+            });
             let raw = obj
                 .get("raw-request")
                 .or_else(|| obj.get("raw"))
@@ -575,16 +556,7 @@ impl OastBroker {
                 .unwrap_or_else(|| item.to_string());
             let raw = truncate_utf8(&raw, MAX_BODY_BYTES);
             let timestamp_ms = obj.get("timestamp_ms").and_then(Value::as_u64).unwrap_or_else(now_ms);
-            push_interaction_locked(
-                bucket,
-                meta,
-                &tok,
-                protocol,
-                remote_addr,
-                summary,
-                raw,
-                timestamp_ms,
-            );
+            push_interaction_locked(bucket, meta, &tok, protocol, remote_addr, summary, raw, timestamp_ms);
             routed_any = true;
         }
         drop(st);
@@ -617,7 +589,8 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> String {
 }
 
 fn extract_external_token(obj: &Map<String, Value>, mission_tokens: &HashMap<String, TokenMeta>) -> Option<String> {
-    for key in ["token", "unique-id", "unique_id", "full-id", "full_id", "path", "host", "qname", "raw-request", "raw"] {
+    for key in ["token", "unique-id", "unique_id", "full-id", "full_id", "path", "host", "qname", "raw-request", "raw"]
+    {
         if let Some(val) = obj.get(key).and_then(Value::as_str) {
             let low = val.to_ascii_lowercase();
             if mission_tokens.contains_key(low.trim()) {
@@ -702,16 +675,7 @@ fn record_local_interaction(
         return false;
     };
     let bucket = st.missions.entry(meta.mission.clone()).or_default();
-    push_interaction_locked(
-        bucket,
-        &meta,
-        &tok,
-        protocol.to_string(),
-        remote_addr,
-        summary,
-        raw,
-        now_ms(),
-    );
+    push_interaction_locked(bucket, &meta, &tok, protocol.to_string(), remote_addr, summary, raw, now_ms());
     drop(st);
     notify.notify_waiters();
     true
@@ -985,19 +949,15 @@ async fn run_dns_listener(
 
         let matched_token = {
             let st = state.lock().unwrap_or_else(|p| p.into_inner());
-            qname
-                .split('.')
-                .find(|label| st.tokens.contains_key(*label))
-                .map(str::to_string)
+            qname.split('.').find(|label| st.tokens.contains_key(*label)).map(str::to_string)
         };
         let Some(token) = matched_token else {
             continue;
         };
         let qtype_str = dns_qtype_name(qtype);
         let summary = format!("DNS {qtype_str} {qname}");
-        let raw = format!(
-            "DNS query\nqname: {qname}\nqtype: {qtype_str} ({qtype})\nqclass: {qclass}\nremote_addr: {peer}\n"
-        );
+        let raw =
+            format!("DNS query\nqname: {qname}\nqtype: {qtype_str} ({qtype})\nqclass: {qclass}\nremote_addr: {peer}\n");
         record_local_interaction(&state, &notify, &token, "dns", peer.to_string(), summary, raw);
     }
 }
@@ -1222,10 +1182,8 @@ mod tests {
         assert_eq!(&rbuf[rn - 4..rn], &[127, 0, 0, 1]);
 
         // Poll mission-a: sees ONLY mission-a's HTTP + DNS callbacks (2 interactions).
-        let a_hits = broker
-            .poll_wait("mission-a", None, None, Duration::from_secs(2), &CancellationToken::new())
-            .await
-            .unwrap();
+        let a_hits =
+            broker.poll_wait("mission-a", None, None, Duration::from_secs(2), &CancellationToken::new()).await.unwrap();
         assert_eq!(a_hits.len(), 2, "{a_hits:?}");
         let http_hit = a_hits.iter().find(|i| i.protocol == "http").expect("http hit");
         assert_eq!(http_hit.token, mint_a.token);
@@ -1352,10 +1310,7 @@ mod tests {
                     }
                 }),
             )
-            .route(
-                "/huge",
-                get(|| async { "a".repeat(MAX_EXTERNAL_POLL_BYTES + 1024) }),
-            );
+            .route("/huge", get(|| async { "a".repeat(MAX_EXTERNAL_POLL_BYTES + 1024) }));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let srv = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -1384,11 +1339,8 @@ mod tests {
         assert!(hits2.is_empty());
 
         // Oversized >4 MiB external poll response is refused cleanly.
-        let huge_cfg = OastCfg {
-            external_poll_url: Some(format!("http://{addr}/huge")),
-            external_token_file: None,
-            ..cfg
-        };
+        let huge_cfg =
+            OastCfg { external_poll_url: Some(format!("http://{addr}/huge")), external_token_file: None, ..cfg };
         let huge_broker = OastBroker::start(&huge_cfg).await.unwrap();
         let err = huge_broker.poll("mission-ext", None, None).await.unwrap_err();
         assert!(err.contains("cap"), "{err}");

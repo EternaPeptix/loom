@@ -57,9 +57,30 @@
 //! quote the path; profiles `gpt 4`, `gpt/4` and `GPT-4` and a profile with `api_key_file = "gpt-4-2"` get
 //! four distinct names (case-insensitively); every suggested write uses `noclobber`.
 
+//! CONTRACT (model lineage and `[monitor]`, docs/MONITOR.md section 2.6).
+//!
+//! A model profile may also set `family` (a list: `["deepseek"]`), `alignment` (`"stock"`, `"relaxed"` or `"unknown"`),
+//! `recipient` (`"local"`, `"lan"` or a provider name) and `purpose = "review"`; what unset ones resolve to is
+//! `lineage::resolve`. `[monitor]` accepts `reviewers` (profile names, in preference order), `tripwires_only_profiles`,
+//! `recipients` (per pack: the recipients the operator consents to), `content.new_recipient_real_targets`
+//! (`"features"` default, or `"redacted"`) and `known_families`; M2 adds `enabled` (default true; false keeps only the precision-list, S4 and canary tripwires),
+//! `mode` (`"shadow"`, the only value until M4), `fleet_every_s` (default 300, at least 10) and `monitor_down`
+//! (`"pause_real_targets"` default, or `"notify"`); later phases add the other keys of the monitor.
+//! `Config::check` refuses, each with a sentence that names the key and the fix: an empty `family` list or a family
+//! outside `lineage::FAMILIES` and `known_families`; an empty `recipient`; a `reviewers` or `tripwires_only_profiles`
+//! entry that is not a configured profile; a profile twice in `reviewers`; a reviewer whose alignment resolves to
+//! relaxed; a `recipients` list that names `unknown` or nothing; an empty `known_families` entry; a reserved word
+//! (`unknown`, `any`, `none`, `*`) in a `family` list or in `known_families` (it names no family: remove the key and the
+//! family stays unknown, which matches every family); a `default_model` that has `purpose = "review"`. Whether a profile has
+//! an eligible reviewer is not decided here (it depends on the packs): `ferret_agent::monitor::lineage::check_config`.
+//!
+//! Tests required: each refusal above with its sentence; an accepted `[monitor]` example; the default config holds no
+//! monitor setting.
+
 use crate::admit::AdmitPolicy;
 use crate::event::ReasoningReplay;
 use crate::ids::{MissionId, SessionId};
+use crate::lineage::{is_reserved_family_word, known_family, normalize_name, resolve, Alignment, FAMILIES};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, HashSet};
@@ -169,6 +190,8 @@ pub struct Config {
     /// The remote Docker container the agent runs commands in (`box_exec`). Disabled by default.
     #[serde(rename = "box")]
     pub boxed: BoxCfg,
+    /// The adversarial monitor's settings (`docs/MONITOR.md`); M1 accepts the model-policy keys only.
+    pub monitor: MonitorCfg,
     /// MCP servers whose tools sessions get (docs/CONTRACTS-MCP.md). Empty by default.
     pub mcp: McpCfg,
     /// Optional operator-scoped read-only email inbox (`inbox_read`) for bug bounty account activation / OTPs.
@@ -178,6 +201,92 @@ pub struct Config {
     /// Optional Out-of-Band Application Security Testing (OAST) callback broker (`oast_mint` / `oast_poll`).
     #[serde(default)]
     pub oast: OastCfg,
+}
+
+/// What a model profile is for. Absent means an agent profile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfilePurpose {
+    /// A reviewer profile of the monitor: not an agent's.
+    Review,
+}
+
+/// What a reviewer in a new-recipient provider receives for a mission that has real targets (decision D9).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RecipientContent {
+    /// Hashes, lengths and classes; no raw target content. Secrets are redacted in every case.
+    #[default]
+    Features,
+    /// The content with secrets redacted.
+    Redacted,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct MonitorContentCfg {
+    pub new_recipient_real_targets: RecipientContent,
+}
+
+/// What the monitor does when its own log is unwritable or its fold failed (`docs/MONITOR.md` section 2.8).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MonitorDown {
+    /// Missions with non-lab grants or relaxed agents are paused (M3 applies it); the default.
+    #[default]
+    PauseRealTargets,
+    /// Only the operator is told.
+    Notify,
+}
+
+/// The monitor's starting state of its causes (`docs/MONITOR.md` section 4.8). Only `shadow` exists until M4.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MonitorMode {
+    /// Every cause is recorded and shown as "would have paused", with no effect an agent can see.
+    #[default]
+    Shadow,
+}
+
+/// `[monitor]`: the model policy (M1) and the watcher's own settings (M2). The later phases add keys; until then the
+/// daemon rejects them as unknown keys.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MonitorCfg {
+    /// Duty W: the tripwires run on every record of every session. `false` keeps only the precision-list, S4 and canary
+    /// tripwires, which have no off switch (design 7.1); the monitor still reads, logs and shows its status.
+    pub enabled: bool,
+    /// The starting state of the causes.
+    pub mode: MonitorMode,
+    /// Seconds between the fleet joins (FS-1 to FS-10).
+    pub fleet_every_s: u64,
+    /// What a down monitor does to the missions it can no longer watch.
+    pub monitor_down: MonitorDown,
+    /// Review profiles in preference order: the first one eligible for a mission reviews it.
+    pub reviewers: Vec<String>,
+    /// Profiles that have no eligible reviewer on purpose; their missions are shown as "not LLM-reviewed".
+    pub tripwires_only_profiles: Vec<String>,
+    /// Per pack, the recipients the operator consents to receive that pack's transcripts for review.
+    pub recipients: BTreeMap<String, Vec<String>>,
+    pub content: MonitorContentCfg,
+    /// Family names beyond the ones ferret infers (`lineage::FAMILIES`) that a `family` key may use.
+    pub known_families: Vec<String>,
+}
+
+impl Default for MonitorCfg {
+    fn default() -> Self {
+        MonitorCfg {
+            enabled: true,
+            mode: MonitorMode::Shadow,
+            fleet_every_s: 300,
+            monitor_down: MonitorDown::PauseRealTargets,
+            reviewers: Vec::new(),
+            tripwires_only_profiles: Vec::new(),
+            recipients: BTreeMap::new(),
+            content: MonitorContentCfg::default(),
+            known_families: Vec::new(),
+        }
+    }
 }
 
 /// `[mcp]`: MCP servers as tools (docs/CONTRACTS-MCP.md M1).
@@ -369,6 +478,17 @@ pub struct ModelProfile {
     pub retry_window_s: u64,
     /// Longest pause between retries.
     pub retry_max_delay_s: u64,
+    /// The model family as a set (`["deepseek"]`; a distill belongs to both of its families). Unset: inferred from the
+    /// model id (`lineage`), else unknown, which matches every family.
+    pub family: Option<Vec<String>>,
+    /// Whether the model's refusals are intact. Unset: `relaxed` when the model id or profile name holds a marker
+    /// such as `uncensored`, else `unknown` (an agent profile then counts as relaxed and a reviewer is ineligible).
+    pub alignment: Option<Alignment>,
+    /// Who receives this profile's traffic: `local`, `lan` (a host the operator owns) or a provider name. Unset: the
+    /// host of `base_url`, or `unknown` when that is a loopback address.
+    pub recipient: Option<String>,
+    /// `review` marks a reviewer profile of the monitor.
+    pub purpose: Option<ProfilePurpose>,
     /// Tool calls the model writes into its reply text instead of the tool-call channel, which the
     /// harness then runs (see *text tool calls* in `docs/DESIGN.md`): `"any"` takes every known
     /// format, a named format takes only that one, `"off"` takes none. Whatever the format, only
@@ -411,6 +531,10 @@ impl Default for ModelProfile {
             stall_timeout_s: 240,
             retry_window_s: 300,
             retry_max_delay_s: 30,
+            family: None,
+            alignment: None,
+            recipient: None,
+            purpose: None,
             text_tool_calls: TextToolCalls::Any,
         }
     }
@@ -548,10 +672,109 @@ pub struct SandboxCfg {
     /// before the runtime starts; not a config key.
     #[serde(skip)]
     pub daemon_port: Option<u16>,
-    /// Whether `[network] mode` is `deny_all`, so that commands also cannot reach the system services that fetch
-    /// URLs for a process (certificate evaluation). Set by the runtime; not a config key.
+    /// Let commands look up the macOS services that fetch a URL for a process (`trustd`, `nsurlsessiond`, WebKit's
+    /// XPC services), which reach the network outside the egress proxy. Off by default, in every network mode.
+    /// Setting it marks the daemon's egress "unbounded" and keep-going refuses to turn on.
+    pub allow_fetch_services: bool,
+    /// Mach services commands may look up besides the built-in list (`MACH_LOOKUP_ALLOW`), for a
+    /// tool that fails under the default-deny of `mach-lookup`: exact names, or a name ending in `*` for a prefix.
+    /// An entry that would allow a fetch service or a disk-mounting service is refused.
+    pub mach_allow: Vec<String>,
+    /// How many processes of the user's limit (RLIMIT_NPROC) a sandboxed command leaves unused: a command can
+    /// fork until the user has `limit - nproc_headroom` processes, so a fork bomb stops while the daemon can
+    /// still start the processes that stop it. 0 sets no limit. Never below the processes that exist plus 64.
+    pub nproc_headroom: u32,
+    /// Loopback ports of infrastructure (a model endpoint, the Signal bridge's signal-cli or a
+    /// `network.infrastructure` entry on this machine) that no command may connect to, whatever else allows
+    /// loopback. Set by the runtime; not a config key.
     #[serde(skip)]
-    pub network_deny_all: bool,
+    pub infra_ports: Vec<u16>,
+}
+
+/// The default of `sandbox.nproc_headroom`.
+pub const DEFAULT_NPROC_HEADROOM: u32 = 256;
+
+/// Loopback ports that are never reachable to a command: Chrome DevTools, the Node inspector and the Docker
+/// API. `sandbox.loopback_ports` may not list them, and the sandbox refuses them under `loopback_all`.
+pub const DENIED_LOOPBACK_PORTS: [u16; 4] = [9222, 9229, 2375, 2376];
+
+/// The macOS services that fetch a URL for a process, outside its sandbox and outside the egress proxy: certificate
+/// evaluation (`trustd` fetches the issuer a certificate names), background URL sessions and WebKit.
+pub const FETCH_SERVICE_NAMES: [&str; 5] = [
+    "com.apple.trustd.agent",
+    "com.apple.trustd",
+    "com.apple.ocspd",
+    "com.apple.nsurlsessiond",
+    "com.apple.nsurlsessiond.NSURLSessionProxyService",
+];
+/// Name prefixes of the same (WebKit's networking and web-content XPC services).
+pub const FETCH_SERVICE_PREFIXES: [&str; 1] = ["com.apple.WebKit."];
+/// Services that mount a disk image or a volume for a process, outside its sandbox.
+pub const DISK_SERVICE_NAMES: [&str; 4] = [
+    "com.apple.DiskArbitration.diskarbitrationd",
+    "com.apple.diskimagesiod",
+    "com.apple.diskimagesiod.ram",
+    "com.apple.diskmanagementd",
+];
+/// The Mach services a command may look up under the default-deny of `mach-lookup`, probed on macOS 27 with a
+/// battery of bash, python3, node, git, curl, clang, swiftc, cargo, rustc, make, cmake, ssh, sqlite3, perl, ruby,
+/// java, codesign, lldb, osascript and the usual utilities: what they need to start, resolve users, notify and
+/// log, check a binary's execution policy, list processes (`pgrep`) and watch files. Everything else fails: the
+/// keychain and security daemons, Spotlight (`mdfind`), the pasteboard, audio, analytics, authorization, disk
+/// services, Launch Services' writers and every fetch service.
+pub const MACH_LOOKUP_ALLOW: [&str; 17] = [
+    "com.apple.CoreServices.coreservicesd",
+    "com.apple.FSEvents",
+    "com.apple.SystemConfiguration.DNSConfiguration",
+    "com.apple.SystemConfiguration.configd",
+    "com.apple.bsd.dirhelper",
+    "com.apple.coreservices.launchservicesd",
+    "com.apple.distributed_notifications@Uv3",
+    "com.apple.logd",
+    "com.apple.lsd.mapdb",
+    "com.apple.security.syspolicy.exec",
+    "com.apple.sysmond",
+    "com.apple.system.logger",
+    "com.apple.system.notification_center",
+    "com.apple.system.opendirectoryd.libinfo",
+    "com.apple.system.opendirectoryd.membership",
+    "com.apple.tccd",
+    "com.apple.tccd.system",
+];
+
+/// Mach service name prefixes a command may look up under the default-deny, besides `MACH_LOOKUP_ALLOW`: the
+/// rendezvous servers (`<bundle id>.MachPortRendezvousServer.<pid>`) through which the child processes of a Chromium
+/// build (renderer, GPU and utility processes of Playwright, Puppeteer, headless Chrome) find their parent. A
+/// process registers its own name and its children look it up, so an exact list cannot name it. Probed on macOS 27
+/// with a process that registers such a name and a child that looks it up: refused without the prefix, found with it.
+/// Chromium itself was not run. Another build (Edge, Electron) needs `<its bundle id>.MachPortRendezvousServer.*` in
+/// `sandbox.mach_allow`. The server checks who asks, which is why a prefix is allowed and no regex is.
+pub const MACH_LOOKUP_ALLOW_PREFIXES: [&str; 3] = [
+    "org.chromium.Chromium.MachPortRendezvousServer.",
+    "com.google.Chrome.MachPortRendezvousServer.",
+    "com.google.chrome.for.testing.MachPortRendezvousServer.",
+];
+
+/// Whether a `sandbox.mach_allow` entry covers `name`: the same string, or, for an entry ending in `*`, a name that
+/// starts with what precedes it.
+pub fn mach_entry_covers(entry: &str, name: &str) -> bool {
+    match entry.strip_suffix('*') {
+        Some(prefix) => name.starts_with(prefix),
+        None => entry == name,
+    }
+}
+
+/// Whether `path` names the socket of a container runtime (Docker, containerd, Podman, CRI-O), which would
+/// give a command the Docker host.
+pub fn is_container_socket(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    let name = lower.rsplit('/').next().unwrap_or("");
+    name.contains("docker.sock")
+        || name.contains("containerd.sock")
+        || name.contains("crio.sock")
+        || name.contains("cri-dockerd.sock")
+        || (name.ends_with(".sock") && name.contains("podman"))
+        || (lower.contains("/podman/") && name.ends_with(".sock"))
 }
 
 impl Default for SandboxCfg {
@@ -569,7 +792,10 @@ impl Default for SandboxCfg {
             secret_env: Vec::new(),
             replay_untrusted_paths: Vec::new(),
             daemon_port: None,
-            network_deny_all: false,
+            allow_fetch_services: false,
+            mach_allow: Vec::new(),
+            nproc_headroom: DEFAULT_NPROC_HEADROOM,
+            infra_ports: Vec::new(),
         }
     }
 }
@@ -609,6 +835,11 @@ pub struct NetworkCfg {
     pub deny: Vec<String>,
     /// Private, loopback or link-local destinations that are permitted (same pattern syntax, or CIDR).
     pub allow_private: Vec<String>,
+    /// Infrastructure no command may reach, whatever its grants say (same syntax as `deny`, CIDR blocks
+    /// too): tailnet infrastructure, a desktop app's debugging port. Added to what ferret always refuses
+    /// (cloud metadata, DevTools and Docker API ports on this machine, the daemon's port, every model
+    /// endpoint, the box's Docker host) and checked before everything else, so a grant cannot lift it.
+    pub infrastructure: Vec<String>,
     /// Bytes of each request or response body kept in a captured exchange (CONTRACTS-TRAFFIC-TARGETS C2).
     pub capture_max_bytes: u64,
     /// Exchanges recorded per session; past it traffic is still relayed but not recorded (C2).
@@ -975,7 +1206,7 @@ impl SignalGuestsCfg {
             let raw = ws.to_string_lossy();
             if raw.trim().is_empty() || raw.chars().any(char::is_control) {
                 return Err(
-                    "signal.guests.action_workspace must be a non-empty path without control characters.".into(),
+                    "signal.guests.action_workspace must be a non-empty path without control characters.".into()
                 );
             }
         }
@@ -1237,6 +1468,7 @@ impl Default for NetworkCfg {
             reference_hosts: Vec::new(),
             deny: Vec::new(),
             allow_private: Vec::new(),
+            infrastructure: Vec::new(),
             capture_max_bytes: 1 << 20,
             capture_max_exchanges: 100_000,
             intercept: InterceptMode::default(),
@@ -1543,12 +1775,10 @@ impl OastCfg {
                 }
             }
             OastMode::External => {
-                let raw_url = self
-                    .external_poll_url
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .ok_or_else(|| "oast.external_poll_url is required when oast.mode = \"external\".".to_string())?;
+                let raw_url =
+                    self.external_poll_url.as_deref().map(str::trim).filter(|s| !s.is_empty()).ok_or_else(|| {
+                        "oast.external_poll_url is required when oast.mode = \"external\".".to_string()
+                    })?;
                 let u = url::Url::parse(raw_url)
                     .map_err(|_| format!("oast.external_poll_url `{raw_url}` must be an http:// or https:// URL."))?;
                 if !matches!(u.scheme(), "http" | "https") || u.host_str().is_none() {
@@ -1629,7 +1859,9 @@ impl BoxCfg {
             }
         }
         if self.proxy_bridge_port == Some(0) {
-            return Err("box.proxy_bridge_port must be between 1 and 65535 (or omitted for automatic port selection).".into());
+            return Err(
+                "box.proxy_bridge_port must be between 1 and 65535 (or omitted for automatic port selection).".into()
+            );
         }
         if !self.enabled {
             return Ok(());
@@ -1767,12 +1999,65 @@ impl Config {
                 names.join(", ")
             )));
         }
+        if let Some(profile) = self.models.get(&self.default_model) {
+            if profile.purpose == Some(ProfilePurpose::Review) {
+                return Err(ConfigError::Invalid(format!(
+                    "default_model \"{}\" has purpose = \"review\": a reviewer profile is not an agent's, and its sessions would run unreviewed. Name an agent profile.",
+                    self.default_model
+                )));
+            }
+        }
         let host = self.daemon.bind.rsplit_once(':').map(|(h, _)| h).unwrap_or("");
         if !matches!(host, "127.0.0.1" | "localhost" | "[::1]") {
             return Err(ConfigError::Invalid(format!(
                 "daemon.bind must be a loopback address, got \"{}\"",
                 self.daemon.bind
             )));
+        }
+        for p in &self.sandbox.loopback_ports {
+            if DENIED_LOOPBACK_PORTS.contains(p) {
+                return Err(ConfigError::Invalid(format!(
+                    "sandbox.loopback_ports lists {p}, a DevTools, inspector or Docker API port: no command may connect to it. Remove it from the list."
+                )));
+            }
+        }
+        for entry in &self.sandbox.mach_allow {
+            let valid = !entry.is_empty()
+                && entry.len() <= 128
+                && entry.chars().enumerate().all(|(i, c)| {
+                    c.is_ascii_alphanumeric()
+                        || matches!(c, '.' | '_' | '-' | '@')
+                        || (c == '*' && i + 1 == entry.chars().count())
+                });
+            if !valid {
+                return Err(ConfigError::Invalid(format!(
+                    "sandbox.mach_allow lists \"{entry}\", which is not a Mach service name: use letters, digits and `.`, `_`, `-`, `@`, with at most one `*` at the end for a prefix. Fix or remove the entry."
+                )));
+            }
+            let fetch = FETCH_SERVICE_NAMES.iter().chain(DISK_SERVICE_NAMES.iter()).copied();
+            let covered = fetch.clone().find(|n| mach_entry_covers(entry, n)).or_else(|| {
+                FETCH_SERVICE_PREFIXES
+                    .iter()
+                    .copied()
+                    .find(|p| mach_entry_covers(entry, p) || entry.trim_end_matches('*').starts_with(p))
+            });
+            let broad = entry.strip_suffix('*').is_some_and(|p| p.len() < 8);
+            if broad || covered.is_some() {
+                let what = covered.map_or_else(
+                    || "nearly every service, which defeats the default-deny".to_string(),
+                    |n| format!("{n}, a service that fetches URLs or mounts disks outside the sandbox"),
+                );
+                return Err(ConfigError::Invalid(format!(
+                    "sandbox.mach_allow lists \"{entry}\", which would allow {what}. List the exact services the tool needs; for the fetch services the only switch is sandbox.allow_fetch_services, which marks the daemon's egress unbounded."
+                )));
+            }
+        }
+        for entry in &self.sandbox.unix_sockets {
+            if is_container_socket(entry) {
+                return Err(ConfigError::Invalid(format!(
+                    "sandbox.unix_sockets lists {entry}, the socket of a container runtime: a command that could connect to it would control the Docker host (a container can mount the whole home). Remove the entry."
+                )));
+            }
         }
         self.boxed.check().map_err(ConfigError::Invalid)?;
         self.mcp.check().map_err(ConfigError::Invalid)?;
@@ -1825,6 +2110,104 @@ impl Config {
             }
             if let Some(file) = &profile.api_key_file {
                 check_key_file_name(file).map_err(|rule| ConfigError::Invalid(format!("models.{name}: {rule}")))?;
+            }
+            self.check_lineage_keys(name, profile).map_err(ConfigError::Invalid)?;
+        }
+        self.check_monitor().map_err(ConfigError::Invalid)?;
+        Ok(())
+    }
+
+    /// The profile's `family` and `recipient` keys.
+    fn check_lineage_keys(&self, name: &str, profile: &ModelProfile) -> Result<(), String> {
+        if let Some(family) = &profile.family {
+            if family.is_empty() {
+                return Err(format!(
+                    "models.{name}.family is an empty list. List the families of the model (for example family = [\"deepseek\"]; a distill lists two), or remove the key to have ferret infer it from the model id."
+                ));
+            }
+            for f in family {
+                if is_reserved_family_word(f) {
+                    return Err(format!(
+                        "models.{name}.family lists \"{f}\", which names no family. If the family of this model is not known, remove the key: an unknown family matches every family, which is the safe reading. Do not add it to known_families."
+                    ));
+                }
+                if !known_family(f, &self.monitor.known_families) {
+                    return Err(format!(
+                        "models.{name}.family lists \"{f}\", which is not a family ferret knows ({}). Fix the spelling, or, for a family that is new, add \"{}\" to known_families under [monitor]: a misspelt family would make a reviewer of the same family look unrelated.",
+                        FAMILIES.join(", "),
+                        normalize_name(f)
+                    ));
+                }
+            }
+        }
+        if let Some(recipient) = &profile.recipient {
+            if normalize_name(recipient).is_empty() {
+                return Err(format!(
+                    "models.{name}.recipient is empty. Name who receives this profile's traffic: \"local\", \"lan\" (a host you own) or the provider's name, or remove the key."
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// `[monitor]`: every profile it names exists, a reviewer is not relaxed, consents name a recipient.
+    fn check_monitor(&self) -> Result<(), String> {
+        let m = &self.monitor;
+        if m.fleet_every_s < 10 {
+            return Err(format!(
+                "monitor.fleet_every_s is {}. The fleet joins are not run more often than every 10 seconds: set 10 or more (default 300).",
+                m.fleet_every_s
+            ));
+        }
+        let known = |p: &str| -> Result<(), String> {
+            self.models.get(p).map(|_| ()).ok_or_else(|| {
+                let names: Vec<&str> = self.models.keys().map(String::as_str).collect();
+                format!(
+                    "{p:?} is not a configured model profile ({}). Add [models.{p}] or fix the name.",
+                    names.join(", ")
+                )
+            })
+        };
+        let mut seen = HashSet::new();
+        for r in &m.reviewers {
+            known(r).map_err(|e| format!("monitor.reviewers: {e}"))?;
+            if !seen.insert(r.as_str()) {
+                return Err(format!(
+                    "monitor.reviewers lists \"{r}\" twice. List each profile once, in preference order."
+                ));
+            }
+            if let Some(profile) = self.models.get(r) {
+                if resolve(r, profile).alignment == Alignment::Relaxed {
+                    return Err(format!(
+                        "monitor.reviewers lists \"{r}\", whose refusals are relaxed. A relaxed model is never a reviewer: remove it from the list."
+                    ));
+                }
+            }
+        }
+        for t in &m.tripwires_only_profiles {
+            known(t).map_err(|e| format!("monitor.tripwires_only_profiles: {e}"))?;
+        }
+        for (pack, list) in &m.recipients {
+            if pack.trim().is_empty() {
+                return Err("monitor.recipients has a pack name that is empty. Name the pack (for example `ctf = [\"alibaba\"]`).".into());
+            }
+            for r in list {
+                let n = normalize_name(r);
+                if n.is_empty() || n == "unknown" {
+                    return Err(format!(
+                        "monitor.recipients.{pack} lists \"{r}\". Consent names a provider (for example \"alibaba\"); an unknown recipient is never eligible, so a consent to it means nothing."
+                    ));
+                }
+            }
+        }
+        for f in &m.known_families {
+            if normalize_name(f).is_empty() {
+                return Err("monitor.known_families lists an empty name. Remove it or write the family.".into());
+            }
+            if is_reserved_family_word(f) {
+                return Err(format!(
+                    "monitor.known_families lists \"{f}\", which names no family. Remove it: a model whose family is not known has no family key, and then matches every family; a family called \"{f}\" would be unrelated to all others."
+                ));
             }
         }
         Ok(())
@@ -2722,11 +3105,7 @@ allow = ["*.example.test"]
         }
         // The rejection holds when the box is not enabled too: nothing unsafe is kept in a config.
         for cap in ["SYS_ADMIN", "DAC_OVERRIDE", "SYS_PTRACE", "SETUID", "CHECKPOINT_RESTORE"] {
-            let err = Config::parse(&format!("[box]\ncap_add = [\"{cap}\"]"))
-                .unwrap()
-                .check()
-                .unwrap_err()
-                .to_string();
+            let err = Config::parse(&format!("[box]\ncap_add = [\"{cap}\"]")).unwrap().check().unwrap_err().to_string();
             assert!(err.contains(cap) && err.contains("allowlist"), "{cap}: {err}");
         }
         // Only the strict allowlist capabilities are accepted (with or without CAP_ prefix, any case).
@@ -2774,6 +3153,55 @@ allow = ["*.example.test"]
     }
 
     #[test]
+    fn mach_allow_takes_exact_names_and_prefixes_but_never_a_fetch_or_disk_service() {
+        let check = |entries: &str| {
+            Config::parse(&format!("[sandbox]\nmach_allow = [{entries}]")).unwrap().check().map_err(|e| e.to_string())
+        };
+        assert!(check("").is_ok());
+        assert!(check("\"com.apple.pasteboard.1\", \"com.apple.system.*\"").is_ok());
+        for bad in [
+            "\"com.apple.trustd\"",
+            "\"com.apple.trustd.*\"",
+            "\"com.apple.WebKit.Networking\"",
+            "\"com.apple.nsurlsessiond*\"",
+            "\"com.apple.diskimagesiod\"",
+            "\"com.apple.*\"",
+            "\"*\"",
+            "\"co*\"",
+        ] {
+            let err = check(bad).unwrap_err();
+            assert!(err.contains("sandbox.mach_allow") && err.contains("allow"), "{bad}: {err}");
+        }
+        let fetch = check("\"com.apple.ocspd\"").unwrap_err();
+        assert!(fetch.contains("com.apple.ocspd") && fetch.contains("sandbox.allow_fetch_services"), "{fetch}");
+        for malformed in ["\"\"", "\"a b\"", "\"x*y\"", "\"a\\\"b\""] {
+            assert!(check(malformed).unwrap_err().contains("not a Mach service name"), "{malformed}");
+        }
+        assert!(Config::parse("[sandbox]\nallow_fetch_services = true").unwrap().sandbox.allow_fetch_services);
+        assert!(!Config::default().sandbox.allow_fetch_services);
+    }
+
+    #[test]
+    fn nproc_headroom_defaults_to_256_and_zero_turns_the_limit_off() {
+        assert_eq!(Config::default().sandbox.nproc_headroom, 256);
+        assert_eq!(Config::parse("[sandbox]\nnproc_headroom = 0").unwrap().sandbox.nproc_headroom, 0);
+        assert_eq!(Config::parse("[sandbox]\nnproc_headroom = 1000").unwrap().sandbox.nproc_headroom, 1000);
+        assert!(Config::parse("[sandbox]\nnproc_headroom = -1").is_err());
+    }
+
+    #[test]
+    fn the_built_in_mach_allowlist_has_no_fetch_or_disk_service() {
+        for name in MACH_LOOKUP_ALLOW.iter().chain(MACH_LOOKUP_ALLOW_PREFIXES.iter()) {
+            assert!(
+                !FETCH_SERVICE_NAMES.contains(name)
+                    && !DISK_SERVICE_NAMES.contains(name)
+                    && !FETCH_SERVICE_PREFIXES.iter().any(|p| name.starts_with(p)),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
     fn r10_the_box_is_refused_with_no_sandbox_and_with_its_socket_in_unix_sockets() {
         // The box with no sandbox: the agent's own commands could reach the socket.
         let err = box_cfg("[sandbox]\nmode = \"none\"").unwrap_err();
@@ -2805,6 +3233,86 @@ allow = ["*.example.test"]
             with("\"/var/run/box.sock\"", "docker_socket = \"/var/run/box.sock\"").check_box_paths(home).unwrap_err();
         assert!(err.contains("box.docker_socket"), "{err}");
         assert!(with("\"/var/run/box.sock\"", ssh).check_box_paths(home).is_ok());
+    }
+
+    #[test]
+    fn lineage_keys_and_monitor_table_parse() {
+        let c = Config::parse(
+            r#"
+[models.dsv41]
+model = "deepseek-v4.1"
+family = ["deepseek"]
+alignment = "stock"
+recipient = "lan"
+[models.dsv41_review]
+purpose = "review"
+[models.qwen4max]
+family = ["Qwen"]
+recipient = "alibaba"
+[monitor]
+reviewers = ["dsv41_review", "qwen4max"]
+tripwires_only_profiles = ["dsv41"]
+known_families = ["acme"]
+[monitor.recipients]
+ctf = ["alibaba"]
+[monitor.content]
+new_recipient_real_targets = "redacted"
+"#,
+        )
+        .unwrap();
+        c.check().unwrap();
+        assert_eq!(c.models["dsv41"].alignment, Some(Alignment::Stock));
+        assert_eq!(c.models["dsv41_review"].purpose, Some(ProfilePurpose::Review));
+        assert_eq!(c.monitor.content.new_recipient_real_targets, RecipientContent::Redacted);
+        assert_eq!(Config::default().monitor, MonitorCfg::default());
+        assert_eq!(MonitorCfg::default().content.new_recipient_real_targets, RecipientContent::Features);
+        assert!(Config::parse("[models.a]\nalignment = \"uncensored\"\n").is_err(), "alignment is a closed set");
+        assert!(Config::parse("[models.a]\npurpose = \"agent\"\n").is_err());
+        // A reserved word names no family, in a profile's key and in known_families.
+        for w in ["unknown", "Any", "none", "*"] {
+            let c = Config::parse(&format!("[models.a]\nfamily = [\"{w}\"]\n[monitor]\nknown_families = [\"{w}\"]\n"))
+                .unwrap();
+            let e = c.check().unwrap_err().to_string();
+            assert!(e.contains("models.a.family") && e.contains("remove the key") && !e.contains("add \""), "{e}");
+            let c = Config::parse(&format!("[models.a]\n[monitor]\nknown_families = [\"{w}\"]\n")).unwrap();
+            let e = c.check().unwrap_err().to_string();
+            assert!(e.contains("monitor.known_families") && e.contains("Remove it"), "{e}");
+        }
+        // A review profile is not the default agent profile.
+        let c = Config::parse("default_model = \"r\"\n[models.r]\npurpose = \"review\"\n").unwrap();
+        assert!(c.check().unwrap_err().to_string().contains("default_model \"r\" has purpose = \"review\""));
+        assert!(Config::parse("[monitor]\nallow_new_recipient = true\n").is_err(), "there is no global key");
+    }
+
+    #[test]
+    fn check_refuses_bad_lineage_and_monitor_settings() {
+        let with = |text: &str| Config::parse(text).unwrap().check().unwrap_err().to_string();
+        let e = with("[models.a]\nfamily = []\n");
+        assert!(e.contains("models.a.family") && e.contains("empty list"), "{e}");
+        let e = with("[models.a]\nfamily = [\"deepseeq\"]\n");
+        assert!(e.contains("\"deepseeq\"") && e.contains("known_families") && e.contains("deepseek"), "{e}");
+        assert!(Config::parse("[models.a]\nfamily = [\"acme\"]\n[monitor]\nknown_families = [\"Acme\"]\n")
+            .unwrap()
+            .check()
+            .is_ok());
+        let e = with("[models.a]\nrecipient = \" \"\n");
+        assert!(e.contains("models.a.recipient is empty"), "{e}");
+        let e = with("[models.a]\n[monitor]\nreviewers = [\"b\"]\n");
+        assert!(e.contains("monitor.reviewers") && e.contains("\"b\"") && e.contains("[models.b]"), "{e}");
+        let e = with("[models.a]\n[monitor]\nreviewers = [\"a\", \"a\"]\n");
+        assert!(e.contains("twice"), "{e}");
+        let e = with("[models.a]\nalignment = \"relaxed\"\n[monitor]\nreviewers = [\"a\"]\n");
+        assert!(e.contains("never a reviewer"), "{e}");
+        let e = with("[models.glm_uncensored]\nmodel = \"glm-5\"\n[monitor]\nreviewers = [\"glm_uncensored\"]\n");
+        assert!(e.contains("never a reviewer"), "a relaxed marker in the name counts: {e}");
+        let e = with("[models.a]\n[monitor]\ntripwires_only_profiles = [\"zzz\"]\n");
+        assert!(e.contains("tripwires_only_profiles") && e.contains("zzz"), "{e}");
+        let e = with("[monitor.recipients]\nctf = [\"unknown\"]\n");
+        assert!(e.contains("monitor.recipients.ctf") && e.contains("never eligible"), "{e}");
+        let e = with("[monitor.recipients]\n\"\" = [\"x\"]\n");
+        assert!(e.contains("pack name"), "{e}");
+        let e = with("[monitor]\nknown_families = [\" \"]\n");
+        assert!(e.contains("known_families"), "{e}");
     }
 
     #[test]
@@ -3039,10 +3547,8 @@ enabled = true
 
         // resolved_action_workspace expands leading `~` and `~/` via HOME, leaves other paths untouched.
         let fake_home = Path::new("/home/tester");
-        let with_ws = |p: Option<&str>| SignalGuestsCfg {
-            action_workspace: p.map(PathBuf::from),
-            ..SignalGuestsCfg::default()
-        };
+        let with_ws =
+            |p: Option<&str>| SignalGuestsCfg { action_workspace: p.map(PathBuf::from), ..SignalGuestsCfg::default() };
         assert_eq!(with_ws(None).resolve_action_workspace_with_home(Some(fake_home)), None);
         assert_eq!(with_ws(Some("   ")).resolve_action_workspace_with_home(Some(fake_home)), None);
         assert_eq!(
@@ -3179,10 +3685,9 @@ enabled = true
             &format!("sha256:{good_hex}"),
             &format!(" {good_hex}"),
         ] {
-            let cfg = Config::parse(&format!(
-                "[mcp.servers.s]\ncommand = [\"srv\"]\npinned_schema_sha256 = \"{bad_pin}\"\n"
-            ))
-            .unwrap();
+            let cfg =
+                Config::parse(&format!("[mcp.servers.s]\ncommand = [\"srv\"]\npinned_schema_sha256 = \"{bad_pin}\"\n"))
+                    .unwrap();
             let err = cfg.check().unwrap_err().to_string();
             assert!(err.contains("pinned_schema_sha256"), "{bad_pin:?}: {err}");
         }
@@ -3211,10 +3716,9 @@ enabled = true
         }
 
         // Master project_instructions = false disables all packs even if opt-in is true.
-        let master_off = Config::parse(
-            "[agents]\nproject_instructions = false\nproject_instructions_in_security_packs = true\n",
-        )
-        .unwrap();
+        let master_off =
+            Config::parse("[agents]\nproject_instructions = false\nproject_instructions_in_security_packs = true\n")
+                .unwrap();
         master_off.check().unwrap();
         for pack in ["core", "vr", "redteam", "ctf", "ctf-generalist"] {
             assert!(!master_off.agents.project_instructions_enabled_for_pack(pack), "{pack}");
@@ -3236,11 +3740,7 @@ enabled = true
         // Port 0 is rejected whether enabled or disabled.
         let err_enabled = box_cfg("proxy_bridge = true\nproxy_bridge_port = 0\n").unwrap_err();
         assert!(err_enabled.contains("proxy_bridge_port"), "{err_enabled}");
-        let err_disabled = Config::parse("[box]\nproxy_bridge_port = 0\n")
-            .unwrap()
-            .check()
-            .unwrap_err()
-            .to_string();
+        let err_disabled = Config::parse("[box]\nproxy_bridge_port = 0\n").unwrap().check().unwrap_err().to_string();
         assert!(err_disabled.contains("proxy_bridge_port"), "{err_disabled}");
     }
 

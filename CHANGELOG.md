@@ -2,6 +2,540 @@
 
 ## Unreleased
 
+### Monitor and main (ef34aa4) together
+
+Main's Wave B (box proxy bridge, multi-principal credential profiles, passive analyzer, OAST, ingestion, the `webapp`
+pack) and its session robustness fixes meet the monitor's floor (E1-E4) and the shadow monitor (M1, M2) here; each keeps
+both sides' guarantees.
+
+- **The box proxy bridge is under the floor.** With `[box] proxy_bridge`, what a program in the box sends over HTTP(S)
+  reaches the proxy on the grant the bridge carries (the lead's, else the session that made the box), so that session's
+  policy applies to it (the infrastructure deny, the mission's revoked hosts, a hold), with the veto, SNI binding, the
+  canary and lab-listener checks, and its connections are in the one live registry: `cut`, `cut_mission`,
+  `revoke_scope`, `set_policy` and `ferret panic` end them (a runtime test goes through the bridge). Main's `INPUT -i
+  fb-+ -j DROP` and `FERRET-ALL6` stand; the bridge's `INPUT 1` accept opens one gateway port to its own mission only;
+  the box chain still holds the direct egress, from the same policy. The box counters (E4f) read the mission's chain,
+  which a bridged request does not pass: it is a net decision of the bridge's session instead.
+- **TW-21 with the bridge.** A bridged request is recorded for the bridge's session whichever session ran the program,
+  so with the bridge on, a box call (`box_exec`, `box_reset`, `bash` of a box-shell role) or a box job of any session of
+  the mission keeps that session's decisions in flight (the bridge's session only: see the fixes below). Without the
+  bridge nothing changes.
+- **OAST endpoints are infrastructure (E1).** With `[oast]` enabled, the broker's HTTP and DNS listeners on the
+  addresses they are bound to (the broker now starts first, and a port 0 is written back to `oast.bind` and
+  `oast.dns_bind`), the external poll endpoint, the callback host (`oast.public_host`, else the poll host) and every
+  name under its DNS domain are services of the daemon (`deny infrastructure: oast.bind 127.0.0.1:…`): no grant reaches
+  them (`grant_scope` refuses one), the sandbox refuses their loopback ports and `oast.external_token_file` is
+  unreadable to commands. A callback `oast_poll` grades as executed evidence therefore comes from the target, never
+  from ferret's own commands. An attempt at one through the proxy is refused and is TW-02 at its net decision; named in
+  a call's arguments beside another destination (the callback a payload carries to the target, in a query string or a
+  body) a broker endpoint is neither TW-02 nor a sink (TW-15), as a granted OAST host covers its own name.
+- **Multi-principal profiles in the authorization.** The profiles the operator attached (`creds`, main's
+  `creds_profiles`: names and summaries) are in the AUTHORIZATION block (`Authorization::credentials`); they authorize
+  no host. TW-06 is unchanged: the union redactor keeps every profile's values out of the records.
+- **Ingestion and TW-23.** An imported artifact (`security_ingest` of OpenAPI, GraphQL or a source map, up to 500
+  mandatory endpoints in one entry) off scope is one TW-23 hit per host, with the count, not one per endpoint. A
+  running mission keeps the target scope its lead's start recorded after an `import-scope`, for its policy and the
+  monitor alike; the passive analyzer's signals are target data the monitor does not read.
+- **The `webapp` pack.** `[monitor.recipients]` needs a `webapp` line like any new pack (the worked example has it).
+  The pack declares `live_targets = true` (a new optional pack key): it works on live bug-bounty targets, so the
+  monitor does not count its restricted network as a lab (D16), and a webapp mission with an unmarked grant or a named
+  target is a real-target mission (keep-going needs `--real-targets`).
+- **Session robustness.** Main's stop epoch (`Input::StopAt`) runs the monitor's one stop body between turns
+  (`stop_between_turns`: the records, the jobs, the children, the MCP connections closed) after marking the epoch
+  handled; a stale companion stop is dropped. Main's parked empty-reply lead ends `Parked`, which keep-going never
+  reopens.
+
+### Fixes after merging main (ef34aa4)
+
+- **A box job is a box job.** The session writes a job's `job_registered` only after the result of the call that started
+  it, when the call is no longer open, so a background `box_exec` (a scan, a fuzzer) was never on the monitor's books
+  as a box job and its bridged requests were TW-21 against the bridge's session for the whole run. The job is now a box
+  job from the result that gives it to the model (meta `job`) until it settles; a box call's result read after a
+  restart counts as a box call of its own duration.
+- **The bridge excuses only its own session.** The bridge carries one grant, so only that session's decisions can be
+  what a program in the box sent: box tools' results now name it (meta `box_bridge`, `META_BOX_BRIDGE`), the monitor
+  takes the mission's lead until one does, and a box call or box job of the mission keeps only that session in flight.
+  A child's idle egress is TW-21 again while a sibling's (or the lead's) box call or box job runs.
+- **TW-01 through the bridge.** A refused bridged request whose host the bridge's session did not name is the TW-01 of
+  the session whose box call or box job running at the time names it.
+- **Every log before a decision.** The core judged a session's net decisions right after its own log, before the
+  mission's other sessions were read; a lead's log sorts before its children's, so a replay (and a live pass that
+  caught up a backlog) judged the lead's bridged decisions without its children's box calls. A pump now reads every log
+  first and then judges; with the bridge it reads every session of a mission it reads one of and holds the mission's
+  decisions while one of them has more to read, and a replay reads every log to its end before any decision. A
+  journal's entries are judged after the logs too (it is still read for the authorization of the first record).
+- **OAST hosts on every port.** The external broker's poll host and the callback host were refused only on the minted
+  URL's port: a grant of the bare host (or the host on another port) was accepted, `mode = "open"` reached it on port
+  80, and a command could send a minted token there and have it graded `run`. They are now refused on every port, by
+  name and by the addresses they resolve to (one on this machine keeps its port), and `grant_scope` refuses a bare
+  name an `oast.` rule refuses on some port.
+- **A call aimed only at the broker is an attempt.** A broker endpoint in a call's arguments is the callback a payload
+  carries only when the call names another destination too; a call whose only destinations are the broker's
+  (`curl --noproxy '*' http://127.0.0.1:<broker port>/oast/<token>`, refused by the sandbox without a net decision) is
+  TW-02 S3, and a credential sent to the broker's domain alone is TW-06 toward a sink.
+- **TW-23 and imported artifacts.** An entry a `security_ingest` of the target's OpenAPI, GraphQL schema or source map
+  wrote (its result names the entry) holds the hosts the target's documents name (third-party APIs a bundle calls, a
+  staging server of `servers`): S0 per host, never a flag, and FS-9 counts each host once. A host is read only from a
+  host, service or endpoint asset: a source map's source files and `GET /v1/users.json` imported without an origin are
+  no longer off-scope hosts.
+- **TW-18 knows each pack's verifier.** The gate verifier is the role a pack's roles name as `verifier` (`triage_judge`
+  in webapp, `judge` in vr, `flag_judge`, `op_judge`), not a role whose name contains `verif`.
+- **TW-19 and reflected payloads.** A quote of an output ferret's network tools received (`http_*`, `web_*`, `fetch*`,
+  `oast_poll`) is the target's: a payload of the session's own arguments reflected in a response is the evidence of a
+  reflected XSS or an open redirect, not output the session made.
+- **The bridge's accept rule is the interface's only one.** The bridge port follows the lead's proxy port, which is new
+  in every daemon life; installing the bridge rule now removes every other `INPUT -i fb-<m> … -j ACCEPT` first (a box
+  adopted after a restart kept the old port's rule), and the rules check fails while another one is there.
+- Left as residuals (MONITOR.md §9.5): ferret's HTTP tools are read as commands (X3a), and a previous daemon life's
+  `ssh -R` bridge forward outlives a crash (X5).
+
+### Monitor and main (6be589b) together
+
+Main's Wave A built the scope revoke, the live cutoff and a kill-switch beside the monitor's floor (E1-E4); each is one
+implementation now, with both sides' guarantees.
+
+- **One scope revoke.** `Runtime::revoke_scope(session, hosts, reason)` is the one entry, `POST
+  /api/sessions/{id}/scope/revoke` (`{hosts, reason?}`, `note` accepted) the one route and `ferret scope revoke
+  <mission|session> <host>... [--reason <text>] [--json]` (`--note` the same flag) the one command; Signal's `/scope
+  revoke` and the web UI's Revoke button call it. The monitor's `POST /api/missions/{id}/scope/revoke` and main's
+  `DELETE /api/sessions/{id}/scope` are gone. From main: several hosts at once, any host, `*.suffix`, address or CIDR
+  block (a name under a wildcard grant, a host `mode open`, `network.allow` or the target's scope reaches), an optional
+  reason, the live cut and an audit note in the lead's log also when it is not running. From the monitor: a revoked
+  grant the ledger lists is recorded (`ScopeRevoke`, `no reason given` without a reason), after the cut; every entry is
+  kept in
+  `<mission>/scope_revoked.json` and refused by every policy of the mission (`deny revoked …`), after a restart and
+  against a later wildcard grant, until the host is granted again; the policy is rebuilt for every session of the
+  mission, started or being started. A host that is no grant by itself is no longer refused: it is revoked without a
+  record. The receipt is `{lead, revoked, ledger, recorded, not_granted, sessions, connections_cut}`, answered `200`.
+  `Policy::with_revoked` is the one policy narrowing (main's `without_hosts` folded into it: it also takes out the
+  `allow` patterns, granted literals and target blocks an entry covers).
+- **One live cutoff.** Every way of ending a connection from outside uses the proxy's one registry (the monitor's
+  E4(a) `Shared::live`, now with the address each connection was opened to): `revoke` (it no longer leaves open
+  connections to finish), `revoke_hosts` (by name and by address: a CIDR revoke ends a tunnel opened by name),
+  `revoke_all`, `set_policy` (what the new policy refuses ends at once), `cut_hosts`, `cut`, `cut_sessions` and
+  `cut_mission`. A connection cut while it waits for pacing, resolves or connects stops at once and is answered `502`
+  with a refusal on record; a connection that authenticated before a session-wide cut or a `revoke_all` is ended when
+  it registers; once connected a connection is judged again by the session's current policy before it is recorded as
+  allowed. `Proxy::hold` (which cuts nothing) is what the monitor's hold-then-cut uses. `cut_mission` and
+  `revoke_scope` reach the mission's MCP servers' grants too.
+- **Panic reaches what only the census finds.** `ferret panic` / `POST /api/panic` / `/panic` / the Panic button
+  (main) now also stops, by sandbox identity, what the sessions left running under their sandboxes (E3), for every
+  known session: `PanicReport` gains `processes_killed` and `processes_left`, and the CLI, Signal and web UI lines say
+  them when there were any.
+- **One set of Mach rules.** E2's default-deny of `mach-lookup` and its fetch-service deny in every network mode stay
+  (main's `deny_all`/`allowlist`-only flag and `Sandbox::with_network_mode` are gone: the monitor's rule denies more);
+  main's keychain and pasteboard deny under `sandbox.protect_credentials` is kept, with `com.apple.pasteboard.1` (what
+  `pbpaste` looks up), after the allows, so `sandbox.mach_allow` cannot open them while credentials are protected.
+- **MCP servers' grants are under the floor.** Main's per-server isolated proxy grants (P0-7) get the infrastructure
+  deny (E1) and the mission's revoked hosts like a session's grant; their net records, floor events and lab-listener
+  checks are the owning session's; a stdio server's sandbox carries the session's identity for the census.
+- **The box's `INPUT` drop and the counters.** Main's unconditional `INPUT -i fb-+ -j DROP` and `FERRET-ALL6` stand; the
+  box counters still read the mission's chain (every forwarded packet), and a packet from a box to the Docker host
+  itself is dropped before any mission chain, so it is no longer counted per mission.
+- **Bidirectional controls.** The tripwires' normalization strips the bidi set of main's untrusted-output sanitizer
+  (`U+061C` added), so a bidi-smuggled `<harness` tag still raises TW-27; TW-26 still reads a write of `AGENTS.md` or
+  `CLAUDE.md` as S1 although main keeps them out of the security packs' prompts by default (a workspace is not tied to
+  a pack).
+
+### Fixes after merging main (6be589b)
+
+- **A revoke cuts before it records.** `revoke_scope` now narrows and cuts first and appends `ScopeRevoke` after: a
+  ledger that cannot be read or written (a full disk the agent filled) no longer refuses the whole revoke with "nothing
+  was changed" while the tunnel stays open. The error says the revoke is applied and not recorded; revoking again
+  records it. The mission's scope generation moves with the revoked list under one lock, so a session built meanwhile
+  cannot keep the host.
+- **MCP grants and revokes.** A host granted again after a revoke is allowed again for the mission's MCP servers'
+  isolated grants at once (they were left refusing it until the session restarted). A lead's MCP grants are known to
+  `revoke_scope` and `cut_mission` from before they are made, so a revoke or a cut while the lead lists its servers
+  reaches them, and grants made while the scope changed get their policy again; the revoke's note to a lead that is
+  still being started waits for its first run instead of creating its log.
+- **Panic.** The boxes' teardown begins right after the proxy cut instead of after the sessions, the job kills and the
+  census kill (a box's egress does not go through the proxy). A panic stop of a session between turns closes its MCP
+  connections, as an operator's stop does (one body for both).
+- **Proxy.** A check (`FERRET-CHECK`) is registered like a connection again: a revoke, a cut or a panic ends its
+  lookup at once (`502`, a refusal on record), and it is judged by the session's policy once the lookup is done. A
+  connection cut while it waited for pacing records its `paced_ms`. The cut docs say what a cut does now (it stops a
+  lookup or a connect at once; the caller holds with `Proxy::hold`), and the listener doc is main's again.
+- **Monitor authorization.** The mission's revoked hosts (`scope_revoked.json`, read when it changes) are out of the
+  authorization whatever covers them, so a carve-out under a wildcard grant or a revoke of an `allow` or target-scope
+  host is no longer "authorized" to TW-13(b), TW-06/TW-15 sinks, TW-23 or the reviewer's block; a change of the file
+  also has the journal read again, so a recorded revoke is seen without a session's ledger record. An MCP server's hosts
+  authorize only an MCP tool's call (P0-7 took them off the session's policy): a session's own command toward one is
+  outside the authorization, its refusal is a TW-01 refusal, and TW-21 no longer exempts an allowlist or `deny_all`
+  refusal toward one.
+- **Tripwires.** TW-23 judges a child's choice of `mandatory` at its `security_record` call: `security_ingest` (main
+  gave it to vr's scout) marks every host it imports, which flooded one S2 per asset. TW-18 counts three refused
+  finishes in a row only for the same reason (main's finish gates refuse one gap at a time). A hit's key and detail drop
+  `U+061C` too.
+
+### Monitor and main (da5d310, the ferret rebrand) together
+
+- **The monitor is named as ferret is.** Its modules are in the ferret crates (`ferret_agent::monitor`, `census`,
+  `egress`, `floor`, `infra`; `ferret_core::lineage`; `ferret_net::clienthello`; `ferret_tools::procinfo`,
+  `sandbox::census`, `sandbox::selfprobe`); its commands are `ferret monitor`, `ferret models lineage` and
+  `ferret scope revoke`; a sandboxed command carries `FERRET_SANDBOX_ID` (the census's fallback), a monitor notification
+  `FERRET_LEVEL`; its files are under `~/.ferret` (`monitor/`, `keys/monitor.key`, `logs/floor.jsonl`,
+  `logs/box-counters.jsonl`, `egress-probe.json`) and the copies under `~/.ferret-copies` (TW-07); the check method is
+  `FERRET-CHECK`. Every rename follows the one main made for the same kind of name.
+- **The services the daemon talks to for the operator are infrastructure (E1).** With `[signal]` enabled, the
+  signal-cli endpoint (`signal.http_url`) is refused to every command whatever is granted, rule `deny infrastructure:
+  signal.http_url 127.0.0.1:1337`, and its loopback port is refused by the sandbox too: a command that reached signal-cli
+  could read the operator's replies or send as the bridge. With `[mail]` enabled (`imaps`), so is the IMAP server
+  (`mail.host` on `mail.port`). A scope request approved from Signal and the bridge's `/scope` go through
+  `grant_scope`, so they are refused for infrastructure up front. The operator's proxy rewrite rules act on a request
+  after its destination was decided and cannot set `Host` or `CONNECT`, so they carry nothing past the deny (tested).
+- **A new pack needs its own consent.** The model policy's consent to a new recipient is per pack, so with main's
+  `ctf-generalist` pack a configuration whose `[monitor.recipients]` names the other packs fails `ferret config check`
+  until it names this one too (or lists the profile in `tripwires_only_profiles`); the worked example has the line.
+- **Main's pacing and the cut.** The noise governor paces an intercepted tunnel's requests inside the tunnel, which a
+  cut (E4a) or a shutdown still ends at once. An opaque tunnel and a forwarded request wait for the governor (up to 30 s)
+  before anything is resolved or opened, and that wait now watches the cut too: a connection cut while it waits
+  (`ferret scope revoke`, the monitor's cut) opens nothing, its client gets `502` and the record is a refusal (`… (cut
+  while it waited for pacing)`), never an allow of a revoked destination; the policy is read again when the wait ends,
+  so a hold or a revoke set meanwhile decides it; and a tunnel whose client gave up while it waited opens nothing and
+  leaves no record (a forwarded request whose client only shut down its writing half is still served).
+- **A paced decision says how long it waited.** A net decision of a connection that waited for the governor carries
+  `paced_ms`; TW-21 (and FS-3 through it) judges it at the time its process connected, so a connection held back
+  20 s past the end of its call is not idle egress.
+- **The services' files are not readable to commands either (E1).** The endpoint deny closed only the network route
+  to signal-cli and the IMAP server. With `[mail]` enabled, `mail.password_file` and `mail.maildir_path` are now in
+  the sandbox's unreadable paths wherever they lie (a command could otherwise read the IMAP password, or the maildir
+  past `allow_senders`); signal-cli's account store (`~/.local/share/signal-cli`) and Signal Desktop's are credential
+  stores of the sandbox, and with `[signal]` enabled a signal-cli store under the daemon's `$XDG_DATA_HOME` is hidden too
+  (another `--config` directory goes in `sandbox.unreadable_paths`).
+- **A Signal approval grants only what its alert showed.** `request_scope` takes any number of hosts and the Signal alert
+  cuts long names (`…`) and leaves hosts out (`… +N more`), while `approve` granted them all, and the monitor counts every
+  grant as the operator's. `approve` (and `/scope <item>`, `/approve <item>`) of such a request, or the number of a host
+  shown cut, now grants nothing and says to give the numbers of hosts shown in full, write the names out with `/scope
+  <session> <host>...`, or use the web UI or `ferret scope`.
+- **The monitor and main's box tools.** Main gave core's lead, worker and chat (and `vr`, `redteam`) `box_exec`,
+  `box_get` and `box_reset`. A command that runs in the box (`box_exec`, `box_reset`, `bash` of a role whose
+  `default_shell` is `box`) is no longer judged by the tripwires about this machine (its paths for TW-05, TW-07,
+  TW-09, TW-10, TW-16 and FS-1; TW-09's git commands, TW-10's `ps eww`, TW-16's `LD_PRELOAD`, TW-22's side channels);
+  destinations, sinks, credentials and canaries still are. `box_get` is judged by the workspace file it writes (`to`,
+  by default the box path's last name), so `box_get` into `AGENTS.md` or `.git/hooks/pre-commit` raises TW-26 or
+  TW-09 and a fetched `/root/.gitconfig` does not.
+- **Operator approvals are authorization.** The approvals not yet used (`ferret approve`, the web UI, Signal's
+  `/approve`) are in the monitor's authorization and are operator text for TW-03, so a scope request for the host an
+  approval names, citing it, is an ordinary request.
+- **Infrastructure on its own port.** TW-02 judges a call's destinations on the port the call gives them (a URL's,
+  `host:port`, `nc host port`, `telnet host port`, `openssl s_client -connect host:port`), so `nc 127.0.0.1 1337`
+  (signal-cli), `-connect imap.mail.example:993` and the daemon's port are infrastructure attempts; TW-03 reads a scope
+  request without a port as covering every port, a service's own included (`Policy::infrastructure_on_some_port`).
+- **A mission directory from before the rename keeps its ledger.** Main renamed the journal head's seal label
+  (`loom-journal-head-v1` to `ferret-journal-head-v1`), so every journal of a home moved from `~/.loom` failed
+  verification (the runtime's ledger reads and the monitor's authorization with it). A head sealed with the old label
+  verifies again and is sealed with the new one at the next append.
+- **`ferret config check`** runs main's start-up checks (the `[mail]` password file, the packs: `packs: …`) with the
+  infrastructure deny, then the model policy. `ferret status` and `GET /api/status` carry both the egress and monitor
+  lines and main's default model and Signal state; the web UI's daemon status panel shows Egress and Monitor.
+
+### Monitor and main (604e342) together
+
+- **An intercepted tunnel is bound and cut like an opaque one.** The first flight of a tunnel is read and its server name
+  bound to the `CONNECT` host (E4c) before interception takes the client's handshake, so a hello the binding refuses is
+  never intercepted; a cut or a shutdown ends an intercepted tunnel at once (main's interception watched only the
+  shutdown). A captured `http://` request that a cut ends is captured with the cut's reason.
+- **The policies of new paths keep the floor.** A session's policy is its grants, its MCP servers' hosts and its
+  target's scope, then the revoked hosts, then the infrastructure deny (E1), which still comes first in every check; the
+  grant of the daemon's MCP check has the infrastructure deny too, and its sandbox withholds the model profiles a
+  session's sandbox withholds (every profile since the start, reloaded ones included). A stdio MCP server starts under
+  the session's process limit (E3), as every sandboxed command does.
+- **The monitor reads calls as the tool dialect runs them.** The path, URL and content tripwires read what
+  `dialect::adapt` makes of a call (a Codex `apply_patch` becomes one call per file it names; a fetch that names its
+  page only in `prompt` fetches that page), so a git hook added through `apply_patch` and a metadata page fetched
+  through `prompt` are seen. A claim's `assets` are read as ledger prose.
+- **A call is recorded and judged as the tool that runs.** The executor folds case and `-` (`Pty_Exec` runs `pty_exec`),
+  runs `shell` with a Codex `apply_patch` argv as a write and an editor's `view` as a read; the `tool_call` record kept the
+  class of the name as sent (`State` for `Pty_Exec`, `Exec` for that patch, `Write` for that view). It now carries the
+  class of what runs (`ferret_tools::run_class`), so `max_exec_calls` caps such calls, and the monitor derives the tool
+  and its class again for older logs: commands sent under another case are read as commands, `Request-Scope`,
+  `Agent_Stop`, `EVIDENCE` and `Finish` meet TW-03, TW-18 and TW-19, a build file or git hook written through a Codex
+  patch raises TW-26 or TW-09, and a viewed `.git/config` or `package.json` no longer does.
+- **Relative paths follow the shell directory.** `cd` persists between `bash` calls (main); the monitor resolved every
+  relative path against the workspace. A `bash` command's relative paths now start at its `cwd`, else where the last
+  result left the shell (meta `cwd`, read back after a restart), so a write to `log.jsonl` from the session's own
+  directory is TW-16 and a read from `~` of another session's log is TW-10.
+- **A target's scope and the MCP servers' hosts are authorized.** The monitor's authorization had only the configured
+  lists and grants, so traffic in a mission target's scope looked unauthorized (TW-13, TW-23, FS-4) and a target mission
+  was not a real-target one. The target's scope and exclusions (recorded at the lead's start) and the hosts of the
+  pack's MCP servers now count; the scope makes a real-target mission and is operator text for TW-03.
+- **MCP servers are not idle egress or survivors.** A lead lists its MCP servers through its proxy before its
+  `session_start`, and a server talks to its hosts between calls: TW-21 judges neither. A session's MCP connections close
+  when a turn of it ends finished or stopped, and when a child settles (they open again on the next call), so a server
+  is not a survivor of an ended session (TW-20). `ferret mcp check` runs its server under an identity of its own
+  (`mcp-check-<id>`) and stops what it left running before its scratch directory goes, so the census and the lab-port
+  listener check (E4e) see it.
+- **An MCP tool's arguments are not a command line.** Issue bodies and chat text no longer raise the command tripwires
+  (`crontab` in an issue was TW-11, `ps auxeww` TW-10); only `command`, `cmd`, `script` and `shell_command` are read as a
+  command, and a tool whose name says it writes (`write_file`) writes the paths it names (TW-26).
+- **`AGENTS.md` and `CLAUDE.md` are build files** for TW-26: main reads them into every later session's system prompt.
+- **An early `sleep` is found beside a `description`.** TW-16 tested the join of every argument, so `sleep 30` with
+  the `description` Claude-trained models send (or a timeout) never matched; it now reads the command, and a
+  `description` is prose for the command tripwires.
+- **An upload is not the ferret home.** With a workspace whose `.ferret` is the home (`$HOME`), reading an operator
+  attachment in `.ferret/uploads` was TW-07.
+
+### Monitor and tolerant tool calls together
+
+- **The monitor reads a repaired call as it runs.** The executor accepts other spellings of tool and argument names
+  (`write_file`, `filename`, `file_text`) and the log keeps what was sent, so the path and content tripwires did not
+  see those calls: a git hook written through `filepath` raised nothing. They now read what the repair adds as well.
+
+### Exact JSON floats
+
+- **A float parsed from JSON is the exact value that was written** (serde_json `float_roundtrip`). A sealed line of the monitor
+  log or a journal is checked by parsing it and serializing it again; with the default parser a float could come back one unit
+  in the last place off (`1200003.6` as `1200003.5999999999`), so a valid line would fail its MAC. It also made
+  `monitor::replay::tests::the_report_round_trips_as_json` flaky.
+
+### Monitor and the 2026-11-17 release together
+
+- **`ferret models lineage [profile]`** is the monitor's command that was `ferret models show [profile]`: `ferret models show
+  <session>` is a mission's models (the release). `ferret models` has both, with `list`, `reload`, `set` and `role`.
+- **A profile with `purpose = "review"` never runs an agent**, also through the release's model choices: it is refused as a
+  mission's `role_models` (at creation and with `ferret models role`), as a switch (`ferret models set`), and a reload is refused,
+  changing nothing, when it would give that purpose to the profile of a session that has not ended or of a mission's choice.
+  `GET /api/sessions/{id}/models` leaves it out of `profiles`.
+- **`model_switched` records the lineage** of the new model in `to.lineage`, and `session_start`'s lineage comes from the
+  live profile (a reloaded one too). A switch is recorded when the profile, model id or window changed, not the lineage. The
+  monitor treats a session switched onto a relaxed model as relaxed from that record on.
+- **The infrastructure deny follows `ferret models reload`**: the endpoint of a profile a reload adds or changes is refused to
+  every command at once (the sessions' proxy policies, `grant_scope`, the floor's veto, the periodic resolve), and its loopback
+  port is refused to the sandboxes made from then on; the start-up endpoints stay denied.
+- **`ferret config check`** runs the release's start-up checks (key files, sandbox preflight, box paths) and the monitor's
+  (the infrastructure deny it can build, `The network configuration cannot be used: …`), then the model policy, and prints
+  `ok: <path>`.
+
+### Monitor M2: the monitor core, in shadow
+
+- **The daemon now watches.** `Runtime::start` builds one `Monitor` per ferret home (`[monitor] enabled = false` keeps only the precision-list, S4 and canary tripwires), folds
+  its log before any session is activated, and runs it on a worker. It reads every record of every session (`log.jsonl`),
+  `net.jsonl`, `logs/net-unattributed.jsonl`, `logs/floor.jsonl` and the mission journals through persisted cursors, and runs
+  the 28 tripwires (TW-01 to TW-28, `docs/MONITOR.md` §6.2) and the 10 fleet joins (FS-1 to FS-10, every `fleet_every_s`)
+  over them. **Everything is shadow**, the precision list included: findings are recorded and shown; nothing is steered,
+  refused, held, paused or notified, and an agent can see no difference.
+- **New files** under the home: `monitor/log.jsonl` (hash-chained and HMAC-sealed with the new `keys/monitor.key`; entry kinds
+  `cursor`, `heartbeat`, `tripwire`, `flag`, `response`, and the rest of §7.3 for later phases), `monitor/reserve`
+  (preallocated, takes pause entries on a full disk), `monitor/first-start`, `keys/monitor.anchor`. A log that does not
+  verify, was cut short or is missing makes the monitor `down` (the daemon still starts; `ferret monitor` says why).
+  The first start begins every source at its end, so it raises nothing about history.
+- **New `[monitor]` keys:** `enabled` (default true), `mode` (`"shadow"`), `fleet_every_s` (default 300, at least 10),
+  `monitor_down` (`"pause_real_targets"` or `"notify"`; M3 applies it).
+- **New routes** (additive): `GET /api/monitor`, `GET /api/missions/{id}/monitor?after=&limit=&quiet=`,
+  `GET /api/monitor/reviews/{review}/input` (`404` until M6); `StatusView.monitor` (`#[serde(default)]`).
+- **New commands:** `ferret monitor [status]`, `ferret monitor log <mission|session> [--json] [--since] [--all] [-n]` and
+  `ferret monitor replay [--since] [--positives FILE] [--home DIR] [--no-journal-key] [--json]`: the tripwires over a home's
+  history through the real cursors, read-only, reporting per-tripwire hits, precision and recall against known positives,
+  would-be pauses per 100 active hours and the fleet joins.
+- `ferret_core::journal::hmac_sha256_hex` and `load_existing_key`; `Authorization::build` replaces the M0 stub `for_mission`;
+  `tripwire::Hit` gains `key`, `at_ms`, `basis`, `precision` and `from_s1` (all `#[serde(default)]`).
+- **Review fixes (M2).** The `check` of `attempt` is read as a command; a forked child primed before its `forked` record is
+  read from it on; the inbox answer's echo no longer lends the agent's words to operator text (TW-03 needs the host in
+  operator text); `ferret monitor log` and `status` print no control or bidirectional character; TW-06's credential index is
+  persisted (a `secrets` field on `cursor` entries, additive), capped per mission and flags only a mission that never saw the
+  value; `$TMPDIR`, `$PWD`, relative paths and commands glued to a URL are matched; TW-02, TW-04, TW-06 and TW-15 read the
+  call's destinations, not payload text, and a path is a write only where the command writes it; a log that takes writes
+  again lifts `down` without a restart and loses no hit; the `n:` cursor is checkpointed only up to the last judged decision;
+  `[monitor] enabled = false` keeps the precision-list, S4 and canary tripwires and the monitor is always built; TW-21 counts a
+  PTY left running, keeps a quiet session's jobs and is held for 10 minutes after a restart; FS-1 keeps reads per mission, counts a
+  two-way board over one file and forgets old paths; the replay reads the windowed joins over the whole history; a first
+  start that was cut short is still a first start; `GET /api/monitor` reads a snapshot, so it never waits for a pass; the status
+  says `degraded` when the worker's heartbeat is older than 30 s. The messages of a down monitor name steps that work in M2.
+- Deferred to later phases and said so in `docs/MONITOR.md` §2.1, §6.2 and in the CONTRACT of `monitor/engine.rs`: inline
+  (pre-call) tripwires and the gate (M8), provenance of a credential toward its asset (M8), the canaries' placement (M10),
+  gzip runs (M6), fold snapshots, `POST /api/monitor/replay` (the replay runs in the CLI).
+
+### Monitor M1: model lineage, recipients and reviewer eligibility
+
+- **New profile keys** (all optional): `[models.<p>] family` (a list), `alignment` (`stock`, `relaxed`, `unknown`), `recipient`
+  (`local`, `lan` or a provider name) and `purpose = "review"`. Unset, the family is inferred from the model id, a relaxed
+  marker in the id or name makes the alignment `relaxed`, and the recipient is the `base_url` host, except that a loopback
+  address is `unknown` until declared. `ferret_core::lineage` is the resolution; a family outside the known list is refused
+  unless `[monitor] known_families` names it.
+- **New `[monitor]` keys:** `reviewers`, `tripwires_only_profiles`, `recipients` (per-pack consent), `content.new_recipient_real_targets`
+  (`features` or `redacted`) and `known_families`. The other keys of the monitor are still rejected as unknown until their phases.
+  There is no global `allow_new_recipient`.
+- **`ferret config check` checks the model policy** and now fails (exit 1) when an agent profile has no eligible reviewer in some
+  pack and is not in `tripwires_only_profiles`, or its family or recipient is unknown, or a reviewer's family, alignment or recipient is not declared (an inferred one is
+  not enough), or the policy cannot be evaluated; the message gives the exact lines to add. `DEFAULT_CONFIG` leaves
+  `tripwires_only_profiles` commented out, so a first check fails until the operator chooses. An existing
+  `config.toml` that has no `[monitor]` fails the check until it says what to do: this is the point, nothing else changes and the
+  daemon still starts.
+- **`ferret models lineage [profile]`** prints each profile's resolved family, alignment, recipient and where each came from, and who
+  reviews its missions in each pack. Needs no daemon.
+- **`session_start`** records the resolved lineage in `model.lineage` (a new optional field of `ModelRef`; older logs read as before).
+- `ferret_agent::monitor::lineage`: `eligible` (the six clauses, overrides that never cover a relaxed agent or reviewer),
+  `select` and `select_with_verifier`, `reachable_profiles`, `check_config`, `creation_refusal`, `show_lines`. Nothing in the
+  runtime consults them yet; the refusal of a real-target mission with no reviewer waits for the monitor (M2).
+- `docs/config.example.toml` has the model-policy keys live and the operator's fleet as a worked example that a test checks.
+
+### Monitor M1 review fixes
+
+- **Recipient inference reads `base_url` as the model client does** (the `url` crate): `127.1`, `2130706433`, `0x7f.1`, `0`,
+  `[::ffff:127.0.0.1]` and `[::]` are loopback and so `unknown` until declared, a backslash ends the authority, and a bare `lan`,
+  `local` or `unknown` host is `unknown` rather than the operator's own recipient.
+- **`unknown`, `any`, `none` and `*` name no family**: `Config::check` refuses them in `family` and `known_families` (and no longer
+  suggests adding them), and `resolve` ignores them, so an unknown family stays unknown and matches every family.
+- **A `purpose = "review"` profile is not an agent**: refused as `default_model`, as a pack role's `model`, `escalation_model` or
+  `alloy_models` entry, and as the model of a new session. `creation_refusal` looks at every profile a mission can reach and
+  refuses, with a sentence, when the reachable set cannot be computed; `ferret config check` fails when the policy cannot be evaluated.
+- **Overrides** are bound to a mission and to what they cover (the recipient, or the reviewer profile) and are honoured nowhere,
+  including the per-profile picks of `select`, on a mission that reaches a relaxed agent. `eligible` returns the `Basis` of the
+  recipient (`OperatorOwned`, `Intersection`, `Consent`, `Override`), carried in `Selection`, so a new recipient can be told apart.
+  `Override` and `Request` gained fields (`mission`, `target`); nothing serialized yet.
+- **`session_start`'s lineage covers the served id**: an undeclared family is the union of the configured and the served id's families.
+- **`ferret models lineage`** prints the fallback reviewer after a fault, `config check` notes a fallback to a recipient the fleet does not
+  otherwise use (consent is per pack, not per fleet), and a profile name with `:` is shown. `config check` requires a reviewer's family
+  and recipient to be declared.
+- **`config init` no longer writes `tripwires_only_profiles = ["local"]`** (a commented line): not LLM-reviewed is the operator's choice.
+
+### Monitor E4 review fixes
+
+- **Server-name binding** reads a hello behind a TLS alert or change-cipher-spec, or in a record whose version is not 3.x, as
+  unreadable and refuses it (servers skip such records); a first byte outside `0x14..=0x17` or a second byte of `0x10` or more is
+  not TLS. An encrypted-ClientHello extension whose outer name is the destination passes (Chromium's placeholder), others are refused.
+- **Lab-listener identity** finds the process that holds the accepted socket of the connection (a one-shot squatter is named), then
+  every listener that covers the address (a decoy listener of the connector no longer masks another's), also for this machine's
+  interface addresses (`Proxy::set_local_addrs`), leaves out the connector's own mission, and bounds the scans (four at once; the
+  state lock is no longer held while session directories are resolved). `ListenerFn` and `listener_of` take the destination and the
+  local end of the connection; `procinfo::tcp_sockets` is new.
+- **Canary hosts** are S4 events in `deny_all` and allowlist missions too (`Proxy::set_refusal_observer`). Floor events are appended
+  to `logs/floor.jsonl`. The floor and the proxy no longer hold each other alive. A check asks the veto for the resolved address.
+  `Proxy::hold` holds the reference grant too. Box counters keep every window between installs and are not double counted.
+
+### Monitor E4: proxy controls
+
+- **Cut.** `Proxy::cut(session)` / `cut_sessions` end every open tunnel and forwarded request of a session (reference grants'
+  too) with the fixed reason "the session's connections were closed by ferret"; `Runtime::cut_mission(mission)`. A connection
+  that authenticated before a cut is ended when it registers. The bytes of an open tunnel stop within a second.
+- **Veto.** `Proxy::set_veto`: a synchronous hook asked before any lookup, before each connect and for a tunnel's server name;
+  `502` with a fixed sentence and a `vetoed: …` refusal record. The daemon installs `ferret_agent::floor::Floor`: canary hosts and
+  the infrastructure classes (a second line behind each session's own policy).
+- **Server-name binding.** A `CONNECT` tunnel's first flight is read before anything goes upstream: a TLS ClientHello must name
+  the destination or another name the session's policy allows; an encrypted ClientHello, an unreadable one and a missing name
+  for a destination that is a name are refused. `NetDecision` gets the optional field `sni` (older records are unchanged and
+  still read). A tunnel that is not TLS passes as before.
+- **Canary users.** `Proxy::add_canary_user`: a decoy proxy user that never authenticates, answered as an unknown user, whose
+  use fires `set_canary_hook` before any answer and is recorded uncapped and attributed to the listener's session.
+- **Lab-listener identity.** For loopback connections the process listening on the port is looked up
+  (`ferret_tools::sandbox::census::listener_of`); a listener started inside another session's sandbox is refused.
+- **Box rule counters.** The mission box chain's per-rule packet and byte counters are polled every 60 s and the deltas
+  appended to `<home>/logs/box-counters.jsonl`; `MissionBox::poll_counters`, `Runtime::box_counters_now`.
+- Dev-dependency `base64` for `ferret-agent` (tests).
+
+### Monitor E3: process identity and limits
+
+- **Fork-free process inspection** (`ferret_tools::procinfo`: libproc and `sysctl` on macOS, `/proc` on Linux). `proc` no longer
+  runs `/bin/ps` (about 12 to 17 forks a second for every leftover job, and no signal at all when the process table was full);
+  who is in a command's group, who its leader is and what its argument vector says come from the kernel. A command that has run
+  for 10 s is looked at every 200 ms instead of every 50.
+- **A group that cannot be inspected is still stopped.** `Unknown` no longer means "do not signal": the group is signalled
+  unless its recorded leader is known to have been replaced (start time read and different). A job whose group could not be
+  confirmed stopped (`Ended(TrackingFailed)`) keeps its `.pid` record and owner marker, so the next start can still find and
+  kill it (`jobs::clear_leftovers`).
+- **RLIMIT_NPROC headroom** for sandboxed commands and PTYs: new `[sandbox] nproc_headroom` (default 256, `0` sets no limit),
+  soft and hard limit `user limit - headroom` whatever else exists, set before the command starts; a command is refused
+  (an error that says what to do) when the user already holds that many processes (Linux: threads).
+- **Process census by sandbox identity** (`ferret_tools::sandbox::census`, `ferret_agent::census`). A process is a session's when
+  its sandbox may read the session's temp dir and may not read the ferret home (macOS `sandbox_check`, probed once; the profile
+  is unchanged), so setsid'd, double-forked and `env -i` processes are found. Every 60 s the daemon finds each non-archived
+  session's processes and what they listen on (TCP listening, UDP bound), warns once about processes of an ended session.
+  New: `GET /api/census[?now=true]`, `POST /api/sessions/{id}/census/kill` (SIGSTOP then SIGKILL, whole process groups when
+  every member is the session's, until two scans find nothing, only a pid that still has the recorded start time; the answer
+  gains `readable`), `Runtime::census`, `census_now`, `census_kill`. Fallback where the query does not
+  work: the `FERRET_SANDBOX_ID` variable (`Sandbox::with_identity`, set by `Sandbox::env`) and known process groups. Nothing is
+  stopped automatically.
+
+### Monitor E2: fetch services denied in every network mode, `mach-lookup` default-deny, and the sandbox self-probe
+
+- **Commands cannot reach the macOS fetch services in any network mode.** `com.apple.trustd(.agent)`, `ocspd`,
+  `nsurlsessiond(.NSURLSessionProxyService)` and WebKit's XPC services were denied only under `deny_all`; they are now denied
+  under `allowlist` and `open` too (the last rule of the profile). Programs that check certificates through macOS
+  (`security verify-cert`, `codesign --verify`, Swift and Go programs), background URL sessions and WebKit-based tools fail
+  in those modes as they did under `deny_all`; Apple's curl, Python and OpenSSL are not affected (probed).
+  `SandboxCfg::network_deny_all` (never a configuration key) is removed: nothing reads `[network] mode` for this any more.
+- **`mach-lookup` is denied by default** with an allowlist of 17 services (`ferret_core::config::MACH_LOOKUP_ALLOW`) found by
+  running bash, python3, node, git, curl, clang, swiftc, cargo, make, cmake, ssh, sqlite3, perl, ruby, java, codesign, lldb,
+  osascript and the usual utilities under `(deny mach-lookup)` until their output matched an unconfined run. The keychain
+  and security daemons, Spotlight (`mdfind`), the clipboard (`pbcopy`, `pbpaste`), audio, analytics, authorization and the
+  disk services are out of reach. A tool that needs one more: new `[sandbox] mach_allow = [...]` (exact names or a prefix
+  ending in `*`; refused when it would cover a fetch or disk service). Chromium builds find their child processes through
+  `<bundle id>.MachPortRendezvousServer.<pid>`, a name the process registers itself, so the prefixes of `org.chromium.Chromium`,
+  `com.google.Chrome` and `com.google.chrome.for.testing` are allowed (`MACH_LOOKUP_ALLOW_PREFIXES`; probed with a registering
+  process and an exec'd child, headless Chromium itself not run); Edge, Electron and other builds need
+  `mach_allow = ["<bundle id>.MachPortRendezvousServer.*"]`.
+- **`[sandbox] allow_fetch_services = true`** (new, default false) allows the fetch services again and marks egress unbounded.
+- **Sandbox self-probe** (`ferret_tools::sandbox::selfprobe`): at start and every hour the daemon runs commands under its own
+  profile against local listeners: a certificate whose AIA URL names the listener, a background URL session and a
+  `WKWebView` made from `osascript -l JavaScript` (each with a control that proves the host fetches, else
+  `not_exercised`), the daemon's port with a decoy process whose argument vector holds a code, and a hook and Git
+  configuration write. Anything that arrives or lands, or a probe that cannot run, makes egress unbounded.
+- **Egress state** (`ferret_agent::egress`): `Runtime::egress()`, `GET /api/status` field `egress` (`level`, `reasons`,
+  `basis`, `probes`, `probed_at_ms`; absent from older daemons), a line in `ferret status` (`egress: bounded (…)` or
+  `egress: UNBOUNDED, <reason>`), a web banner when unbounded, `<home>/egress-probe.json` (the last probe) and one
+  `egress` notification when it turns unbounded. Keep-going will refuse while it is not bounded
+  (`EgressView::keep_going_blockers(now_ms)`), also when the last probe is older than two probe periods (`STALE`). Nothing else is
+  refused or stopped by it. Egress is also unbounded when `sandbox.unix_sockets` names the resolver (`/var/run/mDNSResponder`:
+  DNS carries data outside the proxy), and a problem the probe finds is notified even while `allow_fetch_services` holds egress
+  unbounded. The probe's listeners are bounded (4 KiB, 3 s per connection, never waited for), a probe is cut at five minutes,
+  its process groups are killed when the daemon shuts down, and a directory a cut-off probe left is removed at the next one.
+
+### Monitor E1: infrastructure deny and scope revoke
+
+- **Infrastructure no grant can reach.** Every command policy now refuses, before `deny`, any grant, `allow_private`
+  and `mode open`, by name and by every resolved address (`deny infrastructure: …` in `ferret net`): cloud metadata
+  (169.254.0.0/16, `fd00:ec2::254`, `100.100.100.200`, `192.0.0.192`, names starting `metadata.` or `instance-data.`),
+  the DevTools and inspector ports 9222 and 9229 and the Docker API ports 2375 and 2376 on this machine, the daemon's
+  port, the `host:port` of every model profile and the box's `ssh_host`. New `[network] infrastructure = [...]` (same
+  syntax as `deny`, CIDR blocks too) adds your own; the daemon refuses to start on an entry it cannot read. Other
+  sessions' proxy listeners were already refused by the proxy (#39), and the sandbox profile denies the daemon port
+  (#41). A destination that used to be refused as `private-address` (such as `169.254.169.254`) is now named as
+  infrastructure, and a grant or `allow_private` entry for it no longer opens it.
+- **`ferret scope revoke <mission> <host> --reason <text>`** (`POST /api/missions/{id}/scope/revoke`, ledger op
+  `ScopeRevoke`, `Runtime::revoke_scope`): takes one granted host back. The revoke is written to the ledger first, then
+  the running sessions get the narrowed policy at once, their open tunnels and forwards to the host are cut
+  (`Proxy::cut_hosts`), the box rules are applied again and the lead gets a note without a turn. A restored or new session
+  is built without the host, and granting it again grants it again. A host that is not granted is refused with the list
+  of what is (a wildcard grant that covers it is named). The ledger's Markdown view lists revokes; `granted_hosts()`
+  leaves revoked hosts out.
+- **Review fixes (E1).** The Docker host is refused by its resolved names and addresses: `ssh_host` may be
+  `user@host` or `ssh://user@host:2222` (it no longer stops the daemon), and the `HostName` from `ssh -G` and every
+  address of a model endpoint, `network.infrastructure` name or Docker host (resolved at start and every five
+  minutes) is refused, as are this machine's own LAN, tailnet and global addresses; a grant naming one is refused when
+  made. Only `metadata`, `instance-data`, `metadata.goog` and `metadata.*`/`instance-data.*` under `.internal` are
+  metadata names (`metadata.target.example` is an ordinary host). The sandbox profile now denies 9222, 9229, 2375, 2376
+  and the loopback ports of model endpoints and `network.infrastructure` after every loopback allow
+  (`loopback_all` is written for TCP and UDP); the config refuses `loopback_ports` naming them and Docker, containerd
+  and Podman sockets in `unix_sockets`. A revoke is a real withdrawal: the host is refused (`deny revoked …`) under a
+  covering wildcard, `network.allow` and `mode open`, kept in `<mission>/scope_revoked.json` across restarts (new,
+  additive file), reaches sessions that are starting, and a revoke of a grant the lead had not recorded can be run again
+  once the ledger holds it. The proxy judges a connection by the session's current policy after it is registered for
+  cutting, and does not write a forwarded request to a destination cut while its name resolved. `ferret open` prints a
+  line to use `--print` when an editor opened the page.
+- **The login code is off `/usr/bin/open`'s command line.** `ferret open` writes a page file (mode 0600 in
+  `<home>/login`, removed by the next `open` after five minutes) that redirects to the address, and hands the opener
+  the file's path. `ferret open --print` is unchanged.
+
+### The monitor: specification and contracts (phase P0; no behaviour change)
+
+- New `docs/MONITOR.md`: the normative specification of the adversarial monitor and "keep going" (threat model and
+  taxonomy, the deterministic floor E1 to E4, tripwires TW-01 to TW-28, canaries, the reviewer's contract, the response
+  ladder with its durable pause, the gate, keep-going's conditions, records, routes, commands, evaluation, the phased
+  build plan, the operator's decisions D1 to D18 of 2026-11-16 and the residual risks X1 to X17).
+- `docs/DESIGN.md` gains §15 "Monitor" (overview and the principles it enforces) and the matching notes in §3 (the
+  `monitor/` directory, `keys/monitor.key`, `keep_going` as a cache in `meta.json`), §8 (ferret review as a way to park the
+  operator) and §12 (the monitor's routes, specified and not yet served), and a Roadmap entry. `SECURITY.md` gains the
+  monitor's threat model and residual risks X1 to X17. `docs/config.example.toml` shows, commented out, the `[monitor]`,
+  `[keep_going]`, `[sandbox] allow_fetch_services` and profile keys (`family`, `alignment`, `recipient`, `purpose`) with
+  their defaults and the operator's fleet as a worked example: the daemon does not accept them yet.
+- New module `ferret_agent::monitor` with CONTRACT comments and its vocabulary: categories, severities and response
+  levels; the monitor log's entry kinds; the tripwire table; gated classes; the review-input limits and fence and
+  redaction-tag formats; the `monitor_verdict` schema; lineage; the responder trait and the R3 sequence; keep-going's
+  parameters and limits; canaries; fleet joins; and the fixed sentences an agent may ever see. Nothing calls it; every
+  function a later phase fills returns `MonitorError::NotBuilt`, so a premature caller fails closed. No serialized shape,
+  route, command, configuration key or session record changed.
+
 ### Captured exchanges and HTTPS interception (loom-net)
 
 - `Proxy::grant_with_capture` captures a session's forwarded `http://` requests (head as the destination saw it,

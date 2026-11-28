@@ -28,6 +28,9 @@ max_concurrent = 4                      # concurrent requests to this server acr
 stall_timeout_s = 240                   # abort and retry a stream that delivers nothing this long
 retry_window_s = 300                    # keep retrying an unreachable or failing server this long; 0 = until it returns
 retry_max_delay_s = 30                  # longest pause between retries
+# family = ["deepseek"]                 # lineage, for the adversarial monitor: see the model policy at the end of this file
+# alignment = "stock"
+# recipient = "local"                   # this server is on this machine; its loopback address says nothing, so declare it
 text_tool_calls = "any"                 # calls a model writes into its text, taken only at the
                                         # reply's end: any | tool_call | dsml | invoke | fenced_json | off
 
@@ -83,10 +86,20 @@ protect_credentials = true # ~/.ssh, ~/.aws, ~/.gnupg, keychains, browser profil
 # unreadable_paths = ["~/private"]       # more paths commands and file tools cannot read or write ("~" is expanded)
 # extra_writable = ["/path/to/scratch"]  # more directories commands may write to (absolute)
 # protected_paths = ["secrets"]          # never writable, even inside the workspace (absolute, or relative to it)
-# loopback_ports = [5432]                # loopback TCP ports commands may connect to directly
+# loopback_ports = [5432]                # loopback TCP ports commands may connect to directly (not 9222, 9229, 2375, 2376)
 loopback_all = false       # true lets commands connect to any loopback port
-# unix_sockets = ["/var/run/docker.sock"]  # unix sockets commands may connect to
+# unix_sockets = ["/path/to/lab.sock"]  # unix sockets commands may connect to (never a Docker, containerd or Podman socket)
 # env_pass = ["MY_TOKEN"]  # environment variables passed to commands although their names look like secrets
+# On macOS commands cannot look up the system services that fetch a URL for a process (certificate evaluation by
+# `trustd`, background URL sessions, WebKit) in any network mode, and `mach-lookup` is denied except for a short list of
+# services the usual toolchains need. Programs that check certificates through macOS (`security`, `codesign --verify`,
+# Swift and Go programs), `mdfind`, `pbpaste` and the keychain fail; curl and Python do not.
+# mach_allow = ["com.apple.pasteboard.1", "com.example.helper*"]  # more services a tool needs: exact names, or a prefix ending in *
+#   (headless Chromium of Playwright/Puppeteer works as is; Edge or Electron need "<bundle id>.MachPortRendezvousServer.*")
+# (found with: log show --last 5m --predicate 'eventMessage CONTAINS "deny(1) mach-lookup"'; never a fetch or disk service)
+# nproc_headroom = 256  # processes of the user's limit (RLIMIT_NPROC) a command leaves unused, so a fork bomb stops before
+#   the daemon cannot start the processes that stop it; a command is refused when the user already holds that many; 0 sets no limit
+allow_fetch_services = false  # true lets commands use the fetch services: egress is then reported "unbounded" (ferret status) and keep-going refuses to turn on
 
 [network]
 # What tools (bash, web_fetch, the vulnerability lookups, and dep_scan's first-run database /
@@ -102,6 +115,11 @@ mode = "deny_all"
 # configured with (often ghcr.io) and any ecosystem hosts cdxgen needs for the project type.
 # deny = ["169.254.0.0/16", "tracker.example.test"]   # always refused, in every mode: host patterns, IP addresses or CIDR blocks
 # allow_private = ["10.1.2.3"]   # private, loopback or link-local destinations that are permitted (host pattern, IP or CIDR)
+# Refused to every command whatever is granted or allowed (checked first): your tailnet machines, a desktop app's
+# debugging port. Same syntax as `deny`. Ferret also always refuses cloud metadata, DevTools ports 9222 and 9229 and
+# Docker API ports 2375 and 2376 on this machine, the daemon's port, every model endpoint above and the box's ssh_host
+# (and the addresses these names resolve to, and this machine's own addresses). The sandbox refuses their loopback ports too.
+# infrastructure = ["*.tail1234.ts.net", "100.64.0.0/10", "127.0.0.1:9333"]
 
 # Captured traffic and HTTPS interception (docs/DESIGN.md, section 11).
 capture_max_bytes = 1048576       # bytes of each request or response body kept in a captured exchange
@@ -130,7 +148,7 @@ noise_profile = "off"
 enabled = false
 # Reach Docker one of two ways, not both:
 #   over ssh: ferret starts `ssh -N -L <ferret home>/keys/box.sock:<remote_socket> <ssh_host>` itself
-# ssh_host = "ferret-box"                  # an alias from your ssh config (it may use ProxyJump); batch mode, no prompts
+# ssh_host = "ferret-box"                  # an alias from your ssh config (it may use ProxyJump), `user@host` or `ssh://user@host:22`; batch mode, no prompts. ferret also refuses the HostName `ssh -G` finds
 # remote_socket = "/var/run/docker.sock" # the Docker socket inside that machine
 #   or a socket on this machine:
 # docker_socket = "/var/run/docker.sock"
@@ -202,13 +220,13 @@ project_instructions_in_security_packs = false  # security packs (vr, redteam, c
 # activation links and OTP codes. Off by default. Verify with `ferret mail check`. See docs/SECURITY_STATE.md.
 enabled = false
 backend = "imaps"                               # "imaps" (read-only EXAMINE + BODY.PEEK) or "maildir" (local labs)
-# host = "imap.example.test"                    # required when backend = "imaps"; example
+# host = "imap.example.test"                    # required when backend = "imaps"; example. No command reaches host:port
 port = 993                                      # IMAPS TLS port (1..=65535)
 # username = "researcher@example.test"          # required when backend = "imaps"; example
-# password_file = "~/.ferret/keys/mail.pass"      # required when backend = "imaps"; regular file, mode 0600, never inline
+# password_file = "~/.ferret/keys/mail.pass"      # required when backend = "imaps"; regular file, mode 0600, never inline; no command reads it
 auth = "login"                                  # "login" (app password) or "xoauth2" (OAuth2 bearer token in password_file)
 folder = "INBOX"                                # IMAP mailbox name opened read-only
-# maildir_path = "/path/to/maildir"             # required when backend = "maildir"; example
+# maildir_path = "/path/to/maildir"             # required when backend = "maildir"; example; no command reads it
 # allow_senders = ["*@hackerone.com", "*@bugcrowd.com", "*@*.target.example"]  # REQUIRED when enabled; "*" and "*@*" refused
 # allow_recipients = ["researcher+bb-*@example.test"]  # optional plus-address filter; empty = any recipient in the mailbox
 require_auth_pass = false                       # true: inspect topmost trusted Authentication-Results for dmarc=pass or aligned dkim=pass
@@ -220,6 +238,9 @@ max_messages = 20                               # most messages returned per rea
 [oast]
 # Optional Out-of-Band Application Security Testing (OAST) callback broker (`oast_mint` / `oast_poll`)
 # for blind SSRF, XXE, XSS, and SSTI verification. Off by default. See docs/RUN.md and docs/SECURITY_STATE.md.
+# Every endpoint of the broker (its listeners as bound, the poll endpoint, the callback host and the names under its
+# DNS domain) is infrastructure: refused to every command whatever is granted (docs/MONITOR.md E1); the poll and callback
+# hosts on every port. Give public_host a domain of its own: no name under it, and no port of it, can be a target.
 enabled = false
 mode = "local"                                  # "local" (embedded HTTP + optional UDP DNS listener) or "external" (polling broker)
 bind = "127.0.0.1:0"                            # local HTTP listener socket address (`0` picks a free port)
@@ -232,7 +253,7 @@ bind = "127.0.0.1:0"                            # local HTTP listener socket add
 # Optional two-way Signal bridge talking to a local `signal-cli daemon --http` instance for phone alerts and
 # replies. Off by default. Verify with `ferret signal check` and `ferret signal test`. See docs/RUN.md, "Signal".
 enabled = false
-http_url = "http://127.0.0.1:1337"              # base URL of `signal-cli daemon --http` (plaintext http:// restricted to loopback; remote URLs must use https://)
+http_url = "http://127.0.0.1:1337"              # base URL of `signal-cli daemon --http` (plaintext http:// restricted to loopback; remote URLs must use https://); no command reaches it (infrastructure)
 # account = "+15550100"                         # registered signal-cli account in E.164 format; example
 # Outbound destination: an E.164 number ("+15550199"), a Signal ACI/PNI UUID ("00000000-0000-4000-8000-000000000001",
 # optionally prefixed with "u:" or "PNI:"), or a group ("group:<groupId>").
@@ -277,3 +298,137 @@ action_pack = "core"                            # pack used when spawning an own
 [notify]
 # command = ["/usr/local/bin/my-notify"]   # program run per notification, given FERRET_KIND, FERRET_SESSION, FERRET_TITLE and FERRET_TEXT in its environment; default: the platform's notifier (macOS only; elsewhere nobody is notified)
 repeat_minutes = 0         # re-notify an unanswered blocking item this often (also forwarded to [signal] when enabled); 0 = never (example: 30)
+
+# ---------------------------------------------------------------------------------------------------
+# The adversarial monitor (docs/MONITOR.md). Built so far: the model policy (M1), which decides who may review
+# whom, and the watcher (M2): deterministic tripwires over every record of every session, in shadow (they record and
+# show; nothing changes for an agent). The rest of [monitor] and [keep_going] and sandbox.allow_fetch_services are NOT
+# YET ACCEPTED by this build (the daemon rejects unknown keys); the phase that adds each says so in CHANGELOG.md.
+# They stay commented.
+#
+# Model policy. Each profile has a family (a set: a distill belongs to both), an alignment (are its refusals
+# intact), a recipient (who receives its traffic) and optionally a purpose. Left out, ferret infers the family from
+# the model id and says so (`ferret models lineage`); an unknown alignment makes an agent profile count as relaxed and
+# a reviewer ineligible; a loopback base_url has the recipient `unknown` until you declare it.
+#
+#   [models.<name>]
+#   family = ["deepseek"]        # one of: deepseek, qwen, mistral, glm, kimi, llama, thinking-machines, openai,
+#                                # anthropic, google (or a name listed in [monitor] known_families)
+#   alignment = "stock"          # "stock", "relaxed" or "unknown"; only a declared "stock" can review
+#   recipient = "lan"            # "local" (this machine), "lan" (a host you own) or a provider name such as "alibaba"
+#   purpose = "review"           # marks a review profile (give it its own bounded effort and max_tokens)
+#
+# A reviewer must be of a different family than every profile the reviewed mission can reach (its lead, its roles'
+# models, escalation_model and alloy_models), declared stock, and on `local`/`lan`, or on a recipient that already
+# receives the reviewed sessions' data, or one the pack consents to below. A profile with no eligible reviewer must be
+# named in tripwires_only_profiles, or `ferret config check` fails and prints the lines to add.
+# `ferret config check` prints each profile's resolved values; `ferret models lineage` prints them with who reviews it.
+#
+# This file's own profile has no reviewer, on purpose, so the file checks clean as shipped:
+[monitor]
+enabled = true                        # the watcher; false keeps only the precision-list, S4 and canary tripwires (they have no off switch)
+mode = "shadow"                       # the only mode until M4: every cause is recorded and shown as "would have paused"
+fleet_every_s = 300                   # seconds between the fleet joins (FS-1 to FS-10); at least 10
+monitor_down = "pause_real_targets"   # what a down monitor does to missions it cannot watch: or "notify" (M3 applies it)
+tripwires_only_profiles = ["local"]   # profiles whose missions are watched by the deterministic tripwires only ("not LLM-reviewed")
+# reviewers = []                      # profile names, in preference order; the first eligible for a mission reviews it
+# known_families = []                 # family names beyond the built-in list
+#
+# [monitor.recipients]                # per-pack consent to a reviewer that is a new data recipient
+# ctf = []                            # example: ["alibaba"]
+# core = []
+#
+# [monitor.content]
+# new_recipient_real_targets = "features"   # or "redacted": what a new-recipient reviewer gets for a mission with real targets; secrets are redacted in every case
+#
+# Keys of later phases (not accepted yet; their defaults, for reference):
+# gate = true / gate_timeout_s = 90 / gate_queue_max_s = 30 / step_every_calls = 8 /
+# step_every_s = 120 / unreviewed_pause_min = 60 / review_max_tokens = 48000 / repeat_minutes = 30 /
+# canaries = true / retention_days = 30 under [monitor];
+# [monitor.capacity.<endpoint profile>] gate_slots = 1, review_slots = 1;
+# [keep_going] (no "on" key: the operator arms a mission) max_reopens = 3 (hard maximum 10), max_reopens_real_targets = 1
+# (hard maximum 3; also the cap for a relaxed agent), delay_s = 120, per_reopen_max_steps = 200, per_reopen_max_minutes = 120;
+# [sandbox] allow_fetch_services = false (true marks egress unbounded and refuses keep-going).
+#
+# Worked example: one operator's fleet, decided 2026-11-16 (the profile names, hosts and ids are theirs; replace them).
+#   - The LAN-hosted DeepSeek profile (dsv41) has no reviewer without a new recipient, so a Qwen model hosted by
+#     Alibaba (qwen4max) reviews it, with the operator's consent for each pack (ctf, core, harnessmm, redteam, vr).
+#     ctf-generalist and webapp, packs added after that decision, need their own lines like any new pack (shown here with
+#     the same consent).
+#     For a mission with real targets that reviewer is sent features only (hashes, lengths, classes), and secrets are redacted in every case.
+#   - The four profiles hosted by Alibaba declare that provider as their recipient: it already receives their traffic,
+#     so qwen4max is not a new recipient for the DeepSeek-on-Alibaba missions.
+#   - Everything else (Qwen, relaxed Kimi and GLM, Mistral, inklingv5) is reviewed by dsv41_review, a bounded-effort
+#     profile on the LAN endpoint of dsv41. It shares DeepSeek's family, so only missions that reach a DeepSeek profile
+#     fall through to the hosted reviewer. Relaxed profiles are never reviewers.
+#   - Consent is per pack, not per fleet: qwen4max could review any fleet's mission in those packs, so the LAN
+#     profile is listed first and the hosted one is reached only when the LAN one is ineligible.
+#   - inklingv5's alignment is unknown (it counts as relaxed). It declares its recipient: until it does, it is `unknown`.
+#
+# BEGIN worked example
+# default_model = "dsv41"
+# [monitor]
+# reviewers = ["dsv41_review", "qwen4max", "mistral"]
+# [monitor.recipients]               # one line per pack the fleet runs: consent is per pack
+# ctf = ["alibaba"]
+# ctf-generalist = ["alibaba"]
+# core = ["alibaba"]
+# harnessmm = ["alibaba"]
+# redteam = ["alibaba"]
+# vr = ["alibaba"]
+# webapp = ["alibaba"]
+# [monitor.content]
+# new_recipient_real_targets = "features"
+# [models.dsv41]
+# base_url = "http://dsv41.lan:8000/v1"
+# family = ["deepseek"]
+# alignment = "stock"
+# recipient = "lan"
+# [models.dsv41_review]               # same base_url as dsv41, bounded effort
+# base_url = "http://dsv41.lan:8000/v1"
+# purpose = "review"
+# family = ["deepseek"]
+# alignment = "stock"
+# recipient = "lan"
+# max_concurrent = 1
+# [models.dseekv41]
+# base_url = "https://token-plan.maas.qwencloudapi.com/v1"
+# family = ["deepseek"]
+# alignment = "stock"
+# recipient = "alibaba"
+# [models.dseek4pro]
+# base_url = "https://token-plan.maas.qwencloudapi.com/v1"
+# family = ["deepseek"]
+# alignment = "stock"
+# recipient = "alibaba"
+# [models.qwen]
+# base_url = "https://token-plan.maas.qwencloudapi.com/v1"
+# family = ["qwen"]
+# alignment = "stock"
+# recipient = "alibaba"
+# [models.qwen4max]
+# base_url = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/v1"
+# family = ["qwen"]
+# alignment = "stock"
+# recipient = "alibaba"
+# [models.necromicon]
+# base_url = "http://necromicon.lan:8000/v1"
+# family = ["kimi"]
+# alignment = "relaxed"
+# recipient = "lan"
+# [models.glm_unc]
+# base_url = "http://glm-unc.lan:8000/v1"
+# family = ["glm"]
+# alignment = "relaxed"
+# recipient = "lan"
+# [models.mistral]
+# base_url = "https://api.mistral.ai/v1"
+# family = ["mistral"]
+# alignment = "stock"
+# recipient = "mistral"
+# [models.inklingv5]
+# base_url = "http://127.0.0.1:9000/v1"   # a loopback address: declare where the traffic really goes
+# family = ["thinking-machines"]
+# alignment = "unknown"
+# recipient = "thinking-machines"
+# END worked example

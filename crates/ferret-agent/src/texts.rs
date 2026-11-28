@@ -282,32 +282,31 @@ pub fn scope_granted(hosts: &[String], note: Option<&str>) -> String {
     )
 }
 
-/// The operator revoked network access to `hosts` for the mission; active connections were severed.
-pub fn scope_revoked(hosts: &[String], note: Option<&str>, connections_cut: usize) -> String {
-    let note = note
+/// The operator revoked network access to `hosts` for the mission (`Runtime::revoke_scope`); `connections_cut` open
+/// connections were ended; `reason` is the operator's, when they gave one.
+pub fn scope_revoked(hosts: &[String], reason: Option<&str>, connections_cut: usize) -> String {
+    let why = reason
         .map(str::trim)
-        .filter(|n| !n.is_empty())
-        .map(|n| format!(" Operator's note: {}", sentence(n)))
+        .filter(|r| !r.is_empty())
+        .map(|r| format!(" Operator's reason: {}", sentence(r)))
         .unwrap_or_default();
     let cut = if connections_cut == 1 {
-        "1 active connection was cut".to_string()
+        "1 open connection was cut".to_string()
     } else {
-        format!("{connections_cut} active connections were cut")
+        format!("{connections_cut} open connections were cut")
     };
     format!(
-        "The operator revoked network access to: {}. Access to these hosts is denied immediately ({cut}).{note}",
+        "The operator revoked network access to {}. Connections to them are cut ({cut}) and new ones are refused; do not look for another route to them. Work with the hosts that are still authorized.{why}",
         hosts.join(", ")
     )
 }
 
 /// The operator triggered the emergency panic kill-switch.
 pub fn panic_stopped(reason: Option<&str>) -> String {
+    const DONE: &str = "All network grants were revoked, active sessions stopped, what they left running under their sandboxes stopped, boxes torn down, and proxy rewrites disabled.";
     match reason.map(str::trim).filter(|r| !r.is_empty()) {
-        Some(r) => format!(
-            "Emergency panic stop triggered by the operator: {} All network grants were revoked, active sessions stopped, boxes torn down, and proxy rewrites disabled.",
-            sentence(r)
-        ),
-        None => "Emergency panic stop triggered by the operator. All network grants were revoked, active sessions stopped, boxes torn down, and proxy rewrites disabled.".to_string(),
+        Some(r) => format!("Emergency panic stop triggered by the operator: {} {DONE}", sentence(r)),
+        None => format!("Emergency panic stop triggered by the operator. {DONE}"),
     }
 }
 
@@ -517,6 +516,15 @@ pub fn job_arrival(
 pub fn inbox_answer(item_text: &str, answer: &str) -> String {
     let echoed = cut(&one_line(item_text), 240);
     format!("[The operator's answer to: {}]\n{answer}", ferret_core::tagsafe::neutralize(&echoed))
+}
+
+/// The operator's own words in an `inbox_answer` message: the echoed header, which carries the agent's text, is
+/// dropped. A text that is not such a message is returned as it is.
+pub fn without_inbox_echo(text: &str) -> &str {
+    match text.strip_prefix("[The operator's answer to: ") {
+        Some(rest) => rest.split_once("]\n").map_or("", |(_, answer)| answer),
+        None => text,
+    }
 }
 
 /// The ledger answer of a question the operator dismissed without answering.
@@ -1288,6 +1296,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_inbox_echo_header_is_not_the_operators_words() {
+        let m = inbox_answer("Am I authorized to use the Docker API on h510.lan?", "No.");
+        assert_eq!(without_inbox_echo(&m), "No.");
+        assert_eq!(without_inbox_echo("plain operator text"), "plain operator text");
+        assert_eq!(without_inbox_echo("[The operator's answer to: only a header"), "");
+    }
+
+    #[test]
+    fn a_scope_revoke_note_names_the_host_the_reason_and_that_there_is_no_other_route() {
+        let one = ["api.example.test".to_string()];
+        let t = scope_revoked(&one, Some(" wrong target "), 1);
+        assert!(t.contains("revoked network access to api.example.test"), "{t}");
+        assert!(t.contains("Operator's reason: wrong target."), "{t}");
+        assert!(t.contains("do not look for another route"), "{t}");
+        assert!(t.contains("1 open connection was cut"), "{t}");
+        let two = ["a.test".to_string(), "b.test".to_string()];
+        assert!(
+            scope_revoked(&two, None, 2).contains("a.test, b.test") && scope_revoked(&two, None, 2).contains("2 open")
+        );
+        assert!(!scope_revoked(&two, Some("  "), 0).contains("reason"));
+    }
+
+    #[test]
     fn evidence_not_a_run_names_the_tool_for_analysis_and_reference_only() {
         let a = evidence_not_a_run(EvidenceGrade::Analysis, "dep_scan").expect("analysis is not a run");
         assert!(a.contains("`dep_scan`") && a.contains("analysis, not a run"), "{a}");
@@ -1864,10 +1895,8 @@ mod tests {
 
     #[test]
     fn reasoning_only_nudge_tailors_to_shown_tools_and_escalates() {
-        let judge_tools: Vec<String> = ["verdict", "read", "ledger", "report_blocker"]
-            .into_iter()
-            .map(String::from)
-            .collect();
+        let judge_tools: Vec<String> =
+            ["verdict", "read", "ledger", "report_blocker"].into_iter().map(String::from).collect();
         let n1 = reasoning_only_nudge(&judge_tools, Termination::Explicit, 1);
         assert!(n1.contains("`read`") && n1.contains("`ledger`") && n1.contains("`verdict`"), "{n1}");
         assert!(n1.contains("`report_blocker`") && n1.contains("minimal"), "{n1}");

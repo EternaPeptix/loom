@@ -776,13 +776,7 @@ fn normalize_coverage_action(m: &mut Map<String, Value>, action: &str, l: &str, 
         }
     }
     if let Some(raw) = m.get("outcome").and_then(Value::as_str).map(str::to_string) {
-        let norm = raw
-            .trim()
-            .to_ascii_lowercase()
-            .replace('-', "_")
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join("_");
+        let norm = raw.trim().to_ascii_lowercase().replace('-', "_").split_whitespace().collect::<Vec<_>>().join("_");
         let canonical = match norm.as_str() {
             "reported" | "no_issue_found" | "ruled_out" | "not_applicable" | "needs_follow_up" => Some(norm),
             "needs_followup" | "follow_up" => Some("needs_follow_up".to_string()),
@@ -851,7 +845,10 @@ fn normalize_finding_fields(w: &mut Map<String, Value>, is_update: bool, l: &str
         let trimmed = raw.trim();
         let digits: String = if let Some(pos) = trimmed.to_ascii_uppercase().find("CWE-") {
             trimmed[pos + 4..].chars().take_while(char::is_ascii_digit).collect()
-        } else if trimmed.chars().all(|c| c.is_ascii_digit() || matches!(c, 'c' | 'w' | 'e' | 'C' | 'W' | 'E' | ':' | ' ' | '-')) {
+        } else if trimmed
+            .chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, 'c' | 'w' | 'e' | 'C' | 'W' | 'E' | ':' | ' ' | '-'))
+        {
             trimmed.chars().filter(char::is_ascii_digit).collect()
         } else {
             String::new()

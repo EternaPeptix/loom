@@ -118,13 +118,9 @@ fn detect_scope_format(input: &str) -> Result<&'static str, String> {
 }
 
 fn is_burp_json(v: &Value) -> bool {
-    let scope = v
-        .get("target")
-        .and_then(|t| t.get("scope"))
-        .or_else(|| v.get("scope"))
-        .unwrap_or(v);
-    let has_inc_exc = scope.get("include").is_some_and(Value::is_array)
-        || scope.get("exclude").is_some_and(Value::is_array);
+    let scope = v.get("target").and_then(|t| t.get("scope")).or_else(|| v.get("scope")).unwrap_or(v);
+    let has_inc_exc =
+        scope.get("include").is_some_and(Value::is_array) || scope.get("exclude").is_some_and(Value::is_array);
     if !has_inc_exc {
         return false;
     }
@@ -333,11 +329,8 @@ fn parse_hackerone(
             })?;
         for item in items {
             let attrs = item.get("attributes").unwrap_or(item);
-            let ident = attrs
-                .get("asset_identifier")
-                .or_else(|| attrs.get("identifier"))
-                .and_then(Value::as_str)
-                .unwrap_or("");
+            let ident =
+                attrs.get("asset_identifier").or_else(|| attrs.get("identifier")).and_then(Value::as_str).unwrap_or("");
             let asset_type = attrs.get("asset_type").and_then(Value::as_str);
             let eligible = attrs.get("eligible_for_submission").and_then(Value::as_bool).unwrap_or(true);
             push_scope_entry(ident, asset_type, eligible, out, seen_in, seen_out);
@@ -351,10 +344,8 @@ fn parse_hackerone(
         return Err("HackerOne CSV is empty".to_string());
     }
     let header: Vec<String> = rows[0].iter().map(|c| c.trim().to_ascii_lowercase()).collect();
-    let id_col = header
-        .iter()
-        .position(|h| matches!(h.as_str(), "identifier" | "asset_identifier" | "asset"))
-        .unwrap_or(0);
+    let id_col =
+        header.iter().position(|h| matches!(h.as_str(), "identifier" | "asset_identifier" | "asset")).unwrap_or(0);
     let type_col = header.iter().position(|h| matches!(h.as_str(), "asset_type" | "type"));
     let elig_col = header.iter().position(|h| matches!(h.as_str(), "eligible_for_submission" | "in_scope"));
     let start = if header.iter().any(|h| matches!(h.as_str(), "identifier" | "asset_identifier" | "asset_type")) {
@@ -365,10 +356,7 @@ fn parse_hackerone(
     for row in rows.iter().skip(start) {
         let Some(ident) = row.get(id_col) else { continue };
         let asset_type = type_col.and_then(|i| row.get(i)).map(String::as_str);
-        let eligible = elig_col
-            .and_then(|i| row.get(i))
-            .map(|v| parse_boolish(v, true))
-            .unwrap_or(true);
+        let eligible = elig_col.and_then(|i| row.get(i)).map(|v| parse_boolish(v, true)).unwrap_or(true);
         push_scope_entry(ident, asset_type, eligible, out, seen_in, seen_out);
     }
     Ok(())
@@ -402,10 +390,7 @@ fn parse_bugcrowd(
                             .or_else(|| obj.get("endpoint"))
                             .and_then(Value::as_str)
                             .unwrap_or("");
-                        let ty = obj
-                            .get("type")
-                            .or_else(|| obj.get("category"))
-                            .and_then(Value::as_str);
+                        let ty = obj.get("type").or_else(|| obj.get("category")).and_then(Value::as_str);
                         push_scope_entry(ident, ty, is_in, out, seen_in, seen_out);
                     }
                 }
@@ -433,11 +418,7 @@ fn parse_intigriti(
         .ok_or_else(|| "Intigriti JSON must contain `domains`, `content`, or an array of domain objects".to_string())?;
 
     for item in items {
-        let ident = item
-            .get("endpoint")
-            .or_else(|| item.get("target"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
+        let ident = item.get("endpoint").or_else(|| item.get("target")).and_then(Value::as_str).unwrap_or("");
         let asset_type = match item.get("type") {
             Some(Value::String(s)) => Some(s.as_str()),
             Some(Value::Object(m)) => m.get("value").or_else(|| m.get("name")).and_then(Value::as_str),
@@ -482,11 +463,7 @@ fn parse_burp(
     seen_out: &mut HashSet<String>,
 ) -> Result<(), String> {
     let v: Value = serde_json::from_str(input).map_err(|e| format!("invalid Burp scope JSON: {e}"))?;
-    let scope = v
-        .get("target")
-        .and_then(|t| t.get("scope"))
-        .or_else(|| v.get("scope"))
-        .unwrap_or(&v);
+    let scope = v.get("target").and_then(|t| t.get("scope")).or_else(|| v.get("scope")).unwrap_or(&v);
     let inc = scope.get("include").and_then(Value::as_array);
     let exc = scope.get("exclude").and_then(Value::as_array);
     if inc.is_none() && exc.is_none() {
@@ -501,7 +478,8 @@ fn parse_burp(
                 out.notes.push(format!("skipped disabled Burp rule: {raw_host}"));
                 continue;
             }
-            let Some(host_rx) = rule.get("host").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) else {
+            let Some(host_rx) = rule.get("host").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty())
+            else {
                 continue;
             };
             match burp_regex_to_scope_entries(host_rx) {
@@ -517,7 +495,9 @@ fn parse_burp(
                         }
                     }
                     if let Some(file_rx) = rule.get("file").and_then(Value::as_str).filter(|f| !f.trim().is_empty()) {
-                        out.notes.push(format!("Burp path filter `{file_rx}` on `{host_rx}` noted (target scope is host-level)"));
+                        out.notes.push(format!(
+                            "Burp path filter `{file_rx}` on `{host_rx}` noted (target scope is host-level)"
+                        ));
                     }
                 }
                 Err(reason) => {
@@ -567,16 +547,9 @@ fn burp_regex_to_scope_entries(raw: &str) -> Result<Vec<String>, String> {
     }
 
     // Required wildcard subdomain prefix: `.*\.example\.com`, `.+\.example\.com`, `[^.]+\.example\.com`, etc.
-    for wild_prefix in [
-        r".*\.",
-        r".+\.",
-        r"[^.]+\.",
-        r"[^.]*\.",
-        r"[\w-]+\.",
-        r"[a-z0-9-]+\.",
-        r"[a-zA-Z0-9-]+\.",
-        r"[a-z0-9._-]+\.",
-    ] {
+    for wild_prefix in
+        [r".*\.", r".+\.", r"[^.]+\.", r"[^.]*\.", r"[\w-]+\.", r"[a-z0-9-]+\.", r"[a-zA-Z0-9-]+\.", r"[a-z0-9._-]+\."]
+    {
         if let Some(rest) = s.strip_prefix(wild_prefix) {
             let domain = unescape_burp_literal(rest)?;
             let glob = format!("*.{domain}");
@@ -675,7 +648,15 @@ fn parse_generic_csv(
             .position(|h| {
                 matches!(
                     h.as_str(),
-                    "identifier" | "asset_identifier" | "target" | "host" | "domain" | "url" | "endpoint" | "asset" | "scope"
+                    "identifier"
+                        | "asset_identifier"
+                        | "target"
+                        | "host"
+                        | "domain"
+                        | "url"
+                        | "endpoint"
+                        | "asset"
+                        | "scope"
                 )
             })
             .unwrap_or(0)
@@ -691,15 +672,20 @@ fn parse_generic_csv(
         header.iter().position(|h| {
             matches!(
                 h.as_str(),
-                "eligible_for_submission" | "in_scope" | "scope_status" | "status" | "tier" | "out_of_scope" | "excluded"
+                "eligible_for_submission"
+                    | "in_scope"
+                    | "scope_status"
+                    | "status"
+                    | "tier"
+                    | "out_of_scope"
+                    | "excluded"
             )
         })
     } else {
         None
     };
-    let inverted_col = scope_col
-        .and_then(|i| header.get(i))
-        .is_some_and(|h| matches!(h.as_str(), "out_of_scope" | "excluded"));
+    let inverted_col =
+        scope_col.and_then(|i| header.get(i)).is_some_and(|h| matches!(h.as_str(), "out_of_scope" | "excluded"));
 
     for row in rows.iter().skip(usize::from(has_header)) {
         let Some(ident) = row.get(id_col) else { continue };
@@ -718,7 +704,16 @@ fn is_out_of_scope_label(raw: &str) -> bool {
     let lower = raw.trim().to_ascii_lowercase();
     matches!(
         lower.as_str(),
-        "out of scope" | "out_of_scope" | "out-of-scope" | "oos" | "out" | "excluded" | "exclude" | "false" | "no" | "0"
+        "out of scope"
+            | "out_of_scope"
+            | "out-of-scope"
+            | "oos"
+            | "out"
+            | "excluded"
+            | "exclude"
+            | "false"
+            | "no"
+            | "0"
     )
 }
 
@@ -819,13 +814,7 @@ pub fn parse_openapi(input: &str) -> Result<Vec<DiscoveredSurface>, String> {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(|h| h.to_ascii_lowercase());
-        let bp = obj
-            .get("basePath")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim()
-            .trim_end_matches('/')
-            .to_string();
+        let bp = obj.get("basePath").and_then(Value::as_str).unwrap_or("").trim().trim_end_matches('/').to_string();
         (host, bp)
     };
 
@@ -971,7 +960,11 @@ fn join_base_and_path(base: &str, path: &str) -> String {
     } else {
         format!("{b}/{p}")
     };
-    if combined.is_empty() { "/".to_string() } else { combined }
+    if combined.is_empty() {
+        "/".to_string()
+    } else {
+        combined
+    }
 }
 
 fn resolve_local_ref<'a>(root: &'a Value, val: &'a Value, depth: usize) -> &'a Value {
@@ -1116,11 +1109,8 @@ pub fn parse_graphql_introspection(input: &str) -> Result<Vec<DiscoveredSurface>
                     }
                 }
             }
-            let desc = field
-                .get("description")
-                .and_then(Value::as_str)
-                .map(|s| compact_summary(s, 180))
-                .unwrap_or_default();
+            let desc =
+                field.get("description").and_then(Value::as_str).map(|s| compact_summary(s, 180)).unwrap_or_default();
             let ret_ty = field.get("type").map(|t| render_gql_type(t, 0)).unwrap_or_default();
             let summary = match (desc.is_empty(), ret_ty.is_empty()) {
                 (false, false) => format!("{desc} -> {ret_ty}"),
@@ -1151,11 +1141,19 @@ fn render_gql_type(ty: &Value, depth: usize) -> String {
     match kind {
         "NON_NULL" => {
             let inner = ty.get("ofType").map(|t| render_gql_type(t, depth + 1)).unwrap_or_default();
-            if inner.is_empty() { String::new() } else { format!("{inner}!") }
+            if inner.is_empty() {
+                String::new()
+            } else {
+                format!("{inner}!")
+            }
         }
         "LIST" => {
             let inner = ty.get("ofType").map(|t| render_gql_type(t, depth + 1)).unwrap_or_default();
-            if inner.is_empty() { String::new() } else { format!("[{inner}]") }
+            if inner.is_empty() {
+                String::new()
+            } else {
+                format!("[{inner}]")
+            }
         }
         _ => ty.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
     }
@@ -1795,8 +1793,7 @@ https://github.com/example/repo,SOURCE_CODE,,true,true\n";
         });
         let surfaces = parse_js_sourcemap(&map.to_string(), Some("https://app.acme.test/static/main.js.map")).unwrap();
 
-        let refund: Vec<&DiscoveredSurface> =
-            surfaces.iter().filter(|s| s.path == "/api/v1/orders/refund").collect();
+        let refund: Vec<&DiscoveredSurface> = surfaces.iter().filter(|s| s.path == "/api/v1/orders/refund").collect();
         assert_eq!(refund.len(), 1, "duplicate POST route should be deduplicated");
         assert_eq!(refund[0].method, "POST");
         assert_eq!(refund[0].host.as_deref(), Some("app.acme.test"));

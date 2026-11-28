@@ -74,7 +74,9 @@
 //!   with no `turn_start` since; the runtime starts a turn for a session that was waiting. Calls
 //!   `deps.ctx.jobs.resume_from(n)` with the highest job number in the log's `job_registered`
 //!   records, those just appended included (`j7` → 7). Then, unless the session has ended, the model:
-//!   when `deps.model` or `deps.reasoning_replay` differs from the model the log names (`session_start`'s,
+//!   when `deps.model` (its profile, model id or window, and its `lineage` when the log's model has one too: a
+//!   reload that only reclassified the profile is a new model for the monitor) or
+//!   `deps.reasoning_replay` differs from the model the log names (`session_start`'s,
 //!   a fork's from its parent's, then the latest `model_switched`'s), `model_switched{from, to:
 //!   deps.model, reasoning_replay, reason: SWITCH_IDLE}` is appended (it was switched while no task
 //!   ran it, its profile was reloaded meanwhile, or a restart cut a switch short). Last, unless the
@@ -150,6 +152,16 @@
 //!   `shared.ledger_append(true, ScopeGrant{hosts, note})` and append what it queued (failure: warn,
 //!   carry on). Append `harness_note{Approval, texts::scope_granted(hosts, note)}` with author `User`.
 //!   It starts no turn. (The runtime widens the egress policy itself, not the session.)
+//! - `Input::ScopeRevoke{hosts, note, connections_cut}`: the operator revoked `hosts`; the runtime has already
+//!   recorded `ScopeRevoke` in the ledger for each revoked grant the ledger lists, narrowed the egress policy and cut
+//!   the open connections. Append `harness_note{Approval, texts::scope_revoked(hosts, note, connections_cut)}` with
+//!   author `User`. An empty list is ignored. No ledger entry, no turn; it is kept on disk while queued
+//!   (`queue_input`), like `Scope`.
+//! - `Input::PanicStop{reason}`: the operator's kill-switch. An idle session records `harness_note{Approval,
+//!   texts::panic_stopped(reason)}`, then does what `Input::Stop` does (one body): closes its terminals, kills its
+//!   jobs, stops its children and ends a turn that was waiting or yielded (`interrupted`, `turn_end{Stopped}`), closing
+//!   its MCP servers' connections as every `Stopped` end does; a running turn records the note and is cut; an idle
+//!   child records the note and settles stopped.
 //! - `Input::Queued{file, input}`: rename `file` to `{stem}.{seq}.taking`, `seq` being the log's
 //!   next seq; then `input` as above, then delete the renamed file. When `file` is gone it was taken
 //!   already (at the start of `run`), and nothing happens.
@@ -378,7 +390,6 @@ use crate::gate::{self, Yield, YieldCtx};
 use crate::hud::{self, HudChild, HudInput, HudJob};
 use crate::rtools::{build_registry, ChildInfo, Delivery, Effect, FreshStart, Settlement, Shared};
 use crate::texts;
-use futures_util::FutureExt;
 use ferret_core::admit::AdmitPolicy;
 use ferret_core::compaction::{self, TableInput};
 use ferret_core::config::{AgentsCfg, ContextCfg, Paths};
@@ -405,6 +416,7 @@ use ferret_tools::files::FileTracker;
 use ferret_tools::jobs::{JobEvent, JobInfo, JobState};
 use ferret_tools::proc::Ended;
 use ferret_tools::{canonical_tool_alias, execute, prepare, refused, Admission, Ran, Registry, ToolCtx};
+use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -493,6 +505,18 @@ pub const SWITCH_RELOADED: &str = "profile reloaded";
 /// The `reason` of a `model_switched` recorded when the session is opened on another model than its log names.
 pub const SWITCH_IDLE: &str = "changed while the session was idle";
 
+/// Whether two records name the same model for the log: profile, served id and window, and the lineage the
+/// monitor records with it (`ModelRef::lineage`) when both have one. A reload that changes only a profile's
+/// `family` or `alignment` is a new model for the monitor (a relaxed one uptiers the session), so an idle session
+/// records it when it is next opened. A log written before the lineage was recorded has none: that is not a
+/// change.
+fn same_model(a: &ModelRef, b: &ModelRef) -> bool {
+    a.profile == b.profile
+        && a.model == b.model
+        && a.context_window == b.context_window
+        && (a.lineage.is_none() || b.lineage.is_none() || a.lineage == b.lineage)
+}
+
 /// One input of a session's `queued/` directory.
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -576,11 +600,9 @@ pub fn queue_input(paths: &Paths, session: &SessionId, input: Input) -> Result<I
         Input::Approval { text, scope } => KeptInput::Approval { text: text.clone(), scope: scope.clone() },
         Input::Withdraw { id, reason } => KeptInput::Withdraw { id: id.clone(), reason: reason.clone() },
         Input::Scope { hosts, note } => KeptInput::Scope { hosts: hosts.clone(), note: note.clone() },
-        Input::ScopeRevoke { hosts, note, connections_cut } => KeptInput::ScopeRevoke {
-            hosts: hosts.clone(),
-            note: note.clone(),
-            connections_cut: *connections_cut,
-        },
+        Input::ScopeRevoke { hosts, note, connections_cut } => {
+            KeptInput::ScopeRevoke { hosts: hosts.clone(), note: note.clone(), connections_cut: *connections_cut }
+        }
         Input::Release { reason } => KeptInput::Release { reason: reason.clone() },
         _ => return Ok(input),
     };
@@ -2088,7 +2110,9 @@ Name them when you start a new mission instead."
     /// the shell in, when it is still a directory.
     fn restore_shell_dir(&self) {
         let left = self.own().iter().rev().find_map(|r| match &r.event {
-            Event::ToolResult(t) if t.name == "bash" => t.meta.get(ferret_core::event::META_CWD).and_then(|v| v.as_str()),
+            Event::ToolResult(t) if t.name == "bash" => {
+                t.meta.get(ferret_core::event::META_CWD).and_then(|v| v.as_str())
+            }
             _ => None,
         });
         if let Some(dir) = left.map(std::path::PathBuf::from).filter(|d| d.is_absolute() && d.is_dir()) {
@@ -2145,7 +2169,7 @@ Name them when you start a new mission instead."
     fn record_model(&mut self, reason: &str, always: bool) -> R<()> {
         let to = (self.deps.model.clone(), self.deps.reasoning_replay);
         let Some(from) = self.st.model.clone() else { return Ok(()) };
-        if from == to && !always {
+        if same_model(&from.0, &to.0) && from.1 == to.1 && !always {
             return Ok(());
         }
         let replay_changed = from.1 != to.1;
@@ -2628,43 +2652,40 @@ Name them when you start a new mission instead."
                 if let Input::StopAt(epoch) = input {
                     self.deps.control.mark_stop_handled(epoch);
                 }
-                let jobs = !self.running_jobs().await.is_empty();
-                let children = !self.running_children().await.is_empty();
-                self.deps.ctx.capabilities.ptys.close_all().await;
-                self.deps.ctx.jobs.kill_all(self.grace()).await;
-                self.deps.shared.orch.stop_children(&self.deps.shared.session).await;
-                // Stopped stays stopped: what the stop itself causes (a child's settlement, a job's end)
-                // must not wake a session that was waiting, only the operator can. The `interrupted`
-                // record goes with the `Stopped` end, so the next turn's note names this stop.
-                let wakeable = matches!(self.st.last_end, Some(TurnEndReason::Waiting | TurnEndReason::Yielded));
-                if jobs || children || wakeable {
-                    self.append(Author::Harness, Event::Interrupted { reason: texts::REASON_OPERATOR.to_string() })?;
-                }
-                if wakeable {
-                    self.append(Author::Harness, Event::TurnEnd { reason: TurnEndReason::Stopped })?;
-                    self.publish();
-                }
+                self.stop_between_turns().await?;
                 Ok(None)
             }
             Input::PanicStop { reason } => {
                 self.note(Author::User, NoteKind::Approval, texts::panic_stopped(reason.as_deref()))?;
-                let jobs = !self.running_jobs().await.is_empty();
-                let children = !self.running_children().await.is_empty();
-                self.deps.ctx.capabilities.ptys.close_all().await;
-                self.deps.ctx.jobs.kill_all(self.grace()).await;
-                self.deps.shared.orch.stop_children(&self.deps.shared.session).await;
-                let wakeable = matches!(self.st.last_end, Some(TurnEndReason::Waiting | TurnEndReason::Yielded));
-                if jobs || children || wakeable {
-                    self.append(Author::Harness, Event::Interrupted { reason: texts::REASON_OPERATOR.to_string() })?;
-                }
-                if wakeable {
-                    self.append(Author::Harness, Event::TurnEnd { reason: TurnEndReason::Stopped })?;
-                    self.publish();
-                }
+                self.stop_between_turns().await?;
                 Ok(None)
             }
             other => Ok(self.arrival(other).await?.trigger),
         }
+    }
+
+    /// The operator stopped the session between turns (`Input::Stop`, and a panic's `Input::PanicStop` after its note):
+    /// its terminals, jobs and children end, and a turn that was waiting or yielded ends `Stopped`, which leaves no MCP
+    /// server of the session running (TW-20). One body for both, so that they cannot drift apart.
+    async fn stop_between_turns(&mut self) -> R<()> {
+        let jobs = !self.running_jobs().await.is_empty();
+        let children = !self.running_children().await.is_empty();
+        self.deps.ctx.capabilities.ptys.close_all().await;
+        self.deps.ctx.jobs.kill_all(self.grace()).await;
+        self.deps.shared.orch.stop_children(&self.deps.shared.session).await;
+        // Stopped stays stopped: what the stop itself causes (a child's settlement, a job's end)
+        // must not wake a session that was waiting, only the operator can. The `interrupted`
+        // record goes with the `Stopped` end, so the next turn's note names this stop.
+        let wakeable = matches!(self.st.last_end, Some(TurnEndReason::Waiting | TurnEndReason::Yielded));
+        if jobs || children || wakeable {
+            self.append(Author::Harness, Event::Interrupted { reason: texts::REASON_OPERATOR.to_string() })?;
+        }
+        if wakeable {
+            self.append(Author::Harness, Event::TurnEnd { reason: TurnEndReason::Stopped })?;
+            self.publish();
+            self.close_mcp_after(TurnEndReason::Stopped).await;
+        }
+        Ok(())
     }
 
     /// A child that is between turns was stopped, or its inputs closed: end its jobs and children and
@@ -2875,7 +2896,12 @@ Name them when you start a new mission instead."
                 }
             }
             Input::SwitchModel(sw) => self.switch_model(*sw)?,
-            Input::Resume | Input::Compact | Input::Stop | Input::StopAt(_) | Input::Queued { .. } | Input::DrainQueued => {}
+            Input::Resume
+            | Input::Compact
+            | Input::Stop
+            | Input::StopAt(_)
+            | Input::Queued { .. }
+            | Input::DrainQueued => {}
         }
         Ok(out)
     }
@@ -3062,6 +3088,7 @@ Name them when you start a new mission instead."
             Flow::Next => Ok(None),
             Flow::End(reason) => {
                 self.end_turn(reason)?;
+                self.close_mcp_after(reason).await;
                 Ok(None)
             }
             Flow::Settle(d) if self.deps.shared.is_child() => Ok(Some(self.settle(d).await?)),
@@ -3074,7 +3101,19 @@ Name them when you start a new mission instead."
                     ChildOutcome::Failed => TurnEndReason::Error,
                 };
                 self.end_turn(reason)?;
+                self.close_mcp_after(reason).await;
                 Ok(None)
+            }
+        }
+    }
+
+    /// A turn that ended finished or stopped leaves nothing of the session running, its MCP servers included (the
+    /// monitor reads a process of such a session as a survivor, TW-20): their connections close, and the next call
+    /// opens them again (CONTRACTS-MCP M3).
+    async fn close_mcp_after(&self, reason: TurnEndReason) {
+        if matches!(reason, TurnEndReason::Finished | TurnEndReason::Stopped) {
+            if let Some(m) = self.deps.shared.mcp() {
+                m.close().await;
             }
         }
     }
@@ -3134,6 +3173,9 @@ Name them when you start a new mission instead."
         self.deps.control.finish_turn(d.outcome == ChildOutcome::Stopped);
         self.deps.ctx.capabilities.ptys.close_all().await;
         self.deps.ctx.jobs.kill_all(self.grace()).await;
+        if let Some(m) = self.deps.shared.mcp() {
+            m.close().await;
+        }
         self.phase = Phase::Ended;
         self.publish();
         Ok(settlement)
@@ -3435,7 +3477,9 @@ Name them when you start a new mission instead."
                     if t.meta.get(META_DEFERRED_OBSERVATION).and_then(Value::as_bool) == Some(true)
                         && !observed.contains(&t.call_id)
                         && messages.iter().any(|m| {
-                            m.role == ferret_core::message::Role::Tool && m.origin.contains(&r.seq) && m.content == t.text
+                            m.role == ferret_core::message::Role::Tool
+                                && m.origin.contains(&r.seq)
+                                && m.content == t.text
                         }) =>
                 {
                     Some(t.call_id.clone())
@@ -4065,9 +4109,7 @@ Name them when you start a new mission instead."
         // An operator's compaction while the server is refusing this very window behaves as a refused one.
         let refused_like = reason == "refused" || (reason == "operator" && self.refused_epoch == Some(w.epoch));
         let upto = self.compaction_upto(w, reason, refused_like, compact_at);
-        let note = self
-            .ask_note(w, refused_like || reason == "stall", reason, objections.as_deref(), token)
-            .await?;
+        let note = self.ask_note(w, refused_like || reason == "stall", reason, objections.as_deref(), token).await?;
         if token.is_cancelled() {
             return Ok(false);
         }
@@ -4508,7 +4550,11 @@ Name them when you start a new mission instead."
             let resolved = self.registry.resolve(&call.name);
             let tool = resolved.as_ref().map(|(t, _)| t);
             let policy_name = resolved.as_ref().and_then(|(_, canon)| *canon).unwrap_or(call.name.as_str());
-            let class = tool.map(|t| t.spec().class).unwrap_or(ToolClass::State);
+            // The class of what runs (the executor's adaptation of the call), so the log, the exec cap and the monitor
+            // read a call by what it does: `Pty_Exec` runs `pty_exec`, `shell` with an `apply_patch` argv writes.
+            let class = ferret_tools::run_class(&self.registry, &call.name, &call.arguments, self.deps.ctx.cfg.dialect)
+                .or_else(|| tool.map(|t| t.spec().class))
+                .unwrap_or(ToolClass::State);
             let args = serde_json::from_str::<Value>(&call.arguments)
                 .unwrap_or_else(|_| Value::String(call.arguments.clone()));
             self.append(
@@ -4720,6 +4766,24 @@ mod tests {
     use serde_json::json;
     use tokio::sync::mpsc::UnboundedSender;
 
+    /// The log records a reclassified model (a new lineage) as a switch, and a log written before the lineage was
+    /// recorded as none.
+    #[test]
+    fn same_model_compares_the_lineage_when_both_records_have_one() {
+        use ferret_core::lineage::Alignment;
+        let lineage = |a: Alignment| {
+            ferret_core::lineage::resolve("p", &ModelProfile { alignment: Some(a), ..ModelProfile::default() })
+        };
+        let m = |lineage| ModelRef { profile: "p".into(), model: "m".into(), context_window: 10, lineage };
+        let stock = m(Some(lineage(Alignment::Stock)));
+        assert!(same_model(&stock, &stock.clone()));
+        assert!(same_model(&m(None), &stock), "an old log has no lineage: no change");
+        assert!(same_model(&stock, &m(None)));
+        assert!(!same_model(&stock, &m(Some(lineage(Alignment::Relaxed)))), "reclassified");
+        let wider = ModelRef { context_window: 20, ..stock.clone() };
+        assert!(!same_model(&stock, &wider));
+    }
+
     include!("continuation_tests.rs");
 
     // ---- rig ---------------------------------------------------------------------------------
@@ -4857,7 +4921,12 @@ mod tests {
                 priority: Priority::Lead,
                 context_window: self.window,
                 // As `start` records it, so opening a log it wrote records no switch.
-                model: ModelRef { profile: "mock".into(), model: "mock".into(), context_window: 1_000_000 },
+                model: ModelRef {
+                    profile: "mock".into(),
+                    model: "mock".into(),
+                    context_window: 1_000_000,
+                    lineage: None,
+                },
                 reasoning_replay: ReasoningReplay::All,
                 shared: self.shared.clone(),
                 ctx: self.ctx.clone(),
@@ -4876,7 +4945,12 @@ mod tests {
                 pack: "core".into(),
                 role: self.role.clone(),
                 termination: self.shared.role.termination,
-                model: ModelRef { profile: "mock".into(), model: "mock".into(), context_window: 1_000_000 },
+                model: ModelRef {
+                    profile: "mock".into(),
+                    model: "mock".into(),
+                    context_window: 1_000_000,
+                    lineage: None,
+                },
                 reasoning_replay: ReasoningReplay::All,
                 system_prompt: "You are a test agent.".into(),
                 tools: Vec::new(),
@@ -8418,8 +8492,9 @@ mod tests {
             let mut fx = Fx::new("chat", false, false, script).await;
             fx.ctx.cfg = Arc::new(ferret_core::config::ToolsCfg { speculate, ..(*fx.ctx.cfg).clone() });
             fx.window = Some(window);
-            // Keep size-triggered compaction above the tool-schema + single-result footprint so step 2 runs.
-            fx.context.compact_at_tokens = 12_000;
+            // Not a compaction test: with the role's whole tool list in the prompt (the box tools too), 40% of a
+            // 16k window is reached after one output, and the compaction request would take the scripted reply.
+            fx.context.compact_at_tokens = window / 5 * 4;
             let mut session = fx.create();
             session.registry.add(Arc::new(EchoViewChars));
             // The session is configured with the global bound; the call gets the window's.
@@ -8448,8 +8523,8 @@ mod tests {
         ]);
         let mut fx = Fx::new("chat", false, false, script).await;
         fx.window = Some(window);
-        // Keep size-triggered compaction above the tool-schema + single-result footprint so step 2 runs.
-        fx.context.compact_at_tokens = 12_000;
+        // Not a compaction test (see `a_call_is_admitted_with_the_policy_of_the_sessions_window`).
+        fx.context.compact_at_tokens = window / 5 * 4;
         let line = format!("{{\"k\":\"{}\"}}", "v".repeat(240));
         let text: String = (0..2_000).map(|_| format!("{line}\n")).collect();
         std::fs::write(fx.ctx.workspace.join("big.jsonl"), &text).unwrap();
@@ -8621,6 +8696,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_call_is_recorded_with_the_class_of_the_tool_it_runs() {
+        let mut fx = Fx::new("lead", false, true, seq(vec![])).await;
+        let mut session = fx.create();
+        let token = CancellationToken::new();
+        let early = Early::new(
+            false,
+            session.registry.clone(),
+            session.deps.ctx.clone(),
+            &token,
+            HashSet::new(),
+            session.early_counts.clone(),
+        );
+        let specs = session.woven().weave.tools;
+        let req = |id: &str, name: &str, args: Value| ToolCallRequest {
+            call_id: CallId::from(id),
+            name: name.into(),
+            arguments: args.to_string(),
+            complete: true,
+        };
+        let patch = "*** Begin Patch\n*** Add File: notes.txt\n+hello\n*** End Patch";
+        let calls = vec![
+            // Folded to `out_read`, which the alias table does not name.
+            req("c1", "Out-Read", json!({"handle": "out:nothing"})),
+            // The alias is `bash`; the call writes a file.
+            req("c2", "shell", json!({"command": ["apply_patch", patch]})),
+            // The alias is `edit`; the call reads.
+            req("c3", "text_editor", json!({"command": "view", "path": "notes.txt"})),
+            req("c4", "bash", json!({"command": "true"})),
+        ];
+        session.run_calls("req", &calls, &specs, early).await.unwrap();
+        let recorded: Vec<(String, ToolClass)> = session
+            .records()
+            .iter()
+            .filter_map(|r| match &r.event {
+                Event::ToolCall(c) => Some((c.name.clone(), c.class)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            recorded,
+            vec![
+                ("Out-Read".to_string(), ToolClass::Read),
+                ("shell".to_string(), ToolClass::Write),
+                ("text_editor".to_string(), ToolClass::Read),
+                ("bash".to_string(), ToolClass::Exec),
+            ],
+            "the name as sent, the class of what ran"
+        );
+        assert!(fx.ctx.workspace.join("notes.txt").exists(), "the patch was applied");
+    }
+
+    #[tokio::test]
     async fn role_exec_cap_survives_reopen_and_flag_alert_is_advisory() {
         let mut role = core_role("chat");
         role.max_exec_calls = Some(1);
@@ -8662,7 +8789,7 @@ mod tests {
             client: Arc::new(ModelClient::new("other", fx.profile.clone(), &fx.paths.model_keys_dir()).unwrap()),
             limiter: Arc::new(Limiter::new(4)),
             context_window: fx.window,
-            model: ModelRef { profile: "other".into(), model: "mock".into(), context_window: 1_000_000 },
+            model: ModelRef { profile: "other".into(), model: "mock".into(), context_window: 1_000_000, lineage: None },
             reasoning_replay: ReasoningReplay::None,
             reason: SWITCH_OPERATOR.into(),
             settings_changed: false,
@@ -9215,11 +9342,7 @@ mod tests {
                 _ => Reply::tool("finish", r#"{"answer":"done after fold"}"#).into(),
             }
         });
-        let agents = AgentsCfg {
-            verify_finish: false,
-            lead_fold_every_settlements: 2,
-            ..AgentsCfg::default()
-        };
+        let agents = AgentsCfg { verify_finish: false, lead_fold_every_settlements: 2, ..AgentsCfg::default() };
         let mut role_def = core_role("lead");
         role_def.tools.retain(|t| t != "conclude" && t != "request_scope");
         let mut fx = Fx::build_with(role_def, "lead", false, true, agents, script).await;
@@ -9306,10 +9429,8 @@ mod tests {
         let mut role_def = core_role("lead");
         role_def.tools.retain(|t| t != "conclude" && t != "request_scope");
         let agents_off = AgentsCfg { verify_finish: false, lead_fold_every_settlements: 0, ..AgentsCfg::default() };
-        let script_off = seq(vec![
-            Reply::tool("wait", "{}").into(),
-            Reply::tool("finish", r#"{"answer":"done"}"#).into(),
-        ]);
+        let script_off =
+            seq(vec![Reply::tool("wait", "{}").into(), Reply::tool("finish", r#"{"answer":"done"}"#).into()]);
         let mut fx = Fx::build_with(role_def, "lead", false, true, agents_off, script_off).await;
         fx.context = ctx(400_000);
         fx.orch.running_child("s-kid1", "worker");
