@@ -432,6 +432,10 @@ pub enum Input {
     Withdraw { id: String, reason: String },
     /// The operator authorized network access to `hosts` for the mission.
     Scope { hosts: Vec<String>, note: Option<String> },
+    /// The operator revoked network access to `hosts` for the mission.
+    ScopeRevoke { hosts: Vec<String>, note: Option<String>, connections_cut: usize },
+    /// The operator triggered the emergency panic kill-switch.
+    PanicStop { reason: Option<String> },
     /// The operator closed the mission short of its goal, with a reason.
     Release { reason: String },
     /// A child that nobody was waiting for has settled.
@@ -504,6 +508,12 @@ enum KeptInput {
         hosts: Vec<String>,
         note: Option<String>,
     },
+    ScopeRevoke {
+        hosts: Vec<String>,
+        note: Option<String>,
+        #[serde(default)]
+        connections_cut: usize,
+    },
     Release {
         reason: String,
     },
@@ -530,6 +540,9 @@ impl KeptInput {
             KeptInput::Approval { text, scope } => Input::Approval { text, scope },
             KeptInput::Withdraw { id, reason } => Input::Withdraw { id, reason },
             KeptInput::Scope { hosts, note } => Input::Scope { hosts, note },
+            KeptInput::ScopeRevoke { hosts, note, connections_cut } => {
+                Input::ScopeRevoke { hosts, note, connections_cut }
+            }
             KeptInput::Release { reason } => Input::Release { reason },
             KeptInput::User { text, composed, images, .. } => {
                 let text = if composed.is_empty() { text } else { composed };
@@ -559,6 +572,11 @@ pub fn queue_input(paths: &Paths, session: &SessionId, input: Input) -> Result<I
         Input::Approval { text, scope } => KeptInput::Approval { text: text.clone(), scope: scope.clone() },
         Input::Withdraw { id, reason } => KeptInput::Withdraw { id: id.clone(), reason: reason.clone() },
         Input::Scope { hosts, note } => KeptInput::Scope { hosts: hosts.clone(), note: note.clone() },
+        Input::ScopeRevoke { hosts, note, connections_cut } => KeptInput::ScopeRevoke {
+            hosts: hosts.clone(),
+            note: note.clone(),
+            connections_cut: *connections_cut,
+        },
         Input::Release { reason } => KeptInput::Release { reason: reason.clone() },
         _ => return Ok(input),
     };
@@ -2392,6 +2410,10 @@ Name them when you start a new mission instead."
                 Ev::Input(Some(Input::Stop)) if self.deps.shared.is_child() => {
                     return Ok(End::Settled(self.stop_idle_child(texts::REASON_PARENT).await?));
                 }
+                Ev::Input(Some(Input::PanicStop { reason })) if self.deps.shared.is_child() => {
+                    self.note(Author::User, NoteKind::Approval, texts::panic_stopped(reason.as_deref()))?;
+                    return Ok(End::Settled(self.stop_idle_child(texts::REASON_OPERATOR).await?));
+                }
                 Ev::Input(None) => return self.close_idle().await,
                 Ev::Input(Some(_)) if self.deps.control.is_closed() => return self.close_idle().await,
                 Ev::Input(Some(input)) => self.idle_input(input).await?,
@@ -2521,6 +2543,23 @@ Name them when you start a new mission instead."
                 // Stopped stays stopped: what the stop itself causes (a child's settlement, a job's end)
                 // must not wake a session that was waiting, only the operator can. The `interrupted`
                 // record goes with the `Stopped` end, so the next turn's note names this stop.
+                let wakeable = matches!(self.st.last_end, Some(TurnEndReason::Waiting | TurnEndReason::Yielded));
+                if jobs || children || wakeable {
+                    self.append(Author::Harness, Event::Interrupted { reason: texts::REASON_OPERATOR.to_string() })?;
+                }
+                if wakeable {
+                    self.append(Author::Harness, Event::TurnEnd { reason: TurnEndReason::Stopped })?;
+                    self.publish();
+                }
+                Ok(None)
+            }
+            Input::PanicStop { reason } => {
+                self.note(Author::User, NoteKind::Approval, texts::panic_stopped(reason.as_deref()))?;
+                let jobs = !self.running_jobs().await.is_empty();
+                let children = !self.running_children().await.is_empty();
+                self.deps.ctx.capabilities.ptys.close_all().await;
+                self.deps.ctx.jobs.kill_all(self.grace()).await;
+                self.deps.shared.orch.stop_children(&self.deps.shared.session).await;
                 let wakeable = matches!(self.st.last_end, Some(TurnEndReason::Waiting | TurnEndReason::Yielded));
                 if jobs || children || wakeable {
                     self.append(Author::Harness, Event::Interrupted { reason: texts::REASON_OPERATOR.to_string() })?;
@@ -2690,6 +2729,19 @@ Name them when you start a new mission instead."
                 }
                 self.operator_op(LedgerOp::ScopeGrant { hosts: hosts.clone(), note: note.clone() })?;
                 self.note(Author::User, NoteKind::Approval, texts::scope_granted(&hosts, note.as_deref()))?;
+            }
+            Input::ScopeRevoke { hosts, note, connections_cut } => {
+                if hosts.is_empty() {
+                    return Ok(out);
+                }
+                self.note(
+                    Author::User,
+                    NoteKind::Approval,
+                    texts::scope_revoked(&hosts, note.as_deref(), connections_cut),
+                )?;
+            }
+            Input::PanicStop { reason } => {
+                self.note(Author::User, NoteKind::Approval, texts::panic_stopped(reason.as_deref()))?;
             }
             Input::Release { reason } => {
                 if reason.trim().is_empty() {
@@ -3623,6 +3675,11 @@ Name them when you start a new mission instead."
                 Input::Resume => {}
                 // What was sent after the stop is for the idle loop, once this turn has ended `Stopped`.
                 Input::Stop => {
+                    self.token.cancel();
+                    break;
+                }
+                Input::PanicStop { reason } => {
+                    self.note(Author::User, NoteKind::Approval, texts::panic_stopped(reason.as_deref()))?;
                     self.token.cancel();
                     break;
                 }

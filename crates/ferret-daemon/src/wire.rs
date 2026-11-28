@@ -424,6 +424,16 @@ pub struct ScopeBody {
 
 /// The answer to `POST /api/sessions/{id}/scope`.
 pub use ferret_agent::runtime::ScopeReceipt;
+/// The answers to `POST /api/sessions/{id}/scope/revoke` (`DELETE /api/sessions/{id}/scope`) and `POST /api/panic`.
+pub use ferret_agent::{PanicReport, ScopeRevokeReceipt};
+
+/// Body of `POST /api/panic`. Optional; an empty body or `{}` stops everything without a reason.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PanicBody {
+    #[serde(default)]
+    pub reason: Option<String>,
+}
 
 /// What `GET /api/sessions/{id}/mcp` answers per server, and what the check route and `ferret mcp list`
 /// show (the types live with the runtime's MCP wiring).

@@ -11,7 +11,7 @@ intercept = true
 require_traffic = true
 prompt = "roles/commander.md"
 termination = "explicit"
-tools = ["read", "out_read", "plan", "step", "claim", "claim_update", "evidence", "security_record", "security_query", "agent_spawn", "agent_fanout", "agent_message", "agent_stop", "verify", "request_scope", "conclude", "finish", "report_blocker"]
+tools = ["read", "out_read", "plan", "step", "note", "claim", "claim_update", "evidence", "security_record", "security_query", "agent_spawn", "agent_fanout", "agent_message", "agent_stop", "verify", "request_scope", "conclude", "finish", "report_blocker"]
 hidden_tools = ["out_read", "claim_update", "step", "conclude"]
 may_spawn = ["recon_operator", "tactical_operator", "lateral_operator", "observer", "op_judge"]
 verify_finish = true
@@ -55,7 +55,7 @@ max_steps = 8
 [roles.op_judge]
 prompt = "roles/op_judge.md"
 termination = "explicit"
-tools = ["read", "out_read", "oracle_check", "security_query", "security_record", "evidence", "verdict"]
+tools = ["read", "out_read", "oracle_check", "security_query", "evidence", "verdict"]
 hidden_tools = ["out_read"]
 read_only = true
 max_steps = 12

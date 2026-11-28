@@ -535,11 +535,14 @@ pub struct Sandbox {
     protected: Vec<PathBuf>,
     unreadable: Vec<PathBuf>,
     credentials: Vec<PathBuf>,
+    /// Whether `sandbox.protect_credentials` is enabled (also denies macOS Keychain/pasteboard Mach IPC).
+    protect_credentials: bool,
     loopback_ports: Vec<u16>,
     loopback_all: bool,
     /// The daemon's own port, refused whatever else allows it.
     daemon_port: Option<u16>,
-    /// Commands cannot reach the system services that fetch a URL for a process (certificate evaluation).
+    /// Commands cannot reach the system services that fetch a URL for a process (`trustd`, `ocspd`,
+    /// `nsurlsessiond`, `WebKit`). Enabled in `deny_all` and `allowlist` network modes.
     network_deny_all: bool,
     unix_sockets: Vec<PathBuf>,
     env_pass: Vec<String>,
@@ -1790,6 +1793,7 @@ impl Sandbox {
             protected,
             unreadable,
             credentials,
+            protect_credentials: cfg.protect_credentials,
             loopback_ports,
             loopback_all: cfg.loopback_all,
             daemon_port: cfg.daemon_port,
@@ -1826,6 +1830,17 @@ impl Sandbox {
         sbpl(&dir)?;
         self.jobs_dir = Some(dir);
         Ok(self)
+    }
+
+    /// Apply the session's `[network] mode` to Seatbelt's network-fetching service restrictions:
+    /// both `DenyAll` and `Allowlist` modes deny macOS services that fetch URLs outside the sandbox
+    /// (`trustd`, `ocspd`, `nsurlsessiond`, `WebKit`), whereas `Open` leaves them reachable.
+    pub fn with_network_mode(mut self, mode: ferret_core::config::NetworkMode) -> Self {
+        self.network_deny_all = matches!(
+            mode,
+            ferret_core::config::NetworkMode::DenyAll | ferret_core::config::NetworkMode::Allowlist
+        );
+        self
     }
 
     /// Harness-owned staging lives outside all sessions, whose mutable temp trees are excluded from
@@ -2051,6 +2066,15 @@ impl Sandbox {
              (global-name \"com.apple.diskimagesiod\") (global-name \"com.apple.diskimagesiod.ram\") \
              (global-name \"com.apple.diskmanagementd\"))\n",
         );
+        if self.protect_credentials {
+            // Keychain daemons and the user's clipboard can expose credentials/tokens even when
+            // `~/Library/Keychains` is unreadable on disk.
+            out.push_str(
+                "(deny mach-lookup (global-name \"com.apple.SecurityServer\") \
+                 (global-name \"com.apple.secd\") (global-name \"com.apple.securityd\") \
+                 (global-name \"com.apple.pasteboard.pboard\"))\n",
+            );
+        }
         out.push_str("(deny network*)\n");
         if self.loopback_all && self.daemon_port.is_some() {
             // A later deny of one port is not reliable after an allow of `(remote ip "localhost:*")`: probed on
@@ -6575,5 +6599,30 @@ mod tests {
             let count: usize = out_large.trim().parse().unwrap_or(0);
             assert_eq!(count, 96 * 1024 + 1, "{label}: {out_large}");
         }
+    }
+
+    #[test]
+    fn seatbelt_denies_keychain_and_pasteboard_under_protect_credentials_and_fetch_services_in_allowlist() {
+        let f = fx();
+        let protected = SandboxCfg { protect_credentials: true, ..cfg(SandboxMode::Seatbelt) };
+        let unprotected = SandboxCfg { protect_credentials: false, ..cfg(SandboxMode::Seatbelt) };
+        let p_prot = build(&f, &protected, None).profile().expect("profile");
+        let p_unprot = build(&f, &unprotected, None).profile().expect("profile");
+        for svc in [
+            "com.apple.SecurityServer",
+            "com.apple.secd",
+            "com.apple.securityd",
+            "com.apple.pasteboard.pboard",
+        ] {
+            assert!(p_prot.contains(svc), "{svc} must be denied when protect_credentials=true: {p_prot}");
+            assert!(!p_unprot.contains(svc), "{svc} must not be denied when protect_credentials=false: {p_unprot}");
+        }
+        // Allowlist and DenyAll both deny Apple network-fetching services; Open does not.
+        let allowlist = build(&f, &unprotected, None).with_network_mode(ferret_core::config::NetworkMode::Allowlist);
+        let deny_all = build(&f, &unprotected, None).with_network_mode(ferret_core::config::NetworkMode::DenyAll);
+        let open = build(&f, &unprotected, None).with_network_mode(ferret_core::config::NetworkMode::Open);
+        assert!(allowlist.profile().expect("allowlist profile").contains(FETCH_SERVICES));
+        assert!(deny_all.profile().expect("deny_all profile").contains(FETCH_SERVICES));
+        assert!(!open.profile().expect("open profile").contains(FETCH_SERVICES));
     }
 }

@@ -16,6 +16,7 @@
       <span class="brand">ferret</span>
       <button id="connection-wrap" type="button" class="lconn lconn-btn" aria-haspopup="dialog" title="Daemon and Signal status"><span id="dot" class="dot dot-red" aria-hidden="true"></span><span class="conn-prefix" aria-hidden="true">Daemon</span><span id="connection-state" class="connection-state" role="status">Connecting…</span><svg class="icon conn-chevron" viewBox="0 0 12 12" aria-hidden="true"><path d="M2.5 4.5 6 8l3.5-3.5"/></svg></button>
       <span class="spacer"></span>
+      <button id="btn-panic" type="button" class="btn small danger panic-btn" aria-haspopup="dialog" aria-controls="daemon-status" title="Emergency panic kill-switch: sever all proxy tunnels, stop all active sessions, tear down boxes, and disable rewrite rules">Panic</button>
       <button id="btn-inbox" type="button" class="btn">Inbox <span id="inbox-count" class="count" hidden>0</span></button>
       <button id="close-left" type="button" class="btn small drawer-btn" aria-label="Close missions">Close</button>
     </header>

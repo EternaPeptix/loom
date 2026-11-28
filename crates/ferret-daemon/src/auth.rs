@@ -44,6 +44,10 @@ pub const CODE_TTL: Duration = Duration::from_secs(60);
 pub const MAX_CODES: usize = 16;
 /// Web-session secrets kept at once; creating past it drops the oldest.
 pub const MAX_SESSIONS: usize = 32;
+/// Maximum failed authentication attempts permitted within [`AUTH_FAIL_WINDOW`] before returning 429.
+pub const AUTH_FAIL_LIMIT: usize = 10;
+/// Sliding window duration for authentication-failure rate limiting.
+pub const AUTH_FAIL_WINDOW: Duration = Duration::from_secs(60);
 /// The cookie older daemons kept the API token in. It is not a credential.
 pub const LEGACY_COOKIE: &str = "ferret_token";
 /// The `Set-Cookie` value that removes [`LEGACY_COOKIE`] from a browser: the name and path it was
@@ -211,6 +215,108 @@ impl Logins {
             ok |= token_matches(candidate, secret);
         }
         ok
+    }
+}
+
+/// In-memory sliding-window rate limiter / lockout for failed authentication attempts.
+///
+/// Tracks bearer-token failures and login-code redemption failures in separate bounded deques so
+/// brute-forcing one path triggers `429 Too Many Requests` + `Retry-After` without unbounded
+/// memory growth or locking out valid API-token traffic.
+pub struct AuthRateLimiter {
+    limit: usize,
+    window: Duration,
+    bearer: Mutex<VecDeque<Instant>>,
+    login: Mutex<VecDeque<Instant>>,
+}
+
+impl Default for AuthRateLimiter {
+    fn default() -> Self {
+        Self::new(AUTH_FAIL_LIMIT, AUTH_FAIL_WINDOW)
+    }
+}
+
+impl AuthRateLimiter {
+    pub fn new(limit: usize, window: Duration) -> Self {
+        Self {
+            limit,
+            window,
+            bearer: Mutex::new(VecDeque::new()),
+            login: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    fn prune(q: &mut VecDeque<Instant>, window: Duration, now: Instant) {
+        while q.front().is_some_and(|t| now.saturating_duration_since(*t) >= window) {
+            q.pop_front();
+        }
+    }
+
+    fn retry_after_secs(q: &VecDeque<Instant>, window: Duration, now: Instant) -> u64 {
+        let remaining = q
+            .front()
+            .map(|oldest| window.saturating_sub(now.saturating_duration_since(*oldest)))
+            .unwrap_or(window);
+        let secs = remaining.as_millis().div_ceil(1_000);
+        u64::try_from(secs).unwrap_or(u64::MAX).max(1)
+    }
+
+    fn check_bucket(&self, bucket: &Mutex<VecDeque<Instant>>, now: Instant) -> Option<u64> {
+        let mut q = bucket.lock().unwrap_or_else(PoisonError::into_inner);
+        Self::prune(&mut q, self.window, now);
+        if self.limit == 0 || q.len() >= self.limit {
+            Some(Self::retry_after_secs(&q, self.window, now))
+        } else {
+            None
+        }
+    }
+
+    fn record_bucket(&self, bucket: &Mutex<VecDeque<Instant>>, now: Instant) -> Option<u64> {
+        let mut q = bucket.lock().unwrap_or_else(PoisonError::into_inner);
+        Self::prune(&mut q, self.window, now);
+        if self.limit == 0 || q.len() >= self.limit {
+            return Some(Self::retry_after_secs(&q, self.window, now));
+        }
+        q.push_back(now);
+        None
+    }
+
+    /// Returns `Some(retry_after_secs)` if bearer auth failures are currently locked out.
+    pub fn bearer_retry_after(&self) -> Option<u64> {
+        self.bearer_retry_after_at(Instant::now())
+    }
+
+    pub fn bearer_retry_after_at(&self, now: Instant) -> Option<u64> {
+        self.check_bucket(&self.bearer, now)
+    }
+
+    /// Record a failed bearer/token attempt. Returns `Some(retry_after_secs)` once the sliding
+    /// window has already reached [`AUTH_FAIL_LIMIT`] failures.
+    pub fn record_bearer_failure(&self) -> Option<u64> {
+        self.record_bearer_failure_at(Instant::now())
+    }
+
+    pub fn record_bearer_failure_at(&self, now: Instant) -> Option<u64> {
+        self.record_bucket(&self.bearer, now)
+    }
+
+    /// Returns `Some(retry_after_secs)` if login-code redemption is currently locked out.
+    pub fn login_retry_after(&self) -> Option<u64> {
+        self.login_retry_after_at(Instant::now())
+    }
+
+    pub fn login_retry_after_at(&self, now: Instant) -> Option<u64> {
+        self.check_bucket(&self.login, now)
+    }
+
+    /// Record a failed login-code redemption. Returns `Some(retry_after_secs)` once the sliding
+    /// window has already reached [`AUTH_FAIL_LIMIT`] failures.
+    pub fn record_login_failure(&self) -> Option<u64> {
+        self.record_login_failure_at(Instant::now())
+    }
+
+    pub fn record_login_failure_at(&self, now: Instant) -> Option<u64> {
+        self.record_bucket(&self.login, now)
     }
 }
 
@@ -477,5 +583,26 @@ mod tests {
         assert!(!logins.session_ok(&secrets[0]), "the oldest session is dropped");
         assert!(logins.session_ok(&secrets[1]));
         assert!(logins.session_ok(&secrets[MAX_SESSIONS]));
+    }
+
+    #[test]
+    fn auth_rate_limiter_locks_out_after_limit_and_recovers_after_window() {
+        let limiter = AuthRateLimiter::new(3, Duration::from_secs(60));
+        let t0 = Instant::now();
+        assert_eq!(limiter.record_bearer_failure_at(t0), None);
+        assert_eq!(limiter.record_bearer_failure_at(t0 + Duration::from_secs(10)), None);
+        assert_eq!(limiter.record_bearer_failure_at(t0 + Duration::from_secs(20)), None);
+        // Fourth failure within window is rejected with Retry-After based on oldest failure (t0).
+        let retry = limiter.record_bearer_failure_at(t0 + Duration::from_secs(25)).unwrap();
+        assert!((35..=36).contains(&retry), "expected ~35s Retry-After, got {retry}");
+        // Login bucket is independent.
+        assert_eq!(limiter.login_retry_after_at(t0 + Duration::from_secs(25)), None);
+        assert_eq!(limiter.record_login_failure_at(t0 + Duration::from_secs(25)), None);
+        // Once t0 ages past the 60s window, one slot opens up again.
+        assert_eq!(limiter.bearer_retry_after_at(t0 + Duration::from_secs(60)), None);
+        assert_eq!(limiter.record_bearer_failure_at(t0 + Duration::from_secs(60)), None);
+        // Now 3 failures remain (t0+10, t0+20, t0+60), so the next attempt at t0+61 locks out for ~9s.
+        let retry2 = limiter.record_bearer_failure_at(t0 + Duration::from_secs(61)).unwrap();
+        assert!((9..=10).contains(&retry2), "expected ~9s Retry-After, got {retry2}");
     }
 }

@@ -519,11 +519,11 @@ impl Shared {
             && self.role.read_only
             && self.role.tools.iter().any(|t| t == "evidence")
             && self.role.tools.iter().any(|t| t == "verdict");
-        // Security records are authorized by `security_record` itself (an independent read-only judge may
-        // close a hypothesis); a read-only judge explicitly granted both `evidence` and `verdict` may
-        // attach verbatim-attested evidence to an existing claim; every other op is refused to a read-only role.
+        // A read-only judge explicitly granted both `evidence` and `verdict` (e.g., `op_judge`/`flag_judge`
+        // recording an `oracle_check` receipt) may attach verbatim-attested evidence to an existing claim;
+        // every other op — including all `LedgerOp::Security(_)` mutations — is refused to a read-only role.
         let judge_attests = judge_evidence && matches!(&op, LedgerOp::EvidenceAdd(input) if input.attested);
-        let allowed = from_user || matches!(op, LedgerOp::Security(_)) || judge_attests;
+        let allowed = from_user || judge_attests;
         if self.role.read_only && !allowed {
             return Err("This role has read-only access to the mission ledger. Return observations through its report or verdict.".to_string());
         }
@@ -667,7 +667,7 @@ pub fn build_registry(shared: &Arc<Shared>) -> Result<Registry, String> {
     }
     // After the role's own tools, in server and listing order (CONTRACTS-MCP M6).
     if let Some(mcp) = shared.mcp() {
-        for t in mcp.tools() {
+        for t in mcp.scoped_tools() {
             registry.add(Arc::new(t));
         }
     }
@@ -857,8 +857,20 @@ mod tests {
                 LedgerOp::ClaimAdd { text: "new claim".into(), assets: Vec::new() },
                 LedgerOp::ClaimUpdate { id: "c1".into(), status: ClaimStatus::Supported, note: String::new() },
                 LedgerOp::Decision { text: "d".into(), reason: "r".into() },
+                LedgerOp::Security(ferret_core::security_state::SecurityOp::AssetUpsert {
+                    asset: ferret_core::security_state::AssetInput {
+                        kind: ferret_core::security_state::AssetKind::Host,
+                        locator: "judge-injected.test".into(),
+                        evidence: vec!["e1".into()],
+                        mandatory: false,
+                        parent: None,
+                    },
+                }),
             ] {
-                assert!(r.shared.ledger_append(false, op).unwrap_err().contains("read-only"));
+                assert!(
+                    r.shared.ledger_append(false, op).unwrap_err().contains("read-only"),
+                    "{pack}/{role_name} must refuse read-only ledger/security mutation"
+                );
             }
             let unattested = LedgerOp::EvidenceAdd(EvidenceInput {
                 claim: "c1".into(),

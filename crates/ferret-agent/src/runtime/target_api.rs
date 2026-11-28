@@ -262,12 +262,35 @@ impl Runtime {
         Ok(out)
     }
 
-    /// Export all captured exchanges of a mission as a HAR 1.2 JSON document.
+    /// Export all captured exchanges of a mission as a HAR 1.2 JSON document (sanitized by default).
     pub fn export_har(
         &self,
         mission: &MissionId,
         host: Option<&str>,
         limit: Option<usize>,
+    ) -> Result<(serde_json::Value, ferret_core::har::HarExportMeta), String> {
+        self.export_har_inner(mission, host, limit, true)
+    }
+
+    /// Export all captured exchanges of a mission as a HAR 1.2 JSON document with explicit
+    /// sanitization control. When `sanitize` is `true`, active `sensitive: true` proxy rewrite
+    /// secrets are merged into `extra_secrets` before export.
+    pub fn export_har_with_options(
+        &self,
+        mission: &MissionId,
+        host: Option<&str>,
+        limit: Option<usize>,
+        sanitize: bool,
+    ) -> Result<serde_json::Value, String> {
+        self.export_har_inner(mission, host, limit, sanitize).map(|(doc, _meta)| doc)
+    }
+
+    fn export_har_inner(
+        &self,
+        mission: &MissionId,
+        host: Option<&str>,
+        limit: Option<usize>,
+        sanitize: bool,
     ) -> Result<(serde_json::Value, ferret_core::har::HarExportMeta), String> {
         self.inner.check_open()?;
         let sessions: Vec<SessionId> = {
@@ -305,7 +328,12 @@ impl Runtime {
         if let Some(n) = limit.filter(|&n| n > 0) {
             opts.max_entries = n.min(ferret_core::har::DEFAULT_MAX_IMPORT_ENTRIES);
         }
-        ferret_core::har::export_har(&pairs, &self.inner.blobs, &opts)
+        let extra_secrets = if sanitize {
+            self.inner.rewrites.snapshot().sensitive_values()
+        } else {
+            Vec::new()
+        };
+        ferret_core::har::export_har_sanitized(&pairs, &self.inner.blobs, &opts, &extra_secrets, sanitize)
     }
 
     /// Import a HAR 1.2 document into a mission's traffic log, deduplicating against existing exchange IDs.

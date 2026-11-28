@@ -106,8 +106,8 @@ Export or inspect any mission's active findings and per-surface coverage provena
 compatible with GitHub Code Scanning `upload-sarif` and ASPM tools):
 
 - CLI inspect: `ferret findings <session|mission> [-a/--all] [--severity <critical|high|medium|low|info>] [--json]`
-- CLI export: `ferret sarif <session|mission> [-o findings.sarif] [--repo-name owner/repo --repo-uri ... --commit ... --branch ... --git-ref ...]`
-- HTTP API: `GET /api/missions/{id}/sarif`
+- CLI export: `ferret sarif <session|mission> [-o findings.sarif] [--include-secrets] [--repo-name owner/repo --repo-uri ... --commit ... --branch ... --git-ref ...]`
+- HTTP API: `GET /api/missions/{id}/sarif?sanitize=true` (`sanitize` defaults to `true`, scrubbing sensitive headers, active rewrite secrets, and high-confidence credential/token patterns; pass `?sanitize=false` or `--include-secrets` to opt out)
 
 SARIF rules are keyed on canonical `CWE-NNN` (with `helpUri`, `security-severity`, and `stride:<leg>`
 tags), physical locations drop unsafe paths and anchor locationless DAST findings to `SECURITY.md`
@@ -216,11 +216,16 @@ block recording a newly substantiated finding.
 
 Operators can inspect captured mission HTTP traffic live or round-trip it with Burp Suite, OWASP ZAP, or browser DevTools:
 - `ferret traffic <session> [--host HOST] [--after SEQ] [-n N] [--json]` (or `ferret traffic --target <name> [--node NODE] [-n N] [--json]`)
-- `GET /api/missions/{id}/har?host=&limit=` or `ferret har export <session|mission> [-o out.har] [--host HOST] [--limit N]`
+- `GET /api/missions/{id}/har?host=&limit=&sanitize=true` or `ferret har export <session|mission> [-o out.har] [--host HOST] [--limit N] [--include-secrets]`
 - `POST /api/missions/{id}/har` or `ferret har import <session|mission> traffic.har`
 
-URL userinfo is always stripped; binary bodies use `encoding: "base64"`; imported exchanges get preserved
-`_ferretExchangeId` values or deterministic `ex-har-*` IDs so repeated imports skip duplicates idempotently.
+Exports are **sanitized by default** (`sanitize=true`, setting `log._sanitized = true`): URL userinfo, sensitive auth/cookie/API-key/CSRF headers, sensitive query/form parameters, active rewrite secrets, and high-confidence tokens/JWTs/PEM keys are redacted before leaving the daemon. Pass `?sanitize=false` or `--include-secrets` only when raw credentials are intentionally required. Binary bodies use `encoding: "base64"`; imported exchanges get preserved `_ferretExchangeId` values or deterministic `ex-har-*` IDs so repeated imports skip duplicates idempotently.
+
+## Dynamic scope revocation and emergency panic kill-switch
+
+- **Per-host live scope revocation:** `ferret scope revoke <session> <host>... [--note <text>] [--json]`, `POST /api/sessions/{id}/scope/revoke` (and `DELETE /api/sessions/{id}/scope`), Signal `/scope revoke <id|#n> <host>...`, and the per-host **Revoke** buttons in the Web UI Network panel remove the named hosts from the mission's active policy, immediately sever matching open proxy tunnels (HTTP, CONNECT, and intercepted HTTPS), and re-sync any active `[box]` firewall rules.
+- **Emergency panic kill-switch:** `ferret panic [--reason <text>] [--json]`, `POST /api/panic`, Signal `/panic [reason]`, and the two-step confirmed **Panic** button in the Web UI header / Daemon status dialog immediately sever ALL active proxy tunnels across all sessions, disable every enabled proxy rewrite rule, stop all active sessions and jobs (recording the optional reason), and tear down all active `[box]` containers, returning a `PanicReport` (`connections_cut`, `sessions_stopped`, `boxes_torn_down`, `rewrites_disabled`).
+- **Auth-failure rate limiting:** The daemon API enforces an in-memory sliding-window lockout (`10` failed attempts per `60s` window → `429 Too Many Requests` with `Retry-After`) independently across bearer auth and login-code redemption (`POST /api/web-sessions`), without blocking legitimate valid-token requests.
 
 ## Egress noise governor, assessment `User-Agent`, and operator-only rewrite rules
 
@@ -254,7 +259,8 @@ auth = "login"                           # or "xoauth2"
 folder = "INBOX"
 allow_senders = ["*@hackerone.com", "*@bugcrowd.com", "*@intigriti.com", "*@yeswehack.com", "*@*.target.example"]
 allow_recipients = ["researcher+bb-*@gmail.com"] # optional plus-address filter
-require_auth_pass = true                 # default false; true requires Authentication-Results dkim=pass or spf=pass
+require_auth_pass = true                 # default false; inspects only the topmost trusted Authentication-Results header for dmarc=pass or aligned dkim=pass
+authserv_id = "mx.google.com"            # optional pinned trusted MTA authserv-id hostname (recommended with require_auth_pass = true)
 max_age_minutes = 120                    # only recent mail (0 = unbounded)
 max_messages = 20                        # 1..=50
 # roles = ["lead", "worker"]             # optional; empty = every non-read-only role
@@ -271,10 +277,16 @@ Disabled by default. Connects natively from `ferret daemon` to a local `signal-c
 `approval`, `parked`, `finished`, `error`, and optional `disk` alerts on Signal (plus `[notify] repeat_minutes`
 and post-restart open-blocker reminders) and can answer or steer missions directly from their phone:
 
-- **Strict sender & group allowlists:** `allow_from` is mandatory, validated at config check time (explicit
+- **Strict sender & group allowlists & loopback transport:** Plaintext `http://` `http_url` is restricted to
+  loopback (`127.0.0.1`, `localhost`, `[::1]`; non-loopback requires `https://`). `allow_from` is mandatory, validated at config check time (explicit
   E.164 phone numbers like `+15550199` or Signal ACI/PNI UUIDs; `*` is refused), and unauthorized senders are
   ignored (logged at `warn`). `allow_groups` accepts raw `<groupId>` or `group:<groupId>` (normalized on
   load; a `group:<groupId>` `recipient` is allowed automatically).
+- **Delayed inbox alerts (`inbox_delay_secs`):** Default `0` (immediate). Setting `inbox_delay_secs` (up to
+  `86400`, e.g. `600` for 10 minutes) holds outbound Signal alerts for `blocker`, `question`, `approval`, and
+  `parked` inbox items until they remain open past the delay (honoring existing item age on daemon startup).
+  If the operator answers, approves, or dismisses the item at the computer before the timer expires, zero
+  Signal messages are sent. `finished`, `error`, `disk`, guest alerts, and direct command replies remain immediate.
 - **Phone Number Privacy (PNP):** When Signal hides phone numbers, inbound envelopes may carry only
   `sourceUuid`. Discover your ACI UUID via `signal-cli -a +15550100 listContacts --all-recipients` and
   include it in `allow_from` (and `recipient` if needed); plain `<uuid>`, `u:<uuid>`, and `PNI:<uuid>` are
@@ -291,9 +303,12 @@ and post-restart open-blocker reminders) and can answer or steer missions direct
   different mission's open blocker.
 - **Commands & diagnostics:** Plain DM replies answer an unambiguous sole open blocking item (group chatter
   is ignored unless quoted, `@<id>`-addressed, or a slash command); `/inbox`, `/status`, `/tail [id|#n] [count]`,
-  `/scope <id|#n> [host...]`, `/dismiss [id|#n]`, `/stop [id|#n]`, `/resume [id|#n]`, `/approve <id|#n> <text>`,
-  `/rule <id|#n> <text>`, `/release <id|#n> <reason>`, `/mute [15m|2h|off]`, `/unmute`, and `/help` (`/start`)
-  work from Signal. Verify setup with `ferret signal check` and `ferret signal test`, and monitor live bridge
+  `/scope <id|#n> [host...]`, `/scope revoke <id|#n> <host>...`, `/panic [reason]`, `/dismiss [id|#n]`,
+  `/stop [id|#n]`, `/resume [id|#n]`, `/approve <id|#n> <text>`, `/rule <id|#n> <text>`,
+  `/release <id|#n> <reason>`, `/mute [15m|2h|off]`, `/unmute`, and `/help` (`/start`)
+  work from Signal (all strictly owner-only; quote-reply fallback anchors both line-1 headers and final-line
+  footers so untrusted body text cannot spoof routing, and guest note prompts escape fence delimiters, bidi
+  controls, and harness tags). Verify setup with `ferret signal check` and `ferret signal test`, and monitor live bridge
   health in `ferret status` / `GET /api/status`. See `docs/RUN.md` ("Signal") for step-by-step setup and
   troubleshooting.
 - **Isolated guest chat & unknown-sender gatekeeper (`[signal.guests]`):** Disabled by default (fail-closed:

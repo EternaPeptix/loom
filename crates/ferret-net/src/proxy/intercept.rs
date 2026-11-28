@@ -135,6 +135,8 @@ pub(super) struct Tap {
     max: u64,
     started: Instant,
     ts_ms: u64,
+    secrets: Arc<ferret_core::creds::Secrets>,
+    secret_margin: usize,
     d: Mutex<TapData>,
 }
 
@@ -150,9 +152,20 @@ struct TapData {
 
 impl Tap {
     pub fn new(max_bytes: u64, req_head: Vec<u8>) -> Tap {
+        Tap::new_with_secrets(max_bytes, req_head, Arc::new(ferret_core::creds::Secrets::default()), 0)
+    }
+
+    pub fn new_with_secrets(
+        max_bytes: u64,
+        req_head: Vec<u8>,
+        secrets: Arc<ferret_core::creds::Secrets>,
+        max_secret_len: usize,
+    ) -> Tap {
         let ts_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        let req_head = if secrets.is_empty() { req_head } else { secrets.redact_bytes(&req_head).into_owned() };
+        let secret_margin = if secrets.is_empty() { 0 } else { max_secret_len.min(MAX_HEAD) };
         let d = TapData {
             req_head,
             req_body: Vec::new(),
@@ -162,14 +175,15 @@ impl Tap {
             head_end: None,
             status: None,
         };
-        Tap { max: max_bytes, started: Instant::now(), ts_ms, d: Mutex::new(d) }
+        Tap { max: max_bytes, started: Instant::now(), ts_ms, secrets, secret_margin, d: Mutex::new(d) }
     }
 
     /// Request body bytes that were written to the destination.
     pub fn request_body(&self, data: &[u8]) {
         let mut d = lock(&self.d);
         d.req_body_total = d.req_body_total.saturating_add(data.len() as u64);
-        let room = usize::try_from(self.max).unwrap_or(usize::MAX).saturating_sub(d.req_body.len());
+        let cap = self.max.saturating_add(self.secret_margin as u64);
+        let room = usize::try_from(cap).unwrap_or(usize::MAX).saturating_sub(d.req_body.len());
         d.req_body.extend_from_slice(data.get(..room.min(data.len())).unwrap_or(&[]));
     }
 
@@ -185,7 +199,8 @@ impl Tap {
             d.status = status;
         }
         let limit = match d.head_end {
-            Some(h) => usize::try_from(h.saturating_add(self.max)).unwrap_or(usize::MAX),
+            Some(h) => usize::try_from(h.saturating_add(self.max).saturating_add(self.secret_margin as u64))
+                .unwrap_or(usize::MAX),
             None => 2 * MAX_HEAD,
         };
         let room = limit.saturating_sub(d.resp.len());
@@ -207,23 +222,73 @@ impl Tap {
         upstream_unverified: bool,
     ) -> Captured {
         let d = lock(&self.d);
-        let resp_body = d.head_end.map_or(0, |h| d.resp_total.saturating_sub(h));
-        let mut request = d.req_head.clone();
-        request.extend_from_slice(&d.req_body);
+        let resp_body_total = d.head_end.map_or(0, |h| d.resp_total.saturating_sub(h));
+        let req_truncated = d.req_body_total > self.max;
+        let resp_truncated = resp_body_total > self.max;
+        let max_usize = usize::try_from(self.max).unwrap_or(usize::MAX);
+
+        let (request, response, target, error, request_bytes, response_bytes) = if self.secrets.is_empty() {
+            let mut request = d.req_head.clone();
+            request.extend_from_slice(&d.req_body);
+            let request_bytes = (d.req_head.len() as u64).saturating_add(d.req_body_total);
+            (
+                request,
+                (!d.resp.is_empty()).then(|| d.resp.clone()),
+                target.to_string(),
+                error,
+                request_bytes,
+                d.resp_total,
+            )
+        } else {
+            let mut req_body = self.secrets.redact_bytes(&d.req_body).into_owned();
+            if req_truncated && req_body.len() > max_usize {
+                req_body.truncate(max_usize);
+            }
+            let mut request = d.req_head.clone();
+            request.extend_from_slice(&req_body);
+            let request_bytes = if req_truncated {
+                (d.req_head.len() as u64).saturating_add(d.req_body_total)
+            } else {
+                request.len() as u64
+            };
+            let (response, response_bytes) = if d.resp.is_empty() {
+                (None, 0)
+            } else if let Some(h) = d.head_end {
+                let split = usize::try_from(h).unwrap_or(d.resp.len()).min(d.resp.len());
+                let (raw_head, raw_body) = d.resp.split_at(split);
+                let mut clean_head = self.secrets.redact_bytes(raw_head).into_owned();
+                let mut clean_body = self.secrets.redact_bytes(raw_body).into_owned();
+                if resp_truncated && clean_body.len() > max_usize {
+                    clean_body.truncate(max_usize);
+                }
+                let head_len = clean_head.len() as u64;
+                clean_head.extend_from_slice(&clean_body);
+                let total = if resp_truncated { head_len.saturating_add(resp_body_total) } else { clean_head.len() as u64 };
+                (Some(clean_head), total)
+            } else {
+                let clean = self.secrets.redact_bytes(&d.resp).into_owned();
+                let total = clean.len() as u64;
+                (Some(clean), total)
+            };
+            let target = self.secrets.redact(target).into_owned();
+            let error = error.map(|e| self.secrets.redact(&e).into_owned());
+            (request, response, target, error, request_bytes, response_bytes)
+        };
+
         Captured {
             ts_ms: self.ts_ms,
             transport,
             method: method.to_string(),
             host: String::new(),
             port: 0,
-            target: target.to_string(),
+            target,
             status: d.status,
             error,
             request,
-            response: (!d.resp.is_empty()).then(|| d.resp.clone()),
-            request_bytes: (d.req_head.len() as u64).saturating_add(d.req_body_total),
-            response_bytes: d.resp_total,
-            truncated: d.req_body_total > self.max || resp_body > self.max,
+            response,
+            request_bytes,
+            response_bytes,
+            truncated: req_truncated || resp_truncated,
             upstream_unverified,
             duration_ms: u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
         }
@@ -239,6 +304,7 @@ pub(super) enum Ended {
 }
 
 /// Intercepts an allowed tunnel whose `200` has been sent (see the module contract).
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn run(
     client: TcpStream,
     up: TcpStream,
@@ -247,10 +313,19 @@ pub(super) async fn run(
     cap: &CaptureCfg,
     inject: Option<&Inject>,
     cancel: &CancellationToken,
+    proxy_cancel: &CancellationToken,
 ) -> Ended {
     let Some(ca) = cap.ca.as_ref() else { return Ended::Opaque(client, up) };
     let mut first = [0u8; 1];
-    match tokio::time::timeout(FIRST_BYTES, client.peek(&mut first)).await {
+    let peek = tokio::select! {
+        r = tokio::time::timeout(FIRST_BYTES, client.peek(&mut first)) => r,
+        _ = cancel.cancelled() => {
+            drop((client, up));
+            cx.failed_after_allow(allowed, cancel_reason(proxy_cancel)).await;
+            return Ended::Done;
+        }
+    };
+    match peek {
         Ok(Ok(1)) if first[0] == 0x16 => {}
         Ok(Ok(0) | Err(_)) => return Ended::Done,
         _ => return Ended::Opaque(client, up),
@@ -265,7 +340,15 @@ pub(super) async fn run(
     };
 
     // The destination first: a certificate that does not verify refuses the client before it sends anything.
-    let upstream = tokio::time::timeout(CONNECT_TIMEOUT, TlsConnector::from(config).connect(name, up)).await;
+    let upstream = tokio::select! {
+        r = tokio::time::timeout(CONNECT_TIMEOUT, TlsConnector::from(config).connect(name, up)) => Some(r),
+        _ = cancel.cancelled() => None,
+    };
+    let Some(upstream) = upstream else {
+        drop(client);
+        cx.failed_after_allow(allowed, cancel_reason(proxy_cancel)).await;
+        return Ended::Done;
+    };
     let up_tls = match upstream {
         Ok(Ok(s)) => s,
         other => {
@@ -285,15 +368,26 @@ pub(super) async fn run(
             return Ended::Done;
         }
     };
-    let accepted = tokio::time::timeout(limits.head_timeout, TlsAcceptor::from(leaf).accept(client)).await;
+    let accepted = tokio::select! {
+        r = tokio::time::timeout(limits.head_timeout, TlsAcceptor::from(leaf).accept(client)) => Some(r),
+        _ = cancel.cancelled() => None,
+    };
+    let Some(accepted) = accepted else {
+        drop(up_tls);
+        cx.failed_after_allow(allowed, cancel_reason(proxy_cancel)).await;
+        return Ended::Done;
+    };
     let Ok(Ok(client_tls)) = accepted else {
         let rule = format!("client refused the interception certificate for {}", cx.host);
         cx.record_best_effort(true, rule, Some(allowed.ip)).await;
         return Ended::Done;
     };
-    tokio::select! {
-        _ = serve(client_tls, up_tls, cx, cap, inject, insecure, cancel) => {}
-        _ = cancel.cancelled() => cx.failed_after_allow(allowed, SHUTDOWN).await,
+    let cancelled = tokio::select! {
+        _ = serve(client_tls, up_tls, cx, cap, inject, insecure, cancel) => false,
+        _ = cancel.cancelled() => true,
+    };
+    if cancelled {
+        cx.failed_after_allow(allowed, cancel_reason(proxy_cancel)).await;
     }
     Ended::Done
 }
@@ -412,6 +506,9 @@ async fn serve(
         first = false;
         let gov = cx.shared.governor();
         let _pace = gov.acquire(cx.host, cancel).await;
+        if cancel.is_cancelled() {
+            return;
+        }
         // S3, S6: decided again for every request of the connection, on the tunnel's destination.
         let mut raw = match inject.filter(|i| i.applies_to(cx.host)).and_then(|i| apply_head(i.items(), cx.host, &raw)) {
             Some(injected) => injected,
@@ -427,12 +524,17 @@ async fn serve(
                 raw = tagged;
             }
         }
+        let rewrites = cx.shared.rewrites();
         let mut req_method = head.method.clone();
         let mut req_target = head.target.clone();
-        if let Some((rewritten, m, t, _ids)) = cx.shared.rewrites().apply_raw_request_head_parts(cx.host, &raw) {
-            raw = rewritten;
-            req_method = m;
-            req_target = t;
+        let mut cap_head: Option<Vec<u8>> = None;
+        if let Some(rw) = rewrites.apply_raw_request_head_for_capture(cx.host, &raw) {
+            raw = rw.wire_head;
+            if rw.sensitive_applied {
+                cap_head = Some(rw.captured_head);
+            }
+            req_method = rw.method;
+            req_target = rw.target;
         }
         let body = match body_kind(&head) {
             Ok(Body::Stream) => {
@@ -447,7 +549,12 @@ async fn serve(
         };
         let http11 = raw.split(|b| *b == b'\n').next().is_some_and(|l| l.trim_ascii_end().ends_with(b"HTTP/1.1"));
         let keep = http11 && !connection_has(&head.headers, "close");
-        let tap = Tap::new(cap.grant.max_bytes, raw.clone());
+        let tap = Tap::new_with_secrets(
+            cap.grant.max_bytes,
+            cap_head.unwrap_or_else(|| raw.clone()),
+            rewrites.secrets(),
+            rewrites.max_secret_len(),
+        );
         let head_request = req_method.eq_ignore_ascii_case("HEAD");
         let x = exchange(
             &mut cr,

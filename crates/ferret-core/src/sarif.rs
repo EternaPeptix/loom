@@ -69,12 +69,58 @@ pub struct SilentChild {
 }
 
 /// Options controlling SARIF 2.1.0 generation.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SarifOptions {
     pub tool_version: Option<String>,
     pub mission_id: Option<String>,
     pub repository: Option<RepositoryContext>,
     pub silent_children: Vec<SilentChild>,
+    /// Redact credentials, tokens, JWTs, auth headers, and `extra_secrets` from finding
+    /// descriptions, PoCs, snippets, fixes, coverage notes, and invocation caveats. Defaults to
+    /// `true`.
+    pub sanitize: bool,
+    /// Additional literal secret strings to redact when `sanitize` is `true`.
+    pub extra_secrets: Vec<String>,
+}
+
+impl Default for SarifOptions {
+    fn default() -> Self {
+        Self {
+            tool_version: None,
+            mission_id: None,
+            repository: None,
+            silent_children: Vec::new(),
+            sanitize: true,
+            extra_secrets: Vec::new(),
+        }
+    }
+}
+
+struct Scrubber<'a> {
+    enabled: bool,
+    extra: &'a [String],
+}
+
+impl<'a> Scrubber<'a> {
+    fn from_opts(opts: &'a SarifOptions) -> Self {
+        Self { enabled: opts.sanitize, extra: &opts.extra_secrets }
+    }
+
+    fn text<'b>(&self, s: &'b str) -> std::borrow::Cow<'b, str> {
+        if self.enabled {
+            crate::sanitize::sanitize_text(s, self.extra)
+        } else {
+            std::borrow::Cow::Borrowed(s)
+        }
+    }
+
+    fn url(&self, s: &str) -> String {
+        if self.enabled {
+            crate::sanitize::sanitize_url(s, self.extra)
+        } else {
+            s.to_string()
+        }
+    }
 }
 
 /// Curated CWE -> STRIDE legs mapping (S, T, R, I, D, E).
@@ -173,6 +219,7 @@ const VULN_CLASS_KEYWORDS: &[&str] = &[
 /// Build an OASIS SARIF 2.1.0 document from the mission ledger.
 pub fn build_sarif_report(ledger: &LedgerState, opts: &SarifOptions) -> Value {
     let ev_by_id: HashMap<&str, &Evidence> = ledger.evidence.iter().map(|e| (e.id.as_str(), e)).collect();
+    let scrub = Scrubber::from_opts(opts);
 
     let mut rules: Vec<Value> = Vec::new();
     let mut rule_index_by_id: HashMap<String, usize> = HashMap::new();
@@ -187,7 +234,7 @@ pub fn build_sarif_report(ledger: &LedgerState, opts: &SarifOptions) -> Value {
             withdrawn_count += 1;
             continue;
         }
-        let (locations, is_synthetic, dropped_count) = build_finding_locations(finding);
+        let (locations, is_synthetic, dropped_count) = build_finding_locations(finding, &scrub);
         if is_synthetic {
             synthetic_location_count += 1;
         }
@@ -195,7 +242,7 @@ pub fn build_sarif_report(ledger: &LedgerState, opts: &SarifOptions) -> Value {
             dropped_unsafe_location_total += dropped_count;
             dropped_unsafe_location_findings.push(json!({
                 "id": finding.id,
-                "title": finding.title,
+                "title": scrub.text(&finding.title),
                 "droppedLocationCount": dropped_count,
             }));
         }
@@ -206,12 +253,12 @@ pub fn build_sarif_report(ledger: &LedgerState, opts: &SarifOptions) -> Value {
             None => {
                 let idx = rules.len();
                 rule_index_by_id.insert(rule_id.clone(), idx);
-                rules.push(build_finding_rule(&rule_id, finding));
+                rules.push(build_finding_rule(&rule_id, finding, &scrub));
                 idx
             }
         };
 
-        results.push(build_finding_result(&rule_id, rule_index, finding, locations, is_synthetic, &ev_by_id));
+        results.push(build_finding_result(&rule_id, rule_index, finding, locations, is_synthetic, &ev_by_id, &scrub));
     }
 
     // Non-reported per-surface coverage rides alongside alerts as non-failing SARIF results.
@@ -229,7 +276,7 @@ pub fn build_sarif_report(ledger: &LedgerState, opts: &SarifOptions) -> Value {
                 idx
             }
         };
-        results.push(build_coverage_result(&rule_id, rule_index, kind, entry, &ev_by_id));
+        results.push(build_coverage_result(&rule_id, rule_index, kind, entry, &ev_by_id, &scrub));
     }
 
     let mut driver = Map::new();
@@ -243,7 +290,7 @@ pub fn build_sarif_report(ledger: &LedgerState, opts: &SarifOptions) -> Value {
     let mut run = Map::new();
     run.insert("tool".into(), json!({ "driver": Value::Object(driver) }));
     run.insert("results".into(), Value::Array(results));
-    run.insert("invocations".into(), Value::Array(vec![build_invocation(ledger, opts, &ev_by_id)]));
+    run.insert("invocations".into(), Value::Array(vec![build_invocation(ledger, opts, &scrub)]));
 
     let mut run_properties = Map::new();
     if let Some(mid) = opts.mission_id.as_deref().filter(|s| !s.trim().is_empty()) {
@@ -369,19 +416,28 @@ fn security_severity_str(finding: &Finding) -> String {
     }
 }
 
-fn build_finding_rule(rule_id: &str, finding: &Finding) -> Value {
+fn build_finding_rule(rule_id: &str, finding: &Finding, scrub: &Scrubber<'_>) -> Value {
+    let title = scrub.text(&finding.title);
+    let description = scrub.text(&finding.description);
+    let impact = scrub.text(&finding.impact);
+    let rem_clean = finding
+        .remediation_steps
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| scrub.text(s));
     let help_text = {
-        let mut parts = Vec::new();
-        if !finding.description.trim().is_empty() {
-            parts.push(finding.description.trim());
+        let mut parts: Vec<&str> = Vec::new();
+        if !description.trim().is_empty() {
+            parts.push(description.trim());
         }
-        if !finding.impact.trim().is_empty() {
-            parts.push(finding.impact.trim());
+        if !impact.trim().is_empty() {
+            parts.push(impact.trim());
         }
-        if let Some(rem) = finding.remediation_steps.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(rem) = rem_clean.as_deref() {
             parts.push(rem);
         }
-        if parts.is_empty() { finding.title.clone() } else { parts.join("\n\n") }
+        if parts.is_empty() { title.to_string() } else { parts.join("\n\n") }
     };
 
     let mut tags = vec!["security".to_string()];
@@ -402,9 +458,9 @@ fn build_finding_rule(rule_id: &str, finding: &Finding) -> Value {
 
     let mut rule = Map::new();
     rule.insert("id".into(), json!(rule_id));
-    rule.insert("name".into(), json!(finding.title));
-    rule.insert("shortDescription".into(), json!({ "text": finding.title }));
-    rule.insert("fullDescription".into(), json!({ "text": finding.description }));
+    rule.insert("name".into(), json!(title));
+    rule.insert("shortDescription".into(), json!({ "text": title }));
+    rule.insert("fullDescription".into(), json!({ "text": description }));
     rule.insert("defaultConfiguration".into(), json!({ "level": finding.severity.sarif_level() }));
     rule.insert("help".into(), json!({ "text": help_text, "markdown": help_text }));
     rule.insert(
@@ -420,7 +476,7 @@ fn build_finding_rule(rule_id: &str, finding: &Finding) -> Value {
     Value::Object(rule)
 }
 
-fn build_finding_locations(finding: &Finding) -> (Vec<Value>, bool, usize) {
+fn build_finding_locations(finding: &Finding, scrub: &Scrubber<'_>) -> (Vec<Value>, bool, usize) {
     let mut physical = Vec::new();
     let mut dropped = 0usize;
     for loc in &finding.code_locations {
@@ -438,7 +494,7 @@ fn build_finding_locations(finding: &Finding) -> (Vec<Value>, bool, usize) {
             region.insert("endLine".into(), json!(loc.end_line));
         }
         if let Some(snippet) = loc.snippet.as_deref().filter(|s| !s.trim().is_empty()) {
-            region.insert("snippet".into(), json!({ "text": snippet }));
+            region.insert("snippet".into(), json!({ "text": scrub.text(snippet) }));
         }
         let mut entry = Map::new();
         entry.insert(
@@ -449,7 +505,7 @@ fn build_finding_locations(finding: &Finding) -> (Vec<Value>, bool, usize) {
             }),
         );
         if let Some(label) = loc.label.as_deref().filter(|s| !s.trim().is_empty()) {
-            entry.insert("message".into(), json!({ "text": label }));
+            entry.insert("message".into(), json!({ "text": scrub.text(label) }));
         }
         physical.push(Value::Object(entry));
     }
@@ -463,10 +519,14 @@ fn build_finding_locations(finding: &Finding) -> (Vec<Value>, bool, usize) {
 
     if let Some(endpoint) = finding.endpoint.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         locations.push(json!({
-            "logicalLocations": [{ "fullyQualifiedName": endpoint, "kind": "endpoint" }]
+            "logicalLocations": [{ "fullyQualifiedName": scrub.url(endpoint), "kind": "endpoint" }]
         }));
     } else if is_synthetic {
-        let resource = if !finding.target.trim().is_empty() { finding.target.trim() } else { finding.title.trim() };
+        let resource = if !finding.target.trim().is_empty() {
+            scrub.url(finding.target.trim())
+        } else {
+            scrub.text(finding.title.trim()).into_owned()
+        };
         if !resource.is_empty() {
             locations.push(json!({
                 "logicalLocations": [{ "fullyQualifiedName": resource, "kind": "resource" }]
@@ -477,7 +537,7 @@ fn build_finding_locations(finding: &Finding) -> (Vec<Value>, bool, usize) {
     (locations, is_synthetic, dropped)
 }
 
-fn build_fixes(finding: &Finding) -> Option<Vec<Value>> {
+fn build_fixes(finding: &Finding, scrub: &Scrubber<'_>) -> Option<Vec<Value>> {
     let mut artifact_changes = Vec::new();
     for loc in &finding.code_locations {
         let (Some(before), Some(after)) = (
@@ -502,7 +562,7 @@ fn build_fixes(finding: &Finding) -> Option<Vec<Value>> {
             "artifactLocation": { "uri": uri },
             "replacements": [{
                 "deletedRegion": Value::Object(deleted_region),
-                "insertedContent": { "text": after },
+                "insertedContent": { "text": scrub.text(after) },
             }],
         }));
     }
@@ -512,7 +572,8 @@ fn build_fixes(finding: &Finding) -> Option<Vec<Value>> {
     let mut fix = Map::new();
     fix.insert("artifactChanges".into(), Value::Array(artifact_changes));
     if let Some(rem) = finding.remediation_steps.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        fix.insert("description".into(), json!({ "text": rem, "markdown": rem }));
+        let clean = scrub.text(rem);
+        fix.insert("description".into(), json!({ "text": clean, "markdown": clean }));
     }
     Some(vec![Value::Object(fix)])
 }
@@ -524,11 +585,14 @@ fn build_finding_result(
     locations: Vec<Value>,
     is_synthetic: bool,
     ev_by_id: &HashMap<&str, &Evidence>,
+    scrub: &Scrubber<'_>,
 ) -> Value {
-    let message_text = if finding.description.trim().is_empty() {
-        finding.title.clone()
+    let title = scrub.text(&finding.title);
+    let description = scrub.text(&finding.description);
+    let message_text = if description.trim().is_empty() {
+        title.into_owned()
     } else {
-        format!("{}\n\n{}", finding.title, finding.description)
+        format!("{title}\n\n{description}")
     };
 
     let mut result = Map::new();
@@ -540,7 +604,7 @@ fn build_finding_result(
     if !locations.is_empty() {
         result.insert("locations".into(), Value::Array(locations.clone()));
     }
-    if let Some(fixes) = build_fixes(finding) {
+    if let Some(fixes) = build_fixes(finding, scrub) {
         result.insert("fixes".into(), Value::Array(fixes));
     }
     if let Some(fp) = primary_fingerprint(rule_id, finding, &locations, is_synthetic) {
@@ -569,9 +633,9 @@ fn build_finding_result(
     if let Some(bd) = &finding.cvss_breakdown {
         ferret.insert("cvss_breakdown".into(), json!(bd));
     }
-    ferret.insert("target".into(), json!(finding.target));
+    ferret.insert("target".into(), json!(scrub.url(&finding.target)));
     if let Some(ep) = &finding.endpoint {
-        ferret.insert("endpoint".into(), json!(ep));
+        ferret.insert("endpoint".into(), json!(scrub.url(ep)));
     }
     if let Some(m) = &finding.method {
         ferret.insert("method".into(), json!(m));
@@ -582,32 +646,32 @@ fn build_finding_result(
     if let Some(cwe) = &finding.cwe {
         ferret.insert("cwe".into(), json!(cwe));
     }
-    ferret.insert("impact".into(), json!(finding.impact));
+    ferret.insert("impact".into(), json!(scrub.text(&finding.impact)));
     if let Some(v) = &finding.technical_analysis {
-        ferret.insert("technical_analysis".into(), json!(v));
+        ferret.insert("technical_analysis".into(), json!(scrub.text(v)));
     }
     if let Some(v) = &finding.remediation_steps {
-        ferret.insert("remediation_steps".into(), json!(v));
+        ferret.insert("remediation_steps".into(), json!(scrub.text(v)));
     }
     if let Some(v) = &finding.assumptions {
-        ferret.insert("assumptions".into(), json!(v));
+        ferret.insert("assumptions".into(), json!(scrub.text(v)));
     }
-    ferret.insert("counterevidence".into(), json!(finding.counterevidence));
+    ferret.insert("counterevidence".into(), json!(scrub.text(&finding.counterevidence)));
     ferret.insert("confidence".into(), json!(finding.confidence.as_str()));
     if let Some(v) = &finding.confidence_rationale {
-        ferret.insert("confidence_rationale".into(), json!(v));
+        ferret.insert("confidence_rationale".into(), json!(scrub.text(v)));
     }
-    ferret.insert("severity_change_conditions".into(), json!(finding.severity_change_conditions));
+    ferret.insert("severity_change_conditions".into(), json!(scrub.text(&finding.severity_change_conditions)));
     if let Some(v) = finding.fix_effort {
         ferret.insert("fix_effort".into(), json!(v.as_str()));
     }
     if let Some(v) = &finding.fix_verification {
-        ferret.insert("fix_verification".into(), json!(v));
+        ferret.insert("fix_verification".into(), json!(scrub.text(v)));
     }
     if finding.poc_description.is_some() || finding.poc_handle.is_some() {
         let mut poc = Map::new();
         if let Some(desc) = &finding.poc_description {
-            poc.insert("description".into(), json!(desc));
+            poc.insert("description".into(), json!(scrub.text(desc)));
         }
         if finding.poc_handle.is_some() {
             // Never embed raw exploit script bodies in SARIF intended for external upload.
@@ -668,34 +732,40 @@ fn build_coverage_result(
     kind: &str,
     entry: &SurfaceCoverage,
     ev_by_id: &HashMap<&str, &Evidence>,
+    scrub: &Scrubber<'_>,
 ) -> Value {
+    let surface = scrub.text(&entry.surface);
+    let control = entry.control.as_deref().map(|c| scrub.text(c));
+    let location = entry.location.as_deref().map(|l| scrub.text(l));
+    let reason = entry.reason.as_deref().map(|r| scrub.text(r));
+
     let mut detail_parts = Vec::new();
-    if let (Some(ctrl), Some(loc)) = (&entry.control, &entry.location) {
+    if let (Some(ctrl), Some(loc)) = (control.as_deref(), location.as_deref()) {
         detail_parts.push(format!("Control: {ctrl} at {loc}"));
-    } else if let Some(ctrl) = &entry.control {
+    } else if let Some(ctrl) = control.as_deref() {
         detail_parts.push(format!("Control: {ctrl}"));
     }
-    if let Some(reason) = &entry.reason {
-        detail_parts.push(reason.clone());
+    if let Some(r) = reason.as_deref() {
+        detail_parts.push(r.to_string());
     }
-    let head = format!("{} — {}: {}", entry.risk_area, entry.outcome.label(), entry.surface);
+    let head = format!("{} — {}: {}", entry.risk_area, entry.outcome.label(), surface);
     let message = if detail_parts.is_empty() { head } else { format!("{head}\n\n{}", detail_parts.join("\n")) };
 
     let mut ferret = Map::new();
     ferret.insert("id".into(), json!(entry.id));
     ferret.insert("coverage_outcome".into(), json!(entry.outcome.as_str()));
     ferret.insert("risk_area".into(), json!(entry.risk_area));
-    ferret.insert("surface".into(), json!(entry.surface));
+    ferret.insert("surface".into(), json!(surface));
     if let Some(a) = &entry.asset {
         ferret.insert("asset".into(), json!(a));
     }
-    if let Some(c) = &entry.control {
+    if let Some(c) = control.as_deref() {
         ferret.insert("control".into(), json!(c));
     }
-    if let Some(l) = &entry.location {
+    if let Some(l) = location.as_deref() {
         ferret.insert("location".into(), json!(l));
     }
-    if let Some(r) = &entry.reason {
+    if let Some(r) = reason.as_deref() {
         ferret.insert("reason".into(), json!(r));
     }
     ferret.insert("recorded_by".into(), json!(entry.recorded_by));
@@ -710,17 +780,22 @@ fn build_coverage_result(
         "kind": kind,
         "level": "none",
         "message": { "text": message },
-        "locations": [{ "logicalLocations": [{ "fullyQualifiedName": entry.surface, "kind": "surface" }] }],
+        "locations": [{ "logicalLocations": [{ "fullyQualifiedName": surface, "kind": "surface" }] }],
         "properties": { "ferret": Value::Object(ferret) },
     })
 }
 
-fn build_invocation(ledger: &LedgerState, opts: &SarifOptions, ev_by_id: &HashMap<&str, &Evidence>) -> Value {
+fn build_invocation(ledger: &LedgerState, opts: &SarifOptions, scrub: &Scrubber<'_>) -> Value {
     let mut caveats: Vec<String> = Vec::new();
     let follow_ups = ledger.security.surface_coverage_follow_ups();
     for fu in &follow_ups {
         let gap = fu.reason.as_deref().unwrap_or("unspecified proof gap");
-        caveats.push(format!("Open coverage follow-up on `{}` ({}): {gap}", fu.surface, fu.risk_area));
+        caveats.push(format!(
+            "Open coverage follow-up on `{}` ({}): {}",
+            scrub.text(&fu.surface),
+            fu.risk_area,
+            scrub.text(gap)
+        ));
     }
     let mandatory_open = ledger.security.mandatory_open();
     if !mandatory_open.is_empty() {
@@ -737,31 +812,22 @@ fn build_invocation(ledger: &LedgerState, opts: &SarifOptions, ev_by_id: &HashMa
         ));
     }
     if let Some(rel) = &ledger.release {
-        caveats.push(format!("Mission was released by the operator short of the goal: {}", rel.reason));
+        caveats.push(format!("Mission was released by the operator short of the goal: {}", scrub.text(&rel.reason)));
     }
 
-    // Also warn (without failing executionSuccessful on its own? Wait: an unbacked clear is a provenance caveat!)
-    let mut unbacked_clears = 0usize;
-    for entry in ledger.security.surface_coverage.values() {
-        if matches!(entry.outcome, SurfaceOutcome::NoIssueFound | SurfaceOutcome::RuledOut) {
-            let has_run = entry.evidence.iter().any(|id| {
-                ev_by_id.get(id.as_str()).is_some_and(|e| e.input.attested && e.input.grade_or_kind() == EvidenceGrade::Run)
-            });
-            if !has_run {
-                unbacked_clears += 1;
-            }
-        }
-    }
-    if unbacked_clears > 0 {
+    let unbacked_clears = ledger.security.unbacked_clears(&ledger.evidence);
+    if !unbacked_clears.is_empty() {
         caveats.push(format!(
-            "{unbacked_clears} cleared surface coverage entry/entries (no_issue_found or ruled_out) carry no attested `run` execution evidence (agent-reported or static-only)."
+            "{} cleared surface coverage entry/entries (no_issue_found or ruled_out) carry no attested `run` execution evidence (agent-reported or static-only).",
+            unbacked_clears.len()
         ));
     }
 
     let complete = follow_ups.is_empty()
         && mandatory_open.is_empty()
         && opts.silent_children.is_empty()
-        && ledger.release.is_none();
+        && ledger.release.is_none()
+        && unbacked_clears.is_empty();
 
     let mut inv = Map::new();
     inv.insert("executionSuccessful".into(), json!(complete));
@@ -1113,6 +1179,7 @@ mod tests {
                 git_ref: Some("refs/heads/main".into()),
             }),
             silent_children: vec![SilentChild { session: "s-child-1".into(), role: "scanner".into() }],
+            ..Default::default()
         };
         let doc = build_sarif_report(&l, &opts);
         assert_eq!(doc["version"], SARIF_VERSION);
@@ -1289,5 +1356,114 @@ mod tests {
         write_sarif_report(&out, &l, &SarifOptions::default()).unwrap();
         let parsed: Value = serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
         assert_eq!(parsed, doc);
+    }
+
+    #[test]
+    fn sarif_scrubs_secrets_by_default_and_fails_execution_successful_on_unbacked_clears() {
+        let mut l = seeded_ledger();
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhZG1pbiJ9.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+        let ghp = "ghp_1234567890abcdefghij1234567890abcd";
+        let extra = "mission-specific-secret-999";
+
+        let finding = FindingInput {
+            title: "Token leak in API response".into(),
+            description: format!("Endpoint returned Authorization: Bearer {jwt} and {extra}."),
+            impact: format!("Attacker reuses {ghp} to access admin APIs."),
+            target: "https://admin:topsecret@api.example.test".into(),
+            evidence: vec!["e1".into()],
+            counterevidence: "Reproduced with non-admin token.".into(),
+            confidence: FindingConfidence::High,
+            confidence_rationale: None,
+            severity_change_conditions: "Token rotation limits window.".into(),
+            cvss_breakdown: None,
+            severity: Some(FindingSeverity::High),
+            technical_analysis: Some("Cookie: sid=live-session-abc leaked in logs.".into()),
+            remediation_steps: Some("Strip Authorization headers before logging.".into()),
+            assumptions: None,
+            poc_description: Some(format!("curl -H 'X-Api-Key: secret-api-key-1' -H 'Authorization: Bearer {jwt}' https://api.example.test/me")),
+            poc_handle: None,
+            fix_effort: Some(FixEffort::Low),
+            endpoint: Some("/api/me?access_token=qs-secret-token".into()),
+            method: Some("GET".into()),
+            cve: None,
+            cwe: Some("CWE-200".into()),
+            code_locations: vec![CodeLocation {
+                file: "src/api/me.py".into(),
+                start_line: 10,
+                end_line: 11,
+                snippet: Some("API_KEY = \"sk-proj-abc123def456ghi789jkl012\"".into()),
+                label: Some("Hardcoded key".into()),
+                fix_before: None,
+                fix_after: None,
+            }],
+            fix_verification: None,
+            http_exchanges: vec![],
+            asset: None,
+            claim: None,
+        };
+        apply_sec(&mut l, "s-lead", SecurityOp::FindingRecord { finding: Box::new(finding) });
+
+        // Add ONLY a static-backed clear (no follow-ups, no silent children, no mandatory open assets).
+        apply_sec(
+            &mut l,
+            "s-lead",
+            SecurityOp::CoverageRecord {
+                surface: "POST /api/login".into(),
+                risk_area: "SQL injection".into(),
+                outcome: SurfaceOutcome::RuledOut,
+                control: Some("Parameterized query".into()),
+                location: Some("src/login.py:20".into()),
+                reason: Some("Inspected code only.".into()),
+                evidence: vec!["e2".into()],
+                asset: None,
+            },
+        );
+
+        let mut opts = SarifOptions::default();
+        assert!(opts.sanitize);
+        opts.extra_secrets.push(extra.to_string());
+        let doc = build_sarif_report(&l, &opts);
+        let serialized = serde_json::to_string(&doc).unwrap();
+        for secret in [
+            jwt,
+            ghp,
+            extra,
+            "topsecret",
+            "live-session-abc",
+            "secret-api-key-1",
+            "qs-secret-token",
+            "sk-proj-abc123def456ghi789jkl012",
+        ] {
+            assert!(!serialized.contains(secret), "secret `{secret}` leaked into sanitized SARIF: {serialized}");
+        }
+
+        // Unbacked clear ALONE must set executionSuccessful = false with an explicit notification.
+        let inv = &doc["runs"][0]["invocations"][0];
+        assert_eq!(inv["executionSuccessful"], false);
+        let notes = inv["toolExecutionNotifications"].as_array().unwrap();
+        assert!(notes.iter().any(|n| n["message"]["text"].as_str().unwrap().contains("no attested `run`")));
+
+        // Updating the cleared surface with attested Run evidence (`e1`) makes executionSuccessful = true.
+        let cv_id = crate::security_state::surface_coverage_id("POST /api/login", "SQL injection");
+        apply_sec(
+            &mut l,
+            "s-lead",
+            SecurityOp::CoverageUpdate {
+                id: cv_id,
+                outcome: SurfaceOutcome::RuledOut,
+                control: Some("Parameterized query".into()),
+                location: Some("src/login.py:20".into()),
+                reason: Some("Verified with live probe.".into()),
+                evidence: vec!["e1".into()],
+            },
+        );
+        let doc_backed = build_sarif_report(&l, &opts);
+        assert_eq!(doc_backed["runs"][0]["invocations"][0]["executionSuccessful"], true);
+
+        // Opt-out (`sanitize: false`) leaves original prose untouched.
+        let raw_opts = SarifOptions { sanitize: false, ..Default::default() };
+        let raw_doc = build_sarif_report(&l, &raw_opts);
+        let raw_serialized = serde_json::to_string(&raw_doc).unwrap();
+        assert!(raw_serialized.contains(jwt) && raw_serialized.contains(extra));
     }
 }

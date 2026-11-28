@@ -185,6 +185,20 @@ impl Tool for HttpRepeat {
     }
 }
 
+/// Headers stripped when replaying proxy-captured exchanges (which may carry injected or rewritten
+/// credentials that the model must not replay to arbitrary paths).
+fn is_sensitive_auth_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "authorization" | "proxy-authorization" | "cookie" | "x-api-key" | "x-auth-token"
+    )
+}
+
+/// True when a stored header value contains a redaction placeholder produced by secret/credential scrubbing.
+fn is_redacted_header_value(value: &str) -> bool {
+    value.to_ascii_lowercase().contains("[redacted]")
+}
+
 /// The request of a recorded exchange (`ex-` id), read from the session log and the blob store, so it works
 /// after a restart.
 fn stored_request(ctx: &ToolCtx, id: &str) -> Result<Request, String> {
@@ -196,6 +210,9 @@ fn stored_request(ctx: &ToolCtx, id: &str) -> Result<Request, String> {
     if x.source == "proxy" && x.tls == "intercepted" || x.method == "TLS" {
         return Err(format!("{id} is not a replayable HTTP request."));
     }
+    if x.tool.as_deref().is_some_and(|t| t.starts_with("mcp__")) {
+        return Err(format!("{id} is an MCP transport exchange and cannot be replayed with http_repeat."));
+    }
     if x.truncated && x.request_bytes > crate::traffic::CAPTURE_MAX_BYTES as u64 {
         return Err(format!(
             "The request of {id} was stored cut at {} bytes; replaying it would send a different body.",
@@ -206,12 +223,25 @@ fn stored_request(ctx: &ToolCtx, id: &str) -> Result<Request, String> {
         ctx.blobs.read_all(&x.request.id).map_err(|e| format!("The stored request of {id} could not be read: {e}."))?;
     let (method, headers, body) =
         crate::traffic::parse_request(&bytes).ok_or("The stored request is not a readable HTTP message.")?;
+    let from_proxy = x.source == "proxy";
+    let filtered_headers: BTreeMap<String, String> = headers
+        .into_iter()
+        .filter(|(k, v)| {
+            if from_proxy && (is_sensitive_auth_header(k) || is_redacted_header_value(v)) {
+                return false;
+            }
+            if is_sensitive_auth_header(k) && is_redacted_header_value(v) {
+                return false;
+            }
+            true
+        })
+        .collect();
     let default_port = if x.scheme == "https" { 443 } else { 80 };
     let host = if x.port == default_port { x.host.clone() } else { format!("{}:{}", x.host, x.port) };
     let mut r = Request {
         url: format!("{}://{host}{}", x.scheme, x.target),
         method,
-        headers: headers.into_iter().collect(),
+        headers: filtered_headers,
         body: String::new(),
         body_base64: None,
         json: None,
@@ -1120,5 +1150,68 @@ mod tests {
         assert_eq!(parsed[0]["exchange"]["body_text"], "prefixed");
 
         server.abort();
+    }
+
+    #[test]
+    fn stored_request_blocks_mcp_exchanges_and_strips_sensitive_proxy_headers() {
+        let env = crate::testutil::env();
+        let ctx = env.ctx;
+        let mcp_req = b"POST /mcp HTTP/1.1\r\nHost: mcp.example\r\nAuthorization: Bearer topsecret\r\nContent-Type: application/json\r\n\r\n{}";
+        let mcp_blob = ctx.blobs.put_bytes(mcp_req).unwrap();
+        let proxy_req = b"GET /api/data HTTP/1.1\r\nHost: target.example\r\nAuthorization: Bearer injected\r\nProxy-Authorization: Basic abc\r\nCookie: sid=secret\r\nX-Api-Key: k123\r\nX-Auth-Token: t456\r\nX-Custom: keepme\r\nX-Redacted: [redacted]\r\n\r\n";
+        let proxy_blob = ctx.blobs.put_bytes(proxy_req).unwrap();
+        let tool_req = b"GET /api/data HTTP/1.1\r\nHost: target.example\r\nAuthorization: [redacted]\r\nCookie: sid=ok\r\nX-Custom: keep\r\n\r\n";
+        let tool_blob = ctx.blobs.put_bytes(tool_req).unwrap();
+
+        let make_ex = |id: &str, source: &str, tool: Option<&str>, blob: ferret_core::blob::BlobRef| {
+            ferret_core::event::Exchange {
+                id: id.into(),
+                call_id: None,
+                source: source.into(),
+                tool: tool.map(str::to_string),
+                scheme: "http".into(),
+                tls: if source == "proxy" { "plain".into() } else { "tool".into() },
+                method: "GET".into(),
+                host: "target.example".into(),
+                port: 80,
+                target: "/api/data".into(),
+                status: Some(200),
+                error: None,
+                request_bytes: 100,
+                response_bytes: 0,
+                request: blob,
+                response: None,
+                truncated: false,
+                upstream_unverified: false,
+                duration_ms: 1,
+            }
+        };
+        let map = std::collections::HashMap::from([
+            ("ex-mcp".to_string(), make_ex("ex-mcp", "tool", Some("mcp__gh__issues"), mcp_blob)),
+            ("ex-proxy".to_string(), make_ex("ex-proxy", "proxy", None, proxy_blob)),
+            ("ex-tool".to_string(), make_ex("ex-tool", "tool", Some("http_send"), tool_blob)),
+        ]);
+        let _ = ctx.capabilities.exchange_lookup.set(Arc::new(move |id| map.get(id).cloned()));
+
+        // MCP HTTP exchanges are unconditionally refused.
+        let err = stored_request(&ctx, "ex-mcp").unwrap_err();
+        assert!(err.contains("MCP"), "{err}");
+
+        // Proxy-captured exchanges strip all sensitive auth headers and redacted placeholders.
+        let proxy_replayed = stored_request(&ctx, "ex-proxy").unwrap();
+        for forbidden in ["Authorization", "Proxy-Authorization", "Cookie", "X-Api-Key", "X-Auth-Token", "X-Redacted"] {
+            assert!(
+                !proxy_replayed.headers.keys().any(|k| k.eq_ignore_ascii_case(forbidden)),
+                "{forbidden} must be stripped from proxy replay: {:?}",
+                proxy_replayed.headers
+            );
+        }
+        assert_eq!(proxy_replayed.headers.get("X-Custom").map(String::as_str), Some("keepme"));
+
+        // Tool exchanges strip redacted auth placeholders while preserving ordinary headers.
+        let tool_replayed = stored_request(&ctx, "ex-tool").unwrap();
+        assert!(!tool_replayed.headers.keys().any(|k| k.eq_ignore_ascii_case("Authorization")));
+        assert_eq!(tool_replayed.headers.get("Cookie").map(String::as_str), Some("sid=ok"));
+        assert_eq!(tool_replayed.headers.get("X-Custom").map(String::as_str), Some("keep"));
     }
 }

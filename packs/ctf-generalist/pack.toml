@@ -41,7 +41,7 @@ max_steps = 8
 [roles.flag_judge]
 prompt = "roles/flag_judge.md"
 termination = "explicit"
-tools = ["read", "out_read", "oracle_check", "security_query", "security_record", "evidence", "verdict"]
+tools = ["read", "out_read", "oracle_check", "security_query", "evidence", "verdict"]
 hidden_tools = ["out_read"]
 read_only = true
 max_steps = 12

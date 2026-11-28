@@ -49,7 +49,11 @@
 //! host reservation nor GET-only access prevents exfiltration in URL paths/queries.
 //! `session_port(session) -> Option<u16>`: the port of the session's own listener while it holds a
 //! command grant.
-//! `revoke(session)` drops both command and reference grants; connections already open are left to finish.
+//! `revoke(session)` drops both command and reference grants, closes the session's listener, retires its
+//! port, and **immediately cancels and drops all active sockets/tunnels** for that session.
+//! `revoke_hosts(session, hosts)` removes those host grants from the session's policy (adding matching
+//! deny rules) and immediately cancels active tunnels to those hosts.
+//! `revoke_all()` revokes every session and immediately severs all active proxy tunnels across the proxy.
 //! The session's listener is closed, and `session_port` gives `None`; its port is **retired**: kept, as a
 //! number only, among the proxy's own ports for the proxy's life. A listener for a session is opened with
 //! `tokio::net::TcpSocket`: bind `127.0.0.1:0`, read the port, and if it is retired (or otherwise one of
@@ -339,6 +343,104 @@ impl ReferenceGrant {
     }
 }
 
+struct ActiveConn {
+    reference: bool,
+    host: String,
+    port: u16,
+    resolved: Option<IpAddr>,
+    cancel: CancellationToken,
+}
+
+/// Per-session live connection registry and cancellation root (child of the proxy's `cancel`).
+struct SessionControl {
+    cancel: CancellationToken,
+    next_conn: AtomicU64,
+    active: Mutex<HashMap<u64, ActiveConn>>,
+}
+
+impl SessionControl {
+    fn new(parent: &CancellationToken) -> Self {
+        Self { cancel: parent.child_token(), next_conn: AtomicU64::new(1), active: Mutex::new(HashMap::new()) }
+    }
+
+    fn register(self: &Arc<Self>, reference: bool, host: &str, port: u16) -> ConnGuard {
+        let id = self.next_conn.fetch_add(1, Ordering::Relaxed);
+        let cancel = self.cancel.child_token();
+        let entry = ActiveConn {
+            reference,
+            host: normalize_host(host),
+            port,
+            resolved: None,
+            cancel: cancel.clone(),
+        };
+        lock(&self.active).insert(id, entry);
+        ConnGuard { ctrl: self.clone(), id, cancel }
+    }
+
+    fn cancel_matching(&self, matcher: &crate::policy::RevokeMatcher) -> usize {
+        let tokens: Vec<CancellationToken> = {
+            let active = lock(&self.active);
+            active
+                .values()
+                .filter(|c| !c.cancel.is_cancelled() && matcher.matches(&c.host, c.port, c.resolved))
+                .map(|c| c.cancel.clone())
+                .collect()
+        };
+        let n = tokens.len();
+        for t in tokens {
+            t.cancel();
+        }
+        n
+    }
+
+    fn cancel_disallowed(&self, shared: &Shared, policy: &Policy) -> usize {
+        let tokens: Vec<CancellationToken> = {
+            let active = lock(&self.active);
+            active
+                .values()
+                .filter(|c| !c.reference && !c.cancel.is_cancelled())
+                .filter(|c| {
+                    let nv = policy.check_name(&c.host, c.port);
+                    if !nv.allowed {
+                        return true;
+                    }
+                    c.resolved.is_some_and(|ip| !shared.check_addr(policy, &c.host, c.port, ip, &nv.rule).allowed)
+                })
+                .map(|c| c.cancel.clone())
+                .collect()
+        };
+        let n = tokens.len();
+        for t in tokens {
+            t.cancel();
+        }
+        n
+    }
+
+    fn active_count(&self) -> usize {
+        lock(&self.active).values().filter(|c| !c.cancel.is_cancelled()).count()
+    }
+}
+
+struct ConnGuard {
+    ctrl: Arc<SessionControl>,
+    id: u64,
+    cancel: CancellationToken,
+}
+
+impl ConnGuard {
+    fn set_resolved(&self, ip: IpAddr) {
+        if let Some(c) = lock(&self.ctrl.active).get_mut(&self.id) {
+            c.resolved = Some(ip);
+        }
+    }
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        lock(&self.ctrl.active).remove(&self.id);
+    }
+}
+
 struct Entry {
     reference: bool,
     session: SessionId,
@@ -355,6 +457,8 @@ struct Entry {
     inject: Option<Arc<crate::inject::Inject>>,
     /// The in-process tools' credential (S9): never intercepted, captured or injected.
     tool: bool,
+    /// Live cancellation controller shared across all credentials of `session`.
+    control: Arc<SessionControl>,
 }
 
 /// A pending connection: its id, the token that closes it and its connection permit.
@@ -382,6 +486,8 @@ struct Budget {
 /// handle stops the server).
 struct Shared {
     sessions: Mutex<HashMap<String, Entry>>,
+    /// Live per-session cancellation controllers keyed by session id.
+    session_controls: Mutex<HashMap<String, Arc<SessionControl>>>,
     sink: UnboundedSender<(SessionId, NetDecision)>,
     audit: Option<AuditFn>,
     limits: Limits,
@@ -534,6 +640,12 @@ impl Drop for PendingGuard<'_> {
 
 /// Why a connection on record as allowed ended when the proxy was cancelled.
 const SHUTDOWN: &str = "the egress proxy shut down";
+/// Why a connection on record as allowed ended when its session or host scope was revoked.
+const REVOKED: &str = "the session scope was revoked";
+
+pub(super) fn cancel_reason(proxy_cancel: &CancellationToken) -> &'static str {
+    if proxy_cancel.is_cancelled() { SHUTDOWN } else { REVOKED }
+}
 
 /// The listener a connection was accepted on.
 #[derive(Clone)]
@@ -594,6 +706,7 @@ impl Proxy {
         let bound = listener.local_addr().map_err(|source| ProxyError::Bind { port, source })?.port();
         let shared = Arc::new(Shared {
             sessions: Mutex::new(HashMap::new()),
+            session_controls: Mutex::new(HashMap::new()),
             sink,
             audit,
             connections: semaphore(limits.max_connections),
@@ -705,6 +818,18 @@ impl Proxy {
         self.grant_inner(session, policy, None)
     }
 
+    fn session_control(&self, session: &SessionId) -> Arc<SessionControl> {
+        let mut ctrls = lock(&self.inner.shared.session_controls);
+        if let Some(existing) = ctrls.get(session.as_str()) {
+            if !existing.cancel.is_cancelled() {
+                return existing.clone();
+            }
+        }
+        let ctrl = Arc::new(SessionControl::new(&self.inner.cancel));
+        ctrls.insert(session.as_str().to_string(), ctrl.clone());
+        ctrl
+    }
+
     fn grant_inner(
         &self,
         session: &SessionId,
@@ -712,6 +837,7 @@ impl Proxy {
         capture: Option<Arc<CaptureCfg>>,
     ) -> Result<SessionGrant, ProxyError> {
         let port = self.session_listener(session)?;
+        let control = self.session_control(session);
         let password = format!("{:032x}", rand::rng().random::<u128>());
         let limits = &self.inner.shared.limits;
         let entry = Entry {
@@ -724,6 +850,7 @@ impl Proxy {
             capture,
             inject: None,
             tool: false,
+            control: control.clone(),
         };
         // S9: the tool credential is an entry of its own sharing the session's policy, permits and lookups,
         // with no capture and no injection.
@@ -739,6 +866,7 @@ impl Proxy {
             capture: None,
             inject: None,
             tool: true,
+            control,
         };
         {
             let mut sessions = lock(&self.inner.shared.sessions);
@@ -757,6 +885,7 @@ impl Proxy {
     ) -> Result<ReferenceGrant, String> {
         let raw_policy = Policy::new(cfg)?;
         let policy = Policy::reference(cfg)?;
+        let control = self.session_control(session);
         let user = format!("reference-{:032x}", rand::rng().random::<u128>());
         let password = format!("{:032x}", rand::rng().random::<u128>());
         let limits = &self.inner.shared.limits;
@@ -770,6 +899,7 @@ impl Proxy {
             capture: None,
             inject: None,
             tool: false,
+            control,
         };
         let mut sessions = lock(&self.inner.shared.sessions);
         sessions.retain(|_, entry| !(entry.reference && &entry.session == session));
@@ -803,22 +933,32 @@ impl Proxy {
         }
     }
 
-    /// Replace the policy of a session that holds a grant. Its credentials stay as they are. False
-    /// when the session holds no grant.
+    /// Replace the policy of a session that holds a grant. Its credentials stay as they are, and any
+    /// active command/tool tunnels no longer allowed by `policy` are immediately severed. False when
+    /// the session holds no grant.
     pub fn set_policy(&self, session: &SessionId, policy: Policy) -> bool {
-        let mut sessions = lock(&self.inner.shared.sessions);
         let policy = Arc::new(policy);
-        // The tool credential follows the command credential (S9); the reference one has its own policy.
-        for entry in sessions.values_mut().filter(|e| e.tool && &e.session == session) {
-            entry.policy = policy.clone();
-        }
-        match sessions.get_mut(session.as_str()) {
-            Some(entry) => {
-                entry.policy = policy;
-                true
+        let updated = {
+            let mut sessions = lock(&self.inner.shared.sessions);
+            // The tool credential follows the command credential (S9); the reference one has its own policy.
+            for entry in sessions.values_mut().filter(|e| e.tool && &e.session == session) {
+                entry.policy = policy.clone();
             }
-            None => false,
+            match sessions.get_mut(session.as_str()) {
+                Some(entry) => {
+                    entry.policy = policy.clone();
+                    true
+                }
+                None => false,
+            }
+        };
+        if updated {
+            let ctrl = lock(&self.inner.shared.session_controls).get(session.as_str()).cloned();
+            if let Some(ctrl) = ctrl {
+                ctrl.cancel_disallowed(&self.inner.shared, &policy);
+            }
         }
+        updated
     }
 
     /// What the name check of the session's current policy says about `host:port`; `None` when the
@@ -827,14 +967,65 @@ impl Proxy {
         lock(&self.inner.shared.sessions).get(session.as_str()).map(|e| e.policy.check_name(host, port))
     }
 
-    /// Drops the session's credentials and closes its listener; its port is retired (see the module
-    /// contract).
+    /// Drops the session's credentials, closes its listener, retires its port, and immediately
+    /// cancels and drops all active sockets/tunnels for that session (see the module contract).
     pub fn revoke(&self, session: &SessionId) {
         lock(&self.inner.shared.sessions).retain(|_, entry| &entry.session != session);
-        if let Some((port, token)) = lock(&self.inner.listeners).remove(session.as_str()) {
+        let listener = lock(&self.inner.listeners).remove(session.as_str());
+        if let Some((port, token)) = listener {
             lock(&self.inner.shared.retired).insert(port);
             token.cancel();
         }
+        if let Some(ctrl) = lock(&self.inner.shared.session_controls).remove(session.as_str()) {
+            ctrl.cancel.cancel();
+        }
+    }
+
+    /// Removes `hosts` (names, `*.suffix`, optional `:port`, IP literals, or CIDRs) from `session`'s
+    /// policy (adding matching deny rules) and immediately cancels all active tunnels/requests for
+    /// `session` connected to those hosts. Returns the number of active connections cancelled.
+    pub fn revoke_hosts(&self, session: &SessionId, hosts: &[String]) -> Result<usize, String> {
+        let matcher = crate::policy::RevokeMatcher::parse(hosts)?;
+        if matcher.is_empty() {
+            return Ok(0);
+        }
+        {
+            let mut sessions = lock(&self.inner.shared.sessions);
+            for entry in sessions.values_mut().filter(|e| &e.session == session && !e.reference) {
+                let mut narrowed = (*entry.policy).clone();
+                narrowed.apply_revoke(&matcher);
+                entry.policy = Arc::new(narrowed);
+            }
+        }
+        let ctrl = lock(&self.inner.shared.session_controls).get(session.as_str()).cloned();
+        Ok(ctrl.map_or(0, |c| c.cancel_matching(&matcher)))
+    }
+
+    /// Emergency kill-switch (`ferret panic`): immediately revokes ALL sessions (command, tool, and
+    /// reference grants), closes and retires all session listeners, and severs ALL active proxy
+    /// tunnels while keeping the shared proxy server alive. Returns the number of active connections
+    /// cancelled.
+    pub fn revoke_all(&self) -> usize {
+        lock(&self.inner.shared.sessions).clear();
+        let listeners: Vec<(u16, CancellationToken)> =
+            lock(&self.inner.listeners).drain().map(|(_, v)| v).collect();
+        if !listeners.is_empty() {
+            let mut retired = lock(&self.inner.shared.retired);
+            for (port, _) in &listeners {
+                retired.insert(*port);
+            }
+        }
+        for (_, token) in listeners {
+            token.cancel();
+        }
+        let controls: Vec<Arc<SessionControl>> =
+            lock(&self.inner.shared.session_controls).drain().map(|(_, v)| v).collect();
+        let mut cancelled = 0usize;
+        for ctrl in controls {
+            cancelled = cancelled.saturating_add(ctrl.active_count());
+            ctrl.cancel.cancel();
+        }
+        cancelled
     }
 
     /// Stop accepting connections. Open tunnels are closed.
@@ -894,8 +1085,8 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Accepts on one listener until `stop`; connections are served until `cancel` (the proxy's own token),
-/// so closing a session's listener leaves its open connections to finish.
+/// Accepts on one listener until `stop`; pre-head sockets on a session listener also end on `stop`,
+/// and authenticated connections end immediately on proxy shutdown or session/host revocation.
 async fn accept_loop(
     listener: TcpListener,
     shared: Arc<Shared>,
@@ -914,7 +1105,15 @@ async fn accept_loop(
                     match slot {
                         Some(permit) => {
                             let (id, evicted) = shared.add_pending(permit);
-                            shared.tasks.spawn(handle(stream, shared.clone(), cancel.clone(), id, evicted, origin.clone()));
+                            shared.tasks.spawn(handle(
+                                stream,
+                                shared.clone(),
+                                cancel.clone(),
+                                stop.clone(),
+                                id,
+                                evicted,
+                                origin.clone(),
+                            ));
                         }
                         None => refuse(stream, &shared),
                     }
@@ -1201,12 +1400,14 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 struct Authed {
     reference: bool,
     session: SessionId,
+    cred_user: String,
     policy: Arc<Policy>,
     permits: Arc<Semaphore>,
     lookups: Arc<Semaphore>,
     capture: Option<Arc<CaptureCfg>>,
     inject: Option<Arc<crate::inject::Inject>>,
     tool: bool,
+    control: Arc<SessionControl>,
 }
 
 /// The session whose Basic credentials the request carries, or why there is none.
@@ -1232,12 +1433,14 @@ fn authenticate(shared: &Shared, head: &Head) -> Result<Authed, String> {
         Ok(Authed {
             reference: e.reference,
             session,
+            cred_user: user.to_string(),
             policy,
             permits: e.permits.clone(),
             lookups: e.lookups.clone(),
             capture: e.capture.clone(),
             inject: e.inject.clone(),
             tool: e.tool,
+            control: e.control.clone(),
         })
     } else {
         Err(format!("wrong password for session {}", e.session.as_str()))
@@ -1375,16 +1578,24 @@ impl Ctx<'_> {
 
 /// Name to addresses, on a task of its own: the test hook, or a system lookup. A lookup holds a turn
 /// of its session and one of the proxy until it ends, even when the caller has given up waiting.
-async fn resolve(cx: &Ctx<'_>) -> Result<Vec<IpAddr>, String> {
+async fn resolve(cx: &Ctx<'_>, cancel: &CancellationToken) -> Result<Vec<IpAddr>, String> {
     let turn = |s: &Arc<Semaphore>| tokio::time::timeout(RESOLVE_TIMEOUT, s.clone().acquire_owned());
-    let Ok(Ok(mine)) = turn(cx.lookups).await else {
-        return Err(format!(
-            "this session already has {} name lookups in progress",
-            cx.shared.limits.max_lookups_per_session
-        ));
+    let mine = tokio::select! {
+        r = turn(cx.lookups) => match r {
+            Ok(Ok(p)) => p,
+            _ => return Err(format!(
+                "this session already has {} name lookups in progress",
+                cx.shared.limits.max_lookups_per_session
+            )),
+        },
+        _ = cancel.cancelled() => return Err("the session scope was revoked".to_string()),
     };
-    let Ok(Ok(all)) = turn(&cx.shared.lookups).await else {
-        return Err("too many name lookups are in progress".to_string());
+    let all = tokio::select! {
+        r = turn(&cx.shared.lookups) => match r {
+            Ok(Ok(p)) => p,
+            _ => return Err("too many name lookups are in progress".to_string()),
+        },
+        _ = cancel.cancelled() => return Err("the session scope was revoked".to_string()),
     };
     let (name, port, resolver) = (cx.host.to_string(), cx.port, cx.shared.resolver.clone());
     let task = tokio::spawn(async move {
@@ -1395,11 +1606,14 @@ async fn resolve(cx: &Ctx<'_>) -> Result<Vec<IpAddr>, String> {
         drop((mine, all));
         found.map(|v: Vec<IpAddr>| v.into_iter().take(MAX_ADDRS).collect::<Vec<_>>())
     });
-    match tokio::time::timeout(RESOLVE_TIMEOUT, task).await {
-        Ok(Ok(Ok(v))) => Ok(v),
-        Ok(Ok(Err(e))) => Err(format!("name lookup failed: {e}")),
-        Ok(Err(_)) => Err("name lookup failed".to_string()),
-        Err(_) => Err("name lookup timed out".to_string()),
+    tokio::select! {
+        r = tokio::time::timeout(RESOLVE_TIMEOUT, task) => match r {
+            Ok(Ok(Ok(v))) => Ok(v),
+            Ok(Ok(Err(e))) => Err(format!("name lookup failed: {e}")),
+            Ok(Err(_)) => Err("name lookup failed".to_string()),
+            Err(_) => Err("name lookup timed out".to_string()),
+        },
+        _ = cancel.cancelled() => Err("the session scope was revoked".to_string()),
     }
 }
 
@@ -1409,38 +1623,65 @@ struct Allowed {
     ip: IpAddr,
 }
 
+enum UpstreamErr {
+    Reply(&'static str, String),
+    Cancelled,
+}
+
 /// Applies the policy to the name, resolves it, and connects to the first address the policy allows.
 /// Reports exactly one decision; for the connection it returns, the audit hook has succeeded first, and
 /// the rule and address it was recorded with come along. On failure returns the status line and body
-/// to send.
-async fn open_upstream(cx: &Ctx<'_>, policy: &Policy) -> Result<(TcpStream, Allowed), (&'static str, String)> {
+/// to send, or `UpstreamErr::Cancelled` if revoked/shut down mid-connect.
+async fn open_upstream(
+    cx: &Ctx<'_>,
+    policy: &Policy,
+    cred_user: &str,
+    guard: &ConnGuard,
+    cancel: &CancellationToken,
+) -> Result<(TcpStream, Allowed), UpstreamErr> {
+    if cancel.is_cancelled() {
+        return Err(UpstreamErr::Cancelled);
+    }
     let v = policy.check_name(cx.host, cx.port);
     if !v.allowed {
         cx.record_best_effort(false, v.rule.clone(), None).await;
-        return Err(cx.refused(&v.rule));
+        let (s, b) = cx.refused(&v.rule);
+        return Err(UpstreamErr::Reply(s, b));
     }
     let name_rule = v.rule;
 
     let addrs: Vec<IpAddr> = match cx.host.parse::<IpAddr>() {
         Ok(ip) => vec![ip],
-        Err(_) => match resolve(cx).await {
+        Err(_) => match resolve(cx, cancel).await {
             Ok(a) => a,
-            Err(why) => return Err(unreachable_decision(cx, &name_rule, None, &why).await),
+            Err(_) if cancel.is_cancelled() => return Err(UpstreamErr::Cancelled),
+            Err(why) => {
+                let (s, b) = unreachable_decision(cx, &name_rule, None, &why).await;
+                return Err(UpstreamErr::Reply(s, b));
+            }
         },
     };
     if addrs.is_empty() {
-        return Err(unreachable_decision(cx, &name_rule, None, "the name has no addresses").await);
+        let (s, b) = unreachable_decision(cx, &name_rule, None, "the name has no addresses").await;
+        return Err(UpstreamErr::Reply(s, b));
     }
 
     let mut first_refusal: Option<(String, IpAddr)> = None;
     let mut first_failure: Option<(String, IpAddr, String)> = None;
     for ip in addrs {
+        if cancel.is_cancelled() {
+            return Err(UpstreamErr::Cancelled);
+        }
         let cv = cx.shared.check_addr(policy, cx.host, cx.port, ip, &name_rule);
         if !cv.allowed {
             first_refusal.get_or_insert((cv.rule, ip));
             continue;
         }
-        match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(SocketAddr::new(ip, cx.port))).await {
+        let connected = tokio::select! {
+            r = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(SocketAddr::new(ip, cx.port))) => r,
+            _ = cancel.cancelled() => return Err(UpstreamErr::Cancelled),
+        };
+        match connected {
             Ok(Ok(s)) => {
                 // A listener opened between the first check and the connect is in the set by now.
                 if let Some(refused) = cx.shared.own_port_verdict(ip, cx.port) {
@@ -1448,13 +1689,40 @@ async fn open_upstream(cx: &Ctx<'_>, policy: &Policy) -> Result<(TcpStream, Allo
                     first_refusal.get_or_insert((refused.rule, ip));
                     continue;
                 }
+                guard.set_resolved(ip);
+                // Re-check revocation and latest policy after registering the resolved IP so a
+                // CIDR/IP `revoke_hosts` racing with DNS resolution cannot slip through.
+                if cancel.is_cancelled() {
+                    drop(s);
+                    return Err(UpstreamErr::Cancelled);
+                }
+                let latest = lock(&cx.shared.sessions).get(cred_user).map(|e| e.policy.clone());
+                let Some(latest_policy) = latest else {
+                    drop(s);
+                    return Err(UpstreamErr::Cancelled);
+                };
+                let lnv = latest_policy.check_name(cx.host, cx.port);
+                if !lnv.allowed {
+                    drop(s);
+                    cx.record_best_effort(false, lnv.rule.clone(), Some(ip)).await;
+                    let (st, b) = cx.refused(&lnv.rule);
+                    return Err(UpstreamErr::Reply(st, b));
+                }
+                let lcv = cx.shared.check_addr(&latest_policy, cx.host, cx.port, ip, &lnv.rule);
+                if !lcv.allowed {
+                    drop(s);
+                    cx.record_best_effort(false, lcv.rule.clone(), Some(ip)).await;
+                    let (st, b) = cx.refused(&lcv.rule);
+                    return Err(UpstreamErr::Reply(st, b));
+                }
                 let _ = s.set_nodelay(true);
                 // Nothing has been sent upstream yet; the connection is used only once it is on record.
                 return match cx.record(true, cv.rule.clone(), Some(ip)).await {
                     Ok(()) => Ok((s, Allowed { rule: cv.rule, ip })),
                     Err(e) => {
                         tracing::warn!("cannot write the egress audit record of {}: {e}", cx.session.as_str());
-                        Err(cx.audit_failed(&e))
+                        let (st, b) = cx.audit_failed(&e);
+                        Err(UpstreamErr::Reply(st, b))
                     }
                 };
             }
@@ -1467,14 +1735,19 @@ async fn open_upstream(cx: &Ctx<'_>, policy: &Policy) -> Result<(TcpStream, Allo
         }
     }
     if let Some((rule, ip, why)) = first_failure {
-        return Err(unreachable_decision(cx, &rule, Some(ip), &why).await);
+        let (s, b) = unreachable_decision(cx, &rule, Some(ip), &why).await;
+        return Err(UpstreamErr::Reply(s, b));
     }
     match first_refusal {
         Some((rule, ip)) => {
             cx.record_best_effort(false, rule.clone(), Some(ip)).await;
-            Err(cx.refused(&rule))
+            let (s, b) = cx.refused(&rule);
+            Err(UpstreamErr::Reply(s, b))
         }
-        None => Err(unreachable_decision(cx, &name_rule, None, "the name has no addresses").await),
+        None => {
+            let (s, b) = unreachable_decision(cx, &name_rule, None, "the name has no addresses").await;
+            Err(UpstreamErr::Reply(s, b))
+        }
     }
 }
 
@@ -1484,12 +1757,18 @@ async fn unreachable_decision(cx: &Ctx<'_>, rule: &str, ip: Option<IpAddr>, why:
 }
 
 /// Answers a check (see *Checks*): the decision `open_upstream` would make, without connecting.
-async fn check(client: &mut TcpStream, cx: &Ctx<'_>, policy: &Policy, slot: OwnedSemaphorePermit) {
+async fn check(
+    client: &mut TcpStream,
+    cx: &Ctx<'_>,
+    policy: &Policy,
+    slot: OwnedSemaphorePermit,
+    cancel: &CancellationToken,
+) {
     let name = policy.check_name(cx.host, cx.port);
     let found = if name.allowed {
         let addrs = match cx.host.parse::<IpAddr>() {
             Ok(ip) => Ok(vec![ip]),
-            Err(_) => resolve(cx).await,
+            Err(_) => resolve(cx, cancel).await,
         };
         // The first address the policy allows, else the first refusal.
         addrs.and_then(|addrs| {
@@ -1538,7 +1817,8 @@ async fn unauthorized(client: &mut TcpStream, shared: &Shared, slot: OwnedSemaph
 async fn handle(
     mut client: TcpStream,
     shared: Arc<Shared>,
-    cancel: CancellationToken,
+    proxy_cancel: CancellationToken,
+    listener_stop: CancellationToken,
     id: u64,
     evicted: CancellationToken,
     origin: Origin,
@@ -1549,7 +1829,8 @@ async fn handle(
     let read = tokio::select! {
         r = tokio::time::timeout(wait, read_head(&mut client)) => r,
         _ = evicted.cancelled() => return,
-        _ = cancel.cancelled() => return,
+        _ = listener_stop.cancelled() => return,
+        _ = proxy_cancel.cancelled() => return,
     };
     // From here the connection holds its slot itself; when a newer one was given it meanwhile, it ends.
     let Some(slot) = pending.claim() else { return };
@@ -1574,7 +1855,7 @@ async fn handle(
             return unauthorized(&mut client, &shared, slot).await;
         }
     };
-    let Authed { reference, session, policy, permits, lookups, capture, inject, tool } = auth;
+    let Authed { reference, session, cred_user, policy, permits, lookups, capture, inject, tool, control } = auth;
     let inject = inject.filter(|_| !reference && !tool);
     // Command credentials count only on their own session's listener, reference ones only on the shared
     // one; nothing else of the request is acted on before this.
@@ -1595,6 +1876,9 @@ async fn handle(
         };
         audit_local(&shared, listener_session, local_decision(Some(&head), &rule)).await;
         return unauthorized(&mut client, &shared, slot).await;
+    }
+    if control.cancel.is_cancelled() {
+        return;
     }
     if reference && !matches!(head.method.as_str(), "GET" | "CONNECT" | CHECK_METHOD) {
         return reject(
@@ -1630,9 +1914,31 @@ async fn handle(
                 let method = if connect { "CONNECT" } else { CHECK_METHOD };
                 let cx = Ctx { shared, session, lookups, method, host: &host, port };
                 if connect {
-                    tunnel(client, extra, &cx, &policy, capture.as_deref(), inject.as_deref(), !reference && !tool, slot, cancel).await;
+                    let guard = control.register(reference, &host, port);
+                    let conn_cancel = guard.cancel.clone();
+                    let Some(latest_policy) = lock(&shared.sessions).get(&cred_user).map(|e| e.policy.clone()) else {
+                        return;
+                    };
+                    if conn_cancel.is_cancelled() {
+                        return;
+                    }
+                    tunnel(
+                        client,
+                        extra,
+                        &cx,
+                        &latest_policy,
+                        &cred_user,
+                        capture.as_deref(),
+                        inject.as_deref(),
+                        !reference && !tool,
+                        slot,
+                        &guard,
+                        conn_cancel,
+                        proxy_cancel,
+                    )
+                    .await;
                 } else {
-                    check(&mut client, &cx, &policy, slot).await;
+                    check(&mut client, &cx, &policy, slot, &control.cancel).await;
                 }
             }
             Err(m) => reject(&mut client, &shared, slot, &session, &head, &m).await,
@@ -1650,10 +1956,32 @@ async fn handle(
     }
     match plain_target(&head.target) {
         Ok((host, port, authority, path)) => {
+            let guard = control.register(reference, &host, port);
+            let conn_cancel = guard.cancel.clone();
+            let Some(latest_policy) = lock(&shared.sessions).get(&cred_user).map(|e| e.policy.clone()) else {
+                return;
+            };
+            if conn_cancel.is_cancelled() {
+                return;
+            }
             let (shared, session, lookups) = (&*shared, &session, &lookups);
             let cx = Ctx { shared, session, lookups, method: &head.method, host: &host, port };
             let fx = Forward { authority: &authority, path: &path, reference, tool, inject: inject.as_deref() };
-            forward(client, extra, &head, &cx, &policy, capture.as_deref(), &fx, slot, cancel).await;
+            forward(
+                client,
+                extra,
+                &head,
+                &cx,
+                &latest_policy,
+                &cred_user,
+                capture.as_deref(),
+                &fx,
+                slot,
+                &guard,
+                conn_cancel,
+                proxy_cancel,
+            )
+            .await;
         }
         Err(m) => reject(&mut client, &shared, slot, &session, &head, &m).await,
     }
@@ -1682,39 +2010,73 @@ async fn tunnel(
     extra: Vec<u8>,
     cx: &Ctx<'_>,
     policy: &Policy,
+    cred_user: &str,
     capture: Option<&CaptureCfg>,
     inject: Option<&crate::inject::Inject>,
     paced: bool,
     slot: OwnedSemaphorePermit,
+    guard: &ConnGuard,
     cancel: CancellationToken,
+    proxy_cancel: CancellationToken,
 ) {
     let idle = cx.shared.limits.idle_timeout;
     let will_intercept = capture.is_some_and(|c| extra.is_empty() && c.intercepts(cx.host, cx.port));
     // Intercepted tunnels pace each HTTP request individually in `intercept::serve`; opaque tunnels pace once here.
     let _pace = if paced && !will_intercept { cx.shared.governor().acquire(cx.host, &cancel).await } else { None };
-    let (mut up, allowed) = match open_upstream(cx, policy).await {
+    if cancel.is_cancelled() {
+        return;
+    }
+    let (mut up, allowed) = match open_upstream(cx, policy, cred_user, guard, &cancel).await {
         Ok(s) => s,
-        Err((status, body)) => return answer(&mut client, cx.shared, slot, status, "", &body).await,
+        Err(UpstreamErr::Reply(status, body)) => return answer(&mut client, cx.shared, slot, status, "", &body).await,
+        Err(UpstreamErr::Cancelled) => return,
     };
     let _slot = slot;
-    if client.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await.is_err() {
-        return cx.failed_after_allow(&allowed, "the client closed the connection before the tunnel was open").await;
+    let established = tokio::select! {
+        r = client.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n") => Some(r),
+        _ = cancel.cancelled() => None,
+    };
+    match established {
+        None => {
+            drop((client, up));
+            return cx.failed_after_allow(&allowed, cancel_reason(&proxy_cancel)).await;
+        }
+        Some(Err(_)) => {
+            return cx.failed_after_allow(&allowed, "the client closed the connection before the tunnel was open").await;
+        }
+        Some(Ok(())) => {}
     }
-    if !extra.is_empty() && !write_within(&mut up, &extra, idle).await {
-        let why = "the bytes the client sent ahead could not be written to the destination";
-        return cx.failed_after_allow(&allowed, why).await;
+    if !extra.is_empty() {
+        let wrote_extra = tokio::select! {
+            ok = write_within(&mut up, &extra, idle) => Some(ok),
+            _ = cancel.cancelled() => None,
+        };
+        match wrote_extra {
+            None => {
+                drop((client, up));
+                return cx.failed_after_allow(&allowed, cancel_reason(&proxy_cancel)).await;
+            }
+            Some(false) => {
+                let why = "the bytes the client sent ahead could not be written to the destination";
+                return cx.failed_after_allow(&allowed, why).await;
+            }
+            Some(true) => {}
+        }
     }
     // Interception (I4): a tunnel the session captures is decrypted and relayed as HTTP; bytes the client
     // sent ahead of the 200 are not TLS the proxy could take over, so such a tunnel stays opaque.
     if let Some(cap) = capture.filter(|c| extra.is_empty() && c.intercepts(cx.host, cx.port)) {
-        match intercept::run(client, up, cx, &allowed, cap, inject, &cancel).await {
+        match intercept::run(client, up, cx, &allowed, cap, inject, &cancel, &proxy_cancel).await {
             intercept::Ended::Done => return,
             intercept::Ended::Opaque(c, u) => (client, up) = (c, u),
         }
     }
     let end = tokio::select! {
         end = relay(&mut client, &mut up, idle, None, None) => end,
-        _ = cancel.cancelled() => return cx.failed_after_allow(&allowed, SHUTDOWN).await,
+        _ = cancel.cancelled() => {
+            drop((client, up));
+            return cx.failed_after_allow(&allowed, cancel_reason(&proxy_cancel)).await;
+        }
     };
     // Once bytes have come from the destination, a failure cannot be told from a routine close.
     let why = match end {
@@ -2422,10 +2784,13 @@ async fn forward(
     head: &Head,
     cx: &Ctx<'_>,
     policy: &Policy,
+    cred_user: &str,
     capture: Option<&CaptureCfg>,
     fx: &Forward<'_>,
     slot: OwnedSemaphorePermit,
+    guard: &ConnGuard,
     cancel: CancellationToken,
+    proxy_cancel: CancellationToken,
 ) {
     let Forward { authority, path, reference, tool, inject } = *fx;
     let idle = cx.shared.limits.idle_timeout;
@@ -2436,9 +2801,13 @@ async fn forward(
     let gov = cx.shared.governor();
     let command_traffic = !reference && !tool;
     let _pace = if command_traffic { gov.acquire(cx.host, &cancel).await } else { None };
-    let (mut up, allowed) = match open_upstream(cx, policy).await {
+    if cancel.is_cancelled() {
+        return;
+    }
+    let (mut up, allowed) = match open_upstream(cx, policy, cred_user, guard, &cancel).await {
         Ok(s) => s,
-        Err((status, text)) => return answer(&mut client, cx.shared, slot, status, "", &text).await,
+        Err(UpstreamErr::Reply(status, text)) => return answer(&mut client, cx.shared, slot, status, "", &text).await,
+        Err(UpstreamErr::Cancelled) => return,
     };
 
     // S3: the profile's items for the destination, after the connection was allowed; the request's own cookies
@@ -2450,6 +2819,7 @@ async fn forward(
             attached = Some(headers);
         }
     }
+    let rewrites = cx.shared.rewrites();
     let mut req_method = head.method.clone();
     let mut req_path = path.to_string();
     let mut headers: Vec<(String, Vec<u8>)> = attached
@@ -2465,6 +2835,7 @@ async fn forward(
         })
         .cloned()
         .collect();
+    let mut captured_headers: Option<Vec<(String, Vec<u8>)>> = None;
     if command_traffic {
         if let Some(ua) = cx.shared.assessment_ua() {
             ua.apply_headers("http", cx.host, cx.port, &mut headers);
@@ -2474,23 +2845,34 @@ async fn forward(
                 headers.push(("User-Agent".to_string(), ua.as_bytes().to_vec()));
             }
         }
-        if let Some((m, p, h, _ids)) =
-            cx.shared.rewrites().apply_request_head(cx.host, &req_method, &req_path, &headers)
-        {
-            req_method = m;
-            req_path = p;
-            headers = h;
+        if let Some(rw) = rewrites.apply_request_head_for_capture(cx.host, &req_method, &req_path, &headers) {
+            req_method = rw.method;
+            req_path = rw.target;
+            headers = rw.wire_headers;
+            if rw.sensitive_applied {
+                captured_headers = Some(rw.captured_headers);
+            }
         }
     }
-    let mut out: Vec<u8> = format!("{req_method} {req_path} HTTP/1.1\r\nHost: {authority}\r\n").into_bytes();
-    for (n, v) in &headers {
-        out.extend_from_slice(n.as_bytes());
-        out.extend_from_slice(b": ");
-        out.extend_from_slice(v);
-        out.extend_from_slice(b"\r\n");
-    }
-    out.extend_from_slice(b"Connection: close\r\n\r\n");
-    let tap = capture.map(|c| Tap::new(c.grant.max_bytes, out.clone()));
+    let build_head = |hdrs: &[(String, Vec<u8>)]| -> Vec<u8> {
+        let mut buf: Vec<u8> = format!("{req_method} {req_path} HTTP/1.1\r\nHost: {authority}\r\n").into_bytes();
+        for (n, v) in hdrs {
+            buf.extend_from_slice(n.as_bytes());
+            buf.extend_from_slice(b": ");
+            buf.extend_from_slice(v);
+            buf.extend_from_slice(b"\r\n");
+        }
+        buf.extend_from_slice(b"Connection: close\r\n\r\n");
+        buf
+    };
+    let mut out = build_head(&headers);
+    let tap = capture.map(|c| {
+        let cap_head = match &captured_headers {
+            Some(ch) => build_head(ch),
+            None => out.clone(),
+        };
+        Tap::new_with_secrets(c.grant.max_bytes, cap_head, rewrites.secrets(), rewrites.max_secret_len())
+    });
     let finish = |error: Option<String>| {
         if let (Some(c), Some(t)) = (capture, &tap) {
             c.send(cx, t.finish(crate::capture::Transport::Plain, &req_method, &req_path, error, false));
@@ -2509,12 +2891,25 @@ async fn forward(
     if let Some(t) = &tap {
         t.request_body(already);
     }
-    if !write_within(&mut up, &out, idle).await {
-        let why = "sending the request to the destination failed";
-        finish(Some(why.to_string()));
-        cx.failed_after_allow(&allowed, why).await;
-        let (status, text) = cx.unreachable(why);
-        return answer(&mut client, cx.shared, slot, status, "", &text).await;
+    let sent = tokio::select! {
+        ok = write_within(&mut up, &out, idle) => Some(ok),
+        _ = cancel.cancelled() => None,
+    };
+    match sent {
+        None => {
+            drop((client, up));
+            let reason = cancel_reason(&proxy_cancel);
+            finish(Some(reason.to_string()));
+            return cx.failed_after_allow(&allowed, reason).await;
+        }
+        Some(false) => {
+            let why = "sending the request to the destination failed";
+            finish(Some(why.to_string()));
+            cx.failed_after_allow(&allowed, why).await;
+            let (status, text) = cx.unreachable(why);
+            return answer(&mut client, cx.shared, slot, status, "", &text).await;
+        }
+        Some(true) => {}
     }
 
     let fwd = Fwd {
@@ -2527,8 +2922,10 @@ async fn forward(
     let end = tokio::select! {
         r = relay(&mut client, &mut up, idle, Some(fwd), tap.as_ref()) => r,
         _ = cancel.cancelled() => {
-            finish(Some(SHUTDOWN.to_string()));
-            return cx.failed_after_allow(&allowed, SHUTDOWN).await;
+            drop((client, up));
+            let reason = cancel_reason(&proxy_cancel);
+            finish(Some(reason.to_string()));
+            return cx.failed_after_allow(&allowed, reason).await;
         }
     };
     let (why, reply) = match end {
@@ -4296,19 +4693,189 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_open_connection_survives_the_revoke_of_its_session() {
+    async fn revoke_immediately_severs_active_connect_and_http_tunnels() {
+        let (p, _rx, seen) = start_audited(false, Limits::default(), None).await;
+        let echo = echo_server().await;
+        let (silent_port, silent_srv) = silent_server().await;
+        let (a, b) = (SessionId::from("s-rv-cut-a"), SessionId::from("s-rv-cut-b"));
+        let (ga, gb) = (p.grant(&a, lab()).unwrap(), p.grant(&b, lab()).unwrap());
+
+        let mut sa = TcpStream::connect(("127.0.0.1", ga.port)).await.unwrap();
+        sa.write_all(connect_req(&ga, &format!("127.0.0.1:{echo}")).as_bytes()).await.unwrap();
+        assert_eq!(status(&read_until(&mut sa, "\r\n\r\n").await), 200);
+        sa.write_all(b"ping").await.unwrap();
+        let mut got = [0u8; 4];
+        timeout(T, sa.read_exact(&mut got)).await.unwrap().unwrap();
+        assert_eq!(&got, b"ping");
+
+        let mut sb = TcpStream::connect(("127.0.0.1", gb.port)).await.unwrap();
+        sb.write_all(connect_req(&gb, &format!("127.0.0.1:{echo}")).as_bytes()).await.unwrap();
+        assert_eq!(status(&read_until(&mut sb, "\r\n\r\n").await), 200);
+
+        let mut fa = TcpStream::connect(("127.0.0.1", ga.port)).await.unwrap();
+        fa.write_all(format!("GET http://127.0.0.1:{silent_port}/hang HTTP/1.1\r\n{}\r\n", auth(&ga)).as_bytes())
+            .await
+            .unwrap();
+        let deadline = tokio::time::Instant::now() + T;
+        while !lock(&seen).iter().any(|(s, d)| s.as_ref() == Some(&a) && d.method == "GET" && d.allowed) {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let started = tokio::time::Instant::now();
+        p.revoke(&a);
+
+        // Both Session A's CONNECT tunnel and in-flight HTTP request sever within milliseconds.
+        let mut buf = [0u8; 16];
+        let sa_res = timeout(Duration::from_millis(500), sa.read(&mut buf))
+            .await
+            .expect("CONNECT tunnel did not sever on revoke");
+        assert!(matches!(sa_res, Ok(0) | Err(_)), "expected closed CONNECT tunnel: {sa_res:?}");
+
+        let fa_res = timeout(Duration::from_millis(500), fa.read(&mut buf))
+            .await
+            .expect("in-flight HTTP request did not sever on revoke");
+        assert!(matches!(fa_res, Ok(0) | Err(_)), "expected closed HTTP stream: {fa_res:?}");
+
+        // Upstream silent_server also saw EOF promptly.
+        let (_, closed_at) = timeout(Duration::from_millis(500), silent_srv)
+            .await
+            .expect("upstream did not close promptly")
+            .unwrap();
+        assert!(closed_at.is_some());
+        assert!(started.elapsed() < Duration::from_millis(500));
+
+        // Audit records note the revocation.
+        let deadline = tokio::time::Instant::now() + T;
+        while !lock(&seen)
+            .iter()
+            .any(|(s, d)| s.as_ref() == Some(&a) && d.rule.contains("the session scope was revoked"))
+        {
+            assert!(tokio::time::Instant::now() < deadline, "{:?}", lock(&seen));
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Session B's active tunnel stays completely unaffected.
+        sb.write_all(b"pong").await.unwrap();
+        timeout(T, sb.read_exact(&mut got)).await.unwrap().unwrap();
+        assert_eq!(&got, b"pong");
+    }
+
+    #[tokio::test]
+    async fn revoke_hosts_narrows_policy_and_severs_only_matching_tunnels() {
+        let resolver: Resolver = Arc::new(|name: &str| {
+            if name == "target.lab" {
+                vec![IpAddr::from([127, 0, 0, 1])]
+            } else {
+                Vec::new()
+            }
+        });
+        let (p, _rx, _seen) = start_audited(false, Limits::default(), Some(resolver)).await;
+        let echo1 = echo_server().await;
+        let echo2 = echo_server().await;
+        let sid = SessionId::from("s-rv-hosts");
+        let g = p.grant(&sid, lab()).unwrap();
+
+        let mut s1 = TcpStream::connect(("127.0.0.1", g.port)).await.unwrap();
+        s1.write_all(connect_req(&g, &format!("127.0.0.1:{echo1}")).as_bytes()).await.unwrap();
+        assert_eq!(status(&read_until(&mut s1, "\r\n\r\n").await), 200);
+
+        let mut s2 = TcpStream::connect(("127.0.0.1", g.port)).await.unwrap();
+        s2.write_all(connect_req(&g, &format!("127.0.0.1:{echo2}")).as_bytes()).await.unwrap();
+        assert_eq!(status(&read_until(&mut s2, "\r\n\r\n").await), 200);
+
+        // Revoke only echo1's port: s1 severs immediately, s2 keeps echoing.
+        let started = tokio::time::Instant::now();
+        let n = p.revoke_hosts(&sid, &[format!("127.0.0.1:{echo1}")]).unwrap();
+        assert_eq!(n, 1);
+        let mut buf = [0u8; 16];
+        let r1 = timeout(Duration::from_millis(500), s1.read(&mut buf))
+            .await
+            .expect("revoked host tunnel did not close promptly");
+        assert!(matches!(r1, Ok(0) | Err(_)), "{r1:?}");
+        assert!(started.elapsed() < Duration::from_millis(500));
+
+        // New connection to echo1 is refused by policy (403); echo2 still works.
+        let denied = raw(g.port, connect_req(&g, &format!("127.0.0.1:{echo1}")).as_bytes()).await;
+        assert_eq!(status(&denied), 403, "{denied}");
+        assert!(denied.contains(&format!("deny 127.0.0.1:{echo1}")), "{denied}");
+
+        s2.write_all(b"keep").await.unwrap();
+        let mut got = [0u8; 4];
+        timeout(T, s2.read_exact(&mut got)).await.unwrap().unwrap();
+        assert_eq!(&got, b"keep");
+
+        // Resolved-IP / CIDR revocation severs a tunnel opened by hostname.
+        let mut sn = TcpStream::connect(("127.0.0.1", g.port)).await.unwrap();
+        sn.write_all(connect_req(&g, &format!("target.lab:{echo2}")).as_bytes()).await.unwrap();
+        assert_eq!(status(&read_until(&mut sn, "\r\n\r\n").await), 200);
+        let n2 = p.revoke_hosts(&sid, &["127.0.0.0/8".into()]).unwrap();
+        assert_eq!(n2, 2, "both s2 and sn resolved to 127.0.0.1");
+        let rn = timeout(Duration::from_millis(500), sn.read(&mut buf))
+            .await
+            .expect("CIDR-revoked hostname tunnel did not close promptly");
+        assert!(matches!(rn, Ok(0) | Err(_)), "{rn:?}");
+        let r2 = timeout(Duration::from_millis(500), s2.read(&mut buf))
+            .await
+            .expect("CIDR-revoked IP tunnel did not close promptly");
+        assert!(matches!(r2, Ok(0) | Err(_)), "{r2:?}");
+    }
+
+    #[tokio::test]
+    async fn revoke_all_severs_every_session_and_reference_tunnel_while_keeping_proxy_alive() {
         let (p, _rx) = start().await;
         let echo = echo_server().await;
-        let sid = SessionId::from("s-rv-open");
-        let g = p.grant(&sid, lab()).unwrap();
-        let mut s = TcpStream::connect(("127.0.0.1", g.port)).await.unwrap();
-        s.write_all(connect_req(&g, &format!("127.0.0.1:{echo}")).as_bytes()).await.unwrap();
-        assert_eq!(status(&read_until(&mut s, "\r\n\r\n").await), 200);
-        p.revoke(&sid);
-        s.write_all(b"ping").await.unwrap();
+        let (a, b, c) = (SessionId::from("s-panic-a"), SessionId::from("s-panic-b"), SessionId::from("s-panic-c"));
+        let ga = p.grant(&a, lab()).unwrap();
+        let gb = p.grant(&b, lab()).unwrap();
+        let ref_cfg = NetworkCfg {
+            mode: NetworkMode::DenyAll,
+            reference_hosts: vec![format!("127.0.0.1:{echo}")],
+            allow_private: vec!["127.0.0.1".into()],
+            ..NetworkCfg::default()
+        };
+        let rc = p.grant_reference(&c, &ref_cfg).unwrap();
+
+        let mut sa = TcpStream::connect(("127.0.0.1", ga.port)).await.unwrap();
+        sa.write_all(connect_req(&ga, &format!("127.0.0.1:{echo}")).as_bytes()).await.unwrap();
+        assert_eq!(status(&read_until(&mut sa, "\r\n\r\n").await), 200);
+
+        let mut sb = TcpStream::connect(("127.0.0.1", gb.port)).await.unwrap();
+        sb.write_all(connect_req(&gb, &format!("127.0.0.1:{echo}")).as_bytes()).await.unwrap();
+        assert_eq!(status(&read_until(&mut sb, "\r\n\r\n").await), 200);
+
+        let mut sc = TcpStream::connect(("127.0.0.1", p.port())).await.unwrap();
+        sc.write_all(connect_req(&rc.grant, &format!("127.0.0.1:{echo}")).as_bytes()).await.unwrap();
+        assert_eq!(status(&read_until(&mut sc, "\r\n\r\n").await), 200);
+
+        let started = tokio::time::Instant::now();
+        let cancelled = p.revoke_all();
+        assert_eq!(cancelled, 3);
+
+        let mut buf = [0u8; 16];
+        for (name, stream) in [("a", &mut sa), ("b", &mut sb), ("ref-c", &mut sc)] {
+            let r = timeout(Duration::from_millis(500), stream.read(&mut buf))
+                .await
+                .unwrap_or_else(|_| panic!("tunnel {name} did not sever on revoke_all"));
+            assert!(matches!(r, Ok(0) | Err(_)), "tunnel {name} unexpected: {r:?}");
+        }
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert_eq!(p.session_port(&a), None);
+        assert_eq!(p.session_port(&b), None);
+        assert_eq!(status(&raw(p.port(), connect_req(&rc.grant, &format!("127.0.0.1:{echo}")).as_bytes()).await), 407);
+
+        // Proxy itself stays alive and can grant new sessions afterwards.
+        let d = SessionId::from("s-after-panic");
+        let gd = p.grant(&d, lab()).unwrap();
+        assert_ne!(gd.port, ga.port);
+        assert_ne!(gd.port, gb.port);
+        let mut sd = TcpStream::connect(("127.0.0.1", gd.port)).await.unwrap();
+        sd.write_all(connect_req(&gd, &format!("127.0.0.1:{echo}")).as_bytes()).await.unwrap();
+        assert_eq!(status(&read_until(&mut sd, "\r\n\r\n").await), 200);
+        sd.write_all(b"live").await.unwrap();
         let mut got = [0u8; 4];
-        timeout(T, s.read_exact(&mut got)).await.unwrap().unwrap();
-        assert_eq!(&got, b"ping");
+        timeout(T, sd.read_exact(&mut got)).await.unwrap().unwrap();
+        assert_eq!(&got, b"live");
     }
 
     #[test]

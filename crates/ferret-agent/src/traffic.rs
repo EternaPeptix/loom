@@ -62,6 +62,9 @@ pub struct Traffic {
     /// The session secret set (CONTRACTS-TRAFFIC-TARGETS S5): `ingest` stores the request and response of a
     /// captured exchange with these values replaced. Set by the runtime with the grant; unset = none.
     pub secrets: std::sync::OnceLock<Arc<ferret_core::creds::Secrets>>,
+    /// The mission target's parsed scope (CONTRACTS-TRAFFIC-TARGETS T2/F1), set by the runtime when
+    /// the mission has a target. Used by [`check_traffic`] to extract bare in-scope hostnames.
+    pub target_scope: std::sync::OnceLock<ferret_core::target::Scope>,
 }
 
 const WINDOWS_KEPT: usize = 8;
@@ -78,6 +81,7 @@ impl Traffic {
             pending: Mutex::new(Vec::new()),
             windows: Mutex::new(VecDeque::new()),
             secrets: std::sync::OnceLock::new(),
+            target_scope: std::sync::OnceLock::new(),
         }
     }
 
@@ -278,10 +282,101 @@ pub fn claim_reach(
         .collect()
 }
 
-/// The finding gate (F1): `Err(refusal)` when a claim the answer relies on names a host that none of the claim's
-/// attested supporting evidence reached. `cited` are the evidence ids `finish` cites; with none, every supported
-/// claim of the mission is relied on. `tool` is the refused tool (`finish` or `conclude`). The text names only
-/// tools the role is shown.
+/// The hosts an active structured finding names and whether its attested supporting evidence or
+/// cited `http_exchanges` reached each with a response (empty: not reached).
+pub fn finding_reach(
+    state: &ferret_core::ledger::LedgerState,
+    finding: &ferret_core::security_state::Finding,
+    mission: &MissionTraffic,
+    scope: Option<&ferret_core::target::Scope>,
+) -> Vec<HostReach> {
+    use ferret_core::security_state::AssetKind;
+    let mut asset_hosts: Vec<String> = Vec::new();
+    if let Some(asset_ref) = finding.asset.as_deref() {
+        if let Some(a) = state.security.assets.values().find(|x| x.id == asset_ref || x.locator == asset_ref) {
+            if matches!(a.kind, AssetKind::Host | AssetKind::Service | AssetKind::Endpoint) {
+                asset_hosts.push(locator_host(&a.locator));
+            }
+        }
+    }
+    let mut combined = String::new();
+    for piece in [
+        Some(finding.target.as_str()),
+        finding.endpoint.as_deref(),
+        Some(finding.title.as_str()),
+        Some(finding.description.as_str()),
+        finding.poc_description.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !piece.is_empty() {
+            if !combined.is_empty() {
+                combined.push('\n');
+            }
+            combined.push_str(piece);
+        }
+    }
+    let hosts = ferret_core::target::claim_hosts(&combined, &asset_hosts, scope);
+    let all = mission.all();
+    let support: Vec<_> = state
+        .evidence
+        .iter()
+        .filter(|e| {
+            e.input.attested
+                && e.input.supports
+                && (finding.evidence.iter().any(|id| id == &e.id)
+                    || finding.claim.as_deref().is_some_and(|cid| e.input.claim == cid))
+        })
+        .collect();
+    hosts
+        .into_iter()
+        .map(|host| {
+            let host = norm(&host);
+            let exchanges = all
+                .iter()
+                .filter(|x| x.status.is_some() && norm(&x.host) == host)
+                .filter(|x| {
+                    finding.http_exchanges.iter().any(|id| id == &x.id)
+                        || support.iter().any(|e| {
+                            x.call_id.as_ref() == Some(&e.input.call_id)
+                                || e.input.blob.as_ref().is_some_and(|b| {
+                                    *b == x.request.id || x.response.as_ref().is_some_and(|r| *b == r.id)
+                                })
+                        })
+                })
+                .map(|x| x.id.clone())
+                .collect();
+            HostReach { host, exchanges }
+        })
+        .collect()
+}
+
+fn format_cite_ways(role: &crate::pack::RoleDef, intercept: bool) -> String {
+    let shown = |t: &str| role.tools.iter().any(|x| x == t) && !role.hidden_tools.iter().any(|x| x == t);
+    let mut ways: Vec<String> =
+        ["http_send", "web_fetch"].into_iter().filter(|t| shown(t)).map(str::to_string).collect();
+    if ["bash", "exec", "job"].iter().any(|t| shown(t)) {
+        let state_of = if intercept { "on" } else { "off" };
+        ways.push(format!("a command while interception is on for this mission; interception is {state_of}"));
+    }
+    if ways.is_empty() {
+        "Cite the evidence of a call that did".to_string()
+    } else {
+        // The interception clause follows the list, after a semicolon, as the contract words it.
+        match ways.len() {
+            1 => format!("Cite the evidence of a call that did ({})", ways[0]),
+            n => format!("Cite the evidence of a call that did ({}, or {})", ways[..n - 1].join(", "), ways[n - 1]),
+        }
+    }
+}
+
+/// The finding gate (F1): `Err(refusal)` when a claim or high-confidence structured finding relies
+/// on a host that none of its attested supporting evidence (or cited `http_exchanges`) reached, or
+/// when any active structured finding cites `http_exchanges` IDs that do not exist in the mission's
+/// traffic log. `cited` are the evidence ids `finish` cites; with none, every supported claim of
+/// the mission is relied on. `tool` is the refused tool (`finish` or `conclude`). The text names
+/// only tools the role is shown.
 pub fn check_traffic(
     role: &crate::pack::RoleDef,
     tool: &str,
@@ -290,9 +385,32 @@ pub fn check_traffic(
     traffic: &Traffic,
 ) -> Result<(), String> {
     use ferret_core::ledger::ClaimStatus;
+    use ferret_core::security_state::FindingConfidence;
+
+    let active_findings = state.security.active_findings();
+    // Every active finding citing `http_exchanges` must reference real exchange IDs in this mission.
+    for finding in &active_findings {
+        let missing: Vec<&str> = finding
+            .http_exchanges
+            .iter()
+            .map(String::as_str)
+            .filter(|id| traffic.mission.find(id).is_none())
+            .collect();
+        if !missing.is_empty() {
+            return Err(format!(
+                "{tool} cannot be accepted yet: finding {} cites http_exchanges ({}) that do not exist in this mission's traffic log. Cite real captured exchange IDs from this mission or update the finding with `security_record`.",
+                finding.id,
+                missing.join(", ")
+            ));
+        }
+    }
+
     if !role.require_traffic {
         return Ok(());
     }
+    let scope = traffic.target_scope.get();
+    let cite = format_cite_ways(role, traffic.intercept);
+
     let by_cited: Vec<&str> =
         state.evidence.iter().filter(|e| cited.contains(&e.id)).map(|e| e.input.claim.as_str()).collect();
     for claim in state
@@ -300,8 +418,7 @@ pub fn check_traffic(
         .iter()
         .filter(|c| c.status == ClaimStatus::Supported && (by_cited.is_empty() || by_cited.contains(&c.id.as_str())))
     {
-        // T: `None` until the mission's target scope is wired.
-        let missed: Vec<String> = claim_reach(state, claim, &traffic.mission, None)
+        let missed: Vec<String> = claim_reach(state, claim, &traffic.mission, scope)
             .into_iter()
             .filter(|h| h.exchanges.is_empty())
             .map(|h| h.host)
@@ -309,28 +426,43 @@ pub fn check_traffic(
         if missed.is_empty() {
             continue;
         }
-        let shown = |t: &str| role.tools.iter().any(|x| x == t) && !role.hidden_tools.iter().any(|x| x == t);
-        let mut ways: Vec<String> =
-            ["http_send", "web_fetch"].into_iter().filter(|t| shown(t)).map(str::to_string).collect();
-        if ["bash", "exec", "job"].iter().any(|t| shown(t)) {
-            let state_of = if traffic.intercept { "on" } else { "off" };
-            ways.push(format!("a command while interception is on for this mission; interception is {state_of}"));
-        }
-        let cite = if ways.is_empty() {
-            "Cite the evidence of a call that did".to_string()
-        } else {
-            // The interception clause follows the list, after a semicolon, as the contract words it.
-            match ways.len() {
-                1 => format!("Cite the evidence of a call that did ({})", ways[0]),
-                n => format!("Cite the evidence of a call that did ({}, or {})", ways[..n - 1].join(", "), ways[n - 1]),
-            }
-        };
         return Err(format!(
             "{tool} cannot be accepted yet: {} names {}, but none of its supporting evidence reached {}. {cite}, or take the host out of the claim.",
             claim.id,
             missed.join(", "),
             if missed.len() == 1 { "it" } else { "them" }
         ));
+    }
+
+    // Active high-confidence findings naming hosts must be corroborated by answered mission traffic.
+    for finding in active_findings.into_iter().filter(|f| f.confidence == FindingConfidence::High) {
+        let missed: Vec<String> = finding_reach(state, finding, &traffic.mission, scope)
+            .into_iter()
+            .filter(|h| h.exchanges.is_empty())
+            .map(|h| h.host)
+            .collect();
+        if !missed.is_empty() {
+            return Err(format!(
+                "{tool} cannot be accepted yet: high-confidence finding {} ({}) names {}, but none of its supporting evidence or cited http_exchanges reached {}. {cite}, or downgrade/withdraw the finding with `security_record`.",
+                finding.id,
+                finding.title,
+                missed.join(", "),
+                if missed.len() == 1 { "it" } else { "them" }
+            ));
+        }
+        if !finding.http_exchanges.is_empty()
+            && finding
+                .http_exchanges
+                .iter()
+                .all(|id| traffic.mission.find(id).is_none_or(|x| x.status.is_none()))
+        {
+            return Err(format!(
+                "{tool} cannot be accepted yet: high-confidence finding {} ({}) cites http_exchanges ({}) that never received a response. Capture an answered exchange or downgrade/withdraw the finding with `security_record`.",
+                finding.id,
+                finding.title,
+                finding.http_exchanges.join(", ")
+            ));
+        }
     }
     Ok(())
 }
@@ -432,5 +564,213 @@ mod tests {
         assert!(req.contains("[redacted]") && !req.contains("s3cr3t"), "{req}");
         assert!(resp.contains("[redacted]") && !resp.contains("s3cr3t"), "{resp}");
         assert_eq!((xs[0].request_bytes, xs[0].response_bytes), counted);
+    }
+
+    fn make_role(require_traffic: bool) -> crate::pack::RoleDef {
+        let mut r = crate::pack::Packs::builtin().unwrap().role(None, Some("lead")).unwrap().clone();
+        r.require_traffic = require_traffic;
+        if !r.tools.iter().any(|t| t == "http_send") {
+            r.tools.push("http_send".into());
+        }
+        r
+    }
+
+    fn make_exchange(blobs: &BlobStore, id: &str, host: &str, call_id: Option<&str>, status: Option<u16>) -> Exchange {
+        let blob = blobs.put_bytes(b"GET / HTTP/1.1\r\n\r\n").unwrap();
+        Exchange {
+            id: id.into(),
+            call_id: call_id.map(CallId::from),
+            source: "tool".into(),
+            tool: Some("http_send".into()),
+            scheme: "https".into(),
+            tls: "tool".into(),
+            method: "GET".into(),
+            host: host.into(),
+            port: 443,
+            target: "/".into(),
+            status,
+            error: status.is_none().then(|| "connection refused".into()),
+            request: blob.clone(),
+            response: status.map(|_| blob),
+            request_bytes: 18,
+            response_bytes: 18,
+            truncated: false,
+            upstream_unverified: false,
+            duration_ms: 2,
+        }
+    }
+
+    #[test]
+    fn check_traffic_uses_target_scope_for_bare_in_scope_hosts() {
+        use ferret_core::ledger::{ClaimStatus, Entry, EvidenceInput, EvidenceKind, LedgerOp, LedgerState};
+        use ferret_core::ids::SessionId;
+
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = BlobStore::open(dir.path()).unwrap();
+        let traffic = Traffic::none();
+        let scope = ferret_core::target::Scope::parse(&["*.acme.test".into()], &[]).unwrap();
+        let _ = traffic.target_scope.set(scope);
+
+        let mut state = LedgerState::default();
+        let mut n = 0u64;
+        let mut apply = |op: LedgerOp| {
+            n += 1;
+            state.apply(&Entry {
+                n,
+                ts_ms: n,
+                session: SessionId::from("s-1"),
+                from_user: false,
+                op,
+                mac: String::new(),
+            });
+        };
+        // Bare hostname (no http:// scheme) matched ONLY when real target Scope is wired.
+        apply(LedgerOp::ClaimAdd { text: "api.acme.test leaks admin tokens".into(), assets: vec![] });
+        apply(LedgerOp::EvidenceAdd(EvidenceInput {
+            claim: "c1".into(),
+            kind: EvidenceKind::Execution,
+            supports: true,
+            session: SessionId::from("s-1"),
+            call_id: CallId::from("call-1"),
+            blob: None,
+            lines: None,
+            quote: None,
+            note: "ran check".into(),
+            attested: true,
+            tool: Some("http_send".into()),
+            grade: Some(ferret_core::event::EvidenceGrade::Run),
+        }));
+        apply(LedgerOp::ClaimUpdate { id: "c1".into(), status: ClaimStatus::Supported, note: "done".into() });
+
+        let role = make_role(true);
+        let err = check_traffic(&role, "finish", &state, &["e1".into()], &traffic).unwrap_err();
+        assert!(err.contains("api.acme.test"), "{err}");
+
+        traffic.mission.add(&make_exchange(&blobs, "ex-111111111111", "api.acme.test", Some("call-1"), Some(200)));
+        check_traffic(&role, "finish", &state, &["e1".into()], &traffic).unwrap();
+    }
+
+    #[test]
+    fn check_traffic_verifies_active_findings_exchanges_and_high_confidence_corroboration() {
+        use ferret_core::ledger::{Entry, EvidenceInput, EvidenceKind, LedgerOp, LedgerState};
+        use ferret_core::security_state::{FindingConfidence, FindingInput, SecurityOp};
+        use ferret_core::ids::SessionId;
+
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = BlobStore::open(dir.path()).unwrap();
+        let traffic = Traffic::none();
+        let scope = ferret_core::target::Scope::parse(&["app.acme.test".into()], &[]).unwrap();
+        let _ = traffic.target_scope.set(scope);
+
+        let mut state = LedgerState::default();
+        let mut n = 0u64;
+        let mut apply = |op: LedgerOp| {
+            n += 1;
+            state.apply(&Entry {
+                n,
+                ts_ms: n,
+                session: SessionId::from("s-1"),
+                from_user: false,
+                op,
+                mac: String::new(),
+            });
+        };
+        apply(LedgerOp::ClaimAdd { text: "finding evidence holder".into(), assets: vec![] });
+        apply(LedgerOp::EvidenceAdd(EvidenceInput {
+            claim: "c1".into(),
+            kind: EvidenceKind::Execution,
+            supports: true,
+            session: SessionId::from("s-1"),
+            call_id: CallId::from("call-1"),
+            blob: None,
+            lines: None,
+            quote: None,
+            note: "observed".into(),
+            attested: true,
+            tool: Some("bash".into()),
+            grade: Some(ferret_core::event::EvidenceGrade::Run),
+        }));
+        let mut finding = FindingInput {
+            title: "IDOR on user export".into(),
+            description: "Endpoint on app.acme.test exposes other users' records.".into(),
+            impact: "PII exposure".into(),
+            target: "app.acme.test".into(),
+            severity: Some(ferret_core::security_state::FindingSeverity::High),
+            cvss_breakdown: None,
+            evidence: vec!["e1".into()],
+            counterevidence: "Checked authorization header handling.".into(),
+            confidence: FindingConfidence::High,
+            confidence_rationale: None,
+            severity_change_conditions: "Scoped to authenticated users.".into(),
+            technical_analysis: None,
+            remediation_steps: None,
+            assumptions: None,
+            poc_description: None,
+            poc_handle: None,
+            fix_effort: None,
+            endpoint: Some("https://app.acme.test/api/export".into()),
+            method: Some("GET".into()),
+            cve: None,
+            cwe: Some("CWE-639".into()),
+            code_locations: vec![],
+            fix_verification: None,
+            http_exchanges: vec!["ex-missing12345".into()],
+            asset: None,
+            claim: None,
+        };
+        apply(LedgerOp::Security(SecurityOp::FindingRecord { finding: Box::new(finding.clone()) }));
+
+        // 1. Missing `ex-*` ID is rejected even when `require_traffic` is false.
+        let err = check_traffic(&make_role(false), "finish", &state, &[], &traffic).unwrap_err();
+        assert!(err.contains("ex-missing12345") && err.contains("do not exist"), "{err}");
+
+        // 2. Replace with real unanswered exchange -> rejected for high-confidence finding.
+        traffic.mission.add(&make_exchange(&blobs, "ex-missing12345", "app.acme.test", Some("call-1"), None));
+        let err = check_traffic(&make_role(true), "finish", &state, &[], &traffic).unwrap_err();
+        assert!(err.contains("app.acme.test"), "{err}");
+
+        // 3. Record an answered exchange for the finding's host and update `http_exchanges` -> passes.
+        let answered_id = "ex-real20000001";
+        traffic.mission.add(&make_exchange(&blobs, answered_id, "app.acme.test", Some("call-99"), Some(200)));
+        finding.http_exchanges = vec![answered_id.into()];
+        let mut state2 = LedgerState::default();
+        state2.apply(&Entry {
+            n: 1,
+            ts_ms: 1,
+            session: SessionId::from("s-1"),
+            from_user: false,
+            op: LedgerOp::ClaimAdd { text: "holder".into(), assets: vec![] },
+            mac: String::new(),
+        });
+        state2.apply(&Entry {
+            n: 2,
+            ts_ms: 2,
+            session: SessionId::from("s-1"),
+            from_user: false,
+            op: LedgerOp::EvidenceAdd(EvidenceInput {
+                claim: "c1".into(),
+                kind: EvidenceKind::Execution,
+                supports: true,
+                session: SessionId::from("s-1"),
+                call_id: CallId::from("call-1"),
+                blob: None,
+                lines: None,
+                quote: None,
+                note: "observed".into(),
+                attested: true,
+                tool: Some("http_send".into()),
+                grade: Some(ferret_core::event::EvidenceGrade::Run),
+            }),
+            mac: String::new(),
+        });
+        state2.apply(&Entry {
+            n: 3,
+            ts_ms: 3,
+            session: SessionId::from("s-1"),
+            from_user: false,
+            op: LedgerOp::Security(SecurityOp::FindingRecord { finding: Box::new(finding) }),
+            mac: String::new(),
+        });
+        check_traffic(&make_role(true), "finish", &state2, &[], &traffic).unwrap();
     }
 }

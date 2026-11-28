@@ -246,6 +246,19 @@ impl IpNet {
         }
     }
 
+    /// Whether `self` is equal to or a supernet of `other`.
+    fn covers(&self, other: &IpNet) -> bool {
+        match (self, other) {
+            (IpNet::V4 { base: b1, mask: m1 }, IpNet::V4 { base: b2, mask: m2 }) => {
+                m1.count_ones() <= m2.count_ones() && (*b2 & *m1) == *b1
+            }
+            (IpNet::V6 { base: b1, mask: m1 }, IpNet::V6 { base: b2, mask: m2 }) => {
+                m1.count_ones() <= m2.count_ones() && (*b2 & *m1) == *b1
+            }
+            _ => false,
+        }
+    }
+
     /// An IPv6 address is compared with an IPv4 block in its canonical form (see [`canonical_ip`]), so
     /// `::ffff:10.0.0.5` is in `10.0.0.0/8` and `::1` is not in `0.0.0.0/8`.
     fn contains(&self, addr: IpAddr) -> bool {
@@ -457,6 +470,105 @@ fn parse_list<T>(list: &str, entries: &[String], parse: fn(&str) -> Result<T, St
         .collect()
 }
 
+/// A parsed set of host/pattern/IP/CIDR entries used to narrow a session's [`Policy`] and cancel
+/// matching live connections.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RevokeMatcher {
+    entries: Vec<PrivEntry>,
+}
+
+impl RevokeMatcher {
+    pub(crate) fn parse(hosts: &[String]) -> Result<Self, String> {
+        let mut entries = Vec::with_capacity(hosts.len());
+        for raw in hosts {
+            let h = raw.trim();
+            if h.is_empty() {
+                return Err("A host to revoke is blank.".into());
+            }
+            if h.chars().any(|c| c.is_whitespace() || c == ',') {
+                return Err(format!("The host entry \"{h}\" to revoke contains whitespace or a comma."));
+            }
+            let entry = PrivEntry::parse(h)
+                .map_err(|why| format!("The host \"{h}\" cannot be revoked: {why}."))?;
+            entries.push(entry);
+        }
+        Ok(Self { entries })
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub(crate) fn matches(&self, host: &str, port: u16, resolved: Option<IpAddr>) -> bool {
+        let h = normalize_host(host);
+        let host_ip = h.parse::<IpAddr>().ok();
+        let addrs = [resolved, host_ip];
+        self.entries.iter().any(|e| match e {
+            PrivEntry::Name(p) => {
+                let literal = match &p.kind {
+                    Kind::Exact(x) if p.port.is_none_or(|pp| pp == port) => x.parse::<IpAddr>().ok().is_some_and(|x| {
+                        let cx = canonical_ip(x);
+                        addrs.iter().flatten().any(|a| canonical_ip(*a) == cx)
+                    }),
+                    _ => false,
+                };
+                literal || p.matches(&h, port)
+            }
+            PrivEntry::Net { net, .. } => addrs.iter().flatten().any(|a| net.contains(*a)),
+        })
+    }
+}
+
+fn pattern_revoked_by(p: &Pattern, entry: &PrivEntry) -> bool {
+    match entry {
+        PrivEntry::Name(r) => {
+            if r.port.is_some() && r.port != p.port {
+                return false;
+            }
+            match (&r.kind, &p.kind) {
+                (Kind::Any, _) => true,
+                (Kind::Exact(rh), Kind::Exact(ph)) => {
+                    rh == ph
+                        || match (rh.parse::<IpAddr>(), ph.parse::<IpAddr>()) {
+                            (Ok(a), Ok(b)) => canonical_ip(a) == canonical_ip(b),
+                            _ => false,
+                        }
+                }
+                (Kind::Suffix(rs), Kind::Exact(ph)) => ph.len() > rs.len() && ph.ends_with(rs.as_str()),
+                (Kind::Suffix(rs), Kind::Suffix(ps)) => ps == rs || ps.ends_with(rs.as_str()),
+                _ => false,
+            }
+        }
+        PrivEntry::Net { net, .. } => match &p.kind {
+            Kind::Exact(ph) => ph.parse::<IpAddr>().ok().is_some_and(|ip| net.contains(ip)),
+            _ => false,
+        },
+    }
+}
+
+fn granted_private_revoked_by(ip: IpAddr, port: Option<u16>, entry: &PrivEntry) -> bool {
+    match entry {
+        PrivEntry::Net { net, .. } => net.contains(ip),
+        PrivEntry::Name(r) => {
+            if r.port.is_some() && r.port != port {
+                return false;
+            }
+            match &r.kind {
+                Kind::Any => true,
+                Kind::Exact(rh) => rh.parse::<IpAddr>().ok().is_some_and(|rip| canonical_ip(rip) == canonical_ip(ip)),
+                Kind::Suffix(_) => false,
+            }
+        }
+    }
+}
+
+fn priv_entry_text(e: &PrivEntry) -> &str {
+    match e {
+        PrivEntry::Name(p) => &p.text,
+        PrivEntry::Net { text, .. } => text,
+    }
+}
+
 impl Policy {
     pub fn new(cfg: &NetworkCfg) -> Result<Policy, String> {
         Ok(Policy {
@@ -535,6 +647,34 @@ impl Policy {
         }
         policy.mode = NetworkMode::Allowlist;
         Ok(policy)
+    }
+
+    /// Return a narrowed copy of this policy with `hosts` revoked: removes matching entries from
+    /// `allow`, `granted_private`, and `target_nets`, and adds matching deny entries so revoked
+    /// hosts/ports/IPs/CIDRs cannot be reached even under `open` mode or broader wildcards.
+    pub fn without_hosts(&self, hosts: &[String]) -> Result<Policy, String> {
+        let matcher = RevokeMatcher::parse(hosts)?;
+        let mut next = self.clone();
+        next.apply_revoke(&matcher);
+        Ok(next)
+    }
+
+    pub(crate) fn apply_revoke(&mut self, matcher: &RevokeMatcher) {
+        if matcher.is_empty() {
+            return;
+        }
+        self.allow.retain(|p| !matcher.entries.iter().any(|e| pattern_revoked_by(p, e)));
+        self.granted_private
+            .retain(|(ip, port)| !matcher.entries.iter().any(|e| granted_private_revoked_by(*ip, *port, e)));
+        self.target_nets.retain(|(_, net)| {
+            !matcher.entries.iter().any(|e| matches!(e, PrivEntry::Net { net: rnet, .. } if rnet.covers(net)))
+        });
+        for entry in &matcher.entries {
+            let t = priv_entry_text(entry);
+            if !self.deny.iter().any(|d| priv_entry_text(d).eq_ignore_ascii_case(t)) {
+                self.deny.push(entry.clone());
+            }
+        }
     }
 
     pub fn check_name(&self, host: &str, port: u16) -> Verdict {
@@ -1287,5 +1427,34 @@ mod tests {
         let p = pol(NetworkMode::Open, &[], &[], &["192.168.1.7/32"]);
         assert!(p.check_addr("x", 1, ip("192.168.1.7"), "r").allowed);
         assert!(!p.check_addr("x", 1, ip("192.168.1.8"), "r").allowed);
+    }
+
+    #[test]
+    fn without_hosts_narrows_allowlist_wildcards_open_and_cidrs() {
+        let hosts = |h: &[&str]| h.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let c = cfg(NetworkMode::DenyAll, &[], &[], &[]);
+        let p = Policy::with_hosts(&c, &hosts(&["a.test", "b.test", "*.sub.test", "127.0.0.1:8080"])).unwrap();
+
+        let p2 = p.without_hosts(&hosts(&["a.test", "admin.sub.test", "127.0.0.1:8080"])).unwrap();
+        assert!(!p2.check_name("a.test", 443).allowed);
+        assert!(p2.check_name("b.test", 443).allowed);
+        assert!(!p2.check_name("admin.sub.test", 443).allowed);
+        assert!(p2.check_name("app.sub.test", 443).allowed);
+        assert!(!p2.check_name("127.0.0.1", 8080).allowed);
+        assert!(!p2.check_addr("127.0.0.1", 8080, ip("127.0.0.1"), "allow").allowed);
+
+        // Open mode with allow_private + port-specific and CIDR revocation
+        let open = pol(NetworkMode::Open, &[], &[], &["127.0.0.1", "10.0.0.0/8"]);
+        let narrowed = open.without_hosts(&hosts(&["127.0.0.1:8080", "10.20.0.0/24"])).unwrap();
+        assert!(!narrowed.check_name("127.0.0.1", 8080).allowed);
+        assert!(narrowed.check_name("127.0.0.1", 8081).allowed);
+        assert!(!narrowed.check_addr("127.0.0.1", 8080, ip("127.0.0.1"), "mode open").allowed);
+        assert!(narrowed.check_addr("127.0.0.1", 8081, ip("127.0.0.1"), "mode open").allowed);
+        assert!(!narrowed.check_addr("internal.test", 80, ip("10.20.0.5"), "mode open").allowed);
+        assert!(narrowed.check_addr("internal.test", 80, ip("10.30.0.5"), "mode open").allowed);
+
+        // Invalid host to revoke fails cleanly
+        assert!(open.without_hosts(&hosts(&["bad host"])).is_err());
+        assert!(open.without_hosts(&hosts(&[""])).is_err());
     }
 }

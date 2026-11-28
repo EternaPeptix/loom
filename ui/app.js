@@ -58,8 +58,11 @@ const S = {
   rewrites: { supported: null, list: [], error: null, editing: null, askDelete: null, askDeleteFocus: false, busy: false, formError: null, open: false, toggling: new Set() }, // /api/traffic/rewrite-rules
   harBusy: { importing: false, exporting: false },
   scopeForm: null, // persistent host-grant form for the open session
+  scopeRevoking: new Set(), // host keys currently being revoked via POST /api/sessions/{id}/scope/revoke
+  revokedHosts: new Map(), // mission id -> Set<lowercased host> revoked in this tab
   mcpChecks: new Map(), // server name -> {busy, result, error}
   gc: { busy: false, report: null, error: null, confirmApply: false, focusConfirm: false },
+  panic: { busy: false, report: null, error: null, confirm: false, focusConfirm: false, reason: "" },
   reload: { busy: false, report: "", error: "" },
   statusRefreshing: false,
   reconnecting: false,
@@ -784,18 +787,29 @@ function renderDiskWarning() {
 }
 
 let statusOpener = null;
-function openDaemonStatus(opener = document.activeElement) {
+function openDaemonStatus(opener = document.activeElement, { askPanic = false } = {}) {
   const dialog = $("daemon-status");
   if (!dialog) return;
-  if (dialog.open) return;
+  if (dialog.open) {
+    if (askPanic) {
+      S.panic.confirm = true;
+      S.panic.focusConfirm = true;
+      S.panic.error = null;
+      renderDaemonStatus();
+    }
+    return;
+  }
   if (document.querySelector("dialog[open]")) return;
   statusOpener = opener;
   S.gc.confirmApply = false;
   S.gc.focusConfirm = false;
+  S.panic.confirm = !!askPanic;
+  S.panic.focusConfirm = !!askPanic;
+  S.panic.error = null;
   S.reload.error = "";
   renderDaemonStatus();
   dialog.showModal();
-  $("daemon-status-close").focus({ preventScroll: true });
+  if (!askPanic) $("daemon-status-close").focus({ preventScroll: true });
   refreshDaemonStatus();
 }
 
@@ -832,6 +846,35 @@ async function runGc(apply) {
     S.gc.error = e.message;
   } finally {
     S.gc.busy = false;
+    renderDaemonStatus();
+  }
+}
+
+async function runPanic() {
+  if (S.panic.busy) return;
+  S.panic.busy = true;
+  S.panic.error = null;
+  S.panic.confirm = false;
+  S.panic.focusConfirm = false;
+  renderDaemonStatus();
+  try {
+    const req = C.panicRequest(S.panic.reason);
+    const report = await api("POST", req.path, req.body);
+    S.panic.report = report;
+    S.panic.reason = "";
+    toast(C.formatPanicReport(report));
+    await Promise.all([
+      loadStatus(),
+      loadSessions(),
+      S.rewrites.supported ? loadRewriteRules() : Promise.resolve(),
+      S.openId ? loadLedger() : Promise.resolve(),
+      S.openId && S.tab === "network" ? loadNet() : Promise.resolve(),
+    ]);
+  } catch (e) {
+    S.panic.error = e.message;
+    notice(e.message);
+  } finally {
+    S.panic.busy = false;
     renderDaemonStatus();
   }
 }
@@ -963,10 +1006,51 @@ function renderDaemonStatus() {
   if (S.gc.report) gcSec.append(el("p", "dim status-note", C.formatGcReport(S.gc.report)));
   frag.append(gcSec);
 
+  // Emergency panic kill-switch section (two-step confirmation so an accidental click cannot fire it)
+  const panicSec = el("section", "status-section panic-section");
+  panicSec.append(el("h3", "", "Emergency panic kill-switch"));
+  panicSec.append(el("p", "dim field-note", "Immediately severs all live proxy tunnels, stops all active sessions, tears down active boxes, and disables all proxy rewrite rules."));
+  const panicActions = el("div", "status-actions");
+  const panicBtn = btn(S.panic.busy ? "Stopping everything…" : "Panic stop all…", "small danger", () => {
+    S.panic.confirm = true;
+    S.panic.focusConfirm = true;
+    S.panic.error = null;
+    renderDaemonStatus();
+  });
+  panicBtn.disabled = S.panic.busy;
+  panicBtn.dataset.focusKey = "daemon:panic";
+  panicActions.append(panicBtn);
+  panicSec.append(panicActions);
+  if (S.panic.confirm) {
+    const reasonIn = el("input", "panic-reason");
+    reasonIn.type = "text";
+    reasonIn.placeholder = "Reason (optional, recorded in stopped sessions)";
+    reasonIn.setAttribute("aria-label", "Panic stop reason");
+    reasonIn.value = S.panic.reason || "";
+    reasonIn.dataset.focusKey = "panic:reason";
+    reasonIn.addEventListener("input", () => { S.panic.reason = reasonIn.value; });
+    const cRow = confirmRow(
+      { text: "Confirm emergency panic stop? Every active session, proxy tunnel, box, and rewrite rule will be cut immediately.", yes: "Confirm panic stop", no: "Cancel", danger: true },
+      () => runPanic(),
+      () => { S.panic.confirm = false; S.panic.focusConfirm = false; renderDaemonStatus(); requestAnimationFrame(() => focusKey("daemon:panic")); },
+      "panic:",
+    );
+    cRow.prepend(reasonIn);
+    panicSec.append(cRow);
+  }
+  if (S.panic.error) panicSec.append(el("p", "error status-note", S.panic.error));
+  if (S.panic.report) panicSec.append(el("p", "okc status-note", C.formatPanicReport(S.panic.report)));
+  frag.append(panicSec);
+
   preserveFocus(body, () => body.replaceChildren(frag));
   if (S.gc.confirmApply && S.gc.focusConfirm) {
     S.gc.focusConfirm = false;
     const safe = body.querySelector('[data-focus-key="gc:ask:no"]');
+    if (safe) safe.focus({ preventScroll: true });
+  }
+  if (S.panic.confirm && S.panic.focusConfirm) {
+    S.panic.focusConfirm = false;
+    const safe = body.querySelector('[data-focus-key="panic:ask:no"]');
     if (safe) safe.focus({ preventScroll: true });
   }
 }
@@ -2978,8 +3062,12 @@ function renderEvidence(panel) {
       b.textContent = "Export SARIF";
     }
   }) : null;
-  if (sarifBtn) sarifBtn.dataset.focusKey = "evidence:sarif";
-  frag.append(heading("h2", "Claims and source evidence", sarifBtn, claims.length ? filters : null));
+  if (sarifBtn) {
+    sarifBtn.dataset.focusKey = "evidence:sarif";
+    sarifBtn.title = `Export SARIF 2.1.0 report (${C.EXPORT_SANITIZED_NOTE})`;
+  }
+  const sarifWrap = sarifBtn ? add(el("span", "export-actions"), sarifBtn, el("span", "dim export-note", C.EXPORT_SANITIZED_NOTE)) : null;
+  frag.append(heading("h2", "Claims and source evidence", sarifWrap, claims.length ? filters : null));
   const about = el("p", "dim evidence-about");
   add(about, document.createTextNode("Two separate checks appear below. "), el("strong", "", "Quote match"),
     document.createTextNode(" means the runtime found the quoted text in the stored output. "), el("strong", "", "Claim status"),
@@ -5566,6 +5654,11 @@ function scopeGrantForm() {
     noteEl.textContent = "Granting…";
     try {
       await api("POST", req.path, req.body);
+      const info = S.sessions.byId.get(id);
+      const revSet = info && info.mission ? S.revokedHosts.get(info.mission) : null;
+      if (revSet) {
+        for (const h of req.body.hosts) revSet.delete(h.toLowerCase());
+      }
       hostsIn.value = "";
       noteIn.value = "";
       noteEl.className = "rule-note okc";
@@ -5873,8 +5966,61 @@ function renderNetwork(p) {
     rewritesSlot = el("div", "net-rewrites-slot");
     p.replaceChildren(grantedSlot, form.box, decisionsSlot, requestsSlot, noiseSlot, rewritesSlot);
   }
-  const granted = S.ledger.model ? [el("p", "dim", C.scopeLine(S.ledger.model))] : [];
-  grantedSlot.replaceChildren(...granted);
+  const info = S.sessions.byId.get(S.openId);
+  const missionId = info && info.mission ? info.mission : null;
+  const revSet = missionId ? S.revokedHosts.get(missionId) : null;
+  const hostItems = C.activeGrantedHosts(S.ledger.model, revSet);
+  const grantedNodes = [];
+  if (S.ledger.model) {
+    if (!hostItems.length) {
+      grantedNodes.push(el("p", "dim", C.scopeLine(S.ledger.model)));
+    } else {
+      const box = el("div", "scope-granted");
+      box.append(el("div", "scope-grant-head", "Hosts granted by the operator"));
+      const ul = el("ul", "scope-host-list");
+      for (const item of hostItems) {
+        const hostKey = `${S.openId}:${item.host.toLowerCase()}`;
+        const li = el("li", "scope-host-row");
+        li.append(el("span", "mono scope-host-name" + (item.revoked ? " dim" : ""), item.host));
+        if (item.revoked) {
+          li.append(chip("revoked", "dim"));
+        } else {
+          const busy = S.scopeRevoking.has(hostKey);
+          const revBtn = btn(busy ? "Revoking…" : "Revoke", "small danger", async () => {
+            if (S.scopeRevoking.has(hostKey)) return;
+            const req = C.scopeRevokeRequest(S.openId, [item.host]);
+            if (req.error) { notice(req.error); return; }
+            S.scopeRevoking.add(hostKey);
+            want("right");
+            try {
+              const receipt = await api("POST", req.path, req.body);
+              if (missionId) {
+                let set = S.revokedHosts.get(missionId);
+                if (!set) { set = new Set(); S.revokedHosts.set(missionId, set); }
+                set.add(item.host.toLowerCase());
+              }
+              toast(C.formatScopeRevoke(receipt));
+              loadLedger();
+              loadNet();
+            } catch (e) {
+              notice(e.message);
+            } finally {
+              S.scopeRevoking.delete(hostKey);
+              want("right");
+            }
+          });
+          revBtn.disabled = busy;
+          revBtn.title = `Revoke access to ${item.host} and cut matching live proxy tunnels`;
+          revBtn.dataset.focusKey = "scope-revoke:" + item.host.toLowerCase();
+          li.append(revBtn);
+        }
+        ul.append(li);
+      }
+      box.append(ul);
+      grantedNodes.push(box);
+    }
+  }
+  preserveFocus(grantedSlot, () => grantedSlot.replaceChildren(...grantedNodes));
 
   const error = S.netError ? [el("p", "error", S.netError)] : [];
   const decisionNodes = [];
@@ -5964,7 +6110,7 @@ function requestsSection() {
       }
     });
     exportHar.disabled = S.harBusy.exporting;
-    exportHar.title = activeHost ? `Export HAR filtered to host ${activeHost}` : "Export all captured requests as HAR 1.2";
+    exportHar.title = (activeHost ? `Export HAR filtered to host ${activeHost}` : "Export all captured requests as HAR 1.2") + ` (${C.EXPORT_SANITIZED_NOTE})`;
     exportHar.dataset.focusKey = "net:export-har";
     const importHar = btn(S.harBusy.importing ? "Importing…" : "Import HAR…", "small", () => harFile.click());
     importHar.disabled = S.harBusy.importing;
@@ -5972,6 +6118,7 @@ function requestsSection() {
     add(head, add(el("div", "net-actions"), exportHar, importHar, harFile));
   }
   box.append(head);
+  if (info && info.mission) box.append(el("p", "dim export-note", C.EXPORT_SANITIZED_NOTE));
   const all = allExchanges();
   if (S.exch.error) box.append(el("p", "error", S.exch.error));
   if (!all.length) { box.append(el("p", "dim", S.exch.loaded ? C.exchangeCountLine(0, 0) : "Loading requests…")); return box; }
@@ -8092,6 +8239,7 @@ function wire() {
     if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); cancelComposerStopConfirm(); }
   });
   $("connection-wrap").addEventListener("click", (e) => openDaemonStatus(e.currentTarget));
+  $("btn-panic")?.addEventListener("click", (e) => openDaemonStatus(e.currentTarget, { askPanic: true }));
   $("daemon-status-close").addEventListener("click", closeDaemonStatus);
   $("daemon-status-refresh").addEventListener("click", refreshDaemonStatus);
   $("daemon-status").addEventListener("click", (e) => { if (e.target === $("daemon-status")) closeDaemonStatus(); });
@@ -8102,11 +8250,19 @@ function wire() {
       S.gc.focusConfirm = false;
       renderDaemonStatus();
       requestAnimationFrame(() => focusKey("daemon:gc-run"));
+    } else if (S.panic.confirm) {
+      e.preventDefault();
+      S.panic.confirm = false;
+      S.panic.focusConfirm = false;
+      renderDaemonStatus();
+      requestAnimationFrame(() => focusKey("daemon:panic"));
     }
   });
   $("daemon-status").addEventListener("close", () => {
     S.gc.confirmApply = false;
     S.gc.focusConfirm = false;
+    S.panic.confirm = false;
+    S.panic.focusConfirm = false;
     const o = statusOpener;
     statusOpener = null;
     if (o && document.contains(o)) o.focus({ preventScroll: true });

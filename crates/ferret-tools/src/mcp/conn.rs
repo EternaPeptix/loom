@@ -20,6 +20,8 @@ use crate::ToolCtx;
 pub(super) const STDERR_RING: usize = 200;
 /// Longest stderr line kept, in characters.
 const STDERR_LINE_CHARS: usize = 2000;
+/// Maximum bytes accepted for a single MCP stdio line or HTTP/SSE response body (4 MiB).
+pub(super) const MAX_MSG_BYTES: usize = 4 * 1024 * 1024;
 
 pub(super) fn lock<T>(m: &StdMutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -355,14 +357,77 @@ impl Drop for Stdio {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ReadLine {
+    Eof,
+    Line,
+    TooLong,
+}
+
+/// Read one `\n`-terminated line into `buf`, bounding memory at `cap` bytes.
+/// When `drain_overflow` is true (stderr), bytes beyond `cap` up to `\n` are discarded without
+/// allocating; otherwise returns [`ReadLine::TooLong`] immediately so the caller fails closed.
+async fn read_line_capped<R: tokio::io::AsyncBufRead + Unpin>(
+    r: &mut R,
+    buf: &mut Vec<u8>,
+    cap: usize,
+    drain_overflow: bool,
+) -> std::io::Result<ReadLine> {
+    buf.clear();
+    let mut overflow = false;
+    loop {
+        let chunk = r.fill_buf().await?;
+        if chunk.is_empty() {
+            return Ok(if buf.is_empty() && !overflow {
+                ReadLine::Eof
+            } else if overflow {
+                ReadLine::TooLong
+            } else {
+                ReadLine::Line
+            });
+        }
+        if let Some(nl) = chunk.iter().position(|&b| b == b'\n') {
+            let take = nl + 1;
+            if !overflow {
+                if buf.len().saturating_add(take) > cap {
+                    if drain_overflow {
+                        let room = cap.saturating_sub(buf.len());
+                        buf.extend_from_slice(&chunk[..room]);
+                    }
+                    r.consume(take);
+                    return Ok(ReadLine::TooLong);
+                }
+                buf.extend_from_slice(&chunk[..take]);
+            }
+            r.consume(take);
+            return Ok(if overflow { ReadLine::TooLong } else { ReadLine::Line });
+        }
+        let len = chunk.len();
+        if !overflow {
+            if buf.len().saturating_add(len) > cap {
+                if drain_overflow {
+                    let room = cap.saturating_sub(buf.len());
+                    buf.extend_from_slice(&chunk[..room]);
+                    overflow = true;
+                } else {
+                    r.consume(len);
+                    return Ok(ReadLine::TooLong);
+                }
+            } else {
+                buf.extend_from_slice(chunk);
+            }
+        }
+        r.consume(len);
+    }
+}
+
 async fn read_stderr(stderr: ChildStderr, shared: Arc<Shared>) {
     let mut r = BufReader::new(stderr);
     let mut buf = Vec::new();
     loop {
-        buf.clear();
-        match r.read_until(b'\n', &mut buf).await {
-            Ok(0) | Err(_) => return,
-            Ok(_) => shared.push_line(&buf),
+        match read_line_capped(&mut r, &mut buf, MAX_MSG_BYTES, true).await {
+            Ok(ReadLine::Eof) | Err(_) => return,
+            Ok(ReadLine::Line | ReadLine::TooLong) => shared.push_line(&buf),
         }
     }
 }
@@ -376,11 +441,16 @@ async fn read_stdout(
 ) {
     let mut r = BufReader::new(stdout);
     let mut buf = Vec::new();
+    let mut lost_reason = "the server closed its output (it exited)".to_string();
     loop {
-        buf.clear();
-        match r.read_until(b'\n', &mut buf).await {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
+        match read_line_capped(&mut r, &mut buf, MAX_MSG_BYTES, false).await {
+            Ok(ReadLine::Eof) | Err(_) => break,
+            Ok(ReadLine::TooLong) => {
+                lost_reason = format!("the server sent a message larger than {MAX_MSG_BYTES} bytes");
+                shared.push_line(b"[ferret] server stdout line exceeded 4 MiB cap; closing connection");
+                break;
+            }
+            Ok(ReadLine::Line) => {}
         }
         let line = buf.trim_ascii();
         if line.is_empty() {
@@ -410,7 +480,7 @@ async fn read_stdout(
     alive.store(false, Ordering::SeqCst);
     let waiting: Vec<_> = lock(&pending).drain().collect();
     for (_, tx) in waiting {
-        let _ = tx.send(Err(Fail::Lost("the server closed its output (it exited)".into())));
+        let _ = tx.send(Err(Fail::Lost(lost_reason.clone())));
     }
 }
 
@@ -453,52 +523,79 @@ pub(super) struct Http {
     alive: Arc<AtomicBool>,
 }
 
-/// Splits a stream of bytes into the `data` of its server-sent events.
+/// Splits a stream of bytes into the `data` of its server-sent events, bounded to prevent OOM.
 #[derive(Default)]
 struct Sse {
     buf: Vec<u8>,
     data: Vec<String>,
+    data_bytes: usize,
 }
 
 impl Sse {
-    fn push(&mut self, chunk: &[u8]) -> Vec<String> {
+    fn push_capped(&mut self, chunk: &[u8], cap: usize) -> Result<Vec<String>, String> {
+        if self.buf.len().saturating_add(chunk.len()) > cap {
+            return Err(format!("the event stream line exceeded the {cap}-byte cap"));
+        }
         self.buf.extend_from_slice(chunk);
         let mut events = Vec::new();
         while let Some(at) = self.buf.iter().position(|b| *b == b'\n') {
             let raw: Vec<u8> = self.buf.drain(..=at).collect();
             let line = String::from_utf8_lossy(&raw);
             let line = line.trim_end_matches(['\n', '\r']);
-            if let Some(ev) = self.line(line) {
+            if let Some(ev) = self.line(line, cap)? {
                 events.push(ev);
             }
         }
-        events
+        Ok(events)
     }
 
-    fn finish(&mut self) -> Option<String> {
+    fn finish(&mut self, cap: usize) -> Result<Option<String>, String> {
         if !self.buf.is_empty() {
             let raw = std::mem::take(&mut self.buf);
             let line = String::from_utf8_lossy(&raw).trim_end_matches(['\n', '\r']).to_string();
-            if let Some(ev) = self.line(&line) {
-                return Some(ev);
+            if let Some(ev) = self.line(&line, cap)? {
+                return Ok(Some(ev));
             }
         }
-        self.line("")
+        self.line("", cap)
     }
 
-    fn line(&mut self, line: &str) -> Option<String> {
+    fn line(&mut self, line: &str, cap: usize) -> Result<Option<String>, String> {
         if line.is_empty() {
-            return (!self.data.is_empty()).then(|| std::mem::take(&mut self.data).join("\n"));
+            self.data_bytes = 0;
+            return Ok((!self.data.is_empty()).then(|| std::mem::take(&mut self.data).join("\n")));
         }
         if line.starts_with(':') {
-            return None;
+            return Ok(None);
         }
         let (field, value) = line.split_once(':').unwrap_or((line, ""));
         if field == "data" {
-            self.data.push(value.strip_prefix(' ').unwrap_or(value).to_string());
+            let text = value.strip_prefix(' ').unwrap_or(value);
+            self.data_bytes = self.data_bytes.saturating_add(text.len());
+            if self.data_bytes > cap {
+                return Err(format!("the event stream payload exceeded the {cap}-byte cap"));
+            }
+            self.data.push(text.to_string());
         }
-        None
+        Ok(None)
     }
+}
+
+/// Read an HTTP response body up to `cap` bytes without unbounded buffering.
+async fn read_body_capped(mut resp: reqwest::Response, cap: usize) -> Result<Vec<u8>, Fail> {
+    if resp.content_length().is_some_and(|n| n > cap as u64) {
+        return Err(Fail::Lost(format!("the server response exceeded the {cap}-byte cap")));
+    }
+    let mut buf = Vec::new();
+    while let Some(chunk) =
+        resp.chunk().await.map_err(|e| Fail::Lost(format!("the answer failed: {}", e.without_url())))?
+    {
+        if buf.len().saturating_add(chunk.len()) > cap {
+            return Err(Fail::Lost(format!("the server response exceeded the {cap}-byte cap")));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
 }
 
 impl Http {
@@ -544,14 +641,15 @@ impl Http {
         rb
     }
 
-    /// The request as it goes out (headers the transport adds are included; stored as sent, C5).
+    /// The request as recorded for traffic capture: configured server auth headers (`self.extra`) are
+    /// always redacted before capture so plaintext secrets never enter `BlobStore` or `Event::Exchange`.
     fn request_wire(&self, body: &Value) -> Vec<u8> {
         let mut headers: Vec<(String, String)> = vec![
             ("Accept".into(), "application/json, text/event-stream".into()),
             ("Content-Type".into(), "application/json".into()),
         ];
-        for (n, v) in &self.extra {
-            headers.push((n.to_string(), v.to_str().unwrap_or_default().to_string()));
+        for (n, _) in &self.extra {
+            headers.push((n.to_string(), "[redacted]".into()));
         }
         if let Some(s) = self.session() {
             headers.push(("Mcp-Session-Id".into(), s));
@@ -629,8 +727,16 @@ impl Http {
             });
         };
         if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            note(text.as_bytes(), None);
+            let raw = match read_body_capped(resp, MAX_MSG_BYTES).await {
+                Ok(b) => b,
+                Err(Fail::Lost(why)) => {
+                    note(&[], Some(why.clone()));
+                    return Err(Fail::Lost(format!("the server answered HTTP {status} ({why})")));
+                }
+                Err(other) => return Err(other),
+            };
+            note(&raw, None);
+            let text = String::from_utf8_lossy(&raw);
             if let Ok(msg) = serde_json::from_str::<Value>(&text) {
                 if let Incoming::Response(_, Err(fail)) = classify(&msg) {
                     return Err(fail);
@@ -646,6 +752,7 @@ impl Http {
         if content_type.starts_with("text/event-stream") {
             let mut sse = Sse::default();
             let mut seen: Vec<u8> = Vec::new();
+            let mut total_bytes: usize = 0;
             loop {
                 let chunk = match resp.chunk().await {
                     Ok(Some(c)) => c,
@@ -656,24 +763,50 @@ impl Http {
                         return Err(Fail::Lost(why));
                     }
                 };
-                if seen.len() < crate::traffic::CAPTURE_MAX_BYTES {
-                    seen.extend_from_slice(&chunk);
+                total_bytes = total_bytes.saturating_add(chunk.len());
+                if total_bytes > MAX_MSG_BYTES {
+                    let why = format!("the event stream exceeded the {MAX_MSG_BYTES}-byte cap");
+                    note(&seen, Some(why.clone()));
+                    return Err(Fail::Lost(why));
                 }
-                for data in sse.push(&chunk) {
+                let room = crate::traffic::CAPTURE_MAX_BYTES.saturating_sub(seen.len());
+                if room > 0 {
+                    seen.extend_from_slice(&chunk[..chunk.len().min(room)]);
+                }
+                let events = match sse.push_capped(&chunk, MAX_MSG_BYTES) {
+                    Ok(evs) => evs,
+                    Err(why) => {
+                        note(&seen, Some(why.clone()));
+                        return Err(Fail::Lost(why));
+                    }
+                };
+                for data in events {
                     if let Some(r) = self.on_message(&data, want).await {
+                        note(&seen, None);
                         return r;
                     }
                 }
             }
             note(&seen, None);
-            if let Some(data) = sse.finish() {
+            let tail = match sse.finish(MAX_MSG_BYTES) {
+                Ok(t) => t,
+                Err(why) => return Err(Fail::Lost(why)),
+            };
+            if let Some(data) = tail {
                 if let Some(r) = self.on_message(&data, want).await {
                     return r;
                 }
             }
             return Err(Fail::Lost("the event stream ended without an answer".into()));
         }
-        let bytes = resp.bytes().await.map_err(|e| Fail::Lost(format!("the answer failed: {}", e.without_url())))?;
+        let bytes = match read_body_capped(resp, MAX_MSG_BYTES).await {
+            Ok(b) => b,
+            Err(Fail::Lost(why)) => {
+                note(&[], Some(why.clone()));
+                return Err(Fail::Lost(why));
+            }
+            Err(other) => return Err(other),
+        };
         note(&bytes, None);
         let text = String::from_utf8_lossy(&bytes).into_owned();
         if let Some(r) = self.on_message(&text, want).await {
@@ -758,10 +891,34 @@ mod tests {
         let mut got = Vec::new();
         for c in [&b"event: message\r\ndata: {\"a\""[..], b":1}\r\n\r\n: comment\n", b"data: x\ndata: y\n\ndata: tail"]
         {
-            got.extend(s.push(c));
+            got.extend(s.push_capped(c, MAX_MSG_BYTES).unwrap());
         }
-        got.extend(s.finish());
+        got.extend(s.finish(MAX_MSG_BYTES).unwrap());
         assert_eq!(got, vec!["{\"a\":1}".to_string(), "x\ny".to_string(), "tail".to_string()]);
+    }
+
+    #[test]
+    fn sse_rejects_oversized_line_or_payload() {
+        let mut s = Sse::default();
+        assert!(s.push_capped(&[b'a'; 128], 64).is_err());
+        let mut s2 = Sse::default();
+        assert!(s2.push_capped(b"data: 01234567890123456789\n", 32).is_ok());
+        assert!(s2.push_capped(b"data: 01234567890123456789\n", 32).is_err());
+    }
+
+    #[tokio::test]
+    async fn read_line_capped_enforces_limit_for_stdout_and_drains_stderr() {
+        let mut r = BufReader::new(&b"0123456789abcdef\nnext\n"[..]);
+        let mut buf = Vec::new();
+        assert_eq!(read_line_capped(&mut r, &mut buf, 8, false).await.unwrap(), ReadLine::TooLong);
+        assert!(buf.len() <= 8);
+
+        let mut r2 = BufReader::new(&b"0123456789abcdef\nnext\n"[..]);
+        let mut buf2 = Vec::new();
+        assert_eq!(read_line_capped(&mut r2, &mut buf2, 8, true).await.unwrap(), ReadLine::TooLong);
+        assert_eq!(buf2, b"01234567");
+        assert_eq!(read_line_capped(&mut r2, &mut buf2, 8, true).await.unwrap(), ReadLine::Line);
+        assert_eq!(buf2, b"next\n");
     }
 
     #[test]

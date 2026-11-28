@@ -202,6 +202,7 @@ pub async fn run_until(paths: Paths, stop: CancellationToken, ready: impl FnOnce
         started_ms,
         shutdown: shutdown.clone(),
         logins: Arc::new(auth::Logins::new()),
+        auth_limiter: Arc::new(auth::AuthRateLimiter::default()),
         signal_health,
     };
     tracing::info!("ferret daemon listening on http://{bind} (home {})", paths.home.display());

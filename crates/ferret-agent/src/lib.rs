@@ -26,3 +26,5 @@ pub mod runtime;
 pub mod session;
 pub mod texts;
 pub mod traffic;
+
+pub use runtime::{PanicReport, ScopeRevokeReceipt};

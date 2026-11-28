@@ -704,3 +704,199 @@ async fn intercept_scope_captures_nothing_of_an_out_of_scope_plain_request() {
     plain_via_proxy(&e2, plain_get(&e2, port, "")).await;
     next(&mut e2.rx).await;
 }
+
+// ---- sensitive rewrite pre-capture redaction & live MITM cutoff ----
+
+use crate::rewrite::{RewriteAction, RewriteMatcher, RewritePhase, RewriteRule, RewriteSet};
+
+#[tokio::test]
+async fn sensitive_rewrite_injects_real_secret_on_wire_but_redacts_plain_http_capture_and_blobs() {
+    let mut e = env(cg(1024)).await;
+    let bearer_secret = "Bearer supersecret-plain-token-9999";
+    let cookie_secret = "cookie-secret-val-8888";
+    e.proxy.set_rewrites(RewriteSet::compile(&[RewriteRule {
+        id: 1,
+        name: "inject secrets".into(),
+        enabled: true,
+        phase: RewritePhase::Request,
+        priority: 1,
+        matchers: RewriteMatcher { host: Some("127.0.0.1".into()), ..Default::default() },
+        actions: vec![
+            RewriteAction::SetHeader {
+                name: "Authorization".into(),
+                value: Some(bearer_secret.into()),
+                sensitive: true,
+            },
+            RewriteAction::ReplaceHeader {
+                name: "Cookie".into(),
+                regex: "sid=placeholder".into(),
+                value: Some(format!("sid={cookie_secret}")),
+                sensitive: true,
+            },
+            RewriteAction::SetHeader {
+                name: "X-Short-Pin".into(),
+                value: Some("1234".into()),
+                sensitive: true,
+            },
+            RewriteAction::SetHeader {
+                name: "X-Public".into(),
+                value: Some("non-sensitive-tag".into()),
+                sensitive: false,
+            },
+        ],
+        note: String::new(),
+    }]));
+
+    // Upstream server records wire request and echoes the raw secrets back in response header + body.
+    let heads: Heads = Arc::new(Mutex::new(Vec::new()));
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    let seen = heads.clone();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = l.accept().await {
+            let seen = seen.clone();
+            tokio::spawn(async move {
+                let _ = http_requests(&mut s, |head| {
+                    lock(&seen).push(head.to_string());
+                    let body = format!("echo supersecret-plain-token-9999 and {cookie_secret}");
+                    format!(
+                        "HTTP/1.1 200 OK\r\nX-Echo: supersecret-plain-token-9999\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    )
+                })
+                .await;
+            });
+        }
+    });
+
+    let req = plain_get(&e, port, "Cookie: theme=dark; sid=placeholder\r\n");
+    let resp = plain_via_proxy(&e, req).await;
+    assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+
+    // Wire request received by upstream contains the REAL secrets.
+    let wire = lock(&heads).last().cloned().unwrap();
+    assert!(wire.contains(&format!("Authorization: {bearer_secret}\r\n")), "{wire}");
+    assert!(wire.contains(&format!("Cookie: theme=dark; sid={cookie_secret}\r\n")), "{wire}");
+    assert!(wire.contains("X-Short-Pin: 1234\r\n"), "{wire}");
+    assert!(wire.contains("X-Public: non-sensitive-tag\r\n"), "{wire}");
+
+    // Captured request & response (and stored BlobStore bytes) contain ONLY [redacted], NEVER raw secrets.
+    let c = next(&mut e.rx).await;
+    let blobs = ferret_core::blob::BlobStore::open(e._dir.path().join("blobs")).unwrap();
+    let req_blob = blobs.put_bytes(&c.request).unwrap();
+    let resp_blob = blobs.put_bytes(c.response.as_ref().unwrap()).unwrap();
+    let cap_req = text(&blobs.read_all(&req_blob.id).unwrap());
+    let cap_resp = text(&blobs.read_all(&resp_blob.id).unwrap());
+
+    assert!(cap_req.contains("Authorization: [redacted]\r\n"), "{cap_req}");
+    assert!(cap_req.contains("Cookie: theme=dark; [redacted]\r\n"), "{cap_req}");
+    assert!(cap_req.contains("X-Short-Pin: [redacted]\r\n"), "{cap_req}");
+    assert!(cap_req.contains("X-Public: non-sensitive-tag\r\n"), "{cap_req}");
+    assert!(!cap_req.contains("supersecret-plain-token-9999"), "{cap_req}");
+    assert!(!cap_req.contains(cookie_secret), "{cap_req}");
+    assert!(!cap_req.contains("1234"), "{cap_req}");
+
+    assert!(cap_resp.contains("X-Echo: [redacted]\r\n"), "{cap_resp}");
+    assert!(cap_resp.contains("echo [redacted] and [redacted]"), "{cap_resp}");
+    assert!(!cap_resp.contains("supersecret-plain-token-9999"), "{cap_resp}");
+    assert!(!cap_resp.contains(cookie_secret), "{cap_resp}");
+}
+
+#[tokio::test]
+async fn sensitive_rewrite_injects_real_secret_on_wire_but_redacts_intercepted_https_capture() {
+    let mut e = env(intercepting()).await;
+    let bearer_secret = "Bearer supersecret-tls-token-7777";
+    e.proxy.set_rewrites(RewriteSet::compile(&[RewriteRule {
+        id: 1,
+        name: "tls auth".into(),
+        enabled: true,
+        phase: RewritePhase::Request,
+        priority: 1,
+        matchers: RewriteMatcher { host: Some("127.0.0.1".into()), ..Default::default() },
+        actions: vec![
+            RewriteAction::SetHeader {
+                name: "Authorization".into(),
+                value: Some(bearer_secret.into()),
+                sensitive: true,
+            },
+            RewriteAction::SetHeader {
+                name: "X-Short".into(),
+                value: Some("abcd".into()),
+                sensitive: true,
+            },
+            RewriteAction::SetHeader {
+                name: "X-Visible".into(),
+                value: Some("ok-tag".into()),
+                sensitive: false,
+            },
+        ],
+        note: String::new(),
+    }]));
+
+    let heads: Heads = Arc::new(Mutex::new(Vec::new()));
+    let seen = heads.clone();
+    let port = tls_server(move |mut s| {
+        let seen = seen.clone();
+        async move {
+            let _ = http_requests(&mut s, |head| {
+                lock(&seen).push(head.to_string());
+                let body = "reflected supersecret-tls-token-7777";
+                format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len())
+            })
+            .await;
+        }
+    })
+    .await;
+
+    let mut s = tunnel_tls(&e, port, true).await.expect("client trusts ferret CA");
+    let resp = roundtrip(&mut s, "GET /secret HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await;
+    assert!(resp.starts_with("HTTP/1.1 200 OK"), "{resp}");
+
+    let wire = lock(&heads).last().cloned().unwrap();
+    assert!(wire.contains(&format!("Authorization: {bearer_secret}\r\n")), "{wire}");
+    assert!(wire.contains("X-Short: abcd\r\n"), "{wire}");
+    assert!(wire.contains("X-Visible: ok-tag\r\n"), "{wire}");
+
+    let c = next(&mut e.rx).await;
+    let cap_req = text(&c.request);
+    let cap_resp = text(c.response.as_ref().unwrap());
+    assert!(cap_req.contains("Authorization: [redacted]\r\n"), "{cap_req}");
+    assert!(cap_req.contains("X-Short: [redacted]\r\n"), "{cap_req}");
+    assert!(cap_req.contains("X-Visible: ok-tag\r\n"), "{cap_req}");
+    assert!(!cap_req.contains("supersecret-tls-token-7777") && !cap_req.contains("abcd"), "{cap_req}");
+    assert!(cap_resp.contains("reflected [redacted]"), "{cap_resp}");
+    assert!(!cap_resp.contains("supersecret-tls-token-7777"), "{cap_resp}");
+}
+
+#[tokio::test]
+async fn revoke_and_revoke_hosts_immediately_sever_active_intercepted_https_tunnels() {
+    let e = env(intercepting()).await;
+    let sid = SessionId::from("s-capture");
+    let port1 = https_server().await;
+    let port2 = https_server().await;
+
+    let mut s1 = tunnel_tls(&e, port1, true).await.unwrap();
+    let mut s2 = tunnel_tls(&e, port2, true).await.unwrap();
+    let r1 = roundtrip(&mut s1, "GET /one HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await;
+    let r2 = roundtrip(&mut s2, "GET /two HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await;
+    assert!(r1.starts_with("HTTP/1.1 200") && r2.starts_with("HTTP/1.1 200"));
+
+    // Revoke only port1: s1 closes within milliseconds while s2 keeps working.
+    let started = std::time::Instant::now();
+    let cancelled = e.proxy.revoke_hosts(&sid, &[format!("127.0.0.1:{port1}")]).unwrap();
+    assert_eq!(cancelled, 1);
+    let mut buf = [0u8; 64];
+    let closed = timeout(Duration::from_millis(500), s1.read(&mut buf)).await.expect("s1 did not close promptly");
+    assert!(matches!(closed, Ok(0) | Err(_)), "expected EOF/error on revoked MITM tunnel: {closed:?}");
+    assert!(started.elapsed() < Duration::from_millis(500));
+
+    let r2b = roundtrip(&mut s2, "GET /still-open HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await;
+    assert!(r2b.ends_with("you asked: GET /still-open HTTP/1.1"), "{r2b}");
+
+    // Full session revoke severs s2 immediately.
+    let started = std::time::Instant::now();
+    e.proxy.revoke(&sid);
+    let closed = timeout(Duration::from_millis(500), s2.read(&mut buf)).await.expect("s2 did not close promptly");
+    assert!(matches!(closed, Ok(0) | Err(_)), "expected EOF/error after session revoke: {closed:?}");
+    assert!(started.elapsed() < Duration::from_millis(500));
+}

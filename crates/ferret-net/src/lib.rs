@@ -23,4 +23,5 @@ pub use proxy::{
 };
 pub use rewrite::{
     AssessmentUa, HeaderMatch, RewriteAction, RewriteMatcher, RewritePhase, RewriteRule, RewriteSet, RewriteStore,
+    RewrittenHead, RewrittenRawHead,
 };

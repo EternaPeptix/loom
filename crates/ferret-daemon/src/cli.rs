@@ -120,6 +120,7 @@
 
 use crate::client::{self, Client};
 use crate::render::{self, RecordOpts, Style};
+use crate::wire::{PanicReport, ScopeRevokeReceipt};
 use clap::{Args, Parser, Subcommand};
 use ferret_agent::runtime::{BusEvent, Delta, NewSession, RuleReceipt, ScopeReceipt, ANY_ROLE};
 use ferret_agent::session::Phase;
@@ -252,8 +253,10 @@ pub enum Command {
     Rule(RuleArgs),
     /// Record an approval for a mission
     Approve(ApproveArgs),
-    /// Let a mission's tools reach hosts (the operator's grant; ends with the session)
+    /// Let a mission's tools reach hosts, or revoke previously granted hosts (`ferret scope revoke <session> <host>...`)
     Scope(ScopeArgs),
+    /// Emergency kill-switch: sever all proxy tunnels, stop all active sessions, tear down boxes, and disable rewrites
+    Panic(PanicArgs),
     /// Close a mission without the goal established, giving the reason
     Release(ReleaseArgs),
     /// Delete stored tool outputs that no session or mission refers to any more (dry run unless --apply)
@@ -454,6 +457,9 @@ pub struct HarExportArgs {
     /// Maximum entries to export
     #[arg(long)]
     pub limit: Option<usize>,
+    /// Include raw credentials, cookies, and tokens in the exported HAR (redacted by default)
+    #[arg(long)]
+    pub include_secrets: bool,
 }
 
 #[derive(Args, Debug, Clone, PartialEq, Eq)]
@@ -749,6 +755,9 @@ pub struct SarifArgs {
     /// Git ref (e.g. refs/heads/main) for SARIF run properties
     #[arg(long, value_name = "REF")]
     pub git_ref: Option<String>,
+    /// Include raw credentials and tokens in the exported SARIF (redacted by default)
+    #[arg(long)]
+    pub include_secrets: bool,
 }
 
 #[derive(Args, Debug)]
@@ -796,14 +805,51 @@ pub struct ApproveArgs {
 
 #[derive(Args, Debug)]
 pub struct ScopeArgs {
-    /// A session id, the beginning of one, or `last`
+    /// A session id, the beginning of one, `last`, or `revoke` (`ferret scope revoke <session> <host>...`)
     pub session: String,
-    /// Why the hosts are granted (kept in the ledger)
+    /// Why the hosts are granted or revoked (kept in the ledger)
     #[arg(long)]
     pub note: Option<String>,
-    /// The hosts, one per argument, such as api.example.com or '*.example.com'
+    /// Output raw JSON
+    #[arg(long)]
+    pub json: bool,
+    /// The hosts, one per argument (or `<session> <host>...` after `revoke` / `grant`)
     #[arg(required = true)]
     pub hosts: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ScopeOp<'a> {
+    Grant { session: &'a str, hosts: &'a [String] },
+    Revoke { session: &'a str, hosts: &'a [String] },
+}
+
+impl ScopeArgs {
+    fn resolved(&self) -> Result<ScopeOp<'_>, String> {
+        if self.session.eq_ignore_ascii_case("revoke") {
+            if self.hosts.len() < 2 {
+                return Err("Usage: `ferret scope revoke <session> <host>... [--note <text>] [--json]`.".to_string());
+            }
+            return Ok(ScopeOp::Revoke { session: &self.hosts[0], hosts: &self.hosts[1..] });
+        }
+        if self.session.eq_ignore_ascii_case("grant") {
+            if self.hosts.len() < 2 {
+                return Err("Usage: `ferret scope grant <session> <host>... [--note <text>] [--json]`.".to_string());
+            }
+            return Ok(ScopeOp::Grant { session: &self.hosts[0], hosts: &self.hosts[1..] });
+        }
+        Ok(ScopeOp::Grant { session: &self.session, hosts: &self.hosts })
+    }
+}
+
+#[derive(Args, Debug, Clone, Default, PartialEq, Eq)]
+pub struct PanicArgs {
+    /// Optional reason recorded in stopped sessions and audit logs
+    #[arg(long)]
+    pub reason: Option<String>,
+    /// Output raw JSON
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1407,6 +1453,38 @@ fn scope_line(r: &ScopeReceipt) -> String {
         line.push_str("; this mission keeps no ledger, so the grant is not listed");
     }
     line
+}
+
+/// The line printed once the daemon accepted a scope revocation.
+fn scope_revoke_line(r: &ScopeRevokeReceipt) -> String {
+    let plural = if r.connections_cut == 1 { "connection" } else { "connections" };
+    format!(
+        "scope revoked for {}: {} ({} {plural} cut)",
+        r.session.as_str(),
+        r.revoked.join(", "),
+        r.connections_cut
+    )
+}
+
+/// The line printed once the emergency panic kill-switch finished.
+fn panic_line(r: &PanicReport) -> String {
+    let conn_w = if r.connections_cut == 1 { "connection" } else { "connections" };
+    let sess_w = if r.sessions_stopped.len() == 1 { "session" } else { "sessions" };
+    let box_w = if r.boxes_torn_down == 1 { "box" } else { "boxes" };
+    let rw_w = if r.rewrites_disabled == 1 { "rewrite rule" } else { "rewrite rules" };
+    let stopped_list = if r.sessions_stopped.is_empty() {
+        String::new()
+    } else {
+        let ids: Vec<&str> = r.sessions_stopped.iter().map(SessionId::as_str).collect();
+        format!(" ({})", ids.join(", "))
+    };
+    format!(
+        "panic stop complete: {} {conn_w} cut, {} {sess_w} stopped{stopped_list}, {} {box_w} torn down, {} {rw_w} disabled",
+        r.connections_cut,
+        r.sessions_stopped.len(),
+        r.boxes_torn_down,
+        r.rewrites_disabled
+    )
 }
 
 /// The line printed once the daemon accepted a release: the outcome in words, then what the lead was sent.
@@ -2159,9 +2237,32 @@ async fn dispatch(command: Command) -> Result<i32, String> {
         }
         Command::Scope(a) => {
             let c = client_of(&paths)?;
-            let id = c.resolve(&a.session).await?;
-            let receipt = c.grant_scope(&id, &a.hosts, a.note.as_deref()).await?;
-            outln(&scope_line(&receipt)).map(|()| 0)
+            match a.resolved()? {
+                ScopeOp::Grant { session, hosts } => {
+                    let id = c.resolve(session).await?;
+                    let receipt = c.grant_scope(&id, hosts, a.note.as_deref()).await?;
+                    if a.json {
+                        return json_out(&receipt);
+                    }
+                    outln(&scope_line(&receipt)).map(|()| 0)
+                }
+                ScopeOp::Revoke { session, hosts } => {
+                    let id = c.resolve(session).await?;
+                    let receipt = c.revoke_scope(&id, hosts, a.note.as_deref()).await?;
+                    if a.json {
+                        return json_out(&receipt);
+                    }
+                    outln(&scope_revoke_line(&receipt)).map(|()| 0)
+                }
+            }
+        }
+        Command::Panic(a) => {
+            let c = client_of(&paths)?;
+            let report = c.panic_stop_all(a.reason.as_deref()).await?;
+            if a.json {
+                return json_out(&report);
+            }
+            outln(&panic_line(&report)).map(|()| 0)
         }
         Command::Release(a) => {
             let reason = read_message(&a.reason, "reason")?;
@@ -2282,6 +2383,9 @@ async fn dispatch(command: Command) -> Result<i32, String> {
             if let Some(v) = a.git_ref.as_deref() {
                 query.push(("git_ref", v.to_string()));
             }
+            if a.include_secrets {
+                query.push(("sanitize", "false".to_string()));
+            }
             let doc = c.sarif(&mission, &query).await?;
             let mut text = serde_json::to_string_pretty(&doc)
                 .map_err(|e| format!("The SARIF report could not be written: {e}"))?;
@@ -2313,7 +2417,7 @@ async fn dispatch(command: Command) -> Result<i32, String> {
             HarAction::Export(a) => {
                 let c = client_of(&paths)?;
                 let mission = c.mission_of(&a.session).await?;
-                let doc = c.export_har(&mission, a.host.as_deref(), a.limit).await?;
+                let doc = c.export_har_with_options(&mission, a.host.as_deref(), a.limit, !a.include_secrets).await?;
                 let mut text = serde_json::to_string_pretty(&doc)
                     .map_err(|e| format!("The HAR document could not be written: {e}"))?;
                 text.push('\n');
@@ -4675,5 +4779,71 @@ mod tests {
         let paths = Paths::at(dir.path().join("empty-home"));
         let err = down(&paths, Duration::from_secs(1)).await.unwrap_err();
         assert!(err.starts_with("The ferret daemon is not running"), "{err}");
+    }
+
+    #[test]
+    fn scope_revoke_panic_and_include_secrets_parse_and_format() {
+        let Command::Scope(a) = ok(&["scope", "revoke", "s-1", "api.example.test", "cdn.example.test", "--note", "done", "--json"]) else {
+            panic!("not scope")
+        };
+        assert_eq!(a.note.as_deref(), Some("done"));
+        assert!(a.json);
+        assert_eq!(
+            a.resolved().unwrap(),
+            ScopeOp::Revoke { session: "s-1", hosts: &["api.example.test".into(), "cdn.example.test".into()] }
+        );
+
+        let Command::Scope(missing_host) = ok(&["scope", "revoke", "s-1"]) else { panic!("not scope") };
+        assert!(missing_host.resolved().is_err());
+
+        let Command::Scope(grant_explicit) = ok(&["scope", "grant", "last", "a.test"]) else { panic!("not scope") };
+        assert_eq!(grant_explicit.resolved().unwrap(), ScopeOp::Grant { session: "last", hosts: &["a.test".into()] });
+
+        let Command::Panic(p) = ok(&["panic"]) else { panic!("not panic") };
+        assert_eq!(p, PanicArgs { reason: None, json: false });
+        let Command::Panic(p) = ok(&["panic", "--reason", "out of scope", "--json"]) else { panic!("not panic") };
+        assert_eq!(p, PanicArgs { reason: Some("out of scope".into()), json: true });
+
+        let Command::Har { action: HarAction::Export(h) } = ok(&["har", "export", "last"]) else { panic!("not har") };
+        assert!(!h.include_secrets);
+        let Command::Har { action: HarAction::Export(h) } =
+            ok(&["har", "export", "last", "--include-secrets", "--host", "app.test"])
+        else {
+            panic!("not har")
+        };
+        assert!(h.include_secrets);
+        assert_eq!(h.host.as_deref(), Some("app.test"));
+
+        let Command::Sarif(s) = ok(&["sarif", "last"]) else { panic!("not sarif") };
+        assert!(!s.include_secrets);
+        let Command::Sarif(s) = ok(&["sarif", "last", "--include-secrets"]) else { panic!("not sarif") };
+        assert!(s.include_secrets);
+
+        let rev = ScopeRevokeReceipt {
+            session: SessionId::from("s-1"),
+            revoked: vec!["a.test".into(), "b.test".into()],
+            connections_cut: 2,
+        };
+        assert_eq!(scope_revoke_line(&rev), "scope revoked for s-1: a.test, b.test (2 connections cut)");
+
+        let rep = PanicReport {
+            connections_cut: 4,
+            sessions_stopped: vec![SessionId::from("s-1")],
+            boxes_torn_down: 1,
+            rewrites_disabled: 3,
+        };
+        assert_eq!(
+            panic_line(&rep),
+            "panic stop complete: 4 connections cut, 1 session stopped (s-1), 1 box torn down, 3 rewrite rules disabled"
+        );
+    }
+
+    #[test]
+    fn docs_config_example_toml_parses_and_checks_cleanly() {
+        let raw = include_str!("../../../docs/config.example.toml");
+        let cfg = Config::parse(raw).expect("docs/config.example.toml must parse cleanly");
+        cfg.check().expect("docs/config.example.toml must pass Config::check");
+        assert_eq!(cfg.signal.inbox_delay_secs, 0);
+        assert!(!cfg.agents.project_instructions_in_security_packs);
     }
 }

@@ -282,6 +282,35 @@ pub fn scope_granted(hosts: &[String], note: Option<&str>) -> String {
     )
 }
 
+/// The operator revoked network access to `hosts` for the mission; active connections were severed.
+pub fn scope_revoked(hosts: &[String], note: Option<&str>, connections_cut: usize) -> String {
+    let note = note
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(|n| format!(" Operator's note: {}", sentence(n)))
+        .unwrap_or_default();
+    let cut = if connections_cut == 1 {
+        "1 active connection was cut".to_string()
+    } else {
+        format!("{connections_cut} active connections were cut")
+    };
+    format!(
+        "The operator revoked network access to: {}. Access to these hosts is denied immediately ({cut}).{note}",
+        hosts.join(", ")
+    )
+}
+
+/// The operator triggered the emergency panic kill-switch.
+pub fn panic_stopped(reason: Option<&str>) -> String {
+    match reason.map(str::trim).filter(|r| !r.is_empty()) {
+        Some(r) => format!(
+            "Emergency panic stop triggered by the operator: {} All network grants were revoked, active sessions stopped, boxes torn down, and proxy rewrites disabled.",
+            sentence(r)
+        ),
+        None => "Emergency panic stop triggered by the operator. All network grants were revoked, active sessions stopped, boxes torn down, and proxy rewrites disabled.".to_string(),
+    }
+}
+
 /// The protected note recorded when the operator closes a mission short of its goal.
 pub fn released(reason: &str) -> String {
     format!(

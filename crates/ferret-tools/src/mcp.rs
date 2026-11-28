@@ -61,6 +61,8 @@ const MAX_DESCRIPTION_CHARS: usize = 2000;
 const MAX_PAGES: usize = 50;
 /// Lines of stderr in a failure.
 const FAIL_TAIL: usize = 40;
+/// Maximum size of a `file:` secret referenced by `[mcp.servers.<name>]` (64 KiB).
+pub const MAX_SECRET_FILE_BYTES: usize = 64 * 1024;
 
 /// A configured server with its secrets resolved. `Debug` never prints a value of `env` or `headers`.
 #[derive(Clone)]
@@ -82,7 +84,69 @@ impl std::fmt::Debug for McpServer {
     }
 }
 
-/// One `env`/`headers` value: `env:NAME`, `file:/path` (trimmed) or the literal.
+/// Read a private (`0600`, owner UID matching effective UID, regular file, no symlink follow) secret file
+/// up to `max_bytes`. Never includes file content in error messages.
+pub(crate) fn read_private_secret_file(path: &std::path::Path, label: &str, max_bytes: usize) -> Result<String, String> {
+    use std::io::Read;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut file = opts.open(path).map_err(|e| {
+        #[cfg(unix)]
+        if e.raw_os_error() == Some(libc::ELOOP) {
+            return format!("{label}: the file {} must not be a symlink", path.display());
+        }
+        format!("{label}: the file {} could not be read ({})", path.display(), e.kind())
+    })?;
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("{label}: the file {} could not be inspected ({})", path.display(), e.kind()))?;
+    if !meta.file_type().is_file() {
+        return Err(format!("{label}: the file {} must be a regular file", path.display()));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(format!(
+                "{label}: the file {} has permissions {:04o}; make it owner-only first (`chmod 600 {}`)",
+                path.display(),
+                mode,
+                path.display()
+            ));
+        }
+        // SAFETY: geteuid has no preconditions and returns the current process's effective UID.
+        let euid = unsafe { libc::geteuid() };
+        if meta.uid() != euid {
+            return Err(format!(
+                "{label}: the file {} is owned by uid {}, expected uid {euid}",
+                path.display(),
+                meta.uid()
+            ));
+        }
+    }
+    if meta.len() > max_bytes as u64 {
+        return Err(format!("{label}: the file {} exceeds the {max_bytes}-byte cap", path.display()));
+    }
+    let mut buf = Vec::new();
+    file.by_ref()
+        .take(max_bytes as u64 + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("{label}: the file {} could not be read ({})", path.display(), e.kind()))?;
+    if buf.len() > max_bytes {
+        return Err(format!("{label}: the file {} exceeds the {max_bytes}-byte cap", path.display()));
+    }
+    String::from_utf8(buf)
+        .map_err(|_| format!("{label}: the file {} is not valid UTF-8", path.display()))
+}
+
+/// One `env`/`headers` value: `env:NAME`, `file:/path` (trimmed, private `0600` regular file, `O_NOFOLLOW`,
+/// UID-matched, <= 64 KiB) or the literal.
 fn resolve_value(server: &str, kind: &str, key: &str, source: &str) -> Result<String, String> {
     let at = format!("mcp.servers.{server}.{kind}.{key}");
     if let Some(var) = source.strip_prefix("env:") {
@@ -92,10 +156,8 @@ fn resolve_value(server: &str, kind: &str, key: &str, source: &str) -> Result<St
         };
     }
     if let Some(path) = source.strip_prefix("file:") {
-        return match std::fs::read_to_string(path) {
-            Ok(v) => Ok(v.trim().to_string()),
-            Err(e) => Err(format!("{at}: the file {path} could not be read ({})", e.kind())),
-        };
+        let raw = read_private_secret_file(std::path::Path::new(path), &at, MAX_SECRET_FILE_BYTES)?;
+        return Ok(raw.trim().to_string());
     }
     Ok(source.to_string())
 }
@@ -218,15 +280,47 @@ impl McpHandle {
         &self.server
     }
 
-    /// Remove every resolved secret of the server from `text`.
-    fn redact(&self, text: &str) -> String {
-        let mut out = text.to_string();
-        for v in self.server.env.values().chain(self.server.headers.values()) {
+    /// All resolved secret values (and `<scheme> <token>` tokens for auth headers), sorted longest-first.
+    fn secret_values(&self) -> Vec<&str> {
+        let mut secrets: Vec<&str> = Vec::new();
+        for v in self.server.env.values() {
             if !v.is_empty() {
-                out = out.replace(v.as_str(), "[redacted]");
+                secrets.push(v.as_str());
             }
         }
+        for v in self.server.headers.values() {
+            if !v.is_empty() {
+                secrets.push(v.as_str());
+                // Also scrub bare token from `<scheme> <token>` headers (e.g. `Bearer <tok>`)
+                // when echoed back without the scheme prefix, matching `Secrets::for_items`.
+                if let Some((_, tok)) = v.trim().split_once(' ') {
+                    if tok.len() >= 6 && !tok.contains(' ') {
+                        secrets.push(tok);
+                    }
+                }
+            }
+        }
+        secrets.sort_by_key(|a| std::cmp::Reverse(a.len()));
+        secrets.dedup();
+        secrets
+    }
+
+    /// Remove every resolved secret of the server from `text`, longest secret first.
+    fn redact(&self, text: &str) -> String {
+        let mut out = text.to_string();
+        for v in self.secret_values() {
+            out = out.replace(v, "[redacted]");
+        }
         out
+    }
+
+    /// Remove every resolved secret of the server from raw HTTP wire bytes before traffic capture.
+    fn redact_bytes(&self, input: &[u8]) -> Vec<u8> {
+        let mut buf = input.to_vec();
+        for v in self.secret_values() {
+            buf = replace_bytes(&buf, v.as_bytes(), b"[redacted]");
+        }
+        buf
     }
 
     fn tail(&self, n: usize) -> Vec<String> {
@@ -436,6 +530,7 @@ impl McpHandle {
                 break;
             }
         }
+        verify_schema_pin(&self.server.name, &tools, self.server.cfg.pinned_schema_sha256.as_deref())?;
         let info = lock(&self.slot).info.clone();
         Ok(McpListing {
             server: self.server.name.clone(),
@@ -527,6 +622,107 @@ pub enum CallError {
     Interrupted,
     /// The server could not be started or the connection failed; `stderr_tail` is its last lines.
     Failed { reason: String, stderr_tail: Vec<String> },
+}
+
+fn replace_bytes(haystack: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return haystack.to_vec();
+    }
+    let mut out = Vec::with_capacity(haystack.len());
+    let mut i = 0;
+    while i <= haystack.len() - needle.len() {
+        if &haystack[i..i + needle.len()] == needle {
+            out.extend_from_slice(replacement);
+            i += needle.len();
+        } else {
+            out.push(haystack[i]);
+            i += 1;
+        }
+    }
+    out.extend_from_slice(&haystack[i..]);
+    out
+}
+
+/// Deterministic JSON serialization with recursively sorted object keys.
+fn canonical_json(v: &Value) -> String {
+    match v {
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {
+            serde_json::to_string(v).unwrap_or_default()
+        }
+        Value::Array(items) => {
+            let mut out = String::from("[");
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&canonical_json(item));
+            }
+            out.push(']');
+            out
+        }
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let mut out = String::from("{");
+            for (i, k) in keys.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&serde_json::to_string(k).unwrap_or_default());
+                out.push(':');
+                out.push_str(&canonical_json(&map[*k]));
+            }
+            out.push('}');
+            out
+        }
+    }
+}
+
+/// Compute a canonical lowercase hex SHA-256 hash over an MCP server's `tools/list` definitions
+/// (tool names, descriptions, and canonicalized `inputSchema` JSON), independent of paging/key order.
+pub fn schema_sha256(tools: &[McpToolDef]) -> String {
+    let mut entries: Vec<(&str, &str, String)> =
+        tools.iter().map(|t| (t.name.as_str(), t.description.as_str(), canonical_json(&t.input_schema))).collect();
+    entries.sort();
+    let mut canonical = String::from("[");
+    for (i, (name, desc, schema)) in entries.iter().enumerate() {
+        if i > 0 {
+            canonical.push(',');
+        }
+        canonical.push_str("{\"description\":");
+        canonical.push_str(&serde_json::to_string(desc).unwrap_or_default());
+        canonical.push_str(",\"inputSchema\":");
+        canonical.push_str(schema);
+        canonical.push_str(",\"name\":");
+        canonical.push_str(&serde_json::to_string(name).unwrap_or_default());
+        canonical.push('}');
+    }
+    canonical.push(']');
+    ferret_core::sha256_hex(canonical.as_bytes())
+}
+
+/// Verify an MCP server's `tools/list` schema against an optional operator-pinned SHA-256 hex digest.
+/// Returns the computed canonical SHA-256 digest on success.
+pub fn verify_schema_pin(server: &str, tools: &[McpToolDef], pinned_sha256: Option<&str>) -> Result<String, String> {
+    let actual = schema_sha256(tools);
+    if let Some(expected) = pinned_sha256.map(str::trim).filter(|s| !s.is_empty()) {
+        if !actual.eq_ignore_ascii_case(expected) {
+            return Err(format!(
+                "mcp.servers.{server}: tools/list schema SHA-256 mismatch (expected {expected}, got {actual}); refusing mutated tool definitions"
+            ));
+        }
+    }
+    Ok(actual)
+}
+
+/// Effective [`ToolClass`] for an MCP tool. Server-advertised `readOnlyHint` is untrusted by default
+/// and only downgrades `Exec -> Read` when the operator explicitly enables `trust_read_only_hints`.
+pub fn tool_class(def: &McpToolDef, trust_read_only_hints: bool) -> ToolClass {
+    if trust_read_only_hints && def.read_only_hint == Some(true) {
+        ToolClass::Read
+    } else {
+        ToolClass::Exec
+    }
 }
 
 /// `mcp__{server}__{tool}` with every character of `tool` outside `[A-Za-z0-9_-]` replaced by `_`, cut
@@ -706,7 +902,7 @@ impl Tool for McpTool {
             name: self.name.clone(),
             description: self.def.description.chars().take(MAX_DESCRIPTION_CHARS).collect(),
             parameters,
-            class: if self.def.read_only_hint == Some(true) { ToolClass::Read } else { ToolClass::Exec },
+            class: tool_class(&self.def, self.handle.server.cfg.trust_read_only_hints),
         }
     }
 
@@ -721,16 +917,19 @@ impl Tool for McpTool {
             .into_iter()
             .filter_map(|raw| {
                 let url = url::Url::parse(&raw.url).ok()?;
+                let req = self.handle.redact_bytes(&raw.request);
+                let resp = raw.response.as_deref().map(|r| self.handle.redact_bytes(r));
+                let err = raw.error.as_deref().map(|e| self.handle.redact(e));
                 crate::traffic::record(
                     ctx,
                     &crate::traffic::Made {
                         tool: &self.name,
                         url: &url,
                         method: "POST",
-                        request: &raw.request,
-                        response: raw.response.as_deref(),
+                        request: &req,
+                        response: resp.as_deref(),
                         status: raw.status,
-                        error: raw.error.clone(),
+                        error: err,
                         response_cut: false,
                         unverified: false,
                         started: raw.started,

@@ -127,46 +127,104 @@ pub(super) fn preflight(cfg: &SandboxCfg, exec: &Path, linux: bool) -> Result<()
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
-fn filter() -> io::Result<Vec<u8>> {
-    let arch = if cfg!(target_arch = "x86_64") {
-        0xc000_003e_u32
-    } else if cfg!(target_arch = "aarch64") {
-        0xc000_00b7_u32
-    } else {
-        return Err(invalid(
-            "Bubblewrap seccomp supports x86_64 and aarch64 Linux only. Use a supported host.".to_string(),
-        ));
+/// Linux `EPERM` value (identical on x86_64 and aarch64).
+#[cfg(any(target_os = "linux", test))]
+const LINUX_EPERM: u32 = 1;
+
+#[cfg(any(target_os = "linux", test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SeccompArch {
+    X86_64,
+    Aarch64,
+}
+
+/// Denied syscalls on x86_64 Linux: all network socket creation/connection syscalls plus high-risk
+/// kernel-attack and cross-process escape syscalls (`io_uring_setup`, `userfaultfd`, `ptrace`,
+/// `bpf`, `keyctl`, `add_key`, `request_key`, `process_vm_readv`, `process_vm_writev`).
+#[cfg(any(target_os = "linux", test))]
+const DENIED_SYSCALLS_X86_64: &[u32] = &[
+    41,  // socket
+    53,  // socketpair
+    42,  // connect
+    49,  // bind
+    50,  // listen
+    43,  // accept
+    288, // accept4
+    44,  // sendto
+    46,  // sendmsg
+    307, // sendmmsg
+    425, // io_uring_setup
+    323, // userfaultfd
+    101, // ptrace
+    321, // bpf
+    250, // keyctl
+    248, // add_key
+    249, // request_key
+    310, // process_vm_readv
+    311, // process_vm_writev
+];
+
+/// Denied syscalls on aarch64 Linux (asm-generic syscall table).
+#[cfg(any(target_os = "linux", test))]
+const DENIED_SYSCALLS_AARCH64: &[u32] = &[
+    198, // socket
+    199, // socketpair
+    203, // connect
+    200, // bind
+    201, // listen
+    202, // accept
+    242, // accept4
+    206, // sendto
+    211, // sendmsg
+    269, // sendmmsg
+    425, // io_uring_setup
+    282, // userfaultfd
+    117, // ptrace
+    280, // bpf
+    219, // keyctl
+    217, // add_key
+    218, // request_key
+    270, // process_vm_readv
+    271, // process_vm_writev
+];
+
+#[cfg(any(target_os = "linux", test))]
+fn filter_for_arch(arch: SeccompArch) -> Vec<u8> {
+    let (audit_arch, check_x32, denied) = match arch {
+        SeccompArch::X86_64 => (0xc000_003e_u32, true, DENIED_SYSCALLS_X86_64),
+        SeccompArch::Aarch64 => (0xc000_00b7_u32, false, DENIED_SYSCALLS_AARCH64),
     };
     // Classic BPF: load architecture, kill on a mismatch, then inspect syscall number.
-    let mut code = vec![(0x20_u16, 0_u8, 0_u8, 4_u32), (0x15, 1, 0, arch), (0x06, 0, 0, 0x8000_0000), (0x20, 0, 0, 0)];
-    if cfg!(target_arch = "x86_64") {
+    let mut code =
+        vec![(0x20_u16, 0_u8, 0_u8, 4_u32), (0x15, 1, 0, audit_arch), (0x06, 0, 0, 0x8000_0000), (0x20, 0, 0, 0)];
+    if check_x32 {
         // x32 uses the same audit architecture with different syscall numbers.
         code.extend([(0x45, 0, 1, 0x4000_0000), (0x06, 0, 0, 0x8000_0000)]);
     }
-    for nr in [
-        libc::SYS_socket,
-        libc::SYS_socketpair,
-        libc::SYS_connect,
-        libc::SYS_bind,
-        libc::SYS_listen,
-        libc::SYS_accept,
-        libc::SYS_accept4,
-        libc::SYS_sendto,
-        libc::SYS_sendmsg,
-        libc::SYS_sendmmsg,
-        libc::SYS_io_uring_setup,
-    ] {
-        code.extend([(0x15, 0, 1, nr as u32), (0x06, 0, 0, 0x0005_0000 | libc::EPERM as u32)]);
+    for &nr in denied {
+        code.extend([(0x15, 0, 1, nr), (0x06, 0, 0, 0x0005_0000 | LINUX_EPERM)]);
     }
     code.push((0x06, 0, 0, 0x7fff_0000));
-    let mut bytes = Vec::new();
+    let mut bytes = Vec::with_capacity(code.len() * 8);
     for (op, jt, jf, value) in code {
         bytes.extend_from_slice(&op.to_ne_bytes());
         bytes.extend([jt, jf]);
         bytes.extend_from_slice(&value.to_ne_bytes());
     }
-    Ok(bytes)
+    bytes
+}
+
+#[cfg(target_os = "linux")]
+fn filter() -> io::Result<Vec<u8>> {
+    if cfg!(target_arch = "x86_64") {
+        Ok(filter_for_arch(SeccompArch::X86_64))
+    } else if cfg!(target_arch = "aarch64") {
+        Ok(filter_for_arch(SeccompArch::Aarch64))
+    } else {
+        Err(invalid(
+            "Bubblewrap seccomp supports x86_64 and aarch64 Linux only. Use a supported host.".to_string(),
+        ))
+    }
 }
 
 pub(super) fn prepare(home: &Path) -> io::Result<PathBuf> {
@@ -183,7 +241,7 @@ pub(super) fn prepare(home: &Path) -> io::Result<PathBuf> {
         let bytes = filter()?;
         let dir = home.join("sandbox");
         ferret_core::config::ensure_private_dir(&dir)?;
-        let path = dir.join(format!("network-deny-v1-{}.bpf", std::env::consts::ARCH));
+        let path = dir.join(format!("network-deny-v2-{}.bpf", std::env::consts::ARCH));
         // The path lies in protected Ferret home, not model-writable session temp. Rewrite atomically
         // so concurrent session construction never exposes a partial program.
         let tmp = dir.join(format!(
@@ -548,6 +606,77 @@ mod tests {
         let bytes = std::fs::read(path).unwrap();
         assert_eq!(bytes, filter().unwrap());
         assert_eq!(bytes.len() % 8, 0);
+        // Verify compile-time syscall numbers match libc on this Linux target.
+        let expected: &[u32] = &[
+            libc::SYS_socket as u32,
+            libc::SYS_socketpair as u32,
+            libc::SYS_connect as u32,
+            libc::SYS_bind as u32,
+            libc::SYS_listen as u32,
+            libc::SYS_accept as u32,
+            libc::SYS_accept4 as u32,
+            libc::SYS_sendto as u32,
+            libc::SYS_sendmsg as u32,
+            libc::SYS_sendmmsg as u32,
+            libc::SYS_io_uring_setup as u32,
+            libc::SYS_userfaultfd as u32,
+            libc::SYS_ptrace as u32,
+            libc::SYS_bpf as u32,
+            libc::SYS_keyctl as u32,
+            libc::SYS_add_key as u32,
+            libc::SYS_request_key as u32,
+            libc::SYS_process_vm_readv as u32,
+            libc::SYS_process_vm_writev as u32,
+        ];
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(DENIED_SYSCALLS_X86_64, expected);
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(DENIED_SYSCALLS_AARCH64, expected);
+    }
+
+    #[test]
+    fn seccomp_bpf_blocks_network_and_kernel_escape_syscalls_on_x86_64_and_aarch64() {
+        fn decode_denied(bytes: &[u8]) -> (u32, bool, Vec<u32>) {
+            assert_eq!(bytes.len() % 8, 0);
+            let insns: Vec<(u16, u8, u8, u32)> = bytes
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| {
+                    (
+                        u16::from_ne_bytes([c[0], c[1]]),
+                        c[2],
+                        c[3],
+                        u32::from_ne_bytes([c[4], c[5], c[6], c[7]]),
+                    )
+                })
+                .collect();
+            let arch = insns[1].3;
+            let has_x32 = insns.iter().any(|&(op, _, _, k)| op == 0x45 && k == 0x4000_0000);
+            let mut denied = Vec::new();
+            for pair in insns.windows(2) {
+                if pair[0].0 == 0x15 && pair[0].1 == 0 && pair[0].2 == 1 && pair[1] == (0x06, 0, 0, 0x0005_0000 | LINUX_EPERM) {
+                    denied.push(pair[0].3);
+                }
+            }
+            assert_eq!(*insns.last().unwrap(), (0x06, 0, 0, 0x7fff_0000));
+            (arch, has_x32, denied)
+        }
+        let (x_arch, x_x32, x_denied) = decode_denied(&filter_for_arch(SeccompArch::X86_64));
+        assert_eq!(x_arch, 0xc000_003e);
+        assert!(x_x32);
+        assert_eq!(x_denied, DENIED_SYSCALLS_X86_64);
+        for nr in [323, 101, 321, 250, 248, 249, 310, 311, 425] {
+            assert!(x_denied.contains(&nr), "x86_64 syscall {nr} must be denied");
+        }
+
+        let (a_arch, a_x32, a_denied) = decode_denied(&filter_for_arch(SeccompArch::Aarch64));
+        assert_eq!(a_arch, 0xc000_00b7);
+        assert!(!a_x32);
+        assert_eq!(a_denied, DENIED_SYSCALLS_AARCH64);
+        for nr in [282, 117, 280, 219, 217, 218, 270, 271, 425] {
+            assert!(a_denied.contains(&nr), "aarch64 syscall {nr} must be denied");
+        }
     }
 
     #[test]

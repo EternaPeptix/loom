@@ -64,9 +64,9 @@
 
 use crate::wire::{
     AnswerBody, ApprovalBody, ArchiveBody, CreatedSession, DaemonFile, ErrorBody, GcBody, LinesView, McpCheckBody,
-    McpCheckView, McpServerView, MessageBody, MessageWhen, ModelBody, ModelsView, QueuedEditBody, RecordsPage,
-    ReleaseBody, RenameBody, RoleModelBody, RuleBody, ScopeBody, ScopeReceipt, SessionDetail, StatusView, UploadView,
-    WithdrawBody,
+    McpCheckView, McpServerView, MessageBody, MessageWhen, ModelBody, ModelsView, PanicBody, PanicReport,
+    QueuedEditBody, RecordsPage, ReleaseBody, RenameBody, RoleModelBody, RuleBody, ScopeBody, ScopeReceipt,
+    ScopeRevokeReceipt, SessionDetail, StatusView, UploadView, WithdrawBody,
 };
 use ferret_agent::runtime::{
     BusEvent, ExchangeEntry, InboxEntry, LedgerView, MissionInfo, MissionModels, ModelSwitchReceipt, ModelsReload,
@@ -603,6 +603,27 @@ impl Client {
         self.call(Method::POST, &format!("/api/sessions/{}/scope", segment(id.as_str())), &[], Some(body)).await
     }
 
+    /// Revoke `hosts` from the mission of `id`, cutting matching live proxy tunnels immediately.
+    pub async fn revoke_scope(
+        &self,
+        id: &SessionId,
+        hosts: &[String],
+        note: Option<&str>,
+    ) -> Result<ScopeRevokeReceipt, String> {
+        let body = serde_json::to_value(ScopeBody { hosts: hosts.to_vec(), note: note.map(str::to_string) })
+            .map_err(|e| format!("The scope revocation cannot be encoded ({e})."))?;
+        self.call(Method::POST, &format!("/api/sessions/{}/scope/revoke", segment(id.as_str())), &[], Some(body))
+            .await
+    }
+
+    /// Emergency panic kill-switch: sever all proxy tunnels, stop all active sessions, tear down
+    /// active boxes, and disable all rewrite rules.
+    pub async fn panic_stop_all(&self, reason: Option<&str>) -> Result<PanicReport, String> {
+        let body = serde_json::to_value(PanicBody { reason: reason.map(str::to_string) })
+            .map_err(|e| format!("The panic request cannot be encoded ({e})."))?;
+        self.call(Method::POST, "/api/panic", &[], Some(body)).await
+    }
+
     /// Close the mission of `id` without the goal established, for `reason`.
     pub async fn release(&self, id: &SessionId, reason: &str) -> Result<RuleReceipt, String> {
         let body = serde_json::to_value(ReleaseBody { reason: reason.to_string() })
@@ -884,12 +905,25 @@ impl Client {
         host: Option<&str>,
         limit: Option<usize>,
     ) -> Result<serde_json::Value, String> {
+        self.export_har_with_options(mission, host, limit, true).await
+    }
+
+    pub async fn export_har_with_options(
+        &self,
+        mission: &MissionId,
+        host: Option<&str>,
+        limit: Option<usize>,
+        sanitize: bool,
+    ) -> Result<serde_json::Value, String> {
         let mut query = Vec::new();
         if let Some(h) = host {
             query.push(("host", h.to_string()));
         }
         if let Some(n) = limit {
             query.push(("limit", n.to_string()));
+        }
+        if !sanitize {
+            query.push(("sanitize", "false".to_string()));
         }
         self.call(Method::GET, &format!("/api/missions/{}/har", segment(mission.as_str())), &query, None).await
     }
@@ -2112,5 +2146,58 @@ mod tests {
         std::fs::write(paths.config_file(), "not [toml").unwrap();
         let e = Client::from_home(&paths).err().unwrap();
         assert!(e.contains("config.toml"), "{e}");
+    }
+
+    #[tokio::test]
+    async fn scope_revoke_panic_and_har_sanitize_calls_hit_their_routes() {
+        let script = Script::default()
+            .route(
+                "POST",
+                "/api/sessions/s-1/scope/revoke",
+                200,
+                serde_json::json!({"session": "s-0", "revoked": ["a.test"], "connections_cut": 3}).to_string(),
+            )
+            .route(
+                "POST",
+                "/api/panic",
+                200,
+                serde_json::json!({
+                    "connections_cut": 5,
+                    "sessions_stopped": ["s-1", "s-2"],
+                    "boxes_torn_down": 1,
+                    "rewrites_disabled": 2
+                })
+                .to_string(),
+            )
+            .route("GET", "/api/missions/m-1/har", 200, serde_json::json!({"log": {"version": "1.2"}}).to_string());
+        let (client, shared) = start(script).await;
+
+        let rev = client.revoke_scope(&SessionId::from("s-1"), &["a.test".to_string()], Some("done")).await.unwrap();
+        assert_eq!(rev.session, SessionId::from("s-0"));
+        assert_eq!(rev.revoked, vec!["a.test".to_string()]);
+        assert_eq!(rev.connections_cut, 3);
+
+        let report = client.panic_stop_all(Some("abort")).await.unwrap();
+        assert_eq!(report.connections_cut, 5);
+        assert_eq!(report.sessions_stopped, vec![SessionId::from("s-1"), SessionId::from("s-2")]);
+        assert_eq!(report.boxes_torn_down, 1);
+        assert_eq!(report.rewrites_disabled, 2);
+
+        client.export_har(&MissionId::from("m-1"), Some("a.test"), Some(10)).await.unwrap();
+        client.export_har_with_options(&MissionId::from("m-1"), Some("a.test"), None, false).await.unwrap();
+
+        let seen = shared.lock().unwrap().seen.clone();
+        assert_eq!(seen[0].target, "/api/sessions/s-1/scope/revoke");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&seen[0].body).unwrap(),
+            serde_json::json!({"hosts": ["a.test"], "note": "done"})
+        );
+        assert_eq!(seen[1].target, "/api/panic");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&seen[1].body).unwrap(),
+            serde_json::json!({"reason": "abort"})
+        );
+        assert_eq!(seen[2].target, "/api/missions/m-1/har?host=a.test&limit=10");
+        assert_eq!(seen[3].target, "/api/missions/m-1/har?host=a.test&sanitize=false");
     }
 }
