@@ -308,6 +308,15 @@ and post-restart open-blocker reminders) and can answer or steer missions direct
   `persona`, zero tools or strictly `leave_note_for_owner` capped at 3 notes / 15 min and 500 chars),
   bounded by a 2000-character inbound limit, `rate_limit_per_hour`, and a per-guest single-flight guard.
   Owners manage guests via quote-replies or `/guests` and `/guest approve|revoke|block|unblock|clear|say`.
+  When `triage_notes = true`, incoming guest notes are triaged asynchronously via `Runtime::triage_guest_note`
+  (zero tools, `text_calls: false`, `Priority::Background`, 25s timeout, strict JSON allowlist, untrusted-data
+  framing, graceful fallback to plain note on error) and stored in a 100-entry ring in `signal_guests.json`
+  (mode `0600`) with atomic single-execution claims. Guest notes NEVER auto-run missions: only an explicit
+  owner quote-reply (`"do"`, `"do <extra>"`, `"do + reply"`) on a line-1-anchored
+  `[Ferret · GUEST NOTE · g-N · n-M from <name>]` alert spawns a mission in `action_workspace` (pack
+  `action_pack`, refused before directory creation if inside `<ferret home>` or its copies folder) with the
+  verbatim guest note fenced as untrusted reference context, while `"reply"` sends only the suggested reply
+  and all other text (including `"don't ..."`, `"doing ..."`, `"done"`) relays verbatim to the guest.
 
 
 

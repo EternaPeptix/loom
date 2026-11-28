@@ -842,6 +842,16 @@ pub struct SignalGuestsCfg {
     pub unknown_cooldown_hours: u64,
     /// Optional custom persona appended after the immutable safety preamble (max 2000 chars; default `""`).
     pub persona: String,
+    /// When `guests.enabled && allow_notes`, run the zero-tool triage LLM on incoming guest notes (default `true`).
+    pub triage_notes: bool,
+    /// Optional model profile override for guest note triage; falls back to `guests.model` -> daemon `default_model`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub triage_model: Option<String>,
+    /// Optional dedicated assistant workspace outside `~/.ferret` used when the owner confirms `"do"` on a triaged note.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_workspace: Option<PathBuf>,
+    /// Pack name used when spawning a confirmed note action mission (default `"core"`).
+    pub action_pack: String,
 }
 
 impl Default for SignalGuestsCfg {
@@ -859,11 +869,43 @@ impl Default for SignalGuestsCfg {
             max_reply_chars: 1500,
             unknown_cooldown_hours: 24,
             persona: String::new(),
+            triage_notes: true,
+            triage_model: None,
+            action_workspace: None,
+            action_pack: "core".to_string(),
         }
     }
 }
 
 impl SignalGuestsCfg {
+    /// Return `action_workspace` with a leading `~` or `~/` expanded using `HOME` if present.
+    pub fn resolved_action_workspace(&self) -> Option<PathBuf> {
+        let home = std::env::var_os("HOME").filter(|v| !v.is_empty()).map(PathBuf::from);
+        self.resolve_action_workspace_with_home(home.as_deref())
+    }
+
+    fn resolve_action_workspace_with_home(&self, home: Option<&Path>) -> Option<PathBuf> {
+        let raw = self.action_workspace.as_ref()?;
+        let Some(text) = raw.to_str() else {
+            return Some(raw.clone());
+        };
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        if trimmed == "~" {
+            return Some(home.map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from(trimmed)));
+        }
+        if let Some(rest) = trimmed.strip_prefix("~/") {
+            return Some(match home {
+                Some(h) if rest.is_empty() => h.to_path_buf(),
+                Some(h) => h.join(rest),
+                None => PathBuf::from(trimmed),
+            });
+        }
+        Some(PathBuf::from(trimmed))
+    }
+
     pub fn check(&self) -> Result<(), String> {
         if !self.enabled {
             return Ok(());
@@ -885,6 +927,31 @@ impl SignalGuestsCfg {
                     "signal.guests.model must be a non-empty model profile name without surrounding whitespace.".into(),
                 );
             }
+        }
+        if let Some(model) = self.triage_model.as_deref() {
+            if model.trim().is_empty() || model != model.trim() {
+                return Err(
+                    "signal.guests.triage_model must be a non-empty model profile name without surrounding whitespace."
+                        .into(),
+                );
+            }
+        }
+        if let Some(ws) = self.action_workspace.as_ref() {
+            let raw = ws.to_string_lossy();
+            if raw.trim().is_empty() || raw.chars().any(char::is_control) {
+                return Err(
+                    "signal.guests.action_workspace must be a non-empty path without control characters.".into(),
+                );
+            }
+        }
+        if self.action_pack.is_empty()
+            || matches!(self.action_pack.as_str(), "." | "..")
+            || self.action_pack.chars().any(|c| c.is_whitespace() || c.is_control() || matches!(c, '/' | '\\'))
+        {
+            return Err(
+                "signal.guests.action_pack must be a non-empty pack name without whitespace, control characters, or path separators."
+                    .into(),
+            );
         }
         let owner = self.owner_name.trim();
         if owner.is_empty() || owner.chars().count() > 100 || owner.chars().any(char::is_control) {
@@ -1491,7 +1558,7 @@ impl Config {
         self.mail.check().map_err(ConfigError::Invalid)?;
         self.signal.check().map_err(ConfigError::Invalid)?;
         if self.signal.enabled && self.signal.guests.enabled {
-            if let Some(model) = self.signal.guests.model.as_deref() {
+            let check_guest_model = |field: &str, model: &str| -> Result<(), ConfigError> {
                 if !self.models.contains_key(model) {
                     let names: Vec<&str> = self.models.keys().map(String::as_str).collect();
                     let available = if names.is_empty() {
@@ -1500,9 +1567,16 @@ impl Config {
                         format!("configured models: {}", names.join(", "))
                     };
                     return Err(ConfigError::Invalid(format!(
-                        "signal.guests.model \"{model}\" is not one of the configured models ({available})."
+                        "{field} \"{model}\" is not one of the configured models ({available})."
                     )));
                 }
+                Ok(())
+            };
+            if let Some(model) = self.signal.guests.model.as_deref() {
+                check_guest_model("signal.guests.model", model)?;
+            }
+            if let Some(model) = self.signal.guests.triage_model.as_deref() {
+                check_guest_model("signal.guests.triage_model", model)?;
             }
         }
         if let Some(ua) = self.network.target_user_agent.as_deref() {
@@ -2631,5 +2705,133 @@ enabled = true
             "p".repeat(2000),
         );
         Config::parse(&boundaries).unwrap().check().unwrap();
+    }
+
+    #[test]
+    fn signal_guests_triage_and_action_config_defaults_and_validation() {
+        // Default values are backward-compatible and safe.
+        let def = SignalGuestsCfg::default();
+        assert!(def.triage_notes);
+        assert!(def.triage_model.is_none());
+        assert!(def.action_workspace.is_none());
+        assert_eq!(def.action_pack, "core");
+        assert!(def.resolved_action_workspace().is_none());
+
+        let base = r#"
+[models.fast]
+base_url = "http://127.0.0.1:8000/v1"
+model = "fast-model"
+
+[models.triage]
+base_url = "http://127.0.0.1:8001/v1"
+model = "triage-model"
+
+[signal]
+enabled = true
+http_url = "http://127.0.0.1:1337"
+account = "+15550100"
+recipient = "+15550199"
+allow_from = ["+15550199"]
+
+[signal.guests]
+enabled = true
+"#;
+        // Existing configs omitting the new fields parse with backward-compatible defaults.
+        let parsed = Config::parse(base).unwrap();
+        parsed.check().unwrap();
+        assert!(parsed.signal.guests.triage_notes);
+        assert!(parsed.signal.guests.triage_model.is_none());
+        assert!(parsed.signal.guests.action_workspace.is_none());
+        assert_eq!(parsed.signal.guests.action_pack, "core");
+
+        // Explicit valid triage_notes, triage_model, action_workspace, and action_pack pass.
+        let full = format!(
+            "{base}triage_notes = false\ntriage_model = \"triage\"\naction_workspace = \"~/ferret-assistant\"\naction_pack = \"assistant-pack_1\"\n"
+        );
+        let parsed_full = Config::parse(&full).unwrap();
+        parsed_full.check().unwrap();
+        assert!(!parsed_full.signal.guests.triage_notes);
+        assert_eq!(parsed_full.signal.guests.triage_model.as_deref(), Some("triage"));
+        assert_eq!(parsed_full.signal.guests.action_workspace.as_deref(), Some(Path::new("~/ferret-assistant")));
+        assert_eq!(parsed_full.signal.guests.action_pack, "assistant-pack_1");
+
+        // Unknown or blank/padded triage_model is rejected when signal.enabled && signal.guests.enabled.
+        for bad_triage_model in ["nonexistent", "", "   ", " triage", "triage "] {
+            let cfg = format!("{base}triage_model = \"{bad_triage_model}\"\n");
+            let err = Config::parse(&cfg).unwrap().check().unwrap_err().to_string();
+            assert!(err.contains("signal.guests.triage_model"), "{bad_triage_model:?}: {err}");
+        }
+
+        // When signal.guests.enabled = false, unknown triage_model is not required to exist.
+        let disabled = base.replacen(
+            "[signal.guests]\nenabled = true",
+            "[signal.guests]\nenabled = false\ntriage_model = \"nonexistent\"\naction_pack = \"\"",
+            1,
+        );
+        Config::parse(&disabled).unwrap().check().unwrap();
+
+        // Invalid action_pack values (empty, whitespace, control chars, path separators, dot segments) are rejected.
+        for bad_pack in ["", "   ", "core extra", " core", "core\t", "core\n", "a/b", "a\\b", "../evil", ".", ".."] {
+            let escaped = bad_pack.replace('\\', "\\\\").replace('\t', "\\t").replace('\n', "\\n");
+            let cfg = format!("{base}action_pack = \"{escaped}\"\n");
+            let err = Config::parse(&cfg).unwrap().check().unwrap_err().to_string();
+            assert!(err.contains("signal.guests.action_pack"), "{bad_pack:?}: {err}");
+        }
+
+        // Blank or control-containing action_workspace is rejected.
+        for bad_ws in ["", "   ", "/tmp/bad\\npath"] {
+            let cfg = format!("{base}action_workspace = \"{bad_ws}\"\n");
+            let err = Config::parse(&cfg).unwrap().check().unwrap_err().to_string();
+            assert!(err.contains("signal.guests.action_workspace"), "{bad_ws:?}: {err}");
+        }
+
+        // resolved_action_workspace expands leading `~` and `~/` via HOME, leaves other paths untouched.
+        let fake_home = Path::new("/home/tester");
+        let with_ws = |p: Option<&str>| SignalGuestsCfg {
+            action_workspace: p.map(PathBuf::from),
+            ..SignalGuestsCfg::default()
+        };
+        assert_eq!(with_ws(None).resolve_action_workspace_with_home(Some(fake_home)), None);
+        assert_eq!(with_ws(Some("   ")).resolve_action_workspace_with_home(Some(fake_home)), None);
+        assert_eq!(
+            with_ws(Some("~/ferret-assistant")).resolve_action_workspace_with_home(Some(fake_home)),
+            Some(PathBuf::from("/home/tester/ferret-assistant"))
+        );
+        assert_eq!(
+            with_ws(Some("~/nested/dir")).resolve_action_workspace_with_home(Some(fake_home)),
+            Some(PathBuf::from("/home/tester/nested/dir"))
+        );
+        assert_eq!(
+            with_ws(Some("~/")).resolve_action_workspace_with_home(Some(fake_home)),
+            Some(PathBuf::from("/home/tester"))
+        );
+        assert_eq!(
+            with_ws(Some("~")).resolve_action_workspace_with_home(Some(fake_home)),
+            Some(PathBuf::from("/home/tester"))
+        );
+        assert_eq!(
+            with_ws(Some("~/ferret-assistant")).resolve_action_workspace_with_home(None),
+            Some(PathBuf::from("~/ferret-assistant"))
+        );
+        assert_eq!(
+            with_ws(Some("~other/dir")).resolve_action_workspace_with_home(Some(fake_home)),
+            Some(PathBuf::from("~other/dir"))
+        );
+        assert_eq!(
+            with_ws(Some("/var/tmp/assistant")).resolve_action_workspace_with_home(Some(fake_home)),
+            Some(PathBuf::from("/var/tmp/assistant"))
+        );
+
+        // Also exercise the public env-reading helper directly against current HOME (if set).
+        if let Some(env_home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+            assert_eq!(
+                with_ws(Some("~/ferret-assistant")).resolved_action_workspace(),
+                Some(PathBuf::from(env_home).join("ferret-assistant"))
+            );
+        }
+        assert_eq!(
+            with_ws(Some("/var/tmp/assistant")).resolved_action_workspace(),
+            Some(PathBuf::from("/var/tmp/assistant"))
+        );
     }
 }

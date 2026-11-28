@@ -435,6 +435,10 @@ owner_name = "Jordan"
 # allow = ["+15550101", "00000000-0000-4000-8000-000000000001"]  # optional static pre-approved guests
 # model = "local"                                                # optional [models.*] profile for guests
 # persona = "Keep answers brief and friendly."
+# triage_notes = true                                            # zero-tool LLM triage on incoming guest notes
+# triage_model = "local"                                         # optional profile override for note triage
+# action_workspace = "~/ferret-assistant"                        # workspace outside ~/.ferret for confirmed "do" tasks
+# action_pack = "core"                                           # pack used for confirmed note action missions
 ```
 
 - **Fail-closed & DM-only:** When disabled, non-operator messages are silently dropped. Even when enabled,
@@ -448,10 +452,22 @@ owner_name = "Jordan"
   an isolated LLM completion path with an immutable safety preamble, zero host/file/mission/mail/operator
   tools, per-guest rolling history in `~/.ferret/signal_guests.json` (mode `0600`), hourly message limits
   (`rate_limit_per_hour`), and a per-guest single-flight guard so guest replies never block operator commands.
-- **Guest commands & notes:** Guests may only use `/help`, `/reset` (`/clear`), and `/note <message>` (when
-  `allow_notes = true`, capped at 500 characters and 3 notes per 15 minutes; the model may also call
-  `leave_note_for_owner` under the same cap). Delivered `[Ferret · GUEST NOTE from <name>]` alerts can be
-  quote-replied by the owner to message the guest directly without an LLM in the middle.
+- **Guest commands, note triage & confirm-to-run actions:** Guests may only use `/help`, `/reset` (`/clear`),
+  and `/note <message>` (when `allow_notes = true`, capped at 500 characters and 3 notes per 15 minutes; the
+  model may also call `leave_note_for_owner` under the same cap). When `triage_notes = true` (default),
+  incoming notes are triaged asynchronously by a zero-tool LLM (`triage_model` → `model` → `default_model`)
+  with the local date/time and persisted in `~/.ferret/signal_guests.json` (bounded 100-note ring, mode
+  `0600`; triage failures gracefully fall back to plain note delivery so notes are never dropped). Nothing
+  runs automatically — the owner receives `[Ferret · GUEST NOTE · g-N · n-M from <name>]` and controls what
+  happens by quote-replying:
+  - `"do"` or `"do <extra>"` — spawns a Ferret mission in `action_workspace` (pack `action_pack`; refused
+    if inside `~/.ferret`) with the owner-confirmed task, optional extra instructions, and the verbatim guest
+    note framed as untrusted reference context (protected against duplicate execution).
+  - `"do + reply"` (or `"do+reply"` / `"do and reply"`) — spawns the mission and sends the suggested reply
+    back to the guest.
+  - `"reply"` — sends only the suggested reply to the guest without spawning a mission.
+  - Any other text (including phrases like `"don't worry, see you then"`) — relayed verbatim directly to the
+    guest without invoking an LLM.
 - **Owner guest commands:** `/guests` (lists approved, pending, and blocked contacts with `#1..#N` aliases),
   `/guest approve <id|#n|e164|uuid> [name]`, `/guest revoke <id|#n|name>`, `/guest block <id|#n|name>`,
   `/guest unblock <id|#n>`, `/guest clear <id|#n|name>`, and `/guest say <id|#n|name> <message>`.
