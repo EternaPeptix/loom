@@ -434,6 +434,7 @@ mod tests {
             mcp_hosts: Default::default(),
             box_shell: Default::default(),
             box_bridge: false,
+            verifiers: Default::default(),
         }
     }
 

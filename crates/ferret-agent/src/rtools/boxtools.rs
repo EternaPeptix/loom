@@ -21,7 +21,10 @@
 //! 4. The command runs through `ferret_tools::bash::run_launched`: the same procedure, limits, jobs,
 //!    `background`, `wake_on`, `job_wait` and `job_kill` as `bash`. Its result is `bash`'s, with the fact
 //!    `in box ferret-<id>` first, then the usual facts, then notes: files the copy left out, and once per
-//!    session the one-sentence note that wildcard grants are not applied to the box.
+//!    session the one-sentence note that wildcard grants are not applied to the box. With main's proxy bridge
+//!    (`[box] proxy_bridge`) every box tool's result (`box_exec`, `box_get`, `box_reset`, a box-shell `bash`)
+//!    carries meta `META_BOX_BRIDGE`: the session whose grant the bridge carries (what a program in the box sends
+//!    over HTTP(S) is that session's net decisions; the monitor reads it, TW-21 and TW-01).
 //!
 //! ## `box_get` {path, to}
 //! Class `Write`. `path` is a file or directory in the box (absolute, or relative to `/work`); `to` is where
@@ -43,7 +46,7 @@
 
 use super::Shared;
 use async_trait::async_trait;
-use ferret_core::event::{ToolClass, ToolSpec, META_PATH};
+use ferret_core::event::{ToolClass, ToolSpec, META_BOX_BRIDGE, META_PATH};
 use ferret_tools::boxctl::MissionBox;
 use ferret_tools::boxfs::{self, GetLimits};
 use ferret_tools::{params, Body, Tool, ToolCtx, ToolOutput};
@@ -65,8 +68,13 @@ pub struct BoxBash(pub Arc<Shared>);
 pub struct BoxGet(pub Arc<Shared>);
 pub struct BoxReset(pub Arc<Shared>);
 
+/// The result's header names the box; with the proxy bridge, meta `META_BOX_BRIDGE` names the session whose grant the
+/// bridge carries (the monitor's TW-21 and TW-01 read a program in the box as that session's traffic).
 fn with_box(mut out: ToolOutput, b: &MissionBox) -> ToolOutput {
     out.more.insert(0, format!("in box {}", b.names().container));
+    if let Some((session, _)) = b.proxy_bridge().and_then(|bridge| bridge.proxy_auth.as_ref()) {
+        out = out.with_meta(META_BOX_BRIDGE, json!(session));
+    }
     out
 }
 
@@ -336,6 +344,28 @@ mod tests {
 
     fn header(r: &ferret_core::event::ToolResult) -> &str {
         r.text.lines().next().unwrap_or_default()
+    }
+
+    /// With the proxy bridge, a box tool's result names the session whose grant the bridge carries (meta
+    /// `META_BOX_BRIDGE`: what a program in the box sends over HTTP(S) is that session's net decisions, which the
+    /// monitor's TW-21 and TW-01 read); a box without the bridge names none.
+    #[test]
+    fn a_box_result_names_the_session_whose_grant_the_proxy_bridge_carries() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeDocker::new(dir.path());
+        let bridge = ferret_tools::boxctl::BoxProxyBridge {
+            proxy_port: 4100,
+            proxy_auth: Some(("s-lead".into(), "0".repeat(32))),
+            bridge_port: 18080,
+            bridge_gateway_ip: String::new(),
+            ca_pem: None,
+        };
+        let b = MissionBox::new_with_bridge(fake.host(), "m-test", source(&[]), Some(bridge));
+        let out = super::with_box(ToolOutput::ok("ran", Body::Message(String::new())), &b);
+        assert_eq!(out.meta.get(META_BOX_BRIDGE), Some(&json!("s-lead")));
+        let plain = MissionBox::new(fake.host(), "m-test", source(&[]));
+        let out = super::with_box(ToolOutput::ok("ran", Body::Message(String::new())), &plain);
+        assert!(!out.meta.contains_key(META_BOX_BRIDGE));
     }
 
     #[tokio::test]

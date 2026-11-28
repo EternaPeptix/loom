@@ -41,6 +41,7 @@ fn env_of(paths: &Paths) -> Arc<Env> {
         mcp_hosts: Default::default(),
         box_shell: Default::default(),
         box_bridge: false,
+        verifiers: Default::default(),
     })
 }
 
@@ -352,6 +353,53 @@ fn a_net_decision_during_a_call_is_not_idle_egress() {
     net_line(&h, "s-1", now + 100, "api.target.example", true);
     core.pump(now + 10_000, &all(), true);
     assert!(of_kind(&h, EntryKind::Tripwire).is_empty());
+}
+
+/// Main's box proxy bridge: a lead's decision is judged against the box calls of its mission's other sessions. A pump
+/// that is told only about the lead (its `net.jsonl` was written) reads the mission's other sessions too before it
+/// judges, so a child's box call that the bridge carried keeps the lead in flight; without the bridge the lead is idle.
+#[test]
+fn with_the_bridge_a_pump_reads_the_missions_other_sessions_before_it_judges_a_decision() {
+    for bridge in [true, false] {
+        let h = home();
+        let mut env = (*env_of(&h.paths)).clone();
+        env.box_bridge = bridge;
+        let mut core = Core::open(&h.paths, Arc::new(env), cfg(), None).expect("open");
+        let now = ferret_core::now_ms();
+        core.pump(now, &all(), true);
+        let _lead = new_session(&h, "s-1", "m-1");
+        let mut child = new_child(&h, "s-2", "m-1", "s-1");
+        core.pump(now + 1, &all(), true);
+        child
+            .append(
+                Author::Model,
+                Event::ToolCall(ToolCall {
+                    call_id: CallId::from("c1"),
+                    req_id: "r".into(),
+                    name: "box_exec".into(),
+                    args: json!({"command": "sqlmap -r req.txt --batch"}),
+                    class: ToolClass::Exec,
+                }),
+            )
+            .expect("call");
+        let t = ferret_core::now_ms() + 50;
+        net_line(&h, "s-1", t, "api.target.example", true);
+        core.pump(t + 3_000, &["s-1".to_string()].into(), false);
+        let hits: Vec<Entry> =
+            of_kind(&h, EntryKind::Tripwire).into_iter().filter(|e| text(e, "id") == "TW-21").collect();
+        assert_eq!(hits.is_empty(), bridge, "bridge {bridge}: {hits:?}");
+    }
+}
+
+fn new_child(h: &Home, session: &str, mission: &str, parent: &str) -> SessionLog {
+    let dir = h.paths.sessions_dir().join(session);
+    std::fs::create_dir_all(&dir).expect("dir");
+    let mut log = SessionLog::create(&dir.join("log.jsonl"), Durability::Batch).expect("create");
+    let Event::SessionStart(mut s) = start(session, mission) else { unreachable!() };
+    s.parent = Some(SessionId::from(parent));
+    s.role = "worker".into();
+    log.append(Author::Harness, Event::SessionStart(s)).expect("start");
+    log
 }
 
 #[test]

@@ -97,7 +97,10 @@
 //! missing. A paused box is polled too. The counters say how much, not what: the box has no per-connection
 //! record (`docs/MONITOR.md` X5). With main's proxy bridge ([`BoxProxyBridge`]) the box's HTTP(S) requests go to the
 //! Docker host's gateway (`INPUT`, the bridge's one accept rule), not through the mission's chain: the counters do not
-//! see them, and the proxy records each one as a net decision of the session whose grant the bridge carries.
+//! see them, and the proxy records each one as a net decision of the session whose grant the bridge carries. The
+//! accept rule is the interface's only one: installing it removes every other `INPUT -i fb-<short> … -j ACCEPT` (the
+//! bridge port follows the lead's proxy port, new in every daemon life, so a box adopted after a restart would keep the
+//! old one), and the check fails while another is there.
 //!
 //! ## Life of a box (`MissionBox`, I5)
 //! One per mission, created by the runtime with a source of the mission's grants and effective policy.
@@ -807,13 +810,20 @@ for c in INPUT FORWARD; do while ip6tables -w 5 -D \"$c\" -i \"$2\" -j DROP 2>/d
 
 /// Bridge-enabled variant of [`RULES_APPLY`]: inserts ONE tightly-scoped `INPUT 1` rule allowing TCP from
 /// this mission's bridge `$2` (`fb-<short>`) ONLY to `<bridge_gateway_ip>` (`$3`) port `<bridge_port>` (`$4`)
-/// strictly BEFORE the unconditional `INPUT -i fb-+ -j DROP`. All other host ports and IPv6 remain dropped.
+/// strictly BEFORE the unconditional `INPUT -i fb-+ -j DROP`. All other host ports and IPv6 remain dropped. Every other
+/// `INPUT -i $2 ... -j ACCEPT` goes first, as [`RULES_REMOVE`] sweeps them: the bridge port follows the lead's proxy
+/// port, which is new in every daemon life, so a box adopted after a restart would otherwise keep the old port's
+/// accept rule, a path to whatever holds that port on the Docker host that neither the chain nor the proxy sees.
 const RULES_APPLY_BRIDGE: &str = ": ferret-rules-apply; \
 iptables -w 5 -N FERRET-ALL 2>/dev/null; \
 iptables -w 5 -C FERRET-ALL -j DROP 2>/dev/null || iptables -w 5 -A FERRET-ALL -j DROP || exit 1; \
 iptables -w 5 -C DOCKER-USER -i 'fb-+' -j FERRET-ALL 2>/dev/null || iptables -w 5 -I DOCKER-USER 1 -i 'fb-+' -j FERRET-ALL || exit 1; \
 while iptables -w 5 -D INPUT -i 'fb-+' -j FERRET-ALL 2>/dev/null; do :; done; \
 iptables -w 5 -C INPUT -i 'fb-+' -j DROP 2>/dev/null || iptables -w 5 -I INPUT 1 -i 'fb-+' -j DROP || exit 1; \
+( iface=$2; iptables -w 5 -S INPUT 2>/dev/null | while IFS= read -r r; do \
+case \"$r\" in \"-A INPUT \"*) b=${r#-A INPUT }; \
+case \" $b \" in *\" -i $iface \"*\" -j ACCEPT \"*) set -f; set -- $b; set +f; iptables -w 5 -D INPUT \"$@\" 2>/dev/null || : ;; esac ;; \
+esac; done ); \
 while iptables -w 5 -D INPUT -i \"$2\" -p tcp -d \"$3\" --dport \"$4\" -j ACCEPT 2>/dev/null; do :; done; \
 iptables -w 5 -I INPUT 1 -i \"$2\" -p tcp -d \"$3\" --dport \"$4\" -j ACCEPT || exit 1; \
 iptables-restore -w 5 --noflush || exit 1; \
@@ -823,13 +833,17 @@ ip6tables -w 5 -C FERRET-ALL6 -j DROP 2>/dev/null || ip6tables -w 5 -A FERRET-AL
 for c in INPUT FORWARD; do ip6tables -w 5 -C \"$c\" -i 'fb-+' -j FERRET-ALL6 2>/dev/null || ip6tables -w 5 -I \"$c\" 1 -i 'fb-+' -j FERRET-ALL6 || exit 1; done; \
 for c in INPUT FORWARD; do ip6tables -w 5 -C \"$c\" -i \"$2\" -j DROP 2>/dev/null || ip6tables -w 5 -I \"$c\" 1 -i \"$2\" -j DROP || exit 1; done";
 
-/// Bridge-enabled variant of [`RULES_CHECK`]: verifies the mission's tightly-scoped `INPUT` bridge rule
-/// alongside all standard `FERRET-ALL`, `INPUT DROP`, and `FERRET-ALL6` invariants.
+/// Bridge-enabled variant of [`RULES_CHECK`]: verifies the mission's tightly-scoped `INPUT` bridge rule, and that it is
+/// the interface's only `INPUT` accept rule, alongside all standard `FERRET-ALL`, `INPUT DROP`, and `FERRET-ALL6`
+/// invariants.
 const RULES_CHECK_BRIDGE: &str = ": ferret-rules-check; \
 iptables -w 5 -C FERRET-ALL -j DROP && \
 iptables -w 5 -C DOCKER-USER -i 'fb-+' -j FERRET-ALL && \
 iptables -w 5 -C INPUT -i 'fb-+' -j DROP && \
 iptables -w 5 -C INPUT -i \"$2\" -p tcp -d \"$3\" --dport \"$4\" -j ACCEPT && \
+iptables -w 5 -S INPUT 2>/dev/null | { n=0; while IFS= read -r r; do \
+case \"$r\" in \"-A INPUT \"*) case \" ${r#-A INPUT } \" in *\" -i $2 \"*\" -j ACCEPT \"*) n=$((n+1)) ;; esac ;; esac; \
+done; [ \"$n\" -eq 1 ]; } && \
 ! iptables -w 5 -C INPUT -i 'fb-+' -j FERRET-ALL 2>/dev/null && \
 iptables -w 5 -C FERRET-ALL -i \"$2\" -j \"$1\" && iptables -w 5 -C \"$1\" -j DROP && \
 ip6tables -w 5 -C FERRET-ALL6 -j DROP && \
@@ -4860,6 +4874,43 @@ exit 2
             mutate(&mut v);
             assert!(matches!(check(v), ContainerFound::Stale(_)), "expected Stale for {label}");
         }
+    }
+
+    /// The bridge port follows the lead's proxy port, which is new in every daemon life: a box adopted after a restart
+    /// gets its rules applied again with another port. The accept rule of the old port goes (Linux's canonical `-S`
+    /// form too), so the interface keeps one accept rule; the check fails while another accept rule of the interface
+    /// is there, and a sibling mission's rule is never touched.
+    #[test]
+    fn a_bridge_port_that_changed_leaves_no_stale_accept_rule() {
+        let t = Tables::new();
+        let (n, n2) = (names("m-bridge"), names("m-bridge-other"));
+        let gw = "172.28.0.1";
+        let rule = |port: &str| format!("-i {} -p tcp -d {gw} --dport {port} -j ACCEPT", n.iface);
+        let sibling = format!("-i {} -p tcp -d 172.29.0.1 --dport 18081 -j ACCEPT", n2.iface);
+        assert!(t.run_with_extra(
+            RULES_APPLY_BRIDGE,
+            &n2,
+            &["172.29.0.1", "18081"],
+            &rules_text(&n2, &BTreeSet::new())
+        ));
+        assert!(t.run_with_extra(RULES_APPLY_BRIDGE, &n, &[gw, "18080"], &rules_text(&n, &BTreeSet::new())));
+        // The next daemon life: the same box, another bridge port.
+        assert!(t.run_with_extra(RULES_APPLY_BRIDGE, &n, &[gw, "18090"], &rules_text(&n, &BTreeSet::new())));
+        assert_eq!(t.chain("iptables", "INPUT"), [rule("18090"), sibling.clone(), "-i fb-+ -j DROP".to_string()]);
+        assert!(t.run_with_extra(RULES_CHECK_BRIDGE, &n, &[gw, "18090"], ""));
+        // An accept rule of the interface that is not the bridge's (here in Linux's canonical form) fails the check, and
+        // the next apply sweeps it.
+        {
+            let p = t.dir.join("iptables.rules");
+            let cur = std::fs::read_to_string(&p).unwrap();
+            let stale = format!("INPUT|-d {gw}/32 -i {} -p tcp -m tcp --dport 18080 -j ACCEPT\n{cur}", n.iface);
+            std::fs::write(&p, stale).unwrap();
+        }
+        assert!(!t.run_with_extra(RULES_CHECK_BRIDGE, &n, &[gw, "18090"], ""), "a second accept rule of the interface");
+        assert!(t.run_with_extra(RULES_APPLY_BRIDGE, &n, &[gw, "18090"], &rules_text(&n, &BTreeSet::new())));
+        assert_eq!(t.chain("iptables", "INPUT"), [rule("18090"), sibling, "-i fb-+ -j DROP".to_string()]);
+        assert!(t.run_with_extra(RULES_CHECK_BRIDGE, &n, &[gw, "18090"], ""));
+        assert!(t.run_with_extra(RULES_CHECK_BRIDGE, &n2, &["172.29.0.1", "18081"], ""));
     }
 
     #[test]

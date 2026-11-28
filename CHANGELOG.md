@@ -18,7 +18,8 @@ both sides' guarantees.
   which a bridged request does not pass: it is a net decision of the bridge's session instead.
 - **TW-21 with the bridge.** A bridged request is recorded for the bridge's session whichever session ran the program,
   so with the bridge on, a box call (`box_exec`, `box_reset`, `bash` of a box-shell role) or a box job of any session of
-  the mission keeps the mission's decisions in flight. Without the bridge nothing changes.
+  the mission keeps that session's decisions in flight (the bridge's session only: see the fixes below). Without the
+  bridge nothing changes.
 - **OAST endpoints are infrastructure (E1).** With `[oast]` enabled, the broker's HTTP and DNS listeners on the
   addresses they are bound to (the broker now starts first, and a port 0 is written back to `oast.bind` and
   `oast.dns_bind`), the external poll endpoint, the callback host (`oast.public_host`, else the poll host) and every
@@ -26,8 +27,8 @@ both sides' guarantees.
   them (`grant_scope` refuses one), the sandbox refuses their loopback ports and `oast.external_token_file` is
   unreadable to commands. A callback `oast_poll` grades as executed evidence therefore comes from the target, never
   from ferret's own commands. An attempt at one through the proxy is refused and is TW-02 at its net decision; named in
-  a call's arguments (the callback a payload carries to the target, in a query string or a body) a broker endpoint is
-  neither TW-02 nor a sink (TW-15), as a granted OAST host covers its own name.
+  a call's arguments beside another destination (the callback a payload carries to the target, in a query string or a
+  body) a broker endpoint is neither TW-02 nor a sink (TW-15), as a granted OAST host covers its own name.
 - **Multi-principal profiles in the authorization.** The profiles the operator attached (`creds`, main's
   `creds_profiles`: names and summaries) are in the AUTHORIZATION block (`Authorization::credentials`); they authorize
   no host. TW-06 is unchanged: the union redactor keeps every profile's values out of the records.
@@ -43,6 +44,50 @@ both sides' guarantees.
   (`stop_between_turns`: the records, the jobs, the children, the MCP connections closed) after marking the epoch
   handled; a stale companion stop is dropped. Main's parked empty-reply lead ends `Parked`, which keep-going never
   reopens.
+
+### Fixes after merging main (ef34aa4)
+
+- **A box job is a box job.** The session writes a job's `job_registered` only after the result of the call that started
+  it, when the call is no longer open, so a background `box_exec` (a scan, a fuzzer) was never on the monitor's books
+  as a box job and its bridged requests were TW-21 against the bridge's session for the whole run. The job is now a box
+  job from the result that gives it to the model (meta `job`) until it settles; a box call's result read after a
+  restart counts as a box call of its own duration.
+- **The bridge excuses only its own session.** The bridge carries one grant, so only that session's decisions can be
+  what a program in the box sent: box tools' results now name it (meta `box_bridge`, `META_BOX_BRIDGE`), the monitor
+  takes the mission's lead until one does, and a box call or box job of the mission keeps only that session in flight.
+  A child's idle egress is TW-21 again while a sibling's (or the lead's) box call or box job runs.
+- **TW-01 through the bridge.** A refused bridged request whose host the bridge's session did not name is the TW-01 of
+  the session whose box call or box job running at the time names it.
+- **Every log before a decision.** The core judged a session's net decisions right after its own log, before the
+  mission's other sessions were read; a lead's log sorts before its children's, so a replay (and a live pass that
+  caught up a backlog) judged the lead's bridged decisions without its children's box calls. A pump now reads every log
+  first and then judges; with the bridge it reads every session of a mission it reads one of and holds the mission's
+  decisions while one of them has more to read, and a replay reads every log to its end before any decision. A
+  journal's entries are judged after the logs too (it is still read for the authorization of the first record).
+- **OAST hosts on every port.** The external broker's poll host and the callback host were refused only on the minted
+  URL's port: a grant of the bare host (or the host on another port) was accepted, `mode = "open"` reached it on port
+  80, and a command could send a minted token there and have it graded `run`. They are now refused on every port, by
+  name and by the addresses they resolve to (one on this machine keeps its port), and `grant_scope` refuses a bare
+  name an `oast.` rule refuses on some port.
+- **A call aimed only at the broker is an attempt.** A broker endpoint in a call's arguments is the callback a payload
+  carries only when the call names another destination too; a call whose only destinations are the broker's
+  (`curl --noproxy '*' http://127.0.0.1:<broker port>/oast/<token>`, refused by the sandbox without a net decision) is
+  TW-02 S3, and a credential sent to the broker's domain alone is TW-06 toward a sink.
+- **TW-23 and imported artifacts.** An entry a `security_ingest` of the target's OpenAPI, GraphQL schema or source map
+  wrote (its result names the entry) holds the hosts the target's documents name (third-party APIs a bundle calls, a
+  staging server of `servers`): S0 per host, never a flag, and FS-9 counts each host once. A host is read only from a
+  host, service or endpoint asset: a source map's source files and `GET /v1/users.json` imported without an origin are
+  no longer off-scope hosts.
+- **TW-18 knows each pack's verifier.** The gate verifier is the role a pack's roles name as `verifier` (`triage_judge`
+  in webapp, `judge` in vr, `flag_judge`, `op_judge`), not a role whose name contains `verif`.
+- **TW-19 and reflected payloads.** A quote of an output ferret's network tools received (`http_*`, `web_*`, `fetch*`,
+  `oast_poll`) is the target's: a payload of the session's own arguments reflected in a response is the evidence of a
+  reflected XSS or an open redirect, not output the session made.
+- **The bridge's accept rule is the interface's only one.** The bridge port follows the lead's proxy port, which is new
+  in every daemon life; installing the bridge rule now removes every other `INPUT -i fb-<m> … -j ACCEPT` first (a box
+  adopted after a restart kept the old port's rule), and the rules check fails while another one is there.
+- Left as residuals (MONITOR.md §9.5): ferret's HTTP tools are read as commands (X3a), and a previous daemon life's
+  `ssh -R` bridge forward outlives a crash (X5).
 
 ### Monitor and main (6be589b) together
 

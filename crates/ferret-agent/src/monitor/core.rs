@@ -7,11 +7,18 @@
 //!   and read every source), runs the tripwires over it through `Engine`, and records what they find. `Monitor` (below)
 //!   runs a core on a worker. A core with no `MonitorLog` is a memory core: it records into a vector and changes no
 //!   file (the replay of `replay.rs` is one).
-//! - **Order within a pump:** session logs first, then each session's `net.jsonl`, the floor events, the ledger journals
-//!   of the missions whose sessions wrote a ledger record, the fleet joins when `fleet_every_s` has passed, the
-//!   heartbeat, the cursor checkpoint. A net decision is judged `IDLE_GRACE_MS` after its time, never before, and
-//!   only after the session's log has been read in the same pump, so a call that had started is on the engine's books
-//!   (the `tool_call` record is synced before the tool starts, `session.rs`).
+//! - **Order within a pump:** session logs first (every log the pump reads), then each session's `net.jsonl`, the floor
+//!   events, the ledger journals of the missions whose sessions wrote a ledger record, the fleet joins when
+//!   `fleet_every_s` has passed, the heartbeat, the cursor checkpoint. A net decision is judged `IDLE_GRACE_MS` after
+//!   its time, never before, and only after every log of the pump has been read (its own session's read to its end),
+//!   so a call that had started is on the engine's books (the `tool_call` record is synced before the tool starts,
+//!   `session.rs`). With main's box proxy bridge (`Env::box_bridge`) a decision of the session the bridge carries
+//!   depends on the box calls of its mission's other sessions: a pump reads every primed session of a mission it reads
+//!   one of, and holds the mission's decisions for a later pump while one of them has more to read; a replay
+//!   (`drain`) reads every log to its end before it judges any decision (a lead's log sorts before its children's). A
+//!   journal is read for the authorization of its mission's first record (`load_ledger`), but its entries are judged
+//!   only in the ledger step, after the logs, so an entry comes after the records of the call that wrote it (TW-23
+//!   reads a `security_ingest` result's `entry`).
 //! - **Records:** every hit of severity S1 and above is a `tripwire` entry (S0 is counted only). `state` is `shadow`
 //!   for every one in M2 (the precision list enforces from M4); `precision` says whether the hit is a part of the §4.8
 //!   list; `would` is the response its severity earns once promoted (`Response::earned(sev, true)`). The S1
@@ -82,7 +89,10 @@
 //! mission's authorization follows its journal and its operator messages, and an operator's revoke (the revoked-hosts
 //! file, and the journal it appended to) without any session record; the fleet scan runs on its period and reports
 //! once; a memory core writes no file; the status counts what was read; a switch onto a relaxed model uptiers the
-//! session's later hits and a switch back does not lower them, across a restart too.
+//! session's later hits and a switch back does not lower them, across a restart too. After the merge of main (ef34aa4):
+//! `with_the_bridge_a_pump_reads_the_missions_other_sessions_before_it_judges_a_decision`, and in the replay
+//! `a_replay_judges_a_leads_bridged_decision_after_its_childs_box_call` and
+//! `a_replay_judges_a_journal_entry_after_the_records_of_the_call_that_wrote_it`.
 
 use crate::census::CensusView;
 use crate::monitor::auth::{AuthFacts, Authorization};
@@ -148,6 +158,8 @@ struct MState {
     entries: Vec<LedgerEntry>,
     loaded_ms: u64,
     dirty: bool,
+    /// The journal was read at least once (for the authorization of the mission's first records: `load_ledger`).
+    read_once: bool,
     pack: String,
     role: String,
     facts: AuthFacts,
@@ -712,6 +724,7 @@ impl Core {
         }
         m.dirty = false;
         m.loaded_ms = now;
+        m.read_once = true;
         let read = source::read_journal(&self.paths, mission, key.as_deref());
         if let Some(f) = read.fault {
             self.shared_faults.insert(format!("j:{}", mission.as_str()), f);
@@ -753,6 +766,21 @@ impl Core {
         }
         self.fold.cursors.insert(cursor_key.clone(), Cursor { off: 0, seq: last, hash: String::new() });
         self.dirty_cursors.insert(cursor_key);
+    }
+
+    /// The journal of `mission` read for the authorization of its first record (`auth_for`), without judging its
+    /// entries: `refresh_ledger` judges them (`Engine::ledger`) once the pump has read its session logs, so an entry is
+    /// judged after the records of the call that wrote it (a `security_ingest` result names the entry it wrote).
+    fn load_ledger(&mut self, mission: &MissionId) {
+        let key = self.journal_key.clone();
+        let Some(m) = self.missions.get_mut(mission) else { return };
+        m.read_once = true;
+        let read = source::read_journal(&self.paths, mission, key.as_deref());
+        // A journal that cannot be read is recorded by `refresh_ledger`.
+        if read.fault.is_none() {
+            m.entries = read.entries;
+            m.cache = None;
+        }
     }
 
     // ---- reading --------------------------------------------------------------------------------------------------------
@@ -858,15 +886,16 @@ impl Core {
         true
     }
 
-    /// Read what is new in one session's log, then its net decisions.
-    fn pump_session(&mut self, name: &str, now: u64, replay: bool) -> bool {
+    /// Read what is new in the log of session `name` (at most `PASSES` reads): (whether a cursor moved, whether the log
+    /// was read to its end). Its net decisions are judged apart (`pump_net`), after every log the pump reads.
+    fn pump_session(&mut self, name: &str) -> (bool, bool) {
         if !self.prime(name) {
-            return false;
+            return (false, false);
         }
         let mut progress = false;
         let mut caught_up = false;
         for _ in 0..PASSES {
-            let Some(src) = self.srcs.get(name) else { return progress };
+            let Some(src) = self.srcs.get(name) else { return (progress, caught_up) };
             if src.fault.is_some() {
                 break;
             }
@@ -874,7 +903,7 @@ impl Core {
             let mut skip_below = src.skip_below;
             let mut ctx = match src.primed.as_ref() {
                 Some(p) => p.ctx.clone(),
-                None => return progress,
+                None => return (progress, caught_up),
             };
             self.counts.opaque = self.counts.opaque.saturating_add(read.opaque);
             let key = format!("s:{name}");
@@ -939,10 +968,7 @@ impl Core {
                 break;
             }
         }
-        if caught_up {
-            self.pump_net(name, now, replay);
-        }
-        progress
+        (progress, caught_up)
     }
 
     /// The model a `model_switched` moved to is relaxed-alignment: by the lineage it was recorded with, or by the
@@ -993,8 +1019,8 @@ impl Core {
                 }
             }
         }
-        if self.missions.get(&mission).is_none_or(|m| m.loaded_ms == 0) {
-            self.refresh_ledger(&mission, rec.ts_ms.max(1));
+        if self.missions.get(&mission).is_some_and(|m| m.loaded_ms == 0 && !m.read_once) {
+            self.load_ledger(&mission);
         }
         let auth = self.auth_for(&mission, rec.ts_ms);
         let hits = self.engine.record(ctx, rec, &auth, &self.fold);
@@ -1177,7 +1203,7 @@ impl Core {
                 break;
             }
         }
-        let names: Vec<String> = if full || now.saturating_sub(self.last_checkpoint) >= DISCOVER_EVERY_MS * 3 {
+        let mut names: Vec<String> = if full || now.saturating_sub(self.last_checkpoint) >= DISCOVER_EVERY_MS * 3 {
             self.srcs.keys().cloned().collect()
         } else {
             hints.iter().filter(|h| self.srcs.contains_key(*h)).cloned().collect()
@@ -1190,6 +1216,19 @@ impl Core {
             .collect();
         for m in &watched {
             self.refresh_revoked(m);
+        }
+        // With the box proxy bridge, a decision of the session the bridge carries is judged against the box calls and
+        // jobs of every session of its mission: they are all read in this pump, before any decision is judged.
+        if self.env.box_bridge {
+            let siblings: Vec<String> = self
+                .srcs
+                .iter()
+                .filter(|(n, s)| {
+                    !names.contains(*n) && s.primed.as_ref().is_some_and(|p| watched.contains(&p.ctx.mission))
+                })
+                .map(|(n, _)| n.clone())
+                .collect();
+            names.extend(siblings);
         }
         let mut progress = false;
         let before = self.fold.last_seq;
@@ -1206,8 +1245,24 @@ impl Core {
                 self.engine.drop_session(&id);
             }
         }
+        // Every log first, then the net decisions of the sessions read to their end: a decision is judged after its own
+        // session's log and, with the bridge, after its mission's other sessions (a child's log sorts after its lead's).
+        // With the bridge, a mission one of whose sessions still has more to read waits for a later pump.
+        let mut caught: Vec<String> = Vec::new();
+        let mut behind: BTreeSet<MissionId> = BTreeSet::new();
         for n in &names {
-            progress |= self.pump_session(n, now, false);
+            let (moved, done) = self.pump_session(n);
+            progress |= moved;
+            if done {
+                caught.push(n.clone());
+            } else if let Some(p) = self.srcs.get(n).filter(|s| s.fault.is_none()).and_then(|s| s.primed.as_ref()) {
+                behind.insert(p.ctx.mission.clone());
+            }
+        }
+        for n in &caught {
+            let held = self.env.box_bridge
+                && self.srcs.get(n).and_then(|s| s.primed.as_ref()).is_some_and(|p| behind.contains(&p.ctx.mission));
+            self.pump_net(n, if held { 0 } else { now }, false);
         }
         self.pump_floor();
         self.pump_unattributed();
@@ -1279,8 +1334,29 @@ impl Core {
             self.discover();
             let names: Vec<String> = self.srcs.keys().cloned().collect();
             let mut progress = false;
+            let mut caught: Vec<String> = Vec::new();
             for n in &names {
-                progress |= self.pump_session(n, u64::MAX, true);
+                let (moved, done) = self.pump_session(n);
+                progress |= moved;
+                if done {
+                    caught.push(n.clone());
+                }
+            }
+            guard = guard.saturating_add(1);
+            let last = !progress || guard > 10_000;
+            // The net decisions once every log has been read to its end: a lead's log sorts before its children's, and
+            // with the box proxy bridge its decisions are judged against their box calls.
+            if last {
+                for n in &caught {
+                    // Each call reads at most `PASSES` chunks of the file: on until its cursor stays.
+                    for _ in 0..10_000 {
+                        let before = self.srcs.get(n).map(|s| s.net.clone());
+                        self.pump_net(n, u64::MAX, true);
+                        if self.srcs.get(n).map(|s| s.net.clone()) == before {
+                            break;
+                        }
+                    }
+                }
             }
             self.pump_floor();
             self.pump_unattributed();
@@ -1293,8 +1369,7 @@ impl Core {
                     self.refresh_ledger(&m, 1);
                 }
             }
-            guard = guard.saturating_add(1);
-            if !progress || guard > 10_000 {
+            if last {
                 break;
             }
         }

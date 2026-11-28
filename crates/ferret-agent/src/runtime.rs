@@ -133,7 +133,8 @@
 //!     operator (`service_endpoints`: the Signal bridge's signal-cli, `signal.http_url`, with `[signal]` enabled, the
 //!     mail inbox's IMAP server, `mail.host` on `mail.port`, with `[mail]` enabled and `imaps`, each on its port, and
 //!     with `[oast]` enabled the OAST broker's endpoints, `oast_endpoints`: its listeners on the addresses they are
-//!     bound to, the poll endpoint, the callback host and the names under its DNS domain), the
+//!     bound to, the poll host and the callback host on every port (one on this machine on its own port) and the
+//!     names under its DNS domain), the
 //!     box's `ssh_host` when the box is enabled, and `network.infrastructure`; `Runtime::start` parses them once
 //!     and refuses to start on an entry it cannot read (`The network configuration cannot be used: …`). The
 //!     spec also carries what `crate::infra` resolved (the box's Docker host from `ssh -G`, the addresses of
@@ -485,8 +486,9 @@
 //!   mission keeps a ledger, and the stock text when one was used.
 //! - `grant_scope` refuses a host that infrastructure refuses (`Policy::infrastructure_refusal`: a literal
 //!   address of a model endpoint, the box's Docker host, cloud metadata, DevTools or Docker API ports on this
-//!   machine; `The host `{h}` is infrastructure …`) and grants nothing of the list; it reaches every known session
-//!   of the mission, not only the active ones, and bumps the mission's `scope_gen`. A grant that lifts a revoke also
+//!   machine, the OAST broker's hosts; and a bare name that an `oast.` rule refuses on some port,
+//!   `Policy::infrastructure_on_some_port`; `The host `{h}` is infrastructure …`) and grants nothing of the list;
+//!   it reaches every known session of the mission, not only the active ones, and bumps the mission's `scope_gen`. A grant that lifts a revoke also
 //!   gives each MCP server grant of the mission's sessions its policy again (`Inner::refloor_mcp_grants`: the
 //!   server's own hosts, narrowed by `mission_floor` as it is now), since the revoke narrowed those too.
 //! - `revoke_scope(id, hosts, reason)` (monitor E1 and main's 6be589b together: one entry, which the CLI's `ferret
@@ -1607,18 +1609,42 @@ pub(crate) fn service_endpoints(config: &Config) -> Vec<(String, String)> {
 /// The OAST callback broker's endpoints (`[oast]`, main's Wave B), for the infrastructure deny (E1): in `local` mode its
 /// HTTP listener (`oast.bind`) and DNS listener (`oast.dns_bind`), each on the address it is bound to (`Runtime::start`
 /// starts the broker first and writes the bound addresses back, so a port 0 is the port really bound; an unbound port 0
-/// is left out); in `external` mode the endpoint it polls with the operator's token (`oast.external_poll_url`); in both,
-/// the callback host it mints URLs under when `oast.public_host` names one (on the port of the minted URL: the one
-/// written, else 80 in `local` mode and the poll URL's scheme port in `external` mode, and a poll host without
-/// `public_host` is the poll endpoint itself), and every name under the domain it mints DNS names in
-/// (`*.{domain}`, every port; an IP literal has none). A callback is evidence only when no command of ferret's could
-/// send it: no grant reaches these, and an OAST host is never a way around the infrastructure deny.
+/// is left out); in `external` mode the host it polls with the operator's token (`oast.external_poll_url`); in both,
+/// the callback host it mints URLs under when `oast.public_host` names one (a poll host without `public_host` is the
+/// poll host itself), and every name under the domain it mints DNS names in (`*.{domain}`, every port; an IP literal
+/// has none). The poll and callback hosts are refused on every port, as a Docker host is (`every_port`): an external
+/// server takes callbacks on many (HTTP, HTTPS, DNS over TCP, SMTP), and a grant of the bare host must not reach one of
+/// them; one on this machine keeps its port (the sandbox refuses that loopback port, `infra::loopback_ports`). A
+/// callback is evidence only when no command of ferret's could send it: no grant reaches these, and an OAST host is
+/// never a way around the infrastructure deny.
 pub(crate) fn oast_endpoints(cfg: &ferret_core::config::OastCfg) -> Vec<(String, String)> {
     use ferret_core::config::OastMode;
     let mut out: Vec<(String, String)> = Vec::new();
     let mut push = |key: &str, e: String| {
         if !out.iter().any(|(_, x)| x.eq_ignore_ascii_case(&e)) {
             out.push((key.to_string(), e));
+        }
+    };
+    // `host:port` as the host alone (every port), unless the host is this machine's.
+    let every_port = |e: String| -> String {
+        let host = match e.strip_prefix('[') {
+            Some(rest) => rest.split_once(']').map(|(h, _)| (format!("[{h}]"), h.to_string())),
+            None => e.rsplit_once(':').map(|(h, _)| (h.to_string(), h.to_string())),
+        };
+        let Some((written, bare)) = host.filter(|(_, b)| !b.is_empty()) else { return e };
+        let bare = bare.trim_end_matches('.').to_ascii_lowercase();
+        let here = bare == "localhost"
+            || bare.ends_with(".localhost")
+            || bare.parse::<std::net::IpAddr>().is_ok_and(|a| match a {
+                std::net::IpAddr::V4(v4) => v4.is_loopback() || v4.is_unspecified(),
+                std::net::IpAddr::V6(v6) => {
+                    v6.is_loopback() || v6.is_unspecified() || v6.to_ipv4_mapped().is_some_and(|m| m.is_loopback())
+                }
+            });
+        if here {
+            e
+        } else {
+            written
         }
     };
     let bound = |raw: &str| raw.trim().parse::<std::net::SocketAddr>().ok().filter(|a| a.port() != 0);
@@ -1642,7 +1668,7 @@ pub(crate) fn oast_endpoints(cfg: &ferret_core::config::OastCfg) -> Vec<(String,
         }
         OastMode::External => {
             if let Some(e) = cfg.external_poll_url.as_deref().and_then(endpoint_of) {
-                push("oast.external_poll_url", e);
+                push("oast.external_poll_url", every_port(e));
             }
         }
     }
@@ -1656,7 +1682,7 @@ pub(crate) fn oast_endpoints(cfg: &ferret_core::config::OastCfg) -> Vec<(String,
     });
     if let Some(authority) = callback {
         if let Some(e) = endpoint_of(&format!("{scheme}://{authority}")) {
-            push("oast.public_host", e);
+            push("oast.public_host", every_port(e));
         }
         let domain = match authority.strip_prefix('[') {
             Some(v6) => v6.split(']').next().unwrap_or("").to_string(),
@@ -8001,7 +8027,21 @@ impl Runtime {
             p.with_infrastructure(&infra_spec_resolved(&self.inner.infra_config(), &self.inner.infra()))
         })?;
         for h in &hosts {
-            if let Some(rule) = infra.infrastructure_refusal(h) {
+            // A grant of a bare name reaches it on every port: a name of the OAST broker's is refused whatever port its
+            // rule names (its callbacks must never come from ferret's own commands).
+            let bare_name = {
+                let n = h.trim().trim_end_matches('.').to_ascii_lowercase();
+                !n.contains(':')
+                    && n.parse::<std::net::IpAddr>().is_err()
+                    && n != "localhost"
+                    && !n.ends_with(".localhost")
+            };
+            let rule = infra.infrastructure_refusal(h).or_else(|| {
+                infra
+                    .infrastructure_on_some_port(h)
+                    .filter(|r| bare_name && r.starts_with("deny infrastructure: oast."))
+            });
+            if let Some(rule) = rule {
                 return Err(format!(
                     "The host `{h}` is infrastructure of this machine or of ferret ({rule}); no grant lets a command reach it, so nothing was granted. Grant the target by its own name or address instead."
                 ));
@@ -10959,6 +10999,70 @@ mod tests {
         e.rt.shutdown().await;
     }
 
+    /// The broker's callback host is refused on every port, by name and by address: a grant of the bare host, of the
+    /// host on another port, and `mode = "open"` reach none of it (an external server takes callbacks on many ports,
+    /// and a `run` callback must never come from ferret's own commands).
+    #[test]
+    fn the_oast_brokers_poll_and_callback_hosts_are_refused_on_every_port() {
+        use ferret_core::config::{NetworkCfg, NetworkMode, OastCfg, OastMode};
+        let c = Config {
+            oast: OastCfg {
+                enabled: true,
+                mode: OastMode::External,
+                external_poll_url: Some("https://poll.example.test/api/poll".into()),
+                external_token_file: Some("/nonexistent/oast.token".into()),
+                ..OastCfg::default()
+            },
+            ..Config::default()
+        };
+        let lookup = |h: &str| -> Vec<std::net::IpAddr> {
+            if h == "poll.example.test" {
+                vec!["203.0.113.50".parse().unwrap()]
+            } else {
+                Vec::new()
+            }
+        };
+        let res = crate::infra::resolve(&c, &|_| None, &lookup, Vec::new());
+        let open = Policy::new(&NetworkCfg { mode: NetworkMode::Open, ..NetworkCfg::default() })
+            .and_then(|p| p.with_infrastructure(&infra_spec_resolved(&c, &res)))
+            .unwrap();
+        for entry in ["poll.example.test", "poll.example.test:80", "poll.example.test:53", "203.0.113.50"] {
+            let rule = open.infrastructure_refusal(entry).unwrap_or_default();
+            assert!(rule.starts_with("deny infrastructure: oast."), "{entry}: {rule}");
+        }
+        for (host, port) in [("poll.example.test", 80), ("poll.example.test", 8443), ("203.0.113.50", 80)] {
+            let v = open.check_name(host, port);
+            assert!(!v.allowed && v.rule.starts_with("deny infrastructure: oast."), "{host}:{port} {}", v.rule);
+        }
+        assert!(open.check_name("api.target.example", 80).allowed, "only the broker's host");
+    }
+
+    /// `grant_scope` refuses the broker's callback host however it is written (bare, on its port or on another), as it
+    /// refuses its listener: no grant reaches it.
+    #[tokio::test]
+    async fn no_grant_reaches_the_oast_brokers_callback_host_on_any_port() {
+        let e = env_with(Script::new(|_, _| finish("ok")), false, |c| {
+            c.oast.enabled = true;
+            c.oast.mode = ferret_core::config::OastMode::Local;
+            c.oast.bind = "127.0.0.1:0".into();
+            c.oast.public_host = Some("cb.example.test:8080".into());
+        })
+        .await;
+        let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
+        let id = info.meta.id.clone();
+        until("idle", || e.rt.session(&id).is_some_and(|s| s.status.phase == Phase::Idle)).await;
+        for bad in ["cb.example.test", "cb.example.test:80", "cb.example.test:8080", "tok.cb.example.test"] {
+            let err = e.rt.grant_scope(&id, &[bad.to_string()], None).await.unwrap_err();
+            assert!(
+                err.contains("deny infrastructure: oast.public_host") && err.contains("nothing was granted"),
+                "{bad}: {err}"
+            );
+        }
+        let rule = e.rt.inner.proxy.check_name(&id, "cb.example.test", 443).map(|v| v.rule).unwrap_or_default();
+        assert!(rule.starts_with("deny infrastructure: oast.public_host"), "{rule}");
+        e.rt.shutdown().await;
+    }
+
     /// The OAST endpoints the infrastructure deny takes (`oast_endpoints`) for each mode, and the external token file
     /// among the services' files.
     #[test]
@@ -10981,15 +11085,19 @@ mod tests {
             [
                 "oast.bind 0.0.0.0:8099",
                 "oast.dns_bind 127.0.0.1:5353",
-                "oast.public_host oast.example.test:8080",
+                "oast.public_host oast.example.test",
                 "oast.public_host *.oast.example.test",
-            ]
+            ],
+            "the callback host on every port"
         );
         let local80 = OastCfg { public_host: Some("Oast.Example.Test".into()), dns_bind: None, ..local.clone() };
         assert_eq!(
             pairs(oast_endpoints(&local80)),
-            ["oast.bind 0.0.0.0:8099", "oast.public_host Oast.Example.Test:80", "oast.public_host *.oast.example.test"]
+            ["oast.bind 0.0.0.0:8099", "oast.public_host Oast.Example.Test", "oast.public_host *.oast.example.test"]
         );
+        // A callback host on this machine keeps its port: the sandbox refuses that loopback port, not every one.
+        let here = OastCfg { public_host: Some("127.0.0.1:8099".into()), dns_bind: None, ..local.clone() };
+        assert_eq!(pairs(oast_endpoints(&here)), ["oast.bind 0.0.0.0:8099", "oast.public_host 127.0.0.1:8099"]);
         // External: the endpoint it polls, and the callback host (the poll host itself when no public host is set).
         let external = OastCfg {
             enabled: true,
@@ -11000,12 +11108,13 @@ mod tests {
         };
         assert_eq!(
             pairs(oast_endpoints(&external)),
-            ["oast.external_poll_url poll.example.test:443", "oast.public_host *.poll.example.test"]
+            ["oast.external_poll_url poll.example.test", "oast.public_host *.poll.example.test"],
+            "the poll host on every port"
         );
         let with_public = OastCfg { public_host: Some("203.0.113.9:8443".into()), ..external.clone() };
         assert_eq!(
             pairs(oast_endpoints(&with_public)),
-            ["oast.external_poll_url poll.example.test:443", "oast.public_host 203.0.113.9:8443"],
+            ["oast.external_poll_url poll.example.test", "oast.public_host 203.0.113.9"],
             "an IP literal has no DNS names under it"
         );
         let mut c = Config { oast: external, ..Config::default() };

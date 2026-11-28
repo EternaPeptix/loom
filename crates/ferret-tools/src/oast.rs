@@ -23,8 +23,9 @@
 //!   or `"read"` when no callback has arrived yet.
 //! - The broker's endpoints are infrastructure (`docs/MONITOR.md` §2.2, E1; `ferret_agent::runtime::oast_endpoints`):
 //!   the runtime starts the broker before anything else, takes `http_addr()` / `dns_addr()` as the addresses bound, and
-//!   refuses them, the external poll endpoint, the callback host and the names under its DNS domain to every command
-//!   whatever is granted. A callback is evidence only because no command of ferret's can send one.
+//!   refuses them, the external poll host and the callback host (on every port, by name and by address) and the names
+//!   under its DNS domain to every command whatever is granted. A callback is evidence only because no command of
+//!   ferret's can send one.
 
 use crate::{
     params::{opt, spec},

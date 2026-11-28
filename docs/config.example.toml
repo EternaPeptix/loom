@@ -239,8 +239,8 @@ max_messages = 20                               # most messages returned per rea
 # Optional Out-of-Band Application Security Testing (OAST) callback broker (`oast_mint` / `oast_poll`)
 # for blind SSRF, XXE, XSS, and SSTI verification. Off by default. See docs/RUN.md and docs/SECURITY_STATE.md.
 # Every endpoint of the broker (its listeners as bound, the poll endpoint, the callback host and the names under its
-# DNS domain) is infrastructure: refused to every command whatever is granted (docs/MONITOR.md E1). Give public_host a
-# domain of its own: no name under it can be a target.
+# DNS domain) is infrastructure: refused to every command whatever is granted (docs/MONITOR.md E1); the poll and callback
+# hosts on every port. Give public_host a domain of its own: no name under it, and no port of it, can be a target.
 enabled = false
 mode = "local"                                  # "local" (embedded HTTP + optional UDP DNS listener) or "external" (polling broker)
 bind = "127.0.0.1:0"                            # local HTTP listener socket address (`0` picks a free port)

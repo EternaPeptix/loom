@@ -35,6 +35,10 @@ pub const META_ALSO_STORED: &str = "also_stored";
 pub const META_CWD: &str = "cwd";
 /// `ToolResult::meta` key: id of the background job a call turned into or started.
 pub const META_JOB: &str = "job";
+/// `ToolResult::meta` key on a box tool's result (`box_exec`, `box_get`, `box_reset`, a box-shell `bash`) when the
+/// mission's box has the proxy bridge (`[box] proxy_bridge`): the session whose proxy grant the bridge carries, so
+/// whose net decisions what a program in the box sends over HTTP(S) is recorded as.
+pub const META_BOX_BRIDGE: &str = "box_bridge";
 /// Output was admitted for a stored action; coverage awaits an actual actor callback.
 pub const META_DEFERRED_OBSERVATION: &str = "deferred_observation";
 /// `ToolResult::meta` key: which check of the harness refused the call, for the refusals a

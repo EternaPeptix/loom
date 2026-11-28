@@ -18,7 +18,8 @@
 //!   the Docker host named by `[box] ssh_host` and the `hostname` that `ssh -G` resolves it to, every port;
 //!   the host of each model endpoint (on its port); the host of each service the daemon talks to for the operator
 //!   (`runtime::service_endpoints`: the Signal bridge's signal-cli, the mail inbox's IMAP server, the OAST broker's
-//!   endpoints, on its port; a `*.domain` entry of the broker's is a wildcard and is not looked up); each
+//!   endpoints, on its port; the broker's poll and callback hosts have none and their addresses count on every port;
+//!   a `*.domain` entry of the broker's is a wildcard and is not looked up); each
 //!   `network.infrastructure` entry that is a plain name, with its port. Each name is looked up, and every address found is a `Resolution::addrs` entry
 //!   whose label is the entry's. IP literals, `localhost` names, wildcards and CIDR blocks are not looked
 //!   up (the policy reads them as written). A Docker host's loopback or unspecified address is dropped (an

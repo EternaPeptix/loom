@@ -36,6 +36,7 @@ fn env_of(paths: &Paths) -> Arc<Env> {
         mcp_hosts: Default::default(),
         box_shell: Default::default(),
         box_bridge: false,
+        verifiers: Default::default(),
     })
 }
 
@@ -257,6 +258,151 @@ fn the_grant_in_force_at_the_time_is_the_one_that_counts() {
     assert!(r.ledgers_verified);
     assert_eq!(tw(&r, "TW-01").fired, 1, "the refusal before the grant is a hit; the one after it is not");
     assert!(!r.notes.iter().any(|n| n.contains("without the journal key")));
+}
+
+/// Main's box proxy bridge in a replay: a lead's log sorts before its child's, and a decision of the lead (whose grant
+/// the bridge carries) made while the child's box call ran is judged after every log is read, so the box call keeps it
+/// in flight. Without the bridge the lead was idle.
+#[test]
+fn a_replay_judges_a_leads_bridged_decision_after_its_childs_box_call() {
+    let h = home();
+    let _lead = session(&h, "s-1", "m-1");
+    let dir = h.paths.sessions_dir().join("s-2");
+    std::fs::create_dir_all(&dir).expect("dir");
+    let mut child = SessionLog::create(&dir.join("log.jsonl"), Durability::Batch).expect("create");
+    let Some(Ok(Event::SessionStart(mut start))) =
+        std::fs::read_to_string(h.paths.sessions_dir().join("s-1/log.jsonl")).ok().and_then(|t| {
+            t.lines().next().map(|l| serde_json::from_str::<ferret_core::event::Record>(l).map(|r| r.event))
+        })
+    else {
+        panic!("the lead's start");
+    };
+    start.session = SessionId::from("s-2");
+    start.parent = Some(SessionId::from("s-1"));
+    start.role = "worker".into();
+    child.append(Author::Harness, Event::SessionStart(start)).expect("start");
+    child
+        .append(
+            Author::Model,
+            Event::ToolCall(ToolCall {
+                call_id: CallId::from("c1"),
+                req_id: "r".into(),
+                name: "box_exec".into(),
+                args: json!({"command": "sqlmap -r req.txt --batch"}),
+                class: ToolClass::Exec,
+            }),
+        )
+        .expect("call");
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    let w = ferret_net::netlog::NetLogWriter::new();
+    let e = crate::runtime::NetEntry {
+        ts_ms: ferret_core::now_ms(),
+        decision: NetDecision {
+            host: "api.target.example".into(),
+            port: 443,
+            method: "CONNECT".into(),
+            allowed: true,
+            rule: "allow".into(),
+            resolved: None,
+            sni: None,
+            paced_ms: None,
+        },
+    };
+    w.append(&h.paths.sessions_dir().join("s-1").join("net.jsonl"), &e).expect("net");
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    child
+        .append(
+            Author::Tool,
+            Event::ToolResult(ToolResult {
+                call_id: CallId::from("c1"),
+                name: "box_exec".into(),
+                status: ToolStatus::Ok,
+                text: String::new(),
+                output: None,
+                cut: false,
+                class: ToolClass::Exec,
+                meta: Default::default(),
+                duration_ms: 60,
+                images: Vec::new(),
+                exchanges: Vec::new(),
+            }),
+        )
+        .expect("result");
+    for (bridge, fired) in [(true, 0), (false, 1)] {
+        let mut env = (*env_of(&h.paths)).clone();
+        env.box_bridge = bridge;
+        let r = run(&h.paths, Arc::new(env), None, &ReplayOpts::default());
+        assert_eq!(tw(&r, "TW-21").fired, fired, "bridge {bridge}");
+    }
+}
+
+/// A journal is read for the authorization of its mission's first record, but its entries are judged after the
+/// session logs are read: an import of a target's own artifact (its `security_ingest` result names the entry it wrote)
+/// is the target's hosts, S0, not a TW-23 flag. The same entry that no import's result names is S2.
+#[test]
+fn a_replay_judges_a_journal_entry_after_the_records_of_the_call_that_wrote_it() {
+    use ferret_core::ledger::{Entry as LedgerEntry, LedgerOp};
+    use ferret_core::security_state::{AssetInput, AssetKind, SecurityOp};
+    for (tool, fired) in [("security_ingest", 0), ("security_record", 1)] {
+        let h = home();
+        let mut s = session(&h, "s-1", "m-1");
+        s.append(
+            Author::Model,
+            Event::ToolCall(ToolCall {
+                call_id: CallId::from("c1"),
+                req_id: "r".into(),
+                name: tool.into(),
+                args: json!({"format": "sourcemap", "handle": "out:0123abcd", "evidence": ["e1"]}),
+                class: ToolClass::State,
+            }),
+        )
+        .expect("call");
+        s.append(Author::Harness, Event::Ledger { n: 1, summary: "security".into() }).expect("ledger");
+        let text = match tool {
+            "security_ingest" => "security state\n{\n  \"entry\": 1,\n  \"format\": \"sourcemap\"\n}",
+            _ => "security state\n{\n  \"entry\": 1\n}",
+        };
+        s.append(
+            Author::Tool,
+            Event::ToolResult(ToolResult {
+                call_id: CallId::from("c1"),
+                name: tool.into(),
+                status: ToolStatus::Ok,
+                text: text.into(),
+                output: None,
+                cut: false,
+                class: ToolClass::State,
+                meta: Default::default(),
+                duration_ms: 5,
+                images: Vec::new(),
+                exchanges: Vec::new(),
+            }),
+        )
+        .expect("result");
+        let endpoint = SecurityOp::AssetUpsert {
+            asset: AssetInput {
+                kind: AssetKind::Endpoint,
+                locator: "https://api.stripe.com/v1/payment_intents".into(),
+                evidence: vec!["e1".into()],
+                mandatory: true,
+                parent: None,
+            },
+        };
+        let entry = LedgerEntry {
+            n: 1,
+            ts_ms: ferret_core::now_ms(),
+            session: SessionId::from("s-1"),
+            from_user: false,
+            op: LedgerOp::Security(SecurityOp::Batch { operations: vec![endpoint] }),
+            mac: String::new(),
+        };
+        let m = MissionId::from("m-1");
+        std::fs::create_dir_all(h.paths.mission_dir(&m)).expect("dir");
+        let line = format!("{}\n", serde_json::to_string(&entry).expect("entry"));
+        std::fs::write(h.paths.journal(&m), line).expect("journal");
+        let r = run(&h.paths, env_of(&h.paths), None, &ReplayOpts::default());
+        assert_eq!(tw(&r, "TW-23").fired, fired, "{tool}");
+    }
 }
 
 #[test]

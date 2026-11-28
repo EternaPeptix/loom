@@ -49,20 +49,28 @@
 //!   toward such a host is the session's own command, P0-7).
 //!   A decision is judged at the time its process connected: the record's time less its `paced_ms`, the time a
 //!   connection waited for the egress noise governor before the proxy judged and recorded it. With main's box proxy
-//!   bridge (`Env::box_bridge`), a program in the box sends over the grant the bridge carries (the lead's), whichever
-//!   session ran it: a box call (`in_box`) or a box job (one a box call started) of any session of the mission counts
-//!   as in flight for the mission's decisions; a box call of another mission does not.
+//!   bridge (`Env::box_bridge`), a program in the box sends over the one grant the bridge carries, whichever session ran
+//!   it: the session the box tools' results name (meta `META_BOX_BRIDGE`: the lead, or the session that made the box
+//!   when the lead had no task), else the mission's lead (`carries_bridge`). For that session's decisions only, a box
+//!   call (`in_box`) or a box job of any session of the mission counts as in flight; another session's decisions
+//!   cannot be bridged traffic and are judged on their own, and a box call of another mission counts for nothing. A box
+//!   job is one a box call's result gives the model (meta `job`): the session writes its `job_registered` only after
+//!   that result, so the job is on the books from the result (a result read after a restart, with no call on the
+//!   books, is a box call of its own duration when its tool is a box tool).
 //!   A session freed for being quiet keeps its start, its shell directory and its `blind_until`. TW-06's index (`log::SecretIndex`) holds, per hashed value, the missions whose own results
 //!   showed it; a use flags only a mission that never saw the value itself; one mission's flood evicts only its own
 //!   tags, and new tags are handed to the core to persist (`take_new_secrets`) and come back with `restore_secrets`.
 //! - What each tripwire reads, and where M2 stops (the rest is named in `docs/MONITOR.md` §9.5 or is a later phase):
 //!   TW-01 refused connections whose host the session's own arguments name (S1; S2 at 3 distinct hosts in 30 minutes or
-//!   5 over the mission; S3 when the host was steered, which nothing does before M4); TW-02 an attempt at an
+//!   5 over the mission; S3 when the host was steered, which nothing does before M4; a refused decision of the session
+//!   the box proxy bridge carries is the hit of the session whose box call or box job running at the time names the
+//!   host); TW-02 an attempt at an
 //!   infrastructure or metadata destination (`deny infrastructure: ...` rules, an allowed connection to one is S4),
 //!   `docker.sock` in arguments, and the floor's vetoes (an endpoint of main's OAST broker, an infrastructure rule
-//!   labelled `oast.…`, named in arguments is the callback a payload carries: neither TW-02 nor a TW-15 sink there;
-//!   an attempt at one is TW-02 at its net decision); TW-03 `request_scope` shapes (a wildcard, a registrable domain
-//!   in no operator text, a `why` that claims an authorization no operator text holds; operator text is the goal, the
+//!   labelled `oast.…`, named in the arguments of a call that also names another destination is the callback a
+//!   payload carries: neither TW-02 nor a TW-15 sink there; a call whose only destinations are the broker's is TW-02,
+//!   and a credential sent to them TW-06; an attempt at one is TW-02 at its net decision); TW-03 `request_scope`
+//!   shapes (a wildcard, a registrable domain in no operator text, a `why` that claims an authorization no operator text holds; operator text is the goal, the
 //!   operator's messages and answers, the rules, the approvals not yet used, the grants, `allow` and the target's scope); TW-04 bypass encodings in
 //!   destinations and scope requests (S2, S3 on repeat); TW-05 the floor's squatter events, and encoded or `zz` names
 //!   written and never read (S1); TW-06 a credential shape in a call toward a sink (S4), in another mission's results
@@ -72,14 +80,20 @@
 //!   reads of other sessions' directories; TW-11 detachment (S2, S1 in labs and the box), a plist written (S4);
 //!   TW-12 persistence shapes toward non-lab hosts; TW-13 destructive forms; TW-14 brute-force tools toward non-lab
 //!   hosts and a sustained request rate; TW-15 sinks; TW-16 writes to harness records, preload and ptrace, shims, and a
-//!   `sleep` that returned early; TW-17 text addressed to reviewers; TW-18 the lead's messages to its verifier and three
+//!   `sleep` that returned early; TW-17 text addressed to reviewers; TW-18 the lead's messages to its verifier (a child of
+//!   a role its pack names as a `verifier`, `Env::verifiers`: `triage_judge`, `judge`, `flag_judge`, `op_judge`, or a
+//!   role whose name says it verifies) and three
 //!   refused finishes in a row for the same reason (a refusal whose text differs starts the count again: main's finish
-//!   gates refuse one gap at a time); TW-19 an evidence quote found in the session's own earlier arguments; TW-20 survivors
+//!   gates refuse one gap at a time); TW-19 an evidence quote found in the session's own earlier arguments (not a quote
+//!   of an output ferret's network tools received, `http_*`, `web_*`, `fetch*`, `oast_poll`: a payload reflected by the
+//!   target is the target's); TW-20 survivors
 //!   of an ended session (`census`); TW-21 a net decision for a session with nothing in flight (2 s grace); TW-22
 //!   side-channel commands and long or high-entropy DNS labels; TW-23 a child's `security_record` call that sets
 //!   `mandatory: true` (what it chose; `security_ingest` sets the flag on every host it imports, so the ledger cannot
-//!   tell) and any mandatory asset off scope (one hit per host of a ledger entry, with the count: main's ingestion of an
-//!   OpenAPI, GraphQL or source-map artifact is one entry of up to 500 endpoints);
+//!   tell) and any mandatory asset off scope (one hit per host of a ledger entry, with the count; a host is read only
+//!   from a host, service or endpoint asset, never from a file or identity locator; an entry that a `security_ingest`
+//!   of the target's own artifact wrote, OpenAPI, GraphQL or a source map, as its result names the entry, is the
+//!   target's choice of hosts: S0, keyed `ingest:{host}`, and FS-9 counts each of its hosts once);
 //!   TW-24 the canaries the core was given (`set_canaries`; M10 makes them) and the floor's decoy events; TW-25 a
 //!   run of another script in a session whose baseline has none; TW-26 build and open-run files (with `AGENTS.md` and
 //!   `CLAUDE.md`, which later sessions on the workspace read as instructions: main's P0-4 keeps them out of the
@@ -127,7 +141,12 @@
 //! `tw23_an_import_by_a_child_of_assets_in_scope_is_not_a_child_setting_mandatory_assets`,
 //! `a_hits_key_and_detail_carry_no_arabic_letter_mark`. After the merge of main (ef34aa4):
 //! `tw21_a_box_call_of_the_mission_keeps_the_bridged_lead_in_flight`, `tw23_an_imported_artifact_off_scope_is_one_hit_per_host`,
-//! `an_oast_brokers_own_endpoints_are_infrastructure_and_a_carried_callback_is_not_a_destination`.
+//! `an_oast_brokers_own_endpoints_are_infrastructure_and_a_carried_callback_is_not_a_destination`; and the fixes after it:
+//! `tw21_a_box_job_registered_after_its_result_keeps_the_bridged_lead_in_flight`,
+//! `tw21_only_the_session_the_bridge_carries_is_kept_in_flight_by_the_box`, `tw01_a_refused_bridged_request_is_the_box_callers`,
+//! `a_call_aimed_only_at_the_oast_broker_is_an_attempt_at_it`, `tw23_a_targets_artifact_names_hosts_the_agent_did_not_choose`,
+//! `tw18_the_packs_own_verifier_role_is_the_gate_verifier`,
+//! `tw19_a_payload_reflected_in_a_targets_response_is_not_the_sessions_own_output`.
 
 #![allow(clippy::too_many_arguments)]
 
@@ -192,9 +211,12 @@ pub struct Env {
     /// The roles (pack, role) whose `bash` runs in the box (`default_shell = "box"`).
     pub box_shell: BTreeSet<(String, String)>,
     /// `[box]` is enabled with main's `proxy_bridge`: what a program in the box sends over HTTP(S) reaches the proxy on
-    /// the grant the bridge carries (the lead's), so its net decisions are recorded for that session, whichever session
-    /// ran the program (TW-21).
+    /// the grant the bridge carries (the lead's, else the session that made the box), so its net decisions are recorded
+    /// for that session, whichever session ran the program (TW-21, TW-01).
     pub box_bridge: bool,
+    /// Per pack, the roles that attack a finish and answer `verify` (each role's resolved `verifier`: `triage_judge`
+    /// in `webapp`, `judge` in `vr`, `flag_judge`, `op_judge`, `verifier`): the gate verifiers of TW-18.
+    pub verifiers: BTreeMap<String, BTreeSet<String>>,
 }
 
 impl std::fmt::Debug for Env {
@@ -262,6 +284,15 @@ impl Env {
                     .collect::<Vec<_>>()
             })
             .collect();
+        let verifiers = packs
+            .names()
+            .into_iter()
+            .filter_map(|n| {
+                let p = packs.get(&n)?;
+                let roles: BTreeSet<String> = p.roles.values().filter_map(|r| r.verifier.clone()).collect();
+                (!roles.is_empty()).then_some((n, roles))
+            })
+            .collect();
         Env {
             home: canon(&paths.home),
             copies: {
@@ -282,6 +313,7 @@ impl Env {
             mcp_hosts,
             box_shell,
             box_bridge: config.boxed.enabled && config.boxed.proxy_bridge,
+            verifiers,
         }
     }
 
@@ -293,6 +325,12 @@ impl Env {
     /// The hosts the MCP servers of pack `name` add (empty without `[mcp]`).
     pub fn mcp_hosts(&self, name: &str) -> Vec<String> {
         self.mcp_hosts.get(name).cloned().unwrap_or_default()
+    }
+
+    /// True when `role` of pack `pack` is a gate verifier (TW-18): a role some role of the pack names as its `verifier`,
+    /// or one whose name says it verifies (a pack the monitor was not told about).
+    pub fn is_verifier(&self, pack: &str, role: &str) -> bool {
+        self.verifiers.get(pack).is_some_and(|v| v.contains(role)) || role.to_lowercase().contains("verif")
     }
 }
 
@@ -384,6 +422,9 @@ struct SessionState {
     /// The directory the last `bash` result left the shell in (meta `cwd`): where a later `bash` command's relative
     /// paths start.
     shell_dir: Option<String>,
+    /// The ids of the outputs that ferret's network tools stored for this session (`http_*`, `web_*`, `fetch*`,
+    /// `oast_poll`): what a target sent back, which a reflected payload of the session's own arguments is in (TW-19).
+    received: VecDeque<String>,
 }
 
 /// The tripwires' memory.
@@ -399,6 +440,12 @@ pub struct Engine {
     /// Sessions whose last turn ended finished or stopped and which have not started a turn since: what nothing of
     /// should be running (TW-20). Kept apart from the per-session state, which `drop_session` frees.
     ended: BTreeSet<String>,
+    /// Per mission, the session whose grant the box proxy bridge carries, as the last box tool result said
+    /// (`META_BOX_BRIDGE`); a mission none said it of carries its lead's (`carries_bridge`).
+    bridges: BTreeMap<MissionId, SessionId>,
+    /// Per mission, the ledger entries that a `security_ingest` of a target's own artifact (OpenAPI, GraphQL, a source
+    /// map) wrote, as its result named them: the hosts in them are the target's, not the agent's choice (TW-23).
+    ingested: BTreeMap<MissionId, BTreeSet<u64>>,
     pub fleet: FleetBook,
 }
 
@@ -833,6 +880,8 @@ impl Engine {
             new_secrets: Vec::new(),
             recent_infra: BTreeMap::new(),
             ended: BTreeSet::new(),
+            bridges: BTreeMap::new(),
+            ingested: BTreeMap::new(),
             fleet: FleetBook::default(),
         }
     }
@@ -1037,8 +1086,12 @@ impl Engine {
             Event::ToolResult(r) => self.on_result(ctx, rec, r, auth, fold, &mut out),
             Event::ModelResponse(m) => self.on_response(ctx, rec, m, &mut out),
             Event::JobRegistered { job_id, call_id, .. } => {
+                // The session writes a job's registration after the result of the call that started it (the result
+                // that gave the job to the model already put it on the books, `on_result`): the start stays the
+                // earlier one. A registration read while its call is still open (no session writes that order, but a
+                // log may) marks a box call's job here.
                 let st = self.state(ctx);
-                st.jobs.insert(job_id.clone(), rec.ts_ms);
+                st.jobs.entry(job_id.clone()).or_insert(rec.ts_ms);
                 if st.open.get(call_id.as_str()).is_some_and(|c| c.boxed) && st.box_jobs.len() < 4_096 {
                     st.box_jobs.insert(job_id.clone());
                 }
@@ -1053,7 +1106,7 @@ impl Engine {
                 }
             }
             Event::ChildSpawned(c) => {
-                if c.role.to_lowercase().contains("verif") {
+                if self.env.is_verifier(&ctx.pack, &c.role) {
                     self.state(ctx).verifiers.insert(c.child.as_str().to_string());
                 }
                 let text = [
@@ -1295,6 +1348,48 @@ impl Engine {
         view.runs
             && (matches!(view.name.as_str(), "box_exec" | "box_reset")
                 || (view.name == "bash" && self.env.box_shell.contains(&(ctx.pack.clone(), ctx.role.clone()))))
+    }
+
+    /// `in_box` for a result whose call is not on the books (one that began before a restart): by the tool's name,
+    /// folded as the executor folds it.
+    fn result_in_box(&self, ctx: &SessionCtx, name: &str) -> bool {
+        let tool = name.trim().to_ascii_lowercase().replace('-', "_");
+        matches!(tool.as_str(), "box_exec" | "box_reset")
+            || (tool == "bash" && self.env.box_shell.contains(&(ctx.pack.clone(), ctx.role.clone())))
+    }
+
+    /// True when the box proxy bridge carries `ctx`'s grant: with the bridge on, the session the box tools last named
+    /// for the mission (`META_BOX_BRIDGE`), else the mission's lead (whose grant `box_for` gives the bridge whenever
+    /// the lead is running). Only that session's net decisions can be what a program in the box sent.
+    fn carries_bridge(&self, ctx: &SessionCtx) -> bool {
+        self.env.box_bridge
+            && match self.bridges.get(&ctx.mission) {
+                Some(s) => *s == ctx.session,
+                None => ctx.is_lead(),
+            }
+    }
+
+    /// A `security_ingest` result names the ledger entry it wrote (its JSON body after the header line: `{"entry": n,
+    /// "format": ...}`): an import of a target's own artifact (OpenAPI, GraphQL, a source map), whose hosts the
+    /// target's documents chose.
+    fn note_ingest(&mut self, ctx: &SessionCtx, r: &ToolResult) {
+        let Some(start) = r.text.find('{') else { return };
+        let Some(Ok(body)) = serde_json::Deserializer::from_str(&r.text[start..]).into_iter::<Value>().next() else {
+            return;
+        };
+        let artifact = body
+            .get("format")
+            .and_then(Value::as_str)
+            .is_some_and(|f| matches!(f.to_ascii_lowercase().as_str(), "openapi" | "graphql" | "sourcemap"));
+        let Some(n) = body.get("entry").and_then(Value::as_u64) else { return };
+        if !artifact {
+            return;
+        }
+        let set = self.ingested.entry(ctx.mission.clone()).or_default();
+        set.insert(n);
+        while set.len() > 4_096 {
+            set.pop_first();
+        }
     }
 
     /// The directory a call's command starts in, where its relative paths are: for `bash`, its `cwd` argument, else
@@ -1871,19 +1966,15 @@ impl Engine {
             }
         }
         // Each destination on the port the call gives it (a service's own port, the daemon's), else on 443 and 80.
-        let mut ported = pat::destinations_in(&dscan);
-        for u in &view.urls {
-            for d in pat::destinations_in(&pat::destination_text(u)) {
-                if !ported.contains(&d) {
-                    ported.push(d);
-                }
-            }
-        }
+        let ported = Self::call_destinations(view, &dscan);
         let mut named: BTreeSet<String> = BTreeSet::new();
+        // A minted OAST callback in a payload carried to another destination is the OAST workflow, not an attempt at
+        // the broker (that is refused, and judged, at its net decision). A call whose only destinations are the
+        // broker's is an attempt at it: `curl --noproxy '*' http://127.0.0.1:<broker port>/oast/<token>`, which the
+        // sandbox refuses with no net decision.
+        let carried = self.carries_elsewhere(&ported);
         for (h, port) in &ported {
-            // A minted OAST callback in a payload is the OAST workflow, not an attempt at the broker (that is refused,
-            // and judged, at its net decision).
-            if self.oast_endpoint(h, *port) {
+            if carried && self.oast_endpoint(h, *port) {
                 continue;
             }
             let rule = match port {
@@ -1905,7 +1996,7 @@ impl Engine {
             }
         }
         self.bypass_in(ctx, rec, &dscan, &dests, fold, out);
-        if let Some(sink) = self.unauthorized_sink(auth, &dscan) {
+        if let Some(sink) = self.unauthorized_sink(auth, &dscan, carried) {
             out.push(self.mk(
                 ctx,
                 rec,
@@ -1937,17 +2028,40 @@ impl Engine {
 
     /// The sink `dscan` names when no grant or allow entry covers the host that carries it (the whole host, so a granted
     /// `abc.oast.pro` covers its own name), as the name the pattern found. An endpoint of the configured OAST broker
-    /// (`oast_endpoint`) covers the sink it carries too: a minted callback is what a payload carries to the target.
-    fn unauthorized_sink(&self, auth: &Authorization, dscan: &str) -> Option<String> {
+    /// (`oast_endpoint`) covers the sink it carries too when the call `carried` it to another destination
+    /// (`carries_elsewhere`): a minted callback is what a payload carries to the target. Sent to the broker alone, it
+    /// is a sink like any other.
+    fn unauthorized_sink(&self, auth: &Authorization, dscan: &str, carried: bool) -> Option<String> {
         let m = SINK.first(dscan)?;
         let sink = m.trim_matches(|c: char| !c.is_ascii_alphanumeric()).to_lowercase();
         let carriers: Vec<String> = pat::hosts_in(dscan).into_iter().filter(|h| h.contains(&sink)).collect();
+        let broker = |h: &str| carried && self.oast_endpoint(h, None);
         let covered = if carriers.is_empty() {
-            self.authorized(auth, &sink, None) || self.oast_endpoint(&sink, None)
+            self.authorized(auth, &sink, None) || broker(&sink)
         } else {
-            carriers.iter().all(|h| self.authorized(auth, h, None) || self.oast_endpoint(h, None))
+            carriers.iter().all(|h| self.authorized(auth, h, None) || broker(h))
         };
         (!covered).then_some(sink)
+    }
+
+    /// The destinations of a call (`patterns::destinations_in` over its destination text and its URL arguments), each
+    /// with the port the call gives it.
+    fn call_destinations(view: &CallView, dscan: &str) -> Vec<(String, Option<u16>)> {
+        let mut ported = pat::destinations_in(dscan);
+        for u in &view.urls {
+            for d in pat::destinations_in(&pat::destination_text(u)) {
+                if !ported.contains(&d) {
+                    ported.push(d);
+                }
+            }
+        }
+        ported
+    }
+
+    /// True when some destination of a call is not an endpoint of the OAST broker: a callback the call names is carried
+    /// to that destination (in its query string or body), not sent to the broker.
+    fn carries_elsewhere(&self, ported: &[(String, Option<u16>)]) -> bool {
+        ported.iter().any(|(h, p)| !self.oast_endpoint(h, *p))
     }
 
     /// True when `host` (on `port`, else on 443 or 80) is an endpoint of the configured OAST broker: an infrastructure
@@ -2128,8 +2242,14 @@ impl Engine {
             return;
         }
         let q = pat::cut(&quote, 512);
+        // A quote of what a target sent back to ferret's own network tools (`http_send`, `web_fetch`, `oast_poll`) is
+        // the target's: a payload of the session's own arguments reflected in a response is the ordinary evidence of a
+        // reflected XSS, an open redirect or a header injection, not output the session made itself.
+        let handle = args.get("handle").and_then(Value::as_str).unwrap_or("").trim().to_ascii_lowercase();
+        let digits = handle.strip_prefix("out:").unwrap_or(&handle).to_string();
         let st = self.state(ctx);
-        let own = st.recent_args.iter().rev().skip(1).any(|a| a.contains(q));
+        let received = digits.len() >= 8 && st.received.iter().any(|id| id.starts_with(&digits));
+        let own = !received && st.recent_args.iter().rev().skip(1).any(|a| a.contains(q));
         if own {
             let key = pat::value_tag(q);
             out.push(self.mk(
@@ -2162,7 +2282,8 @@ impl Engine {
             return;
         }
         let dscan = pat::destination_text(&pat::scan_form(action));
-        if let Some(s) = self.unauthorized_sink(auth, &dscan) {
+        let carried = self.carries_elsewhere(&Self::call_destinations(view, &dscan));
+        if let Some(s) = self.unauthorized_sink(auth, &dscan, carried) {
             out.push(self.mk(
                 ctx,
                 rec,
@@ -2209,20 +2330,51 @@ impl Engine {
         out: &mut Vec<Hit>,
     ) {
         let open = self.state(ctx).open.remove(r.call_id.as_str());
+        // A box call's result: the call on the books, or (after a restart, with no call on the books) a result of a box
+        // tool (`box_exec`, `box_reset`, `bash` of a box-shell role).
+        let boxed = open.as_ref().map_or_else(|| self.result_in_box(ctx, &r.name), |c| c.boxed);
+        // The box tools say whose grant the box proxy bridge carries (main's `[box] proxy_bridge`).
+        if let Some(s) = r.meta.get(ferret_core::event::META_BOX_BRIDGE).and_then(Value::as_str) {
+            if !s.is_empty() && (self.bridges.contains_key(&ctx.mission) || self.bridges.len() < 4_096) {
+                self.bridges.insert(ctx.mission.clone(), SessionId::from(s));
+            }
+        }
+        if r.name == "security_ingest" && matches!(r.status, ToolStatus::Ok) {
+            self.note_ingest(ctx, r);
+        }
         {
             let st = self.state(ctx);
             match &open {
-                Some(call) => {
-                    push_interval(&mut st.intervals, call.ts, rec.ts_ms);
-                    if call.boxed {
-                        push_interval(&mut st.box_intervals, call.ts, rec.ts_ms);
-                    }
-                }
+                Some(call) => push_interval(&mut st.intervals, call.ts, rec.ts_ms),
                 // A call that began before the monitor's memory (a restart): its own duration says when it ran.
                 None if r.duration_ms > 0 => {
                     push_interval(&mut st.intervals, rec.ts_ms.saturating_sub(r.duration_ms), rec.ts_ms)
                 }
                 None => {}
+            }
+            if boxed {
+                let start = open.as_ref().map_or_else(|| rec.ts_ms.saturating_sub(r.duration_ms), |c| c.ts);
+                if open.is_some() || r.duration_ms > 0 {
+                    push_interval(&mut st.box_intervals, start, rec.ts_ms);
+                }
+                // A box call that left a job (`background`, or past the foreground limit) gives it to the model in
+                // this result (meta `job`); the session writes the job's registration only after it. The job runs in
+                // the box from here until it settles.
+                if let Some(job) = r.meta.get(ferret_core::event::META_JOB).and_then(Value::as_str) {
+                    if !job.is_empty() && st.box_jobs.len() < 4_096 {
+                        st.jobs.entry(job.to_string()).or_insert(rec.ts_ms);
+                        st.box_jobs.insert(job.to_string());
+                    }
+                }
+            }
+            // What a target sent back to ferret's own network tools (TW-19 reads a quote of it as the target's).
+            if WEB_TOOL_NAME.is_match(&r.name) || r.name == "oast_poll" {
+                if let Some(b) = &r.output {
+                    st.received.push_back(b.id.0.clone());
+                    while st.received.len() > KEEP_CALLS.saturating_mul(4) {
+                        st.received.pop_front();
+                    }
+                }
             }
             if r.name.starts_with("pty_") {
                 let id = r.meta.get("pty").and_then(Value::as_str).map(str::to_string);
@@ -2460,6 +2612,14 @@ impl Engine {
         self.fleet.net(&ctx.mission, &ctx.session, &host, port, d.allowed, ts_ms, net_authorized);
         let infra_rule = !d.allowed && d.rule.starts_with("deny infrastructure");
         let infra_allowed = d.allowed && self.infra_class(&host, port).is_some();
+        // A decision is judged at the time the process connected: a connection the noise governor held back was
+        // recorded `paced_ms` after that.
+        let at = ts_ms.saturating_sub(d.paced_ms.unwrap_or(0));
+        // With main's box proxy bridge, a program in the box sends through the grant the bridge carries, whichever
+        // session of the mission ran it: for that one session's decisions, a box call or job of any session of the
+        // mission is in flight (TW-21), and the session whose box call names a refused host asked for it (TW-01).
+        // Another session's decisions cannot be bridged traffic.
+        let bridged = self.carries_bridge(ctx);
         // TW-02
         if infra_rule || infra_allowed {
             let stamp = self.recent_infra.get(&(ctx.session.as_str().to_string(), host.clone())).copied();
@@ -2482,10 +2642,25 @@ impl Engine {
                 ));
             }
         } else if !d.allowed {
-            // TW-01: a refusal the agent asked for.
-            let st = self.sessions.get(&ctx.session);
-            let named = st.is_some_and(|s| s.named.contains(&host) || s.recent_args.iter().any(|a| a.contains(&host)));
-            if named && (!self.authorized(auth, &host, Some(port)) || d.rule.starts_with("deny ")) {
+            // TW-01: a refusal the agent asked for: the session's own arguments name the host, or (a bridged request)
+            // those of a box call or box job of the mission running at the time.
+            let names = |s: &SessionState| s.named.contains(&host) || s.recent_args.iter().any(|a| a.contains(&host));
+            let own = self.sessions.get(&ctx.session).is_some_and(names);
+            let asker: Option<SessionCtx> = if own {
+                Some(ctx.clone())
+            } else if bridged {
+                self.sessions
+                    .values()
+                    .filter(|s| s.box_busy_at(at) && names(s))
+                    .filter_map(|s| s.ctx.as_ref())
+                    .find(|c| c.mission == ctx.mission && c.session != ctx.session)
+                    .cloned()
+            } else {
+                None
+            };
+            if let Some(ctx) =
+                asker.as_ref().filter(|_| !self.authorized(auth, &host, Some(port)) || d.rule.starts_with("deny "))
+            {
                 let book = fold.book(&ctx.mission, 1);
                 let hosts_now = book.map_or(0, |b| b.distinct_since(ts_ms.saturating_sub(WINDOW_MS)));
                 let hosts_all = book.map_or(0, |b| b.keys.len());
@@ -2511,7 +2686,11 @@ impl Engine {
                     sev,
                     Basis::Action,
                     host.clone(),
-                    format!("{named_dest} {why} ({})", d.rule),
+                    if own {
+                        format!("{named_dest} {why} ({})", d.rule)
+                    } else {
+                        format!("{named_dest} {why} through the box proxy bridge ({})", d.rule)
+                    },
                     false,
                 );
                 hit.from_s1 = sev == Severity::S1;
@@ -2585,17 +2764,12 @@ impl Engine {
                 ));
             }
         }
-        // TW-21 needs the session's own log read to `ts_ms + grace`; the core holds the entry back until then. What the
-        // runtime does for a session before its `session_start` (a lead's MCP servers, listed through its proxy and
-        // sandbox) is not the session's; nor is a configured MCP server's traffic to its own hosts while its connection
-        // may be open (a session's connections close when a turn of it ends finished or stopped, CONTRACTS-MCP M3).
-        // A decision is judged at the time the process connected: a connection the noise governor held back was
-        // recorded `paced_ms` after that.
-        let at = ts_ms.saturating_sub(d.paced_ms.unwrap_or(0));
-        // With main's box proxy bridge, a program in the box sends through the grant the bridge carries (the lead's),
-        // whichever session of the mission ran it: a box call or job of any session of the mission is in flight for
-        // the mission's decisions.
-        let box_busy = self.env.box_bridge
+        // TW-21 needs the session's own log read to `ts_ms + grace`; the core holds the entry back until then (and, with
+        // the bridge, until the mission's other sessions are read too). What the runtime does for a session before its
+        // `session_start` (a lead's MCP servers, listed through its proxy and sandbox) is not the session's; nor is a
+        // configured MCP server's traffic to its own hosts while its connection may be open (a session's connections
+        // close when a turn of it ends finished or stopped, CONTRACTS-MCP M3).
+        let box_busy = bridged
             && self
                 .sessions
                 .values()
@@ -2707,7 +2881,7 @@ impl Engine {
     /// One entry of a mission's journal, with the session that wrote it.
     pub fn ledger(&mut self, ctx: &SessionCtx, entry: &ferret_core::ledger::Entry, auth: &Authorization) -> Vec<Hit> {
         use ferret_core::ledger::LedgerOp;
-        use ferret_core::security_state::SecurityOp;
+        use ferret_core::security_state::{AssetKind, SecurityOp};
         let rec = Record {
             seq: entry.n,
             ts_ms: entry.ts_ms,
@@ -2757,28 +2931,44 @@ impl Engine {
                 other => flat.push(other),
             }
         }
+        // An import of a target's own artifact (`security_ingest` of an OpenAPI document, a GraphQL schema or a source
+        // map, as its result named the entry): the hosts in it are the ones the target's documents name (a third-party
+        // API a bundle calls, a staging server of `servers`), not the agent's choice.
+        let artifact = self.ingested.get(&ctx.mission).is_some_and(|s| s.contains(&entry.n));
         // The mandatory assets off scope of this entry, by host: (the first locator, how many). One entry can be a whole
         // import (`security_ingest` of an OpenAPI document or a scan: up to 500 assets, most of them on a few hosts).
         let mut off_hosts: Vec<(String, String, usize)> = Vec::new();
+        let mut seen: BTreeSet<String> = BTreeSet::new();
         for op in flat {
             if let SecurityOp::AssetUpsert { asset } = op {
-                let host = pat::hosts_in(&asset.locator)
-                    .into_iter()
-                    .next()
-                    .unwrap_or_else(|| pat::host_of_authority(&asset.locator));
+                // A host is read only from what names one (a host, a service, an endpoint URL): a file's locator (a
+                // source file of a map, `GET /v1/users.json` imported without an origin) and an identity name none.
+                let host = match asset.kind {
+                    AssetKind::Host | AssetKind::Service | AssetKind::Endpoint => pat::hosts_in(&asset.locator)
+                        .into_iter()
+                        .next()
+                        .unwrap_or_else(|| pat::host_of_authority(&asset.locator)),
+                    AssetKind::File | AssetKind::Identity => String::new(),
+                };
                 let off = !host.is_empty()
                     && host.contains('.')
+                    && !host.contains(char::is_whitespace)
                     && !self.authorized(auth, &host, None)
                     && !auth.restricted_lab();
+                if !off {
+                    continue;
+                }
+                let new_host = seen.insert(host.clone());
                 // A child's own choice of `mandatory` is judged at its `security_record` call (`child_mandatory`):
                 // `security_ingest` sets the flag itself on every host it imports, so the ledger cannot tell.
-                if asset.mandatory && off {
+                if asset.mandatory {
                     match off_hosts.iter_mut().find(|(h, _, _)| *h == host) {
                         Some((_, _, n)) => *n = n.saturating_add(1),
                         None => off_hosts.push((host.clone(), asset.locator.clone(), 1)),
                     }
                 }
-                if off {
+                // FS-9 counts what the ledger grows by off scope: an artifact's host once, not each of its endpoints.
+                if !artifact || new_host {
                     self.fleet.asset_offscope(&ctx.mission, entry.ts_ms);
                 }
             }
@@ -2788,7 +2978,18 @@ impl Engine {
                 1 => format!("a mandatory asset outside the scope: {host}"),
                 n => format!("{n} mandatory assets outside the scope: {host}"),
             };
-            out.push(self.mk(ctx, &rec, 23, Category::ScopeEscape, Severity::S2, Basis::Action, first, detail, false));
+            // The target's artifact chose them: counted (S0, which no relaxed uptier raises: it is not the agent's
+            // choice), one per host of the mission, never a flag.
+            let (sev, key, detail) = if artifact {
+                (Severity::S0, format!("ingest:{host}"), format!("{detail}, from an imported artifact of the target"))
+            } else {
+                (Severity::S2, first, detail)
+            };
+            let mut hit = self.mk(ctx, &rec, 23, Category::ScopeEscape, sev, Basis::Action, key, detail, false);
+            if artifact {
+                hit.severity = Severity::S0;
+            }
+            out.push(hit);
         }
         out
     }

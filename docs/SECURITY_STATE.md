@@ -304,7 +304,8 @@ Disabled by default. When `[oast] enabled = true` is configured in `config.toml`
   `Read` on zero interactions or errors), and is never granted to `read_only` verifier roles.
 - **Infrastructure (E1, `docs/MONITOR.md` §2.2):** the broker's endpoints are refused to every command whatever is
   granted: its HTTP and DNS listeners on the addresses they are bound to (the broker starts before anything else and a
-  port `0` is written back), the external poll endpoint, the callback host and every name under its DNS domain
+  port `0` is written back), the external poll host and the callback host (on every port, by name and by the addresses
+  they resolve to; one on this machine on its own port) and every name under its DNS domain
   (`deny infrastructure: oast.bind …`); the sandbox refuses their loopback ports and `external_token_file` is
   unreadable to commands. A recorded callback therefore came from the target, never from ferret's own commands (a lab
   the agent runs in its own sandbox cannot call back either).
