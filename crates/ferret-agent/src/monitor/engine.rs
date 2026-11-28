@@ -67,7 +67,9 @@
 //!   side-channel commands and long or high-entropy DNS labels; TW-23 a child's mandatory asset or one off scope;
 //!   TW-24 the canaries the core was given (`set_canaries`; M10 makes them) and the floor's decoy events; TW-25 a
 //!   run of another script in a session whose baseline has none; TW-26 build and open-run files (with `AGENTS.md` and
-//!   `CLAUDE.md`, which later sessions on the workspace read as instructions); TW-27 harness markers in
+//!   `CLAUDE.md`, which later sessions on the workspace read as instructions: main's P0-4 keeps them out of the
+//!   security packs' prompts unless `agents.project_instructions_in_security_packs`, but a workspace is not tied to a
+//!   pack, so a write of one stays S1 in every pack); TW-27 harness markers in
 //!   output; TW-28 irreversible-effect shapes in arguments (scripts are the gate's, M8).
 //! - Not built in M2, so none of these can be a hit: provenance of a credential toward its asset (G2, M8); the
 //!   `harness_test` flag (M4); the S3 of TW-17 beside a gated call (M8); a re-finish in a reopened turn (M9); gzip runs

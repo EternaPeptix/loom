@@ -60,15 +60,20 @@
 //!   the lead is in a turn and records it at its next step, not while a tool call is running; check
 //!   with ferret ledger {lead}`). It also names a stock scope or reason that was recorded for a blank
 //!   one, and says when the mission keeps no ledger (the rule is then a note without an id).
-//! - `scope <session> <host>… [--note <text>]`: `client.grant_scope`, one host per argument (`'*.example.com'`
+//! - `scope <session> <host>… [--note <text>] [--json]` (also `scope grant <session> <host>…`): `client.grant_scope`,
+//!   one host per argument (`'*.example.com'`
 //!   quoted); the operator's grant of network hosts to the mission, for the session's lifetime. Prints
 //!   `scope granted for {lead}: a, b` (`scope_line`, from the daemon's receipt), and says when the mission
 //!   keeps no ledger. The command an agent's scope request (`ferret inbox`) asks the operator to run.
-//! - `scope revoke <mission> --reason <text> <host>`: `client.revoke_scope` (`mission_of`: an `m-` id as it is, or
-//!   the mission of a session word); the operator withdraws one granted host, written as it was granted. Prints
-//!   `scope revoked for {lead}: {host}; {n} session(s) narrowed, {n} connection(s) cut` (`scope_revoke_line`),
-//!   and says when the mission keeps no ledger or the grant was not in the ledger yet. A host that is not
-//!   granted is refused with the list of what is. `--reason` is required.
+//! - `scope revoke <mission|session> <host>… [--reason <text>] [--json]` (`--note` is the same flag):
+//!   `client.revoke_scope` to the session `client.lead_of` names (an `m-` id: its lead; a session word: that
+//!   session, whose lead the daemon takes); the operator revokes hosts, a grant written as it was granted or any
+//!   host, `*.suffix`, address or CIDR block. Prints `scope revoked for {lead}: a, b; {n} session(s) narrowed, {n}
+//!   connection(s) cut` (`scope_revoke_line`), then the hosts that were not granted by themselves, and says when
+//!   the mission keeps no ledger or a grant was not in the ledger yet. `--json` prints the receipt.
+//! - `panic [--reason <text>] [--json]`: `client.panic_stop_all`; prints `panic stop complete: …` (`panic_line`):
+//!   connections cut, sessions stopped (their ids), boxes torn down, rewrite rules disabled, and the processes the
+//!   census stopped under the sessions' sandboxes when there were any.
 //!   `release <session> <reason…>` (`-` = standard input): `client.release`; the operator closes the mission
 //!   without the goal established. Prints `closed by operator, goal not established: release sent to {lead}`
 //!   (`release_line`). A blank reason is refused.
@@ -153,8 +158,9 @@
 
 use crate::client::{self, Client};
 use crate::render::{self, RecordOpts, Style};
+use crate::wire::{PanicReport, ScopeRevokeReceipt};
 use clap::{Args, Parser, Subcommand};
-use ferret_agent::runtime::{BusEvent, Delta, NewSession, RuleReceipt, ScopeReceipt, ScopeRevokeReceipt, ANY_ROLE};
+use ferret_agent::runtime::{BusEvent, Delta, NewSession, RuleReceipt, ScopeReceipt, ANY_ROLE};
 use ferret_agent::session::Phase;
 use ferret_core::config::{Config, ConfigError, Paths};
 use ferret_core::event::{Budget, Event, Record, Seq, SessionOutcome, TurnEndReason};
@@ -291,8 +297,10 @@ pub enum Command {
     Rule(RuleArgs),
     /// Record an approval for a mission
     Approve(ApproveArgs),
-    /// Let a mission's tools reach hosts (the operator's grant; ends with the session)
+    /// Let a mission's tools reach hosts, or revoke hosts (`ferret scope revoke <mission|session> <host>...`)
     Scope(ScopeArgs),
+    /// Emergency kill-switch: sever all proxy tunnels, stop all active sessions, tear down boxes, and disable rewrites
+    Panic(PanicArgs),
     /// Close a mission without the goal established, giving the reason
     Release(ReleaseArgs),
     /// Delete stored tool outputs that no session or mission refers to any more (dry run unless --apply)
@@ -495,6 +503,9 @@ pub struct HarExportArgs {
     /// Maximum entries to export
     #[arg(long)]
     pub limit: Option<usize>,
+    /// Include raw credentials, cookies, and tokens in the exported HAR (redacted by default)
+    #[arg(long)]
+    pub include_secrets: bool,
 }
 
 #[derive(Args, Debug, Clone, PartialEq, Eq)]
@@ -790,6 +801,9 @@ pub struct SarifArgs {
     /// Git ref (e.g. refs/heads/main) for SARIF run properties
     #[arg(long, value_name = "REF")]
     pub git_ref: Option<String>,
+    /// Include raw credentials and tokens in the exported SARIF (redacted by default)
+    #[arg(long)]
+    pub include_secrets: bool,
 }
 
 #[derive(Args, Debug)]
@@ -846,6 +860,9 @@ pub struct ScopeArgs {
     /// Why the hosts are granted (kept in the ledger)
     #[arg(long)]
     pub note: Option<String>,
+    /// Output raw JSON
+    #[arg(long)]
+    pub json: bool,
     /// The hosts, one per argument, such as api.example.com or '*.example.com'
     #[arg(required = true)]
     pub hosts: Vec<String>,
@@ -853,19 +870,40 @@ pub struct ScopeArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum ScopeAction {
-    /// Withdraw a granted host from a mission: its open connections are cut and new ones refused
+    /// Let a mission's tools reach hosts: `ferret scope grant <session> <host>...` is `ferret scope <session> <host>...`
+    Grant(ScopeGrantArgs),
+    /// Revoke hosts from a mission: refused at once whatever else allows them, open connections cut, recorded
     Revoke(ScopeRevokeArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct ScopeGrantArgs {
+    /// A session id, the beginning of one, or `last`
+    pub session: String,
+    /// The hosts, one per argument, such as api.example.com or '*.example.com'
+    #[arg(required = true)]
+    pub hosts: Vec<String>,
+    /// Why the hosts are granted (kept in the ledger)
+    #[arg(long)]
+    pub note: Option<String>,
+    /// Output raw JSON
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args, Debug)]
 pub struct ScopeRevokeArgs {
     /// A mission id (`m-…`), or a session id, the beginning of one, or `last`
-    pub mission: String,
-    /// The host exactly as it was granted
-    pub host: String,
-    /// Why (kept in the ledger and shown to the lead)
+    pub target: String,
+    /// The hosts, one per argument: a grant as it was granted, or any host, '*.suffix', address or CIDR block
+    #[arg(required = true)]
+    pub hosts: Vec<String>,
+    /// Why (kept in the ledger and shown to the lead; left out, the ledger says `no reason given`)
+    #[arg(long, visible_alias = "note")]
+    pub reason: Option<String>,
+    /// Output raw JSON
     #[arg(long)]
-    pub reason: String,
+    pub json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -919,6 +957,16 @@ pub struct MonitorReplayArgs {
     /// Do not read `keys/journal.key`: the ledgers are read unverified
     #[arg(long)]
     pub no_journal_key: bool,
+}
+
+#[derive(Args, Debug, Clone, Default, PartialEq, Eq)]
+pub struct PanicArgs {
+    /// Optional reason recorded in stopped sessions and audit logs
+    #[arg(long)]
+    pub reason: Option<String>,
+    /// Output raw JSON
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1528,19 +1576,67 @@ fn scope_line(r: &ScopeReceipt) -> String {
     line
 }
 
-/// The line printed once the daemon accepted a scope revoke.
+/// The line printed once the daemon accepted a scope revoke: what was revoked and cut, then what the ledger holds of it.
 fn scope_revoke_line(r: &ScopeRevokeReceipt) -> String {
+    let plural = if r.connections_cut == 1 { "connection" } else { "connections" };
     let mut line = format!(
-        "scope revoked for {}: {}; {} session(s) narrowed, {} connection(s) cut",
+        "scope revoked for {}: {}; {} session(s) narrowed, {} {plural} cut",
         r.lead.as_str(),
-        r.host,
+        r.revoked.join(", "),
         r.sessions,
-        r.cut
+        r.connections_cut
     );
+    if !r.not_granted.is_empty() {
+        line.push_str(&format!(
+            "; not granted by itself (refused from now on, no ledger record): {}",
+            r.not_granted.join(", ")
+        ));
+    }
+    let pending: Vec<&str> = r
+        .revoked
+        .iter()
+        .filter(|h| !r.recorded.contains(h) && !r.not_granted.contains(h))
+        .map(String::as_str)
+        .collect();
     if !r.ledger {
-        line.push_str("; this mission keeps no ledger, so the revoke is not listed and a restart does not keep it");
-    } else if !r.recorded {
-        line.push_str("; the grant was not in the ledger yet, so the revoke is not recorded there: run it again once `ferret ledger` lists the grant");
+        line.push_str("; this mission keeps no ledger, so the revoke is not listed (it is kept across a restart)");
+    } else if !pending.is_empty() {
+        line.push_str(&format!(
+            "; the grant of {} was not in the ledger yet, so the revoke is not recorded there: run it again once `ferret ledger` lists the grant",
+            pending.join(", ")
+        ));
+    }
+    line
+}
+
+/// The line printed once the emergency panic kill-switch finished.
+fn panic_line(r: &PanicReport) -> String {
+    let conn_w = if r.connections_cut == 1 { "connection" } else { "connections" };
+    let sess_w = if r.sessions_stopped.len() == 1 { "session" } else { "sessions" };
+    let box_w = if r.boxes_torn_down == 1 { "box" } else { "boxes" };
+    let rw_w = if r.rewrites_disabled == 1 { "rewrite rule" } else { "rewrite rules" };
+    let stopped_list = if r.sessions_stopped.is_empty() {
+        String::new()
+    } else {
+        let ids: Vec<&str> = r.sessions_stopped.iter().map(SessionId::as_str).collect();
+        format!(" ({})", ids.join(", "))
+    };
+    let mut line = format!(
+        "panic stop complete: {} {conn_w} cut, {} {sess_w} stopped{stopped_list}, {} {box_w} torn down, {} {rw_w} disabled",
+        r.connections_cut,
+        r.sessions_stopped.len(),
+        r.boxes_torn_down,
+        r.rewrites_disabled
+    );
+    // What only the census finds (E3): said when there was any.
+    if r.processes_killed > 0 || r.processes_left > 0 {
+        line.push_str(&format!(", {} process(es) left under the sandboxes stopped", r.processes_killed));
+        if r.processes_left > 0 {
+            line.push_str(&format!(
+                ", {} could not be stopped (the daemon's log names them; `GET /api/census` lists them)",
+                r.processes_left
+            ));
+        }
     }
     line
 }
@@ -2296,9 +2392,21 @@ async fn dispatch(command: Command) -> Result<i32, String> {
         }
         Command::Scope(ScopeArgs { action: Some(ScopeAction::Revoke(a)), .. }) => {
             let c = client_of(&paths)?;
-            let mission = c.mission_of(&a.mission).await?;
-            let receipt = c.revoke_scope(&mission, &a.host, &a.reason).await?;
+            let id = c.lead_of(&a.target).await?;
+            let receipt = c.revoke_scope(&id, &a.hosts, a.reason.as_deref()).await?;
+            if a.json {
+                return json_out(&receipt);
+            }
             outln(&scope_revoke_line(&receipt)).map(|()| 0)
+        }
+        Command::Scope(ScopeArgs { action: Some(ScopeAction::Grant(a)), .. }) => {
+            let c = client_of(&paths)?;
+            let id = c.resolve(&a.session).await?;
+            let receipt = c.grant_scope(&id, &a.hosts, a.note.as_deref()).await?;
+            if a.json {
+                return json_out(&receipt);
+            }
+            outln(&scope_line(&receipt)).map(|()| 0)
         }
         Command::Scope(a) => {
             let c = client_of(&paths)?;
@@ -2306,7 +2414,18 @@ async fn dispatch(command: Command) -> Result<i32, String> {
                 a.session.as_deref().ok_or("Name the session to grant the hosts to: ferret scope <session> <host>…")?;
             let id = c.resolve(word).await?;
             let receipt = c.grant_scope(&id, &a.hosts, a.note.as_deref()).await?;
+            if a.json {
+                return json_out(&receipt);
+            }
             outln(&scope_line(&receipt)).map(|()| 0)
+        }
+        Command::Panic(a) => {
+            let c = client_of(&paths)?;
+            let report = c.panic_stop_all(a.reason.as_deref()).await?;
+            if a.json {
+                return json_out(&report);
+            }
+            outln(&panic_line(&report)).map(|()| 0)
         }
         Command::Release(a) => {
             let reason = read_message(&a.reason, "reason")?;
@@ -2425,6 +2544,9 @@ async fn dispatch(command: Command) -> Result<i32, String> {
             if let Some(v) = a.git_ref.as_deref() {
                 query.push(("git_ref", v.to_string()));
             }
+            if a.include_secrets {
+                query.push(("sanitize", "false".to_string()));
+            }
             let doc = c.sarif(&mission, &query).await?;
             let mut text = serde_json::to_string_pretty(&doc)
                 .map_err(|e| format!("The SARIF report could not be written: {e}"))?;
@@ -2456,7 +2578,7 @@ async fn dispatch(command: Command) -> Result<i32, String> {
             HarAction::Export(a) => {
                 let c = client_of(&paths)?;
                 let mission = c.mission_of(&a.session).await?;
-                let doc = c.export_har(&mission, a.host.as_deref(), a.limit).await?;
+                let doc = c.export_har_with_options(&mission, a.host.as_deref(), a.limit, !a.include_secrets).await?;
                 let mut text = serde_json::to_string_pretty(&doc)
                     .map_err(|e| format!("The HAR document could not be written: {e}"))?;
                 text.push('\n');
@@ -4012,8 +4134,14 @@ mod tests {
             panic!("not scope revoke")
         };
         let Some(ScopeAction::Revoke(r)) = a.action else { panic!("not revoke") };
-        assert_eq!((r.mission.as_str(), r.host.as_str(), r.reason.as_str()), ("m-1", "a.test", "wrong target"));
-        rejected(&["scope", "revoke", "m-1", "a.test"]);
+        assert_eq!(
+            (r.target.as_str(), r.hosts, r.reason.as_deref()),
+            ("m-1", words(&["a.test"]), Some("wrong target"))
+        );
+        // The reason may be left out (the ledger records the stock one); a host may not.
+        let Command::Scope(a) = ok(&["scope", "revoke", "m-1", "a.test"]) else { panic!("not scope revoke") };
+        let Some(ScopeAction::Revoke(r)) = a.action else { panic!("not revoke") };
+        assert_eq!(r.reason, None);
         rejected(&["scope", "revoke", "m-1", "--reason", "x"]);
         let Command::Release(a) = ok(&["release", "s-1", "target", "is", "gone"]) else { panic!("not release") };
         assert_eq!((a.session.as_str(), a.reason), ("s-1", words(&["target", "is", "gone"])));
@@ -5390,5 +5518,103 @@ mod tests {
         let paths = Paths::at(dir.path().join("empty-home"));
         let err = down(&paths, Duration::from_secs(1)).await.unwrap_err();
         assert!(err.starts_with("The ferret daemon is not running"), "{err}");
+    }
+
+    #[test]
+    fn scope_revoke_panic_and_include_secrets_parse_and_format() {
+        let Command::Scope(ScopeArgs { action: Some(ScopeAction::Revoke(a)), .. }) =
+            ok(&["scope", "revoke", "s-1", "api.example.test", "cdn.example.test", "--note", "done", "--json"])
+        else {
+            panic!("not scope revoke")
+        };
+        assert_eq!(a.reason.as_deref(), Some("done"), "--note is --reason");
+        assert!(a.json);
+        assert_eq!((a.target.as_str(), a.hosts), ("s-1", vec!["api.example.test".into(), "cdn.example.test".into()]));
+
+        // A revoke names at least one host.
+        rejected(&["scope", "revoke", "s-1"]);
+
+        let Command::Scope(ScopeArgs { action: Some(ScopeAction::Grant(g)), .. }) =
+            ok(&["scope", "grant", "last", "a.test"])
+        else {
+            panic!("not scope grant")
+        };
+        assert_eq!((g.session.as_str(), g.hosts, g.note), ("last", vec!["a.test".to_string()], None));
+
+        let Command::Panic(p) = ok(&["panic"]) else { panic!("not panic") };
+        assert_eq!(p, PanicArgs { reason: None, json: false });
+        let Command::Panic(p) = ok(&["panic", "--reason", "out of scope", "--json"]) else { panic!("not panic") };
+        assert_eq!(p, PanicArgs { reason: Some("out of scope".into()), json: true });
+
+        let Command::Har { action: HarAction::Export(h) } = ok(&["har", "export", "last"]) else { panic!("not har") };
+        assert!(!h.include_secrets);
+        let Command::Har { action: HarAction::Export(h) } =
+            ok(&["har", "export", "last", "--include-secrets", "--host", "app.test"])
+        else {
+            panic!("not har")
+        };
+        assert!(h.include_secrets);
+        assert_eq!(h.host.as_deref(), Some("app.test"));
+
+        let Command::Sarif(s) = ok(&["sarif", "last"]) else { panic!("not sarif") };
+        assert!(!s.include_secrets);
+        let Command::Sarif(s) = ok(&["sarif", "last", "--include-secrets"]) else { panic!("not sarif") };
+        assert!(s.include_secrets);
+
+        let rev = ScopeRevokeReceipt {
+            lead: SessionId::from("s-1"),
+            revoked: vec!["a.test".into(), "b.test".into()],
+            ledger: true,
+            recorded: vec!["a.test".into(), "b.test".into()],
+            not_granted: vec![],
+            sessions: 1,
+            connections_cut: 2,
+        };
+        assert_eq!(
+            scope_revoke_line(&rev),
+            "scope revoked for s-1: a.test, b.test; 1 session(s) narrowed, 2 connections cut"
+        );
+        // A carve-out, a grant the ledger does not list yet, and a mission without a ledger are each said.
+        let partial = ScopeRevokeReceipt {
+            recorded: vec!["a.test".into()],
+            not_granted: vec!["x.b.test".into()],
+            revoked: vec!["a.test".into(), "late.test".into(), "x.b.test".into()],
+            connections_cut: 1,
+            ..rev.clone()
+        };
+        let line = scope_revoke_line(&partial);
+        assert!(line.contains("1 connection cut") && line.contains("no ledger record): x.b.test"), "{line}");
+        assert!(line.contains("the grant of late.test was not in the ledger yet"), "{line}");
+        let no_ledger = ScopeRevokeReceipt { ledger: false, recorded: vec![], ..rev.clone() };
+        assert!(scope_revoke_line(&no_ledger).contains("keeps no ledger"));
+
+        let rep = PanicReport {
+            connections_cut: 4,
+            sessions_stopped: vec![SessionId::from("s-1")],
+            boxes_torn_down: 1,
+            rewrites_disabled: 3,
+            processes_killed: 0,
+            processes_left: 0,
+        };
+        assert_eq!(
+            panic_line(&rep),
+            "panic stop complete: 4 connections cut, 1 session stopped (s-1), 1 box torn down, 3 rewrite rules disabled"
+        );
+        // What the census stopped under the sessions' sandboxes is said when there was any.
+        let census = PanicReport { processes_killed: 2, processes_left: 1, ..rep };
+        let line = panic_line(&census);
+        assert!(
+            line.contains("2 process(es) left under the sandboxes stopped") && line.contains("1 could not"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn docs_config_example_toml_parses_and_checks_cleanly() {
+        let raw = include_str!("../../../docs/config.example.toml");
+        let cfg = Config::parse(raw).expect("docs/config.example.toml must parse cleanly");
+        cfg.check().expect("docs/config.example.toml must pass Config::check");
+        assert_eq!(cfg.signal.inbox_delay_secs, 0);
+        assert!(!cfg.agents.project_instructions_in_security_packs);
     }
 }

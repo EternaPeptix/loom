@@ -147,6 +147,9 @@
 //!   Spotlight (`mdfind` and `mds`, which would name files the profile hides), the pasteboard (`pbpaste`),
 //!   audio, analytics, authorization, Launch Services' writers, disk services. A tool that needs one more is
 //!   fixed with `sandbox.mach_allow`, found from `log show --predicate 'eventMessage CONTAINS "deny(1) mach-lookup"'`.
+//!   With `cfg.protect_credentials` (the default) the keychain's daemons and the clipboard
+//!   (`CREDENTIAL_MACH_SERVICES`) are denied once more after the allows, so `mach_allow` cannot open them: only
+//!   `protect_credentials = false` and a `mach_allow` entry together do.
 //!   The prefixes are the rendezvous servers of Chromium builds (`org.chromium.Chromium.`, `com.google.Chrome.`,
 //!   `com.google.chrome.for.testing.` + `MachPortRendezvousServer.`): a process registers its own name and its child
 //!   processes look it up, which a list of exact names cannot say. Probed on macOS 27 with a python3 that registers
@@ -221,6 +224,7 @@
 //! (deny mach-lookup)
 //! (allow mach-lookup (global-name "<MACH_LOOKUP_ALLOW>") … (global-name "<cfg.mach_allow exact>") … (global-name-prefix "<cfg.mach_allow prefix*>") … <the fetch services, only with `cfg.allow_fetch_services`>)
 //! (deny mach-lookup (global-name "com.apple.DiskArbitration.diskarbitrationd") (global-name "com.apple.diskimagesiod") (global-name "com.apple.diskimagesiod.ram") (global-name "com.apple.diskmanagementd"))
+//! (deny mach-lookup (global-name "com.apple.SecurityServer") (global-name "com.apple.secd") (global-name "com.apple.securityd") (global-name "com.apple.pasteboard.pboard") (global-name "com.apple.pasteboard.1"))   ; only with `cfg.protect_credentials` (`CREDENTIAL_MACH_SERVICES`)
 //! (deny network*)
 //! (allow network-outbound (remote ip "localhost:<port>")) …      ; for loopback_all: `(remote tcp "localhost:*") (remote udp "localhost:*")`
 //! (allow network-outbound (remote unix-socket (path-literal "<socket>"))) …
@@ -458,6 +462,17 @@ pub mod census;
 mod linux;
 pub mod selfprobe;
 
+/// The Mach services of the keychain and the clipboard, denied after every `mach-lookup` allow while
+/// `cfg.protect_credentials` is on (the default-deny refuses them in any case): the security daemons and the pasteboard
+/// (`com.apple.pasteboard.1` is what `pbpaste` looks up, probed on macOS 27).
+pub const CREDENTIAL_MACH_SERVICES: [&str; 5] = [
+    "com.apple.SecurityServer",
+    "com.apple.secd",
+    "com.apple.securityd",
+    "com.apple.pasteboard.pboard",
+    "com.apple.pasteboard.1",
+];
+
 use ferret_core::config::{
     SandboxCfg, SandboxMode, FETCH_SERVICE_NAMES, FETCH_SERVICE_PREFIXES, MACH_LOOKUP_ALLOW, MACH_LOOKUP_ALLOW_PREFIXES,
 };
@@ -595,6 +610,8 @@ pub struct Sandbox {
     protected: Vec<PathBuf>,
     unreadable: Vec<PathBuf>,
     credentials: Vec<PathBuf>,
+    /// Whether `sandbox.protect_credentials` is enabled (also denies macOS Keychain/pasteboard Mach IPC).
+    protect_credentials: bool,
     loopback_ports: Vec<u16>,
     loopback_all: bool,
     /// The daemon's own port, refused whatever else allows it.
@@ -1867,6 +1884,7 @@ impl Sandbox {
             protected,
             unreadable,
             credentials,
+            protect_credentials: cfg.protect_credentials,
             loopback_ports,
             loopback_all: cfg.loopback_all,
             daemon_port: cfg.daemon_port,
@@ -2161,6 +2179,13 @@ impl Sandbox {
              (global-name \"com.apple.diskimagesiod\") (global-name \"com.apple.diskimagesiod.ram\") \
              (global-name \"com.apple.diskmanagementd\"))\n",
         );
+        if self.protect_credentials {
+            // Keychain daemons and the user's clipboard can expose credentials/tokens even when
+            // `~/Library/Keychains` is unreadable on disk. The default-deny above refuses them already; this deny
+            // comes after its allows, so `mach_allow` does not reach them either while credentials are protected.
+            let names: String = CREDENTIAL_MACH_SERVICES.iter().map(|n| format!(" (global-name \"{n}\")")).collect();
+            out.push_str(&format!("(deny mach-lookup{names})\n"));
+        }
         out.push_str("(deny network*)\n");
         if self.loopback_all {
             // A later deny of one port is not reliable after an allow of `(remote ip "localhost:*")`: probed on
@@ -6803,9 +6828,13 @@ PY";
             out.contains("BEGIN CERTIFICATE")
         };
         assert!(!found(&cfg(SandboxMode::Seatbelt)), "the security daemon is reachable by default");
+        // `mach_allow` opens a service only while credentials are not protected: the keychain's deny comes after it.
+        let open = SandboxCfg { protect_credentials: false, ..cfg(SandboxMode::Seatbelt) };
         for entry in ["com.apple.SecurityServer", "com.apple.Security*"] {
-            let named = SandboxCfg { mach_allow: vec![entry.into()], ..cfg(SandboxMode::Seatbelt) };
+            let named = SandboxCfg { mach_allow: vec![entry.into()], ..open.clone() };
             assert!(found(&named), "mach_allow = [\"{entry}\"] did not allow the service");
+            let protected = SandboxCfg { mach_allow: vec![entry.into()], ..cfg(SandboxMode::Seatbelt) };
+            assert!(!found(&protected), "mach_allow = [\"{entry}\"] reached the keychain with protect_credentials");
         }
         // An unrelated entry does not.
         let other = SandboxCfg { mach_allow: vec!["com.apple.pasteboard*".into()], ..cfg(SandboxMode::Seatbelt) };
@@ -6816,8 +6845,11 @@ PY";
         {
             let paste = "/usr/bin/pbpaste >/dev/null 2>&1";
             assert!(!run(&build(&f, &cfg(SandboxMode::Seatbelt), None), &f.ws, paste).0);
-            let named = SandboxCfg { mach_allow: vec!["com.apple.pasteboard.1".into()], ..cfg(SandboxMode::Seatbelt) };
+            let named = SandboxCfg { mach_allow: vec!["com.apple.pasteboard.1".into()], ..open.clone() };
             assert!(run(&build(&f, &named, None), &f.ws, paste).0, "mach_allow did not allow the pasteboard");
+            let protected =
+                SandboxCfg { mach_allow: vec!["com.apple.pasteboard.1".into()], ..cfg(SandboxMode::Seatbelt) };
+            assert!(!run(&build(&f, &protected, None), &f.ws, paste).0, "the clipboard with protect_credentials");
         }
     }
 
@@ -6965,5 +6997,35 @@ PY";
             let count: usize = out_large.trim().parse().unwrap_or(0);
             assert_eq!(count, 96 * 1024 + 1, "{label}: {out_large}");
         }
+    }
+
+    #[test]
+    fn seatbelt_denies_keychain_and_pasteboard_under_protect_credentials_and_fetch_services_in_every_mode() {
+        let f = fx();
+        let protected = SandboxCfg { protect_credentials: true, ..cfg(SandboxMode::Seatbelt) };
+        let unprotected = SandboxCfg { protect_credentials: false, ..cfg(SandboxMode::Seatbelt) };
+        let p_prot = build(&f, &protected, None).profile().expect("profile");
+        let p_unprot = build(&f, &unprotected, None).profile().expect("profile");
+        for svc in CREDENTIAL_MACH_SERVICES {
+            assert!(p_prot.contains(svc), "{svc} must be denied when protect_credentials=true: {p_prot}");
+            assert!(!p_unprot.contains(svc), "{svc} must not be denied when protect_credentials=false: {p_unprot}");
+        }
+        // The credential deny comes after the allows: `mach_allow` does not reach the keychain or the clipboard while
+        // credentials are protected.
+        let named = SandboxCfg {
+            mach_allow: vec!["com.apple.SecurityServer".into(), "com.apple.pasteboard*".into()],
+            ..protected.clone()
+        };
+        let p = build(&f, &named, None).profile().expect("profile");
+        let allow = p.rfind("(allow mach-lookup").expect("allow");
+        let deny = p.find("(deny mach-lookup (global-name \"com.apple.SecurityServer\")").expect("deny");
+        assert!(allow < deny, "{p}");
+        // The network-fetching services are denied whatever the network mode (it is no input of the profile: the
+        // deny holds in `deny_all`, `allowlist` and `open` alike); only `allow_fetch_services` lifts it.
+        for c in [&protected, &unprotected] {
+            assert!(build(&f, c, None).profile().expect("profile").contains(FETCH_SERVICES));
+        }
+        let lifted = SandboxCfg { allow_fetch_services: true, ..unprotected.clone() };
+        assert!(!build(&f, &lifted, None).profile().expect("profile").contains(FETCH_SERVICES));
     }
 }

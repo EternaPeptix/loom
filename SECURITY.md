@@ -103,8 +103,10 @@ On macOS, with `[sandbox] mode = "seatbelt"` (the default), commands run under `
   entries and for this machine, and the sandbox refuses those loopback ports directly (also under `loopback_all`) and
   hides those services' files from commands and file tools (`mail.password_file`, `mail.maildir_path` and signal-cli's
   account store, wherever they lie);
-  `ferret scope revoke` takes a grant back for good (it is refused whatever else allows it, and kept across a restart)
-  and cuts its open connections. Commands that listen on loopback can be reached by other
+  `ferret scope revoke` takes a grant back for good, or carves any other host, address or block out of what the
+  mission reaches (it is refused whatever else allows it, and kept across a restart) and cuts its open connections at
+  once; `ferret panic` cuts every connection and stops every session, what they left running under their sandboxes,
+  every box and every rewrite rule. Commands that listen on loopback can be reached by other
   local processes. Commands cannot connect to the daemon's own port, whatever you allow on loopback, so a
   `ferret open` login code (which is no longer on any command line) could not be redeemed from inside the sandbox directly (the
   proxy, which refuses loopback addresses, could reach it only if you list loopback in `allow_private` or
@@ -115,7 +117,8 @@ On macOS, with `[sandbox] mode = "seatbelt"` (the default), commands run under `
   then fail, while curl and Python, which use their own certificate files, work. `mach-lookup` is denied by
   default and a short list of services is allowed (what the usual toolchains need; `sandbox.mach_allow` adds
   one that a tool needs), so the keychain and security daemons, Spotlight (`mdfind`), the clipboard, audio and
-  the rest are out of reach too. At start and every hour the daemon runs a self-probe of this (a certificate
+  the rest are out of reach too; with `sandbox.protect_credentials` (the default) the keychain's daemons and the
+  clipboard are denied once more after the allows, so `mach_allow` cannot open them either. At start and every hour the daemon runs a self-probe of this (a certificate
   that names a URL, a background URL session, a WebKit view, and the daemon's port with a decoy process whose
   argument vector is readable) against a local listener; `ferret status` and the web header say
   `egress: bounded`, or `UNBOUNDED` with the reason when a probe got through, could not run, or

@@ -35,6 +35,12 @@ pub struct HarExportOptions {
     pub creator_version: String,
     pub max_entries: usize,
     pub max_total_bytes: u64,
+    /// Redact sensitive headers (`Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie`,
+    /// `X-Api-Key`, `X-Auth-Token`, `X-CSRF-Token`, `X-XSRF-Token`, etc.), auth query parameters,
+    /// high-confidence tokens/JWTs, and `extra_secrets`. Defaults to `true`.
+    pub sanitize: bool,
+    /// Additional literal secret values to redact when `sanitize` is `true`.
+    pub extra_secrets: Vec<String>,
 }
 
 impl Default for HarExportOptions {
@@ -43,6 +49,8 @@ impl Default for HarExportOptions {
             creator_version: env!("CARGO_PKG_VERSION").to_string(),
             max_entries: DEFAULT_MAX_EXPORT_ENTRIES,
             max_total_bytes: DEFAULT_MAX_EXPORT_BYTES,
+            sanitize: true,
+            extra_secrets: Vec::new(),
         }
     }
 }
@@ -96,6 +104,8 @@ pub struct ImportedExchange {
 }
 
 /// Export `(ts_ms, &Exchange)` pairs into a HAR 1.2 JSON document.
+///
+/// Respects `opts.sanitize` (default `true`) and `opts.extra_secrets`.
 pub fn export_har(
     items: &[(u64, &Exchange)],
     blobs: &BlobStore,
@@ -121,7 +131,7 @@ pub fn export_har(
             meta.truncated_reason = Some("max_bytes".into());
             break;
         }
-        let har_entry = build_har_entry(ts_ms, ex, &req_bytes, &resp_bytes);
+        let har_entry = build_har_entry(ts_ms, ex, &req_bytes, &resp_bytes, opts);
         entries.push(har_entry);
         meta.exported += 1;
         meta.total_bytes = meta.total_bytes.saturating_add(combined);
@@ -131,6 +141,7 @@ pub fn export_har(
     log.insert("version".into(), json!(HAR_VERSION));
     log.insert("creator".into(), json!({ "name": "Ferret", "version": opts.creator_version }));
     log.insert("entries".into(), Value::Array(entries));
+    log.insert("_sanitized".into(), json!(opts.sanitize));
     if meta.truncated {
         log.insert("_truncated".into(), json!(true));
         if let Some(reason) = &meta.truncated_reason {
@@ -140,6 +151,23 @@ pub fn export_har(
     }
 
     Ok((json!({ "log": Value::Object(log) }), meta))
+}
+
+/// Convenience helper to export HAR 1.2 with an explicit `sanitize` flag and additional literal
+/// secrets to redact (merged with any `opts.extra_secrets`).
+pub fn export_har_sanitized(
+    items: &[(u64, &Exchange)],
+    blobs: &BlobStore,
+    opts: &HarExportOptions,
+    extra_secrets: &[String],
+    sanitize: bool,
+) -> Result<(Value, HarExportMeta), String> {
+    let mut merged = opts.clone();
+    merged.sanitize = sanitize;
+    if !extra_secrets.is_empty() {
+        merged.extra_secrets.extend(extra_secrets.iter().cloned());
+    }
+    export_har(items, blobs, &merged)
 }
 
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
@@ -239,17 +267,45 @@ fn parse_rfc3339_ms(raw: &str) -> Result<u64, String> {
     Ok(u64::try_from(total_ms).unwrap_or(0))
 }
 
-fn build_har_entry(ts_ms: u64, ex: &Exchange, req_raw: &[u8], resp_raw: &[u8]) -> Value {
+fn build_har_entry(ts_ms: u64, ex: &Exchange, req_raw: &[u8], resp_raw: &[u8], opts: &HarExportOptions) -> Value {
     let default_port = (ex.scheme == "http" && ex.port == 80) || (ex.scheme == "https" && ex.port == 443);
     let authority = if default_port { ex.host.clone() } else { format!("{}:{}", ex.host, ex.port) };
     let path_query = if ex.target.starts_with('/') { ex.target.clone() } else { format!("/{}", ex.target) };
     let raw_url = format!("{}://{authority}{path_query}", ex.scheme);
-    let clean_url = redact_url_userinfo(&raw_url);
+    let clean_url = if opts.sanitize {
+        crate::sanitize::sanitize_url(&raw_url, &opts.extra_secrets)
+    } else {
+        redact_url_userinfo(&raw_url)
+    };
 
-    let (req_ver, req_headers, req_head_len, req_body) = parse_wire_request(req_raw);
+    let (req_ver, raw_req_headers, req_head_len, req_body) = parse_wire_request(req_raw);
+    let req_headers: Vec<(String, String)> = if opts.sanitize {
+        raw_req_headers
+            .into_iter()
+            .map(|(n, v)| {
+                let sv = crate::sanitize::sanitize_header_value(&n, &v, &opts.extra_secrets);
+                (n, sv)
+            })
+            .collect()
+    } else {
+        raw_req_headers
+    };
     let query_string = url::Url::parse(&clean_url)
         .ok()
-        .map(|u| u.query_pairs().map(|(k, v)| json!({ "name": k, "value": v })).collect::<Vec<_>>())
+        .map(|u| {
+            u.query_pairs()
+                .map(|(k, v)| {
+                    let val = if opts.sanitize && crate::sanitize::is_sensitive_param(&k) && !v.is_empty() {
+                        crate::creds::REDACTED.to_string()
+                    } else if opts.sanitize {
+                        crate::sanitize::sanitize_text(&v, &opts.extra_secrets).into_owned()
+                    } else {
+                        v.into_owned()
+                    };
+                    json!({ "name": k, "value": val })
+                })
+                .collect::<Vec<_>>()
+        })
         .unwrap_or_default();
     let req_cookies = parse_request_cookies(&req_headers);
     let req_ct = header_value(&req_headers, "content-type").unwrap_or_default();
@@ -266,10 +322,24 @@ fn build_har_entry(ts_ms: u64, ex: &Exchange, req_raw: &[u8], resp_raw: &[u8]) -
         pd.insert("mimeType".into(), json!(req_ct));
         match std::str::from_utf8(req_body) {
             Ok(text) => {
-                pd.insert("text".into(), json!(text));
+                let body_text = if opts.sanitize {
+                    if req_ct.to_ascii_lowercase().starts_with("application/x-www-form-urlencoded") {
+                        crate::sanitize::sanitize_form_urlencoded(text, &opts.extra_secrets)
+                    } else {
+                        crate::sanitize::sanitize_text(text, &opts.extra_secrets).into_owned()
+                    }
+                } else {
+                    text.to_string()
+                };
+                pd.insert("text".into(), json!(body_text));
             }
             Err(_) => {
-                pd.insert("text".into(), json!(base64::engine::general_purpose::STANDARD.encode(req_body)));
+                let bytes = if opts.sanitize {
+                    crate::sanitize::sanitize_bytes(req_body, &opts.extra_secrets)
+                } else {
+                    std::borrow::Cow::Borrowed(req_body)
+                };
+                pd.insert("text".into(), json!(base64::engine::general_purpose::STANDARD.encode(bytes.as_ref())));
                 pd.insert("encoding".into(), json!("base64"));
             }
         }
@@ -278,7 +348,19 @@ fn build_har_entry(ts_ms: u64, ex: &Exchange, req_raw: &[u8], resp_raw: &[u8]) -
     req_obj.insert("headersSize".into(), json!(if req_head_len > 0 { req_head_len as i64 } else { -1 }));
     req_obj.insert("bodySize".into(), json!(req_body.len() as i64));
 
-    let (resp_ver, resp_status, resp_reason, resp_headers, resp_head_len, resp_body) = parse_wire_response(resp_raw);
+    let (resp_ver, resp_status, resp_reason, raw_resp_headers, resp_head_len, resp_body) =
+        parse_wire_response(resp_raw);
+    let resp_headers: Vec<(String, String)> = if opts.sanitize {
+        raw_resp_headers
+            .into_iter()
+            .map(|(n, v)| {
+                let sv = crate::sanitize::sanitize_header_value(&n, &v, &opts.extra_secrets);
+                (n, sv)
+            })
+            .collect()
+    } else {
+        raw_resp_headers
+    };
     let status = ex.status.map(i64::from).unwrap_or(resp_status);
     let resp_ct = header_value(&resp_headers, "content-type").unwrap_or_default();
     let redirect_url = header_value(&resp_headers, "location").unwrap_or_default();
@@ -290,10 +372,20 @@ fn build_har_entry(ts_ms: u64, ex: &Exchange, req_raw: &[u8], resp_raw: &[u8]) -
     if !resp_body.is_empty() {
         match std::str::from_utf8(resp_body) {
             Ok(text) => {
-                content.insert("text".into(), json!(text));
+                let body_text = if opts.sanitize {
+                    crate::sanitize::sanitize_text(text, &opts.extra_secrets).into_owned()
+                } else {
+                    text.to_string()
+                };
+                content.insert("text".into(), json!(body_text));
             }
             Err(_) => {
-                content.insert("text".into(), json!(base64::engine::general_purpose::STANDARD.encode(resp_body)));
+                let bytes = if opts.sanitize {
+                    crate::sanitize::sanitize_bytes(resp_body, &opts.extra_secrets)
+                } else {
+                    std::borrow::Cow::Borrowed(resp_body)
+                };
+                content.insert("text".into(), json!(base64::engine::general_purpose::STANDARD.encode(bytes.as_ref())));
                 content.insert("encoding".into(), json!("base64"));
             }
         }
@@ -906,5 +998,122 @@ mod tests {
             &HarImportOptions::default()
         )
         .is_err());
+    }
+
+    #[test]
+    fn har_export_sanitizes_secrets_by_default_and_supports_opt_out_and_extra_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = BlobStore::open(dir.path()).unwrap();
+
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhZG1pbiJ9.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+        let ghp = "ghp_1234567890abcdefghij1234567890abcd";
+        let sk = "sk-proj-abc123def456ghi789jkl012";
+        let aws = "AKIAIOSFODNN7EXAMPLE";
+        let extra = "custom-tenant-token-998877";
+
+        let req = format!(
+            "POST /api/sync?next=%2Fdash&api_key=qsecret123 HTTP/1.1\r\n\
+             Host: shop.example.test\r\n\
+             Authorization: Bearer {jwt}\r\n\
+             Proxy-Authorization: Basic dXNlcjpwYXNz\r\n\
+             Cookie: sid=sess-secret-1; csrf=csrf-cookie-2\r\n\
+             X-Api-Key: header-api-key-val\r\n\
+             X-Auth-Token: header-auth-tok-val\r\n\
+             X-CSRF-Token: header-csrf-val\r\n\
+             X-XSRF-Token: header-xsrf-val\r\n\
+             Content-Type: application/json\r\n\r\n\
+             {{\"jwt\":\"{jwt}\",\"gh\":\"{ghp}\",\"openai\":\"{sk}\",\"aws\":\"{aws}\",\"custom\":\"{extra}\",\"ok\":true}}"
+        );
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\n\
+             Content-Type: application/json\r\n\
+             Set-Cookie: session=resp-sess-secret; HttpOnly; Secure\r\n\
+             Location: https://shop.example.test/done?token=redir-tok-777\r\n\r\n\
+             {{\"access_token\":\"resp-access-tok\",\"extra\":\"{extra}\"}}"
+        );
+        let ex = Exchange {
+            id: "ex-sanitize123456".into(),
+            call_id: None,
+            source: "proxy".into(),
+            tool: None,
+            scheme: "https".into(),
+            tls: "intercepted".into(),
+            method: "POST".into(),
+            host: "shop.example.test".into(),
+            port: 443,
+            target: "/api/sync?next=%2Fdash&api_key=qsecret123".into(),
+            status: Some(200),
+            error: None,
+            request: blobs.put_bytes(req.as_bytes()).unwrap(),
+            response: Some(blobs.put_bytes(resp.as_bytes()).unwrap()),
+            request_bytes: req.len() as u64,
+            response_bytes: resp.len() as u64,
+            truncated: false,
+            upstream_unverified: false,
+            duration_ms: 12,
+        };
+
+        // Default export sanitizes automatically (sanitize == true by default).
+        assert!(HarExportOptions::default().sanitize);
+        let (har_def, _) = export_har_sanitized(
+            &[(1_700_000_000_000, &ex)],
+            &blobs,
+            &HarExportOptions::default(),
+            &[extra.to_string()],
+            true,
+        )
+        .unwrap();
+        assert_eq!(har_def["log"]["_sanitized"], true);
+        let serialized = serde_json::to_string(&har_def).unwrap();
+        for secret in [
+            jwt,
+            ghp,
+            sk,
+            aws,
+            extra,
+            "qsecret123",
+            "dXNlcjpwYXNz",
+            "sess-secret-1",
+            "csrf-cookie-2",
+            "header-api-key-val",
+            "header-auth-tok-val",
+            "header-csrf-val",
+            "header-xsrf-val",
+            "resp-sess-secret",
+            "redir-tok-777",
+            "resp-access-tok",
+        ] {
+            assert!(!serialized.contains(secret), "secret `{secret}` leaked into sanitized HAR: {serialized}");
+        }
+        // Structural metadata is preserved.
+        let entry = &har_def["log"]["entries"][0];
+        assert!(entry["request"]["url"].as_str().unwrap().contains("next=%2Fdash"));
+        assert_eq!(entry["request"]["cookies"][0]["name"], "sid");
+        assert_eq!(entry["request"]["cookies"][0]["value"], "[redacted]");
+        assert_eq!(entry["response"]["cookies"][0]["name"], "session");
+        assert_eq!(entry["response"]["cookies"][0]["value"], "[redacted]");
+        let set_cookie =
+            entry["response"]["headers"].as_array().unwrap().iter().find(|h| h["name"] == "Set-Cookie").unwrap()
+                ["value"]
+                .as_str()
+                .unwrap();
+        assert_eq!(set_cookie, "session=[redacted]; HttpOnly; Secure");
+
+        // Explicit opt-out (`sanitize = false`) preserves raw values for authorized debugging.
+        let (har_raw, _) = export_har_sanitized(
+            &[(1_700_000_000_000, &ex)],
+            &blobs,
+            &HarExportOptions::default(),
+            &[extra.to_string()],
+            false,
+        )
+        .unwrap();
+        assert_eq!(har_raw["log"]["_sanitized"], false);
+        let raw_serialized = serde_json::to_string(&har_raw).unwrap();
+        assert!(
+            raw_serialized.contains(jwt)
+                && raw_serialized.contains("header-api-key-val")
+                && raw_serialized.contains(extra)
+        );
     }
 }

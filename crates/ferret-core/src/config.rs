@@ -328,6 +328,13 @@ pub struct McpServerCfg {
     pub roles: Option<Vec<String>>,
     /// The operator says no tool of this server changes anything: read-only roles get it too.
     pub read_only: bool,
+    /// Trust server-advertised `readOnlyHint` tool annotations (default `false`: never blindly
+    /// trust untrusted MCP servers to self-declare tools as read-only).
+    #[serde(default)]
+    pub trust_read_only_hints: bool,
+    /// Optional 64-character hexadecimal SHA-256 digest pinning the server's tool schema list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_schema_sha256: Option<String>,
     /// Per call, seconds.
     pub timeout_s: u64,
 }
@@ -344,6 +351,8 @@ impl Default for McpServerCfg {
             tools: None,
             roles: None,
             read_only: false,
+            trust_read_only_hints: false,
+            pinned_schema_sha256: None,
             timeout_s: 120,
         }
     }
@@ -381,6 +390,13 @@ impl McpCfg {
             }
             if s.timeout_s == 0 {
                 return Err(format!("mcp.servers.{name}: timeout_s must be at least 1"));
+            }
+            if let Some(pin) = s.pinned_schema_sha256.as_deref() {
+                if pin.len() != 64 || !pin.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Err(format!(
+                        "mcp.servers.{name}: pinned_schema_sha256 must be a 64-character hexadecimal SHA-256 digest"
+                    ));
+                }
             }
         }
         Ok(())
@@ -952,6 +968,10 @@ pub struct MailCfg {
     pub allow_recipients: Vec<String>,
     /// When true, require `Authentication-Results` showing `dkim=pass` or `spf=pass`.
     pub require_auth_pass: bool,
+    /// Optional trusted MTA `authserv-id` (for example `mx.google.com`) pinned when inspecting
+    /// `Authentication-Results` headers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authserv_id: Option<String>,
     /// Only return messages received within this many minutes (default 120; 0 = unbounded).
     pub max_age_minutes: u64,
     /// Maximum messages returned per read (default 20, capped at 50).
@@ -975,6 +995,7 @@ impl Default for MailCfg {
             allow_senders: Vec::new(),
             allow_recipients: Vec::new(),
             require_auth_pass: false,
+            authserv_id: None,
             max_age_minutes: 120,
             max_messages: 20,
             roles: Vec::new(),
@@ -984,6 +1005,17 @@ impl Default for MailCfg {
 
 impl MailCfg {
     pub fn check(&self) -> Result<(), String> {
+        if let Some(raw) = self.authserv_id.as_deref() {
+            let trimmed = raw.trim();
+            if trimmed.is_empty()
+                || trimmed.len() > 255
+                || trimmed.chars().any(|c| c.is_whitespace() || c.is_control() || c == ';')
+            {
+                return Err(format!(
+                    "mail.authserv_id `{raw}` is invalid; provide a non-empty MTA authserv-id hostname (for example `mx.google.com`) without whitespace, control characters, or `;`."
+                ));
+            }
+        }
         if !self.enabled {
             return Ok(());
         }
@@ -1232,6 +1264,11 @@ pub struct SignalCfg {
     pub events: Vec<String>,
     /// Maximum characters of one outbound Signal message body (200..=7500; default 3500).
     pub max_chars: usize,
+    /// Seconds to wait before sending outbound Signal alerts for inbox items
+    /// (`blocker`, `question`, `approval`, `parked`) so items answered at the computer never buzz
+    /// the phone (0 = send immediately, max 86400 = 24 hours).
+    #[serde(default)]
+    pub inbox_delay_secs: u64,
     /// Optional isolated guest-chat and unknown-sender gatekeeper settings (`[signal.guests]`).
     #[serde(default)]
     pub guests: SignalGuestsCfg,
@@ -1269,8 +1306,18 @@ impl Default for SignalCfg {
                 "error".into(),
             ],
             max_chars: 3500,
+            inbox_delay_secs: 0,
             guests: SignalGuestsCfg::default(),
         }
+    }
+}
+
+fn is_loopback_url_host(u: &url::Url) -> bool {
+    match u.host() {
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
     }
 }
 
@@ -1341,6 +1388,12 @@ impl SignalCfg {
         if !matches!(u.scheme(), "http" | "https") || u.host_str().is_none() {
             return Err(format!("signal.http_url `{}` must be an http:// or https:// URL with a host.", self.http_url));
         }
+        if u.scheme() == "http" && !is_loopback_url_host(&u) {
+            return Err(format!(
+                "signal.http_url `{}` uses plaintext http:// for a non-loopback host; allow only http://127.0.0.1, http://localhost, http://[::1], or https:// for a remote signal-cli daemon.",
+                self.http_url
+            ));
+        }
         if !valid_e164(&self.account) {
             return Err(format!(
                 "signal.account `{}` must be an E.164 phone number (for example `+15550100`).",
@@ -1395,6 +1448,9 @@ impl SignalCfg {
         }
         if !(200..=7500).contains(&self.max_chars) {
             return Err("signal.max_chars must be between 200 and 7500.".into());
+        }
+        if self.inbox_delay_secs > 86_400 {
+            return Err("signal.inbox_delay_secs must be between 0 and 86400.".into());
         }
         self.guests.check()?;
         Ok(())
@@ -1479,6 +1535,40 @@ pub struct AgentsCfg {
     pub idle_ledger_nudge: bool,
     /// Put the workspace's `AGENTS.md` and `CLAUDE.md` into the system prompt of each new session.
     pub project_instructions: bool,
+    /// Also load workspace `AGENTS.md` / `CLAUDE.md` in security/offensive packs (`vr`, `redteam`,
+    /// `ctf`, `ctf-generalist`, `webapp`, `audit`, `cloud`). Defaults to `false` so untrusted
+    /// target repositories cannot inject instructions into the system prompt unless explicitly
+    /// opted in.
+    #[serde(default)]
+    pub project_instructions_in_security_packs: bool,
+}
+
+/// Security/offensive packs whose workspaces may contain hostile target-repo files and therefore
+/// do NOT load `AGENTS.md` / `CLAUDE.md` unless `agents.project_instructions_in_security_packs`
+/// is explicitly enabled.
+pub const SECURITY_PACKS: &[&str] = &["vr", "redteam", "ctf", "ctf-generalist", "webapp", "audit", "cloud"];
+
+impl AgentsCfg {
+    /// Whether `pack` is a security/offensive pack subject to default-off project instructions.
+    pub fn is_security_pack(pack: &str) -> bool {
+        let norm = pack.trim().to_ascii_lowercase();
+        SECURITY_PACKS.contains(&norm.as_str())
+    }
+
+    /// Whether workspace `AGENTS.md` / `CLAUDE.md` project instructions should be loaded for `pack`.
+    ///
+    /// Non-security packs follow `self.project_instructions` (default `true`). Security packs
+    /// require BOTH `self.project_instructions` AND explicit opt-in via
+    /// `self.project_instructions_in_security_packs` (default `false`).
+    pub fn project_instructions_enabled_for_pack(&self, pack: &str) -> bool {
+        if !self.project_instructions {
+            return false;
+        }
+        if Self::is_security_pack(pack) {
+            return self.project_instructions_in_security_packs;
+        }
+        true
+    }
 }
 
 impl Default for AgentsCfg {
@@ -1501,6 +1591,7 @@ impl Default for AgentsCfg {
             implicit_finish: false,
             idle_ledger_nudge: true,
             project_instructions: true,
+            project_instructions_in_security_packs: false,
         }
     }
 }
@@ -1516,22 +1607,12 @@ pub struct NotifyCfg {
     pub repeat_minutes: u32,
 }
 
-/// Capabilities `[box] cap_add` may never contain (compared without a `CAP_` prefix, ignoring case).
-pub const BOX_FORBIDDEN_CAPS: &[&str] = &[
-    "ALL",
-    "SYS_ADMIN",
-    "SYS_MODULE",
-    "SYS_RAWIO",
-    "SYS_BOOT",
-    "SYS_TIME",
-    "MAC_ADMIN",
-    "MAC_OVERRIDE",
-    "NET_ADMIN",
-    "DAC_READ_SEARCH",
-    "BPF",
-    "PERFMON",
-    "SYSLOG",
-];
+/// Strict allowlist of Linux capabilities `[box] cap_add` may contain (compared without a `CAP_`
+/// prefix, ignoring case). All other capabilities — including container-escape and
+/// privilege-escalation capabilities such as `DAC_OVERRIDE`, `SETUID`, `SETGID`, `SYS_CHROOT`,
+/// `CHECKPOINT_RESTORE`, `SYS_ADMIN`, `NET_ADMIN`, `SYS_PTRACE`, `SYS_MODULE`, and `BPF` — are
+/// refused.
+pub const BOX_ALLOWED_CAPS: &[&str] = &["NET_RAW", "NET_BIND_SERVICE"];
 
 /// `[box]`: one Docker host, one container per mission (see `ferret_tools::boxctl`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1557,7 +1638,7 @@ pub struct BoxCfg {
     pub work_mb: u64,
     /// Size of the tmpfs mounted on `/tmp`.
     pub tmp_mb: u64,
-    /// Capabilities added back to the box (everything else is dropped); see [`BOX_FORBIDDEN_CAPS`].
+    /// Capabilities added back to the box (everything else is dropped); see [`BOX_ALLOWED_CAPS`].
     pub cap_add: Vec<String>,
     /// Most megabytes of changed workspace files copied into `/work` before one `box_exec`.
     pub sync_max_mb: u64,
@@ -1626,12 +1707,14 @@ impl BoxCfg {
             let name = normalize_cap(cap);
             if name.is_empty() || !name.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_') {
                 return Err(format!(
-                    "box.cap_add contains \"{cap}\", which is not a capability name. Write names such as SYS_PTRACE or NET_RAW."
+                    "box.cap_add contains \"{cap}\", which is not a capability name. Allowed capabilities: {}.",
+                    BOX_ALLOWED_CAPS.join(", ")
                 ));
             }
-            if BOX_FORBIDDEN_CAPS.contains(&name.as_str()) {
+            if !BOX_ALLOWED_CAPS.contains(&name.as_str()) {
                 return Err(format!(
-                    "box.cap_add contains {name}, which ferret never gives the box: it would let a command act on the Docker host or undo the box's own limits. Remove it; capabilities such as SYS_PTRACE or NET_RAW are accepted."
+                    "box.cap_add contains {name}, which is not in ferret's box capability allowlist ({}): granting other capabilities can weaken container isolation or let a command act on the Docker host. Remove it.",
+                    BOX_ALLOWED_CAPS.join(", ")
                 ));
             }
         }
@@ -2841,27 +2924,53 @@ allow = ["*.example.test"]
     fn box_is_off_by_default_and_parses_when_pinned() {
         assert!(!Config::default().boxed.enabled);
         assert!(Config::parse("").unwrap().check().is_ok());
-        let c = box_cfg("cap_add = [\"SYS_PTRACE\", \"cap_net_raw\"]").unwrap();
+        let c = box_cfg("cap_add = [\"NET_BIND_SERVICE\", \"cap_net_raw\"]").unwrap();
         assert!(c.boxed.enabled);
-        assert_eq!(c.boxed.caps(), ["SYS_PTRACE", "NET_RAW"]);
+        assert_eq!(c.boxed.caps(), ["NET_BIND_SERVICE", "NET_RAW"]);
         assert_eq!((c.boxed.cpus, c.boxed.memory_mb, c.boxed.pids), (4, 8192, 512));
         assert!(Config::parse("[box]\nbogus = 1").is_err());
     }
 
     #[test]
-    fn i2_cap_add_rejects_exactly_the_dangerous_capabilities() {
-        for cap in BOX_FORBIDDEN_CAPS {
+    fn i2_cap_add_enforces_strict_capability_allowlist() {
+        let refused = [
+            "ALL",
+            "SYS_ADMIN",
+            "NET_ADMIN",
+            "SYS_PTRACE",
+            "SYS_MODULE",
+            "SYS_CHROOT",
+            "DAC_OVERRIDE",
+            "DAC_READ_SEARCH",
+            "SETUID",
+            "SETGID",
+            "CHECKPOINT_RESTORE",
+            "BPF",
+            "PERFMON",
+            "SYS_RAWIO",
+            "SYS_BOOT",
+            "SYS_TIME",
+            "MAC_ADMIN",
+            "MAC_OVERRIDE",
+            "SYSLOG",
+            "FOWNER",
+            "CHOWN",
+        ];
+        for cap in refused {
             for spelled in
                 [cap.to_string(), cap.to_lowercase(), format!("CAP_{cap}"), format!("cap_{}", cap.to_lowercase())]
             {
                 let err = box_cfg(&format!("cap_add = [\"{spelled}\"]")).unwrap_err();
-                assert!(err.contains("never gives the box"), "{spelled}: {err}");
+                assert!(err.contains("allowlist") && err.contains(cap), "{spelled}: {err}");
             }
         }
         // The rejection holds when the box is not enabled too: nothing unsafe is kept in a config.
-        let err = Config::parse("[box]\ncap_add = [\"SYS_ADMIN\"]").unwrap().check().unwrap_err().to_string();
-        assert!(err.contains("SYS_ADMIN"), "{err}");
-        for ok in ["SYS_PTRACE", "NET_RAW", "CAP_SYS_PTRACE", "NET_BIND_SERVICE", "SYS_CHROOT"] {
+        for cap in ["SYS_ADMIN", "DAC_OVERRIDE", "SYS_PTRACE", "SETUID", "CHECKPOINT_RESTORE"] {
+            let err = Config::parse(&format!("[box]\ncap_add = [\"{cap}\"]")).unwrap().check().unwrap_err().to_string();
+            assert!(err.contains(cap) && err.contains("allowlist"), "{cap}: {err}");
+        }
+        // Only the strict allowlist capabilities are accepted (with or without CAP_ prefix, any case).
+        for ok in ["NET_RAW", "cap_net_raw", "CAP_NET_RAW", "NET_BIND_SERVICE", "net_bind_service"] {
             assert!(box_cfg(&format!("cap_add = [\"{ok}\"]")).is_ok(), "{ok}");
         }
         assert!(box_cfg("cap_add = [\"not a cap\"]").unwrap_err().contains("not a capability name"));
@@ -3343,5 +3452,137 @@ enabled = true
             with_ws(Some("/var/tmp/assistant")).resolved_action_workspace(),
             Some(PathBuf::from("/var/tmp/assistant"))
         );
+    }
+
+    #[test]
+    fn signal_http_url_refuses_non_loopback_plaintext_http() {
+        let with_url = |url: &str| {
+            format!(
+                "[signal]\nenabled = true\nhttp_url = \"{url}\"\naccount = \"+15550100\"\nrecipient = \"+15550199\"\nallow_from = [\"+15550199\"]\n"
+            )
+        };
+        for ok_url in [
+            "http://127.0.0.1:1337",
+            "http://127.0.0.2:1337",
+            "http://localhost:1337",
+            "http://LOCALHOST:1337",
+            "http://[::1]:1337",
+            "https://signal.example.com:8443",
+            "https://192.168.1.50:8443",
+        ] {
+            Config::parse(&with_url(ok_url)).unwrap().check().unwrap_or_else(|e| panic!("{ok_url}: {e}"));
+        }
+        for bad_url in [
+            "http://192.168.1.10:1337",
+            "http://10.0.0.5:1337",
+            "http://0.0.0.0:1337",
+            "http://signal.example.com:1337",
+            "http://evil.localhost:1337",
+            "http://[::]:1337",
+        ] {
+            let err = Config::parse(&with_url(bad_url)).unwrap().check().unwrap_err().to_string();
+            assert!(err.contains("non-loopback") && err.contains("https://"), "{bad_url}: {err}");
+        }
+
+        // inbox_delay_secs defaults to 0 and accepts 0..=86400.
+        assert_eq!(SignalCfg::default().inbox_delay_secs, 0);
+        for ok_delay in [0u64, 600, 86_400] {
+            let cfg = format!("{}inbox_delay_secs = {ok_delay}\n", with_url("http://127.0.0.1:1337"));
+            let parsed = Config::parse(&cfg).unwrap();
+            parsed.check().unwrap();
+            assert_eq!(parsed.signal.inbox_delay_secs, ok_delay);
+        }
+        let too_large = format!("{}inbox_delay_secs = 86401\n", with_url("http://127.0.0.1:1337"));
+        let err = Config::parse(&too_large).unwrap().check().unwrap_err().to_string();
+        assert!(err.contains("inbox_delay_secs"), "{err}");
+    }
+
+    #[test]
+    fn mail_authserv_id_defaults_none_and_validates_when_set() {
+        assert_eq!(MailCfg::default().authserv_id, None);
+        let serialized = serde_json::to_value(MailCfg::default()).unwrap();
+        assert!(serialized.get("authserv_id").is_none());
+
+        let ok_cfg = Config::parse(
+            "[mail]\nenabled = true\nbackend = \"maildir\"\nmaildir_path = \"/tmp/mail\"\nallow_senders = [\"*@hackerone.com\"]\nrequire_auth_pass = true\nauthserv_id = \"mx.google.com\"\n",
+        )
+        .unwrap();
+        ok_cfg.check().unwrap();
+        assert_eq!(ok_cfg.mail.authserv_id.as_deref(), Some("mx.google.com"));
+
+        for bad in ["", "   ", "mx google.com", "mx.google.com;dkim=pass", "mx\ngoogle.com", &"a".repeat(256)] {
+            let cfg = MailCfg { authserv_id: Some(bad.to_string()), ..MailCfg::default() };
+            let err = cfg.check().unwrap_err();
+            assert!(err.contains("mail.authserv_id"), "{bad:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn mcp_read_only_hints_default_false_and_schema_pin_validates_64_hex() {
+        let def = McpServerCfg::default();
+        assert!(!def.trust_read_only_hints);
+        assert!(def.pinned_schema_sha256.is_none());
+        let val = serde_json::to_value(&def).unwrap();
+        assert!(val.get("pinned_schema_sha256").is_none());
+
+        let good_hex = "0123456789abcdef".repeat(4);
+        let good_upper = "0123456789ABCDEF".repeat(4);
+        for hex_pin in [&good_hex, &good_upper] {
+            let cfg = Config::parse(&format!(
+                "[mcp.servers.s]\ncommand = [\"srv\"]\ntrust_read_only_hints = true\npinned_schema_sha256 = \"{hex_pin}\"\n"
+            ))
+            .unwrap();
+            cfg.check().unwrap();
+            assert!(cfg.mcp.servers["s"].trust_read_only_hints);
+            assert_eq!(cfg.mcp.servers["s"].pinned_schema_sha256.as_deref(), Some(hex_pin.as_str()));
+        }
+
+        for bad_pin in [
+            "",
+            "abc",
+            &"g".repeat(64),
+            &"a".repeat(63),
+            &"a".repeat(65),
+            &format!("sha256:{good_hex}"),
+            &format!(" {good_hex}"),
+        ] {
+            let cfg =
+                Config::parse(&format!("[mcp.servers.s]\ncommand = [\"srv\"]\npinned_schema_sha256 = \"{bad_pin}\"\n"))
+                    .unwrap();
+            let err = cfg.check().unwrap_err().to_string();
+            assert!(err.contains("pinned_schema_sha256"), "{bad_pin:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn agents_project_instructions_default_off_in_security_packs_unless_opted_in() {
+        let def = AgentsCfg::default();
+        assert!(def.project_instructions);
+        assert!(!def.project_instructions_in_security_packs);
+
+        // Non-security packs keep loading project instructions by default.
+        assert!(def.project_instructions_enabled_for_pack("core"));
+        assert!(def.project_instructions_enabled_for_pack("custom-dev"));
+
+        // Security packs default to NOT loading hostile target-repo AGENTS.md / CLAUDE.md.
+        for pack in ["vr", "redteam", "ctf", "ctf-generalist", "VR", " ctf ", "webapp", "audit", "cloud"] {
+            assert!(!def.project_instructions_enabled_for_pack(pack), "should be off by default for {pack}");
+        }
+
+        // Explicit opt-in enables security packs while respecting the master project_instructions switch.
+        let opted_in = Config::parse("[agents]\nproject_instructions_in_security_packs = true\n").unwrap();
+        opted_in.check().unwrap();
+        for pack in ["core", "vr", "redteam", "ctf", "ctf-generalist"] {
+            assert!(opted_in.agents.project_instructions_enabled_for_pack(pack), "{pack}");
+        }
+
+        // Master project_instructions = false disables all packs even if opt-in is true.
+        let master_off =
+            Config::parse("[agents]\nproject_instructions = false\nproject_instructions_in_security_packs = true\n")
+                .unwrap();
+        master_off.check().unwrap();
+        for pack in ["core", "vr", "redteam", "ctf", "ctf-generalist"] {
+            assert!(!master_off.agents.project_instructions_enabled_for_pack(pack), "{pack}");
+        }
     }
 }

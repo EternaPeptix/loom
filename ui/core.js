@@ -1265,6 +1265,59 @@ export function scopeRequest(session, hosts, note) {
   return { path: `/api/sessions/${encodeURIComponent(session)}/scope`, body };
 }
 
+/** The operator's revocation of hosts: `{ path, body }` for `POST /api/sessions/{id}/scope/revoke`, or `{ error }`. */
+export function scopeRevokeRequest(session, hosts, note = "") {
+  const list = (hosts || []).map((h) => String(h).trim()).filter(Boolean);
+  if (!list.length) return { error: "Name the hosts to revoke." };
+  const body = { hosts: list };
+  const n = String(note || "").trim();
+  if (n) body.note = n;
+  return { path: `/api/sessions/${encodeURIComponent(session)}/scope/revoke`, body };
+}
+
+/** Granted hosts from `ledgerModel` annotated with any session-local revocations. */
+export function activeGrantedHosts(model, revokedSet = null) {
+  const hosts = (model && model.scope) || [];
+  const rev = revokedSet instanceof Set ? revokedSet : null;
+  return hosts.map((host) => ({
+    host,
+    revoked: !!(rev && rev.has(String(host).toLowerCase())),
+  }));
+}
+
+/** One-line summary of a `ScopeRevokeReceipt`. */
+export function formatScopeRevoke(receipt) {
+  if (!receipt || typeof receipt !== "object") return "Scope revoked.";
+  const hosts = Array.isArray(receipt.revoked) && receipt.revoked.length ? receipt.revoked.join(", ") : "scope";
+  const cut = Number(receipt.connections_cut) || 0;
+  const carved = Array.isArray(receipt.not_granted) && receipt.not_granted.length
+    ? ` Not granted by itself, refused from now on: ${receipt.not_granted.join(", ")}.`
+    : "";
+  return `Revoked ${hosts} (${count(cut, "connection")} cut).${carved}`;
+}
+
+/** Request payload for `POST /api/panic`. */
+export function panicRequest(reason = "") {
+  const r = String(reason || "").trim();
+  return { path: "/api/panic", body: r ? { reason: r } : {} };
+}
+
+/** One-line summary of a `PanicReport`. */
+export function formatPanicReport(report) {
+  if (!report || typeof report !== "object") return "Panic stop complete.";
+  const cut = Number(report.connections_cut) || 0;
+  const stopped = Array.isArray(report.sessions_stopped) ? report.sessions_stopped.length : 0;
+  const boxes = Number(report.boxes_torn_down) || 0;
+  const rewrites = Number(report.rewrites_disabled) || 0;
+  // What the census stopped under the sessions' sandboxes (processes that left their group), when there was any.
+  const killed = Number(report.processes_killed) || 0;
+  const left = Number(report.processes_left) || 0;
+  const census = killed || left
+    ? ` · ${count(killed, "process", "processes")} left under the sandboxes stopped${left ? ` (${left} could not be)` : ""}`
+    : "";
+  return `Panic stop complete: ${count(cut, "connection")} cut · ${count(stopped, "session")} stopped · ${count(boxes, "box", "boxes")} torn down · ${count(rewrites, "rewrite rule")} disabled${census}.`;
+}
+
 /** The choice that closes a blocked session without the goal established. */
 export const PARK_ACCEPT = "Accept as blocked and close";
 const PARK_KEEP = "Keep working";
@@ -5786,17 +5839,22 @@ export function briefDetails(brief) {
   return out;
 }
 
-/** URL for downloading a mission's SARIF 2.1.0 report. */
-export function sarifUrl(mission) {
-  return `/api/missions/${encodeURIComponent(mission)}/sarif`;
+/** Subtle note displayed alongside HAR and SARIF downloads in the UI. */
+export const EXPORT_SANITIZED_NOTE = "Sanitized export — secrets redacted";
+
+/** URL for downloading a mission's SARIF 2.1.0 report (sanitized by default). */
+export function sarifUrl(mission, { includeSecrets = false } = {}) {
+  const base = `/api/missions/${encodeURIComponent(mission)}/sarif`;
+  return includeSecrets ? `${base}?sanitize=false` : base;
 }
 
-/** URL for downloading a mission's HAR 1.2 archive (optional host filter and entry limit). */
-export function harUrl(mission, { host = "", limit = null } = {}) {
+/** URL for downloading a mission's HAR 1.2 archive (sanitized by default; optional host filter and entry limit). */
+export function harUrl(mission, { host = "", limit = null, includeSecrets = false } = {}) {
   const q = [];
   const h = String(host || "").trim();
   if (h && h !== "all") q.push("host=" + encodeURIComponent(h));
   if (Number.isInteger(limit) && limit > 0) q.push("limit=" + limit);
+  if (includeSecrets) q.push("sanitize=false");
   return `/api/missions/${encodeURIComponent(mission)}/har` + (q.length ? "?" + q.join("&") : "");
 }
 

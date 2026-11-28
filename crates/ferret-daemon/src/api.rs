@@ -56,7 +56,7 @@
 //! | `POST /sessions/{id}/approvals` (`ApprovalBody`; `scope` may be left out) | `runtime.approve` | `202` `RuleReceipt` |
 //! | `POST /sessions/{id}/rules/{rule_id}/withdraw` (`WithdrawBody`; `reason` may be left out) | `runtime.withdraw_rule` (`404` when the mission has no such rule, `409` when it is already withdrawn) | `202` `RuleReceipt` |
 //! | `POST /sessions/{id}/scope` (`ScopeBody`; `note` may be left out) | `runtime.grant_scope` (operator only; a child's id goes to its lead; `409` for no hosts or a host that is not a plain name) | `202` `ScopeReceipt` |
-//! | `POST /missions/{id}/scope/revoke` (`ScopeRevokeBody`; both fields required) | `runtime.revoke_scope` (operator only; `404` for an unknown mission, `409` for a blank field or a host that is not granted; the sentence lists what is) | `202` `ScopeRevokeReceipt` |
+//! | `POST /sessions/{id}/scope/revoke` (`ScopeRevokeBody`: `hosts`, and `reason` (or `note`) that may be left out) | `runtime.revoke_scope` (operator only; a child's id goes to its lead; `404` for an unknown session, `409` for no hosts, a blank or unreadable host) | `200` `ScopeRevokeReceipt` |
 //! | `POST /sessions/{id}/release` (`ReleaseBody`; `reason` required) | `runtime.release` (operator only; closes the mission without the goal established; `409` for a blank reason) | `202` `RuleReceipt` |
 //! | `POST /sessions/{id}/stop` | `runtime.stop` | `202` `{}` |
 //! | `POST /sessions/{id}/resume` | `runtime.resume` | `202` `{}` |
@@ -92,8 +92,8 @@
 //! | `DELETE /targets/{name}/creds/{profile}` | `runtime.creds_remove` (`404` when there was none) | `204` |
 //! | `GET /missions` | `runtime.missions` | `[MissionInfo]` |
 //! | `GET /missions/{id}/ledger` | `runtime.ledger` | `LedgerView` |
-//! | `GET /missions/{id}/sarif?repo_uri=&repo_name=&commit=&branch=&git_ref=` | `runtime.sarif` | SARIF 2.1.0 JSON (`application/sarif+json`) |
-//! | `GET /missions/{id}/har?host=&limit={n}` | `runtime.export_har` | HAR 1.2 JSON |
+//! | `GET /missions/{id}/sarif?repo_uri=&repo_name=&commit=&branch=&git_ref=&sanitize=true` | `runtime.sarif` (sanitized by default; pass `sanitize=false` to include secrets) | SARIF 2.1.0 JSON (`application/sarif+json`) |
+//! | `GET /missions/{id}/har?host=&limit={n}&sanitize=true` | `runtime.export_har_with_options` (sanitized by default; pass `sanitize=false` to include secrets) | HAR 1.2 JSON |
 //! | `POST /missions/{id}/har` | `runtime.import_har` (max 32 MiB) | `HarImportResult` |
 //! | `GET /network/noise` | `runtime.noise_status` | `NoiseStatusView` |
 //! | `GET /traffic/rewrite-rules` | `runtime.rewrite_list` (sensitive values redacted) | `[RewriteRule]` |
@@ -112,6 +112,7 @@
 //! | `GET /sessions/{id}/files/lines?path={relative}&start={n}&count={n}` | `fsview::read_file_lines` (`start` default 1, `count` default 2000, at most 5000; at most 32 MiB of a file is read) | `FileLinesView` (`path`, `text`, `first`, `last`, `total`, `total_lines`, `bytes`, `mtime_ms`, `binary`) |
 //! | `GET /events?deltas=true` | see *Streams* | SSE |
 //! | `POST /gc` (`GcBody`) | `runtime.gc(apply, None)` | `200` `SweepReport` |
+//! | `POST /panic` (optional `PanicBody` or empty body) | `runtime.panic_stop_all` (emergency kill-switch: sever tunnels, stop sessions, tear down boxes, disable rewrites) | `200` `PanicReport` |
 //! | `POST /shutdown` | cancels `state.shutdown` | `202` `{}` |
 //!
 //! A session id that no session has is `404` `{"error": "There is no session {id}."}`; a handle
@@ -174,9 +175,9 @@ use crate::fsview;
 use crate::ui;
 use crate::wire::{
     AnswerBody, ApprovalBody, ArchiveBody, CreatedSession, DirsView, DiskSpace, ErrorBody, FileLinesView, FilesView,
-    GcBody, LinesView, McpCheckBody, MessageBody, MessageWhen, ModelBody, ModelsView, QueuedEditBody, QueuedReceipt,
-    ReleaseBody, RenameBody, RoleModelBody, RuleBody, ScopeBody, ScopeRevokeBody, SessionDetail, SignalHealth,
-    StatusView, UploadView, WithdrawBody,
+    GcBody, LinesView, McpCheckBody, MessageBody, MessageWhen, ModelBody, ModelsView, PanicBody, QueuedEditBody,
+    QueuedReceipt, ReleaseBody, RenameBody, RoleModelBody, RuleBody, ScopeBody, ScopeRevokeBody, SessionDetail,
+    SignalHealth, StatusView, UploadView, WithdrawBody,
 };
 use axum::body::{Body, Bytes};
 use axum::extract::rejection::BytesRejection;
@@ -218,6 +219,8 @@ pub struct ApiState {
     pub shutdown: CancellationToken,
     /// Login codes and web-session secrets of the web UI.
     pub logins: Arc<auth::Logins>,
+    /// Sliding-window rate limiter for failed bearer auth and login-code attempts.
+    pub auth_limiter: Arc<auth::AuthRateLimiter>,
     /// Live health of the optional two-way Signal bridge.
     pub signal_health: Arc<SignalHealth>,
 }
@@ -265,6 +268,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/sessions/{id}/approvals", post(approve))
         .route("/api/sessions/{id}/rules/{rule_id}/withdraw", post(withdraw_rule))
         .route("/api/sessions/{id}/scope", post(grant_scope))
+        .route("/api/sessions/{id}/scope/revoke", post(revoke_scope))
         .route("/api/sessions/{id}/release", post(release))
         .route("/api/sessions/{id}/stop", post(stop))
         .route("/api/sessions/{id}/resume", post(resume))
@@ -307,7 +311,6 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/traffic/rewrite-rules/{id}", put(rewrite_update).delete(rewrite_delete))
         .route("/api/traffic/rewrite-rules/{id}/toggle", post(rewrite_toggle))
         .route("/api/missions/{id}/score", get(score))
-        .route("/api/missions/{id}/scope/revoke", post(revoke_scope))
         .route("/api/inbox", get(inbox))
         .route("/api/inbox/{item_id}", post(answer))
         .route("/api/blobs/{handle}", get(blob_meta))
@@ -320,6 +323,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/uploads", post(upload).layer(DefaultBodyLimit::max(UPLOAD_MAX_BYTES)))
         .route("/api/events", get(events))
         .route("/api/gc", post(gc))
+        .route("/api/panic", post(panic_stop_all))
         .route("/api/shutdown", post(shutdown))
         .fallback(not_found)
         .layer(middleware::from_fn_with_state(state.clone(), gate))
@@ -491,6 +495,29 @@ fn refusal(status: StatusCode, message: &str) -> Response {
     ApiError::new(status, message).into_response()
 }
 
+fn too_many_auth_failures(retry_after: u64) -> Response {
+    let mut response = refusal(
+        StatusCode::TOO_MANY_REQUESTS,
+        &format!("Too many failed authentication attempts. Try again in {retry_after} seconds."),
+    );
+    if let Ok(val) = HeaderValue::from_str(&retry_after.to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, val);
+    }
+    response
+}
+
+fn too_many_auth_failures_plain(retry_after: u64) -> Response {
+    let mut response = Response::new(Body::from(format!(
+        "Too many failed authentication attempts. Try again in {retry_after} seconds."
+    )));
+    *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+    response.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain; charset=utf-8"));
+    if let Ok(val) = HeaderValue::from_str(&retry_after.to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, val);
+    }
+    with_ui_headers(response)
+}
+
 /// The one middleware: Host, then Origin (unsafe methods), then the token; and the headers every
 /// response carries.
 async fn gate(State(state): State<ApiState>, req: Request, next: Next) -> Response {
@@ -518,6 +545,9 @@ async fn admit(state: &ApiState, req: Request, next: Next) -> Response {
         && matches!(path, "/" | "/healthz" | "/app.js" | "/core.js" | "/style.css" | "/favicon.svg"))
         || (method == Method::POST && path == "/api/web-sessions");
     if !exempt && !bearer_ok(state, headers) {
+        if let Some(retry_after) = state.auth_limiter.record_bearer_failure() {
+            return too_many_auth_failures(retry_after);
+        }
         return refusal(StatusCode::UNAUTHORIZED, UNAUTHORIZED);
     }
     next.run(req).await
@@ -591,6 +621,9 @@ async fn index(State(s): State<ApiState>, headers: HeaderMap, q: RawQuery) -> Re
     // browser never sends anywhere, and set no cookie.
     if let Some(token) = query.get("token") {
         if !auth::token_matches(&s.token, token) {
+            if let Some(retry_after) = s.auth_limiter.record_bearer_failure() {
+                return too_many_auth_failures_plain(retry_after);
+            }
             return unauthorized_page();
         }
         let mut response = Response::new(Body::empty());
@@ -612,6 +645,9 @@ async fn index(State(s): State<ApiState>, headers: HeaderMap, q: RawQuery) -> Re
 /// `POST /api/login-codes`: a single-use code for the web UI. Only the API token may ask.
 async fn login_code(State(s): State<ApiState>, headers: HeaderMap) -> Response {
     if !token_ok(&s, &headers) {
+        if let Some(retry_after) = s.auth_limiter.record_bearer_failure() {
+            return too_many_auth_failures(retry_after);
+        }
         return refusal(StatusCode::UNAUTHORIZED, UNAUTHORIZED);
     }
     let code = s.logins.mint_code();
@@ -626,10 +662,18 @@ struct CodeBody {
 
 /// `POST /api/web-sessions`: a login code for a web-session secret.
 async fn web_session(State(s): State<ApiState>, body: Bytes) -> Res<Response> {
+    if let Some(retry_after) = s.auth_limiter.login_retry_after() {
+        return Ok(too_many_auth_failures(retry_after));
+    }
     let body: CodeBody = json_body(&body)?;
     match s.logins.redeem(&body.code) {
         Some(secret) => Ok(Json(json!({ "secret": secret })).into_response()),
-        None => Ok(refusal(StatusCode::UNAUTHORIZED, UNAUTHORIZED)),
+        None => {
+            if let Some(retry_after) = s.auth_limiter.record_login_failure() {
+                return Ok(too_many_auth_failures(retry_after));
+            }
+            Ok(refusal(StatusCode::UNAUTHORIZED, UNAUTHORIZED))
+        }
     }
 }
 
@@ -885,8 +929,9 @@ async fn grant_scope(State(s): State<ApiState>, Path(id): Path<String>, body: By
 
 async fn revoke_scope(State(s): State<ApiState>, Path(id): Path<String>, body: Bytes) -> Res<Response> {
     let body: ScopeRevokeBody = json_body(&body)?;
-    let receipt = s.runtime.revoke_scope(&MissionId::from(id), &body.host, &body.reason).await.map_err(rt_err)?;
-    Ok((StatusCode::ACCEPTED, Json(receipt)).into_response())
+    let receipt =
+        s.runtime.revoke_scope(&SessionId::from(id), &body.hosts, body.reason.as_deref()).await.map_err(rt_err)?;
+    Ok((StatusCode::OK, Json(receipt)).into_response())
 }
 
 /// NEEDS `Runtime::release` (not in this slice, which may not edit runtime.rs and session.rs): the one
@@ -1167,6 +1212,8 @@ struct SarifQuery {
     branch: Option<String>,
     #[serde(default)]
     git_ref: Option<String>,
+    #[serde(default)]
+    sanitize: Option<bool>,
 }
 
 async fn mission_sarif(
@@ -1188,6 +1235,7 @@ async fn mission_sarif(
             branch: q.branch,
             git_ref: q.git_ref,
         }),
+        sanitize: q.sanitize.unwrap_or(true),
         ..Default::default()
     };
     let doc = s.runtime.sarif(&MissionId::from(id), opts).map_err(rt_err)?;
@@ -1202,6 +1250,8 @@ struct HarExportQuery {
     host: Option<String>,
     #[serde(default)]
     limit: Option<usize>,
+    #[serde(default)]
+    sanitize: Option<bool>,
 }
 
 async fn mission_har_export(
@@ -1211,8 +1261,11 @@ async fn mission_har_export(
 ) -> Res<Response> {
     let Query(q) = q.map_err(ApiError::bad_query)?;
     let rt = s.runtime.clone();
-    let (doc, _meta) =
-        blocking(move || rt.export_har(&MissionId::from(id), q.host.as_deref(), q.limit).map_err(rt_err)).await?;
+    let sanitize = q.sanitize.unwrap_or(true);
+    let doc = blocking(move || {
+        rt.export_har_with_options(&MissionId::from(id), q.host.as_deref(), q.limit, sanitize).map_err(rt_err)
+    })
+    .await?;
     let bytes = serde_json::to_vec_pretty(&doc).unwrap_or_else(|_| b"{}".to_vec());
     Ok(([(header::CONTENT_TYPE, HeaderValue::from_static("application/json; charset=utf-8"))], bytes).into_response())
 }
@@ -1281,6 +1334,13 @@ async fn gc(State(s): State<ApiState>, body: Bytes) -> Res<Response> {
     let body: GcBody = json_body(&body)?;
     let report = s.runtime.gc(body.apply, None).await.map_err(rt_err)?;
     Ok(Json(report).into_response())
+}
+
+async fn panic_stop_all(State(s): State<ApiState>, body: Bytes) -> Res<Response> {
+    let body: PanicBody =
+        if body.iter().all(|b| b.is_ascii_whitespace()) { PanicBody::default() } else { json_body(&body)? };
+    let report = s.runtime.panic_stop_all(body.reason).await.map_err(rt_err)?;
+    Ok((StatusCode::OK, Json(report)).into_response())
 }
 
 async fn shutdown(State(s): State<ApiState>) -> Response {
@@ -1764,6 +1824,7 @@ mod tests {
         let token = "ab".repeat(32);
         let shutdown = CancellationToken::new();
         let logins = Arc::new(auth::Logins::new());
+        let auth_limiter = Arc::new(auth::AuthRateLimiter::default());
         let signal_health = Arc::new(SignalHealth::from_config(&rt.config().signal));
         let state = ApiState {
             runtime: rt.clone(),
@@ -1773,6 +1834,7 @@ mod tests {
             started_ms: 1_234,
             shutdown: shutdown.clone(),
             logins: logins.clone(),
+            auth_limiter,
             signal_health: signal_health.clone(),
         };
         let app = router(state);
@@ -2701,7 +2763,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_scope_revoke_route_withdraws_a_granted_host_and_refuses_what_is_not_granted() {
+    async fn the_scope_revoke_route_withdraws_a_granted_host_records_it_and_refuses_bad_input() {
         let e = env(lead_script(json!({"question": "CHILDMARK find it"}))).await;
         let id = e.create("go").await;
         e.wait_turn_ends(&id, 1).await;
@@ -2712,11 +2774,11 @@ mod tests {
         assert_eq!(s, 202, "{b}");
         e.ledger_state(&mission, "the grant", |l| l["scope_grants"].as_array().is_some_and(|g| !g.is_empty())).await;
 
-        let path = format!("/api/missions/{mission}/scope/revoke");
-        let (s, b) = e.post(&path, json!({"host": "A.example.test", "reason": "wrong target"})).await;
+        let path = format!("/api/sessions/{id}/scope/revoke");
+        let (s, b) = e.post(&path, json!({"hosts": ["A.example.test"], "reason": "wrong target"})).await;
         assert_eq!(
-            (s, &b["lead"], &b["host"], &b["recorded"]),
-            (202, &json!(id), &json!("a.example.test"), &json!(true)),
+            (s, &b["lead"], &b["revoked"], &b["recorded"]),
+            (200, &json!(id), &json!(["a.example.test"]), &json!(["a.example.test"])),
             "{b}"
         );
         let state = e
@@ -2724,24 +2786,27 @@ mod tests {
             .await;
         assert_eq!(state["scope_revokes"][0]["reason"], "wrong target");
 
-        // Refused: not granted any more (the sentence lists what is), a host a wildcard covers, a blank
-        // reason, an unknown mission; unknown fields and missing fields are bad bodies.
-        let (s, b) = e.post(&path, json!({"host": "a.example.test", "reason": "again"})).await;
+        // A host that is no grant by itself (not granted any more, a name under a wildcard) is revoked without a
+        // record; a blank or unreadable host and an unknown session are refused; unknown fields and missing fields
+        // are bad bodies.
+        let (s, b) = e.post(&path, json!({"hosts": ["a.example.test"], "reason": "again"})).await;
+        assert_eq!((s, &b["not_granted"], &b["recorded"]), (200, &json!(["a.example.test"]), &json!([])), "{b}");
+        let (s, b) = e.post(&path, json!({"hosts": ["x.b.test"]})).await;
+        assert_eq!((s, &b["not_granted"]), (200, &json!(["x.b.test"])), "{b}");
+        let (s, b) = e.post(&path, json!({"hosts": [" "], "reason": "r"})).await;
         assert_eq!(s, 409, "{b}");
-        assert!(b["error"].as_str().unwrap().contains("*.b.test"), "{b}");
-        let (s, b) = e.post(&path, json!({"host": "x.b.test", "reason": "r"})).await;
-        assert_eq!(s, 409, "{b}");
-        let (s, b) = e.post(&path, json!({"host": "*.b.test", "reason": " "})).await;
-        assert_eq!(s, 409, "{b}");
-        assert!(b["error"].as_str().unwrap().contains("Say why"), "{b}");
-        let (s, b) = e.post("/api/missions/m-nope/scope/revoke", json!({"host": "a.test", "reason": "r"})).await;
+        assert!(b["error"].as_str().unwrap().contains("Name the host"), "{b}");
+        let (s, b) = e.post("/api/sessions/s-nope/scope/revoke", json!({"hosts": ["a.test"], "reason": "r"})).await;
         assert_eq!(s, 404, "{b}");
-        let (s, _) = e.post(&path, json!({"host": "a.test", "reason": "r", "extra": 1})).await;
+        let (s, _) = e.post(&path, json!({"hosts": ["a.test"], "reason": "r", "extra": 1})).await;
         assert_eq!(s, 400);
-        let (s, _) = e.post(&path, json!({"host": "a.test"})).await;
+        let (s, _) = e.post(&path, json!({"reason": "r"})).await;
         assert_eq!(s, 400);
-        let (s, b) = e.post(&path, json!({"host": "*.b.test", "reason": "done with it"})).await;
-        assert_eq!(s, 202, "{b}");
+        // The route the monitor first served is gone: one route revokes.
+        let (s, _) = e.post(&format!("/api/missions/{mission}/scope/revoke"), json!({"hosts": ["*.b.test"]})).await;
+        assert_eq!(s, 404);
+        let (s, b) = e.post(&path, json!({"hosts": ["*.b.test"], "note": "done with it"})).await;
+        assert_eq!((s, &b["recorded"]), (200, &json!(["*.b.test"])), "{b}");
     }
 
     #[tokio::test]
@@ -4106,6 +4171,205 @@ done
         assert_eq!(r.status().as_u16(), 204);
         let r = e.rq(Method::DELETE, "/api/targets/acme/creds/default").send().await.unwrap();
         assert_eq!(r.status().as_u16(), 404);
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn auth_rate_limiter_returns_429_with_retry_after_on_repeated_bad_bearer_and_login_codes() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+
+        // 1. Repeated bad bearer attempts trigger 429 + Retry-After after AUTH_FAIL_LIMIT failures.
+        for i in 0..auth::AUTH_FAIL_LIMIT {
+            let r = e.http.get(e.url("/api/status")).bearer_auth("bad-token").send().await.unwrap();
+            assert_eq!(r.status().as_u16(), 401, "attempt {i}");
+        }
+        let r = e.http.get(e.url("/api/status")).bearer_auth("bad-token").send().await.unwrap();
+        assert_eq!(r.status().as_u16(), 429);
+        let retry_after: u64 = r
+            .headers()
+            .get(header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse().ok())
+            .expect("Retry-After header on 429");
+        assert!((1..=60).contains(&retry_after), "unexpected Retry-After: {retry_after}");
+        let (_, body) = json_of(r).await;
+        assert!(body["error"].as_str().unwrap().contains("Too many failed"), "{body}");
+
+        // Bad `/?token=` also returns 429 + Retry-After + CSP while bearer lockout is active.
+        let r_idx = e.http.get(e.url("/?token=wrong")).send().await.unwrap();
+        assert_eq!(r_idx.status().as_u16(), 429);
+        assert!(r_idx.headers().get(header::RETRY_AFTER).is_some());
+        assert_eq!(r_idx.headers()["content-security-policy"], ui::CSP);
+
+        // Legitimate valid-token traffic MUST NOT be interfered with during bad-token lockout!
+        let (s, _) = e.get("/api/status").await;
+        assert_eq!(s, 200);
+        let r_valid_idx = e.http.get(e.url(&format!("/?token={}", e.token))).send().await.unwrap();
+        assert_eq!(r_valid_idx.status().as_u16(), 303);
+
+        // 2. Repeated bad login-code attempts on POST /api/web-sessions trigger 429 + Retry-After.
+        for i in 0..auth::AUTH_FAIL_LIMIT {
+            let r = e
+                .http
+                .post(e.url("/api/web-sessions"))
+                .json(&json!({ "code": format!("bad-code-{i}") }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status().as_u16(), 401, "login attempt {i}");
+        }
+        let valid_code = e.logins.mint_code();
+        let r_locked =
+            e.http.post(e.url("/api/web-sessions")).json(&json!({ "code": valid_code })).send().await.unwrap();
+        assert_eq!(r_locked.status().as_u16(), 429);
+        let retry_login: u64 = r_locked
+            .headers()
+            .get(header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse().ok())
+            .expect("Retry-After header on login 429");
+        assert!((1..=60).contains(&retry_login), "unexpected Retry-After: {retry_login}");
+
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn har_and_sarif_routes_sanitize_by_default_and_honor_sanitize_false() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let id = e.create("go").await;
+        let (_, detail) = e.get(&format!("/api/sessions/{id}")).await;
+        let mission = detail["mission"].as_str().unwrap().to_string();
+
+        let har_payload = json!({
+            "log": {
+                "version": "1.2",
+                "entries": [{
+                    "startedDateTime": "2026-11-27T14:00:00Z",
+                    "time": 12.0,
+                    "request": {
+                        "method": "GET",
+                        "url": "https://app.example.test/api/v1?api_key=raw-query-secret-999",
+                        "httpVersion": "HTTP/1.1",
+                        "headers": [
+                            { "name": "Authorization", "value": "Bearer supersecret-har-token-1234" },
+                            { "name": "Cookie", "value": "session=rawcookie9876" }
+                        ]
+                    },
+                    "response": {
+                        "status": 200,
+                        "statusText": "OK",
+                        "httpVersion": "HTTP/1.1",
+                        "headers": [],
+                        "content": { "text": "ok" }
+                    }
+                }]
+            }
+        });
+        let (s, imp) = e.post(&format!("/api/missions/{mission}/har"), har_payload).await;
+        assert_eq!(s, 200, "{imp}");
+
+        // Default HAR export redacts secrets.
+        let (s, sanitized) = e.get(&format!("/api/missions/{mission}/har")).await;
+        assert_eq!(s, 200, "{sanitized}");
+        let san_text = sanitized.to_string();
+        assert!(!san_text.contains("supersecret-har-token-1234"), "Authorization leaked: {san_text}");
+        assert!(!san_text.contains("rawcookie9876"), "Cookie leaked: {san_text}");
+        assert!(!san_text.contains("raw-query-secret-999"), "api_key leaked: {san_text}");
+        assert_eq!(sanitized["log"]["_sanitized"], json!(true));
+
+        // Explicit `?sanitize=false` opts out of redaction.
+        let (s, raw_har) = e.get(&format!("/api/missions/{mission}/har?sanitize=false")).await;
+        assert_eq!(s, 200, "{raw_har}");
+        let raw_text = raw_har.to_string();
+        assert!(raw_text.contains("supersecret-har-token-1234"), "expected raw Authorization: {raw_text}");
+        assert!(raw_text.contains("rawcookie9876"), "expected raw Cookie: {raw_text}");
+
+        // Invalid boolean query value returns 400.
+        let (s, _) = e.get(&format!("/api/missions/{mission}/har?sanitize=maybe")).await;
+        assert_eq!(s, 400);
+
+        // SARIF accepts default (sanitized) and explicit sanitize=true/false; rejects invalid bool.
+        let (s, sarif_def) = e.get(&format!("/api/missions/{mission}/sarif")).await;
+        assert_eq!(s, 200, "{sarif_def}");
+        assert_eq!(sarif_def["version"], "2.1.0");
+        let (s, sarif_raw) = e.get(&format!("/api/missions/{mission}/sarif?sanitize=false")).await;
+        assert_eq!(s, 200, "{sarif_raw}");
+        assert_eq!(sarif_raw["version"], "2.1.0");
+        let (s, _) = e.get(&format!("/api/missions/{mission}/sarif?sanitize=nope")).await;
+        assert_eq!(s, 400);
+
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn scope_revoke_and_panic_routes_enforce_auth_csrf_and_status_codes() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let id = e.create("go").await;
+
+        let (s, _) = e
+            .post(&format!("/api/sessions/{id}/scope"), json!({"hosts": ["api.example.test", "cdn.example.test"]}))
+            .await;
+        assert_eq!(s, 202);
+
+        // Auth + Origin CSRF guards on both revoke and panic endpoints.
+        for (method, path, body) in [
+            (Method::POST, format!("/api/sessions/{id}/scope/revoke"), json!({"hosts": ["api.example.test"]})),
+            (Method::POST, "/api/panic".to_string(), json!({"reason": "drill"})),
+        ] {
+            let r_unauth = e.http.request(method.clone(), e.url(&path)).json(&body).send().await.unwrap();
+            assert_eq!(r_unauth.status().as_u16(), 401, "{method} {path}");
+            let r_csrf =
+                e.rq(method.clone(), &path).header("Origin", "http://evil.example").json(&body).send().await.unwrap();
+            assert_eq!(r_csrf.status().as_u16(), 403, "{method} {path}");
+        }
+
+        // POST /api/sessions/{id}/scope/revoke returns 200 ScopeRevokeReceipt.
+        let (s, b) = e
+            .post(
+                &format!("/api/sessions/{id}/scope/revoke"),
+                json!({"hosts": ["api.example.test"], "note": "finished"}),
+            )
+            .await;
+        assert_eq!(s, 200, "{b}");
+        assert_eq!(b["revoked"], json!(["api.example.test"]));
+        assert!(b["connections_cut"].is_u64());
+
+        // One route revokes: `DELETE /api/sessions/{id}/scope` is not a second one; the host is revoked by the route.
+        let r_del = e
+            .rq(Method::DELETE, &format!("/api/sessions/{id}/scope"))
+            .json(&json!({"hosts": ["cdn.example.test"]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_del.status().as_u16(), 405);
+        let (s, b) = e.post(&format!("/api/sessions/{id}/scope/revoke"), json!({"hosts": ["cdn.example.test"]})).await;
+        assert_eq!(s, 200, "{b}");
+        assert_eq!(b["revoked"], json!(["cdn.example.test"]));
+
+        // Error mapping: unknown session -> 404, empty/bad hosts -> 409, unknown field -> 400.
+        let (s, _) = e.post("/api/sessions/s-nope/scope/revoke", json!({"hosts": ["a.test"]})).await;
+        assert_eq!(s, 404);
+        let (s, _) = e.post(&format!("/api/sessions/{id}/scope/revoke"), json!({"hosts": []})).await;
+        assert_eq!(s, 409);
+        let (s, _) =
+            e.post(&format!("/api/sessions/{id}/scope/revoke"), json!({"hosts": ["a.test"], "extra": true})).await;
+        assert_eq!(s, 400);
+
+        // POST /api/panic accepts empty body, JSON {}, or {"reason": "..."}, and rejects unknown fields.
+        let (s, _) = e.post("/api/panic", json!({"unknown": 1})).await;
+        assert_eq!(s, 400);
+        let r_empty = e.rq(Method::POST, "/api/panic").send().await.unwrap();
+        let (s, b_empty) = json_of(r_empty).await;
+        assert_eq!(s, 200, "{b_empty}");
+        assert!(b_empty["connections_cut"].is_u64());
+        assert!(b_empty["sessions_stopped"].is_array());
+        assert!(b_empty["boxes_torn_down"].is_u64());
+        assert!(b_empty["rewrites_disabled"].is_u64());
+
+        let (s, b_reason) = e.post("/api/panic", json!({"reason": "operator drill"})).await;
+        assert_eq!(s, 200, "{b_reason}");
+        assert!(b_reason["connections_cut"].is_u64());
+
         e.rt.shutdown().await;
     }
 }

@@ -4879,3 +4879,53 @@ test("app.js: embedded FerretDesk UA adds body.embedded-desk and lost() closes o
   assert.equal(nodes.get("auth-overlay").hidden, false);
   assert.equal(globalThis.document.title, "ferret · not signed in");
 });
+
+test("Wave A helpers: sanitized HAR/SARIF URLs, scope revocation, and panic kill-switch formatting", () => {
+  assert.equal(C.EXPORT_SANITIZED_NOTE, "Sanitized export — secrets redacted");
+  assert.equal(C.sarifUrl("m-1"), "/api/missions/m-1/sarif");
+  assert.equal(C.sarifUrl("m-1", { includeSecrets: true }), "/api/missions/m-1/sarif?sanitize=false");
+  assert.equal(C.harUrl("m-1"), "/api/missions/m-1/har");
+  assert.equal(C.harUrl("m-1", { host: "a.test", includeSecrets: true }), "/api/missions/m-1/har?host=a.test&sanitize=false");
+
+  assert.deepEqual(C.scopeRevokeRequest("s-1", [" api.test ", "cdn.test"], "done"), {
+    path: "/api/sessions/s-1/scope/revoke",
+    body: { hosts: ["api.test", "cdn.test"], note: "done" },
+  });
+  assert.deepEqual(C.scopeRevokeRequest("s/1", ["a.test"]), {
+    path: "/api/sessions/s%2F1/scope/revoke",
+    body: { hosts: ["a.test"] },
+  });
+  assert.deepEqual(C.scopeRevokeRequest("s-1", [" ", ""]), { error: "Name the hosts to revoke." });
+
+  assert.deepEqual(C.activeGrantedHosts({ scope: ["API.test", "cdn.test"] }, new Set(["api.test"])), [
+    { host: "API.test", revoked: true },
+    { host: "cdn.test", revoked: false },
+  ]);
+  assert.equal(
+    C.formatScopeRevoke({ lead: "s-1", revoked: ["api.test"], connections_cut: 2 }),
+    "Revoked api.test (2 connections cut).",
+  );
+  assert.equal(
+    C.formatScopeRevoke({ lead: "s-1", revoked: ["api.test"], connections_cut: 1 }),
+    "Revoked api.test (1 connection cut).",
+  );
+
+  assert.deepEqual(C.panicRequest(""), { path: "/api/panic", body: {} });
+  assert.deepEqual(C.panicRequest("  out of scope  "), { path: "/api/panic", body: { reason: "out of scope" } });
+  assert.equal(
+    C.formatPanicReport({ connections_cut: 3, sessions_stopped: ["s-1", "s-2"], boxes_torn_down: 1, rewrites_disabled: 4 }),
+    "Panic stop complete: 3 connections cut · 2 sessions stopped · 1 box torn down · 4 rewrite rules disabled.",
+  );
+  assert.equal(
+    C.formatPanicReport({ connections_cut: 0, sessions_stopped: [], boxes_torn_down: 0, rewrites_disabled: 0 }),
+    "Panic stop complete: 0 connections cut · 0 sessions stopped · 0 boxes torn down · 0 rewrite rules disabled.",
+  );
+  assert.equal(
+    C.formatPanicReport({ connections_cut: 1, sessions_stopped: ["s-1"], boxes_torn_down: 0, rewrites_disabled: 0, processes_killed: 2, processes_left: 1 }),
+    "Panic stop complete: 1 connection cut · 1 session stopped · 0 boxes torn down · 0 rewrite rules disabled · 2 processes left under the sandboxes stopped (1 could not be).",
+  );
+  assert.equal(
+    C.formatScopeRevoke({ lead: "s-1", revoked: ["a.test", "x.b.test"], not_granted: ["x.b.test"], connections_cut: 0 }),
+    "Revoked a.test, x.b.test (0 connections cut). Not granted by itself, refused from now on: x.b.test.",
+  );
+});

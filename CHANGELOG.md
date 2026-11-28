@@ -2,6 +2,53 @@
 
 ## Unreleased
 
+### Monitor and main (6be589b) together
+
+Main's Wave A built the scope revoke, the live cutoff and a kill-switch beside the monitor's floor (E1-E4); each is one
+implementation now, with both sides' guarantees.
+
+- **One scope revoke.** `Runtime::revoke_scope(session, hosts, reason)` is the one entry, `POST
+  /api/sessions/{id}/scope/revoke` (`{hosts, reason?}`, `note` accepted) the one route and `ferret scope revoke
+  <mission|session> <host>... [--reason <text>] [--json]` (`--note` the same flag) the one command; Signal's `/scope
+  revoke` and the web UI's Revoke button call it. The monitor's `POST /api/missions/{id}/scope/revoke` and main's
+  `DELETE /api/sessions/{id}/scope` are gone. From main: several hosts at once, any host, `*.suffix`, address or CIDR
+  block (a name under a wildcard grant, a host `mode open`, `network.allow` or the target's scope reaches), an optional
+  reason, the live cut and an audit note in the lead's log also when it is not running. From the monitor: a revoked
+  grant the ledger lists is recorded first (`ScopeRevoke`, `no reason given` without a reason); every entry is kept in
+  `<mission>/scope_revoked.json` and refused by every policy of the mission (`deny revoked …`), after a restart and
+  against a later wildcard grant, until the host is granted again; the policy is rebuilt for every session of the
+  mission, started or being started. A host that is no grant by itself is no longer refused: it is revoked without a
+  record. The receipt is `{lead, revoked, ledger, recorded, not_granted, sessions, connections_cut}`, answered `200`.
+  `Policy::with_revoked` is the one policy narrowing (main's `without_hosts` folded into it: it also takes out the
+  `allow` patterns, granted literals and target blocks an entry covers).
+- **One live cutoff.** Every way of ending a connection from outside uses the proxy's one registry (the monitor's
+  E4(a) `Shared::live`, now with the address each connection was opened to): `revoke` (it no longer leaves open
+  connections to finish), `revoke_hosts` (by name and by address: a CIDR revoke ends a tunnel opened by name),
+  `revoke_all`, `set_policy` (what the new policy refuses ends at once), `cut_hosts`, `cut`, `cut_sessions` and
+  `cut_mission`. A connection cut while it waits for pacing, resolves or connects stops at once and is answered `502`
+  with a refusal on record; a connection that authenticated before a session-wide cut or a `revoke_all` is ended when
+  it registers; once connected a connection is judged again by the session's current policy before it is recorded as
+  allowed. `Proxy::hold` (which cuts nothing) is what the monitor's hold-then-cut uses. `cut_mission` and
+  `revoke_scope` reach the mission's MCP servers' grants too.
+- **Panic reaches what only the census finds.** `ferret panic` / `POST /api/panic` / `/panic` / the Panic button
+  (main) now also stops, by sandbox identity, what the sessions left running under their sandboxes (E3), for every
+  known session: `PanicReport` gains `processes_killed` and `processes_left`, and the CLI, Signal and web UI lines say
+  them when there were any.
+- **One set of Mach rules.** E2's default-deny of `mach-lookup` and its fetch-service deny in every network mode stay
+  (main's `deny_all`/`allowlist`-only flag and `Sandbox::with_network_mode` are gone: the monitor's rule denies more);
+  main's keychain and pasteboard deny under `sandbox.protect_credentials` is kept, with `com.apple.pasteboard.1` (what
+  `pbpaste` looks up), after the allows, so `sandbox.mach_allow` cannot open them while credentials are protected.
+- **MCP servers' grants are under the floor.** Main's per-server isolated proxy grants (P0-7) get the infrastructure
+  deny (E1) and the mission's revoked hosts like a session's grant; their net records, floor events and lab-listener
+  checks are the owning session's; a stdio server's sandbox carries the session's identity for the census.
+- **The box's `INPUT` drop and the counters.** Main's unconditional `INPUT -i fb-+ -j DROP` and `FERRET-ALL6` stand; the
+  box counters still read the mission's chain (every forwarded packet), and a packet from a box to the Docker host
+  itself is dropped before any mission chain, so it is no longer counted per mission.
+- **Bidirectional controls.** The tripwires' normalization strips the bidi set of main's untrusted-output sanitizer
+  (`U+061C` added), so a bidi-smuggled `<harness` tag still raises TW-27; TW-26 still reads a write of `AGENTS.md` or
+  `CLAUDE.md` as S1 although main keeps them out of the security packs' prompts by default (a workspace is not tied to
+  a pack).
+
 ### Monitor and main (da5d310, the ferret rebrand) together
 
 - **The monitor is named as ferret is.** Its modules are in the ferret crates (`ferret_agent::monitor`, `census`,

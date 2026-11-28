@@ -40,6 +40,7 @@ const IO_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_SCAN_UIDS: usize = 120;
 const MAX_BODY_CHARS: usize = 16 * 1024;
 const MAX_RAW_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_PASSWORD_FILE_BYTES: usize = 4 * 1024;
 const MAX_LINKS: usize = 25;
 const MAX_CODES: usize = 10;
 
@@ -372,7 +373,7 @@ pub fn evaluate_policy(
         return None;
     }
 
-    let auth_pass = auth_results_pass(headers);
+    let auth_pass = auth_results_pass_for(headers, cfg.authserv_id.as_deref());
     if cfg.require_auth_pass && !auth_pass {
         return None;
     }
@@ -555,11 +556,277 @@ pub fn recipient_allowed(addrs: &[String], patterns: &[String]) -> bool {
     addrs.iter().any(|a| patterns.iter().any(|p| addr_matches_pattern(a, p)))
 }
 
-/// True when any `Authentication-Results` header reports `dkim=pass` or `spf=pass` as a standalone token.
+/// True when the topmost `Authentication-Results` header passes DMARC or aligned DKIM for every `From:`
+/// domain (with no pinned `authserv-id`). Use [`auth_results_pass_for`] to enforce a pinned MTA `authserv-id`.
 pub fn auth_results_pass(headers: &[(String, String)]) -> bool {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| Regex::new(r"(?i)(?:^|[\s;(])(?:dkim|spf)=pass(?:$|[\s;)])").unwrap());
-    header_values(headers, "authentication-results").iter().any(|v| re.is_match(v))
+    auth_results_pass_for(headers, None)
+}
+
+/// Evaluate RFC 8601 `Authentication-Results` strictly against spoofing:
+/// 1. Inspect ONLY the topmost `Authentication-Results` header (so forged lower headers injected by the
+///    sender are ignored).
+/// 2. Strip RFC 5322 comments `(...)` before parsing so comment-smuggling like `(dmarc=pass)` cannot match.
+/// 3. Enforce `pinned_authserv_id` when configured (trimmed, case-insensitive, trailing `.` ignored).
+/// 4. Require `dmarc=pass` (with `header.from` aligned to `From:` when present) OR aligned `dkim=pass`
+///    whose `header.d` (or Gmail `header.i=@domain` fallback) shares the organizational domain of every
+///    `From:` address. Bare `spf=pass` or attacker-domain DKIM never satisfies `From:` authentication.
+pub fn auth_results_pass_for(headers: &[(String, String)], pinned_authserv_id: Option<&str>) -> bool {
+    let Some(top) = header_first(headers, "authentication-results") else {
+        return false;
+    };
+    let from_vals = header_values(headers, "from");
+    let mut from_domains: Vec<String> = Vec::new();
+    for v in &from_vals {
+        for addr in extract_email_addresses(v) {
+            if let Some((_, dom)) = addr.split_once('@') {
+                if !from_domains.iter().any(|d| d == dom) {
+                    from_domains.push(dom.to_string());
+                }
+            }
+        }
+    }
+    if from_domains.is_empty() {
+        return false;
+    }
+
+    let cleaned = strip_rfc5322_comments(&top);
+    let clauses = split_unquoted(&cleaned, ';');
+    let Some(first) = clauses.first() else {
+        return false;
+    };
+    let authserv = first
+        .split_whitespace()
+        .next()
+        .map(|t| t.trim_matches('"').trim_end_matches('.').to_ascii_lowercase())
+        .unwrap_or_default();
+    if authserv.is_empty() {
+        return false;
+    }
+    if let Some(pin) = pinned_authserv_id.map(str::trim).filter(|s| !s.is_empty()) {
+        let want = pin.trim_end_matches('.').to_ascii_lowercase();
+        if authserv != want {
+            return false;
+        }
+    }
+
+    for clause in clauses.iter().skip(1) {
+        let Some(AuthresClause { method, result, props }) = parse_authres_clause(clause) else {
+            continue;
+        };
+        if method == "dmarc" && result == "pass" {
+            if let Some(hf) = props.iter().find(|(k, _)| k == "header.from").map(|(_, v)| v.as_str()) {
+                if from_domains.iter().all(|fd| domains_aligned(hf, fd)) {
+                    return true;
+                }
+            } else {
+                return true;
+            }
+        } else if method == "dkim" && result == "pass" {
+            let signing_domain = props.iter().find(|(k, _)| k == "header.d").map(|(_, v)| v.as_str()).or_else(|| {
+                props.iter().find(|(k, _)| k == "header.i").and_then(|(_, v)| v.rsplit_once('@').map(|(_, d)| d))
+            });
+            if let Some(sd) = signing_domain {
+                if from_domains.iter().all(|fd| domains_aligned(sd, fd)) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Remove RFC 5322 `(...)` comments while keeping `"..."` quoted strings intact so `header.d="example.com"`
+/// parses cleanly while `(dmarc=pass)` comments are stripped.
+fn strip_rfc5322_comments(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    let mut in_quote = false;
+    let mut comment_depth = 0usize;
+    while let Some(c) = chars.next() {
+        if in_quote {
+            out.push(c);
+            if c == '\\' {
+                if let Some(esc) = chars.next() {
+                    out.push(esc);
+                }
+            } else if c == '"' {
+                in_quote = false;
+            }
+            continue;
+        }
+        if comment_depth > 0 {
+            if c == '\\' {
+                let _ = chars.next();
+            } else if c == '(' {
+                comment_depth += 1;
+            } else if c == ')' {
+                comment_depth -= 1;
+                if comment_depth == 0 {
+                    out.push(' ');
+                }
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_quote = true;
+                out.push(c);
+            }
+            '(' => comment_depth = 1,
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+fn split_unquoted(input: &str, delim: char) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut chars = input.chars();
+    let mut in_quote = false;
+    while let Some(c) = chars.next() {
+        if in_quote {
+            cur.push(c);
+            if c == '\\' {
+                if let Some(esc) = chars.next() {
+                    cur.push(esc);
+                }
+            } else if c == '"' {
+                in_quote = false;
+            }
+            continue;
+        }
+        if c == '"' {
+            in_quote = true;
+            cur.push(c);
+        } else if c == delim {
+            out.push(std::mem::take(&mut cur));
+        } else {
+            cur.push(c);
+        }
+    }
+    out.push(cur);
+    out
+}
+
+struct AuthresClause {
+    method: String,
+    result: String,
+    props: Vec<(String, String)>,
+}
+
+/// Tokenize one RFC 8601 `resinfo` clause into `(method, result, props)`.
+fn parse_authres_clause(clause: &str) -> Option<AuthresClause> {
+    // Parse `key = value` pairs allowing optional whitespace around `=` and quoted values.
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    let bytes = clause.as_bytes();
+    let mut i = 0;
+    let skip_ws = |idx: &mut usize| {
+        while *idx < bytes.len() && bytes[*idx].is_ascii_whitespace() {
+            *idx += 1;
+        }
+    };
+    let read_val = |idx: &mut usize| -> String {
+        skip_ws(idx);
+        if *idx < bytes.len() && bytes[*idx] == b'"' {
+            *idx += 1;
+            let mut val = String::new();
+            while *idx < bytes.len() {
+                let b = bytes[*idx];
+                *idx += 1;
+                if b == b'\\' && *idx < bytes.len() {
+                    val.push(bytes[*idx] as char);
+                    *idx += 1;
+                } else if b == b'"' {
+                    break;
+                } else {
+                    val.push(b as char);
+                }
+            }
+            val
+        } else {
+            let start = *idx;
+            while *idx < bytes.len() && !bytes[*idx].is_ascii_whitespace() {
+                *idx += 1;
+            }
+            clause[start..*idx].to_string()
+        }
+    };
+    while i < bytes.len() {
+        skip_ws(&mut i);
+        if i >= bytes.len() {
+            break;
+        }
+        let key_start = i;
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'=' {
+            i += 1;
+        }
+        let key = clause[key_start..i].to_ascii_lowercase();
+        skip_ws(&mut i);
+        if i < bytes.len() && bytes[i] == b'=' {
+            i += 1;
+            let val = read_val(&mut i);
+            if !key.is_empty() && !val.is_empty() {
+                pairs.push((key, val));
+            }
+        }
+    }
+    let mut iter = pairs.into_iter();
+    let (method, result) = iter.next()?;
+    // RFC 8601 method may carry `/version` (e.g. `dkim/1=pass`).
+    let method_base = method.split('/').next().unwrap_or(&method).to_string();
+    Some(AuthresClause { method: method_base, result: result.to_ascii_lowercase(), props: iter.collect() })
+}
+
+/// Extract the organizational domain (RFC 7489 relaxed alignment), rejecting bare public suffixes and
+/// guarding common two-level ccTLD and multi-tenant hosting suffixes (`co.uk`, `com.au`, `github.io`, …).
+fn organizational_domain(raw: &str) -> Option<String> {
+    let dom = raw.trim().trim_matches('"').trim_start_matches('@').trim_end_matches('.').to_ascii_lowercase();
+    if dom.is_empty() || !dom.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.')) {
+        return None;
+    }
+    let labels: Vec<&str> = dom.split('.').collect();
+    if labels.len() < 2 || labels.iter().any(|l| l.is_empty()) {
+        return None;
+    }
+    let last2 = format!("{}.{}", labels[labels.len() - 2], labels[labels.len() - 1]);
+    let tld = labels[labels.len() - 1];
+    let sld = labels[labels.len() - 2];
+    const CCTLD_SLDS: &[&str] = &[
+        "co", "com", "net", "org", "gov", "edu", "ac", "mil", "go", "ne", "or", "sch", "ltd", "plc", "me", "nom",
+        "gob", "gouv", "gv", "lg", "ed", "gr", "ad",
+    ];
+    const MULTI_TENANT_2L: &[&str] = &[
+        "github.io",
+        "pages.dev",
+        "appspot.com",
+        "amazonaws.com",
+        "cloudfront.net",
+        "azurewebsites.net",
+        "herokuapp.com",
+        "vercel.app",
+        "netlify.app",
+        "workers.dev",
+        "firebaseapp.com",
+        "web.app",
+    ];
+    let is_two_level_suffix =
+        (tld.len() == 2 && CCTLD_SLDS.contains(&sld)) || MULTI_TENANT_2L.contains(&last2.as_str());
+    if is_two_level_suffix {
+        if labels.len() < 3 {
+            return None;
+        }
+        Some(format!("{}.{last2}", labels[labels.len() - 3]))
+    } else {
+        Some(last2)
+    }
+}
+
+fn domains_aligned(a: &str, b: &str) -> bool {
+    let (Some(oa), Some(ob)) = (organizational_domain(a), organizational_domain(b)) else {
+        return false;
+    };
+    oa == ob
 }
 
 // =============================================================================
@@ -891,29 +1158,11 @@ fn expand_tilde(path: &str) -> PathBuf {
     PathBuf::from(trimmed)
 }
 
-/// Read an IMAP password or OAuth2 bearer token from a private (`0600`) file.
+/// Read an IMAP password or OAuth2 bearer token from a private (`0600`, owner UID, regular file,
+/// `O_NOFOLLOW`, <= 4 KiB) file.
 pub fn read_password_file(path: &str) -> Result<String, String> {
     let p = expand_tilde(path);
-    let meta =
-        std::fs::metadata(&p).map_err(|e| format!("Could not read mail.password_file `{}`: {e}", p.display()))?;
-    if !meta.is_file() {
-        return Err(format!("mail.password_file `{}` must be a regular file.", p.display()));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = meta.permissions().mode() & 0o777;
-        if mode & 0o077 != 0 {
-            return Err(format!(
-                "mail.password_file `{}` has permissions {:04o}; make it owner-only first (`chmod 600 {}`).",
-                p.display(),
-                mode,
-                p.display()
-            ));
-        }
-    }
-    let raw =
-        std::fs::read_to_string(&p).map_err(|e| format!("Could not read mail.password_file `{}`: {e}", p.display()))?;
+    let raw = crate::mcp::read_private_secret_file(&p, "mail.password_file", MAX_PASSWORD_FILE_BYTES)?;
     let secret = raw.trim_end_matches(&['\r', '\n'][..]).to_string();
     if secret.is_empty() {
         return Err(format!("mail.password_file `{}` is empty.", p.display()));
@@ -1298,11 +1547,14 @@ mod tests {
 
     #[test]
     fn auth_results_and_dates_and_rfc2047() {
-        let ok = vec![(
-            "Authentication-Results".into(),
-            "mx.google.com; dkim=pass header.i=@hackerone.com; spf=pass".into(),
-        )];
-        let fail = vec![("Authentication-Results".into(), "mx.google.com; dkim=fail; spf=softfail".into())];
+        let ok = vec![
+            ("From".into(), "no-reply@hackerone.com".into()),
+            ("Authentication-Results".into(), "mx.google.com; dkim=pass header.i=@hackerone.com; spf=pass".into()),
+        ];
+        let fail = vec![
+            ("From".into(), "no-reply@hackerone.com".into()),
+            ("Authentication-Results".into(), "mx.google.com; dkim=fail; spf=softfail".into()),
+        ];
         assert!(auth_results_pass(&ok));
         assert!(!auth_results_pass(&fail));
 
@@ -1313,6 +1565,126 @@ mod tests {
 
         assert_eq!(decode_rfc2047("=?UTF-8?B?QWN0aXZhdGUgeW91ciBhY2NvdW50?="), "Activate your account");
         assert_eq!(decode_rfc2047("=?UTF-8?Q?Verify_your_email=3A_123456?="), "Verify your email: 123456");
+    }
+
+    #[test]
+    fn auth_results_rejects_spoofing_forged_lower_headers_unaligned_dkim_and_wrong_authserv() {
+        // 1. Attacker passes SPF/DKIM on their own domain while spoofing From: no-reply@hackerone.com.
+        let spoofed = vec![
+            ("From".into(), "no-reply@hackerone.com".into()),
+            (
+                "Authentication-Results".into(),
+                "mx.google.com; dkim=pass header.d=attacker.test; spf=pass smtp.mailfrom=bounce@attacker.test".into(),
+            ),
+        ];
+        assert!(!auth_results_pass(&spoofed), "attacker-domain DKIM/SPF must not authenticate hackerone.com");
+
+        // 2. Bare spf=pass or bare dkim=pass (no header.d / header.i) is refused.
+        let bare_spf = vec![
+            ("From".into(), "no-reply@hackerone.com".into()),
+            ("Authentication-Results".into(), "mx.google.com; spf=pass".into()),
+        ];
+        let bare_dkim = vec![
+            ("From".into(), "no-reply@hackerone.com".into()),
+            ("Authentication-Results".into(), "mx.google.com; dkim=pass".into()),
+        ];
+        assert!(!auth_results_pass(&bare_spf));
+        assert!(!auth_results_pass(&bare_dkim));
+
+        // 3. Only the topmost Authentication-Results header is inspected (forged lower header ignored).
+        let forged_lower = vec![
+            ("From".into(), "no-reply@hackerone.com".into()),
+            ("Authentication-Results".into(), "mx.google.com; dkim=fail; dmarc=fail".into()),
+            ("Authentication-Results".into(), "mx.google.com; dmarc=pass; dkim=pass header.d=hackerone.com".into()),
+        ];
+        assert!(!auth_results_pass(&forged_lower));
+
+        // 4. Pinned authserv-id is strictly enforced when configured.
+        let valid_dmarc = vec![
+            ("From".into(), "no-reply@hackerone.com".into()),
+            ("Authentication-Results".into(), "mx.google.com; dmarc=pass (p=REJECT) header.from=hackerone.com".into()),
+        ];
+        assert!(auth_results_pass_for(&valid_dmarc, Some("mx.google.com")));
+        assert!(auth_results_pass_for(&valid_dmarc, Some("MX.GOOGLE.COM.")));
+        assert!(!auth_results_pass_for(&valid_dmarc, Some("mail.fastmail.com")));
+
+        // 5. Aligned DKIM (exact domain, subdomain, and Gmail header.i=@domain) passes.
+        let aligned_sub = vec![
+            ("From".into(), "no-reply@mail.hackerone.com".into()),
+            ("Authentication-Results".into(), "mx.google.com; dkim=pass header.d=hackerone.com".into()),
+        ];
+        assert!(auth_results_pass_for(&aligned_sub, Some("mx.google.com")));
+
+        // 6. Comment smuggling `(dmarc=pass)` is stripped before parsing.
+        let comment_smuggle = vec![
+            ("From".into(), "no-reply@hackerone.com".into()),
+            ("Authentication-Results".into(), "mx.google.com (dmarc=pass); dkim=fail".into()),
+        ];
+        assert!(!auth_results_pass(&comment_smuggle));
+
+        // 7. Multi-label public suffix spoofing (`evil.co.uk` vs `target.co.uk`) is rejected.
+        let psl_spoof = vec![
+            ("From".into(), "alerts@target.co.uk".into()),
+            ("Authentication-Results".into(), "mx.google.com; dkim=pass header.d=evil.co.uk".into()),
+        ];
+        assert!(!auth_results_pass(&psl_spoof));
+        let psl_ok = vec![
+            ("From".into(), "alerts@mail.target.co.uk".into()),
+            ("Authentication-Results".into(), "mx.google.com; dkim=pass header.d=target.co.uk".into()),
+        ];
+        assert!(auth_results_pass(&psl_ok));
+
+        // 8. Misaligned header.from on dmarc=pass is rejected.
+        let bad_dmarc_from = vec![
+            ("From".into(), "no-reply@hackerone.com".into()),
+            ("Authentication-Results".into(), "mx.google.com; dmarc=pass header.from=evil.test".into()),
+        ];
+        assert!(!auth_results_pass(&bad_dmarc_from));
+
+        // 9. evaluate_policy enforces cfg.authserv_id when set.
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = test_cfg(dir.path());
+        cfg.authserv_id = Some("mx.trusted.example".into());
+        let mut headers = valid_dmarc.clone();
+        headers.push(("To".into(), "me+bb-h1@gmail.com".into()));
+        assert!(evaluate_policy(&cfg, "id-1", &headers, Some(100), 100).is_none());
+        cfg.authserv_id = Some("mx.google.com".into());
+        assert!(evaluate_policy(&cfg, "id-1", &headers, Some(100), 100).is_some());
+    }
+
+    #[test]
+    fn password_file_enforces_0600_no_symlink_regular_file_and_4kib_cap() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+
+        let good = dir.path().join("pw.txt");
+        std::fs::write(&good, "app-password-xyz\r\n").unwrap();
+        std::fs::set_permissions(&good, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(read_password_file(&good.display().to_string()).unwrap(), "app-password-xyz");
+
+        let loose = dir.path().join("loose.txt");
+        std::fs::write(&loose, "pw").unwrap();
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_password_file(&loose.display().to_string()).unwrap_err().contains("permissions 0644"));
+
+        let link = dir.path().join("pw.link");
+        symlink(&good, &link).unwrap();
+        assert!(read_password_file(&link.display().to_string()).unwrap_err().contains("symlink"));
+
+        let sub = dir.path().join("dir");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(read_password_file(&sub.display().to_string()).unwrap_err().contains("regular file"));
+
+        let big = dir.path().join("big.txt");
+        std::fs::write(&big, vec![b'a'; MAX_PASSWORD_FILE_BYTES + 1]).unwrap();
+        std::fs::set_permissions(&big, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(read_password_file(&big.display().to_string()).unwrap_err().contains("cap"));
+
+        let empty = dir.path().join("empty.txt");
+        std::fs::write(&empty, "\n").unwrap();
+        std::fs::set_permissions(&empty, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(read_password_file(&empty.display().to_string()).unwrap_err().contains("empty"));
     }
 
     #[tokio::test]

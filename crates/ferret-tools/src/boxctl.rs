@@ -187,12 +187,142 @@ pub const RULES_RETRY_DELAY: Duration = Duration::from_secs(2);
 pub const BOX_CLOSED: &str = "The box of this mission was removed when the mission was stopped. It comes back when the operator resumes the mission.";
 /// The `PATH` of every process this module starts on this machine: fixed system directories, all absolute.
 pub const SYSTEM_PATH: &str = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
-/// The static chain that every box bridge (`fb-+`) is sent to first; it ends with `DROP`.
+/// The static chain that every box bridge (`fb-+`) is sent to from `DOCKER-USER`; it ends with `DROP`.
 pub const ALL_CHAIN: &str = "FERRET-ALL";
+/// The static IPv6 catch-all chain that drops all traffic entering on any `fb-+` bridge in `INPUT` and `FORWARD`.
+pub const ALL_CHAIN6: &str = "FERRET-ALL6";
+/// The bounded, non-executable `/dev/shm` tmpfs mount passed to `docker run`.
+pub const SHM_TMPFS: &str = "/dev/shm:rw,noexec,nosuid,nodev,size=64m";
 /// The directory (under `<ferret home>/keys`) that is `HOME` and `DOCKER_CONFIG` of the docker client: empty.
 const DOCKER_DIR: &str = "box-docker";
 /// The directory (under `<ferret home>/keys`) the launcher processes start in.
 const RUN_DIR: &str = "box-run";
+/// The hardened OCI/Docker seccomp profile written under `<ferret home>/keys` and sent by the CLI host.
+const SECCOMP_FILE: &str = "box-seccomp.json";
+
+/// Hardened default-deny OCI/Docker seccomp profile for `[box]` containers (x86_64 & aarch64).
+///
+/// Explicitly excludes container-escape and high-risk kernel attack surface syscalls:
+/// `io_uring_*`, `userfaultfd`, `bpf`, `keyctl`/`add_key`/`request_key`, `ptrace`,
+/// `process_vm_readv`/`process_vm_writev`, `unshare`, `setns`, `mount*`/`umount*`/`pivot_root`/`chroot`,
+/// `init_module`/`finit_module`/`delete_module`, `kexec_*`, `reboot`, `swapon`/`swapoff`, `syslog`,
+/// `perf_event_open`, `open_by_handle_at`, `acct`, `adjtimex`/`settimeofday`/`clock_settime`, `vmsplice`,
+/// namespace-creating `clone` flags, and `personality` ASLR-disabling flags.
+/// `clone3` returns `ENOSYS` (38) so glibc falls back cleanly to the flag-filtered `clone`.
+pub const BOX_SECCOMP_PROFILE: &str = r#"{
+  "defaultAction": "SCMP_ACT_ERRNO",
+  "defaultErrnoRet": 1,
+  "archMap": [
+    {
+      "architecture": "SCMP_ARCH_X86_64",
+      "subArchitectures": ["SCMP_ARCH_X86", "SCMP_ARCH_X32"]
+    },
+    {
+      "architecture": "SCMP_ARCH_AARCH64",
+      "subArchitectures": ["SCMP_ARCH_ARM"]
+    }
+  ],
+  "syscalls": [
+    {
+      "names": [
+        "accept", "accept4", "access", "alarm", "arch_prctl",
+        "bind", "brk",
+        "capget", "capset", "chdir", "chmod", "chown", "chown32",
+        "clock_getres", "clock_getres_time64", "clock_gettime", "clock_gettime64",
+        "clock_nanosleep", "clock_nanosleep_time64", "close", "close_range",
+        "connect", "copy_file_range", "creat",
+        "dup", "dup2", "dup3",
+        "epoll_create", "epoll_create1", "epoll_ctl", "epoll_ctl_old",
+        "epoll_pwait", "epoll_pwait2", "epoll_wait", "epoll_wait_old",
+        "eventfd", "eventfd2", "execve", "execveat", "exit", "exit_group",
+        "faccessat", "faccessat2", "fadvise64", "fadvise64_64", "fallocate",
+        "fchdir", "fchmod", "fchmodat", "fchmodat2", "fchown", "fchown32", "fchownat",
+        "fcntl", "fcntl64", "fdatasync", "fgetxattr", "flistxattr", "flock", "fork",
+        "fremovexattr", "fsetxattr", "fstat", "fstat64", "fstatat64", "fstatfs", "fstatfs64",
+        "fsync", "ftruncate", "ftruncate64", "futex", "futex_time64", "futex_waitv", "futimesat",
+        "getcpu", "getcwd", "getdents", "getdents64", "getegid", "getegid32",
+        "geteuid", "geteuid32", "getgid", "getgid32", "getgroups", "getgroups32",
+        "getitimer", "getpeername", "getpgid", "getpgrp", "getpid", "getppid",
+        "getpriority", "getrandom", "getresgid", "getresgid32", "getresuid", "getresuid32",
+        "getrlimit", "get_robust_list", "getrusage", "getsid", "getsockname", "getsockopt",
+        "get_thread_area", "gettid", "gettimeofday", "getuid", "getuid32", "getxattr",
+        "inotify_add_watch", "inotify_init", "inotify_init1", "inotify_rm_watch",
+        "io_cancel", "ioctl", "io_destroy", "io_getevents", "io_pgetevents", "io_pgetevents_time64",
+        "ioprio_get", "ioprio_set", "io_setup", "io_submit",
+        "kill",
+        "landlock_add_rule", "landlock_create_ruleset", "landlock_restrict_self",
+        "lchown", "lchown32", "lgetxattr", "link", "linkat", "listen", "listxattr",
+        "llistxattr", "_llseek", "lremovexattr", "lseek", "lsetxattr", "lstat", "lstat64",
+        "madvise", "membarrier", "memfd_create", "memfd_secret", "mincore",
+        "mkdir", "mkdirat", "mknod", "mknodat", "mlock", "mlock2", "mlockall",
+        "mmap", "mmap2", "mprotect", "mq_getsetattr", "mq_notify", "mq_open",
+        "mq_timedreceive", "mq_timedreceive_time64", "mq_timedsend", "mq_timedsend_time64",
+        "mq_unlink", "mremap", "msgctl", "msgget", "msgrcv", "msgsnd", "msync",
+        "munlock", "munlockall", "munmap",
+        "nanosleep", "newfstatat", "_newselect",
+        "open", "openat", "openat2",
+        "pause", "pidfd_open", "pidfd_send_signal", "pipe", "pipe2", "poll",
+        "ppoll", "ppoll_time64", "prctl", "pread64", "preadv", "preadv2", "prlimit64",
+        "pselect6", "pselect6_time64", "pwrite64", "pwritev", "pwritev2",
+        "read", "readahead", "readlink", "readlinkat", "readv", "recv", "recvfrom",
+        "recvmmsg", "recvmmsg_time64", "recvmsg", "remap_file_pages", "removexattr",
+        "rename", "renameat", "renameat2", "restart_syscall", "rmdir", "rseq",
+        "rt_sigaction", "rt_sigpending", "rt_sigprocmask", "rt_sigqueueinfo",
+        "rt_sigreturn", "rt_sigsuspend", "rt_sigtimedwait", "rt_sigtimedwait_time64",
+        "rt_tgsigqueueinfo",
+        "sched_getaffinity", "sched_getattr", "sched_getparam", "sched_get_priority_max",
+        "sched_get_priority_min", "sched_getscheduler", "sched_rr_get_interval",
+        "sched_rr_get_interval_time64", "sched_setaffinity", "sched_setattr",
+        "sched_setparam", "sched_setscheduler", "sched_yield", "seccomp", "select",
+        "semctl", "semget", "semop", "semtimedop", "semtimedop_time64", "send",
+        "sendfile", "sendfile64", "sendmmsg", "sendmsg", "sendto", "setfsgid", "setfsgid32",
+        "setfsuid", "setfsuid32", "setgid", "setgid32", "setgroups", "setgroups32",
+        "setitimer", "setpgid", "setpriority", "setregid", "setregid32", "setresgid",
+        "setresgid32", "setresuid", "setresuid32", "setreuid", "setreuid32", "setrlimit",
+        "set_robust_list", "setsid", "setsockopt", "set_thread_area", "set_tid_address",
+        "setuid", "setuid32", "setxattr", "shmat", "shmctl", "shmdt", "shmget", "shutdown",
+        "sigaltstack", "signalfd", "signalfd4", "sigprocmask", "sigreturn", "socket",
+        "socketcall", "socketpair", "splice", "stat", "stat64", "statfs", "statfs64",
+        "statx", "symlink", "symlinkat", "sync", "sync_file_range", "syncfs", "sysinfo",
+        "tee", "tgkill", "time", "timer_create", "timer_delete", "timer_getoverrun",
+        "timer_gettime", "timer_gettime64", "timer_settime", "timer_settime64",
+        "timerfd_create", "timerfd_gettime", "timerfd_gettime64", "timerfd_settime",
+        "timerfd_settime64", "times", "tkill", "truncate", "truncate64",
+        "ugetrlimit", "umask", "uname", "unlink", "unlinkat", "utime", "utimensat",
+        "utimensat_time64", "utimes",
+        "vfork", "wait4", "waitid", "waitpid", "write", "writev"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+    {
+      "names": ["clone"],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [
+        {
+          "index": 0,
+          "value": 2114060288,
+          "valueTwo": 0,
+          "op": "SCMP_CMP_MASKED_EQ"
+        }
+      ]
+    },
+    {
+      "names": ["clone3"],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 38
+    },
+    {
+      "names": ["personality"],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [{"index": 0, "value": 0, "op": "SCMP_CMP_EQ"}]
+    },
+    {
+      "names": ["personality"],
+      "action": "SCMP_ACT_ALLOW",
+      "args": [{"index": 0, "value": 4294967295, "op": "SCMP_CMP_EQ"}]
+    }
+  ]
+}"#;
 
 // ---- names ---------------------------------------------------------------------------------------
 
@@ -297,6 +427,18 @@ pub fn container_inspect_args(n: &Names) -> Vec<String> {
 /// addresses that passed the policy: each becomes one `--add-host name:ip`, from a validated name and an
 /// `Ipv4Addr`, so nothing in a grant can become a flag or a second value.
 pub fn run_args(cfg: &BoxCfg, n: &Names, home: &str, hosts: &Hosts) -> Vec<String> {
+    run_args_with_seccomp(cfg, n, home, hosts, None)
+}
+
+/// [`run_args`] with an explicit seccomp profile path read by the Docker CLI on the daemon host and sent in
+/// the container-create payload to the Docker daemon (works identically over SSH-forwarded remote sockets).
+pub fn run_args_with_seccomp(
+    cfg: &BoxCfg,
+    n: &Names,
+    home: &str,
+    hosts: &Hosts,
+    seccomp_profile: Option<&Path>,
+) -> Vec<String> {
     // `--init`: an init as PID 1 reaps the processes a stopped command leaves behind; without it they stay
     // zombies under `sleep` and count against `--pids-limit`.
     let mut a = strings(["run", "--detach", "--init", "--name"]);
@@ -317,6 +459,10 @@ pub fn run_args(cfg: &BoxCfg, n: &Names, home: &str, hosts: &Hosts) -> Vec<Strin
         a.push(cap);
     }
     a.extend(strings(["--security-opt", "no-new-privileges"]));
+    if let Some(profile) = seccomp_profile {
+        a.push("--security-opt".into());
+        a.push(format!("seccomp={}", profile.display()));
+    }
     a.extend(strings([
         "--sysctl",
         "net.ipv6.conf.all.disable_ipv6=1",
@@ -337,6 +483,8 @@ pub fn run_args(cfg: &BoxCfg, n: &Names, home: &str, hosts: &Hosts) -> Vec<Strin
     a.push(format!("/tmp:rw,exec,nosuid,nodev,size={}m,uid=1000,gid=1000,mode=1777", cfg.tmp_mb));
     a.push("--tmpfs".into());
     a.push(format!("{WORK}:rw,exec,nosuid,nodev,size={}m,uid=1000,gid=1000,mode=0755", cfg.work_mb));
+    a.push("--tmpfs".into());
+    a.push(SHM_TMPFS.into());
     a.extend(strings(["--user", BOX_USER, "--workdir", WORK, "--ipc", "private", "--restart", "no"]));
     a.extend(strings(["--entrypoint", "/bin/sleep", &cfg.image, "2147483647"]));
     a
@@ -465,27 +613,39 @@ pub fn network_ls_args(home: &str) -> Vec<String> {
 /// The script of the helper run that installs or replaces the mission's rules. `$1` is the mission's chain
 /// and `$2` its bridge interface; the chain's rules arrive on stdin ([`rules_text`]).
 ///
-/// The static chain `FERRET-ALL` is made first and ends with `DROP`; `DOCKER-USER` (forwarded packets) and
-/// `INPUT` (packets to the Docker host) send everything that enters on any `fb-` interface to it. The
-/// mission's own chain is installed by `iptables-restore --noflush` (a declared chain is replaced as one
+/// The static chain `FERRET-ALL` is made first and ends with `DROP`; `DOCKER-USER` (forwarded packets) sends
+/// everything that enters on any `fb-` interface to `FERRET-ALL`, while `INPUT` (packets destined to the
+/// Docker host itself) unconditionally `DROP`s all `-i fb-+` traffic (and strips any legacy `INPUT -> FERRET-ALL`
+/// jump) so containers can never reach Docker VM host services even when `allow_private` covers the VM's subnet.
+/// The mission's own chain is installed by `iptables-restore --noflush` (a declared chain is replaced as one
 /// step), and only then does `FERRET-ALL` get the mission's jump, inserted above its final `DROP`. A bridge
-/// without a jump of its own is therefore dropped, never routed or translated. IPv6 is dropped for the
-/// interface in `INPUT` and `FORWARD`. Every step can be repeated.
+/// without a jump of its own is therefore dropped, never routed or translated. Static IPv6 catch-all chain
+/// `FERRET-ALL6` drops all `-i fb-+` IPv6 traffic in `INPUT` and `FORWARD`, in addition to per-interface drops.
+/// Every step can be repeated.
 const RULES_APPLY: &str = ": ferret-rules-apply; \
 iptables -w 5 -N FERRET-ALL 2>/dev/null; \
 iptables -w 5 -C FERRET-ALL -j DROP 2>/dev/null || iptables -w 5 -A FERRET-ALL -j DROP || exit 1; \
-for c in DOCKER-USER INPUT; do iptables -w 5 -C \"$c\" -i 'fb-+' -j FERRET-ALL 2>/dev/null || iptables -w 5 -I \"$c\" 1 -i 'fb-+' -j FERRET-ALL || exit 1; done; \
+iptables -w 5 -C DOCKER-USER -i 'fb-+' -j FERRET-ALL 2>/dev/null || iptables -w 5 -I DOCKER-USER 1 -i 'fb-+' -j FERRET-ALL || exit 1; \
+while iptables -w 5 -D INPUT -i 'fb-+' -j FERRET-ALL 2>/dev/null; do :; done; \
+iptables -w 5 -C INPUT -i 'fb-+' -j DROP 2>/dev/null || iptables -w 5 -I INPUT 1 -i 'fb-+' -j DROP || exit 1; \
 iptables-restore -w 5 --noflush || exit 1; \
 iptables -w 5 -C FERRET-ALL -i \"$2\" -j \"$1\" 2>/dev/null || iptables -w 5 -I FERRET-ALL 1 -i \"$2\" -j \"$1\" || exit 1; \
+ip6tables -w 5 -N FERRET-ALL6 2>/dev/null; \
+ip6tables -w 5 -C FERRET-ALL6 -j DROP 2>/dev/null || ip6tables -w 5 -A FERRET-ALL6 -j DROP || exit 1; \
+for c in INPUT FORWARD; do ip6tables -w 5 -C \"$c\" -i 'fb-+' -j FERRET-ALL6 2>/dev/null || ip6tables -w 5 -I \"$c\" 1 -i 'fb-+' -j FERRET-ALL6 || exit 1; done; \
 for c in INPUT FORWARD; do ip6tables -w 5 -C \"$c\" -i \"$2\" -j DROP 2>/dev/null || ip6tables -w 5 -I \"$c\" 1 -i \"$2\" -j DROP || exit 1; done";
 /// The script that tells whether everything [`RULES_APPLY`] makes is still there (exit status 0).
 const RULES_CHECK: &str = ": ferret-rules-check; \
 iptables -w 5 -C FERRET-ALL -j DROP && \
-iptables -w 5 -C DOCKER-USER -i 'fb-+' -j FERRET-ALL && iptables -w 5 -C INPUT -i 'fb-+' -j FERRET-ALL && \
+iptables -w 5 -C DOCKER-USER -i 'fb-+' -j FERRET-ALL && \
+iptables -w 5 -C INPUT -i 'fb-+' -j DROP && \
+! iptables -w 5 -C INPUT -i 'fb-+' -j FERRET-ALL 2>/dev/null && \
 iptables -w 5 -C FERRET-ALL -i \"$2\" -j \"$1\" && iptables -w 5 -C \"$1\" -j DROP && \
+ip6tables -w 5 -C FERRET-ALL6 -j DROP && \
+ip6tables -w 5 -C INPUT -i 'fb-+' -j FERRET-ALL6 && ip6tables -w 5 -C FORWARD -i 'fb-+' -j FERRET-ALL6 && \
 ip6tables -w 5 -C INPUT -i \"$2\" -j DROP && ip6tables -w 5 -C FORWARD -i \"$2\" -j DROP";
-/// The script that removes the mission's jump from `FERRET-ALL`, its chain and its IPv6 drops. Nothing else:
-/// `FERRET-ALL` and its final `DROP` stay.
+/// The script that removes the mission's jump from `FERRET-ALL`, its chain and its per-interface IPv6 drops.
+/// Nothing else: `FERRET-ALL`, `INPUT -i fb-+ -j DROP`, and `FERRET-ALL6` stay.
 const RULES_REMOVE: &str = ": ferret-rules-remove; \
 while iptables -w 5 -D FERRET-ALL -i \"$2\" -j \"$1\" 2>/dev/null; do :; done; \
 iptables -w 5 -F \"$1\" 2>/dev/null; iptables -w 5 -X \"$1\" 2>/dev/null; \
@@ -853,6 +1013,8 @@ pub struct DockerHost {
     docker_dir: PathBuf,
     /// Where the launcher processes start: a directory of the daemon's own.
     run_dir: PathBuf,
+    /// Hardened seccomp JSON profile written under `<ferret home>/keys`, read by the CLI host.
+    seccomp_profile: PathBuf,
     forward: Mutex<Option<Forward>>,
     last_ssh_error: Arc<StdMutex<String>>,
     /// One lock per mission (by `Names::short`) that every change of its box takes (R1).
@@ -889,6 +1051,26 @@ fn resolve_program(name: &str, what: &str, search: &OsStr) -> Result<PathBuf, St
         .ok_or_else(|| format!("{what} `{name}` was not found on the daemon's PATH. Install it or give its full path."))
 }
 
+/// Atomically write [`BOX_SECCOMP_PROFILE`] as `0600` under `<ferret home>/keys`.
+fn write_seccomp_profile(keys: &Path) -> Result<PathBuf, String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let path = keys.join(SECCOMP_FILE);
+    let tmp = keys.join(format!(".{SECCOMP_FILE}.{}.{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed)));
+    let res = (|| -> std::io::Result<()> {
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
+        f.write_all(BOX_SECCOMP_PROFILE.as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, &path)
+    })();
+    if let Err(e) = res {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("The box seccomp profile {} cannot be written: {e}", path.display()));
+    }
+    Ok(path)
+}
+
 impl DockerHost {
     /// Prepare the connection (nothing is started yet). `ferret_home` is where `keys/box.sock` lives.
     pub fn new(cfg: &BoxCfg, ferret_home: &Path) -> Result<Arc<DockerHost>, String> {
@@ -919,10 +1101,11 @@ impl DockerHost {
         }
         let keys = ferret_home.join("keys");
         let (docker_dir, run_dir) = (keys.join(DOCKER_DIR), keys.join(RUN_DIR));
-        for dir in [&docker_dir, &run_dir] {
+        for dir in [&keys, &docker_dir, &run_dir] {
             ferret_core::config::ensure_private_dir(dir)
                 .map_err(|e| format!("The box's private directory {} cannot be made: {e}", dir.display()))?;
         }
+        let seccomp_profile = write_seccomp_profile(&keys)?;
         Ok(Arc::new(DockerHost {
             cfg: cfg.clone(),
             home: ferret_home.to_path_buf(),
@@ -931,12 +1114,18 @@ impl DockerHost {
             ssh_program,
             docker_dir,
             run_dir,
+            seccomp_profile,
             forward: Mutex::new(None),
             last_ssh_error: Arc::new(StdMutex::new(String::new())),
             locks: StdMutex::new(HashMap::new()),
             recheck_ms: AtomicU64::new(u64::try_from(RULES_RECHECK.as_millis()).unwrap_or(u64::MAX)),
             retry_ms: AtomicU64::new(u64::try_from(RULES_RETRY_DELAY.as_millis()).unwrap_or(u64::MAX)),
         }))
+    }
+
+    /// The path to the hardened seccomp JSON profile on the CLI host.
+    pub fn seccomp_profile(&self) -> &Path {
+        &self.seccomp_profile
     }
 
     /// The lock that serializes everything done to one mission's box: creating, resetting, re-ruling,
@@ -1544,7 +1733,17 @@ impl MissionBox {
         self.make_network().await?;
         // The container starts only once the rules that confine it are in place.
         self.install_rules(&plan).await?;
-        self.run_ok("Starting the box", run_args(&self.host.cfg, &self.names, &self.home, &plan.hosts)).await?;
+        self.run_ok(
+            "Starting the box",
+            run_args_with_seccomp(
+                &self.host.cfg,
+                &self.names,
+                &self.home,
+                &plan.hosts,
+                Some(self.host.seccomp_profile()),
+            ),
+        )
+        .await?;
         st.forget();
         st.up = true;
         st.created_hosts.clone_from(&plan.hosts);
@@ -1806,28 +2005,74 @@ fn inspect_container(json: &[u8], n: &Names, home: &str, cfg: &BoxCfg) -> Result
     if v.pointer("/Config/Image").and_then(serde_json::Value::as_str) != Some(cfg.image.as_str()) {
         return Ok(ContainerFound::Stale("its image changed".to_string()));
     }
+    if v.pointer("/Config/User").and_then(serde_json::Value::as_str) != Some(BOX_USER) {
+        return Ok(ContainerFound::Stale(format!("its user is not {BOX_USER}")));
+    }
     let nets = v.pointer("/NetworkSettings/Networks").and_then(serde_json::Value::as_object);
     if !nets.is_some_and(|m| m.len() == 1 && m.contains_key(&n.network)) {
         return Ok(ContainerFound::Stale(format!("its network is not {}", n.network)));
     }
-    if let Some(hc) = v.pointer("/HostConfig").and_then(serde_json::Value::as_object) {
-        if hc.get("Privileged").and_then(serde_json::Value::as_bool) == Some(true) {
-            return Ok(ContainerFound::Stale("it is privileged".to_string()));
+    let Some(hc) = v.pointer("/HostConfig").and_then(serde_json::Value::as_object) else {
+        return Ok(ContainerFound::Stale("its host config is missing".to_string()));
+    };
+    if hc.get("Privileged").and_then(serde_json::Value::as_bool) != Some(false) {
+        return Ok(ContainerFound::Stale("it is privileged".to_string()));
+    }
+    if hc.get("ReadonlyRootfs").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Ok(ContainerFound::Stale("its rootfs is not read-only".to_string()));
+    }
+    let sec_opts: Vec<&str> = match hc.get("SecurityOpt") {
+        Some(serde_json::Value::Array(arr)) => arr.iter().filter_map(serde_json::Value::as_str).collect(),
+        _ => return Ok(ContainerFound::Stale("its security options are missing".to_string())),
+    };
+    let has_no_new_privs = sec_opts.iter().any(|opt| {
+        let low = opt.trim().to_ascii_lowercase();
+        matches!(low.as_str(), "no-new-privileges" | "no-new-privileges:true" | "no-new-privileges=true")
+    });
+    if !has_no_new_privs {
+        return Ok(ContainerFound::Stale("it lacks no-new-privileges".to_string()));
+    }
+    let seccomp_unconfined = sec_opts.iter().any(|opt| {
+        let low = opt.trim().to_ascii_lowercase();
+        low == "seccomp=unconfined" || low == "seccomp:unconfined"
+    });
+    if seccomp_unconfined {
+        return Ok(ContainerFound::Stale("it disables seccomp".to_string()));
+    }
+    match hc.get("PidMode") {
+        None | Some(serde_json::Value::Null) => {}
+        Some(serde_json::Value::String(s)) if s.is_empty() => {}
+        _ => return Ok(ContainerFound::Stale("its pid namespace is not private".to_string())),
+    }
+    match hc.get("IpcMode") {
+        None | Some(serde_json::Value::Null) => {}
+        Some(serde_json::Value::String(s)) if s.is_empty() || s == "private" => {}
+        _ => return Ok(ContainerFound::Stale("its ipc namespace is not private".to_string())),
+    }
+    match hc.get("Binds") {
+        None | Some(serde_json::Value::Null) => {}
+        Some(serde_json::Value::Array(arr)) if arr.is_empty() => {}
+        _ => return Ok(ContainerFound::Stale("it has host bind mounts".to_string())),
+    }
+    let drops_all = match hc.get("CapDrop") {
+        Some(serde_json::Value::Array(arr)) => {
+            arr.iter().filter_map(serde_json::Value::as_str).map(normalize_cap).any(|c| c == "ALL")
         }
-        if hc.get("ReadonlyRootfs").and_then(serde_json::Value::as_bool) == Some(false) {
-            return Ok(ContainerFound::Stale("its rootfs is not read-only".to_string()));
+        _ => false,
+    };
+    if !drops_all {
+        return Ok(ContainerFound::Stale("it does not drop ALL capabilities".to_string()));
+    }
+    let got: BTreeSet<String> = match hc.get("CapAdd") {
+        None | Some(serde_json::Value::Null) => BTreeSet::new(),
+        Some(serde_json::Value::Array(arr)) => {
+            arr.iter().filter_map(serde_json::Value::as_str).map(normalize_cap).collect()
         }
-        if let Some(cap_val) = hc.get("CapAdd") {
-            let got: BTreeSet<String> = match cap_val {
-                serde_json::Value::Null => BTreeSet::new(),
-                serde_json::Value::Array(arr) => arr.iter().filter_map(|x| x.as_str()).map(normalize_cap).collect(),
-                _ => return Ok(ContainerFound::Stale("its capabilities could not be read".to_string())),
-            };
-            let want: BTreeSet<String> = cfg.caps().into_iter().collect();
-            if got != want {
-                return Ok(ContainerFound::Stale("its capabilities changed".to_string()));
-            }
-        }
+        Some(_) => return Ok(ContainerFound::Stale("its capabilities could not be read".to_string())),
+    };
+    let want: BTreeSet<String> = cfg.caps().into_iter().collect();
+    if got != want {
+        return Ok(ContainerFound::Stale("its capabilities changed".to_string()));
     }
     let paused = v.pointer("/State/Paused").and_then(serde_json::Value::as_bool).unwrap_or(false);
     Ok(ContainerFound::Ours { paused })
@@ -1988,26 +2233,33 @@ case "$sub" in
         touch "$D/chain-$chain"
         exit 0;;
     esac
-    name=""; net=""; h=""; m=""; img=""; caps=""; prev=""; after_ep=0
+    jesc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+    name=""; net=""; h=""; m=""; img=""; caps=""; drops=""; secopts=""; user=""; ipc=""; ro="false"; prev=""; after_ep=0
     for a in "$@"; do
       if [ "$after_ep" = "1" ]; then
         img="$a"; after_ep=2
       else
+        case "$a" in
+          --read-only) ro="true";;
+        esac
         case "$prev" in
           --name) name="$a";;
           --network) net="$a";;
+          --user) user="$a";;
+          --ipc) ipc="$a";;
           --label) case "$a" in ferret.home=*) h="${a#ferret.home=}";; ferret.mission=*) m="${a#ferret.mission=}";; esac;;
-          --cap-add) if [ -z "$caps" ]; then caps="\"$a\""; else caps="$caps,\"$a\""; fi;;
+          --cap-add) if [ -z "$caps" ]; then caps="\"$(jesc "$a")\""; else caps="$caps,\"$(jesc "$a")\""; fi;;
+          --cap-drop) if [ -z "$drops" ]; then drops="\"$(jesc "$a")\""; else drops="$drops,\"$(jesc "$a")\""; fi;;
+          --security-opt) if [ -z "$secopts" ]; then secopts="\"$(jesc "$a")\""; else secopts="$secopts,\"$(jesc "$a")\""; fi;;
           --entrypoint) after_ep=1;;
         esac
       fi
       prev="$a"
     done
-    jesc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
     # A container that starts while the chain of its bridge is not there is a hole: note it.
     if [ -f "$D/netif-$net" ]; then short=$(sed 's/^fb-//' "$D/netif-$net"); [ -f "$D/chain-FERRET-$short" ] || echo "$name" >> "$D/violations"; fi
     touch "$D/ctr-$name"
-    printf '{"State":{"Running":true,"Paused":false},"Config":{"Image":"%s","Labels":{"ferret.home":"%s","ferret.mission":"%s"}},"HostConfig":{"Privileged":false,"ReadonlyRootfs":true,"CapAdd":[%s]},"NetworkSettings":{"Networks":{"%s":{}}}}\n' "$(jesc "$img")" "$(jesc "$h")" "$(jesc "$m")" "$caps" "$(jesc "$net")" > "$D/ctrjson-$name"
+    printf '{"State":{"Running":true,"Paused":false},"Config":{"Image":"%s","User":"%s","Labels":{"ferret.home":"%s","ferret.mission":"%s"}},"HostConfig":{"Privileged":false,"ReadonlyRootfs":%s,"CapDrop":[%s],"CapAdd":[%s],"SecurityOpt":[%s],"PidMode":"","IpcMode":"%s","Binds":[]},"NetworkSettings":{"Networks":{"%s":{}}}}\n' "$(jesc "$img")" "$(jesc "$user")" "$(jesc "$h")" "$(jesc "$m")" "$ro" "$drops" "$caps" "$secopts" "$(jesc "$ipc")" "$(jesc "$net")" > "$D/ctrjson-$name"
     echo "fakeid"; exit 0;;
   rm) for a in "$@"; do last="$a"; done
       if [ -f "$D/ctr-$last" ]; then rm -f "$D/ctr-$last" "$D/paused-$last" "$D/ctrjson-$last"; exit 0; fi
@@ -2278,6 +2530,8 @@ mod tests {
             "/tmp:rw,exec,nosuid,nodev,size=1024m,uid=1000,gid=1000,mode=1777",
             "--tmpfs",
             "/work:rw,exec,nosuid,nodev,size=4096m,uid=1000,gid=1000,mode=0755",
+            "--tmpfs",
+            SHM_TMPFS,
             "--user",
             "1000:1000",
             "--workdir",
@@ -2295,6 +2549,19 @@ mod tests {
         .map(|s| s.to_string())
         .collect();
         assert_eq!(args, expected);
+        // With an explicit seccomp profile path, `--security-opt seccomp=<path>` follows `no-new-privileges`.
+        let with_seccomp = run_args_with_seccomp(
+            &sample_cfg(),
+            &n,
+            "HOMEHASH",
+            &sample_hosts(),
+            Some(Path::new("/k/box-seccomp.json")),
+        );
+        assert!(
+            with_seccomp.windows(2).any(|w| w == ["--security-opt", "seccomp=/k/box-seccomp.json"]),
+            "{with_seccomp:?}"
+        );
+        assert!(with_seccomp.windows(2).any(|w| w == ["--tmpfs", SHM_TMPFS]), "{with_seccomp:?}");
         // What must never appear, whatever the configuration.
         for forbidden in
             ["--privileged", "-v", "--volume", "--mount", "--device", "--pid", "--uts", "--userns", "--cap-add=ALL"]
@@ -3294,17 +3561,33 @@ exit 2
         let allowed: BTreeSet<Allowed> =
             [Allowed { ip: "203.0.113.7".parse().unwrap(), port: None }].into_iter().collect();
         let to_all = |n: &Names| format!("-i {} -j {}", n.iface, n.chain);
-        // One mission: its chain, its jump above FERRET-ALL's DROP, the static jumps, the IPv6 drops.
+        // One mission: its chain, its jump above FERRET-ALL's DROP, DOCKER-USER -> FERRET-ALL,
+        // unconditional INPUT -i fb-+ -j DROP, and static IPv6 catch-all FERRET-ALL6 + per-iface drops.
         assert!(t.run(RULES_APPLY, &m1, &rules_text(&m1, &allowed)));
         assert_eq!(t.chain("iptables", ALL_CHAIN), [to_all(&m1), "-j DROP".to_string()]);
         assert_eq!(t.chain("iptables", "DOCKER-USER"), ["-i fb-+ -j FERRET-ALL"]);
-        assert_eq!(t.chain("iptables", "INPUT"), ["-i fb-+ -j FERRET-ALL"]);
+        assert_eq!(t.chain("iptables", "INPUT"), ["-i fb-+ -j DROP"]);
         let own = t.chain("iptables", &m1.chain);
         assert!(!own.iter().any(|l| l.contains("ESTABLISHED") || l.contains("conntrack")), "{own:?}");
         assert!(own.first().unwrap().contains("-d 203.0.113.7/32") && own.last().unwrap() == "-j DROP", "{own:?}");
         assert!(own.iter().any(|l| l.contains("-d 203.0.113.7/32 -p tcp -j ACCEPT")), "{own:?}");
+        assert_eq!(t.chain("ip6tables", ALL_CHAIN6), ["-j DROP"]);
         for c in ["INPUT", "FORWARD"] {
-            assert_eq!(t.chain("ip6tables", c), [format!("-i {} -j DROP", m1.iface)], "{c}");
+            assert_eq!(
+                t.chain("ip6tables", c),
+                [format!("-i {} -j DROP", m1.iface), "-i fb-+ -j FERRET-ALL6".to_string()],
+                "{c}"
+            );
+        }
+        // Legacy INPUT -> FERRET-ALL jump is detected by RULES_CHECK and stripped by RULES_APPLY.
+        {
+            let p = t.dir.join("iptables.rules");
+            let cur = std::fs::read_to_string(&p).unwrap();
+            std::fs::write(&p, format!("INPUT|-i fb-+ -j FERRET-ALL\n{cur}")).unwrap();
+            assert!(!t.run(RULES_CHECK, &m1, ""), "legacy INPUT -> FERRET-ALL jump must fail check");
+            assert!(t.run(RULES_APPLY, &m1, &rules_text(&m1, &allowed)));
+            assert_eq!(t.chain("iptables", "INPUT"), ["-i fb-+ -j DROP"]);
+            assert!(t.run(RULES_CHECK, &m1, ""));
         }
         // Again: nothing doubles. A second mission goes above the DROP, not below it.
         assert!(t.run(RULES_APPLY, &m1, &rules_text(&m1, &allowed)));
@@ -3312,34 +3595,43 @@ exit 2
         assert_eq!(t.chain("iptables", "DOCKER-USER").len(), 1);
         assert!(t.run(RULES_APPLY, &m2, &rules_text(&m2, &BTreeSet::new())));
         assert_eq!(t.chain("iptables", ALL_CHAIN), [to_all(&m2), to_all(&m1), "-j DROP".to_string()]);
-        assert_eq!(t.chain("iptables", "INPUT").len(), 1);
-        assert_eq!(t.chain("ip6tables", "FORWARD").len(), 2);
-        // The check passes while everything is there, and fails when the jump or an IPv6 drop is gone.
+        assert_eq!(t.chain("iptables", "INPUT"), ["-i fb-+ -j DROP"]);
+        assert_eq!(t.chain("ip6tables", "FORWARD").len(), 3);
+        // The check passes while everything is there, and fails when an IPv6 drop or FERRET-ALL6 jump is gone.
         assert!(t.run(RULES_CHECK, &m1, ""));
         let rules = std::fs::read_to_string(t.dir.join("ip6tables.rules")).unwrap();
         let without = rules.lines().filter(|l| *l != format!("FORWARD|-i {} -j DROP", m1.iface)).collect::<Vec<_>>();
         std::fs::write(t.dir.join("ip6tables.rules"), without.join("\n") + "\n").unwrap();
         assert!(!t.run(RULES_CHECK, &m1, ""), "an IPv6 drop is missing");
         assert!(t.run(RULES_APPLY, &m1, &rules_text(&m1, &allowed)) && t.run(RULES_CHECK, &m1, ""));
-        // Removing one mission removes its own jump, chain and IPv6 drops, and nothing of FERRET-ALL's.
+        // Removing one mission removes its own jump, chain and per-iface IPv6 drops, and nothing static.
         assert!(t.run(RULES_REMOVE, &m1, ""));
         assert_eq!(t.chain("iptables", ALL_CHAIN), [to_all(&m2), "-j DROP".to_string()]);
         assert!(t.chain("iptables", &m1.chain).is_empty());
         assert!(!std::fs::read_to_string(t.dir.join("iptables.chains")).unwrap().contains(&m1.chain));
-        assert_eq!(t.chain("ip6tables", "INPUT"), [format!("-i {} -j DROP", m2.iface)]);
+        assert_eq!(
+            t.chain("ip6tables", "INPUT"),
+            [format!("-i {} -j DROP", m2.iface), "-i fb-+ -j FERRET-ALL6".to_string()]
+        );
         assert_eq!(t.chain("iptables", "DOCKER-USER"), ["-i fb-+ -j FERRET-ALL"], "the static jumps stay");
         assert!(!t.run(RULES_CHECK, &m1, ""));
-        // The last mission leaves FERRET-ALL with its DROP alone: a bridge with no chain is dropped.
+        // The last mission leaves FERRET-ALL, INPUT DROP, and FERRET-ALL6 intact: any orphan fb-+ bridge is dropped.
         assert!(t.run(RULES_REMOVE, &m2, ""));
         assert_eq!(t.chain("iptables", ALL_CHAIN), ["-j DROP"]);
-        assert_eq!(t.chain("iptables", "INPUT"), ["-i fb-+ -j FERRET-ALL"]);
-        assert!(t.chain("ip6tables", "INPUT").is_empty() && t.chain("ip6tables", "FORWARD").is_empty());
-        // The scripts say nothing that touches the static chain's end: no flush, no delete of FERRET-ALL.
+        assert_eq!(t.chain("iptables", "INPUT"), ["-i fb-+ -j DROP"]);
+        assert_eq!(t.chain("ip6tables", ALL_CHAIN6), ["-j DROP"]);
+        assert_eq!(t.chain("ip6tables", "INPUT"), ["-i fb-+ -j FERRET-ALL6"]);
+        assert_eq!(t.chain("ip6tables", "FORWARD"), ["-i fb-+ -j FERRET-ALL6"]);
+        // The scripts never flush or delete the static chains or their final DROPs.
         for script in [RULES_APPLY, RULES_REMOVE] {
             assert!(
                 !script.contains("-F FERRET-ALL")
                     && !script.contains("-X FERRET-ALL")
                     && !script.contains("-D FERRET-ALL -j")
+                    && !script.contains("-F FERRET-ALL6")
+                    && !script.contains("-X FERRET-ALL6")
+                    && !script.contains("-D FERRET-ALL6 -j")
+                    && !script.contains("-D INPUT -i 'fb-+' -j DROP")
             );
         }
     }
@@ -3857,5 +4149,153 @@ exit 2
         assert!(std::fs::read_to_string(&pf).is_ok_and(|s| s.trim().parse::<i32>().is_ok()));
         let _ = std::fs::remove_file(&pf);
         let _ = std::fs::remove_file(&marker);
+    }
+
+    #[test]
+    fn box_seccomp_profile_is_valid_json_and_blocks_dangerous_syscalls() {
+        let parsed: serde_json::Value = serde_json::from_str(BOX_SECCOMP_PROFILE).expect("valid seccomp JSON");
+        assert_eq!(parsed["defaultAction"], "SCMP_ACT_ERRNO");
+        let syscalls = parsed["syscalls"].as_array().expect("syscalls array");
+        let mut allowed_names: BTreeSet<String> = BTreeSet::new();
+        for rule in syscalls {
+            if rule["action"] == "SCMP_ACT_ALLOW" {
+                for name in rule["names"].as_array().into_iter().flatten().filter_map(serde_json::Value::as_str) {
+                    allowed_names.insert(name.to_string());
+                }
+            }
+        }
+        for forbidden in [
+            "io_uring_setup",
+            "io_uring_enter",
+            "io_uring_register",
+            "userfaultfd",
+            "bpf",
+            "keyctl",
+            "add_key",
+            "request_key",
+            "ptrace",
+            "process_vm_readv",
+            "process_vm_writev",
+            "unshare",
+            "setns",
+            "mount",
+            "umount2",
+            "init_module",
+            "finit_module",
+            "delete_module",
+            "kexec_load",
+            "kexec_file_load",
+            "reboot",
+            "perf_event_open",
+            "open_by_handle_at",
+            "pivot_root",
+            "chroot",
+            "syslog",
+            "vmsplice",
+        ] {
+            assert!(!allowed_names.contains(forbidden), "{forbidden} must not be allowed in box seccomp");
+        }
+        // `clone3` returns ENOSYS (38) so glibc falls back cleanly to filtered `clone`.
+        let clone3 = syscalls
+            .iter()
+            .find(|r| r["names"].as_array().is_some_and(|n| n.iter().any(|x| x == "clone3")))
+            .expect("clone3 rule");
+        assert_eq!(clone3["action"], "SCMP_ACT_ERRNO");
+        assert_eq!(clone3["errnoRet"], 38);
+    }
+
+    #[tokio::test]
+    async fn box_ready_writes_private_seccomp_profile_and_passes_it_with_noexec_shm() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let f = FakeDocker::new(dir.path());
+        let host = f.host();
+        let seccomp = host.seccomp_profile();
+        assert!(seccomp.starts_with(f.dir.join("keys")));
+        assert_eq!(std::fs::metadata(seccomp).unwrap().permissions().mode() & 0o777, 0o600);
+        let _: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(seccomp).unwrap()).unwrap();
+
+        let b = MissionBox::new(host.clone(), "m-seccomp", source(&[]));
+        b.ready().await.unwrap();
+        let runs = f.sub("run");
+        let container = runs.last().unwrap();
+        let want_opt = format!("seccomp={}", seccomp.display());
+        assert!(container.windows(2).any(|w| w == ["--security-opt", &want_opt]), "{container:?}");
+        assert!(container.windows(2).any(|w| w == ["--tmpfs", SHM_TMPFS]), "{container:?}");
+    }
+
+    #[test]
+    fn inspect_container_enforces_full_hardening_invariants() {
+        let n = names("m-1");
+        let cfg = BoxCfg { image: DIGEST.into(), cap_add: vec!["NET_RAW".into()], ..BoxCfg::default() };
+        let base = || {
+            serde_json::json!({
+                "State": {"Running": true, "Paused": false},
+                "Config": {
+                    "Image": DIGEST,
+                    "User": "1000:1000",
+                    "Labels": {"ferret.home": "H", "ferret.mission": "m-1"}
+                },
+                "HostConfig": {
+                    "Privileged": false,
+                    "ReadonlyRootfs": true,
+                    "SecurityOpt": ["no-new-privileges", "seccomp=/k/box-seccomp.json"],
+                    "PidMode": "",
+                    "IpcMode": "private",
+                    "Binds": [],
+                    "CapDrop": ["ALL"],
+                    "CapAdd": ["NET_RAW"]
+                },
+                "NetworkSettings": {"Networks": {"ferret-m-1": {}}}
+            })
+        };
+        let check = |v: serde_json::Value| inspect_container(&serde_json::to_vec(&v).unwrap(), &n, "H", &cfg).unwrap();
+        assert_eq!(check(base()), ContainerFound::Ours { paused: false });
+        // Empty IpcMode is also accepted.
+        let mut empty_ipc = base();
+        empty_ipc["HostConfig"]["IpcMode"] = serde_json::json!("");
+        assert_eq!(check(empty_ipc), ContainerFound::Ours { paused: false });
+
+        type Mutator = fn(&mut serde_json::Value);
+        let cases: Vec<(&str, Mutator)> = vec![
+            ("missing HostConfig", |v| {
+                v.as_object_mut().unwrap().remove("HostConfig");
+            }),
+            ("privileged", |v| {
+                v["HostConfig"]["Privileged"] = serde_json::json!(true);
+            }),
+            ("writable rootfs", |v| {
+                v["HostConfig"]["ReadonlyRootfs"] = serde_json::json!(false);
+            }),
+            ("missing no-new-privileges", |v| {
+                v["HostConfig"]["SecurityOpt"] = serde_json::json!([]);
+            }),
+            ("seccomp unconfined", |v| {
+                v["HostConfig"]["SecurityOpt"] = serde_json::json!(["no-new-privileges", "seccomp=unconfined"]);
+            }),
+            ("host pid mode", |v| {
+                v["HostConfig"]["PidMode"] = serde_json::json!("host");
+            }),
+            ("host ipc mode", |v| {
+                v["HostConfig"]["IpcMode"] = serde_json::json!("host");
+            }),
+            ("host bind mount", |v| {
+                v["HostConfig"]["Binds"] = serde_json::json!(["/etc:/host-etc"]);
+            }),
+            ("wrong user", |v| {
+                v["Config"]["User"] = serde_json::json!("0:0");
+            }),
+            ("missing CapDrop ALL", |v| {
+                v["HostConfig"]["CapDrop"] = serde_json::json!(["NET_ADMIN"]);
+            }),
+            ("extra CapAdd", |v| {
+                v["HostConfig"]["CapAdd"] = serde_json::json!(["NET_RAW", "SYS_ADMIN"]);
+            }),
+        ];
+        for (label, mutate) in cases {
+            let mut v = base();
+            mutate(&mut v);
+            assert!(matches!(check(v), ContainerFound::Stale(_)), "expected Stale for {label}");
+        }
     }
 }

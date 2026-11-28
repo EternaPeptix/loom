@@ -746,6 +746,11 @@ impl Tool for SecurityRecord {
         )
     }
     async fn run(&self, ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
+        if self.0.role.read_only {
+            return ToolOutput::error(
+                "This role has read-only access and cannot mutate mission security state via `security_record`. Use `security_query` to inspect state and return observations through your report or verdict.",
+            );
+        }
         let Some(mission) = self.0.mission.as_ref() else {
             return ToolOutput::error(super::NO_MISSION);
         };
@@ -1195,6 +1200,11 @@ impl Tool for SecurityIngest {
         )
     }
     async fn run(&self, ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
+        if self.0.role.read_only {
+            return ToolOutput::error(
+                "This role has read-only access and cannot mutate mission security state via `security_ingest`. Use `security_query` to inspect state and return observations through your report or verdict.",
+            );
+        }
         let ledger = match self.0.ledger() {
             Ok(s) => s,
             Err(e) => return ToolOutput::error(e),
@@ -1921,5 +1931,38 @@ mod tests {
             .await;
         assert_eq!(f_upd.status, Status::Ok, "{}", f_upd.text);
         assert_eq!(r.shared.ledger().unwrap().security.findings[&fid].revisions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn read_only_roles_are_refused_by_security_record_and_security_ingest() {
+        let mut role = core_role("verifier");
+        role.read_only = true;
+        role.tools.extend(["security_record".into(), "security_query".into(), "security_ingest".into()]);
+        let r = rig_with(role, true, true, AgentsCfg::default());
+        let h = r.output("10.0.0.5 open\n", "bash", ToolClass::Exec);
+        evidence(&r, &h);
+        let before_entries = r.shared.ledger().unwrap().entries;
+
+        let rec = r
+            .call(
+                "security_record",
+                json!({"operation": {
+                    "action": "asset_upsert",
+                    "asset": {"kind": "host", "locator": "10.0.0.5", "evidence": ["e1"]}
+                }}),
+            )
+            .await;
+        assert_eq!(rec.status, Status::Error, "{}", rec.text);
+        assert!(rec.text.to_ascii_lowercase().contains("read-only"), "{}", rec.text);
+
+        let ing = r.call("security_ingest", json!({"format": "nuclei", "handle": h, "evidence": ["e1"]})).await;
+        assert_eq!(ing.status, Status::Error, "{}", ing.text);
+        assert!(ing.text.to_ascii_lowercase().contains("read-only"), "{}", ing.text);
+
+        // Read-only inspection via `security_query` still succeeds, and zero state was mutated.
+        let q = r.call("security_query", json!({"view": "state"})).await;
+        assert_eq!(q.status, Status::Ok, "{}", q.text);
+        assert_eq!(r.shared.ledger().unwrap().entries, before_entries);
+        assert!(r.shared.ledger().unwrap().security.assets.is_empty());
     }
 }

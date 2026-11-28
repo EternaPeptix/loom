@@ -14,7 +14,7 @@
 //!   evidence earned it; `Cohort::All` only on cross-mission evidence); `notify(level, mission,
 //!   item)` the operator notification.
 //! - The **R3 sequence** (`PAUSE_STEPS`, each idempotent, the write-ahead record first): (1) `pause{begun}` written and
-//!   synced (the reserve file if the disk is full); (2) `may_run(mission) = false`; (3) proxy `set_policy(hold)` for every
+//!   synced (the reserve file if the disk is full); (2) `may_run(mission) = false`; (3) proxy `hold(policy)` for every
 //!   session, then `cut_mission`; (4) the hold state of `session::Control` on every session and their tokens cancelled:
 //!   the lead's turn ends `interrupted{"held by ferret review"}` and `Parked` with the monitor item, **without** `jobs.kill_all`
 //!   or `stop_children`, an idle lead's item opens through the harness-notice path with no turn started, children's turns

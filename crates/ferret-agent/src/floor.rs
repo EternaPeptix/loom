@@ -391,7 +391,8 @@ impl Floor {
             kind,
             category,
             severity,
-            session: session.cloned(),
+            // An MCP server's isolated proxy grant (P0-7) is attributed to the session it was made for.
+            session: session.map(crate::mcp::grant_owner),
             label,
             detail,
         };

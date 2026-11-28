@@ -163,9 +163,8 @@ memory_mb = 8192
 pids = 512
 work_mb = 4096             # size of the tmpfs on /work
 tmp_mb = 1024              # size of the tmpfs on /tmp
-cap_add = []               # capabilities to add back (all are dropped); ferret refuses the dangerous ones (SYS_ADMIN, NET_ADMIN, ...)
-#                            Commands run as uid 1000 with no-new-privileges, so cap_add does NOT give them capabilities: it
-#                            affects only root processes inside the container (and a command cannot become root there).
+cap_add = []               # capabilities added back (all are dropped first); strict allowlist: ONLY "NET_RAW" and "NET_BIND_SERVICE" are permitted (all others including DAC_OVERRIDE, SETUID, SETGID, SYS_CHROOT, CHECKPOINT_RESTORE, SYS_ADMIN, NET_ADMIN are refused)
+#                            Commands run as uid 1000 with no-new-privileges, a hardened default-deny seccomp profile, and bounded noexec /dev/shm.
 sync_max_mb = 64           # most data copied from the workspace into /work by one call
 sync_file_max_mb = 16      # largest single file copied
 get_max_mb = 64            # most data one box_get brings back
@@ -187,7 +186,8 @@ copy_max_mb = 20480        # nor one with more MiB of file content, where a copy
 compact_tools = false      # true: use compact tool descriptions and schemas to reduce prompt token overhead
 implicit_finish = false    # true: allow explicit-termination sessions to treat a plain reply with no open ledger items as an implicit finish
 # idle_ledger_nudge = true # accepted and ignored: the idle-goal paragraph was removed
-project_instructions = true  # put the workspace root's AGENTS.md and CLAUDE.md into each new session's system prompt (32 KiB at most); false = never read them
+project_instructions = true  # put the workspace root's AGENTS.md and CLAUDE.md into each new session's untrusted-data framing (32 KiB at most); false = never read them
+project_instructions_in_security_packs = false  # security packs (vr, redteam, ctf, ctf-generalist, webapp, audit, cloud) ignore workspace AGENTS.md/CLAUDE.md unless explicitly set true here (requires project_instructions = true)
 
 [mcp]
 # MCP servers become tools named mcp__{server}__{tool}. Nothing here applies without a [mcp.servers.*] table.
@@ -196,18 +196,22 @@ project_instructions = true  # put the workspace root's AGENTS.md and CLAUDE.md 
 
 # [mcp.servers.github]
 # command = ["npx", "-y", "@modelcontextprotocol/server-github"]   # stdio: run in the session sandbox
-# env = { GITHUB_PERSONAL_ACCESS_TOKEN = "env:GITHUB_PAT" }        # "env:NAME" | "file:/path" | literal (warned about)
+# env = { GITHUB_PERSONAL_ACCESS_TOKEN = "env:GITHUB_PAT" }        # "env:NAME" | "file:/path" (must be regular 0600 file owned by you, no symlinks) | literal (warned about)
 # cwd = "."                    # relative to the workspace
-# hosts = ["api.github.com"]   # added to the allowed hosts of sessions that get this server (bash can reach them too)
+# hosts = ["api.github.com"]   # MCP server hosts (isolated from general session bash/web_fetch egress policy)
 # tools = ["search_issues", "get_issue"]   # default: every tool the server lists
 # roles = ["lead", "worker"]   # default: every role that is not read-only
 # read_only = false            # true: no tool of this server changes anything, so read-only roles get it too
+# trust_read_only_hints = false  # true: trust server-advertised readOnlyHint annotations (default false)
+# pinned_schema_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"  # optional 64-hex SHA-256 pinning the server's tool schemas
 # timeout_s = 120              # per call
 
 # [mcp.servers.docs]
-# url = "https://mcp.example.com/mcp"                 # Streamable HTTP, through the session's egress proxy
+# url = "https://mcp.example.com/mcp"                 # Streamable HTTP, isolated to this server's configured hosts
 # headers = { Authorization = "env:DOCS_MCP_AUTH" }
 # hosts = ["mcp.example.com"]
+# trust_read_only_hints = false
+# pinned_schema_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
 
 [mail]
 # Optional operator-scoped, strictly read-only email inbox (`inbox_read` tool) for bug-bounty account
@@ -223,7 +227,8 @@ folder = "INBOX"                                # IMAP mailbox name opened read-
 # maildir_path = "/path/to/maildir"             # required when backend = "maildir"; example; no command reads it
 # allow_senders = ["*@hackerone.com", "*@bugcrowd.com", "*@*.target.example"]  # REQUIRED when enabled; "*" and "*@*" refused
 # allow_recipients = ["researcher+bb-*@example.test"]  # optional plus-address filter; empty = any recipient in the mailbox
-require_auth_pass = false                       # true: require Authentication-Results showing dkim=pass or spf=pass
+require_auth_pass = false                       # true: inspect topmost trusted Authentication-Results for dmarc=pass or aligned dkim=pass
+# authserv_id = "mx.example.test"               # optional pinned trusted MTA authserv-id hostname for Authentication-Results (recommended with require_auth_pass = true)
 max_age_minutes = 120                           # only return messages newer than this many minutes; 0 = unbounded
 max_messages = 20                               # most messages returned per read (1..=50)
 # roles = ["lead", "worker"]                    # optional roles allowed to call inbox_read; empty = every non-read-only role
@@ -232,7 +237,7 @@ max_messages = 20                               # most messages returned per rea
 # Optional two-way Signal bridge talking to a local `signal-cli daemon --http` instance for phone alerts and
 # replies. Off by default. Verify with `ferret signal check` and `ferret signal test`. See docs/RUN.md, "Signal".
 enabled = false
-http_url = "http://127.0.0.1:1337"              # base URL of `signal-cli daemon --http`; no command reaches it (infrastructure)
+http_url = "http://127.0.0.1:1337"              # base URL of `signal-cli daemon --http` (plaintext http:// restricted to loopback; remote URLs must use https://); no command reaches it (infrastructure)
 # account = "+15550100"                         # registered signal-cli account in E.164 format; example
 # Outbound destination: an E.164 number ("+15550199"), a Signal ACI/PNI UUID ("00000000-0000-4000-8000-000000000001",
 # optionally prefixed with "u:" or "PNI:"), or a group ("group:<groupId>").
@@ -251,6 +256,7 @@ allow_groups = []
 # ("disk" forwards low-disk warnings; unanswered blocking reminders follow `[notify] repeat_minutes`.)
 events = ["blocker", "question", "approval", "parked", "finished", "error"]
 max_chars = 3500                                # max characters per outbound Signal message (200..=7500)
+inbox_delay_secs = 0                            # seconds to wait before sending Signal alerts for open inbox items (blocker/question/approval/parked) so items answered at the computer never buzz the phone (0 = immediate, max 86400; finished/error/disk & guest alerts stay immediate)
 
 [signal.guests]
 # Optional isolated guest-chat and unknown-sender gatekeeper for direct messages. Off by default

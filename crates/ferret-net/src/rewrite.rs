@@ -12,10 +12,15 @@
 //!   setting method `CONNECT` or CR/LF/NUL bytes, run in `(priority ASC, id ASC)` order, and fail
 //!   open atomically per rule.
 //! - Actions marked `sensitive: true` never appear with plaintext `value` in API reads
-//!   ([`RewriteRule::redacted_view`]) and retain stored values on update only when the rule's `host`
-//!   matcher stays unchanged (preventing accidental secret redirection to a new host).
+//!   ([`RewriteRule::redacted_view`]) or `Debug` output, are AEAD-encrypted at rest in
+//!   [`RewriteStore`] (`ring::aead::CHACHA20_POLY1305` using a `0600` key in `keys/rewrite.key`,
+//!   with transparent migration of legacy plaintext values on load), are redacted before traffic
+//!   capture, and retain stored values on update only when the rule's `host` matcher stays
+//!   unchanged (preventing accidental secret redirection to a new host).
 
+use base64::Engine as _;
 use ferret_core::config::AssessmentUaCfg;
+use ferret_core::creds::{Secrets, REDACTED};
 use hmac::{Hmac, KeyInit, Mac};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -24,6 +29,10 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+
+const ENC_PREFIX: &str = "enc:v1:";
+const NONCE_LEN: usize = 12;
+const TAG_LEN: usize = 16;
 
 pub const MAX_RULES: usize = 100;
 pub const MAX_ENABLED_RULES: usize = 50;
@@ -168,7 +177,7 @@ pub struct RewriteMatcher {
     pub resp_body_regex: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RewriteAction {
     SetMethod {
@@ -215,6 +224,51 @@ pub enum RewriteAction {
     SetStatus {
         value: u16,
     },
+}
+
+impl std::fmt::Debug for RewriteAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn shown(value: &Option<String>, sensitive: bool) -> Option<&str> {
+            match (value.as_deref(), sensitive) {
+                (Some(_), true) => Some(REDACTED),
+                (v, false) => v,
+                (None, true) => None,
+            }
+        }
+        match self {
+            RewriteAction::SetMethod { value } => f.debug_struct("SetMethod").field("value", value).finish(),
+            RewriteAction::SetPathQuery { value } => f.debug_struct("SetPathQuery").field("value", value).finish(),
+            RewriteAction::ReplaceUrl { regex, value } => {
+                f.debug_struct("ReplaceUrl").field("regex", regex).field("value", value).finish()
+            }
+            RewriteAction::DeleteHeader { name } => f.debug_struct("DeleteHeader").field("name", name).finish(),
+            RewriteAction::SetHeader { name, value, sensitive } => f
+                .debug_struct("SetHeader")
+                .field("name", name)
+                .field("value", &shown(value, *sensitive))
+                .field("sensitive", sensitive)
+                .finish(),
+            RewriteAction::ReplaceHeader { name, regex, value, sensitive } => f
+                .debug_struct("ReplaceHeader")
+                .field("name", name)
+                .field("regex", regex)
+                .field("value", &shown(value, *sensitive))
+                .field("sensitive", sensitive)
+                .finish(),
+            RewriteAction::SetBody { value, sensitive } => f
+                .debug_struct("SetBody")
+                .field("value", &shown(value, *sensitive))
+                .field("sensitive", sensitive)
+                .finish(),
+            RewriteAction::ReplaceBody { regex, value, sensitive } => f
+                .debug_struct("ReplaceBody")
+                .field("regex", regex)
+                .field("value", &shown(value, *sensitive))
+                .field("sensitive", sensitive)
+                .finish(),
+            RewriteAction::SetStatus { value } => f.debug_struct("SetStatus").field("value", value).finish(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -459,10 +513,10 @@ enum CompiledAction {
     SetPathQuery(String),
     ReplaceUrl(Regex, String),
     DeleteHeader(String),
-    SetHeader(String, String),
-    ReplaceHeader(String, Regex, String),
-    SetBody(String),
-    ReplaceBody(Regex, String),
+    SetHeader(String, String, bool),
+    ReplaceHeader(String, Regex, String, bool),
+    SetBody(String, bool),
+    ReplaceBody(Regex, String, bool),
     SetStatus(u16),
 }
 
@@ -479,6 +533,7 @@ struct CompiledRule {
     resp_body_regex: Option<Regex>,
     actions: Vec<CompiledAction>,
     touches_body: bool,
+    has_sensitive: bool,
 }
 
 impl CompiledRule {
@@ -517,6 +572,7 @@ impl CompiledRule {
 
         let mut actions = Vec::with_capacity(rule.actions.len());
         let mut touches_body = body_regex.is_some() || resp_body_regex.is_some();
+        let mut has_sensitive = false;
         for a in &rule.actions {
             match a {
                 RewriteAction::SetMethod { value } => {
@@ -527,25 +583,35 @@ impl CompiledRule {
                     actions.push(CompiledAction::ReplaceUrl(compile_re(regex, "replace_url")?, value.clone()));
                 }
                 RewriteAction::DeleteHeader { name } => actions.push(CompiledAction::DeleteHeader(name.trim().into())),
-                RewriteAction::SetHeader { name, value, .. } => {
-                    actions.push(CompiledAction::SetHeader(name.trim().into(), value.clone().unwrap_or_default()));
+                RewriteAction::SetHeader { name, value, sensitive } => {
+                    has_sensitive |= *sensitive;
+                    actions.push(CompiledAction::SetHeader(
+                        name.trim().into(),
+                        value.clone().unwrap_or_default(),
+                        *sensitive,
+                    ));
                 }
-                RewriteAction::ReplaceHeader { name, regex, value, .. } => {
+                RewriteAction::ReplaceHeader { name, regex, value, sensitive } => {
+                    has_sensitive |= *sensitive;
                     actions.push(CompiledAction::ReplaceHeader(
                         name.trim().into(),
                         compile_re(regex, "replace_header")?,
                         value.clone().unwrap_or_default(),
+                        *sensitive,
                     ));
                 }
-                RewriteAction::SetBody { value, .. } => {
+                RewriteAction::SetBody { value, sensitive } => {
                     touches_body = true;
-                    actions.push(CompiledAction::SetBody(value.clone().unwrap_or_default()));
+                    has_sensitive |= *sensitive;
+                    actions.push(CompiledAction::SetBody(value.clone().unwrap_or_default(), *sensitive));
                 }
-                RewriteAction::ReplaceBody { regex, value, .. } => {
+                RewriteAction::ReplaceBody { regex, value, sensitive } => {
                     touches_body = true;
+                    has_sensitive |= *sensitive;
                     actions.push(CompiledAction::ReplaceBody(
                         compile_re(regex, "replace_body")?,
                         value.clone().unwrap_or_default(),
+                        *sensitive,
                     ));
                 }
                 RewriteAction::SetStatus { value } => actions.push(CompiledAction::SetStatus(*value)),
@@ -565,6 +631,7 @@ impl CompiledRule {
             resp_body_regex,
             actions,
             touches_body,
+            has_sensitive,
         })
     }
 
@@ -617,25 +684,128 @@ impl CompiledRule {
 }
 
 /// Immutable compiled snapshot of enabled proxy rewrite rules.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct RewriteSet {
     rules: Arc<Vec<CompiledRule>>,
+    sensitive_values: Arc<Vec<String>>,
+    secrets: Arc<Secrets>,
+    max_secret_len: usize,
+}
+
+impl Default for RewriteSet {
+    fn default() -> Self {
+        Self {
+            rules: Arc::new(Vec::new()),
+            sensitive_values: Arc::new(Vec::new()),
+            secrets: Arc::new(Secrets::default()),
+            max_secret_len: 0,
+        }
+    }
 }
 
 pub type HeaderList = Vec<(String, Vec<u8>)>;
 pub type RewrittenRequestHead = (String, String, HeaderList, Vec<u64>);
 pub type RewrittenResponse = (u16, HeaderList, Option<Vec<u8>>, Vec<u64>);
 
+/// Result of rewriting a structured request head with separate wire and capture-safe headers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RewrittenHead {
+    pub method: String,
+    pub target: String,
+    pub wire_headers: HeaderList,
+    pub captured_headers: HeaderList,
+    pub applied_ids: Vec<u64>,
+    pub sensitive_applied: bool,
+}
+
+/// Result of rewriting a raw HTTP/1.1 request head with separate wire and capture-safe bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RewrittenRawHead {
+    pub wire_head: Vec<u8>,
+    pub captured_head: Vec<u8>,
+    pub method: String,
+    pub target: String,
+    pub applied_ids: Vec<u64>,
+    pub sensitive_applied: bool,
+}
+
+fn collect_sensitive_values(compiled: &[CompiledRule]) -> (Vec<String>, Secrets, usize) {
+    let mut raw = Vec::new();
+    let mut seen = HashSet::new();
+    let mut expanded = Vec::new();
+    for rule in compiled {
+        for action in &rule.actions {
+            let (is_cookie_or_header, val) = match action {
+                CompiledAction::SetHeader(name, v, true) | CompiledAction::ReplaceHeader(name, _, v, true) => {
+                    (Some(name.as_str()), v.as_str())
+                }
+                CompiledAction::SetBody(v, true) | CompiledAction::ReplaceBody(_, v, true) => (None, v.as_str()),
+                _ => continue,
+            };
+            if val.is_empty() {
+                continue;
+            }
+            if seen.insert(val.to_string()) {
+                raw.push(val.to_string());
+            }
+            expanded.push(val.to_string());
+            // For `<scheme> <token>` headers (e.g. `Authorization: Bearer <tok>`), also redact the bare token.
+            if is_cookie_or_header.is_some() && val.matches(' ').count() == 1 {
+                if let Some((_, tok)) = val.split_once(' ') {
+                    if !tok.is_empty() {
+                        expanded.push(tok.to_string());
+                    }
+                }
+            }
+            // For `Cookie` headers (or semicolon-separated `k=v` pairs), also redact individual values.
+            if is_cookie_or_header.is_some_and(|n| n.eq_ignore_ascii_case("cookie")) || val.contains('=') {
+                for pair in val.split(';') {
+                    if let Some((_, pv)) = pair.trim().split_once('=') {
+                        let pv = pv.trim();
+                        if !pv.is_empty() {
+                            expanded.push(pv.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let max_len = raw.iter().map(String::len).max().unwrap_or(0);
+    (raw, Secrets::new(expanded), max_len)
+}
+
 impl RewriteSet {
     pub fn compile(rules: &[RewriteRule]) -> Self {
         let mut enabled: Vec<&RewriteRule> = rules.iter().filter(|r| r.enabled).collect();
         enabled.sort_by_key(|r| (r.priority, r.id));
         let compiled: Vec<CompiledRule> = enabled.into_iter().filter_map(|r| CompiledRule::from_rule(r).ok()).collect();
-        Self { rules: Arc::new(compiled) }
+        let (sensitive_values, secrets, max_secret_len) = collect_sensitive_values(&compiled);
+        Self {
+            rules: Arc::new(compiled),
+            sensitive_values: Arc::new(sensitive_values),
+            secrets: Arc::new(secrets),
+            max_secret_len,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
         self.rules.is_empty()
+    }
+
+    /// All active `sensitive: true` action values from enabled rules, deduplicated in deterministic order.
+    pub fn sensitive_values(&self) -> Vec<String> {
+        (*self.sensitive_values).clone()
+    }
+
+    /// Precompiled [`Secrets`] redactor covering all active `sensitive: true` values (plus extracted
+    /// `<scheme> <token>` and cookie pair values) for redacting captured traffic before storage.
+    pub fn secrets(&self) -> Arc<Secrets> {
+        self.secrets.clone()
+    }
+
+    /// Byte length of the longest active `sensitive: true` value (0 when none are active).
+    pub(crate) fn max_secret_len(&self) -> usize {
+        self.max_secret_len
     }
 
     /// Apply enabled request-phase head-only rules (skipping rules that touch the body).
@@ -647,13 +817,28 @@ impl RewriteSet {
         target: &str,
         headers: &[(String, Vec<u8>)],
     ) -> Option<RewrittenRequestHead> {
+        let rw = self.apply_request_head_for_capture(host, method, target, headers)?;
+        Some((rw.method, rw.target, rw.wire_headers, rw.applied_ids))
+    }
+
+    /// Like [`RewriteSet::apply_request_head`], also returning capture-safe headers where every
+    /// applied `sensitive: true` action substitutes `[redacted]` instead of the raw secret value.
+    pub fn apply_request_head_for_capture(
+        &self,
+        host: &str,
+        method: &str,
+        target: &str,
+        headers: &[(String, Vec<u8>)],
+    ) -> Option<RewrittenHead> {
         if self.rules.is_empty() {
             return None;
         }
         let mut cur_method = method.to_string();
         let mut cur_target = target.to_string();
         let mut cur_headers = headers.to_vec();
+        let mut cap_headers = headers.to_vec();
         let mut applied = Vec::new();
+        let mut sensitive_applied = false;
 
         for rule in self.rules.iter().filter(|r| r.phase == RewritePhase::Request && !r.touches_body) {
             if !rule.matches_request(host, &cur_method, &cur_target, &cur_headers, None) {
@@ -662,16 +847,29 @@ impl RewriteSet {
             let mut next_method = cur_method.clone();
             let mut next_target = cur_target.clone();
             let mut next_headers = cur_headers.clone();
-            if apply_head_actions(&rule.actions, &mut next_method, &mut next_target, &mut next_headers).is_ok()
+            if apply_head_actions(&rule.actions, &mut next_method, &mut next_target, &mut next_headers, false).is_ok()
                 && (next_method != cur_method || next_target != cur_target || next_headers != cur_headers)
             {
+                let mut cap_m = cur_method.clone();
+                let mut cap_t = cur_target.clone();
+                let mut next_cap = cap_headers.clone();
+                let _ = apply_head_actions(&rule.actions, &mut cap_m, &mut cap_t, &mut next_cap, true);
                 cur_method = next_method;
                 cur_target = next_target;
                 cur_headers = next_headers;
+                cap_headers = next_cap;
                 applied.push(rule.id);
+                sensitive_applied |= rule.has_sensitive;
             }
         }
-        (!applied.is_empty()).then_some((cur_method, cur_target, cur_headers, applied))
+        (!applied.is_empty()).then_some(RewrittenHead {
+            method: cur_method,
+            target: cur_target,
+            wire_headers: cur_headers,
+            captured_headers: cap_headers,
+            applied_ids: applied,
+            sensitive_applied,
+        })
     }
 
     /// Apply enabled request-phase head-only rules directly onto raw HTTP/1.1 request head bytes.
@@ -686,6 +884,13 @@ impl RewriteSet {
         host: &str,
         raw_head: &[u8],
     ) -> Option<(Vec<u8>, String, String, Vec<u64>)> {
+        let rw = self.apply_raw_request_head_for_capture(host, raw_head)?;
+        Some((rw.wire_head, rw.method, rw.target, rw.applied_ids))
+    }
+
+    /// Like [`RewriteSet::apply_raw_request_head_parts`], returning both wire bytes and capture-safe
+    /// bytes where `sensitive: true` actions are replaced by `[redacted]`.
+    pub fn apply_raw_request_head_for_capture(&self, host: &str, raw_head: &[u8]) -> Option<RewrittenRawHead> {
         if self.rules.is_empty() {
             return None;
         }
@@ -700,19 +905,32 @@ impl RewriteSet {
         let ver = if req.version == Some(0) { "HTTP/1.0" } else { "HTTP/1.1" };
         let headers: Vec<(String, Vec<u8>)> =
             req.headers.iter().map(|h| (h.name.to_string(), h.value.to_vec())).collect();
-        let (new_method, new_target, new_headers, applied) = self.apply_request_head(host, method, target, &headers)?;
-        let mut out = format!("{new_method} {new_target} {ver}\r\n").into_bytes();
-        for (name, val) in new_headers {
-            out.extend_from_slice(name.as_bytes());
-            out.extend_from_slice(b": ");
-            out.extend_from_slice(&val);
+        let rw = self.apply_request_head_for_capture(host, method, target, &headers)?;
+        let trailing = raw_head.get(n..).unwrap_or(&[]);
+        let render = |hdrs: &[(String, Vec<u8>)]| -> Vec<u8> {
+            let mut out = format!("{} {} {ver}\r\n", rw.method, rw.target).into_bytes();
+            for (name, val) in hdrs {
+                out.extend_from_slice(name.as_bytes());
+                out.extend_from_slice(b": ");
+                out.extend_from_slice(val);
+                out.extend_from_slice(b"\r\n");
+            }
             out.extend_from_slice(b"\r\n");
-        }
-        out.extend_from_slice(b"\r\n");
-        if n < raw_head.len() {
-            out.extend_from_slice(&raw_head[n..]);
-        }
-        Some((out, new_method, new_target, applied))
+            if !trailing.is_empty() {
+                out.extend_from_slice(trailing);
+            }
+            out
+        };
+        let wire_head = render(&rw.wire_headers);
+        let captured_head = if rw.sensitive_applied { render(&rw.captured_headers) } else { wire_head.clone() };
+        Some(RewrittenRawHead {
+            wire_head,
+            captured_head,
+            method: rw.method,
+            target: rw.target,
+            applied_ids: rw.applied_ids,
+            sensitive_applied: rw.sensitive_applied,
+        })
     }
 
     /// Apply enabled response-phase rules against a complete buffered response (head + optional text body).
@@ -783,6 +1001,7 @@ fn apply_head_actions(
     method: &mut String,
     target: &mut String,
     headers: &mut Vec<(String, Vec<u8>)>,
+    redact_sensitive: bool,
 ) -> Result<(), ()> {
     // Fixed deterministic order: method & URL -> delete_header -> set/replace_header.
     for a in actions {
@@ -806,15 +1025,20 @@ fn apply_head_actions(
     }
     for a in actions {
         match a {
-            CompiledAction::SetHeader(name, val) => {
+            CompiledAction::SetHeader(name, val, sensitive) => {
                 headers.retain(|(n, _)| !n.eq_ignore_ascii_case(name));
-                headers.push((name.clone(), val.as_bytes().to_vec()));
+                let out_val = if redact_sensitive && *sensitive { REDACTED.as_bytes() } else { val.as_bytes() };
+                headers.push((name.clone(), out_val.to_vec()));
             }
-            CompiledAction::ReplaceHeader(name, re, rep) => {
+            CompiledAction::ReplaceHeader(name, re, rep, sensitive) => {
                 for (n, v) in headers.iter_mut() {
                     if n.eq_ignore_ascii_case(name) {
                         if let Ok(s) = std::str::from_utf8(v) {
-                            let next = re.replace_all(s, rep.as_str()).into_owned();
+                            let next = if redact_sensitive && *sensitive {
+                                re.replace_all(s, regex::NoExpand(REDACTED)).into_owned()
+                            } else {
+                                re.replace_all(s, rep.as_str()).into_owned()
+                            };
                             if !no_crlf_nul(&next) {
                                 return Err(());
                             }
@@ -842,11 +1066,11 @@ fn apply_response_actions(
     }
     for a in actions {
         match a {
-            CompiledAction::SetHeader(name, val) => {
+            CompiledAction::SetHeader(name, val, _) => {
                 headers.retain(|(n, _)| !n.eq_ignore_ascii_case(name));
                 headers.push((name.clone(), val.as_bytes().to_vec()));
             }
-            CompiledAction::ReplaceHeader(name, re, rep) => {
+            CompiledAction::ReplaceHeader(name, re, rep, _) => {
                 for (n, v) in headers.iter_mut() {
                     if n.eq_ignore_ascii_case(name) {
                         if let Ok(s) = std::str::from_utf8(v) {
@@ -864,13 +1088,13 @@ fn apply_response_actions(
     }
     for a in actions {
         match a {
-            CompiledAction::SetBody(val) => {
+            CompiledAction::SetBody(val, _) => {
                 if val.len() > MAX_REWRITE_BODY_BYTES {
                     return Err(());
                 }
                 *body = Some(val.as_bytes().to_vec());
             }
-            CompiledAction::ReplaceBody(re, rep) => {
+            CompiledAction::ReplaceBody(re, rep, _) => {
                 let Some(b) = body.as_deref() else { return Err(()) };
                 let Ok(s) = std::str::from_utf8(b) else { return Err(()) };
                 let next = re.replace_all(s, rep.as_str()).into_owned();
@@ -886,28 +1110,197 @@ fn apply_response_actions(
     Ok(())
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct PersistedRules {
     next_id: u64,
     rules: Vec<RewriteRule>,
 }
 
-/// Persistent file-backed store of operator-only rewrite rules (`<home>/rewrite_rules.json`).
+fn default_key_path(rules_path: &Path) -> PathBuf {
+    match rules_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        Some(dir) => dir.join("keys").join("rewrite.key"),
+        None => PathBuf::from("keys").join("rewrite.key"),
+    }
+}
+
+fn read_existing_key(path: &Path) -> Result<Option<[u8; 32]>, String> {
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+                format!(
+                    "The rewrite encryption key {} is not exactly 32 bytes, so it was left alone; \
+                     restore it from a backup or move it away to start a new key.",
+                    path.display()
+                )
+            })?;
+            Ok(Some(arr))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("Could not read the rewrite encryption key {}: {e}.", path.display())),
+    }
+}
+
+fn load_or_create_key(path: &Path) -> Result<[u8; 32], String> {
+    if let Some(k) = read_existing_key(path)? {
+        return Ok(k);
+    }
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        let mut b = std::fs::DirBuilder::new();
+        b.recursive(true);
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
+        b.create(parent)
+            .map_err(|e| format!("Could not create the rewrite key directory {}: {e}.", parent.display()))?;
+    }
+    let mut key = [0u8; 32];
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut key)
+        .map_err(|_| "Could not get random bytes for the rewrite encryption key.".to_string())?;
+    ferret_core::journal::publish_new_file(path, &key)
+        .map_err(|e| format!("Could not write the rewrite encryption key {}: {e}.", path.display()))?;
+    read_existing_key(path)?
+        .ok_or_else(|| format!("The rewrite encryption key {} disappeared right after it was written.", path.display()))
+}
+
+fn aead_key(key: &[u8; 32]) -> Result<ring::aead::LessSafeKey, String> {
+    let unbound = ring::aead::UnboundKey::new(&ring::aead::CHACHA20_POLY1305, key)
+        .map_err(|_| "The rewrite encryption key is unusable.".to_string())?;
+    Ok(ring::aead::LessSafeKey::new(unbound))
+}
+
+fn action_aad(rule: &RewriteRule, action_idx: usize, kind: &str, name: &str) -> String {
+    let host = rule.matchers.host.as_deref().map(crate::inject::norm_host).unwrap_or_default();
+    format!("ferret-rewrite-v1:{}:{action_idx}:{host}:{kind}:{}", rule.id, name.trim().to_ascii_lowercase())
+}
+
+fn seal_value(key: &[u8; 32], aad: &str, plaintext: &str) -> Result<String, String> {
+    let mut nonce = [0u8; NONCE_LEN];
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut nonce)
+        .map_err(|_| "Could not get random bytes to seal a sensitive rewrite rule.".to_string())?;
+    let mut buf = plaintext.as_bytes().to_vec();
+    aead_key(key)?
+        .seal_in_place_append_tag(
+            ring::aead::Nonce::assume_unique_for_key(nonce),
+            ring::aead::Aad::from(aad.as_bytes()),
+            &mut buf,
+        )
+        .map_err(|_| "Could not seal a sensitive rewrite rule.".to_string())?;
+    let mut raw = Vec::with_capacity(NONCE_LEN + buf.len());
+    raw.extend_from_slice(&nonce);
+    raw.extend_from_slice(&buf);
+    Ok(format!("{ENC_PREFIX}{}", base64::engine::general_purpose::STANDARD.encode(raw)))
+}
+
+fn open_value(key: &[u8; 32], aad: &str, rule_id: u64, encoded: &str) -> Result<String, String> {
+    let fail = || {
+        format!(
+            "Could not decrypt sensitive value in rewrite rule {rule_id}: the file is damaged, \
+             its rule context changed, or it was sealed with another key."
+        )
+    };
+    let b64 = encoded.strip_prefix(ENC_PREFIX).ok_or_else(fail)?;
+    let raw = base64::engine::general_purpose::STANDARD.decode(b64).map_err(|_| fail())?;
+    if raw.len() < NONCE_LEN + TAG_LEN {
+        return Err(fail());
+    }
+    let (nonce_bytes, ct) = raw.split_at(NONCE_LEN);
+    let nonce: [u8; NONCE_LEN] = nonce_bytes.try_into().map_err(|_| fail())?;
+    let mut buf = ct.to_vec();
+    let plain = aead_key(key)?
+        .open_in_place(ring::aead::Nonce::assume_unique_for_key(nonce), ring::aead::Aad::from(aad.as_bytes()), &mut buf)
+        .map_err(|_| fail())?;
+    String::from_utf8(plain.to_vec()).map_err(|_| fail())
+}
+
+fn sensitive_action_parts_mut(action: &mut RewriteAction) -> Option<(&'static str, String, &mut Option<String>)> {
+    match action {
+        RewriteAction::SetHeader { name, value, sensitive: true } => Some(("set_header", name.clone(), value)),
+        RewriteAction::ReplaceHeader { name, value, sensitive: true, .. } => {
+            Some(("replace_header", name.clone(), value))
+        }
+        RewriteAction::SetBody { value, sensitive: true } => Some(("set_body", String::new(), value)),
+        RewriteAction::ReplaceBody { value, sensitive: true, .. } => Some(("replace_body", String::new(), value)),
+        _ => None,
+    }
+}
+
+fn has_sensitive_value(rules: &[RewriteRule]) -> bool {
+    rules.iter().any(|r| {
+        r.actions.iter().any(|a| {
+            matches!(
+                a,
+                RewriteAction::SetHeader { value: Some(_), sensitive: true, .. }
+                    | RewriteAction::ReplaceHeader { value: Some(_), sensitive: true, .. }
+                    | RewriteAction::SetBody { value: Some(_), sensitive: true }
+                    | RewriteAction::ReplaceBody { value: Some(_), sensitive: true, .. }
+            )
+        })
+    })
+}
+
+/// Persistent file-backed store of operator-only rewrite rules (`<home>/rewrite_rules.json`),
+/// with ChaCha20-Poly1305 encryption at rest for all `sensitive: true` action values.
 #[derive(Clone)]
 pub struct RewriteStore {
     path: PathBuf,
+    key_path: PathBuf,
     state: Arc<Mutex<PersistedRules>>,
 }
 
 impl RewriteStore {
+    /// Open `path`, placing the `0600` rewrite encryption key at `<parent>/keys/rewrite.key`.
+    /// Any legacy plaintext `sensitive: true` values on disk are transparently migrated to ciphertext.
     pub fn open(path: PathBuf) -> Result<Self, String> {
-        let state = match std::fs::read(&path) {
+        let key_path = default_key_path(&path);
+        Self::open_with_key(path, key_path)
+    }
+
+    /// Open `path` with an explicit encryption key file `key_path` (`0600`, 32 raw bytes).
+    /// Any legacy plaintext `sensitive: true` values on disk are transparently migrated to ciphertext.
+    pub fn open_with_key(path: PathBuf, key_path: PathBuf) -> Result<Self, String> {
+        let mut state = match std::fs::read(&path) {
             Ok(bytes) => serde_json::from_slice::<PersistedRules>(&bytes)
                 .map_err(|e| format!("Could not parse `{}`: {e}", path.display()))?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => PersistedRules { next_id: 1, rules: Vec::new() },
             Err(e) => return Err(format!("Could not read `{}`: {e}", path.display())),
         };
-        Ok(Self { path, state: Arc::new(Mutex::new(state)) })
+        let mut key: Option<[u8; 32]> = None;
+        let mut migrated = false;
+        for rule in &mut state.rules {
+            let rule_id = rule.id;
+            let rule_meta = rule.clone();
+            for (idx, action) in rule.actions.iter_mut().enumerate() {
+                let Some((kind, name, slot)) = sensitive_action_parts_mut(action) else { continue };
+                let Some(stored) = slot.as_deref() else { continue };
+                if stored.starts_with(ENC_PREFIX) {
+                    let k = match key {
+                        Some(k) => k,
+                        None => {
+                            let loaded = read_existing_key(&key_path)?.ok_or_else(|| {
+                                format!(
+                                    "The rewrite encryption key {} is missing, so sensitive rewrite rule {rule_id} cannot be decrypted.",
+                                    key_path.display()
+                                )
+                            })?;
+                            key = Some(loaded);
+                            loaded
+                        }
+                    };
+                    let aad = action_aad(&rule_meta, idx, kind, &name);
+                    let plain = open_value(&k, &aad, rule_id, stored)?;
+                    *slot = Some(plain);
+                } else {
+                    migrated = true;
+                }
+            }
+        }
+        if migrated {
+            save_persisted(&path, &key_path, &state)?;
+        }
+        Ok(Self { path, key_path, state: Arc::new(Mutex::new(state)) })
+    }
+
+    pub fn key_path(&self) -> &Path {
+        &self.key_path
     }
 
     pub fn list(&self) -> Vec<RewriteRule> {
@@ -935,7 +1328,7 @@ impl RewriteStore {
         rule.id = st.next_id;
         st.next_id = st.next_id.saturating_add(1);
         st.rules.push(rule.clone());
-        save_persisted(&self.path, &st)?;
+        save_persisted(&self.path, &self.key_path, &st)?;
         Ok(rule)
     }
 
@@ -1012,7 +1405,7 @@ impl RewriteStore {
             return Err(format!("Maximum of {MAX_ENABLED_RULES} enabled rewrite rules reached."));
         }
         st.rules[idx] = incoming.clone();
-        save_persisted(&self.path, &st)?;
+        save_persisted(&self.path, &self.key_path, &st)?;
         Ok(incoming)
     }
 
@@ -1030,7 +1423,7 @@ impl RewriteStore {
         }
         st.rules[idx].enabled = enabled;
         let out = st.rules[idx].clone();
-        save_persisted(&self.path, &st)?;
+        save_persisted(&self.path, &self.key_path, &st)?;
         Ok(out)
     }
 
@@ -1041,34 +1434,58 @@ impl RewriteStore {
         if st.rules.len() == before {
             return Err(format!("There is no rewrite rule {id}."));
         }
-        save_persisted(&self.path, &st)?;
+        save_persisted(&self.path, &self.key_path, &st)?;
         Ok(())
     }
 }
 
-fn save_persisted(path: &Path, st: &PersistedRules) -> Result<(), String> {
+fn save_persisted(path: &Path, key_path: &Path, st: &PersistedRules) -> Result<(), String> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent).map_err(|e| format!("Could not create `{}`: {e}", parent.display()))?;
     }
-    let bytes = serde_json::to_vec_pretty(st).map_err(|e| format!("Could not serialize rewrite rules: {e}"))?;
+    let mut to_write = st.clone();
+    if has_sensitive_value(&to_write.rules) {
+        let key = load_or_create_key(key_path)?;
+        for rule in &mut to_write.rules {
+            let rule_meta = rule.clone();
+            for (idx, action) in rule.actions.iter_mut().enumerate() {
+                let Some((kind, name, slot)) = sensitive_action_parts_mut(action) else { continue };
+                let Some(plain) = slot.as_deref() else { continue };
+                let aad = action_aad(&rule_meta, idx, kind, &name);
+                *slot = Some(seal_value(&key, &aad, plain)?);
+            }
+        }
+    }
+    let bytes = serde_json::to_vec_pretty(&to_write).map_err(|e| format!("Could not serialize rewrite rules: {e}"))?;
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("rewrite_rules.json");
-    let tmp = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
-    let write_res = (|| -> std::io::Result<()> {
+    let mut attempt = 0u8;
+    let (tmp, mut f) = loop {
+        let tmp = path.with_file_name(format!(".{name}.{}.tmp", hex::encode(rand::random::<u64>().to_le_bytes())));
+        let mut o = std::fs::OpenOptions::new();
+        o.write(true).create_new(true);
         #[cfg(unix)]
-        let mut f = {
+        {
             use std::os::unix::fs::OpenOptionsExt;
-            std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?
-        };
-        #[cfg(not(unix))]
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(&bytes)?;
-        f.sync_all()?;
-        std::fs::rename(&tmp, path)?;
-        Ok(())
-    })();
+            o.mode(0o600);
+        }
+        match o.open(&tmp) {
+            Ok(f) => break (tmp, f),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt < 8 => attempt += 1,
+            Err(e) => return Err(format!("Could not save `{}`: {e}", path.display())),
+        }
+    };
+    let write_res = f.write_all(&bytes).and_then(|()| f.sync_all()).and_then(|()| {
+        drop(f);
+        std::fs::rename(&tmp, path)
+    });
     if let Err(e) = write_res {
         let _ = std::fs::remove_file(&tmp);
         return Err(format!("Could not save `{}`: {e}", path.display()));
+    }
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        if let Ok(d) = std::fs::File::open(parent) {
+            let _ = d.sync_all();
+        }
     }
     Ok(())
 }
@@ -1152,5 +1569,213 @@ mod tests {
         assert!(text.contains("Authorization: Bearer supersecret\r\n"), "{text}");
         // Apex domain does not match `*.staging.example.test`
         assert!(set.apply_raw_request_head("staging.example.test", raw).is_none());
+    }
+
+    #[test]
+    fn sensitive_values_are_encrypted_at_rest_with_0600_key_and_bound_by_aad() {
+        let dir = tempfile::tempdir().unwrap();
+        let rules_path = dir.path().join("rewrite_rules.json");
+        let store = RewriteStore::open(rules_path.clone()).unwrap();
+        let key_path = dir.path().join("keys").join("rewrite.key");
+        assert_eq!(store.key_path(), key_path.as_path());
+
+        let secret = "Bearer s3cr3t-rewrite-token-0123456789";
+        let rule = RewriteRule {
+            id: 0,
+            name: "auth header".into(),
+            enabled: false,
+            phase: RewritePhase::Request,
+            priority: 1,
+            matchers: RewriteMatcher { host: Some("api.example.test".into()), ..Default::default() },
+            actions: vec![
+                RewriteAction::SetHeader { name: "Authorization".into(), value: Some(secret.into()), sensitive: true },
+                RewriteAction::SetHeader {
+                    name: "X-Public-Tag".into(),
+                    value: Some("visible-tag".into()),
+                    sensitive: false,
+                },
+            ],
+            note: String::new(),
+        };
+        let created = store.create(rule).unwrap();
+        // Debug never leaks sensitive values.
+        let dbg = format!("{created:?}");
+        assert!(!dbg.contains(secret) && dbg.contains("[redacted]"), "{dbg}");
+
+        // On-disk JSON encrypts sensitive values with enc:v1: and leaves non-sensitive values readable.
+        let disk = std::fs::read_to_string(&rules_path).unwrap();
+        assert!(!disk.contains("s3cr3t-rewrite-token"), "plaintext secret leaked to disk: {disk}");
+        assert!(disk.contains("enc:v1:"), "expected encrypted prefix on disk: {disk}");
+        assert!(disk.contains("visible-tag"), "non-sensitive value should remain readable: {disk}");
+        assert_eq!(std::fs::read(&key_path).unwrap().len(), 32);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(std::fs::metadata(key_path.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
+            assert_eq!(std::fs::metadata(&rules_path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+
+        // Reopen decrypts faithfully.
+        let reopened = RewriteStore::open(rules_path.clone()).unwrap();
+        let loaded = reopened.list();
+        assert_eq!(loaded.len(), 1);
+        assert!(matches!(
+            &loaded[0].actions[0],
+            RewriteAction::SetHeader { value: Some(v), sensitive: true, .. } if v == secret
+        ));
+
+        // Wrong key refuses to decrypt without leaking plaintext.
+        let other_key = dir.path().join("other.key");
+        std::fs::write(&other_key, [9u8; 32]).unwrap();
+        let err = RewriteStore::open_with_key(rules_path.clone(), other_key).err().unwrap();
+        assert!(err.contains("Could not decrypt") && !err.contains("s3cr3t"), "{err}");
+
+        // Missing key refuses to decrypt and does not create a replacement key.
+        let missing_key = dir.path().join("missing.key");
+        let err = RewriteStore::open_with_key(rules_path.clone(), missing_key.clone()).err().unwrap();
+        assert!(err.contains("missing"), "{err}");
+        assert!(!missing_key.exists());
+
+        // Corrupt (short) key is left untouched and rejected.
+        let short_key = dir.path().join("short.key");
+        std::fs::write(&short_key, b"short").unwrap();
+        let err = RewriteStore::open_with_key(rules_path.clone(), short_key.clone()).err().unwrap();
+        assert!(err.contains("32 bytes"), "{err}");
+        assert_eq!(std::fs::read(&short_key).unwrap(), b"short");
+
+        // AAD binds ciphertext to host matcher: editing host on disk breaks decryption.
+        let tampered_host = disk.replace("api.example.test", "evil.example.test");
+        let tampered_path = dir.path().join("tampered_host.json");
+        std::fs::write(&tampered_path, tampered_host).unwrap();
+        let err = RewriteStore::open_with_key(tampered_path, key_path).err().unwrap();
+        assert!(err.contains("Could not decrypt"), "{err}");
+    }
+
+    #[test]
+    fn legacy_plaintext_sensitive_rules_are_migrated_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let rules_path = dir.path().join("rewrite_rules.json");
+        let key_path = dir.path().join("keys").join("rewrite.key");
+        let legacy = serde_json::json!({
+            "next_id": 2,
+            "rules": [{
+                "id": 1,
+                "name": "legacy secret",
+                "enabled": true,
+                "phase": "request",
+                "priority": 1,
+                "matchers": { "host": "legacy.example.test" },
+                "actions": [{
+                    "type": "set_header",
+                    "name": "Authorization",
+                    "value": "Bearer legacy-plaintext-secret-999",
+                    "sensitive": true
+                }],
+                "note": ""
+            }]
+        });
+        std::fs::write(&rules_path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+
+        let store = RewriteStore::open_with_key(rules_path.clone(), key_path.clone()).unwrap();
+        let rules = store.list();
+        assert!(matches!(
+            &rules[0].actions[0],
+            RewriteAction::SetHeader { value: Some(v), sensitive: true, .. } if v == "Bearer legacy-plaintext-secret-999"
+        ));
+
+        // File on disk was immediately rewritten with ciphertext, and key was created with 0600 perms.
+        let on_disk = std::fs::read_to_string(&rules_path).unwrap();
+        assert!(!on_disk.contains("legacy-plaintext-secret-999"), "{on_disk}");
+        assert!(on_disk.contains("enc:v1:"), "{on_disk}");
+        assert_eq!(std::fs::read(&key_path).unwrap().len(), 32);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&key_path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+
+        // Reopening loads decrypted value from migrated ciphertext.
+        let again = RewriteStore::open_with_key(rules_path, key_path).unwrap();
+        assert_eq!(again.snapshot().sensitive_values(), vec!["Bearer legacy-plaintext-secret-999"]);
+    }
+
+    #[test]
+    fn rewrite_set_sensitive_values_and_capture_redaction() {
+        let rules = vec![
+            RewriteRule {
+                id: 1,
+                name: "disabled secret".into(),
+                enabled: false,
+                phase: RewritePhase::Request,
+                priority: 1,
+                matchers: RewriteMatcher::default(),
+                actions: vec![RewriteAction::SetHeader {
+                    name: "X-Disabled".into(),
+                    value: Some("disabled-secret-0000".into()),
+                    sensitive: true,
+                }],
+                note: String::new(),
+            },
+            RewriteRule {
+                id: 2,
+                name: "active secrets".into(),
+                enabled: true,
+                phase: RewritePhase::Request,
+                priority: 1,
+                matchers: RewriteMatcher { host: Some("app.test".into()), ..Default::default() },
+                actions: vec![
+                    RewriteAction::SetHeader {
+                        name: "Authorization".into(),
+                        value: Some("Bearer active-token-123456".into()),
+                        sensitive: true,
+                    },
+                    RewriteAction::SetHeader {
+                        name: "X-Short-Pin".into(),
+                        value: Some("9876".into()),
+                        sensitive: true,
+                    },
+                    RewriteAction::SetHeader { name: "X-Public".into(), value: Some("hello".into()), sensitive: false },
+                ],
+                note: String::new(),
+            },
+            RewriteRule {
+                id: 3,
+                name: "chained matcher on real header".into(),
+                enabled: true,
+                phase: RewritePhase::Request,
+                priority: 2,
+                matchers: RewriteMatcher {
+                    host: Some("app.test".into()),
+                    headers: vec![HeaderMatch { name: "Authorization".into(), value_regex: "active-token".into() }],
+                    ..Default::default()
+                },
+                actions: vec![RewriteAction::SetHeader {
+                    name: "X-Chained".into(),
+                    value: Some("matched".into()),
+                    sensitive: false,
+                }],
+                note: String::new(),
+            },
+        ];
+        let set = RewriteSet::compile(&rules);
+        assert_eq!(set.sensitive_values(), vec!["Bearer active-token-123456", "9876"]);
+        let secrets = set.secrets();
+        assert_eq!(secrets.redact("echo active-token-123456 here"), "echo [redacted] here");
+        assert_eq!(secrets.redact("Bearer active-token-123456"), "[redacted]");
+
+        let raw = b"GET /profile HTTP/1.1\r\nHost: app.test\r\n\r\n";
+        let rw = set.apply_raw_request_head_for_capture("app.test", raw).unwrap();
+        assert!(rw.sensitive_applied);
+        assert_eq!(rw.applied_ids, vec![2, 3]);
+        let wire = String::from_utf8(rw.wire_head).unwrap();
+        let cap = String::from_utf8(rw.captured_head).unwrap();
+        assert!(wire.contains("Authorization: Bearer active-token-123456\r\n"), "{wire}");
+        assert!(wire.contains("X-Short-Pin: 9876\r\n"), "{wire}");
+        assert!(wire.contains("X-Public: hello\r\n") && wire.contains("X-Chained: matched\r\n"), "{wire}");
+        assert!(cap.contains("Authorization: [redacted]\r\n"), "{cap}");
+        assert!(cap.contains("X-Short-Pin: [redacted]\r\n"), "{cap}");
+        assert!(cap.contains("X-Public: hello\r\n") && cap.contains("X-Chained: matched\r\n"), "{cap}");
+        assert!(!cap.contains("active-token-123456") && !cap.contains("9876"), "{cap}");
     }
 }

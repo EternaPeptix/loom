@@ -6,7 +6,9 @@
 //! - Every function is pure and bounded: input is cut at `MAX_SCAN_BYTES` (on a character boundary) before it is
 //!   scanned, a pattern never backtracks (the `regex` crate), and at most `MAX_RUNS` encoded runs are decoded.
 //! - `normalize(text)` removes zero-width and bidirectional control characters (U+200B to U+200F, U+202A to U+202E,
-//!   U+2060 to U+2064, U+2066 to U+2069, U+FEFF) and maps the fullwidth forms of ASCII (U+FF01 to U+FF5E) to ASCII, so
+//!   U+2060 to U+2064, U+2066 to U+2069, U+FEFF, and U+061C: every character `ferret_core::tagsafe::is_bidi_control`
+//!   strips from untrusted output, so a tag the harness neutralizes is the tag a tripwire sees) and maps the fullwidth
+//!   forms of ASCII (U+FF01 to U+FF5E) to ASCII, so
 //!   `ｎｉｐ.ｉｏ` and `ni\u{200b}p.io` match as `nip.io`. Every tripwire matches the normalized text.
 //! - `decoded_views(text)` returns the decoded text of every run of 8 bytes or more that is base64 (standard or
 //!   URL-safe), hex or percent-encoded, when the decoding is mostly printable UTF-8. gzip runs are not decoded here
@@ -147,10 +149,13 @@ patterns! {
 
 /// Remove what hides a name (zero-width and bidirectional controls) and fold fullwidth ASCII to ASCII.
 pub fn normalize(text: &str) -> String {
+    // The zero-width characters, and every bidirectional control the harness strips from untrusted output
+    // (`ferret_core::tagsafe::is_bidi_control`, `U+061C` among them), so a smuggled `<\u{202E}harness` reads as one.
     text.chars()
-        .filter(
-            |c| !matches!(*c as u32, 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064 | 0x2066..=0x2069 | 0xFEFF),
-        )
+        .filter(|c| {
+            !matches!(*c as u32, 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064 | 0x2066..=0x2069 | 0xFEFF)
+                && !ferret_core::tagsafe::is_bidi_control(*c)
+        })
         .map(|c| match c as u32 {
             n @ 0xFF01..=0xFF5E => char::from_u32(n.saturating_sub(0xFF01).saturating_add(0x21)).unwrap_or(c),
             0x3000 => ' ',
@@ -471,6 +476,7 @@ mod tests {
     fn normalize_removes_what_hides_a_name() {
         assert_eq!(normalize("ni\u{200b}p.io"), "nip.io");
         assert_eq!(normalize("\u{202e}evil.example"), "evil.example");
+        assert_eq!(normalize("<\u{061c}harness>"), "<harness>", "the bidi set the harness strips (P0-4)");
         assert_eq!(normalize("ｎｉｐ.ｉｏ"), "nip.io");
         assert_eq!(normalize("plain text"), "plain text");
     }

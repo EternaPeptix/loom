@@ -44,11 +44,16 @@
 //! entry that cannot be parsed is an error sentence naming the entry and its list.
 //!
 //! ## Revoked hosts — `Policy::with_revoked(hosts)`
-//! The operator's revokes of a mission's grants (`Runtime::revoke_scope`): each entry (as granted, a host,
-//! `*.suffix`, an IP literal, optionally with a port) is refused in `check_name` and `check_addr`, rule
-//! `deny revoked {entry}`, right after infrastructure and before `deny`, so a wildcard grant that also
-//! covers the host, `allow`, `mode open` and `allow_private` do not let it through. An entry that cannot
-//! be read is an error sentence naming it.
+//! The operator's revokes of a mission's hosts (`Runtime::revoke_scope`): each entry (a grant as written, or any
+//! host, `*.suffix`, IP literal or CIDR block, optionally with a port: what `network.deny` reads) is refused in
+//! `check_name` and `check_addr`, rule `deny revoked {entry}`, right after infrastructure and before `deny`, so a
+//! wildcard grant that also covers the host, `allow`, `mode open`, `allow_private` and the target's scope do not let
+//! it through; an IP literal or a block also refuses a name that resolves into it. The `allow` patterns, granted
+//! literals (and their private-address unlock) and target blocks an entry covers are taken out as well (a revoke of
+//! `*.sub.test` takes `a.sub.test` out; `10.20.0.0/24` takes `10.20.0.0/25` out and refuses the rest of a wider
+//! block by address). Entries are trimmed; a blank one, one with whitespace or a comma inside, and one that cannot
+//! be read are an error sentence naming it, and nothing is revoked. This is the one parser and matcher of a revoke:
+//! `Proxy::revoke_hosts` narrows a live policy with it and ends the connections it matches.
 //!
 //! ## Decision — `check_name(host, port)` runs before resolving, `check_addr` after
 //! `check_name`, first match wins:
@@ -157,7 +162,9 @@
 //! model endpoint and a Docker host refuse a literal grant of that address (`infrastructure_refusal`
 //! names it too); this machine's own addresses refuse the loopback rules' ports; `metadata.target.test`
 //! is an ordinary host; a revoked host is refused (`deny revoked`) in open mode, under a covering wildcard
-//! grant and by address, and its sibling hosts are not.
+//! grant and by address, and its sibling hosts are not; a revoke narrows an allowlist, a wildcard grant (one name
+//! under it), `mode open` with `allow_private` (one port of a literal, a block inside a wider one) and refuses a
+//! blank or malformed entry.
 
 #![allow(clippy::doc_lazy_continuation)]
 
@@ -321,6 +328,19 @@ impl IpNet {
                 let mask = u128::MAX.checked_shl(128u32.saturating_sub(u32::from(prefix))).unwrap_or(0);
                 IpNet::V6 { base: u128::from(a) & mask, mask }
             }
+        }
+    }
+
+    /// Whether `self` is equal to or a supernet of `other`.
+    fn covers(&self, other: &IpNet) -> bool {
+        match (self, other) {
+            (IpNet::V4 { base: b1, mask: m1 }, IpNet::V4 { base: b2, mask: m2 }) => {
+                m1.count_ones() <= m2.count_ones() && (*b2 & *m1) == *b1
+            }
+            (IpNet::V6 { base: b1, mask: m1 }, IpNet::V6 { base: b2, mask: m2 }) => {
+                m1.count_ones() <= m2.count_ones() && (*b2 & *m1) == *b1
+            }
+            _ => false,
         }
     }
 
@@ -694,6 +714,97 @@ fn parse_list<T>(list: &str, entries: &[String], parse: fn(&str) -> Result<T, St
         .collect()
 }
 
+/// The entries of a revoke (`Policy::with_revoked`, `Proxy::revoke_hosts`): hosts, `*.suffix` patterns, IP literals
+/// and CIDR blocks, each optionally with a port, as `network.deny` reads them. The one parser and the one matcher of a
+/// revoke: the policy refuses what it matches (`deny revoked {entry}`) and the proxy ends the live connections it
+/// matches.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RevokeMatcher {
+    entries: Vec<PrivEntry>,
+}
+
+impl RevokeMatcher {
+    /// Trims each entry and refuses a blank one, one with whitespace or a comma inside, and one that is not a host,
+    /// a pattern, an address or a block, with a sentence naming it.
+    pub(crate) fn parse(hosts: &[String]) -> Result<Self, String> {
+        let mut entries = Vec::with_capacity(hosts.len());
+        for raw in hosts {
+            let h = raw.trim();
+            if h.is_empty() {
+                return Err("A host to revoke is blank.".into());
+            }
+            if h.chars().any(|c| c.is_whitespace() || c == ',') {
+                return Err(format!("The host entry \"{h}\" to revoke contains whitespace or a comma."));
+            }
+            let entry = PrivEntry::parse(h).map_err(|why| format!("The host \"{h}\" cannot be revoked: {why}."))?;
+            entries.push(entry);
+        }
+        Ok(Self { entries })
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Whether an entry covers a connection to `host:port`, by name and by `resolved` (the address it was opened
+    /// to, when known; an IP literal host is its own address): the rule `check_name` and `check_addr` apply.
+    pub(crate) fn matches(&self, host: &str, port: u16, resolved: Option<IpAddr>) -> bool {
+        let h = normalize_host(host);
+        let addr = resolved.or_else(|| h.parse::<IpAddr>().ok());
+        Policy::list_hit(&self.entries, "", &h, port, addr).is_some()
+    }
+}
+
+fn pattern_revoked_by(p: &Pattern, entry: &PrivEntry) -> bool {
+    match entry {
+        PrivEntry::Name(r) => {
+            if r.port.is_some() && r.port != p.port {
+                return false;
+            }
+            match (&r.kind, &p.kind) {
+                (Kind::Any, _) => true,
+                (Kind::Exact(rh), Kind::Exact(ph)) => {
+                    rh == ph
+                        || match (rh.parse::<IpAddr>(), ph.parse::<IpAddr>()) {
+                            (Ok(a), Ok(b)) => canonical_ip(a) == canonical_ip(b),
+                            _ => false,
+                        }
+                }
+                (Kind::Suffix(rs), Kind::Exact(ph)) => ph.len() > rs.len() && ph.ends_with(rs.as_str()),
+                (Kind::Suffix(rs), Kind::Suffix(ps)) => ps == rs || ps.ends_with(rs.as_str()),
+                _ => false,
+            }
+        }
+        PrivEntry::Net { net, .. } => match &p.kind {
+            Kind::Exact(ph) => ph.parse::<IpAddr>().ok().is_some_and(|ip| net.contains(ip)),
+            _ => false,
+        },
+    }
+}
+
+fn granted_private_revoked_by(ip: IpAddr, port: Option<u16>, entry: &PrivEntry) -> bool {
+    match entry {
+        PrivEntry::Net { net, .. } => net.contains(ip),
+        PrivEntry::Name(r) => {
+            if r.port.is_some() && r.port != port {
+                return false;
+            }
+            match &r.kind {
+                Kind::Any => true,
+                Kind::Exact(rh) => rh.parse::<IpAddr>().ok().is_some_and(|rip| canonical_ip(rip) == canonical_ip(ip)),
+                Kind::Suffix(_) => false,
+            }
+        }
+    }
+}
+
+fn priv_entry_text(e: &PrivEntry) -> &str {
+    match e {
+        PrivEntry::Name(p) => &p.text,
+        PrivEntry::Net { text, .. } => text,
+    }
+}
+
 impl Policy {
     pub fn new(cfg: &NetworkCfg) -> Result<Policy, String> {
         Ok(Policy {
@@ -754,14 +865,14 @@ impl Policy {
         Ok(self)
     }
 
-    /// This policy with `hosts` (entries as granted) refused as revoked, in the rule `deny revoked {entry}`:
-    /// after infrastructure and before every other rule, so a wildcard grant, `allow` and `mode open` do
-    /// not reach them. An entry that cannot be read is an error sentence naming it.
+    /// This policy with `hosts` refused as revoked (entries as granted, or any host, `*.suffix`, IP literal or CIDR
+    /// block, optionally with a port), in the rule `deny revoked {entry}`: after infrastructure and before every other
+    /// rule, so a wildcard grant, `allow`, `allow_private`, the target's scope and `mode open` do not reach them. The
+    /// `allow` patterns, granted literals and target blocks an entry covers are also taken out. An entry that cannot be
+    /// read is an error sentence naming it.
     pub fn with_revoked(mut self, hosts: &[String]) -> Result<Policy, String> {
-        for h in hosts {
-            let e = PrivEntry::parse(h).map_err(|why| format!("The revoked host \"{h}\" is not valid: {why}."))?;
-            self.revoked.push(e);
-        }
+        let matcher = RevokeMatcher::parse(hosts)?;
+        self.apply_revoke(&matcher);
         Ok(self)
     }
 
@@ -873,6 +984,27 @@ impl Policy {
         }
         policy.mode = NetworkMode::Allowlist;
         Ok(policy)
+    }
+
+    /// What `with_revoked` does with parsed entries (also `Proxy::revoke_hosts`, on a live policy): the entries join
+    /// the revoked list (once each, ignoring case), and the `allow` patterns, granted literals and target blocks they
+    /// cover are taken out.
+    pub(crate) fn apply_revoke(&mut self, matcher: &RevokeMatcher) {
+        if matcher.is_empty() {
+            return;
+        }
+        self.allow.retain(|p| !matcher.entries.iter().any(|e| pattern_revoked_by(p, e)));
+        self.granted_private
+            .retain(|(ip, port)| !matcher.entries.iter().any(|e| granted_private_revoked_by(*ip, *port, e)));
+        self.target_nets.retain(|(_, net)| {
+            !matcher.entries.iter().any(|e| matches!(e, PrivEntry::Net { net: rnet, .. } if rnet.covers(net)))
+        });
+        for entry in &matcher.entries {
+            let t = priv_entry_text(entry);
+            if !self.revoked.iter().any(|d| priv_entry_text(d).eq_ignore_ascii_case(t)) {
+                self.revoked.push(entry.clone());
+            }
+        }
     }
 
     pub fn check_name(&self, host: &str, port: u16) -> Verdict {
@@ -1976,5 +2108,33 @@ mod tests {
         assert!(infra_rule(&p.check_name("127.0.0.1", 9222)));
         assert!(infra_rule(&p.check_name("metadata.google.internal", 80)));
         assert!(p.check_name("lab.test", 80).allowed);
+    }
+
+    #[test]
+    fn a_revoke_narrows_allowlist_wildcards_open_and_cidrs() {
+        let c = cfg(NetworkMode::DenyAll, &[], &[], &[]);
+        let p = Policy::with_hosts(&c, &hosts(&["a.test", "b.test", "*.sub.test", "127.0.0.1:8080"])).unwrap();
+
+        let p2 = p.clone().with_revoked(&hosts(&["a.test", "admin.sub.test", "127.0.0.1:8080"])).unwrap();
+        assert!(!p2.check_name("a.test", 443).allowed);
+        assert!(p2.check_name("b.test", 443).allowed);
+        assert!(!p2.check_name("admin.sub.test", 443).allowed);
+        assert!(p2.check_name("app.sub.test", 443).allowed);
+        assert!(!p2.check_name("127.0.0.1", 8080).allowed);
+        assert!(!p2.check_addr("127.0.0.1", 8080, ip("127.0.0.1"), "allow").allowed);
+
+        // Open mode with allow_private + port-specific and CIDR revocation
+        let open = pol(NetworkMode::Open, &[], &[], &["127.0.0.1", "10.0.0.0/8"]);
+        let narrowed = open.clone().with_revoked(&hosts(&["127.0.0.1:8080", "10.20.0.0/24"])).unwrap();
+        assert!(!narrowed.check_name("127.0.0.1", 8080).allowed);
+        assert!(narrowed.check_name("127.0.0.1", 8081).allowed);
+        assert!(!narrowed.check_addr("127.0.0.1", 8080, ip("127.0.0.1"), "mode open").allowed);
+        assert!(narrowed.check_addr("127.0.0.1", 8081, ip("127.0.0.1"), "mode open").allowed);
+        assert!(!narrowed.check_addr("internal.test", 80, ip("10.20.0.5"), "mode open").allowed);
+        assert!(narrowed.check_addr("internal.test", 80, ip("10.30.0.5"), "mode open").allowed);
+
+        // Invalid host to revoke fails cleanly
+        assert!(open.clone().with_revoked(&hosts(&["bad host"])).is_err());
+        assert!(open.clone().with_revoked(&hosts(&[""])).is_err());
     }
 }

@@ -282,13 +282,32 @@ pub fn scope_granted(hosts: &[String], note: Option<&str>) -> String {
     )
 }
 
-/// The operator withdrew network access to `host`; `reason` is the operator's.
-pub fn scope_revoked(host: &str, reason: &str) -> String {
-    let reason = reason.trim();
-    let why = if reason.is_empty() { String::new() } else { format!(" Operator's reason: {}", sentence(reason)) };
+/// The operator revoked network access to `hosts` for the mission (`Runtime::revoke_scope`); `connections_cut` open
+/// connections were ended; `reason` is the operator's, when they gave one.
+pub fn scope_revoked(hosts: &[String], reason: Option<&str>, connections_cut: usize) -> String {
+    let why = reason
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .map(|r| format!(" Operator's reason: {}", sentence(r)))
+        .unwrap_or_default();
+    let cut = if connections_cut == 1 {
+        "1 open connection was cut".to_string()
+    } else {
+        format!("{connections_cut} open connections were cut")
+    };
     format!(
-        "The operator withdrew network access to {host}. Connections to it are cut and new ones are refused; do not look for another route to it. Work with the hosts that are still authorized.{why}"
+        "The operator revoked network access to {}. Connections to them are cut ({cut}) and new ones are refused; do not look for another route to them. Work with the hosts that are still authorized.{why}",
+        hosts.join(", ")
     )
+}
+
+/// The operator triggered the emergency panic kill-switch.
+pub fn panic_stopped(reason: Option<&str>) -> String {
+    const DONE: &str = "All network grants were revoked, active sessions stopped, what they left running under their sandboxes stopped, boxes torn down, and proxy rewrites disabled.";
+    match reason.map(str::trim).filter(|r| !r.is_empty()) {
+        Some(r) => format!("Emergency panic stop triggered by the operator: {} {DONE}", sentence(r)),
+        None => format!("Emergency panic stop triggered by the operator. {DONE}"),
+    }
 }
 
 /// The protected note recorded when the operator closes a mission short of its goal.
@@ -1222,11 +1241,17 @@ mod tests {
 
     #[test]
     fn a_scope_revoke_note_names_the_host_the_reason_and_that_there_is_no_other_route() {
-        let t = scope_revoked("api.example.test", " wrong target ");
-        assert!(t.contains("withdrew network access to api.example.test"), "{t}");
+        let one = ["api.example.test".to_string()];
+        let t = scope_revoked(&one, Some(" wrong target "), 1);
+        assert!(t.contains("revoked network access to api.example.test"), "{t}");
         assert!(t.contains("Operator's reason: wrong target."), "{t}");
         assert!(t.contains("do not look for another route"), "{t}");
-        assert!(!scope_revoked("a.test", "  ").contains("reason"));
+        assert!(t.contains("1 open connection was cut"), "{t}");
+        let two = ["a.test".to_string(), "b.test".to_string()];
+        assert!(
+            scope_revoked(&two, None, 2).contains("a.test, b.test") && scope_revoked(&two, None, 2).contains("2 open")
+        );
+        assert!(!scope_revoked(&two, Some("  "), 0).contains("reason"));
     }
 
     #[test]

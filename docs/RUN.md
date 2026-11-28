@@ -184,11 +184,19 @@ A session can also be given hosts by you while it runs. When it needs one it doe
 calls `request_scope`; an item naming the hosts and why waits in your inbox, and the session keeps
 working. `ferret scope <session> <host>...` grants them (the UI and the app have an Approve button on the
 item). The grant is recorded in the mission's ledger, applies to that mission only, and ends with the
-session. `ferret scope revoke <mission> <host> --reason <text>` takes one granted host back (the host as it was
-granted; the mission is an `m-` id or any session of it): it is recorded in the ledger, refused to the running
-sessions at once (also under a wildcard grant that covers it, `network.allow` and `mode open`: it is refused as
-`deny revoked <host>` until you grant it again), and its open connections are cut. The revoke is kept on disk, so a
-restart does not bring the host back. A host only a wildcard grant covers is revoked by revoking the wildcard.
+session. `ferret scope revoke <mission|session> <host>... [--reason <text>] [--json]` (`--note` is the same flag;
+the mission is an `m-` id or any session of it; the web UI's Revoke button beside a granted host and Signal's
+`/scope revoke` do the same) takes hosts back: a grant, written as it was granted, is recorded in the ledger (with
+`no reason given` when you give none); any other host, `*.suffix`, address or CIDR block (a name under a wildcard
+grant, a host `mode open`, `network.allow` or the target's scope reaches) is revoked too, without a ledger record.
+Each is refused to the mission's sessions and its MCP servers at once (also under a wildcard grant that covers it,
+`network.allow`, `allow_private` and `mode open`: it is refused as `deny revoked <host>` until you grant it again),
+their open connections to it are cut (by name and by the address a connection was opened to), and the box rules
+follow. The revoke is kept on disk, so a restart does not bring the host back, whatever the ledger says of a grant
+recorded later. For an immediate daemon-wide halt, `ferret panic [--reason <text>] [--json]` (or the confirmed Panic
+button in the web UI / `/panic` on Signal) cuts every proxy tunnel, disables every proxy rewrite rule, stops every
+active session, stops what the sessions left running under their sandboxes (found by the process census), and
+tears down every `[box]` container.
 
 The proxy also looks at the name a command asks an HTTPS server for. A tunnel's TLS ClientHello must name the host the command
 connected to, or another host its policy allows; a hello that hides the name (an encrypted ClientHello naming another host),
@@ -199,8 +207,8 @@ encrypted-ClientHello extension with the real name in the clear on every hello; 
 so browsers work through the proxy without a switch. A decoy host or a ferret-internal address the daemon
 vetoes answers `502` ("closed to this mission by ferret's own rules"), and a lab port on this machine that another mission's sandboxed
 process listens on is refused with `403`. A grant
-the lead has not recorded yet is revoked without a ledger entry (`recorded: false`); run the revoke again once
-`ferret ledger` lists the grant and it is recorded. `ferret net <session>` lists the hosts granted so far. Under `deny_all` a grant allows exactly the
+the lead has not recorded yet is revoked without a ledger entry (it is not in the receipt's `recorded`); run the
+revoke again once `ferret ledger` lists the grant and it is recorded. `ferret net <session>` lists the hosts granted so far. Under `deny_all` a grant allows exactly the
 granted hosts; the `allow` list stays off. `*`, a wildcard over a whole top-level domain (`*.com`) or
 over IP addresses (`*.0.1`), the unspecified address (`0.0.0.0`, `::`) and a loopback address without a
 port (`127.0.0.1`; write `127.0.0.1:8080`) cannot be requested or granted: name the hosts, or a wildcard
@@ -231,7 +239,8 @@ With `[sandbox] mode = "seatbelt"` (the default) commands run under a macOS sand
 - no network except the egress proxy (plus `loopback_ports`, `loopback_all`, `unix_sockets`);
 - no LaunchServices opens, Apple Events or launchd jobs;
 - only the Mach services the usual toolchains need (Spotlight's `mdfind`, the clipboard, the keychain and audio fail): a
-  tool that needs one more is fixed with `[sandbox] mach_allow`. Headless Chromium (Playwright, Puppeteer) finds its child
+  tool that needs one more is fixed with `[sandbox] mach_allow` (not the keychain or the clipboard while
+  `protect_credentials` is on: they are denied after the allows). Headless Chromium (Playwright, Puppeteer) finds its child
   processes through `org.chromium.Chromium`, `com.google.Chrome` and `com.google.chrome.for.testing` rendezvous names, which
   are allowed (the launch itself was not run on the gate host); another build (Edge, Electron) needs
   `mach_allow = ["<bundle id>.MachPortRendezvousServer.*"]`;
@@ -325,9 +334,12 @@ hosts = ["mcp.example.com"]
 read_only = true                      # the verifier gets its tools too
 ```
 
-Prefer `env:NAME` or `file:/path` for secrets: a literal in the file makes the daemon warn at start, and a value
-is never written to a log or a record. `hosts` are granted to every session whose role gets the server, and
-that includes the agent's own `bash` and `web_fetch`: list only hosts you would let the agent reach.
+Prefer `env:NAME` or `file:/path` for secrets: a literal in the file makes the daemon warn at start, `file:`
+paths must be regular `0600` files owned by you (no symlinks), and secret values are redacted before wire
+capture or logs. HTTP MCP server `hosts` stay isolated to that MCP server's transport rather than widening
+the session's general `bash`/`web_fetch` egress scope. Set `pinned_schema_sha256` (64 hex chars) to pin a
+server's tool schemas against rug-pulls; `trust_read_only_hints` defaults to `false` so servers cannot
+self-declare tools as read-only unless you explicitly opt in.
 
 ```
 ferret mcp list                                   # the configured servers, transport and roles
@@ -366,8 +378,9 @@ What the box can reach is the mission's grants: exact hosts and IP addresses giv
 `box_exec` of a session says so). The daemon resolves names, applies the `[network]` policy to the
 addresses (private addresses need `allow_private`), passes the names that resolved to `docker run` as
 `--add-host` (the container's root is read-only, so Docker writes its `/etc/hosts` at creation), and writes the
-result into rules on the Docker VM (chain `FERRET-<id>`); everything else, including DNS and IPv6, is dropped. `DOCKER-USER` and `INPUT` send
-everything that enters on a box bridge (`fb-*`) to a static chain `FERRET-ALL`, which holds one jump per
+result into rules on the Docker VM (chain `FERRET-<id>`); everything else, including DNS and IPv6
+(`FERRET-ALL6`), is dropped. `INPUT -i fb-+` unconditionally `DROP`s container-to-host traffic while
+`DOCKER-USER` sends forwarded traffic from a box bridge (`fb-*`) to `FERRET-ALL`, which holds one jump per
 mission and ends with `DROP`: a box bridge without its own chain is dropped, never routed or translated.
 The Docker host must not have other interfaces named `fb-*`: they are dropped by `FERRET-ALL`. A revoked
 grant cuts open flows at once (the mission chain has no rule for established traffic). A name granted
@@ -375,8 +388,10 @@ after the box exists is reachable by address at once but resolves inside the box
 (which wipes `/work`); until then each `box_exec` result carries a line that says so.
 ferret checks a running box's rules about once a minute and puts them back if they are gone; if that fails
 twice it pauses the box (keeping `/work`), refuses the command, and resumes the box when a later check
-works. A new grant, a release and the end of the mission update or remove the rules. The box has no
-other mounts, no devices, all capabilities dropped except `cap_add`, a read-only root, and tmpfs `/work`
+works. A new grant, a revocation, a release, a panic stop, and the end of the mission update or remove the rules.
+The box runs with a hardened default-deny seccomp profile, bounded `noexec` `/dev/shm`, no other mounts, no
+devices, all capabilities dropped except the tight `cap_add` allowlist (`NET_RAW`, `NET_BIND_SERVICE` only),
+a read-only root, and tmpfs `/work`
 and `/tmp` (both executable): files in it are lost when the mission ends or on `box_reset`. The image
 needs `/bin/sh`, `/bin/bash`, `setsid` (util-linux) and `/usr/bin/tar` (GNU tar, or one that supports
 `--format=pax`); Docker supplies the init. Files go in and out through `docker exec ... tar` as user 1000, not
@@ -428,8 +443,14 @@ or steer missions directly from Signal. It is off by default.
    # allow_groups = ["<groupId>"]  # optional; raw id or "group:<id>" (group recipient added automatically)
    # events = ["blocker", "question", "approval", "parked", "finished", "error", "disk"]
    # max_chars = 3500              # 200..=7500
+   # inbox_delay_secs = 0          # 0..=86400; e.g. 600 = wait 10 min before buzzing for open inbox items
    ```
 
+   Plaintext `http://` is restricted to loopback addresses (`127.0.0.1`, `localhost`, `[::1]`; remote URLs must
+   use `https://`). When `inbox_delay_secs > 0`, outbound alerts for inbox items (`blocker`, `question`,
+   `approval`, `parked`) wait until the item has remained open for that many seconds (including across daemon
+   restarts); if you answer, approve, or dismiss it at the computer first, no Signal alert is sent. `finished`,
+   `error`, `disk`, guest alerts, and direct command replies are always sent immediately.
    For Note-to-Self mode, set `recipient = "+15550100"` and `allow_from = ["+15550100"]`. Unanswered
    blocking reminders follow `[notify] repeat_minutes` (default `0`, off) and open blocking items are
    re-notified after a daemon restart; add `"disk"` to `events` to receive low-disk warnings on Signal.
@@ -499,8 +520,9 @@ outbound alerts) will fail with `UNTRUSTED_IDENTITY`. To trust the updated ident
 - **`@<id> <text>`** answers an open inbox item or messages a mission by ID prefix/suffix (or short `#n`
   index shown by `/inbox` and `/status`).
 - **Slash commands:** `/inbox`, `/status`, `/tail [id|#n] [count]`, `/scope <id|#n> [host...]`,
-  `/dismiss [id|#n]`, `/stop [id|#n]`, `/resume [id|#n]`, `/approve <id|#n> <text>`,
-  `/rule <id|#n> <text>`, `/release <id|#n> <reason>`, `/mute [15m|2h|off]`, `/unmute`, and `/help` (`/start`).
+  `/scope revoke <id|#n> <host>...`, `/panic [reason]`, `/dismiss [id|#n]`, `/stop [id|#n]`,
+  `/resume [id|#n]`, `/approve <id|#n> <text>`, `/rule <id|#n> <text>`, `/release <id|#n> <reason>`,
+  `/mute [15m|2h|off]`, `/unmute`, and `/help` (`/start`).
   When `[signal.guests]` is enabled, operators also have `/guests` and `/guest approve|revoke|block|unblock|clear|say`.
 
 ### Guest chat and unknown-sender gatekeeper
@@ -664,16 +686,17 @@ Exit status of `run` and `send`: 0 after `Finished` or `Yielded`; 2 when you are
 | `ferret rule <session> <text...>` | set a standing rule (a ledger constraint) for the mission |
 | `ferret rule <session> --withdraw <rule-id> [--reason <text>]` | withdraw a rule |
 | `ferret approve <session> <text...> [--scope <text>]` | record an approval |
-| `ferret scope <session> <host>... [--note <text>]` | let the mission's tools reach these hosts (one host per argument) |
-| `ferret scope revoke <mission> <host> --reason <text>` | take a granted host back: recorded, refused at once, open connections cut |
+| `ferret scope <session> <host>... [--note <text>] [--json]` | let the mission's tools reach these hosts (one host per argument; also `ferret scope grant <session> <host>...`) |
+| `ferret scope revoke <mission\|session> <host>... [--reason <text>] [--json]` | take hosts back: refused at once whatever else allows them, open connections cut, recorded in the ledger when they were grants (`--note` is `--reason`) |
+| `ferret panic [--reason <text>] [--json]` | emergency kill-switch: sever all proxy tunnels, stop all active sessions and what they left running under their sandboxes, tear down active boxes, and disable all rewrite rules |
 | `ferret release <session> <reason...>` | accept a blocked mission as it is and close it: "closed by operator, goal not established" |
 | `ferret inbox [--json]` | list questions, approvals, scope requests and blockers waiting for you |
 | `ferret answer <item> [text... \| --dismiss]` | answer or dismiss an inbox item (`<item>`: id, prefix, unique 4+ char suffix, `last`, or `.` for the sole waiting item; bare `1..N` selects a numbered option; reads piped stdin when `text` is omitted; `--dismiss` or empty on TTY dismisses non-blocking items) |
 | `ferret ledger <session\|mission> [--json]` | print the mission ledger |
 | `ferret findings <session\|mission> [-a/--all] [--severity <level>] [--json]` | show a mission's structured security findings and surface coverage (`-a`: include withdrawn; `--severity`: `critical\|high\|medium\|low\|info`) |
-| `ferret sarif <session\|mission> [-o <path>] [--repo-name ...] [--repo-uri ...] [--commit ...] [--branch ...] [--git-ref ...]` | export active findings and coverage provenance as SARIF 2.1.0 |
+| `ferret sarif <session\|mission> [-o <path>] [--include-secrets] [--repo-name ...] [--repo-uri ...] [--commit ...] [--branch ...] [--git-ref ...]` | export active findings and coverage provenance as SARIF 2.1.0 (secrets redacted by default; pass `--include-secrets` to opt out) |
 | `ferret traffic <session> [--host <host>] [--after <seq>] [-n <limit>] [--json]` (alias `exchanges`) | inspect captured HTTP exchanges for a session (`--target <name> [--node <node>]` inspects across all missions of a target instead) |
-| `ferret har export <session\|mission> [-o <path>] [--host <host>] [--limit <N>]` | export captured HTTP exchanges as HAR 1.2 JSON |
+| `ferret har export <session\|mission> [-o <path>] [--host <host>] [--limit <N>] [--include-secrets]` | export captured HTTP exchanges as HAR 1.2 JSON (sanitized by default; pass `--include-secrets` to opt out) |
 | `ferret har import <session\|mission> <file.har>` | import a HAR 1.2 file into a mission's traffic log (idempotent) |
 | `ferret rewrite list\|add\|enable\|disable\|rm\|example` | manage operator-only proxy rewrite rules (`list`/`ls` supports `--json`; `example` prints a JSON template for `add <file>`; `rm`/`remove`/`delete`) |
 | `ferret mail check` | verify `[mail]` configuration, credentials, read-only mailbox access, and sender allowlist |

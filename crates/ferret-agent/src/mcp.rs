@@ -42,7 +42,25 @@ pub fn pack_servers<'a>(cfg: &'a McpCfg, roles: &[(&str, bool)]) -> Vec<&'a str>
     cfg.servers.iter().filter(|(_, s)| roles.iter().any(|(r, ro)| serves(s, r, *ro))).map(|(n, _)| n.as_str()).collect()
 }
 
-/// The hosts the servers of a role add to its sessions' allowed hosts (M4), without repeats.
+/// The marker in the proxy grant id of an MCP server's isolated egress grant: `<session>__mcp__<server>` (P0-7).
+pub const GRANT_MARK: &str = "__mcp__";
+
+/// The proxy grant id of MCP server `server` of `session`: a grant of its own, isolated from the session's policy.
+pub fn grant_id(session: &ferret_core::SessionId, server: &str) -> ferret_core::SessionId {
+    ferret_core::SessionId::from(format!("{}{GRANT_MARK}{server}", session.as_str()))
+}
+
+/// The session a proxy grant id belongs to: the session itself, or the one an MCP server's isolated grant was made
+/// for. What a grant does is the session's: its net records, its floor events, its mission's own listeners.
+pub fn grant_owner(grant: &ferret_core::SessionId) -> ferret_core::SessionId {
+    match grant.as_str().split_once(GRANT_MARK) {
+        Some((base, _)) => ferret_core::SessionId::from(base),
+        None => grant.clone(),
+    }
+}
+
+/// The hosts the servers of a role declare (M4), without repeats: what their isolated proxy grants may reach (P0-7;
+/// never the session's own policy) and what the monitor's authorization counts as the tools' backends.
 pub fn hosts_for_role(cfg: &McpCfg, role: &str, read_only: bool) -> Vec<String> {
     let mut hosts: Vec<String> = Vec::new();
     for name in role_servers(cfg, role, read_only) {
@@ -139,7 +157,7 @@ pub fn start_note(picks: &[ServerPick], budget: u64) -> Option<String> {
             }
         }
         if !p.hosts.is_empty() {
-            parts.push(format!("added to the allowed hosts: {}", p.hosts.join(", ")));
+            parts.push(format!("MCP-only allowed hosts: {}", p.hosts.join(", ")));
         }
         let mut left: Vec<String> = Vec::new();
         if p.by_filter > 0 {
@@ -160,19 +178,80 @@ pub fn start_note(picks: &[ServerPick], budget: u64) -> Option<String> {
     Some(out)
 }
 
+/// Isolated network/sandbox context for one MCP server so MCP traffic uses its own dedicated
+/// egress proxy grant and never widens the session's general `Policy` (`bash`, `http_send`,
+/// `web_fetch`).
+#[derive(Clone)]
+pub struct McpServerContext {
+    pub tool_proxy: String,
+    pub env: Arc<BTreeMap<String, String>>,
+    pub sandbox: Option<Arc<ferret_tools::sandbox::Sandbox>>,
+}
+
+/// Build a [`ToolCtx`] scoped strictly to one MCP server's isolated proxy/sandbox context.
+pub fn scoped_tool_ctx(base: &ToolCtx, override_ctx: &McpServerContext) -> ToolCtx {
+    let mut ctx = base.clone();
+    ctx.env = override_ctx.env.clone();
+    ctx.reference_proxy = None;
+    if let Some(sb) = &override_ctx.sandbox {
+        ctx.sandbox = sb.clone();
+    }
+    let caps = ferret_tools::capabilities::SessionTools::new(
+        base.capabilities.command_guard,
+        base.capabilities.target_concurrency,
+    );
+    let _ = caps.tool_proxy.set(override_ctx.tool_proxy.clone());
+    if let Some(lookup) = base.capabilities.exchange_lookup.get() {
+        let _ = caps.exchange_lookup.set(lookup.clone());
+    }
+    // Intentionally omit `creds` and `secrets` (S8: MCP never receives target profile items).
+    ctx.capabilities = Arc::new(caps);
+    ctx
+}
+
+/// An [`McpTool`] wrapper that executes every call inside its server's isolated [`McpServerContext`].
+pub struct ScopedMcpTool {
+    inner: McpTool,
+    context: Option<McpServerContext>,
+}
+
+#[async_trait::async_trait]
+impl ferret_tools::Tool for ScopedMcpTool {
+    fn spec(&self) -> ToolSpec {
+        self.inner.spec()
+    }
+
+    async fn run(&self, ctx: &ToolCtx, args: &serde_json::Map<String, serde_json::Value>) -> ferret_tools::ToolOutput {
+        match &self.context {
+            Some(override_ctx) => {
+                let scoped = scoped_tool_ctx(ctx, override_ctx);
+                self.inner.run(&scoped, args).await
+            }
+            None => self.inner.run(ctx, args).await,
+        }
+    }
+}
+
 /// What one session owns of its MCP servers.
 pub struct McpSession {
     /// The listing of the mission (every server its lead connected to), as recorded.
     listings: Vec<McpListing>,
     picks: Vec<ServerPick>,
     handles: Vec<(String, Arc<McpHandle>)>,
+    contexts: BTreeMap<String, McpServerContext>,
     note: Option<String>,
 }
 
 impl McpSession {
     /// A session without MCP tools.
     pub fn none() -> McpSession {
-        McpSession { listings: Vec::new(), picks: Vec::new(), handles: Vec::new(), note: None }
+        McpSession {
+            listings: Vec::new(),
+            picks: Vec::new(),
+            handles: Vec::new(),
+            contexts: BTreeMap::new(),
+            note: None,
+        }
     }
 
     /// What `role` gets of `listings`. `handles` are connections already made (the lead's listing
@@ -184,7 +263,20 @@ impl McpSession {
         role: &str,
         read_only: bool,
         listings: Vec<McpListing>,
+        handles: BTreeMap<String, Arc<McpHandle>>,
+    ) -> McpSession {
+        Self::plan_with_contexts(cfg, role, read_only, listings, handles, BTreeMap::new())
+    }
+
+    /// Like [`McpSession::plan`], attaching per-server isolated [`McpServerContext`]s so MCP tools
+    /// reach their configured hosts without widening the session's general network policy.
+    pub fn plan_with_contexts(
+        cfg: &McpCfg,
+        role: &str,
+        read_only: bool,
+        listings: Vec<McpListing>,
         mut handles: BTreeMap<String, Arc<McpHandle>>,
+        contexts: BTreeMap<String, McpServerContext>,
     ) -> McpSession {
         let mut picks = Vec::new();
         let mut owned = Vec::new();
@@ -236,7 +328,7 @@ impl McpSession {
             tokio::spawn(async move { h.close().await });
         }
         let note = start_note(&picks, cfg.max_schema_tokens);
-        McpSession { listings, picks, handles: owned, note }
+        McpSession { listings, picks, handles: owned, contexts, note }
     }
 
     pub fn listings(&self) -> &[McpListing] {
@@ -254,6 +346,23 @@ impl McpSession {
             let Some((_, handle)) = self.handles.iter().find(|(n, _)| n == &p.server) else { continue };
             for (name, def) in &p.presented {
                 out.push(McpTool { handle: handle.clone(), name: name.clone(), def: def.clone() });
+            }
+        }
+        out
+    }
+
+    /// The tools to put in the session's registry, each wrapped in its server's isolated
+    /// [`McpServerContext`] when present.
+    pub fn scoped_tools(&self) -> Vec<ScopedMcpTool> {
+        let mut out = Vec::new();
+        for p in &self.picks {
+            let Some((_, handle)) = self.handles.iter().find(|(n, _)| n == &p.server) else { continue };
+            let context = self.contexts.get(&p.server).cloned();
+            for (name, def) in &p.presented {
+                out.push(ScopedMcpTool {
+                    inner: McpTool { handle: handle.clone(), name: name.clone(), def: def.clone() },
+                    context: context.clone(),
+                });
             }
         }
         out
@@ -295,6 +404,17 @@ pub async fn list_servers(
     names: &[&str],
     ctx: &ToolCtx,
 ) -> (Vec<McpListing>, BTreeMap<String, Arc<McpHandle>>) {
+    list_servers_with_contexts(cfg, names, ctx, &BTreeMap::new()).await
+}
+
+/// Like [`list_servers`], executing each server's handshake and `tools/list` inside its isolated
+/// [`McpServerContext`] when present.
+pub async fn list_servers_with_contexts(
+    cfg: &McpCfg,
+    names: &[&str],
+    ctx: &ToolCtx,
+    contexts: &BTreeMap<String, McpServerContext>,
+) -> (Vec<McpListing>, BTreeMap<String, Arc<McpHandle>>) {
     let jobs = names.iter().map(|name| async move {
         let scfg = &cfg.servers[*name];
         let transport = if scfg.url.is_some() { "http" } else { "stdio" };
@@ -313,7 +433,11 @@ pub async fn list_servers(
         };
         let handle = McpHandle::new(server, Duration::from_secs(cfg.idle_close_s));
         let wait = Duration::from_secs(scfg.timeout_s.max(1));
-        match tokio::time::timeout(wait, handle.list(ctx)).await {
+        let list_ctx = match contexts.get(*name) {
+            Some(override_ctx) => scoped_tool_ctx(ctx, override_ctx),
+            None => ctx.clone(),
+        };
+        match tokio::time::timeout(wait, handle.list(&list_ctx)).await {
             Ok(Ok(listing)) => (listing, Some(handle)),
             Ok(Err(e)) => (failed(e), Some(handle)),
             Err(_) => (failed(format!("the server did not list its tools within {}s", wait.as_secs())), Some(handle)),
@@ -566,7 +690,7 @@ mod tests {
         assert_eq!(
             note,
             "MCP servers for this session. Their tools are named mcp__{server}__{tool}.\n\
-- github (stdio): 2 tools; added to the allowed hosts: api.github.com; left out: 3 not in its `tools` list; 2 over the size budget of 20000 tokens for tool definitions; 1 with a name already taken (a b).\n\
+- github (stdio): 2 tools; MCP-only allowed hosts: api.github.com; left out: 3 not in its `tools` list; 2 over the size budget of 20000 tokens for tool definitions; 1 with a name already taken (a b).\n\
 - docs (http): could not be used, no tools: connection refused.\n\
 - one (stdio): 1 tool."
         );

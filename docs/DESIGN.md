@@ -451,9 +451,11 @@ the first two are singletons.
   written. `LedgerState::granted_hosts()` returns all hosts granted so far, de-duplicated ignoring ASCII
   case, in first-seen order, leaving out a host revoked after the grant that named it. Never evicted.
 - **Scope revoke** (`scope_revokes`, written by `ScopeRevoke`, operator only). The operator withdraws one granted
-  host, written as it was granted (ignoring case), with a reason. A host that is not granted is refused with a
-  sentence that lists what is, and names the covering wildcard grant when there is one. A later grant of the host
-  grants it again. Never evicted; the Markdown view lists them as `v1…`.
+  host, written as it was granted (ignoring case), with a reason (`no reason given` when the operator gave none). A
+  host that is not granted is refused here with a sentence that lists what is, and names the covering wildcard grant
+  when there is one: the runtime records only grants, and revokes any other host (a carve-out of a wildcard, of
+  `mode open`) without a record, in the mission's revoked-hosts file. A later grant of the host grants it again.
+  Never evicted; the Markdown view lists them as `v1…`.
 
 `brief()` shows, right after the goal, `Goal status: open (not yet concluded)` / `met — <note>
 (evidence: …)` / `cannot be met as stated — <note> (evidence: …)`, the release line when present, and
@@ -1568,7 +1570,7 @@ with interception off and no capture is granted and run exactly as before.
 
 - *Configuration (M1).* A server has exactly one of `command` (stdio) and `url` (Streamable HTTP); the name matches `[a-z0-9_-]{1,32}` and unknown keys are refused. Secret values in `env` and `headers` are `env:NAME` (the daemon's environment at session start), `file:/path` (trimmed) or a literal (allowed, and the daemon warns at start that a secret is written in the config). A source that is missing fails that server's start, not the daemon's. Values are never written to a log, a record or an API answer: records and routes carry names only. With no `[mcp]` or no servers, nothing below happens and no request changes.
 - *Where it runs (M3).* A stdio server is a child of the session's sandbox (argv run through `ctx.sandbox`, new process group, killed with the group), so a read-only session's server is read-only too. An HTTP server is reached the way `web_fetch` is, through the session's egress proxy, so the network policy decides and every connection is in `net.jsonl`. There is one connection per session per server, opened by the first call or the listing, closed after `idle_close_s` without a call, when the session ends or when it is archived; a call that finds the server dead restarts it once and its result says `server restarted`.
-- *Network (M4).* The `hosts` of a server are added to the allowed hosts of every session whose role gets that server, on top of `[network]` and mission grants (in `deny_all` too). **Threat note:** the proxy cannot tell the server's connections from the agent's, so a host granted for a server is reachable by that session's `bash` and `web_fetch` as well. Grant only hosts you would grant the agent.
+- *Network (M4).* Each server with `hosts` or a `url` gets a proxy grant of its own per session whose role gets it (`<session>__mcp__<server>`, main's P0-7), allowing the server's `hosts` (in `deny_all` too) and narrowed like every grant by the infrastructure deny (§11) and the mission's revoked hosts; the session's own policy does not get them, so the agent's `bash`, `http_send` and `web_fetch` cannot reach a host only a server declares. **Threat note:** a stdio server's process still runs in the session's sandbox, with its own grant's credentials in its environment; a host granted to the server is reachable by whatever that process runs. Grant only hosts you would grant the agent.
 - *A call (M5).* The tool's class is `Read` when the server's `readOnlyHint` is true, else `Exec`, never speculative. The arguments are checked by `schema::check` only when the schema uses keywords it supports; otherwise the server validates. The content blocks become the body in order; an `isError` result or a JSON-RPC error is an `Error` outcome; a timeout is `Timeout`. The result is an ordinary stored output: admitted, cut, keyed (`out:`), readable with `read` and `grep`, quotable as evidence and readable by the verifier.
 - *Which session gets what (M6).* When a mission's lead starts, the runtime connects to every configured server whose `roles` match a role of the mission's pack, lists its tools and records the listings in `session_start.mcp` (a server that fails is recorded with its `error` and no tools). Children use their lead's listing and a reopened session its own record's, so a session's tool list and request prefix never change while it lives; changes on the server reach the next mission. A role gets the tools of each server whose `roles` name it (default: every role that is not read-only; a read-only role such as the verifier only when `read_only = true`), filtered by `tools`, after its own tools, in the server's order; once their definitions pass `max_schema_tokens` the rest are left out. A session with MCP tools gets one harness note at its start: per server the tool count, the hosts it added, what was left out (by `tools`, by the budget, by a name collision) and any start error. `hidden_tools`, the dialect layer and the tool-shape aliases do not apply to MCP tools.
 - *Daemon (M7).* `GET /api/sessions/{id}/mcp` shows the state of the session's servers; `POST /api/mcp/{server}/check` starts one in a scratch sandbox for a workspace, lists its tools and closes it; `ferret mcp list` and `ferret mcp check` use them.
@@ -1640,7 +1642,8 @@ POST /api/sessions/{id}/rules                 {text} → 202 RuleReceipt
 POST /api/sessions/{id}/approvals             {text, scope?} → 202 RuleReceipt
 POST /api/sessions/{id}/rules/{rule_id}/withdraw   {reason?} → 202 RuleReceipt
 POST /api/sessions/{id}/scope                 {hosts, note?} → 202 ScopeReceipt {lead, hosts, ledger}
-POST /api/missions/{id}/scope/revoke          {host, reason} → 202 ScopeRevokeReceipt {lead, host, ledger, recorded, sessions, cut}
+POST /api/sessions/{id}/scope/revoke          {hosts, reason?} → 200 ScopeRevokeReceipt {lead, revoked, ledger, recorded, not_granted, sessions, connections_cut}
+POST /api/panic                               {reason?} → 200 PanicReport {connections_cut, sessions_stopped, boxes_torn_down, rewrites_disabled, processes_killed, processes_left}
 POST /api/sessions/{id}/release               {reason} → 202 RuleReceipt
 POST /api/sessions/{id}/stop                  → 202 {}
 POST /api/sessions/{id}/resume                → 202 {}
@@ -1686,7 +1689,7 @@ only after the path is checked (not relative, not in the ferret home or its copi
 /api/monitor`, `GET /api/missions/{id}/monitor` and the `404` of `GET /api/monitor/reviews/{review}/input` (M2).
 `docs/MONITOR.md` §7.5 specifies those the monitor adds beyond them (`POST
 /api/sessions/{id}/keep-going`, the flag, review, pause, observe-only, halt, promote, vet, replay and capacity routes;
-`POST /api/missions/{id}/scope/revoke` is served since phase E1), the `monitor` bus event (an unknown `type` is ignored by the UI and CLI) and
+`POST /api/sessions/{id}/scope/revoke` is served since phase E1, the one revoke route since the merge of main 6be589b), the `monitor` bus event (an unknown `type` is ignored by the UI and CLI) and
 the `monitor` fields of `StatusView` and `MissionInfo` (`#[serde(default)]`); each phase adds its routes to the list
 above and to the `api.rs` contract in the commit that serves them. Routes that mutate monitor state record the client
 (CLI token or web session), and the ones that lift a halt, promote a tripwire, set observe-only or an override need the
@@ -1783,12 +1786,18 @@ recorded as a `scope_grant` (and a standing rule); the grant lasts as long as th
 with the `request_scope` tool, which opens a non-blocking inbox item (kind `approval`, the hosts as its
 `options`, the reason as its text) and does not stop the session; the UI and app show the hosts with an
 Approve button that calls `/scope` and then resolves the item, and `ferret inbox` prints the `ferret scope`
-command to run. Nothing is granted without that call. `POST /api/missions/{id}/scope/revoke` (`ferret scope revoke
-<mission> <host> --reason`) takes one grant back: it is appended to the ledger first, the host leaves the egress
-policy of every running session of the mission at once, the open tunnels and forwards to it are cut
-(`Proxy::cut_hosts`), the mission's box rules are applied again, and the lead gets a protected note (no turn).
-A restored or later session is built without it. The infrastructure deny of §11 is not a grant and has nothing to
-revoke. `POST /release` (`ferret release`) takes a reason,
+command to run. Nothing is granted without that call. `POST /api/sessions/{id}/scope/revoke` (`ferret scope revoke
+<mission|session> <host>... [--reason]`, Signal's `/scope revoke`, the web UI's Revoke button; one route and one
+runtime entry for the monitor's E1 revoke and main's live revocation) takes hosts back: a grant the ledger lists is
+appended to the ledger first; a grant, a name under a wildcard grant or any host, address or CIDR block that `mode
+open`, `network.allow` or the target's scope reaches is refused from then on (`deny revoked`, kept in the mission's
+revoked-hosts file, also against a later wildcard grant and after a restart, until it is granted again) to every
+session of the mission and its MCP servers' grants at once, the open tunnels and forwards to it are cut
+(`Proxy::revoke_hosts`, by name and by address), the mission's box rules are applied again, and the lead gets a
+protected note (no turn). A restored or later session is built without it. The infrastructure deny of §11 is not a
+grant and has nothing to revoke. `POST /api/panic` (`ferret panic`, Signal's `/panic`, the web UI's Panic button) is
+the kill-switch: every proxy grant and open connection, every rewrite rule, every running session, what the
+sessions left under their sandboxes (the census, by sandbox identity), every box. `POST /release` (`ferret release`) takes a reason,
 which must not be blank, records an `operator_release` and closes the mission; the outcome reads "closed
 by operator, goal not established", never "finished". A blocking blocker or park offers the choices
 "Keep working", "Keep working (more budget)" (budget parks), "Provide what's missing" (blockers) and

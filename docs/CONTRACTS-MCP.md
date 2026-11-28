@@ -23,7 +23,7 @@ idle_close_s = 600             # a server with no call for this long is closed; 
 command = ["npx", "-y", "@modelcontextprotocol/server-github"]   # stdio: argv, run in the session sandbox
 env = { GITHUB_PERSONAL_ACCESS_TOKEN = "env:GITHUB_PAT" }        # value: "env:NAME" | "file:/path" | literal
 cwd = "."                      # relative to the workspace (default: the workspace)
-hosts = ["api.github.com"]     # granted to the session's proxy while this server is configured (M4)
+hosts = ["api.github.com"]     # what this server's own proxy grant may reach, never the session's (M4)
 tools = ["search_issues", "get_issue"]   # default: every tool the server lists
 roles = ["lead", "worker"]     # default: every role that is not read-only
 read_only = false              # true: the operator says no tool of this server changes anything; then
@@ -88,11 +88,19 @@ JSON-RPC 2.0, written by hand on `serde_json` and `reqwest` (no new dependency).
 
 ## M4. Network
 
-A stdio server's own connections go through the session proxy like every sandboxed process. `hosts` of a
-configured server are added to the session's allowed hosts for every session whose role gets that server
-(M6). The proxy cannot tell the server's connections from the agent's: a host granted for a server is
-reachable by the agent's `bash` too. `docs/DESIGN.md` says so in its threat notes, and the session start
-note (M6) names the hosts each server added.
+Each configured server that has `hosts` or a `url` gets an egress proxy grant of its own for every session whose
+role gets it (`<session>__mcp__<server>`, `ferret_agent::mcp::grant_id`; main's P0-7): its `hosts` are what that
+grant allows (the configuration's `deny` and private-address rules kept, `network.allow` left out; an HTTP server
+without `hosts` gets the configured network's policy), and the session's own policy does **not** get them, so a
+host declared for a server is not reachable by the agent's `bash`, `http_send` or `web_fetch` unless the operator
+grants it or the target's scope has it. The server's grant is narrowed like the session's (`Inner::mission_floor`,
+monitor E1): the infrastructure deny (the daemon's port, model endpoints, the services, Docker hosts, cloud
+metadata) and the mission's revoked hosts beat its `hosts`. Its decisions are recorded in the owning session's
+`net.jsonl` and its floor events are the session's (`mcp::grant_owner`); its connections end with the session's
+(`cut_mission`, `revoke_scope`, the panic), and the grant is revoked when the session ends. A stdio server runs in a
+sandbox with the grant's port and the session's identity and temp dir, so the census counts its processes as the
+session's (E3). The session start note (M6) names the hosts each server declares; the monitor's authorization
+counts them as the tools' backends.
 
 ## M5. A call and its result (`ferret-tools/src/mcp.rs` `McpTool`)
 

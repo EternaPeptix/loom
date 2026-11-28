@@ -383,11 +383,44 @@ async fn check_mechanical_oracle(
 }
 
 fn check_security_coverage(state: &LedgerState) -> Result<(), String> {
+    if state.release.is_some() {
+        return Ok(());
+    }
     let pending = state.security.mandatory_open();
-    if state.release.is_none() && !pending.is_empty() {
+    if !pending.is_empty() {
         return Err(format!(
             "Mandatory security coverage is still untested for {}. Record tested evidence or a reasoned deferral with security_record coverage_set before concluding or finishing.",
             pending.join(", ")
+        ));
+    }
+    if state.security.has_open_coverage_gaps(&state.evidence) {
+        let unbacked = state.security.unbacked_clears(&state.evidence);
+        if !unbacked.is_empty() {
+            let items: Vec<String> = unbacked
+                .iter()
+                .map(|c| format!("{} ({} / {}, outcome={})", c.id, c.surface, c.risk_area, c.outcome.as_str()))
+                .collect();
+            return Err(format!(
+                "Security coverage clearances lack attested run-grade execution evidence: {}. Run the target and attach attested execution evidence with security_record coverage_update (or reopen as needs_follow_up) before finishing.",
+                items.join(", ")
+            ));
+        }
+        let follow_ups = state.security.surface_coverage_follow_ups();
+        if !follow_ups.is_empty() {
+            let items: Vec<String> =
+                follow_ups.iter().map(|c| format!("{} ({} / {})", c.id, c.surface, c.risk_area)).collect();
+            return Err(format!(
+                "Open security coverage follow-ups remain unfinished: {}. Complete the follow-up and update each entry with security_record coverage_update before finishing.",
+                items.join(", ")
+            ));
+        }
+    }
+    let unbacked_findings = state.security.unbacked_high_confidence_findings(&state.evidence);
+    if !unbacked_findings.is_empty() {
+        let items: Vec<String> = unbacked_findings.iter().map(|f| format!("{} ({})", f.id, f.title)).collect();
+        return Err(format!(
+            "High-confidence security findings lack attested supporting run-grade execution evidence: {}. Attach attested execution evidence or downgrade/withdraw each finding with security_record finding_update before finishing.",
+            items.join(", ")
         ));
     }
     Ok(())
@@ -5152,5 +5185,168 @@ mod tests {
         reached(&r, "api.acme.test", "call-9");
         let state = r.shared.ledger().unwrap();
         assert!(crate::traffic::check_traffic(&r.shared.role, "finish", &state, &[e], &r.shared.traffic).is_err());
+    }
+
+    #[tokio::test]
+    async fn finish_gate_blocks_unbacked_clears_open_follow_ups_and_unbacked_high_findings() {
+        use ferret_core::security_state::{
+            FindingConfidence, FindingInput, FindingSeverity, FindingUpdateInput, SecurityOp, SurfaceOutcome,
+        };
+
+        // 1. Non-security `core` session with empty security state stays completely unaffected.
+        let mut core_lead = crate::rtools::testkit::core_role("lead");
+        core_lead.verify_finish = false;
+        let core =
+            crate::rtools::testkit::rig_with(core_lead.clone(), false, true, ferret_core::config::AgentsCfg::default());
+        let core_res = core.call("finish", json!({"answer": "done without security state"})).await;
+        assert_eq!(core_res.status, Status::Ok, "{}", core_res.text);
+
+        // 2. Security state with static-only `ruled_out` clear -> finish refused naming the cv-* ID.
+        let r = crate::rtools::testkit::rig_with(core_lead, false, true, ferret_core::config::AgentsCfg::default());
+        r.model_op(LedgerOp::ClaimAdd { text: "surface check".into(), assets: vec![] });
+        let read_blob = r.env.ctx.blobs.put_bytes(b"fn check_auth() {}\n").unwrap();
+        r.model_op(LedgerOp::EvidenceAdd(EvidenceInput {
+            claim: "c1".into(),
+            kind: EvidenceKind::Static,
+            supports: true,
+            session: r.shared.session.clone(),
+            call_id: "call-read".into(),
+            blob: Some(read_blob.id),
+            lines: Some((1, 1)),
+            quote: Some("fn check_auth() {}".into()),
+            note: "read source".into(),
+            attested: true,
+            tool: Some("read".into()),
+            grade: Some(EvidenceGrade::Read),
+        }));
+        let st = r.model_op(LedgerOp::Security(SecurityOp::CoverageRecord {
+            surface: "POST /api/admin".into(),
+            risk_area: "authz".into(),
+            outcome: SurfaceOutcome::RuledOut,
+            reason: None,
+            control: Some("check_auth".into()),
+            location: Some("src/auth.rs:1".into()),
+            evidence: vec!["e1".into()],
+            asset: None,
+        }));
+        let cov_id = st.security.surface_coverage.keys().next().unwrap().clone();
+        let blocked_clear = r.call("finish", json!({"answer": "cleared by reading"})).await;
+        assert_eq!(blocked_clear.status, Status::Error, "{}", blocked_clear.text);
+        assert!(blocked_clear.text.contains(&cov_id), "{}", blocked_clear.text);
+
+        // 3. Reopening as `needs_follow_up` still refuses finish naming the open follow-up cv-* ID.
+        r.model_op(LedgerOp::Security(SecurityOp::CoverageUpdate {
+            id: cov_id.clone(),
+            outcome: SurfaceOutcome::NeedsFollowUp,
+            reason: Some("need runtime test".into()),
+            control: None,
+            location: None,
+            evidence: vec![],
+        }));
+        let blocked_fu = r.call("finish", json!({"answer": "still open"})).await;
+        assert_eq!(blocked_fu.status, Status::Error, "{}", blocked_fu.text);
+        assert!(blocked_fu.text.contains(&cov_id) && blocked_fu.text.contains("follow-up"), "{}", blocked_fu.text);
+
+        // 4. Backing the clear with attested run-grade execution evidence clears the coverage gate.
+        let run_blob = r.env.ctx.blobs.put_bytes(b"HTTP/1.1 403 Forbidden\n").unwrap();
+        r.model_op(LedgerOp::EvidenceAdd(EvidenceInput {
+            claim: "c1".into(),
+            kind: EvidenceKind::Execution,
+            supports: true,
+            session: r.shared.session.clone(),
+            call_id: "call-run".into(),
+            blob: Some(run_blob.id),
+            lines: Some((1, 1)),
+            quote: Some("HTTP/1.1 403 Forbidden".into()),
+            note: "tested live".into(),
+            attested: true,
+            tool: Some("http_send".into()),
+            grade: Some(EvidenceGrade::Run),
+        }));
+        r.model_op(LedgerOp::Security(SecurityOp::CoverageUpdate {
+            id: cov_id.clone(),
+            outcome: SurfaceOutcome::RuledOut,
+            reason: None,
+            control: Some("check_auth".into()),
+            location: Some("src/auth.rs:1".into()),
+            evidence: vec!["e2".into()],
+        }));
+
+        // 5. High-confidence finding backed ONLY by static read evidence `e1` refuses finish naming `fn-*`.
+        let st = r.model_op(LedgerOp::Security(SecurityOp::FindingRecord {
+            finding: Box::new(FindingInput {
+                title: "SQLi in /search".into(),
+                description: "Static sink seen".into(),
+                impact: "DB read".into(),
+                target: "src/search.rs".into(),
+                severity: Some(FindingSeverity::High),
+                cvss_breakdown: None,
+                evidence: vec!["e1".into()],
+                counterevidence: "Checked ORM usage.".into(),
+                confidence: FindingConfidence::High,
+                confidence_rationale: None,
+                severity_change_conditions: "Auth reduces impact.".into(),
+                technical_analysis: None,
+                remediation_steps: None,
+                assumptions: None,
+                poc_description: None,
+                poc_handle: None,
+                fix_effort: None,
+                endpoint: None,
+                method: None,
+                cve: None,
+                cwe: Some("CWE-89".into()),
+                code_locations: vec![],
+                fix_verification: None,
+                http_exchanges: vec![],
+                asset: None,
+                claim: None,
+            }),
+        }));
+        let fn_id = st.security.findings.keys().next().unwrap().clone();
+        let blocked_fn = r.call("finish", json!({"answer": "found sqli statically"})).await;
+        assert_eq!(blocked_fn.status, Status::Error, "{}", blocked_fn.text);
+        assert!(blocked_fn.text.contains(&fn_id), "{}", blocked_fn.text);
+
+        // 6. Attach run-grade execution evidence `e2` to the finding -> finish succeeds!
+        r.model_op(LedgerOp::Security(SecurityOp::FindingUpdate {
+            update: Box::new(FindingUpdateInput {
+                id: fn_id,
+                update_reason: "Confirmed dynamically with run evidence".into(),
+                title: None,
+                description: None,
+                impact: None,
+                target: None,
+                severity: None,
+                cvss_breakdown: None,
+                evidence: vec!["e2".into()],
+                counterevidence: None,
+                confidence: None,
+                confidence_rationale: None,
+                severity_change_conditions: None,
+                technical_analysis: None,
+                remediation_steps: None,
+                assumptions: None,
+                poc_description: None,
+                poc_handle: None,
+                fix_effort: None,
+                endpoint: None,
+                method: None,
+                cve: None,
+                cwe: None,
+                code_locations: None,
+                fix_verification: None,
+                http_exchanges: vec![],
+                status: None,
+                withdrawn_reason: None,
+            }),
+        }));
+        r.model_op(LedgerOp::ClaimUpdate {
+            id: "c1".into(),
+            status: ClaimStatus::Supported,
+            note: "confirmed by execution evidence".into(),
+        });
+        let ok = r.call("finish", json!({"answer": "all verified with execution evidence"})).await;
+        assert_eq!(ok.status, Status::Ok, "{}", ok.text);
     }
 }

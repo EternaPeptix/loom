@@ -1612,6 +1612,52 @@ impl SecurityState {
         self.findings.values().filter(|f| f.status == FindingStatus::Active).collect()
     }
 
+    /// Cleared per-`(surface, risk_area)` entries (`no_issue_found` or `ruled_out`) that carry no
+    /// attested `run`-grade execution evidence in `evidence`, in deterministic ID order.
+    pub fn unbacked_clears(&self, evidence: &[crate::ledger::Evidence]) -> Vec<&SurfaceCoverage> {
+        let ev_by_id: std::collections::HashMap<&str, &crate::ledger::Evidence> =
+            evidence.iter().map(|e| (e.id.as_str(), e)).collect();
+        self.surface_coverage
+            .values()
+            .filter(|entry| matches!(entry.outcome, SurfaceOutcome::NoIssueFound | SurfaceOutcome::RuledOut))
+            .filter(|entry| {
+                !entry.evidence.iter().any(|id| {
+                    ev_by_id.get(id.as_str()).is_some_and(|e| {
+                        e.input.attested && e.input.grade_or_kind() == crate::event::EvidenceGrade::Run
+                    })
+                })
+            })
+            .collect()
+    }
+
+    /// Active structured findings rated `confidence == high` that carry no attested, supporting
+    /// `run`-grade execution evidence in `evidence`, in deterministic ID order.
+    pub fn unbacked_high_confidence_findings(&self, evidence: &[crate::ledger::Evidence]) -> Vec<&Finding> {
+        let ev_by_id: std::collections::HashMap<&str, &crate::ledger::Evidence> =
+            evidence.iter().map(|e| (e.id.as_str(), e)).collect();
+        self.findings
+            .values()
+            .filter(|f| f.status == FindingStatus::Active && f.confidence == FindingConfidence::High)
+            .filter(|f| {
+                !f.evidence.iter().any(|id| {
+                    ev_by_id.get(id.as_str()).is_some_and(|e| {
+                        e.input.attested
+                            && e.input.supports
+                            && e.input.grade_or_kind() == crate::event::EvidenceGrade::Run
+                    })
+                })
+            })
+            .collect()
+    }
+
+    /// Whether the security state still has open coverage gaps: untested mandatory assets, open
+    /// `needs_follow_up` surface entries, or cleared surfaces without attested `run` evidence.
+    pub fn has_open_coverage_gaps(&self, evidence: &[crate::ledger::Evidence]) -> bool {
+        !self.mandatory_open().is_empty()
+            || !self.surface_coverage_follow_ups().is_empty()
+            || !self.unbacked_clears(evidence).is_empty()
+    }
+
     pub fn newly_unlocked(&self) -> Vec<String> {
         self.newly_unlocked_at(0)
     }
@@ -3272,5 +3318,206 @@ mod tests {
         let f_refiled = make("Confirmed SQLi on user lookup", "/api/users?a=1&b=2", Some("CWE-89"));
         apply(&mut l, SecurityOp::FindingRecord { finding: Box::new(f_refiled) });
         assert_eq!(l.security.active_findings().len(), 2);
+    }
+
+    #[test]
+    fn unbacked_high_confidence_findings_and_open_coverage_gaps_helpers() {
+        let mut l = LedgerState::default();
+        // e1: attested supporting Run; e2: attested supporting Read (static); e3: attested refuting Run.
+        l.evidence.push(Evidence {
+            id: "e1".into(),
+            n: 1,
+            input: EvidenceInput {
+                claim: "c1".into(),
+                kind: EvidenceKind::Execution,
+                supports: true,
+                session: "s-lead".into(),
+                call_id: CallId::from("call-1"),
+                blob: None,
+                lines: None,
+                quote: None,
+                note: "executed probe".into(),
+                attested: true,
+                tool: Some("http_send".into()),
+                grade: Some(crate::event::EvidenceGrade::Run),
+            },
+        });
+        l.evidence.push(Evidence {
+            id: "e2".into(),
+            n: 2,
+            input: EvidenceInput {
+                claim: "c1".into(),
+                kind: EvidenceKind::Static,
+                supports: true,
+                session: "s-lead".into(),
+                call_id: CallId::from("call-2"),
+                blob: None,
+                lines: None,
+                quote: None,
+                note: "read source file".into(),
+                attested: true,
+                tool: Some("read".into()),
+                grade: Some(crate::event::EvidenceGrade::Read),
+            },
+        });
+        l.evidence.push(Evidence {
+            id: "e3".into(),
+            n: 3,
+            input: EvidenceInput {
+                claim: "c1".into(),
+                kind: EvidenceKind::Execution,
+                supports: false,
+                session: "s-lead".into(),
+                call_id: CallId::from("call-3"),
+                blob: None,
+                lines: None,
+                quote: None,
+                note: "probe blocked by auth middleware".into(),
+                attested: true,
+                tool: Some("http_send".into()),
+                grade: Some(crate::event::EvidenceGrade::Run),
+            },
+        });
+
+        // Empty state has no gaps or unbacked findings.
+        assert!(!l.security.has_open_coverage_gaps(&l.evidence));
+        assert!(l.security.unbacked_clears(&l.evidence).is_empty());
+        assert!(l.security.unbacked_high_confidence_findings(&l.evidence).is_empty());
+
+        // High-confidence finding with only static Read evidence -> unbacked.
+        let make_finding = |title: &str, ep: &str, conf: FindingConfidence, ev: Vec<String>| FindingInput {
+            title: title.into(),
+            description: "desc".into(),
+            impact: "impact".into(),
+            target: "https://app.example.test".into(),
+            evidence: ev,
+            counterevidence: "checked middleware".into(),
+            confidence: conf,
+            confidence_rationale: (conf != FindingConfidence::High).then(|| "static trace only".into()),
+            severity_change_conditions: "auth required".into(),
+            cvss_breakdown: None,
+            severity: Some(FindingSeverity::High),
+            technical_analysis: None,
+            remediation_steps: None,
+            assumptions: None,
+            poc_description: None,
+            poc_handle: None,
+            fix_effort: None,
+            endpoint: Some(ep.into()),
+            method: Some("GET".into()),
+            cve: None,
+            cwe: Some("CWE-89".into()),
+            code_locations: vec![],
+            fix_verification: None,
+            http_exchanges: vec![],
+            asset: None,
+            claim: None,
+        };
+        let f_static_high = make_finding("SQLi static high", "/static", FindingConfidence::High, vec!["e2".into()]);
+        let f_static_high_id = f_static_high.id();
+        let f_refuting_high = make_finding("SQLi refuting high", "/refute", FindingConfidence::High, vec!["e3".into()]);
+        let f_refuting_high_id = f_refuting_high.id();
+        let f_backed_high = make_finding("SQLi backed high", "/backed", FindingConfidence::High, vec!["e1".into()]);
+        let f_static_med = make_finding("SQLi static med", "/med", FindingConfidence::Medium, vec!["e2".into()]);
+
+        apply(&mut l, SecurityOp::FindingRecord { finding: Box::new(f_static_high) });
+        apply(&mut l, SecurityOp::FindingRecord { finding: Box::new(f_refuting_high) });
+        apply(&mut l, SecurityOp::FindingRecord { finding: Box::new(f_backed_high) });
+        apply(&mut l, SecurityOp::FindingRecord { finding: Box::new(f_static_med) });
+
+        let unbacked_ids: Vec<&str> =
+            l.security.unbacked_high_confidence_findings(&l.evidence).iter().map(|f| f.id.as_str()).collect();
+        assert_eq!(unbacked_ids.len(), 2);
+        assert!(unbacked_ids.contains(&f_static_high_id.as_str()));
+        assert!(unbacked_ids.contains(&f_refuting_high_id.as_str()));
+
+        // Withdrawing an unbacked high-confidence finding removes it from unbacked_high_confidence_findings.
+        apply(
+            &mut l,
+            SecurityOp::FindingUpdate {
+                update: Box::new(FindingUpdateInput {
+                    id: f_refuting_high_id,
+                    update_reason: "false positive".into(),
+                    title: None,
+                    description: None,
+                    impact: None,
+                    target: None,
+                    evidence: vec![],
+                    counterevidence: None,
+                    confidence: None,
+                    confidence_rationale: None,
+                    severity_change_conditions: None,
+                    cvss_breakdown: None,
+                    severity: None,
+                    technical_analysis: None,
+                    remediation_steps: None,
+                    assumptions: None,
+                    poc_description: None,
+                    poc_handle: None,
+                    fix_effort: None,
+                    endpoint: None,
+                    method: None,
+                    cve: None,
+                    cwe: None,
+                    code_locations: None,
+                    fix_verification: None,
+                    http_exchanges: vec![],
+                    status: Some(FindingStatus::Withdrawn),
+                    withdrawn_reason: None,
+                }),
+            },
+        );
+        let unbacked_after: Vec<&str> =
+            l.security.unbacked_high_confidence_findings(&l.evidence).iter().map(|f| f.id.as_str()).collect();
+        assert_eq!(unbacked_after, vec![f_static_high_id.as_str()]);
+
+        // Coverage gaps: static-only ruled_out -> unbacked clear -> has_open_coverage_gaps == true.
+        apply(
+            &mut l,
+            SecurityOp::CoverageRecord {
+                surface: "POST /login".into(),
+                risk_area: "SQLi".into(),
+                outcome: SurfaceOutcome::RuledOut,
+                control: Some("sqlx bound query".into()),
+                location: Some("src/login.rs:10".into()),
+                reason: Some("checked code".into()),
+                evidence: vec!["e2".into()],
+                asset: None,
+            },
+        );
+        let cv_id = surface_coverage_id("POST /login", "SQLi");
+        assert_eq!(l.security.unbacked_clears(&l.evidence).len(), 1);
+        assert!(l.security.has_open_coverage_gaps(&l.evidence));
+
+        // Updating with attested Run evidence (even refuting e3) clears the unbacked_clear gap.
+        apply(
+            &mut l,
+            SecurityOp::CoverageUpdate {
+                id: cv_id,
+                outcome: SurfaceOutcome::RuledOut,
+                control: Some("sqlx bound query".into()),
+                location: Some("src/login.rs:10".into()),
+                reason: Some("verified dynamically".into()),
+                evidence: vec!["e3".into()],
+            },
+        );
+        assert!(l.security.unbacked_clears(&l.evidence).is_empty());
+        assert!(!l.security.has_open_coverage_gaps(&l.evidence));
+
+        // Open needs_follow_up triggers has_open_coverage_gaps.
+        apply(
+            &mut l,
+            SecurityOp::CoverageRecord {
+                surface: "POST /refund".into(),
+                risk_area: "IDOR".into(),
+                outcome: SurfaceOutcome::NeedsFollowUp,
+                control: None,
+                location: None,
+                reason: Some("need second tenant".into()),
+                evidence: vec![],
+                asset: None,
+            },
+        );
+        assert!(l.security.has_open_coverage_gaps(&l.evidence));
     }
 }

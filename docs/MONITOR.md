@@ -288,9 +288,10 @@ To keep authorized offensive work unblocked, the monitor does **not** judge:
 `check_name` and `check_addr`, rule `deny infrastructure: {what}` (what TW-02 matches). The foreign per-session proxy
 listeners are the proxy's own-port rule (#39), not a policy entry. DevTools (9222, 9229) and Docker (2375, 2376) ports are
 refused on this machine only: a remote host listening on them is an ordinary target, so a lab may be granted it; the
-box's Docker host and any other infrastructure host are listed by name. `ScopeRevoke`, `POST /api/missions/{id}/scope/revoke`
-and `ferret scope revoke` are served; the proxy narrows the running sessions at once and cuts the open connections to the host
-(`Proxy::cut_hosts`, a part of E4(a)); `ferret open` no longer puts the login code on `/usr/bin/open`'s argv. The daemon port
+box's Docker host and any other infrastructure host are listed by name. `ScopeRevoke`, `POST /api/sessions/{id}/scope/revoke`
+and `ferret scope revoke` are served (one route and one runtime entry with main's live revocation since 6be589b, below); the
+proxy narrows the running sessions at once and cuts the open connections to the host (`Proxy::revoke_hosts`, on the
+registry of E4(a)); `ferret open` no longer puts the login code on `/usr/bin/open`'s argv. The daemon port
 in the sandbox profile is #41's. With the ferret rebrand merge (main da5d310): the services the daemon talks to for the
 operator are listed too (`InfraSpec.services`, `runtime::service_endpoints`): the Signal bridge's signal-cli
 (`signal.http_url`, when `[signal]` is enabled) and the mail inbox's IMAP server (`mail.host` on `mail.port`, when
@@ -307,6 +308,56 @@ or the number of such a host, grants nothing and says where to approve it), sinc
 monitor (§2.4); the operator's proxy
 rewrite rules (`ferret rewrite`) act on a request after its destination was decided and connected, cannot set `Host`
 or `CONNECT`, and so cannot carry a request to infrastructure.
+
+**The floor and main's Wave A (6be589b) together.** Main built some of the floor's controls a second time; each now has
+one implementation that keeps both sides' guarantees:
+- *Scope revoke.* One runtime entry, `Runtime::revoke_scope(session, hosts, reason)`, one route (`POST
+  /api/sessions/{id}/scope/revoke`; the monitor's `POST /api/missions/{id}/scope/revoke` and main's `DELETE
+  /api/sessions/{id}/scope` are gone), one command (`ferret scope revoke <mission|session> <host>... [--reason]`, `--note`
+  the same flag; main's `ferret scope grant <session> <host>...` is a subcommand too), called by Signal's `/scope revoke`
+  and the web UI's Revoke button. It takes main's breadth (several hosts; any host, `*.suffix`, address or CIDR block, so
+  a name under a wildcard grant, `mode open`, `network.allow` and the target's scope can be narrowed; an optional reason)
+  and keeps E1's guarantees: a revoked grant the ledger lists is recorded first (`ScopeRevoke`, the stock `no reason
+  given` without a reason); every entry is kept in `<mission>/scope_revoked.json` and refused by every policy of the
+  mission (`deny revoked {entry}`, `Policy::with_revoked`, now also pruning the `allow` patterns, granted literals and
+  target blocks it covers as main's `without_hosts` did, which it replaces) after a restart and against a later wildcard
+  grant, until the host is granted again. An entry that is no grant by itself is no longer refused: it is revoked
+  without a ledger record (`not_granted` in the receipt). The receipt is `{lead, revoked, ledger, recorded, not_granted,
+  sessions, connections_cut}` (`200`).
+- *Live cutoff.* One registry of the connections being served (`Shared::live`, E4(a)), with the address each was
+  opened to (main's), ends connections for every caller: `revoke` (main: no longer leaves open connections to finish),
+  `revoke_hosts` (by name and by address), `revoke_all`, `set_policy` (main: what the new policy refuses ends at once;
+  a hold uses `Proxy::hold`, which cuts nothing, so that the following `cut` counts and words its own), `cut_hosts`,
+  `cut` / `cut_sessions` / `cut_mission`. A connection that authenticated before a session-wide cut is ended when it
+  registers (per-session marks, and one for `revoke_all`); one that is waiting for pacing, resolving or connecting
+  stops at once (main) and is answered `502` with a refusal on record (E4); once connected it is judged again by the
+  session's current policy before it is recorded as allowed (main's race with an address revoke). `cut_mission` and
+  `revoke_scope` reach the mission's MCP servers' isolated grants too.
+- *Panic.* Main's `Runtime::panic_stop_all` (`ferret panic`, `/panic`, the web UI) cuts everything through that
+  registry, disables the rewrite rules, stops the sessions and tears down the boxes, and now also stops what only the
+  census finds (E3): the processes the sessions left under their sandboxes, by sandbox identity, for every known
+  session (`PanicReport.processes_killed`, `processes_left`).
+- *Sandbox Mach services.* One rule set: the default-deny of `mach-lookup` with its probed allowlist (E2) and the fetch
+  services denied in every network mode (main's per-mode `network_deny_all` and `Sandbox::with_network_mode` are gone:
+  E2's rule denies more), plus main's keychain and pasteboard deny under `sandbox.protect_credentials`
+  (`CREDENTIAL_MACH_SERVICES`, `com.apple.pasteboard.1` added, the name `pbpaste` looks up), written after the allows
+  so `sandbox.mach_allow` cannot open them while credentials are protected. The self-probe runs the daemon's profile as
+  before (credentials off, as egress is its concern).
+- *Box firewall.* Main's unconditional `INPUT -i fb-+ -j DROP` (and the removal of the old `INPUT -> FERRET-ALL` jump)
+  and the static IPv6 chain `FERRET-ALL6` stand as main wrote them. The box counters (E4f) still read the mission's
+  chain, which every forwarded packet of the box passes (`DOCKER-USER -> FERRET-ALL -> mission chain`); a packet from a
+  box to the Docker host itself is now dropped by the shared `INPUT` rule before any mission chain, so such an attempt
+  is no longer in a mission's counters (it is not reachable either). IPv6 is dropped and not counted, as before.
+- *MCP hosts.* Main isolates each MCP server on a proxy grant of its own (P0-7): its hosts are not in the session's
+  policy. Those grants are narrowed like a session's (the infrastructure deny of E1 and the mission's revoked hosts,
+  `Inner::mission_floor`), their records and floor events are the owning session's (`mcp::grant_owner`), the
+  lab-listener check reads their session's mission, and a stdio server's sandbox carries the session's identity for the
+  census. The authorization block still counts an MCP server's hosts as the tools' backends (TW-21's exemption for a
+  server's own traffic stands, and a session's own command can no longer reach such a host).
+- *Workspace instructions.* Main keeps `AGENTS.md` and `CLAUDE.md` out of the security packs' prompts by default
+  (P0-4) and frames them as untrusted data elsewhere; TW-26 still reads a write of either as S1 in every pack (a
+  workspace is not tied to a pack). The tripwires' normalization strips the same bidirectional controls as main's
+  sanitizer of untrusted output (`U+061C` added), so a bidi-smuggled `<harness` tag is TW-27's.
 
 Until E1–E4 are deployed, tripwires detect attempts but do not close these routes (§9.5).
 
@@ -664,7 +715,7 @@ This follows the research:
 **R3 sequence** (each step idempotent; the write-ahead record comes first):
 1. `pause{begun}` (fsync; reserve file if the disk is full).
 2. `may_run(M) = false`.
-3. **Proxy.** `set_policy(hold)` for every session of M, then `cut_mission(M)` (E4a): open tunnels and forwards close within 1 s.
+3. **Proxy.** `Proxy::hold(policy)` for every session of M (it sets the command and reference grants' policy and cuts nothing; since main 6be589b `set_policy` ends at once what the new policy refuses, so the hold is not a `set_policy`), then `cut_mission(M)` (E4a): open tunnels and forwards close within 1 s.
 4. **Turn control.** Hold is set on every session of M and their current tokens are cancelled. `Session::cancelled` branches on hold:
    - **Lead:** `interrupted{reason: "held by ferret review"}`. The in-flight model request is cancelled. An in-flight tool is cancelled (TERM, then KILL, result recorded). **No `jobs.kill_all`, no `stop_children`.** The turn ends `Parked` with the monitor item.
    - **Idle lead** (Waiting, Finished, Asked): the item opens through the harness-notice path (as the model-unavailable notice does); no turn starts.
@@ -1211,7 +1262,7 @@ POST /api/monitor/promote                           {cause, state}             (
 POST /api/monitor/vet                               {profile, set} → 202 {job}
 POST /api/monitor/replay                            {since?} → 202 {job}
 GET  /api/monitor/capacity                          → per-endpoint load estimate
-POST /api/missions/{id}/scope/revoke                {host, reason}
+POST /api/sessions/{id}/scope/revoke                {hosts, reason?}  (the one revoke route, with main 6be589b)
 ```
 Bodies live in `crate::wire` with `deny_unknown_fields`, modelled on the other bodies there.
 
@@ -1240,7 +1291,7 @@ Each command is added to the `Command` enum and the cli.rs contract list:
 - `ferret monitor capacity`
 - `ferret monitor vet <profile> [--set fixtures|operator]`
 - `ferret monitor input <review>`
-- `ferret scope --lab <host>`; `ferret scope revoke <mission> <host> --reason`
+- `ferret scope --lab <host>`; `ferret scope revoke <mission|session> <host>... [--reason]`
 - `ferret ls`: `render::session_state` appends words, never colour only: ` keep-going 1/3`, ` paused(review)`, ` halted`, ` not-reviewed`.
 - `ferret inbox`: review items print the `ferret answer` choices and the `ferret monitor log` command.
 

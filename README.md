@@ -219,7 +219,8 @@ ferret rename <session> "title" | archive <session> [--undo]
 ferret inbox [--json]                               # open questions, scope requests, blockers
 ferret answer <item|last|.> ["..." | 1..N | --dismiss]   # also reads piped stdin
 ferret scope <session> <host>...                    # grant per-session egress hosts
-ferret scope revoke <mission> <host> --reason "..." # take a granted host back (recorded, cut at once)
+ferret scope revoke <mission|session> <host>... [--reason "..."]  # take hosts back (refused and cut at once, recorded)
+ferret panic [--reason "..."]                       # kill-switch: cut every tunnel, stop every session and box
 ferret rule <session> "text" | --withdraw <id> [--reason "..."]
 ferret approve <session> "text" [--scope "..."]
 ferret release <session> "reason"                   # close a blocked mission cleanly

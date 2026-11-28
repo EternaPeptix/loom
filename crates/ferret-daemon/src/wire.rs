@@ -441,19 +441,29 @@ pub struct ScopeBody {
 
 /// The answer to `POST /api/sessions/{id}/scope`.
 pub use ferret_agent::runtime::ScopeReceipt;
-
-/// Body of `POST /api/missions/{id}/scope/revoke`: the operator withdraws one granted host.
+/// Body of `POST /api/sessions/{id}/scope/revoke`: the operator revokes hosts from the mission of the session.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ScopeRevokeBody {
-    /// The host exactly as it was granted (compared ignoring case).
-    pub host: String,
-    /// Why; kept in the ledger and shown to the lead. Required.
-    pub reason: String,
+    /// One host per entry: a grant as it was granted (compared ignoring case), or any host, `*.suffix`, address or
+    /// CIDR block, optionally with `:port`. Required (an empty list is refused by the runtime).
+    pub hosts: Vec<String>,
+    /// Why; kept in the ledger and shown to the lead. Left out, the ledger records `no reason given`. `note` is the
+    /// same field.
+    #[serde(default, alias = "note")]
+    pub reason: Option<String>,
 }
 
-/// The answer to `POST /api/missions/{id}/scope/revoke`.
-pub use ferret_agent::runtime::ScopeRevokeReceipt;
+/// The answers to `POST /api/sessions/{id}/scope/revoke` and `POST /api/panic`.
+pub use ferret_agent::{PanicReport, ScopeRevokeReceipt};
+
+/// Body of `POST /api/panic`. Optional; an empty body or `{}` stops everything without a reason.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PanicBody {
+    #[serde(default)]
+    pub reason: Option<String>,
+}
 
 /// What `GET /api/sessions/{id}/mcp` answers per server, and what the check route and `ferret mcp list`
 /// show (the types live with the runtime's MCP wiring).
