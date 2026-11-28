@@ -158,8 +158,9 @@
 //!   author `User`. An empty list is ignored. No ledger entry, no turn; it is kept on disk while queued
 //!   (`queue_input`), like `Scope`.
 //! - `Input::PanicStop{reason}`: the operator's kill-switch. An idle session records `harness_note{Approval,
-//!   texts::panic_stopped(reason)}`, closes its terminals, kills its jobs, stops its children and ends a turn that
-//!   was waiting or yielded (`interrupted`, `turn_end{Stopped}`); a running turn records the note and is cut; an idle
+//!   texts::panic_stopped(reason)}`, then does what `Input::Stop` does (one body): closes its terminals, kills its
+//!   jobs, stops its children and ends a turn that was waiting or yielded (`interrupted`, `turn_end{Stopped}`), closing
+//!   its MCP servers' connections as every `Stopped` end does; a running turn records the note and is cut; an idle
 //!   child records the note and settles stopped.
 //! - `Input::Queued{file, input}`: rename `file` to `{stem}.{seq}.taking`, `seq` being the log's
 //!   next seq; then `input` as above, then delete the renamed file. When `file` is gone it was taken
@@ -2558,44 +2559,40 @@ Name them when you start a new mission instead."
                 Ok(None)
             }
             Input::Stop => {
-                let jobs = !self.running_jobs().await.is_empty();
-                let children = !self.running_children().await.is_empty();
-                self.deps.ctx.capabilities.ptys.close_all().await;
-                self.deps.ctx.jobs.kill_all(self.grace()).await;
-                self.deps.shared.orch.stop_children(&self.deps.shared.session).await;
-                // Stopped stays stopped: what the stop itself causes (a child's settlement, a job's end)
-                // must not wake a session that was waiting, only the operator can. The `interrupted`
-                // record goes with the `Stopped` end, so the next turn's note names this stop.
-                let wakeable = matches!(self.st.last_end, Some(TurnEndReason::Waiting | TurnEndReason::Yielded));
-                if jobs || children || wakeable {
-                    self.append(Author::Harness, Event::Interrupted { reason: texts::REASON_OPERATOR.to_string() })?;
-                }
-                if wakeable {
-                    self.append(Author::Harness, Event::TurnEnd { reason: TurnEndReason::Stopped })?;
-                    self.publish();
-                    self.close_mcp_after(TurnEndReason::Stopped).await;
-                }
+                self.stop_between_turns().await?;
                 Ok(None)
             }
             Input::PanicStop { reason } => {
                 self.note(Author::User, NoteKind::Approval, texts::panic_stopped(reason.as_deref()))?;
-                let jobs = !self.running_jobs().await.is_empty();
-                let children = !self.running_children().await.is_empty();
-                self.deps.ctx.capabilities.ptys.close_all().await;
-                self.deps.ctx.jobs.kill_all(self.grace()).await;
-                self.deps.shared.orch.stop_children(&self.deps.shared.session).await;
-                let wakeable = matches!(self.st.last_end, Some(TurnEndReason::Waiting | TurnEndReason::Yielded));
-                if jobs || children || wakeable {
-                    self.append(Author::Harness, Event::Interrupted { reason: texts::REASON_OPERATOR.to_string() })?;
-                }
-                if wakeable {
-                    self.append(Author::Harness, Event::TurnEnd { reason: TurnEndReason::Stopped })?;
-                    self.publish();
-                }
+                self.stop_between_turns().await?;
                 Ok(None)
             }
             other => Ok(self.arrival(other).await?.trigger),
         }
+    }
+
+    /// The operator stopped the session between turns (`Input::Stop`, and a panic's `Input::PanicStop` after its note):
+    /// its terminals, jobs and children end, and a turn that was waiting or yielded ends `Stopped`, which leaves no MCP
+    /// server of the session running (TW-20). One body for both, so that they cannot drift apart.
+    async fn stop_between_turns(&mut self) -> R<()> {
+        let jobs = !self.running_jobs().await.is_empty();
+        let children = !self.running_children().await.is_empty();
+        self.deps.ctx.capabilities.ptys.close_all().await;
+        self.deps.ctx.jobs.kill_all(self.grace()).await;
+        self.deps.shared.orch.stop_children(&self.deps.shared.session).await;
+        // Stopped stays stopped: what the stop itself causes (a child's settlement, a job's end)
+        // must not wake a session that was waiting, only the operator can. The `interrupted`
+        // record goes with the `Stopped` end, so the next turn's note names this stop.
+        let wakeable = matches!(self.st.last_end, Some(TurnEndReason::Waiting | TurnEndReason::Yielded));
+        if jobs || children || wakeable {
+            self.append(Author::Harness, Event::Interrupted { reason: texts::REASON_OPERATOR.to_string() })?;
+        }
+        if wakeable {
+            self.append(Author::Harness, Event::TurnEnd { reason: TurnEndReason::Stopped })?;
+            self.publish();
+            self.close_mcp_after(TurnEndReason::Stopped).await;
+        }
+        Ok(())
     }
 
     /// A child that is between turns was stopped, or its inputs closed: end its jobs and children and

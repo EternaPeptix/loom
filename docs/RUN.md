@@ -193,10 +193,14 @@ Each is refused to the mission's sessions and its MCP servers at once (also unde
 `network.allow`, `allow_private` and `mode open`: it is refused as `deny revoked <host>` until you grant it again),
 their open connections to it are cut (by name and by the address a connection was opened to), and the box rules
 follow. The revoke is kept on disk, so a restart does not bring the host back, whatever the ledger says of a grant
-recorded later. For an immediate daemon-wide halt, `ferret panic [--reason <text>] [--json]` (or the confirmed Panic
-button in the web UI / `/panic` on Signal) cuts every proxy tunnel, disables every proxy rewrite rule, stops every
-active session, stops what the sessions left running under their sandboxes (found by the process census), and
-tears down every `[box]` container.
+recorded later. The cut comes before the ledger record: when the ledger cannot be written (a full disk) or read, the
+host is cut and refused all the same, and the command says it is not recorded; run it again once the disk has room to
+record it. Granting the host again gives it back to the sessions and their MCP servers at once. The reference client's
+own credential (`network.reference_hosts`) is not narrowed by a revoke (its open connections are cut). For an
+immediate daemon-wide halt, `ferret panic [--reason <text>] [--json]` (or the confirmed Panic
+button in the web UI / `/panic` on Signal) cuts every proxy tunnel, disables every proxy rewrite rule, begins tearing
+down every `[box]` container at once, stops every active session (closing its MCP servers' connections), stops what
+the sessions left running under their sandboxes (found by the process census), and returns once the boxes are gone.
 
 The proxy also looks at the name a command asks an HTTPS server for. A tunnel's TLS ClientHello must name the host the command
 connected to, or another host its policy allows; a hello that hides the name (an encrypted ClientHello naming another host),

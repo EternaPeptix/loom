@@ -14,7 +14,8 @@ implementation now, with both sides' guarantees.
   `DELETE /api/sessions/{id}/scope` are gone. From main: several hosts at once, any host, `*.suffix`, address or CIDR
   block (a name under a wildcard grant, a host `mode open`, `network.allow` or the target's scope reaches), an optional
   reason, the live cut and an audit note in the lead's log also when it is not running. From the monitor: a revoked
-  grant the ledger lists is recorded first (`ScopeRevoke`, `no reason given` without a reason); every entry is kept in
+  grant the ledger lists is recorded (`ScopeRevoke`, `no reason given` without a reason), after the cut; every entry is
+  kept in
   `<mission>/scope_revoked.json` and refused by every policy of the mission (`deny revoked …`), after a restart and
   against a later wildcard grant, until the host is granted again; the policy is rebuilt for every session of the
   mission, started or being started. A host that is no grant by itself is no longer refused: it is revoked without a
@@ -48,6 +49,37 @@ implementation now, with both sides' guarantees.
   (`U+061C` added), so a bidi-smuggled `<harness` tag still raises TW-27; TW-26 still reads a write of `AGENTS.md` or
   `CLAUDE.md` as S1 although main keeps them out of the security packs' prompts by default (a workspace is not tied to
   a pack).
+
+### Fixes after merging main (6be589b)
+
+- **A revoke cuts before it records.** `revoke_scope` now narrows and cuts first and appends `ScopeRevoke` after: a
+  ledger that cannot be read or written (a full disk the agent filled) no longer refuses the whole revoke with "nothing
+  was changed" while the tunnel stays open. The error says the revoke is applied and not recorded; revoking again
+  records it. The mission's scope generation moves with the revoked list under one lock, so a session built meanwhile
+  cannot keep the host.
+- **MCP grants and revokes.** A host granted again after a revoke is allowed again for the mission's MCP servers'
+  isolated grants at once (they were left refusing it until the session restarted). A lead's MCP grants are known to
+  `revoke_scope` and `cut_mission` from before they are made, so a revoke or a cut while the lead lists its servers
+  reaches them, and grants made while the scope changed get their policy again; the revoke's note to a lead that is
+  still being started waits for its first run instead of creating its log.
+- **Panic.** The boxes' teardown begins right after the proxy cut instead of after the sessions, the job kills and the
+  census kill (a box's egress does not go through the proxy). A panic stop of a session between turns closes its MCP
+  connections, as an operator's stop does (one body for both).
+- **Proxy.** A check (`FERRET-CHECK`) is registered like a connection again: a revoke, a cut or a panic ends its
+  lookup at once (`502`, a refusal on record), and it is judged by the session's policy once the lookup is done. A
+  connection cut while it waited for pacing records its `paced_ms`. The cut docs say what a cut does now (it stops a
+  lookup or a connect at once; the caller holds with `Proxy::hold`), and the listener doc is main's again.
+- **Monitor authorization.** The mission's revoked hosts (`scope_revoked.json`, read when it changes) are out of the
+  authorization whatever covers them, so a carve-out under a wildcard grant or a revoke of an `allow` or target-scope
+  host is no longer "authorized" to TW-13(b), TW-06/TW-15 sinks, TW-23 or the reviewer's block; a change of the file
+  also has the journal read again, so a recorded revoke is seen without a session's ledger record. An MCP server's hosts
+  authorize only an MCP tool's call (P0-7 took them off the session's policy): a session's own command toward one is
+  outside the authorization, its refusal is a TW-01 refusal, and TW-21 no longer exempts an allowlist or `deny_all`
+  refusal toward one.
+- **Tripwires.** TW-23 judges a child's choice of `mandatory` at its `security_record` call: `security_ingest` (main
+  gave it to vr's scout) marks every host it imports, which flooded one S2 per asset. TW-18 counts three refused
+  finishes in a row only for the same reason (main's finish gates refuse one gap at a time). A hit's key and detail drop
+  `U+061C` too.
 
 ### Monitor and main (da5d310, the ferret rebrand) together
 

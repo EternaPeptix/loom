@@ -10,12 +10,22 @@
 //!   `solvable` and `requires_restricted_network` flags and the role, the `scope` and `exclude` of the mission's named
 //!   target as its lead's start recorded them (`SessionMeta::target`, CONTRACTS-TRAFFIC-TARGETS T2), and the hosts the
 //!   configured MCP servers of the mission's pack add to its sessions (each server's `hosts` and the host of its `url`,
-//!   CONTRACTS-MCP M4). An agent's `why`, a ledger note by an agent, a goal or rule host that no operator grant backs,
-//!   and a ledger asset never enter it (the deterministic authorization of a host is the configured allow list, an
-//!   operator grant, a `[lab]` mark, the target's scope or an MCP server's hosts).
-//! - `authorizes(host, port)` is that deterministic authorization: an active grant, an `allow` entry, a target scope
-//!   entry (a host pattern, an IP literal or a CIDR block: `ferret_net::policy::scope_entry_covers`) or an MCP host
-//!   covers it, and no target `exclude` entry does (the proxy denies an excluded host whatever else allows it).
+//!   CONTRACTS-MCP M4), and the hosts the operator revoked from the mission (`<mission dir>/scope_revoked.json`, what
+//!   `ferret scope revoke`, Signal's `/scope revoke` and the web UI's Revoke write). An agent's `why`, a ledger note by
+//!   an agent, a goal or rule host that no operator grant backs, and a ledger asset never enter it (the deterministic
+//!   authorization of a host is the configured allow list, an operator grant, a `[lab]` mark or the target's scope,
+//!   less the target's exclusions and the revoked hosts).
+//! - `authorizes(host, port)` is that deterministic authorization: an active grant, an `allow` entry or a target scope
+//!   entry (a host pattern, an IP literal or a CIDR block: `ferret_net::policy::scope_entry_covers`) covers it, and no
+//!   target `exclude` entry and no revoked entry does (the proxy denies an excluded host, and every policy of the
+//!   mission denies a revoked one, `deny revoked {entry}`, whatever else allows it; a revoked entry is matched as
+//!   `ferret_net::policy::revoke_entry_covers` matches it, so a carve-out under a wildcard grant, or a revoke of a host
+//!   that `allow` or the target's scope reaches, is not authorized either). An MCP server's hosts do **not** authorize a
+//!   session's own command (P0-7: they are on the server's isolated proxy grant, not on the session's policy, so the
+//!   proxy refuses the session's own connection to them): they count only for the call of an MCP tool
+//!   (`for_mcp_call`), whose server reaches them through its own grant, and for the monitor's reading of an allowed net
+//!   decision toward them (the server's traffic, attributed to the session that owns it). `is_mcp_host` says whether a
+//!   host is one.
 //! - `Mark::Lab` is given only by `ferret scope --lab` or a restricted-network pack. Loopback and link-local addresses are
 //!   `Mark::None` unless an operator said otherwise.
 //! - A **real-target mission** is defined once, here, and every other place in the monitor uses it (§2.5 triage, §2.6
@@ -41,9 +51,11 @@
 //!   of its grant, `Mark::None`: `ferret scope --lab` is M4), the operator's chat messages and the answer part of their
 //!   inbox answers (`AuthFacts::operator_messages`, from the records authored by the user, cut to `MAX_MESSAGES` of
 //!   `MAX_MESSAGE_CHARS`), and the configuration's allow and deny lists, network mode, `solvable`,
-//!   `requires_restricted_network`, the role, the target's scope and exclusions and the MCP hosts. Nothing an agent wrote reaches it: not a `why`, a claim, a decision,
-//!   a note, an asset, a plan or a report. The monitor keeps an `Authorization` per mission and rebuilds it when the
-//!   ledger changes.
+//!   `requires_restricted_network`, the role, the target's scope and exclusions, the MCP hosts and the revoked hosts in
+//!   force at `upto_ms` (`AuthFacts::revoked`: each entry with the time the monitor first saw it in the mission's
+//!   revoked-hosts file, which is the time the file was written then; one that was granted again since is gone).
+//!   Nothing an agent wrote reaches it: not a `why`, a claim, a decision, a note, an asset, a plan or a report. The
+//!   monitor keeps an `Authorization` per mission and rebuilds it when the ledger or the revoked hosts change.
 //!
 //! Tests required (M2): no agent-authored string is reachable from `Authorization`; a scope request's `why` does not
 //! change `authorizes`; grants made in a reopened turn carry an expiry; the mission's goal is verbatim; the entries
@@ -51,7 +63,8 @@
 //! `a_grant_gives_its_mark_and_nothing_else_does`, `wildcard_and_port_grants_give_their_mark`,
 //! `the_strictest_mark_wins_and_lapsed_grants_give_nothing`, `real_targets_are_derived_from_mode_allow_list_and_grants`;
 //! after the merge of targets and MCP: `the_target_scope_and_mcp_hosts_authorize_and_exclusions_do_not`; after the merge
-//! of main (da5d310): `the_operators_approvals_not_yet_used_are_in_the_block`.
+//! of main (da5d310): `the_operators_approvals_not_yet_used_are_in_the_block`; after the merge of main (6be589b):
+//! `a_revoked_host_is_not_authorized_whatever_covers_it`, `mcp_hosts_authorize_only_an_mcp_tools_call`.
 
 use ferret_core::ledger::{Entry, LedgerState};
 use ferret_core::MissionId;
@@ -107,6 +120,9 @@ pub struct AuthFacts {
     pub target_exclude: Vec<String>,
     /// The hosts the configured MCP servers of the mission's pack add to its sessions (`hosts`, and the `url` host).
     pub mcp_hosts: Vec<String>,
+    /// (since, entry) of the hosts the operator revoked from the mission (`scope_revoked.json`): an entry counts for
+    /// what is judged at `since` or later.
+    pub revoked: Vec<(u64, String)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,6 +155,13 @@ pub struct Authorization {
     /// The hosts the mission's MCP servers add (CONTRACTS-MCP M4).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_hosts: Vec<String>,
+    /// The entries the operator revoked from the mission (hosts, `*.suffix`, IP literals, CIDR blocks, optionally with
+    /// a port), in force at the time the block is for: refused by every policy of the mission.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub revoked: Vec<String>,
+    /// Set by `for_mcp_call` only: the MCP servers' hosts authorize (an MCP tool's call). Never serialized.
+    #[serde(skip)]
+    pub mcp_call: bool,
 }
 
 impl Authorization {
@@ -167,13 +190,24 @@ impl Authorization {
 
     /// The deterministic authorization of `host` (on `port`, when known): see the CONTRACT.
     pub fn authorizes(&self, host: &str, port: Option<u16>) -> bool {
-        if self.excluded(host, port) {
+        if self.excluded(host, port) || self.revoked(host, port) {
             return false;
         }
         self.mark_of(host, port).is_some()
             || self.allow.iter().any(|p| ferret_net::policy::pattern_covers(p, host, port))
             || self.target_scope.iter().any(|e| ferret_net::policy::scope_entry_covers(e, host, port))
-            || self.is_mcp_host(host, port)
+            || (self.mcp_call && self.is_mcp_host(host, port))
+    }
+
+    /// The block as an MCP tool's call reads it: the MCP servers' hosts authorize too (the server reaches them through
+    /// its own isolated grant).
+    pub fn for_mcp_call(&self) -> Authorization {
+        Authorization { mcp_call: true, ..self.clone() }
+    }
+
+    /// True when an entry the operator revoked from the mission refuses `host` (on every port when `port` is `None`).
+    pub fn revoked(&self, host: &str, port: Option<u16>) -> bool {
+        self.revoked.iter().any(|e| ferret_net::policy::revoke_entry_covers(e, host, port))
     }
 
     /// True when an `exclude` entry of the mission's target covers `host`.
@@ -233,11 +267,17 @@ impl Authorization {
             target_scope: facts.target_scope.clone(),
             target_exclude: facts.target_exclude.clone(),
             mcp_hosts: facts.mcp_hosts.clone(),
+            revoked: facts.revoked.iter().filter(|(t, _)| *t <= upto_ms).map(|(_, h)| h.clone()).collect(),
+            mcp_call: false,
         }
     }
 
-    /// The mark the active operator grants give `host` (on `port`, when known), if any grant covers it.
+    /// The mark the active operator grants give `host` (on `port`, when known), if any grant covers it. A revoked host
+    /// has none: no grant reaches it.
     pub fn mark_of(&self, host: &str, port: Option<u16>) -> Option<Mark> {
+        if self.revoked(host, port) {
+            return None;
+        }
         self.grants
             .iter()
             .filter(|g| self.active(g) && ferret_net::policy::pattern_covers(&g.host, host, port))
@@ -274,6 +314,8 @@ mod tests {
             target_scope: vec![],
             target_exclude: vec![],
             mcp_hosts: vec![],
+            revoked: vec![],
+            mcp_call: false,
         }
     }
 
@@ -344,7 +386,7 @@ mod tests {
         assert!(a.authorizes("api.acme.example", Some(443)), "a host in the target's scope");
         assert!(a.authorizes("10.20.0.7", None), "an address in a scope block");
         assert!(!a.authorizes("sso.acme.example", None), "an excluded host");
-        assert!(a.authorizes("api.github.com", Some(443)), "an MCP server's host");
+        assert!(a.for_mcp_call().authorizes("api.github.com", Some(443)), "an MCP server's host, for its tool's call");
         assert!(a.is_mcp_host("api.github.com", None) && !a.is_mcp_host("api.acme.example", None));
         assert!(!a.authorizes("other.example", None));
         assert!(a.has_real_targets(), "a target's scope is a real target");
@@ -456,6 +498,62 @@ mod tests {
         let m = MissionId::from("m-1");
         assert!(Authorization::build(&m, &entries, 15, &facts()).mark_of("h.example", None).is_some());
         assert!(Authorization::build(&m, &entries, 25, &facts()).mark_of("h.example", None).is_none());
+    }
+
+    /// A revoke the ledger does not hold (a carve-out under a wildcard grant, a host `allow` or the target's scope
+    /// reaches) is refused by every policy of the mission: it is not authorized either, from the time it was seen.
+    #[test]
+    fn a_revoked_host_is_not_authorized_whatever_covers_it() {
+        use ferret_core::ledger::LedgerOp;
+        let entries = vec![entry(1, 10, "s-1", LedgerOp::ScopeGrant { hosts: vec!["*.lab.test".into()], note: None })];
+        let facts = AuthFacts {
+            network_mode: "allowlist".into(),
+            allow: vec!["api.allowed.test".into()],
+            target_scope: vec!["*.acme.test".into(), "10.9.0.0/24".into()],
+            revoked: vec![
+                (100, "web.lab.test".into()),
+                (100, "api.allowed.test".into()),
+                (100, "pay.acme.test".into()),
+                (100, "10.9.0.0/28".into()),
+                (100, "svc.lab.test:443".into()),
+            ],
+            ..AuthFacts::default()
+        };
+        let m = MissionId::from("m-1");
+        let before = Authorization::build(&m, &entries, 50, &facts);
+        assert!(before.authorizes("web.lab.test", None), "not revoked yet at 50");
+        let a = Authorization::build(&m, &entries, 150, &facts);
+        assert_eq!(a.revoked.len(), 5);
+        assert!(!a.authorizes("web.lab.test", Some(443)), "a carve-out under a wildcard grant");
+        assert_eq!(a.mark_of("web.lab.test", None), None);
+        assert!(a.authorizes("www.lab.test", None), "the wildcard's other names stay");
+        assert!(!a.authorizes("api.allowed.test", None), "an allow entry revoked");
+        assert!(!a.authorizes("pay.acme.test", None), "a host the target's scope reaches, revoked");
+        assert!(a.authorizes("www.acme.test", None));
+        assert!(!a.authorizes("10.9.0.3", None) && a.authorizes("10.9.0.30", None), "a block, by address");
+        assert!(!a.authorizes("svc.lab.test", Some(443)) && a.authorizes("svc.lab.test", Some(80)), "one port only");
+        assert!(a.authorizes("svc.lab.test", None), "still authorized on another port");
+        let json = serde_json::to_string(&a).unwrap_or_default();
+        assert!(json.contains("\"revoked\"") && json.contains("pay.acme.test"), "the reviewer's block says so: {json}");
+    }
+
+    /// P0-7: an MCP server's hosts are on its own isolated grant, not on the session's policy. They authorize the call
+    /// of an MCP tool, never a session's own command toward them.
+    #[test]
+    fn mcp_hosts_authorize_only_an_mcp_tools_call() {
+        let facts = AuthFacts {
+            network_mode: "allowlist".into(),
+            allow: vec!["target.example".into()],
+            mcp_hosts: vec!["api.github.com".into()],
+            ..AuthFacts::default()
+        };
+        let a = Authorization::build(&MissionId::from("m-1"), &[], u64::MAX, &facts);
+        assert!(!a.authorizes("api.github.com", Some(443)), "a session's own command does not reach it");
+        assert!(a.is_mcp_host("api.github.com", Some(443)));
+        assert!(a.for_mcp_call().authorizes("api.github.com", Some(443)));
+        assert!(a.authorizes("target.example", None) && a.for_mcp_call().authorizes("target.example", None));
+        let json = serde_json::to_string(&a.for_mcp_call()).unwrap_or_default();
+        assert!(!json.contains("mcp_call"), "{json}");
     }
 
     #[test]

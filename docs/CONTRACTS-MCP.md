@@ -97,10 +97,14 @@ grants it or the target's scope has it. The server's grant is narrowed like the 
 monitor E1): the infrastructure deny (the daemon's port, model endpoints, the services, Docker hosts, cloud
 metadata) and the mission's revoked hosts beat its `hosts`. Its decisions are recorded in the owning session's
 `net.jsonl` and its floor events are the session's (`mcp::grant_owner`); its connections end with the session's
-(`cut_mission`, `revoke_scope`, the panic), and the grant is revoked when the session ends. A stdio server runs in a
+(`cut_mission`, `revoke_scope`, the panic: the grant's id is in the runtime's `mcp_grants` from before the grant is
+made, so a lead still listing its servers is reached too, and grants made while the mission's scope changed get their
+policy again), a grant that lifts a revoke gives it its policy back (`grant_scope`), and the grant is revoked when the
+session ends. A stdio server runs in a
 sandbox with the grant's port and the session's identity and temp dir, so the census counts its processes as the
 session's (E3). The session start note (M6) names the hosts each server declares; the monitor's authorization
-counts them as the tools' backends.
+counts them as the tools' backends for an MCP tool's call and the server's own allowed traffic only, not for the
+session's own commands, which the session's policy does not let reach them.
 
 ## M5. A call and its result (`ferret-tools/src/mcp.rs` `McpTool`)
 

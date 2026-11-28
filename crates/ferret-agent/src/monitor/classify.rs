@@ -272,6 +272,8 @@ mod tests {
             target_scope: vec![],
             target_exclude: vec![],
             mcp_hosts: vec![],
+            revoked: vec![],
+            mcp_call: false,
         };
         assert!(classify(&call, &auth).is_err());
     }

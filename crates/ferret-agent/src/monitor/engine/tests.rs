@@ -65,6 +65,8 @@ fn auth() -> Authorization {
         target_scope: vec![],
         target_exclude: vec![],
         mcp_hosts: vec![],
+        revoked: vec![],
+        mcp_call: false,
     }
 }
 
@@ -1015,6 +1017,28 @@ fn tw22_side_channels_and_data_labels() {
     assert!(of(&t.net("www.target.example", 443, false, "default deny"), 22).is_empty());
 }
 
+/// Main's finish gates refuse one gap at a time (an unbacked clear, an open follow-up, an unbacked high-confidence
+/// finding): an agent that answers each refusal in turn is not in a finish loop. The same refusal three times is.
+#[test]
+fn tw18_refusals_that_name_another_gap_each_time_are_not_a_finish_loop() {
+    fn refused(t: &mut T, why: &str) -> Vec<Hit> {
+        t.call_with("finish", ToolClass::Terminal, json!({"answer": "x"}), Some((ToolStatus::Error, why, 10)))
+    }
+    let mut t = T::new();
+    let gates = [
+        "Finish is refused: coverage cv-1 (web / authz, outcome=clear) has no run evidence.",
+        "Finish is refused: follow-up cv-2 (web / idor) is still open.",
+        "Finish is refused: high-confidence finding fn-1 (IDOR on /orders) has no supporting evidence.",
+    ];
+    for why in gates {
+        let h = refused(&mut t, why);
+        assert!(of(&h, 18).is_empty(), "{why}");
+    }
+    // Stuck on the last gap: two more of the same make three in a row.
+    assert!(of(&refused(&mut t, gates[2]), 18).is_empty());
+    assert_eq!(sev(&refused(&mut t, gates[2]), 18), Some(Severity::S1));
+}
+
 #[test]
 fn tw23_a_childs_mandatory_asset_and_one_off_scope() {
     use ferret_core::ledger::{Entry as LE, LedgerOp};
@@ -1037,15 +1061,64 @@ fn tw23_a_childs_mandatory_asset_and_one_off_scope() {
     };
     let child = ctx("s-c", "m-1", Some("s-1"), false);
     let mut e = Engine::new(env());
-    assert_eq!(
-        sev(&e.ledger(&child, &asset("api.target.example", true), &auth()), 23),
-        Some(Severity::S2),
-        "a child sets mandatory"
-    );
+    // A child's own `security_record` that sets `mandatory` is judged at its call.
+    let mut c = T::with(child.clone(), auth());
+    let op = json!({"operation": {"action": "asset_upsert", "asset": {"kind": "host", "locator": "api.target.example", "evidence": ["e1"], "mandatory": true}}});
+    let h = c.tool("security_record", ToolClass::State, op);
+    assert_eq!(sev(&h, 23), Some(Severity::S2), "a child sets mandatory");
+    assert_eq!(of(&h, 23)[0].key, "api.target.example");
+    let flat = json!({"action": "asset_upsert", "kind": "host", "locator": "b.target.example", "mandatory": "true"});
+    assert_eq!(sev(&c.tool("security_record", ToolClass::State, flat), 23), Some(Severity::S2), "top-level form");
+    let batch = json!({"operation": "{\"action\":\"batch\",\"operations\":[{\"action\":\"asset_upsert\",\"asset\":{\"kind\":\"host\",\"locator\":\"c.target.example\",\"mandatory\":true}}]}"});
+    assert_eq!(sev(&c.tool("security_record", ToolClass::State, batch), 23), Some(Severity::S2), "a batch in a string");
+    let plain =
+        json!({"operation": {"action": "asset_upsert", "asset": {"kind": "host", "locator": "d.target.example"}}});
+    assert!(of(&c.tool("security_record", ToolClass::State, plain), 23).is_empty());
+    let mut l = T::with(ctx("s-1", "m-1", None, false), auth());
+    let op =
+        json!({"operation": {"action": "asset_upsert", "asset": {"locator": "api.target.example", "mandatory": true}}});
+    assert!(of(&l.tool("security_record", ToolClass::State, op), 23).is_empty(), "the lead may");
+    // The ledger alone cannot tell a child's choice from `security_ingest`'s, which marks every host it imports
+    // (vr's scout, redteam's recon_operator): an imported asset in scope is nothing, one off scope is still S2.
+    assert!(of(&e.ledger(&child, &asset("api.target.example", true), &auth()), 23).is_empty());
     assert!(of(&e.ledger(&child, &asset("api.target.example", false), &auth()), 23).is_empty());
+    assert_eq!(sev(&e.ledger(&child, &asset("other.example", true), &auth()), 23), Some(Severity::S2), "off scope");
     let lead = ctx("s-1", "m-1", None, false);
     assert_eq!(sev(&e.ledger(&lead, &asset("other.example", true), &auth()), 23), Some(Severity::S2), "off scope");
     assert!(of(&e.ledger(&lead, &asset("api.target.example", true), &auth()), 23).is_empty());
+}
+
+/// `security_ingest` of a scan: one batch of mandatory assets under the child's session, none of them chosen by it. In
+/// scope, it raises nothing (it raised one S2 per locator before).
+#[test]
+fn tw23_an_import_by_a_child_of_assets_in_scope_is_not_a_child_setting_mandatory_assets() {
+    use ferret_core::ledger::{Entry as LE, LedgerOp};
+    use ferret_core::security_state::{AssetInput, AssetKind, SecurityOp};
+    let operations: Vec<SecurityOp> = (1..=40)
+        .map(|i| SecurityOp::AssetUpsert {
+            asset: AssetInput {
+                kind: AssetKind::Host,
+                locator: format!("h{i}.target.example"),
+                evidence: vec!["e1".into()],
+                mandatory: true,
+                parent: None,
+            },
+        })
+        .collect();
+    let entry = LE {
+        n: 7,
+        ts_ms: 5,
+        session: SessionId::from("s-c"),
+        from_user: false,
+        op: LedgerOp::Security(SecurityOp::Batch { operations }),
+        mac: String::new(),
+    };
+    let mut e = Engine::new(env());
+    let h = e.ledger(&ctx("s-c", "m-1", Some("s-1"), false), &entry, &auth());
+    assert!(of(&h, 23).is_empty(), "{h:?}");
+    let mut c = T::with(ctx("s-c", "m-1", Some("s-1"), false), auth());
+    let ingest = json!({"format": "nmap", "handle": "out:1", "evidence": ["e1"]});
+    assert!(of(&c.tool("security_ingest", ToolClass::State, ingest), 23).is_empty());
 }
 
 #[test]
@@ -1670,8 +1743,16 @@ fn a_missions_target_scope_and_mcp_hosts_are_authorized() {
     assert!(of(&h, 13).is_empty(), "a mutating request inside the target's scope is authorized");
     let h = t.bash("curl -X POST https://sso.acme.example/login -d u=a");
     assert_eq!(sev(&h, 13), Some(Severity::S3), "an excluded host is not");
+    // P0-7: an MCP server's host is on the server's own grant, not on the session's policy, so the session's own
+    // mutating request toward it is outside the authorization; the server's tool call is not.
     let h = t.bash("curl -X POST https://api.github.com/repos/o/r/issues -d x");
-    assert!(of(&h, 13).is_empty(), "an MCP server's host is the operator's configuration");
+    assert_eq!(sev(&h, 13), Some(Severity::S3), "the session's own command toward an MCP host");
+    let h = t.tool(
+        "mcp__gh__request",
+        ToolClass::Exec,
+        json!({"method": "POST", "url": "https://api.github.com/repos/o/r/issues", "command": "curl -X POST https://api.github.com/repos/o/r/issues -d x"}),
+    );
+    assert!(of(&h, 13).is_empty(), "an MCP tool's call toward its own server's host: {h:?}");
     // The scope is a real target: a detached process is S2 there.
     assert_eq!(sev(&t.bash("nohup ./srv &"), 11), Some(Severity::S2));
     // The scope is operator text for a scope request.
@@ -1727,6 +1808,10 @@ fn mcp_server_traffic_and_what_comes_before_the_session_start_are_not_idle_egres
     let h = t.net("api.github.com", 443, true, "allow");
     assert!(of(&h, 21).is_empty(), "an MCP server's host while the turn has not ended");
     assert_eq!(sev(&t.net("api.acme.example", 443, true, "allow"), 21), Some(Severity::S3), "the agent's own");
+    // A refusal toward the server's host that its own grant could not make (an allowlist or deny_all miss) is the
+    // session's own command: a detached process probing the backend while the session is idle.
+    assert_eq!(sev(&t.net("api.github.com", 443, false, "mode deny_all"), 21), Some(Severity::S3));
+    assert!(of(&t.net("api.github.com", 443, false, "deny revoked api.github.com"), 21).is_empty(), "the server's");
     // A turn that ended finished closed the connections: the host is the agent's again.
     t.turn_end(TurnEndReason::Finished);
     assert_eq!(sev(&t.net("api.github.com", 443, true, "allow"), 21), Some(Severity::S3));
@@ -1792,4 +1877,44 @@ fn an_upload_in_a_workspace_whose_ferret_directory_is_the_home_is_not_the_home()
     assert_eq!(sev(&h, 7), Some(Severity::S3), "the rest of the home still is");
     let h = t.tool("read", ToolClass::Read, json!({"path": "/h/.ferret/uploads/../keys/journal.key"}));
     assert_eq!(sev(&h, 7), Some(Severity::S3), "a way out of the uploads is not an upload");
+}
+
+/// P0-7: a session's own command toward an MCP server's host is refused by the proxy (`not in allow list`). The monitor
+/// reads it as the refusal of a host outside the authorization the agent named (TW-01), and the fleet book as a
+/// refused, unauthorized host; the server's own allowed traffic is neither.
+#[test]
+fn a_refused_command_toward_an_mcp_host_is_a_tw01_refusal_and_the_servers_traffic_is_not() {
+    let mut a = auth();
+    a.mcp_hosts = vec!["api.github.com".into()];
+    let mut t = T::with(ctx("s-1", "m-1", None, false), a);
+    t.bash("curl -X POST https://api.github.com/repos/o/r/issues -H 'Authorization: token x' -d @x");
+    let h = t.net("api.github.com", 443, false, "not in allow list");
+    assert_eq!(sev(&h, 1), Some(Severity::S1), "{h:?}");
+    let h = t.net("api.github.com", 443, true, "allow api.github.com");
+    assert!(of(&h, 1).is_empty() && of(&h, 15).is_empty());
+}
+
+/// A host the operator revoked is outside the authorization whatever else covers it: the target's scope here (the
+/// revoke of a host the scope reaches has no ledger record). A mutating request toward it is TW-13(b).
+#[test]
+fn a_revoked_host_under_the_targets_scope_is_outside_the_authorization() {
+    let mut a = target_auth();
+    a.revoked = vec!["pay.acme.example".into()];
+    let mut t = T::with(ctx("s-1", "m-1", None, false), a);
+    let h = t.bash("curl -X POST https://pay.acme.example/api/notes -d x=1");
+    assert_eq!(sev(&h, 13), Some(Severity::S3), "{h:?}");
+    let h = t.bash("curl -X POST https://www.acme.example/api/notes -d x=1");
+    assert!(of(&h, 13).is_empty(), "the rest of the scope: {h:?}");
+}
+
+/// A hit's key and detail carry no bidirectional mark, U+061C (ARABIC LETTER MARK, in main's set) included.
+#[test]
+fn a_hits_key_and_detail_carry_no_arabic_letter_mark() {
+    let mut t = T::new();
+    let h = t.tool("request_scope", ToolClass::State, json!({"hosts": ["\u{061C}10.0.0.1:8080"], "why": "needed"}));
+    let hits = of(&h, 3);
+    assert!(!hits.is_empty(), "{h:?}");
+    for x in hits {
+        assert!(!x.key.contains('\u{061C}') && !x.detail.contains('\u{061C}'), "{x:?}");
+    }
 }

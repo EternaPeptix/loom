@@ -22,7 +22,10 @@
 //! nothing. It answers `200` (allowed), `403` (refused, with the refusal text) or `502` (the name does
 //! not resolve), with the rule in header [`RULE_HEADER`], and records the decision with method
 //! `FERRET-CHECK` and the rule suffixed ` (check only)`. Tools ask it before an https request, because an
-//! HTTP client does not show what the proxy answered to its CONNECT.
+//! HTTP client does not show what the proxy answered to its CONNECT. A check is registered as a connection is (see
+//! *Sessions*): a revoke, a cut or a policy change that reaches it while it resolves its name ends the wait at once,
+//! with `502` and a refusal on record (`{reason} (cut while its name resolved) (check only)`), and the addresses
+//! it found are judged by the session's policy as it is once the lookup is done, not as it was at authentication.
 //!
 //! ## Sessions
 //! `grant(session, policy) -> Result<SessionGrant, ProxyError>` returns fresh random credentials (user =
@@ -58,8 +61,8 @@
 //! command and tool credentials with `hosts` revoked (`Policy::with_revoked`: `deny revoked {entry}`) and ends its
 //! open connections to them, as `cut_hosts` does (below); an entry that cannot be read is an error and nothing
 //! changes. All of these, `set_policy`, `cut_hosts`, `cut` and `cut_sessions` end connections through one registry
-//! (each tunnel and forwarded request is registered under its credentials' session before it opens its
-//! destination), so a connection is ended by whichever of them reaches it first, with that one's reason.
+//! (each tunnel, forwarded request and check is registered under its credentials' session before it opens or looks
+//! up its destination), so a connection is ended by whichever of them reaches it first, with that one's reason.
 //! The session's listener is closed, and `session_port` gives `None`; its port is **retired**: kept, as a
 //! number only, among the proxy's own ports for the proxy's life. A listener for a session is opened with
 //! `tokio::net::TcpSocket`: bind `127.0.0.1:0`, read the port, and if it is retired (or otherwise one of
@@ -115,11 +118,12 @@
 //! reason "the session's connections were closed by ferret" (never anything the monitor decided or wrote). A
 //! connection that authenticated before the call and is registered after it is ended when it registers (each
 //! cut bumps a counter and marks its sessions with it; a connection remembers the counter at its
-//! authentication), and one that is only resolving or connecting is ended when it has opened its destination,
-//! before the `200` and before any byte upstream (a connect that hangs is bounded by its 10 s timeout and
-//! carries no bytes). It does not touch the policy, the credentials or the listener: the caller sets a hold
-//! with `set_policy` first so that nothing new opens. It returns how many were ended; `0` for a session with
-//! nothing open.
+//! authentication), and one that waits for pacing, resolves its name or connects stops at once, before the `200`
+//! and before any byte upstream: its client gets `502` and the record is a refusal, as above. A check that is
+//! resolving its name is ended the same way (see *Checks*). It does not touch the policy, the credentials or the
+//! listener: the caller sets a hold with `hold` first so that nothing new opens (not `set_policy`, which itself
+//! ends what the new policy refuses, with the reason "the session scope was revoked", and leaves the reference
+//! credential's policy as it was). It returns how many were ended; `0` for a session with nothing open.
 //!
 //! ## Veto (E4b)
 //! `set_veto(Some(f))` installs a synchronous, in-process veto, `f(session, &Dest) -> Option<rule>`, with
@@ -292,8 +296,10 @@
 //! names: a placeholder encrypted hello naming the destination passes and one naming another host does not, an alert
 //! or a record of version `0.0` in front of a hello naming a denied name is refused with nothing sent upstream.
 //! Pacing: a tunnel and a forwarded request queued behind another one to the same host are cut while they wait and
-//! open nothing (`502`, one refusal with the cut's reason, the destination accepts nothing), are judged by a policy
-//! set while they wait, and once let through carry `paced_ms`; a queued tunnel whose client closes opens nothing.
+//! open nothing (`502`, one refusal with the cut's reason and the time it waited, the destination accepts nothing),
+//! are judged by a policy set while they wait, and once let through carry `paced_ms`; a queued tunnel whose client
+//! closes opens nothing. Checks: a check that is resolving when its session is revoked stops at once (`502`, a
+//! refusal on record), without waiting for its lookup.
 //! Revokes: `revoke(A)` ends A's open `CONNECT` tunnel and its in-flight forwarded request within milliseconds (the
 //! destination sees EOF, the record says "the session scope was revoked") and leaves B's tunnel; `revoke_hosts`
 //! ends only the tunnel to the revoked `host:port`, a new connection to it is refused (`403`, `deny revoked …`) and
@@ -346,8 +352,9 @@
 //! client goes away (a tunnel's client that closes its end; a forwarded request's whose connection fails: one that
 //! only shut down its writing half still waits and is served, as above), nothing is recorded. When the wait ends the
 //! policy is read again from the session's current entry, so a hold or a revoke set meanwhile decides the
-//! connection. Every decision recorded for a connection that waited carries `paced_ms`, how long it waited: the
-//! client connected that long before the time of the record (the monitor's TW-21 judges the decision at that time).
+//! connection. Every decision recorded for a connection that waited carries `paced_ms`, how long it waited, the
+//! refusal of one that was cut while it waited included: the client connected that long before the time of the
+//! record (the monitor's TW-21 judges the decision at that time).
 //!
 //! ## Forwarded requests
 //! The request body is forwarded up to its end as its head frames it: `Content-Length` bytes, or a
@@ -1296,10 +1303,11 @@ impl Proxy {
     /// destination (E4a). Returns how many were ended. Each ended connection that was on record as allowed gets
     /// the second decision, with the fixed reason "the session's connections were closed by ferret". A
     /// connection the session authenticated before this call and has not registered yet is ended when it
-    /// registers; one that is only resolving or connecting its destination is ended when that finishes, before
-    /// the `200` or any byte upstream. The bytes of an open tunnel stop within a few milliseconds. It does not
-    /// change the policy: the caller sets a hold with `set_policy` first, so a connection that starts afterwards
-    /// is refused by it.
+    /// registers; one that waits for pacing, resolves its name or connects stops at once, before the `200` or any
+    /// byte upstream (its client gets `502`, and a refusal is on record). The bytes of an open tunnel stop within a
+    /// few milliseconds. It does not change the policy: the caller sets a hold with [`Proxy::hold`] first, so a
+    /// connection that starts afterwards is refused by it ([`Proxy::set_policy`] would itself end what the new
+    /// policy refuses, with another reason, and leave the reference credential's policy as it was).
     pub fn cut(&self, session: &SessionId) -> usize {
         self.cut_sessions(std::iter::once(session))
     }
@@ -1471,8 +1479,8 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Accepts on one listener until `stop`; connections are served until `cancel` (the proxy's own token),
-/// so closing a session's listener leaves its open connections to finish.
+/// Accepts on one listener until `stop`; pre-head sockets on a session listener also end on `stop`,
+/// and authenticated connections end immediately on proxy shutdown or session/host revocation.
 async fn accept_loop(
     listener: TcpListener,
     shared: Arc<Shared>,
@@ -2242,8 +2250,21 @@ async fn unreachable_decision(cx: &Ctx<'_>, rule: &str, ip: Option<IpAddr>, why:
     cx.unreachable(why)
 }
 
-/// Answers a check (see *Checks*): the decision `open_upstream` would make, without connecting.
-async fn check(client: &mut TcpStream, cx: &Ctx<'_>, policy: &Policy, slot: OwnedSemaphorePermit) {
+/// Answers a check (see *Checks*): the decision `open_upstream` would make, without connecting. It is registered
+/// (`live`): a cut that reaches it while it resolves its name ends the wait at once (`502`, a refusal on record), and
+/// the addresses it found are judged by the session's policy as it is then.
+async fn check(
+    client: &mut TcpStream,
+    cx: &Ctx<'_>,
+    policy: &Policy,
+    slot: OwnedSemaphorePermit,
+    live: &LiveGuard<'_>,
+) {
+    let cut = &live.cut;
+    // Cut since it authenticated (a revoke, a cut, a panic): nothing is looked up.
+    if cut.is_cancelled() {
+        return check_cut(client, cx, slot, cut, "before it was judged").await;
+    }
     let name = policy.check_name(cx.host, cx.port);
     if !name.allowed {
         cx.observe_refusal(None);
@@ -2258,15 +2279,30 @@ async fn check(client: &mut TcpStream, cx: &Ctx<'_>, policy: &Policy, slot: Owne
     let found = if name.allowed {
         let addrs = match cx.host.parse::<IpAddr>() {
             Ok(ip) => Ok(vec![ip]),
-            Err(_) => resolve(cx, None).await,
+            Err(_) => resolve(cx, Some(cut)).await,
         };
-        // The first address the policy allows, else the first refusal.
-        addrs.and_then(|addrs| {
-            let mut checked =
-                addrs.into_iter().map(|ip| (cx.shared.check_addr(policy, cx.host, cx.port, ip, &name.rule), Some(ip)));
-            let first = checked.next().ok_or("the name has no addresses")?;
-            Ok(if first.0.allowed { first } else { checked.find(|(v, _)| v.allowed).unwrap_or(first) })
-        })
+        if cut.is_cancelled() {
+            return check_cut(client, cx, slot, cut, "while its name resolved").await;
+        }
+        // Judged by the session's policy as it is now: a change made while the name resolved counts. A session that
+        // holds no grant any more was revoked.
+        let Some(now) = current_policy(cx.shared, cx.session, cx.reference) else {
+            cut.fire(REVOKED);
+            return check_cut(client, cx, slot, cut, "while its name resolved").await;
+        };
+        let again = now.check_name(cx.host, cx.port);
+        if again.allowed {
+            // The first address the policy allows, else the first refusal.
+            addrs.and_then(|addrs| {
+                let mut checked = addrs
+                    .into_iter()
+                    .map(|ip| (cx.shared.check_addr(&now, cx.host, cx.port, ip, &again.rule), Some(ip)));
+                let first = checked.next().ok_or("the name has no addresses")?;
+                Ok(if first.0.allowed { first } else { checked.find(|(v, _)| v.allowed).unwrap_or(first) })
+            })
+        } else {
+            Ok((again, None))
+        }
     } else {
         Ok((name.clone(), None))
     };
@@ -2291,6 +2327,19 @@ async fn check(client: &mut TcpStream, cx: &Ctx<'_>, policy: &Policy, slot: Owne
     let header: String = rule.chars().map(|c| if c == ' ' || c.is_ascii_graphic() { c } else { '?' }).collect();
     cx.record_best_effort(allowed, format!("{rule} (check only)"), resolved).await;
     answer(client, cx.shared, slot, status, &format!("{RULE_HEADER}: {header}\r\n"), &body).await;
+}
+
+/// Answers a check that was cut `when` (before it was judged, while its name resolved): `502`, and a refusal on
+/// record with the cut's reason.
+async fn check_cut(client: &mut TcpStream, cx: &Ctx<'_>, slot: OwnedSemaphorePermit, cut: &Cut, when: &str) {
+    let why = cut.why();
+    cx.record_best_effort(false, format!("{why} (cut {when}) (check only)"), None).await;
+    let body = format!(
+        "ferret proxy: the check of {} was ended before it was answered: {why}. Nothing was opened.\n",
+        cx.dest()
+    );
+    let header: String = why.chars().map(|c| if c == ' ' || c.is_ascii_graphic() { c } else { '?' }).collect();
+    answer(client, cx.shared, slot, "502 Bad Gateway", &format!("{RULE_HEADER}: {header}\r\n"), &body).await;
 }
 
 /// Answers a request of a session that the proxy rejects itself with 400, after auditing it.
@@ -2454,7 +2503,9 @@ async fn handle(
                     )
                     .await;
                 } else {
-                    check(&mut client, &cx, &policy, slot).await;
+                    // Registered like a connection, so that a cut reaches it while it resolves (see *Checks*).
+                    let live = LiveGuard::register(shared, session, reference, &host, port, seen);
+                    check(&mut client, &cx, &policy, slot, &live).await;
                 }
             }
             Err(m) => reject(&mut client, &shared, slot, &session, &head, &m).await,
@@ -2595,8 +2646,8 @@ enum Paced {
     /// Go on, holding the governor's permit (`None` when nothing paces it or the wait reached its bound), after
     /// waiting that many milliseconds.
     Go(Option<crate::pace::PaceGuard>, u64),
-    /// The connection was cut while it waited: nothing was resolved or opened.
-    Cut,
+    /// The connection was cut while it waited, after that many milliseconds: nothing was resolved or opened.
+    Cut(u64),
     /// The client went away while it waited (see `client_gone`), or the proxy shut down: nothing was resolved,
     /// opened or recorded.
     Gone,
@@ -2619,20 +2670,21 @@ async fn pace(
         return Paced::Go(None, 0);
     }
     if cut.is_cancelled() {
-        return Paced::Cut;
+        return Paced::Cut(0);
     }
     let started = std::time::Instant::now();
+    let waited = || u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let guard = tokio::select! {
         biased;
-        _ = cut.cancelled() => return Paced::Cut,
+        _ = cut.cancelled() => return Paced::Cut(waited()),
         _ = cancel.cancelled() => return Paced::Gone,
         g = gov.acquire(cx.host, cancel) => g,
         _ = client_gone(client, eof_is_gone) => return Paced::Gone,
     };
     if cut.is_cancelled() {
-        return Paced::Cut;
+        return Paced::Cut(waited());
     }
-    Paced::Go(guard, u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX))
+    Paced::Go(guard, waited())
 }
 
 /// Returns when the client's connection failed, or, with `eof_is_gone`, when it closed its end; never while it is
@@ -2646,9 +2698,10 @@ async fn client_gone(client: &TcpStream, eof_is_gone: bool) {
     }
 }
 
-/// Answers a connection that was cut while it waited for pacing: `502`, and a refusal on record (nothing was opened,
-/// so there is no allow to follow).
-async fn cut_while_paced(client: &mut TcpStream, cx: &Ctx<'_>, slot: OwnedSemaphorePermit, cut: &Cut) {
+/// Answers a connection that was cut while it waited for pacing, after `paced_ms`: `502`, and a refusal on record
+/// that says how long it waited (nothing was opened, so there is no allow to follow).
+async fn cut_while_paced(client: &mut TcpStream, cx: &Ctx<'_>, slot: OwnedSemaphorePermit, cut: &Cut, paced_ms: u64) {
+    let cx = &Ctx { paced_ms, ..*cx };
     let (status, body) = closed_before_open(cx, cut.why(), "while it waited for pacing").await;
     answer(client, cx.shared, slot, status, "", &body).await;
 }
@@ -2681,7 +2734,7 @@ async fn tunnel(
     // Intercepted tunnels pace each HTTP request individually in `intercept::serve`; opaque tunnels pace once here.
     let (_pace, paced_ms) = match pace(cx, &client, paced && !will_intercept, true, &cancel, cut).await {
         Paced::Go(guard, ms) => (guard, ms),
-        Paced::Cut => return cut_while_paced(&mut client, cx, slot, cut).await,
+        Paced::Cut(ms) => return cut_while_paced(&mut client, cx, slot, cut, ms).await,
         Paced::Gone => return,
     };
     let cx = &Ctx { paced_ms, ..*cx };
@@ -3477,7 +3530,7 @@ async fn forward(
     let command_traffic = !reference && !tool;
     let (_pace, paced_ms) = match pace(cx, &client, command_traffic, false, &cancel, cut).await {
         Paced::Go(guard, ms) => (guard, ms),
-        Paced::Cut => return cut_while_paced(&mut client, cx, slot, cut).await,
+        Paced::Cut(ms) => return cut_while_paced(&mut client, cx, slot, cut, ms).await,
         Paced::Gone => return,
     };
     let cx = &Ctx { paced_ms, ..*cx };
@@ -6630,8 +6683,38 @@ mod tests {
         let ds = decisions_of(&mut rx, &s, Duration::from_millis(500)).await;
         let allows = ds.iter().filter(|d| d.allowed && !d.rule.contains("failed after the allow")).count();
         assert_eq!(allows, 1, "the waiting connections are never on record as allowed: {ds:?}");
-        let cut = ds.iter().filter(|d| !d.allowed && d.rule.ends_with("(cut while it waited for pacing)")).count();
-        assert_eq!(cut, 2, "{ds:?}");
+        let cut: Vec<&NetDecision> =
+            ds.iter().filter(|d| !d.allowed && d.rule.ends_with("(cut while it waited for pacing)")).collect();
+        assert_eq!(cut.len(), 2, "{ds:?}");
+        // The refusal says how long each waited, so the monitor judges it at the time its client connected (TW-21).
+        assert!(cut.iter().all(|d| d.paced_ms.is_some_and(|ms| ms >= 300)), "{cut:?}");
+    }
+
+    /// A check is registered like a connection: a revoke of its session ends its wait for a slow lookup at once, with
+    /// `502` and a refusal on record, and the check does not answer from the policy it authenticated with.
+    #[tokio::test]
+    async fn a_check_whose_session_is_revoked_while_its_name_resolves_ends_at_once() {
+        let resolver: Resolver = Arc::new(|_: &str| {
+            std::thread::sleep(Duration::from_millis(1500));
+            vec!["127.0.0.1".parse().unwrap()]
+        });
+        let (p, _rx, seen) = start_audited(false, Limits::default(), Some(resolver)).await;
+        let s = SessionId::from("s-check-cut");
+        let g = p.grant(&s, lab()).unwrap();
+        let req = format!("{CHECK_METHOD} slow.test:443 HTTP/1.1\r\n{}\r\n", auth(&g));
+        let gp = g.port;
+        let begun = std::time::Instant::now();
+        let client = tokio::spawn(async move { raw(gp, req.as_bytes()).await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        p.revoke(&s);
+        let resp = timeout(T, client).await.unwrap().unwrap();
+        assert!(begun.elapsed() < Duration::from_millis(1200), "the revoke ended the wait: {:?}", begun.elapsed());
+        assert_eq!(status(&resp), 502, "{resp}");
+        assert!(resp.contains(REVOKED), "{resp}");
+        let ds: Vec<NetDecision> =
+            lock(&seen).iter().filter(|(sid, _)| sid.as_ref() == Some(&s)).map(|(_, d)| d.clone()).collect();
+        assert_eq!(ds.len(), 1, "{ds:?}");
+        assert!(!ds[0].allowed && ds[0].rule.ends_with("(cut while its name resolved) (check only)"), "{ds:?}");
     }
 
     /// The policy a queued connection is judged by is the session's when its wait ends (a hold or a revoke set

@@ -51,10 +51,15 @@
 //! - **`enabled = false`** keeps the precision-list, S4 and canary tripwires (they have no off switch, design 7.1): the
 //!   core reads and logs only the hits that are `precision`, S4 or TW-24; the rest are dropped.
 //! - **Authorization:** `auth_for(mission, ts)` is `Authorization::build` over the mission's journal entries up to `ts`
-//!   and the operator's messages up to `ts`, cached per mission until the journal or the messages change. A mission's
-//!   journal is read when a session of it wrote a `ledger` record (debounced by `LEDGER_DEBOUNCE_MS`), verified with
-//!   the journal key when the core has it. Its facts carry the mission's named target (scope and exclusions, from the
-//!   first session primed with one: `source::prime`) and the hosts of the lead's pack's MCP servers (`Env::mcp_hosts`).
+//!   and the operator's messages up to `ts`, cached per mission until the journal, the messages or the revoked hosts
+//!   change. A mission's journal is read when a session of it wrote a `ledger` record (debounced by
+//!   `LEDGER_DEBOUNCE_MS`), verified with the journal key when the core has it. Its facts carry the mission's named
+//!   target (scope and exclusions, from the first session primed with one: `source::prime`), the hosts of the lead's
+//!   pack's MCP servers (`Env::mcp_hosts`) and the hosts the operator revoked (`<mission dir>/scope_revoked.json`). That
+//!   file is read when the mission is first seen and again, before a pump reads the mission's sessions, whenever its
+//!   length or time changed; an entry counts from the time the file was written when the core first saw it. An
+//!   operator's revoke writes no `ledger` record to any session's log, so a change of the file also has the journal
+//!   read again (the `ScopeRevoke` of a recorded grant).
 //! - **Priming** a session tells the engine when it started (`Engine::started_at`) and, for a session resumed past
 //!   records (a cursor not at 0), where its shell was left (`source::last_shell_dir`, `Engine::set_shell_dir`).
 //! - **Model switches:** a session is relaxed-alignment (one tier up for six categories) when its `session_start`'s
@@ -74,7 +79,8 @@
 //! an interrupted first start is still a first start; a child primed before its `forked` record is read from it on; a
 //! net decision that waited out no grace is read again after a restart; the credential index survives a restart; a
 //! disabled core keeps the precision list; an S1 target back inside the window counts; a net decision is judged after its grace and after the log; a
-//! mission's authorization follows its journal and its operator messages; the fleet scan runs on its period and reports
+//! mission's authorization follows its journal and its operator messages, and an operator's revoke (the revoked-hosts
+//! file, and the journal it appended to) without any session record; the fleet scan runs on its period and reports
 //! once; a memory core writes no file; the status counts what was read; a switch onto a relaxed model uptiers the
 //! session's later hits and a switch back does not lower them, across a restart too.
 
@@ -137,6 +143,7 @@ struct Src {
     last_ts: u64,
 }
 
+#[derive(Default)]
 struct MState {
     entries: Vec<LedgerEntry>,
     loaded_ms: u64,
@@ -144,8 +151,12 @@ struct MState {
     pack: String,
     role: String,
     facts: AuthFacts,
-    cache: Option<(usize, usize, Arc<Authorization>)>,
+    /// (journal entries, operator messages, revoked entries) in force at the time the cached block is for.
+    cache: Option<(usize, usize, usize, Arc<Authorization>)>,
     prior: Vec<MissionId>,
+    /// The revoked-hosts file has been read once; `revoked_stamp` is its (length, time) then, `None` when it was absent.
+    revoked_read: bool,
+    revoked_stamp: Option<(u64, Option<std::time::SystemTime>)>,
 }
 
 #[derive(Default)]
@@ -631,12 +642,10 @@ impl Core {
     // ---- authorization --------------------------------------------------------------------------------------------------
 
     fn mstate(&mut self, mission: &MissionId, pack: &str, role: &str) -> &mut MState {
-        let env = self.env.clone();
-        self.missions.entry(mission.clone()).or_insert_with(|| {
+        if !self.missions.contains_key(mission) {
+            let env = self.env.clone();
             let p = env.pack(pack);
-            MState {
-                entries: Vec::new(),
-                loaded_ms: 0,
+            let mut m = MState {
                 dirty: true,
                 pack: pack.to_string(),
                 role: role.to_string(),
@@ -644,19 +653,25 @@ impl Core {
                     network_mode: env.network_mode.clone(),
                     allow: env.allow.clone(),
                     deny: env.deny.clone(),
-                    box_targets: Vec::new(),
                     solvable: p.solvable,
                     requires_restricted_network: p.requires_restricted_network,
                     role: role.to_string(),
-                    operator_messages: Vec::new(),
-                    target_scope: Vec::new(),
-                    target_exclude: Vec::new(),
                     mcp_hosts: env.mcp_hosts(pack),
+                    ..AuthFacts::default()
                 },
-                cache: None,
-                prior: Vec::new(),
-            }
-        })
+                ..MState::default()
+            };
+            read_revoked(&self.paths, self.clock_ms, mission, &mut m);
+            self.missions.insert(mission.clone(), m);
+        }
+        self.missions.entry(mission.clone()).or_default()
+    }
+
+    /// Read the revoked-hosts file of `mission` again when it changed (see `read_revoked`).
+    fn refresh_revoked(&mut self, mission: &MissionId) {
+        if let Some(m) = self.missions.get_mut(mission) {
+            read_revoked(&self.paths, self.clock_ms, mission, m);
+        }
     }
 
     /// The authorization in force for `mission` at `ts`.
@@ -676,13 +691,14 @@ impl Core {
         };
         let k = m.entries.iter().filter(|e| e.ts_ms <= ts).count();
         let msgs = m.facts.operator_messages.iter().filter(|(t, _)| *t <= ts).count();
-        if let Some((ck, cm, a)) = &m.cache {
-            if *ck == k && *cm == msgs {
+        let revoked = m.facts.revoked.iter().filter(|(t, _)| *t <= ts).count();
+        if let Some((ck, cm, cr, a)) = &m.cache {
+            if *ck == k && *cm == msgs && *cr == revoked {
                 return a.clone();
             }
         }
         let a = Arc::new(Authorization::build(mission, &m.entries, ts, &m.facts));
-        m.cache = Some((k, msgs, a.clone()));
+        m.cache = Some((k, msgs, revoked, a.clone()));
         a
     }
 
@@ -1158,6 +1174,15 @@ impl Core {
         } else {
             hints.iter().filter(|h| self.srcs.contains_key(*h)).cloned().collect()
         };
+        // The operator's revokes reach no session's log as a ledger record: the mission's revoked-hosts file is looked
+        // at before its sessions' records are judged.
+        let watched: BTreeSet<MissionId> = names
+            .iter()
+            .filter_map(|n| self.srcs.get(n).and_then(|s| s.primed.as_ref()).map(|p| p.ctx.mission.clone()))
+            .collect();
+        for m in &watched {
+            self.refresh_revoked(m);
+        }
         let mut progress = false;
         let before = self.fold.last_seq;
         if full {
@@ -1339,6 +1364,43 @@ impl Core {
             reviewers: Vec::new(),
             down_reason: down,
         }
+    }
+}
+
+/// Read the revoked-hosts file of `mission` (`<mission dir>/scope_revoked.json`, which the runtime's `revoke_scope`
+/// and `grant_scope` write) into `m` when it changed since the last read (its length and time), or on the first read.
+/// An entry new to the list is in force from the time the file was written (`clock_ms`, the newest record's time,
+/// when the time cannot be read), one already known keeps its time, one that is gone (granted again) leaves. A change
+/// after the first read marks the journal to be read again: a revoke of a recorded grant appended `ScopeRevoke` to it,
+/// which no session's log announces with a `ledger` record.
+fn read_revoked(paths: &Paths, clock_ms: u64, mission: &MissionId, m: &mut MState) {
+    let path = crate::runtime::revoked_hosts_path(paths, mission);
+    let meta = std::fs::metadata(&path).ok();
+    let stamp = meta.as_ref().map(|md| (md.len(), md.modified().ok()));
+    if m.revoked_read && m.revoked_stamp == stamp {
+        return;
+    }
+    let first = !m.revoked_read;
+    m.revoked_read = true;
+    m.revoked_stamp = stamp;
+    let hosts = if stamp.is_some() { crate::runtime::load_revoked(&path) } else { Vec::new() };
+    let written = stamp
+        .and_then(|(_, t)| t)
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(clock_ms, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+    let revoked: Vec<(u64, String)> = hosts
+        .into_iter()
+        .map(|h| {
+            let since = m.facts.revoked.iter().find(|(_, x)| x.eq_ignore_ascii_case(&h)).map_or(written, |(t, _)| *t);
+            (since, h)
+        })
+        .collect();
+    if revoked != m.facts.revoked {
+        m.facts.revoked = revoked;
+        m.cache = None;
+    }
+    if !first {
+        m.dirty = true;
     }
 }
 

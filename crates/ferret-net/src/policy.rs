@@ -269,6 +269,23 @@ pub fn scope_entry_covers(entry: &str, host: &str, port: Option<u16>) -> bool {
     }
 }
 
+/// True when the revoke entry `entry` (the grammar of [`Policy::with_revoked`] and `Proxy::revoke_hosts`: a host or
+/// `*.suffix`, optionally with `:port`, an IP literal or a CIDR block) refuses `host` as `deny revoked {entry}` does:
+/// by name, and by address when `host` is an IP literal. With `port` of `None` the answer is "is the host revoked on
+/// every port", so an entry with a port, which refuses that port only, does not cover it. An invalid entry covers
+/// nothing. The monitor's authorization reads a mission's revoked hosts with it.
+pub fn revoke_entry_covers(entry: &str, host: &str, port: Option<u16>) -> bool {
+    let Ok(e) = PrivEntry::parse(entry) else { return false };
+    if let (PrivEntry::Name(p), None) = (&e, port) {
+        if p.port.is_some() {
+            return false;
+        }
+    }
+    let h = normalize_host(host);
+    let addr = h.parse::<IpAddr>().ok();
+    Policy::list_hit(std::slice::from_ref(&e), "", &h, port.unwrap_or(0), addr).is_some()
+}
+
 /// Splits `host[:port]`, `[v6]` and `[v6]:port`; a bare IPv6 literal has no port.
 fn split_host_port(text: &str) -> Result<(&str, Option<u16>), String> {
     let parse_port = |p: &str| p.parse::<u16>().map_err(|_| format!("`{p}` is not a port number"));
@@ -1227,6 +1244,21 @@ mod tests {
         assert!(scope_entry_covers("fd00::/8", "[fd00::1]", None));
         assert!(!scope_entry_covers("10.20.0.0/24", "www.acme.test", None), "a block never covers a name");
         assert!(!scope_entry_covers("10.20.0.0/99", "10.20.0.5", None), "an invalid entry covers nothing");
+    }
+
+    #[test]
+    fn a_revoke_entry_covers_what_deny_revoked_refuses() {
+        assert!(revoke_entry_covers("web.lab.test", "WEB.lab.test", None));
+        assert!(revoke_entry_covers("*.lab.test", "a.lab.test", Some(443)));
+        assert!(!revoke_entry_covers("*.lab.test", "lab.test", None), "a wildcard does not cover the apex");
+        assert!(revoke_entry_covers("api.lab.test:443", "api.lab.test", Some(443)));
+        assert!(!revoke_entry_covers("api.lab.test:443", "api.lab.test", Some(80)));
+        assert!(!revoke_entry_covers("api.lab.test:443", "api.lab.test", None), "revoked on one port only");
+        assert!(revoke_entry_covers("10.0.0.0/24", "10.0.0.7", None));
+        assert!(!revoke_entry_covers("10.0.0.0/24", "web.lab.test", None), "a block never covers a name");
+        assert!(!revoke_entry_covers("not a host", "web.lab.test", None));
+        let p = pol(NetworkMode::Open, &[], &[], &[]).with_revoked(&["*.lab.test".into()]).unwrap();
+        assert_eq!(p.check_name("a.lab.test", 443).rule, "deny revoked *.lab.test");
     }
 
     #[test]

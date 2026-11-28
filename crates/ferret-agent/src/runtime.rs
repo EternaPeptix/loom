@@ -472,7 +472,9 @@
 //! - `grant_scope` refuses a host that infrastructure refuses (`Policy::infrastructure_refusal`: a literal
 //!   address of a model endpoint, the box's Docker host, cloud metadata, DevTools or Docker API ports on this
 //!   machine; `The host `{h}` is infrastructure …`) and grants nothing of the list; it reaches every known session
-//!   of the mission, not only the active ones, and bumps the mission's `scope_gen`.
+//!   of the mission, not only the active ones, and bumps the mission's `scope_gen`. A grant that lifts a revoke also
+//!   gives each MCP server grant of the mission's sessions its policy again (`Inner::refloor_mcp_grants`: the
+//!   server's own hosts, narrowed by `mission_floor` as it is now), since the revoke narrowed those too.
 //! - `revoke_scope(id, hosts, reason)` (monitor E1 and main's 6be589b together: one entry, which the CLI's `ferret
 //!   scope revoke`, `POST /api/sessions/{id}/scope/revoke`, Signal's `/scope revoke` and the web UI's Revoke button
 //!   call): the operator revokes hosts from the mission of `id` (any session; a child's id goes to its lead). Each
@@ -480,33 +482,41 @@
 //!   optionally with a port (a name under a wildcard grant, a host `mode open`, `network.allow` or the target's scope
 //!   reaches). `reason` is optional (the ledger records `no reason given`). An empty list, a blank entry, one with
 //!   whitespace or a comma and one `network.deny` cannot read are refused (`invalid host…`), an unknown session too
-//!   (`There is no session {id} (not found).`), and change nothing. In order: each revoked grant the ledger lists is
-//!   appended to the mission's journal as `ScopeRevoke` (a mission without a ledger skips this; a grant the lead has
-//!   not recorded yet, still queued on disk, and an entry that is no grant get no record: the receipt's `recorded`
-//!   and `not_granted` say which; revoking a grant again once the lead has recorded it records it; a journal failure
-//!   on the first record refuses the call and changes nothing, a later one is reported once everything else stands);
-//!   the grants leave the in-memory grants and every entry joins the mission's revoked hosts (`<mission
-//!   dir>/scope_revoked.json`, written durably, read at start; `scope_revoked` in memory), which keep it out of
+//!   (`There is no session {id} (not found).`), and change nothing. In order, the cut first and the records after it
+//!   (a full disk or a ledger that cannot be read or written never keeps a revoked destination open): the grants leave
+//!   the in-memory grants and every entry joins the mission's revoked hosts (`<mission dir>/scope_revoked.json`,
+//!   written durably, read at start; `scope_revoked` in memory; `scope_gen` moves under the same lock), which keep it
+//!   out of
 //!   `granted_hosts` and refused by every policy the mission's sessions and MCP servers' isolated grants get
 //!   (`Inner::mission_floor`: `Policy::with_revoked`, rule `deny revoked {entry}`; a wildcard grant, `network.allow`,
 //!   `allow_private`, the target's scope and `mode open` do not reach it) until granted again (`grant_scope` of it
-//!   clears that) — also after a restart, whatever the ledger says of a grant recorded later. Every session of the
-//!   mission that is known, started or being started, and each of its MCP servers' grants, gets its live policy
-//!   narrowed and its open tunnels and forwarded requests to the entries ended at once (`Proxy::revoke_hosts`, by
-//!   name and by the address a connection was opened to: the one registry every cut uses), then its rebuilt policy
-//!   through `Proxy::set_policy`; a session that is built while this runs derives its policy again when the mission's
-//!   grants changed meanwhile (`scope_gen`); the box rules are applied again; the lead records a protected note
-//!   (`Input::ScopeRevoke`, kept on disk while queued, no turn; appended to its log directly when it is not running).
-//!   Receipt: [`ScopeRevokeReceipt`] (`lead`, `revoked`, `ledger`, `recorded`, `not_granted`, `sessions`,
-//!   `connections_cut`). A policy that cannot be rebuilt for a session is an error naming it, after everything else
-//!   was done; a revoke that is not recorded and could not be saved says that a restart undoes it.
+//!   clears that, for the sessions' policies and their MCP servers' grants alike) — also after a restart, whatever the
+//!   ledger says of a grant recorded later. Every session of the mission that is known, started or being started, and
+//!   each of its MCP servers' grants (a lead that is still listing its servers has them in `mcp_grants` from before
+//!   each grant is made, and grants made while the scope changed are given their policy again:
+//!   `Inner::mcp_contexts_for`), gets its live policy narrowed and its open tunnels and forwarded requests to the
+//!   entries ended at once (`Proxy::revoke_hosts`, by name and by the address a connection was opened to: the one
+//!   registry every cut uses), then its rebuilt policy through `Proxy::set_policy`; a session that is built while this
+//!   runs derives its policy again when the mission's grants changed meanwhile (`scope_gen`); the box rules are applied
+//!   again. Then each revoked grant the ledger lists is appended to the mission's journal as `ScopeRevoke` (a mission
+//!   without a ledger skips this; a grant the lead has not recorded yet, still queued on disk, and an entry that is no
+//!   grant get no record: the receipt's `recorded` and `not_granted` say which; revoking a grant again once the lead
+//!   has recorded it records it; a ledger that cannot be read, or a record that cannot be written, is an error that
+//!   says the revoke is applied and to revoke it again to record it). Last, the lead records a protected note
+//!   (`Input::ScopeRevoke`, kept on disk while queued, no turn; appended to its log directly when it is not running;
+//!   kept on disk for its first run when it is still being started and has no log yet). The reference credential keeps
+//!   its own policy (its open connections are cut, it is not narrowed: a known gap). Receipt: [`ScopeRevokeReceipt`]
+//!   (`lead`, `revoked`, `ledger`, `recorded`, `not_granted`, `sessions`, `connections_cut`). A policy that cannot be
+//!   rebuilt for a session is an error naming it, after everything else was done; a revoke that is not recorded and
+//!   could not be saved says that a restart undoes it.
 //! - `panic_stop_all(reason)`: the kill-switch. `Proxy::revoke_all` first (every grant, listener and open
 //!   connection, MCP servers' grants included), every enabled rewrite rule disabled (live at once, on disk best
-//!   effort), the boxes claimed, every active, running or waiting session stopped (`Input::PanicStop`: its note,
-//!   its jobs killed, its children stopped; a straggler aborted) and its status left `Idle` / `Stopped` with the note
-//!   and a `turn_end{Stopped}` in its log, then what the sessions left running under their sandboxes stopped by
-//!   sandbox identity (`Inner::census_kill_all`, E3: what only the census finds), then the boxes torn down.
-//!   [`PanicReport`] says how many of each.
+//!   effort), the boxes claimed and their teardown begun at once (a box's egress does not go through the proxy, so it
+//!   is not left running while the sessions stop), every active, running or waiting session stopped
+//!   (`Input::PanicStop`: its note, its jobs killed, its children stopped, its MCP connections closed; a straggler
+//!   aborted) and its status left `Idle` / `Stopped` with the note and a `turn_end{Stopped}` in its log, then what the
+//!   sessions left running under their sandboxes stopped by sandbox identity (`Inner::census_kill_all`, E3: what only
+//!   the census finds), then the boxes' teardowns waited for. [`PanicReport`] says how many of each.
 //! - `stop(id)`: any session. Active: `control.stop_turn()` and `Input::Stop`. Not active: nothing.
 //! - `resume(id)`: root only; activate; `Input::Resume` to it and to each of its unsettled children
 //!   that a restart left idle and that have not been resumed since (activating them): each gets one
@@ -1652,9 +1662,15 @@ pub(crate) fn endpoint_of(base_url: &str) -> Option<String> {
     Some(if has_port { authority.to_string() } else { format!("{authority}:{default}") })
 }
 
+/// Where the hosts the operator revoked from `mission` are kept (`revoke_scope`, `grant_scope`), as a JSON array of
+/// entries; the monitor reads it too (`monitor::core`).
+pub(crate) fn revoked_hosts_path(paths: &Paths, mission: &MissionId) -> PathBuf {
+    paths.mission_dir(mission).join("scope_revoked.json")
+}
+
 /// The hosts kept in `path` (a JSON list); none when the file is missing or unreadable (with a warning for
 /// the second).
-fn load_revoked(path: &Path) -> Vec<String> {
+pub(crate) fn load_revoked(path: &Path) -> Vec<String> {
     match std::fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
             tracing::warn!("the revoked hosts in {} cannot be read ({e}); they are not applied", path.display());
@@ -4182,7 +4198,7 @@ impl Inner {
     /// Where the hosts the operator revoked from `mission` are kept, so that a revoke the ledger does not
     /// hold (a grant still queued for the lead) survives a restart.
     fn revoked_path(&self, mission: &MissionId) -> PathBuf {
-        self.paths.mission_dir(mission).join("scope_revoked.json")
+        revoked_hosts_path(&self.paths, mission)
     }
 
     /// The hosts revoked from `mission` (kept on disk, read once).
@@ -4321,9 +4337,67 @@ impl Inner {
         }
     }
 
+    /// The isolated proxy policy of MCP server `name` for the session `meta` (P0-7): the server's declared `hosts` on
+    /// the configured network without its `allow` list (its `deny` list and private-address rules kept), or, for a
+    /// server with a `url` and no hosts, the configured network; narrowed by `mission_floor` (the mission's revoked
+    /// hosts and the infrastructure). `None` for a server that is not configured, that needs no grant (no hosts, no
+    /// `url`) or whose policy cannot be made (logged).
+    fn mcp_server_policy(&self, meta: &SessionMeta, name: &str) -> Option<Policy> {
+        let scfg = self.config.mcp.servers.get(name)?;
+        if scfg.hosts.is_empty() && scfg.url.is_none() {
+            return None;
+        }
+        let mcp_policy = if !scfg.hosts.is_empty() {
+            // Scope strictly to this MCP server's declared hosts (keeping global `deny` and
+            // private-IP protections, without inheriting unrelated `[network] allow` hosts).
+            let mut mcp_net = self.config.network.clone();
+            mcp_net.allow.clear();
+            match Policy::with_hosts(&mcp_net, &scfg.hosts) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(session = %meta.id, server = name, "MCP server hosts ignored for isolated policy: {e}");
+                    Policy::new(&mcp_net).ok()?
+                }
+            }
+        } else {
+            match Policy::new(&self.config.network) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(session = %meta.id, server = name, "MCP server policy failed: {e}");
+                    return None;
+                }
+            }
+        };
+        // The revoked hosts and the infrastructure deny hold for an MCP server's grant too (E1): no grant, the
+        // configuration's own included, reaches them.
+        match self.mission_floor(&meta.mission, mcp_policy) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                tracing::warn!(session = %meta.id, server = name, "MCP server policy failed: {e}");
+                None
+            }
+        }
+    }
+
+    /// Give each MCP server grant of `meta` (`mcp_grants`) its policy again from the mission as it is now: after a grant
+    /// lifted a revoke (`grant_scope`), and after grants made while the mission's scope changed (`mcp_contexts_for`).
+    /// The open connections the new policy refuses are ended (`Proxy::set_policy`).
+    fn refloor_mcp_grants(&self, meta: &SessionMeta) {
+        let ids: Vec<SessionId> = self.st().mcp_grants.get(&meta.id).cloned().unwrap_or_default();
+        for id in ids {
+            let Some(server) = crate::mcp::grant_server(&id) else { continue };
+            if let Some(policy) = self.mcp_server_policy(meta, server) {
+                self.proxy.set_policy(&id, policy);
+            }
+        }
+    }
+
     /// Build isolated per-server proxy grants and [`crate::mcp::McpServerContext`]s for `names`.
     /// Each server with configured `hosts` or an HTTP `url` receives its own proxy credential scoped
-    /// strictly to that server's hosts, keeping MCP hosts out of the general session `Policy`.
+    /// strictly to that server's hosts, keeping MCP hosts out of the general session `Policy`. Each grant id is in
+    /// `mcp_grants` before the grant is made, so that a revoke (`revoke_scope`) or a cut (`cut_mission`) that runs while
+    /// the lead lists its servers reaches it; when the mission's grants or revokes changed while the grants were made
+    /// (`scope_gen`), they are given their policy again before this returns.
     fn mcp_contexts_for(
         &self,
         meta: &SessionMeta,
@@ -4336,49 +4410,18 @@ impl Inner {
         let copies = self.paths.copies_dir();
         let jobs_dir = self.paths.session_dir(&meta.id).join("jobs");
         let role = &deps.shared.role;
+        let built_at = self.scope_generation(&meta.mission);
         for &name in names {
             let Some(scfg) = self.config.mcp.servers.get(name) else { continue };
-            if scfg.hosts.is_empty() && scfg.url.is_none() {
-                continue;
-            }
-            let mcp_policy = if !scfg.hosts.is_empty() {
-                // Scope strictly to this MCP server's declared hosts (keeping global `deny` and
-                // private-IP protections, without inheriting unrelated `[network] allow` hosts).
-                let mut mcp_net = self.config.network.clone();
-                mcp_net.allow.clear();
-                match Policy::with_hosts(&mcp_net, &scfg.hosts) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::warn!(
-                            session = %meta.id,
-                            server = name,
-                            "MCP server hosts ignored for isolated policy: {e}"
-                        );
-                        match Policy::new(&mcp_net) {
-                            Ok(p) => p,
-                            Err(_) => continue,
-                        }
-                    }
-                }
-            } else {
-                match Policy::new(&self.config.network) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        tracing::warn!(session = %meta.id, server = name, "MCP server policy failed: {e}");
-                        continue;
-                    }
-                }
-            };
-            // The revoked hosts and the infrastructure deny hold for an MCP server's grant too (E1): no grant, the
-            // configuration's own included, reaches them.
-            let mcp_policy = match self.mission_floor(&meta.mission, mcp_policy) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::warn!(session = %meta.id, server = name, "MCP server policy failed: {e}");
-                    continue;
-                }
-            };
+            let Some(mcp_policy) = self.mcp_server_policy(meta, name) else { continue };
             let mcp_sid = crate::mcp::grant_id(&meta.id, name);
+            {
+                let mut st = self.st();
+                let ids = st.mcp_grants.entry(meta.id.clone()).or_default();
+                if !ids.contains(&mcp_sid) {
+                    ids.push(mcp_sid.clone());
+                }
+            }
             let grant = match self.proxy.grant(&mcp_sid, mcp_policy) {
                 Ok(g) => g,
                 Err(e) => {
@@ -4387,6 +4430,7 @@ impl Inner {
                         server = name,
                         "isolated MCP egress proxy grant failed: {e}"
                     );
+                    self.forget_mcp_grant(&meta.id, &mcp_sid);
                     continue;
                 }
             };
@@ -4418,7 +4462,22 @@ impl Inner {
                 crate::mcp::McpServerContext { tool_proxy: grant.tool_url(), env: Arc::new(grant.env()), sandbox },
             );
         }
+        // A revoke or a grant that ran while the policies were made may have found no grant to narrow yet.
+        if self.scope_generation(&meta.mission) != built_at {
+            self.refloor_mcp_grants(meta);
+        }
         (contexts, granted_ids)
+    }
+
+    /// Takes MCP server grant `grant` of `session` out of `mcp_grants` (its proxy grant was not made, or is revoked).
+    fn forget_mcp_grant(&self, session: &SessionId, grant: &SessionId) {
+        let mut st = self.st();
+        if let Some(ids) = st.mcp_grants.get_mut(session) {
+            ids.retain(|g| g != grant);
+            if ids.is_empty() {
+                st.mcp_grants.remove(session);
+            }
+        }
     }
 
     /// Give a session that is being created its MCP servers (M6) and return the listing for its
@@ -4451,13 +4510,11 @@ impl Inner {
             let keep = role_names.iter().any(|r| r == server);
             if !keep {
                 self.proxy.revoke(mcp_sid);
+                self.forget_mcp_grant(&meta.id, mcp_sid);
                 contexts.remove(server);
             }
             keep
         });
-        if !granted_ids.is_empty() {
-            self.st().mcp_grants.entry(meta.id.clone()).or_default().extend(granted_ids.into_values());
-        }
         let session = crate::mcp::McpSession::plan_with_contexts(
             cfg,
             &role.name,
@@ -4483,10 +4540,7 @@ impl Inner {
         }
         let role = &deps.shared.role;
         let role_names: Vec<&str> = crate::mcp::role_servers(cfg, &role.name, role.read_only);
-        let (contexts, granted_ids) = self.mcp_contexts_for(meta, &role_names, deps);
-        if !granted_ids.is_empty() {
-            self.st().mcp_grants.entry(meta.id.clone()).or_default().extend(granted_ids.into_values());
-        }
+        let (contexts, _) = self.mcp_contexts_for(meta, &role_names, deps);
         let session = crate::mcp::McpSession::plan_with_contexts(
             cfg,
             &role.name,
@@ -7792,6 +7846,9 @@ impl Runtime {
                     if let Ok(policy) = self.inner.session_policy(&meta, ledger) {
                         self.inner.proxy.set_policy(&meta.id, policy);
                     }
+                    if !unrevoked.is_empty() {
+                        self.inner.refloor_mcp_grants(&meta);
+                    }
                 }
             }
             return Err(e);
@@ -7802,6 +7859,11 @@ impl Runtime {
             let policy = self.inner.session_policy(meta, ledger)?;
             let set = self.inner.proxy.set_policy(&meta.id, policy);
             lead_set |= set && meta.id == lead.id;
+            // A revoke narrowed the MCP servers' isolated grants too (`revoke_scope` step 2): the grant that lifts it
+            // gives them their policy back, without the host (each server's own hosts, as at its start).
+            if !unrevoked.is_empty() {
+                self.inner.refloor_mcp_grants(meta);
+            }
         }
         // The mission's box, when it has one, gets the new grants too (I5).
         self.inner.box_resync(&lead.mission).await;
@@ -7817,22 +7879,30 @@ impl Runtime {
     /// Revoke network access to `hosts` for the mission of `id` (any of its sessions: a child's id goes to its
     /// lead), for `reason` (optional; the ledger records `no reason given` without one). Each entry is a grant as it
     /// was granted (case ignored), or any other host, `*.suffix`, IP literal or CIDR block, optionally with `:port`:
-    /// a name under a wildcard grant, a host `mode open`, `network.allow` or the target's scope reaches. In this order:
-    /// (0) the list is checked (not empty, no blank entry, no whitespace or comma inside one, each readable as
-    /// `network.deny` reads it) and the ledger read, and a refusal changes nothing; (1) each revoked grant that the
-    /// ledger lists is appended to it (`ScopeRevoke`; a grant the lead has not recorded yet, still queued on disk, and
-    /// an entry that is no grant get no record: the receipt's `recorded` and `not_granted` say which); (2) the grants
-    /// leave the mission's grants held in memory, and every entry joins the mission's revoked hosts
-    /// (`<mission dir>/scope_revoked.json`, written durably), which every policy of the mission's sessions and MCP
-    /// servers refuses from then on (`Policy::with_revoked`: `deny revoked {entry}`, whatever a wildcard grant,
-    /// `network.allow`, `mode open`, `allow_private` or the target's scope allows), after a restart too and whatever
-    /// the ledger says of a grant recorded later, until the host is granted again; (3) every session of the mission,
-    /// started or being started, and its MCP servers' grants have their live policy narrowed and their open tunnels
-    /// and forwarded requests to the entries ended at once (`Proxy::revoke_hosts`, by name and by address), then get
-    /// their rebuilt policy (`set_policy`); (4) the mission's box rules are applied again; (5) the lead records a
-    /// protected note (`Input::ScopeRevoke`, no turn; written to its log directly when it is not running). The
-    /// infrastructure deny (E1) is not touched. A step after the first that fails does not undo the earlier ones:
-    /// the error says what stands. The receipt says what was revoked, recorded and cut.
+    /// a name under a wildcard grant, a host `mode open`, `network.allow` or the target's scope reaches. In this order,
+    /// the cut first and the records after it, so that nothing the agent can do to the disk (a full volume, a ledger
+    /// it cannot corrupt but can starve of space) keeps a revoked destination open: (0) the list is checked (not empty,
+    /// no blank entry, no whitespace or comma inside one, each readable as `network.deny` reads it), and a refusal
+    /// changes nothing; the ledger is read (a ledger that cannot be read does not stop the revoke: it is applied, and
+    /// the error says it is not recorded); (1) the grants leave the mission's grants held in memory, and every entry
+    /// joins the mission's revoked hosts (`<mission dir>/scope_revoked.json`, written durably; the generation of the
+    /// mission's scope moves in the same step, so a session being built meanwhile derives its policy again), which
+    /// every policy of the mission's sessions and MCP servers refuses from then on (`Policy::with_revoked`: `deny
+    /// revoked {entry}`, whatever a wildcard grant, `network.allow`, `mode open`, `allow_private` or the target's scope
+    /// allows), after a restart too and whatever the ledger says of a grant recorded later, until the host is granted
+    /// again (`grant_scope` of it clears that, for the sessions and their MCP servers' grants alike); (2) every session
+    /// of the mission, started or being started, and its MCP servers' grants (those of a lead still listing its
+    /// servers included) have their live policy narrowed and their open tunnels and forwarded requests to the entries
+    /// ended at once (`Proxy::revoke_hosts`, by name and by address), then get their rebuilt policy (`set_policy`);
+    /// (3) the mission's box rules are applied again; (4) each revoked grant that the ledger lists is appended to it
+    /// (`ScopeRevoke`; a grant the lead has not recorded yet, still queued on disk, and an entry that is no grant get no
+    /// record: the receipt's `recorded` and `not_granted` say which); (5) the lead records a protected note
+    /// (`Input::ScopeRevoke`, no turn; written to its log directly when it is not running, and kept on disk for its
+    /// first run when it is still being started). The reference credential (`network.reference_hosts`, GET only) keeps
+    /// its own policy: its open connections to an entry are ended, but it is not narrowed (a known gap). The
+    /// infrastructure deny (E1) is not touched. A step that fails does not undo the others: the error says what
+    /// stands (a revoke that is applied but not recorded says to revoke it again to record it). The receipt says what
+    /// was revoked, recorded and cut.
     pub async fn revoke_scope(
         &self,
         id: &SessionId,
@@ -7840,7 +7910,7 @@ impl Runtime {
         reason: Option<&str>,
     ) -> Result<ScopeRevokeReceipt, String> {
         self.inner.check_open()?;
-        // (0) The list, then the mission, then the ledger: a refusal changes nothing.
+        // (0) The list, then the mission: a refusal changes nothing.
         if hosts.is_empty() {
             return Err(
                 "invalid host list: name at least one host to revoke, one per entry, such as `api.example.test`, `*.example.test` or `10.0.0.0/24`."
@@ -7873,14 +7943,16 @@ impl Runtime {
         let ledger = self.inner.mission_explicit(&lead)?;
         let granted = self.inner.granted_hosts(&lead, ledger);
         // What the ledger holds as granted now, apart from what was revoked here and not recorded: the lead may have
-        // recorded the grant since, and then the revoke can be recorded too.
+        // recorded the grant since, and then the revoke can be recorded too. A ledger that cannot be read does not
+        // keep the destination open: the revoke is applied all the same, and not recorded.
         let journal = Journal::new(self.inner.paths.journal(&mission), self.inner.key.clone());
-        let in_ledger: Vec<String> = if ledger {
-            journal.state().map(|state| state.granted_hosts()).map_err(|e| {
-                format!("The ledger of the mission cannot be read ({e}); nothing was changed. Try again.")
-            })?
+        let (in_ledger, unread): (Vec<String>, Option<String>) = if ledger {
+            match journal.state() {
+                Ok(state) => (state.granted_hosts(), None),
+                Err(e) => (Vec::new(), Some(e.to_string())),
+            }
         } else {
-            Vec::new()
+            (Vec::new(), None)
         };
         // A grant is revoked as it was granted; any other entry as written.
         let mut revoked: Vec<String> = Vec::with_capacity(cleaned.len());
@@ -7894,31 +7966,9 @@ impl Runtime {
                 }
             }
         }
-        // (1) The records first. A grant the ledger lists gets its `ScopeRevoke`; the revoked-hosts file keeps the
-        // rest out.
-        let stock = reason.unwrap_or(STOCK_REASON);
-        let mut recorded: Vec<String> = Vec::new();
-        let mut unrecorded: Option<String> = None;
-        for entry in revoked.iter().filter(|e| in_ledger.iter().any(|g| g.eq_ignore_ascii_case(e))) {
-            let op = LedgerOp::ScopeRevoke { host: entry.clone(), reason: stock.to_string() };
-            match journal.append(&lead.id, true, op, &|_| Ok(())) {
-                Ok(_) => recorded.push(entry.clone()),
-                Err(e) if recorded.is_empty() => {
-                    return Err(format!(
-                        "The revoke could not be recorded in the ledger ({e}); nothing was changed. Try again."
-                    ))
-                }
-                Err(e) => {
-                    unrecorded = Some(format!(
-                        "The revoke of {entry} could not be recorded in the ledger ({e}); it is applied and kept in the revoked hosts all the same. Revoke {entry} again to record it."
-                    ));
-                    break;
-                }
-            }
-        }
-        // (2) Out of the grants held in memory, and kept out until granted again: in memory and on disk, so that it
-        // holds after a restart, whatever the ledger says of a grant recorded later.
-        self.inner.bump_scope_generation(&mission);
+        // (1) Out of the grants held in memory, and kept out until granted again: in memory and on disk, so that it
+        // holds after a restart, whatever the ledger says of a grant recorded later. The generation moves with the list,
+        // under the same lock: a session built meanwhile either reads the new list or sees the generation move.
         let kept = {
             let mut st = self.inner.st();
             if let Some(held) = st.scope.get_mut(&mission) {
@@ -7933,10 +7983,13 @@ impl Runtime {
                     list.push(entry.clone());
                 }
             }
-            list.clone()
+            let kept = list.clone();
+            let g = st.scope_gen.entry(mission.clone()).or_insert(0);
+            *g = g.wrapping_add(1);
+            kept
         };
         let saved = self.inner.save_revoked(&mission, &kept);
-        // (3) Every session of the mission, started or being started, and its MCP servers' grants: the live policy
+        // (2) Every session of the mission, started or being started, and its MCP servers' grants: the live policy
         // narrowed and the open connections cut at once, then the rebuilt policy.
         let (mut sessions, mut connections_cut, mut failed) = (0u32, 0usize, Vec::new());
         for meta in self.mission_family(&mission) {
@@ -7954,9 +8007,31 @@ impl Runtime {
                 Err(e) => failed.push(format!("{}: {e}", meta.id.as_str())),
             }
         }
-        // (4) The box.
+        // (3) The box.
         self.inner.box_resync(&mission).await;
-        // (5) The lead is told: a protected note, no turn; in its log directly when it is not running.
+        // (4) The records. A grant the ledger lists gets its `ScopeRevoke`; the revoked-hosts file keeps the rest out.
+        let stock = reason.unwrap_or(STOCK_REASON);
+        let mut recorded: Vec<String> = Vec::new();
+        let mut unrecorded: Option<String> = unread.map(|e| {
+            format!(
+                "The revoke of {} is applied (its connections are cut and every policy of the mission refuses it), but the ledger of the mission cannot be read ({e}), so it is not recorded there. Revoke it again once the ledger can be read, to record it.",
+                revoked.join(", ")
+            )
+        });
+        for entry in revoked.iter().filter(|e| in_ledger.iter().any(|g| g.eq_ignore_ascii_case(e))) {
+            let op = LedgerOp::ScopeRevoke { host: entry.clone(), reason: stock.to_string() };
+            match journal.append(&lead.id, true, op, &|_| Ok(())) {
+                Ok(_) => recorded.push(entry.clone()),
+                Err(e) => {
+                    unrecorded = Some(format!(
+                        "The revoke of {entry} could not be recorded in the ledger ({e}); it is applied (its connections are cut and every policy of the mission refuses it) and kept in the revoked hosts all the same. Revoke {entry} again to record it."
+                    ));
+                    break;
+                }
+            }
+        }
+        // (5) The lead is told: a protected note, no turn; in its log directly when it is not running, and kept on
+        // disk for its first run when it is still being started (it has no log yet).
         let note = reason.map(str::to_string);
         let audit_text = texts::scope_revoked(&revoked, reason, connections_cut);
         let input = Input::ScopeRevoke { hosts: revoked.clone(), note, connections_cut };
@@ -7976,8 +8051,10 @@ impl Runtime {
             } else {
                 self.append_audit_note(&lead.id, audit_text);
             }
-        } else {
+        } else if self.inner.paths.session_log(&lead.id).is_file() {
             self.append_audit_note(&lead.id, audit_text);
+        } else if let Err(e) = queue_input(&self.inner.paths, &lead.id, input) {
+            tracing::warn!(session = %lead.id, "the note of a scope revoke could not be kept for the lead's start: {e}");
         }
         if let Err(e) = saved {
             let unkept: Vec<&String> = revoked.iter().filter(|r| !recorded.contains(r)).collect();
@@ -7991,7 +8068,7 @@ impl Runtime {
         }
         if !failed.is_empty() {
             return Err(format!(
-                "The revoke of {} is recorded, cut and kept out of every new session, but the egress policy of {} could not be rebuilt ({}): stop that session so that it restarts without the host.",
+                "The revoke of {} is cut and kept out of every new session, but the egress policy of {} could not be rebuilt ({}): stop that session so that it restarts without the host.",
                 revoked.join(", "),
                 failed.len(),
                 failed.join("; ")
@@ -8007,11 +8084,12 @@ impl Runtime {
     /// 1. Immediately revokes all proxy grants and severs all active sockets/tunnels (`Proxy::revoke_all`, the
     ///    registry every cut uses: what `cut_mission`, a revoke or a policy change would end, this ends).
     /// 2. Disables every enabled proxy rewrite rule and pushes the cleared snapshot live.
-    /// 3. Stops all active/running/paused sessions (and their running jobs/children), recording the
+    /// 3. Claims every active Docker `[box]` and begins its teardown at once (its egress does not go through the
+    ///    proxy), then stops all active/running/paused sessions (and their running jobs/children), recording the
     ///    panic stop reason in each session's event stream.
     /// 4. Stops by sandbox identity what the sessions left running that only the census finds (E3: a process that
     ///    left its process group, a daemonized server), for every known session.
-    /// 5. Tears down all active Docker `[box]` containers/networks cleanly.
+    /// 5. Waits for the boxes' teardowns (containers, networks and chains) to end.
     pub async fn panic_stop_all(&self, reason: Option<String>) -> Result<PanicReport, String> {
         self.inner.check_open()?;
         let reason = reason.map(|r| r.trim().to_string()).filter(|r| !r.is_empty());
@@ -8048,6 +8126,10 @@ impl Runtime {
             drained.into_iter().map(|(_, b)| b).collect()
         };
         let boxes_torn_down = boxes.len();
+        // A box's egress does not go through the proxy: its chain, network and container are taken away now, while the
+        // sessions stop, not after them (a loop the agent left in the box would keep sending meanwhile).
+        let teardowns: Vec<tokio::task::JoinHandle<()>> =
+            boxes.into_iter().map(|b| tokio::spawn(async move { b.teardown().await })).collect();
 
         // 4. Stop all active/running/paused sessions (and their jobs/children) and record the audit note.
         let audit_text = texts::panic_stopped(reason.as_deref());
@@ -8145,8 +8227,10 @@ impl Runtime {
         //    identity once their tasks and jobs are gone (E3).
         let (processes_killed, processes_left) = self.inner.census_kill_all().await;
 
-        // 6. Tear down ALL claimed Docker `[box]` containers/networks cleanly.
-        futures_util::future::join_all(boxes.into_iter().map(|b| async move { b.teardown().await })).await;
+        // 6. The teardowns of every claimed Docker `[box]` (begun at step 3) have ended.
+        for t in teardowns {
+            let _ = t.await;
+        }
 
         Ok(PanicReport {
             connections_cut,
@@ -10503,6 +10587,41 @@ mod tests {
         assert_eq!(rule(&rt2, "api.example.test").as_deref(), Some("deny revoked api.example.test"));
         assert_eq!(rule(&rt2, "x.cdn.test").as_deref(), Some("allow *.cdn.test"));
         rt2.shutdown().await;
+    }
+
+    /// The cut comes before the record: a ledger that cannot be written (a full disk) or read does not keep a revoked
+    /// destination open. The error says the revoke is applied and is not recorded.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_revoke_is_applied_when_its_ledger_record_cannot_be_made() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
+        let (id, mission) = (info.meta.id.clone(), info.meta.mission.clone());
+        until("idle", || e.rt.session(&id).is_some_and(|s| s.status.phase == Phase::Idle)).await;
+        let rule = |host: &str| e.rt.inner.proxy.check_name(&id, host, 443).map(|v| v.rule);
+        let hosts = vec!["api.example.test".to_string(), "b.example.test".to_string()];
+        e.rt.grant_scope(&id, &hosts, None).await.unwrap();
+        until("grants in ledger", || e.rt.ledger(&mission).is_ok_and(|l| l.state.scope_grants.len() == 1)).await;
+        let journal = e.rt.inner.paths.journal(&mission);
+        let perms = std::fs::metadata(&journal).unwrap().permissions();
+        std::fs::set_permissions(&journal, std::fs::Permissions::from_mode(0o400)).unwrap();
+        // Root writes a read-only file all the same: then only the unreadable ledger below is tried.
+        if std::fs::OpenOptions::new().append(true).open(&journal).is_err() {
+            let err = e.rt.revoke_scope(&id, &["api.example.test".to_string()], Some("r")).await.unwrap_err();
+            assert!(err.contains("could not be recorded in the ledger") && err.contains("it is applied"), "{err}");
+            assert_eq!(rule("api.example.test").as_deref(), Some("deny revoked api.example.test"));
+        }
+        std::fs::set_permissions(&journal, perms).unwrap();
+        let mut f = std::fs::OpenOptions::new().append(true).open(&journal).unwrap();
+        f.write_all(b"not a ledger entry\n").unwrap();
+        drop(f);
+        let err = e.rt.revoke_scope(&id, &["b.example.test".to_string()], None).await.unwrap_err();
+        assert!(err.contains("cannot be read") && err.contains("is applied"), "{err}");
+        assert_eq!(rule("b.example.test").as_deref(), Some("deny revoked b.example.test"));
+        assert!(load_revoked(&e.rt.inner.revoked_path(&mission)).iter().any(|h| h == "b.example.test"));
+        e.rt.shutdown().await;
     }
 
     #[tokio::test]
@@ -13847,6 +13966,89 @@ done
         until("finished", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Finished }))).await;
         // The listing's connection was kept for the lead's calls; the finished turn leaves nothing of the session
         // running (TW-20), its server included. The next call would open it again.
+        until("closed", || e.rt.mcp_views(&id).is_ok_and(|v| !v.is_empty() && v.iter().all(|s| s.state == "closed")))
+            .await;
+        e.rt.shutdown().await;
+    }
+
+    /// A revoke narrows the MCP servers' isolated grants too; granting the host again gives it back to them, at once and
+    /// without a restart of the session.
+    #[tokio::test]
+    async fn an_mcp_servers_grant_reaches_a_host_again_once_it_is_granted_after_a_revoke() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = fake_mcp_script(dir.path(), "echo");
+        let e = env_with(Script::new(|_, _| finish("ok")), false, |c| {
+            c.mcp = fake_mcp_cfg(&script, |s| s.hosts = vec!["api.example.test".into()]);
+        })
+        .await;
+        let id = e.rt.create_session(e.new_session(Some("go"))).await.unwrap().meta.id;
+        until("idle", || e.rt.session(&id).is_some_and(|s| s.status.phase == Phase::Idle)).await;
+        let mcp = crate::mcp::grant_id(&id, "fake");
+        let rule = || e.rt.inner.proxy.check_name(&mcp, "api.example.test", 443).map(|v| v.rule);
+        assert_eq!(rule().as_deref(), Some("allow api.example.test"));
+        e.rt.revoke_scope(&id, &["api.example.test".to_string()], Some("r")).await.unwrap();
+        assert_eq!(rule().as_deref(), Some("deny revoked api.example.test"));
+        e.rt.grant_scope(&id, &["api.example.test".to_string()], None).await.unwrap();
+        assert_eq!(rule().as_deref(), Some("allow api.example.test"), "the grant lifts the revoke for the server too");
+        e.rt.shutdown().await;
+    }
+
+    /// The lead's MCP servers are granted, then listed (which takes as long as the servers take to start). A revoke made
+    /// meanwhile reaches their grants, and the lead's start goes on (the revoke's note waits for its first run).
+    #[tokio::test]
+    async fn a_revoke_while_the_lead_lists_its_mcp_servers_reaches_their_grants() {
+        let dir = tempfile::tempdir().unwrap();
+        let fast = fake_mcp_script(dir.path(), "echo");
+        let slow = dir.path().join("slow-mcp.sh");
+        std::fs::write(&slow, format!("sleep 2\n{}", std::fs::read_to_string(&fast).unwrap())).unwrap();
+        let e = env_with(Script::new(|_, _| finish("ok")), false, |c| {
+            c.mcp = fake_mcp_cfg(&slow, |s| s.hosts = vec!["api.example.test".into()]);
+        })
+        .await;
+        let rt = e.rt.clone();
+        let new = e.new_session(Some("go"));
+        let create = tokio::spawn(async move { rt.create_session(new).await });
+        let mut lead = None;
+        until("the MCP grant", || {
+            let id = e.rt.inner.st().known.keys().next().cloned();
+            lead = id.clone();
+            id.is_some_and(|id| e.rt.inner.proxy.check_name(&crate::mcp::grant_id(&id, "fake"), "x.test", 1).is_some())
+        })
+        .await;
+        let id = lead.unwrap();
+        assert!(!create.is_finished(), "the servers are still being listed");
+        e.rt.revoke_scope(&id, &["api.example.test".to_string()], Some("r")).await.unwrap();
+        let info = create.await.unwrap().unwrap();
+        assert_eq!(info.meta.id, id);
+        let mcp = crate::mcp::grant_id(&id, "fake");
+        let rule = e.rt.inner.proxy.check_name(&mcp, "api.example.test", 443).map(|v| v.rule);
+        assert_eq!(rule.as_deref(), Some("deny revoked api.example.test"));
+        until("the note", || {
+            e.has(&id, |ev| matches!(ev, Event::HarnessNote { text, .. } if text.contains("revoked network access to api.example.test")))
+        })
+        .await;
+        e.rt.shutdown().await;
+    }
+
+    /// A panic stops a session between turns as an operator's stop does: a turn that yielded ends `Stopped`, which
+    /// leaves no MCP server of the session running (TW-20).
+    #[tokio::test]
+    async fn a_panic_stop_between_turns_closes_the_sessions_mcp_connections() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = fake_mcp_script(dir.path(), "echo");
+        let e = env_with(Script::new(|_, _| Action::Reply(Reply::text("hello"))), false, |c| {
+            c.mcp = fake_mcp_cfg(&script, |_| {})
+        })
+        .await;
+        let mut chat = e.new_session(Some("hi"));
+        chat.role = Some("chat".into());
+        let id = e.rt.create_session(chat).await.unwrap().meta.id;
+        until("yielded", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Yielded }))).await;
+        until("idle", || e.rt.session(&id).is_some_and(|s| s.status.phase == Phase::Idle)).await;
+        let views = e.rt.mcp_views(&id).unwrap();
+        assert!(!views.is_empty() && views.iter().all(|s| s.state != "closed"), "kept for the next turn: {views:?}");
+        assert!(e.rt.inner.send_input(&id, Input::PanicStop { reason: None }));
+        until("stopped", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Stopped }))).await;
         until("closed", || e.rt.mcp_views(&id).is_ok_and(|v| !v.is_empty() && v.iter().all(|s| s.state == "closed")))
             .await;
         e.rt.shutdown().await;
@@ -19225,6 +19427,51 @@ done
             "panic audit note missing from session log"
         );
 
+        e.rt.shutdown().await;
+    }
+
+    /// A box's egress does not go through the proxy: a panic takes it away at once, not after the sessions it stops have
+    /// ended (here a job that ignores `SIGTERM` keeps its session stopping for its kill grace).
+    #[tokio::test]
+    async fn panic_stop_all_takes_the_boxes_egress_away_before_the_sessions_have_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeDocker::new(dir.path());
+        let cfg = fake.cfg();
+        let e = env_with(
+            Script::new(|body, _| {
+                if tool_msgs(body) == 0 {
+                    call("bash", json!({"command": "trap '' TERM; sleep 600", "background": true}))
+                } else {
+                    Action::Reply(Reply::text("it runs"))
+                }
+            }),
+            false,
+            move |c| {
+                c.boxed = cfg;
+                with_os_sandbox(c);
+                c.tools.kill_grace_s = 3;
+            },
+        )
+        .await;
+        std::fs::create_dir_all(e.ws.join(".ferret")).unwrap();
+        let mut chat = e.new_session(Some("start a job"));
+        chat.role = Some("chat".into());
+        let info = e.rt.create_session(chat).await.unwrap();
+        let (id, mission) = (info.meta.id.clone(), info.meta.mission.clone());
+        until("yielded", || e.has(&id, |ev| matches!(ev, Event::TurnEnd { reason: TurnEndReason::Yielded }))).await;
+        e.rt.inner.orch.box_access(&id).await.unwrap().ready().await.unwrap();
+        let container = box_container(&mission);
+        assert!(fake.running(&container));
+        let rt = e.rt.clone();
+        let begun = tokio::time::Instant::now();
+        let panic = tokio::spawn(async move { rt.panic_stop_all(None).await });
+        while fake.running(&container) && begun.elapsed() < Duration::from_millis(1500) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!fake.running(&container), "the box is gone while the sessions stop ({:?})", begun.elapsed());
+        let report = panic.await.unwrap().unwrap();
+        assert_eq!(report.boxes_torn_down, 1, "{report:?}");
+        assert!(begun.elapsed() >= Duration::from_secs(2), "the session took its grace to stop: {:?}", begun.elapsed());
         e.rt.shutdown().await;
     }
 

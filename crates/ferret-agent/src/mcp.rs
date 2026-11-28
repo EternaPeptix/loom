@@ -50,6 +50,11 @@ pub fn grant_id(session: &ferret_core::SessionId, server: &str) -> ferret_core::
     ferret_core::SessionId::from(format!("{}{GRANT_MARK}{server}", session.as_str()))
 }
 
+/// The server an MCP server's isolated grant id was made for; `None` for a session's own grant.
+pub fn grant_server(grant: &ferret_core::SessionId) -> Option<&str> {
+    grant.as_str().split_once(GRANT_MARK).map(|(_, server)| server)
+}
+
 /// The session a proxy grant id belongs to: the session itself, or the one an MCP server's isolated grant was made
 /// for. What a grant does is the session's: its net records, its floor events, its mission's own listeners.
 pub fn grant_owner(grant: &ferret_core::SessionId) -> ferret_core::SessionId {

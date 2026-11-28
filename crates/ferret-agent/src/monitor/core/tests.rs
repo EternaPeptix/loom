@@ -389,6 +389,49 @@ fn the_authorization_follows_the_journal_and_the_operators_words() {
     assert!(early.mark_of("granted.example", None).is_none() && early.goal.is_empty());
 }
 
+/// An operator's revoke writes no `ledger` record to any session's log: the core reads the mission's revoked-hosts file
+/// when it changes, so a carve-out under a wildcard grant (no ledger record) is out of the authorization, and the
+/// journal is read again for the `ScopeRevoke` of a recorded grant.
+#[test]
+fn an_operators_revoke_reaches_the_authorization_without_a_session_record() {
+    let h = home();
+    let key = vec![5u8; 32];
+    let mut core = Core::open(&h.paths, env_of(&h.paths), cfg(), Some(key.clone())).expect("open");
+    core.pump(ferret_core::now_ms(), &all(), true);
+    let m = MissionId::from("m-1");
+    std::fs::create_dir_all(h.paths.mission_dir(&m)).expect("dir");
+    let j = ferret_core::journal::Journal::new(h.paths.journal(&m), key);
+    let who = SessionId::from("s-1");
+    let grant = ferret_core::ledger::LedgerOp::ScopeGrant {
+        hosts: vec!["*.lab.test".into(), "api.lab.test".into()],
+        note: None,
+    };
+    j.append(&who, true, grant, &|_| Ok(())).expect("grant");
+    let mut s = new_session(&h, "s-1", "m-1");
+    s.append(Author::Harness, Event::Ledger { n: 1, summary: "grant".into() }).expect("ledger");
+    let now = ferret_core::now_ms() + 5_000;
+    core.pump(now, &all(), true);
+    let a = core.auth_for(&m, u64::MAX);
+    assert!(a.authorizes("web.lab.test", None) && a.authorizes("api.lab.test", None));
+    // `ferret scope revoke m-1 api.lab.test web.lab.test`: the recorded grant gets its `ScopeRevoke`, the name under
+    // the wildcard is a carve-out the ledger does not hold; both are in the revoked-hosts file.
+    let revoke = ferret_core::ledger::LedgerOp::ScopeRevoke { host: "api.lab.test".into(), reason: "done".into() };
+    j.append(&who, true, revoke, &|_| Ok(())).expect("revoke");
+    std::fs::write(h.paths.mission_dir(&m).join("scope_revoked.json"), br#"["api.lab.test","web.lab.test"]"#)
+        .expect("revoked");
+    core.pump(now + 10_000, &all(), true);
+    let a = core.auth_for(&m, u64::MAX);
+    assert!(!a.authorizes("web.lab.test", None), "the carve-out: {a:?}");
+    assert!(!a.authorizes("api.lab.test", None));
+    assert!(a.grants.iter().all(|g| g.host != "api.lab.test"), "the journal was read again: {:?}", a.grants);
+    assert!(a.authorizes("www.lab.test", None), "the wildcard's other names stay");
+    assert!(core.auth_for(&m, 1).revoked.is_empty(), "a record made before the revoke is judged without it");
+    // Granted again (the runtime takes it out of the file): authorized again.
+    std::fs::write(h.paths.mission_dir(&m).join("scope_revoked.json"), br#"["api.lab.test"]"#).expect("regrant");
+    core.pump(now + 20_000, &all(), true);
+    assert!(core.auth_for(&m, u64::MAX).authorizes("web.lab.test", None));
+}
+
 #[test]
 fn the_fleet_scan_reports_a_shared_path_once() {
     let h = home();
@@ -884,7 +927,9 @@ fn a_missions_target_and_mcp_hosts_reach_its_authorization() {
     let a = core.auth_for(&MissionId::from("m-1"), u64::MAX);
     assert!(a.authorizes("api.acme.example", Some(443)), "the target's scope");
     assert!(!a.authorizes("sso.acme.example", None), "the target's exclusions");
-    assert!(a.authorizes("api.github.com", None), "the pack's MCP hosts");
+    assert!(a.is_mcp_host("api.github.com", None), "the pack's MCP hosts");
+    assert!(a.for_mcp_call().authorizes("api.github.com", None), "for an MCP tool's call");
+    assert!(!a.authorizes("api.github.com", None), "not for the session's own commands (P0-7)");
     assert!(a.has_real_targets());
     let hits = of_kind(&h, EntryKind::Tripwire);
     assert!(hits.iter().all(|e| text(e, "id") != "TW-13"), "{hits:?}");
