@@ -1069,11 +1069,21 @@ export function parseRoute(hash) {
 }
 
 /** The dot in the left header: green, amber or red, and what the tooltip says. */
-export function healthDot({ connected, models }) {
+export function healthDot({ connected, models, signal = null }) {
   if (!connected) return { state: "red", tip: "The event stream is disconnected; reconnecting." };
-  const bad = (models || []).filter((m) => !m.reachable);
-  if (bad.length) {
-    return { state: "amber", tip: bad.map((m) => `${m.profile}: ${m.detail || "not reachable"}`).join("\n") };
+  const tips = [];
+  for (const m of models || []) {
+    if (m && !m.reachable) tips.push(`${m.profile}: ${m.detail || "not reachable"}`);
+  }
+  if (signal && signal.enabled) {
+    if (!signal.connected) {
+      tips.push(`Signal bridge: disconnected${signal.last_error ? " (" + signal.last_error + ")" : ""}`);
+    } else if (signal.last_error) {
+      tips.push(`Signal bridge error: ${signal.last_error}`);
+    }
+  }
+  if (tips.length) {
+    return { state: "amber", tip: tips.join("\n") };
   }
   return { state: "green", tip: "Every model is reachable." };
 }
@@ -1081,18 +1091,22 @@ export function healthDot({ connected, models }) {
 /**
  * The connection in short words for the sidebar header, and its detail for the tooltip. `short` is one of "Live",
  * "Connecting…", "Reconnecting…", "Offline" (the stream failed `attempts` times in a row, 3 or more); the unreachable
- * model profiles, a failed status request and the time of the last update go in `tip` (one line each) and in the
- * Session/status views, not on the sidebar line. opts: {connected, everConnected, attempts, statusError, models,
- * lastUpdateText}.
+ * model profiles, Signal bridge trouble, a failed status request and the time of the last update go in `tip` (one line
+ * each) and in the Session/status views, not on the sidebar line. opts: {connected, everConnected, attempts,
+ * statusError, models, signal, lastUpdateText}.
  */
 export function connectionWords(opts = {}) {
-  const { connected = false, everConnected = false, attempts = 0, statusError = null, models = [], lastUpdateText = "" } = opts;
+  const { connected = false, everConnected = false, attempts = 0, statusError = null, models = [], signal = null, lastUpdateText = "" } = opts;
   const short = connected ? "Live" : attempts >= 3 ? "Offline" : everConnected ? "Reconnecting…" : "Connecting…";
   const tip = [];
   if (connected) tip.push("Live events are connected.");
   else tip.push(everConnected || attempts ? "The event stream is down; execution state unknown until it returns." : "Connecting to the event stream.");
   if (statusError) tip.push("Model status unavailable: " + statusError);
   for (const m of models || []) if (m && !m.reachable) tip.push(`${m.profile}: unreachable${m.detail ? " (" + m.detail + ")" : ""}`);
+  if (signal && signal.enabled) {
+    if (!signal.connected) tip.push(`Signal bridge: disconnected${signal.last_error ? " (" + signal.last_error + ")" : ""}`);
+    else if (signal.last_error) tip.push(`Signal bridge warning: ${signal.last_error}`);
+  }
   if (lastUpdateText) tip.push(lastUpdateText);
   return { short, tip: tip.join("\n") };
 }
@@ -3770,14 +3784,27 @@ export function proseTree(text) {
     if (paragraph.length) { out.push({ type: "p", inline: inline(paragraph.join("\n")) }); paragraph = []; }
     if (quote && quote.length) { out.push({ type: "blockquote", inline: inline(quote.join("\n")) }); quote = null; }
   };
+  const emitCode = (c) => {
+    const textVal = c.lines.join("\n");
+    out.push(c.lang ? { type: "pre", lang: c.lang, text: textVal } : { type: "pre", text: textVal });
+  };
   const lines = String(text ?? "").split("\n");
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
-    if (/^\s*```/.test(line)) {
+    if (code) {
+      const closeFence = /^\s*(`{3,})\s*$/.exec(line);
+      if (closeFence && closeFence[1].length >= code.len) {
+        emitCode(code);
+        code = null;
+      } else {
+        code.lines.push(line);
+      }
+      continue;
+    }
+    const openFence = /^\s*(`{3,})\s*([^\s`]*)/.exec(line);
+    if (openFence) {
       flush(); list = null;
-      if (code) { out.push({ type: "pre", text: code.join("\n") }); code = null; } else code = [];
-    } else if (code) {
-      code.push(line);
+      code = { len: openFence[1].length, lang: openFence[2] || "", lines: [] };
     } else if (/^#{1,6}\s+/.test(line)) {
       flush(); list = null;
       const hashes = line.match(/^(#{1,6})\s+/)[1].length;
@@ -3817,7 +3844,7 @@ export function proseTree(text) {
     }
   }
   flush();
-  if (code) out.push({ type: "pre", text: code.join("\n") }); // a fence left open runs to the end, as it is read
+  if (code) emitCode(code); // a fence left open runs to the end, as it is read
   return out;
 }
 
@@ -4010,6 +4037,7 @@ export function keySheet(mac = false) {
       { keys: ["Enter"], text: "In Find: next match" },
       { keys: ["Shift", "Enter"], text: "In Find: previous match" },
       { keys: ["Enter"], text: "In the message box: send" },
+      { keys: [alt, "Enter"], text: "In the message box: queue for after this turn while running" },
       { keys: ["Shift", "Enter"], text: "In the message box: new line" },
     ] },
     { title: "Answering", rows: [
@@ -5883,6 +5911,24 @@ export function rewriteRuleSummary(rule) {
   return [rule.phase || "request", when.length ? when.join(" ") : "any request", acts.join(", ")].filter(Boolean).join(" · ");
 }
 
+const REWRITE_ACTIONS_ALL = [
+  { value: "set_header", label: "Set header", phases: ["request", "response"] },
+  { value: "delete_header", label: "Delete header", phases: ["request", "response"] },
+  { value: "replace_header", label: "Replace header (regex)", phases: ["request", "response"] },
+  { value: "set_method", label: "Set method", phases: ["request"] },
+  { value: "set_path_query", label: "Set path/query", phases: ["request"] },
+  { value: "replace_url", label: "Replace URL (regex)", phases: ["request"] },
+  { value: "set_body", label: "Set body", phases: ["request", "response"] },
+  { value: "replace_body", label: "Replace body (regex)", phases: ["request", "response"] },
+  { value: "set_status", label: "Set status", phases: ["response"] },
+];
+
+/** Rewrite action options valid for `phase` ("request" | "response"). */
+export function rewriteActionsForPhase(phase) {
+  const p = phase === "response" ? "response" : "request";
+  return REWRITE_ACTIONS_ALL.filter((a) => a.phases.includes(p)).map(({ value, label }) => [value, label]);
+}
+
 /** Build and validate a `RewriteRule` body for `POST /api/traffic/rewrite-rules` or `PUT /api/traffic/rewrite-rules/{id}`. */
 export function buildRewriteRule(form = {}) {
   const name = String(form.name ?? "").trim();
@@ -5898,8 +5944,10 @@ export function buildRewriteRule(form = {}) {
   if (extra) {
     if (Array.isArray(extra.headers) && extra.headers.length) matchers.headers = extra.headers;
     if (typeof extra.body_regex === "string" && extra.body_regex) matchers.body_regex = extra.body_regex;
-    if (Array.isArray(extra.resp_headers) && extra.resp_headers.length) matchers.resp_headers = extra.resp_headers;
-    if (typeof extra.resp_body_regex === "string" && extra.resp_body_regex) matchers.resp_body_regex = extra.resp_body_regex;
+    if (phase === "response") {
+      if (Array.isArray(extra.resp_headers) && extra.resp_headers.length) matchers.resp_headers = extra.resp_headers;
+      if (typeof extra.resp_body_regex === "string" && extra.resp_body_regex) matchers.resp_body_regex = extra.resp_body_regex;
+    }
   }
   const host = String(form.host ?? "").trim();
   if (host) matchers.host = host;
@@ -5908,7 +5956,7 @@ export function buildRewriteRule(form = {}) {
   const urlRegex = String(form.url_regex ?? "").trim();
   if (urlRegex) matchers.url_regex = urlRegex;
   const status = String(form.status ?? "").split(/[\s,]+/).map((s) => s.trim()).filter(Boolean);
-  if (status.length) matchers.status = status;
+  if (phase === "response" && status.length) matchers.status = status;
 
   const actionType = String(form.actionType || "set_header");
   const headerName = String(form.headerName ?? "").trim();
@@ -5934,14 +5982,17 @@ export function buildRewriteRule(form = {}) {
       action = { type: "replace_header", name: headerName, regex, value: secretOrValue, sensitive };
       break;
     case "set_method":
+      if (phase !== "request") return { error: "Set method is only valid in the request phase." };
       if (!value.trim()) return { error: "Method is required." };
       action = { type: "set_method", value: value.trim().toUpperCase() };
       break;
     case "set_path_query":
+      if (phase !== "request") return { error: "Set path/query is only valid in the request phase." };
       if (!value.trim()) return { error: "Path/query is required." };
       action = { type: "set_path_query", value: value.trim() };
       break;
     case "replace_url":
+      if (phase !== "request") return { error: "Replace URL is only valid in the request phase." };
       if (!regex) return { error: "Match regex is required." };
       action = { type: "replace_url", regex, value };
       break;
@@ -5976,6 +6027,64 @@ export function buildRewriteRule(form = {}) {
       note: String(form.note ?? "").trim(),
     },
   };
+}
+
+/** Detect native ferret-desk WKWebView via its custom UA token (`FerretDesk/<version>`), zero JS injection. */
+export function isEmbeddedDesk(userAgent) {
+  return /\bFerretDesk\//.test(String(userAgent ?? ""));
+}
+
+const MIME_EXT = {
+  "image/png": "png",
+  "image/jpeg": "jpg",
+  "image/webp": "webp",
+  "image/gif": "gif",
+  "image/svg+xml": "svg",
+  "application/pdf": "pdf",
+  "application/json": "json",
+  "text/plain": "txt",
+};
+
+/** Safe upload filename for a dropped or pasted File, deriving an extension from MIME type when unnamed. */
+export function attachmentName(file) {
+  const raw = file && typeof file.name === "string" ? file.name.trim() : "";
+  if (raw) return raw;
+  const mime = file && typeof file.type === "string" ? file.type.split(";")[0].trim().toLowerCase() : "";
+  const ext = MIME_EXT[mime];
+  if (!ext) return "pasted-file";
+  return mime.startsWith("image/") ? `pasted-image.${ext}` : `pasted-file.${ext}`;
+}
+
+/** Whether a paste event carrying `files` and `plainText` should attach the files instead of pasting text.
+ *  Empty plain text attaches files; macOS Finder file copy puts the file name(s) in `text/plain` and should also attach. */
+export function shouldPasteFiles(files, plainText) {
+  if (!Array.isArray(files) || !files.length) return false;
+  const text = String(plainText ?? "").trim();
+  if (!text) return true;
+  const names = files.map((f) => (f && typeof f.name === "string" ? f.name.trim() : "")).filter(Boolean);
+  if (!names.length) return false;
+  const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  return lines.length === names.length && lines.every((l, i) => l === names[i]);
+}
+
+const QUICK_ACTIONS = [
+  { id: "new-mission", title: "New mission", detail: "Start a new mission", keywords: "new create start mission" },
+  { id: "inbox", title: "Open Inbox", detail: "Review waiting questions, approvals, and results", keywords: "inbox questions approvals waiting" },
+  { id: "targets", title: "Open Targets", detail: "Browse targets, scopes, and asset graphs", keywords: "targets scope assets graph", needsTargets: true },
+  { id: "daemon-status", title: "Daemon & Signal status", detail: "Inspect daemon health, Signal bridge, models, and GC", keywords: "daemon status signal models reload gc health" },
+  { id: "toggle-inspector", title: "Toggle Inspector", detail: "Show or hide the mission inspector panel", keywords: "inspector ledger context network models files panel", needsSession: true },
+  { id: "keys", title: "Keyboard shortcuts", detail: "View all keyboard shortcuts", keywords: "keyboard shortcuts help keys ?" },
+];
+
+/** Quick actions offered inside the Ctrl/Cmd+K switcher alongside sessions. */
+export function switcherActions(query, { targetsSupported = false, inSession = false } = {}) {
+  const q = String(query ?? "").trim().toLowerCase();
+  return QUICK_ACTIONS.filter((a) => {
+    if (a.needsTargets && !targetsSupported) return false;
+    if (a.needsSession && !inSession) return false;
+    if (!q) return true;
+    return a.title.toLowerCase().includes(q) || a.detail.toLowerCase().includes(q) || a.keywords.includes(q);
+  }).map(({ id, title, detail }) => ({ id, title, detail }));
 }
 
 /** Classify user input pasted into the sign-in recovery box: a full `ferret open` URL (`#code=...`), a login code, or a bearer secret/token. */

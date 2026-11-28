@@ -151,20 +151,41 @@ enum ConnectionStore {
         return s
     }
 
-    /// Stores a valid token (updating in place when present so a failed write never deletes an existing
-    /// token). Returns false for an invalid token or a Keychain failure.
-    @discardableResult
-    static func setToken(_ token: String, for id: UUID) -> Bool {
-        guard isValidToken(token) else { return false }
+    /// Stores a valid token (updating in place when present; if macOS Keychain rejects the update with
+    /// an ACL/auth error after an ad-hoc rebuild, replaces the stale entry once we already hold the
+    /// validated replacement token). Returns `errSecSuccess` or the underlying `OSStatus`.
+    static func setTokenDetailed(_ token: String, for id: UUID) -> OSStatus {
+        guard isValidToken(token) else { return errSecParam }
         let q = query(id)
         let data = Data(token.utf8)
         let status = SecItemUpdate(q as CFDictionary, [kSecValueData as String: data] as CFDictionary)
-        if status == errSecSuccess { return true }
-        guard status == errSecItemNotFound else { return false }
+        if status == errSecSuccess { return errSecSuccess }
         var add = q
         add[kSecValueData as String] = data
         add[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlocked
-        return SecItemAdd(add as CFDictionary, nil) == errSecSuccess
+        if status == errSecItemNotFound {
+            return SecItemAdd(add as CFDictionary, nil)
+        }
+        // Ad-hoc rebuilds change the binary CDHash and can cause SecItemUpdate on an older item to fail
+        // with an ACL/auth error. Only delete when we already hold a validated replacement token.
+        let del = SecItemDelete(q as CFDictionary)
+        if del == errSecSuccess || del == errSecItemNotFound {
+            return SecItemAdd(add as CFDictionary, nil)
+        }
+        return status
+    }
+
+    /// Stores a valid token (updating in place when present, replacing stale-ACL entries if needed).
+    /// Returns false for an invalid token or a Keychain failure.
+    @discardableResult
+    static func setToken(_ token: String, for id: UUID) -> Bool {
+        setTokenDetailed(token, for: id) == errSecSuccess
+    }
+
+    static func keychainFailureMessage(status: OSStatus, action: String) -> String {
+        let detail = (SecCopyErrorMessageString(status, nil) as String?)
+            .map { "\($0) (OSStatus \(status))" } ?? "OSStatus \(status)"
+        return "could not \(action) in the Keychain (\(detail)). If you rebuilt ad-hoc, sign with FERRET_CODESIGN_ID or delete the old com.ferret.desk item in Keychain Access."
     }
 
     static func clearToken(for id: UUID) {
@@ -247,9 +268,27 @@ enum ConnectionStore {
         return isValidToken(t) ? t : nil
     }
 
+    /// True when `pid` refers to a currently running local process (guards against stale `daemon.json`).
+    static func isLocalProcessAlive(_ pid: Int) -> Bool {
+        guard pid > 0, pid <= Int(Int32.max) else { return false }
+        return Darwin.kill(pid_t(pid), 0) == 0 || errno == EPERM
+    }
+
+    /// True when probing `candidate` would hit our own active/opening SSH tunnel on that loopback port.
+    static func matchesActiveSSHTunnel(candidate: String, activeSSHTunnelPort: Int?) -> Bool {
+        guard let port = activeSSHTunnelPort,
+              let norm = normalizedBaseURL(candidate),
+              let u = URL(string: norm),
+              let host = u.host?.lowercased(),
+              ["127.0.0.1", "localhost", "::1", "[::1]"].contains(host) else { return false }
+        let effectivePort = u.port ?? (u.scheme?.lowercased() == "https" ? 443 : 80)
+        return effectivePort == port
+    }
+
     /// Inspects `<home>/daemon.json` and `<home>/token` (without reading the secret into UI state) to
-    /// describe a local daemon for one-click onboarding.
-    static func localDaemonFromHome(_ home: URL = ferretHome) -> LocalDaemonInfo? {
+    /// describe a local daemon for one-click onboarding. Ignores stale `daemon.json` whose PID is gone.
+    static func localDaemonFromHome(_ home: URL = ferretHome,
+                                    isProcessAlive: (Int) -> Bool = isLocalProcessAlive) -> LocalDaemonInfo? {
         struct DaemonFileLite: Decodable { var pid: Int?; var bind: String? }
         let tokenPath = home.appendingPathComponent("token").path
         let hasToken = FileManager.default.isReadableFile(atPath: tokenPath)
@@ -258,6 +297,9 @@ enum ConnectionStore {
            let info = try? JSONDecoder().decode(DaemonFileLite.self, from: data),
            let bind = info.bind,
            let base = parseBindAddress(bind) {
+            if let pid = info.pid, !isProcessAlive(pid) {
+                return nil
+            }
             return LocalDaemonInfo(baseURL: base, hasToken: hasToken, pid: info.pid)
         }
         return nil
@@ -300,11 +342,20 @@ enum ConnectionStore {
         let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("ferret-conn-check-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: tmpDir) }
         try? FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
-        try? Data("{\"pid\":42,\"bind\":\"127.0.0.1:7979\",\"started_ms\":1}".utf8)
+        let myPID = Int(getpid())
+        try? Data("{\"pid\":\(myPID),\"bind\":\"127.0.0.1:7979\",\"started_ms\":1}".utf8)
             .write(to: tmpDir.appendingPathComponent("daemon.json"))
         try? Data((good + "\n").utf8).write(to: tmpDir.appendingPathComponent("token"))
         let detected = localDaemonFromHome(tmpDir)
-        chk(detected == LocalDaemonInfo(baseURL: "http://127.0.0.1:7979", hasToken: true, pid: 42), "localDaemonFromHome failed")
+        chk(detected == LocalDaemonInfo(baseURL: "http://127.0.0.1:7979", hasToken: true, pid: myPID), "localDaemonFromHome live pid failed")
+        chk(localDaemonFromHome(tmpDir, isProcessAlive: { _ in false }) == nil, "localDaemonFromHome accepted dead pid")
+        chk(isLocalProcessAlive(myPID), "current process reported dead")
+        chk(!isLocalProcessAlive(0) && !isLocalProcessAlive(-1), "invalid pid reported alive")
+        chk(matchesActiveSSHTunnel(candidate: "http://127.0.0.1:7878", activeSSHTunnelPort: 7878), "active tunnel port 7878 not excluded")
+        chk(matchesActiveSSHTunnel(candidate: "http://localhost:7878", activeSSHTunnelPort: 7878), "active tunnel localhost:7878 not excluded")
+        chk(!matchesActiveSSHTunnel(candidate: "http://127.0.0.1:7979", activeSSHTunnelPort: 7878), "other port wrongly excluded")
+        chk(!matchesActiveSSHTunnel(candidate: "http://127.0.0.1:7878", activeSSHTunnelPort: nil), "nil tunnel port wrongly excluded")
+        chk(keychainFailureMessage(status: errSecAuthFailed, action: "store token").contains("FERRET_CODESIGN_ID"), "keychain failure missing hint")
         chk(readLocalToken(in: tmpDir) == good, "readLocalToken failed")
         let jsonURL = tmpDir.appendingPathComponent("connections.json")
         let sample = Connection(name: "studio", mode: .sshTunnel, sshHost: "studio", remotePort: 7878)

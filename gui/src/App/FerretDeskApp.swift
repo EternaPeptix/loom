@@ -28,6 +28,7 @@ struct FerretDeskApp: App {
                 .frame(minWidth: 480, minHeight: 480)
                 .navigationTitle(state.windowTitle)
         }
+        .windowToolbarStyle(.unifiedCompact(showsTitle: false))
         .defaultSize(width: 1200, height: 800)
         .commands {
             CommandGroup(replacing: .appSettings) {
@@ -74,6 +75,9 @@ struct FerretDeskApp: App {
                 Button("Copy Address") { state.copyAddress() }
                     .keyboardShortcut("c", modifiers: [.command, .shift])
                     .disabled(!state.isConnected)
+                Button("Open in Default Browser") { state.openInDefaultBrowser() }
+                    .keyboardShortcut("o", modifiers: [.command, .shift])
+                    .disabled(!state.isConnected)
             }
         }
 
@@ -118,14 +122,36 @@ struct MenuBarLabel: View {
         }
     }
 
+    /// Caches the rendered non-template red NSImage by `(text, scale)` so unrelated `AppState` updates
+    /// (e.g. typing in FindBar) never re-run `ImageRenderer` on every keystroke.
+    @MainActor
+    private enum UrgentBadgeCache {
+        private struct Key: Equatable { let text: String; let scale: CGFloat }
+        private static var lastKey: Key?
+        private static var lastImage: NSImage?
+
+        static func image(for text: String) -> NSImage? {
+            let scale = NSScreen.screens.map(\.backingScaleFactor).max() ?? 2
+            let key = Key(text: text, scale: scale)
+            if key == lastKey, let img = lastImage { return img }
+            let r = ImageRenderer(content: Text(text)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundColor(.red)
+                .padding(.horizontal, 2))
+            r.scale = scale
+            guard let img = r.nsImage else { return nil }
+            img.isTemplate = false
+            lastKey = key
+            lastImage = img
+            return img
+        }
+    }
+
     @ViewBuilder private var content: some View {
         let (text, spoken, urgent) = label
         if urgent {
             // The menu bar tints plain text as a template; a rendered, non-template image keeps the red.
-            let r = ImageRenderer(content: Text(text).font(.system(size: 13, weight: .semibold)).foregroundColor(.red).padding(.horizontal, 2))
-            let _ = { r.scale = NSScreen.screens.map(\.backingScaleFactor).max() ?? 2 }()
-            if let img = r.nsImage {
-                let _ = { img.isTemplate = false }()
+            if let img = UrgentBadgeCache.image(for: text) {
                 // Always speak the full verbose label for VoiceOver.
                 Image(nsImage: img).accessibilityLabel(spoken)
             } else {
@@ -168,6 +194,7 @@ struct MenuBarMenu: View {
                 } else {
                     Button("Open Inbox") { state.openWindowToInbox() }
                 }
+                Button("Open in Default Browser") { state.openInDefaultBrowser() }
             }
             if case .failed = state.link, let a = state.active {
                 Button("Reconnect \(a.displayName)") { state.connect(a) }

@@ -21,22 +21,32 @@ final class Tunnel: @unchecked Sendable {
 
     enum TunnelError: Error, CustomStringConvertible {
         case spawnFailed(String)
-        case forwardTimedOut(String)
-        case badToken(String)
+        case forwardTimedOut(String, permanent: Bool = false)
+        case badToken(String, permanent: Bool = true)
         case portBusy(Int)
-        case exited(String)
+        case exited(String, permanent: Bool = false)
+
+        /// True when retrying automatically with backoff cannot help (busy port, bad config, SSH auth/host-key
+        /// failure, invalid/missing remote token) and would only wipe diagnostics or hammer the SSH server.
+        var isPermanent: Bool {
+            switch self {
+            case .spawnFailed, .portBusy: return true
+            case .forwardTimedOut(_, let p), .badToken(_, let p), .exited(_, let p): return p
+            }
+        }
+
         var description: String {
             switch self {
             case .spawnFailed(let s): return "could not start the SSH tunnel: \(s)"
-            case .forwardTimedOut(let s): return "the SSH tunnel did not come up: \(s)"
-            case .badToken(let s): return "could not read the daemon token: \(s)"
+            case .forwardTimedOut(let s, _): return "the SSH tunnel did not come up: \(s)"
+            case .badToken(let s, _): return "could not read the daemon token: \(s)"
             case .portBusy(let p):
                 return "local port \(p) is already in use. ferret-desk needs 127.0.0.1:\(p) free for this connection: "
                     + "the daemon accepts only its own port number, so any forward must use port \(p) on both ends. "
                     + "Stop whatever is listening on port \(p) (`lsof -nP -iTCP:\(p) -sTCP:LISTEN` names it; a leftover "
                     + "ssh from an earlier ferret-desk run can hold it), or move one of the daemons to another port with "
                     + "[daemon] bind in its config (if you move the remote one, change this connection's port to match)."
-            case .exited(let s): return "the SSH tunnel closed: \(s)"
+            case .exited(let s, _): return "the SSH tunnel closed: \(s)"
             }
         }
     }
@@ -86,6 +96,9 @@ final class Tunnel: @unchecked Sendable {
     private var ssh: Process?
     private var stderrSink: Sink?
     private var closing = false
+    /// Monotonic generation bumped on every `open()`, `close()`, and `closeBlocking()` so an older
+    /// `open()` suspended across `waitForExitingChild()` can never overwrite a newer `ssh` child.
+    private var openGen: UInt64 = 0
     /// All tunnel children stopped by `close()` / `close(only:)` until they have exited: their
     /// listener may hold the port for a moment, and `closeBlocking()` must ensure every one dies on quit.
     private var stopping: [ObjectIdentifier: Process] = [:]
@@ -140,9 +153,9 @@ final class Tunnel: @unchecked Sendable {
         guard let forward = Forward(remotePort: connection.remotePort) else {
             throw TunnelError.spawnFailed("the remote port is out of range")
         }
-        close()
+        let myGen = beginOpen()
         await waitForExitingChild()
-        if Task.isCancelled { throw CancellationError() }
+        if Task.isCancelled || !isCurrentOpenGen(myGen) { throw CancellationError() }
         if Tunnel.canConnect(port: forward.port) { throw TunnelError.portBusy(forward.port) }
 
         let p = Process()
@@ -174,14 +187,35 @@ final class Tunnel: @unchecked Sendable {
                 }
             }
         }
-        lock.withLock { closing = false; ssh = p; stderrSink = sink }
+        let superseded: Bool = lock.withLock {
+            guard self.openGen == myGen, !Task.isCancelled else { return true }
+            closing = false
+            ssh = p
+            stderrSink = sink
+            return false
+        }
+        if superseded {
+            err.fileHandleForReading.readabilityHandler = nil
+            try? err.fileHandleForReading.close()
+            try? err.fileHandleForWriting.close()
+            sink.end()
+            throw CancellationError()
+        }
         do { try p.run() } catch {
             err.fileHandleForReading.readabilityHandler = nil
             try? err.fileHandleForReading.close()
             try? err.fileHandleForWriting.close()
             sink.end()
-            lock.withLock { ssh = nil; stderrSink = nil }
+            lock.withLock {
+                if ssh === p { ssh = nil; stderrSink = nil }
+            }
             throw TunnelError.spawnFailed(error.localizedDescription)
+        }
+        // If close() or a newer open() raced while p.run() was launching, terminate p immediately.
+        let racedAfterLaunch: Bool = lock.withLock { self.openGen != myGen || self.ssh !== p }
+        if racedAfterLaunch {
+            close(only: p)
+            throw CancellationError()
         }
 
         // Wait for the forward, and for the daemon behind it to answer /healthz.
@@ -215,7 +249,7 @@ final class Tunnel: @unchecked Sendable {
                 } else {
                     why = "no answer within \(Int(Tunnel.forwardDeadline)) s"
                 }
-                throw TunnelError.forwardTimedOut(msg.isEmpty ? why : "\(why) — \(msg)")
+                throw TunnelError.forwardTimedOut(msg.isEmpty ? why : "\(why) — \(msg)", permanent: false)
             }
             try? await Task.sleep(nanoseconds: 150_000_000)
         }
@@ -228,15 +262,34 @@ final class Tunnel: @unchecked Sendable {
                 throw error
             }
         }
-        if Task.isCancelled { close(only: p); throw CancellationError() }
+        if Task.isCancelled || !isCurrentOpenGen(myGen) { close(only: p); throw CancellationError() }
         // The forward may have died during the token fetch; the caller only learns of an exit from here.
         if !p.isRunning {
             await sink.awaitEnd()
             let msg = sink.lastLine
             close(only: p)
-            throw TunnelError.exited(msg.isEmpty ? "ssh exited with status \(p.terminationStatus)" : msg)
+            let perm = Tunnel.isBindFailure(msg) || Tunnel.sshAuthHint(stderr: msg, host: connection.sshHost) != nil
+            throw TunnelError.exited(msg.isEmpty ? "ssh exited with status \(p.terminationStatus)" : msg, permanent: perm)
         }
         return Ready(baseURL: forward.baseURL, token: token)
+    }
+
+    private func beginOpen() -> UInt64 {
+        let (gen, prev): (UInt64, Process?) = lock.withLock {
+            openGen &+= 1
+            closing = true
+            let p = ssh
+            ssh = nil
+            stderrSink = nil
+            if let p { stopping[ObjectIdentifier(p)] = p }
+            return (openGen, p)
+        }
+        if let prev { stop(prev) }
+        return gen
+    }
+
+    private func isCurrentOpenGen(_ gen: UInt64) -> Bool {
+        lock.withLock { openGen == gen }
     }
 
     private func failIfExited(_ p: Process, sink: Sink, port: Int, host: String) async throws {
@@ -248,9 +301,9 @@ final class Tunnel: @unchecked Sendable {
             if Tunnel.isBindFailure(msg) { throw TunnelError.portBusy(port) }
             let base = msg.isEmpty ? "ssh exited with status \(p.terminationStatus)" : msg
             if let hint = Tunnel.sshAuthHint(stderr: base, host: host) {
-                throw TunnelError.forwardTimedOut("\(base) — \(hint)")
+                throw TunnelError.forwardTimedOut("\(base) — \(hint)", permanent: true)
             }
-            throw TunnelError.forwardTimedOut(base)
+            throw TunnelError.forwardTimedOut(base, permanent: false)
         }
     }
 
@@ -277,6 +330,7 @@ final class Tunnel: @unchecked Sendable {
             stop(only)
             return
         }
+        openGen &+= 1
         closing = true
         let p = ssh
         ssh = nil
@@ -322,6 +376,7 @@ final class Tunnel: @unchecked Sendable {
     /// Synchronous variant for app quit: SIGTERM, brief wait, SIGKILL on all tracked children.
     func closeBlocking() {
         let tracked: [Process] = lock.withLock {
+            openGen &+= 1
             closing = true
             var procs: [ObjectIdentifier: Process] = stopping
             if let p = ssh {
@@ -393,15 +448,25 @@ final class Tunnel: @unchecked Sendable {
         guard r.status == 0 else {
             let m = r.stderr.isEmpty ? "ssh exited with status \(r.status)" : r.stderr
             if let hint = Tunnel.sshAuthHint(stderr: m, host: host) {
-                throw TunnelError.badToken("\(m) — \(hint)")
+                throw TunnelError.badToken("\(m) — \(hint)", permanent: true)
             }
-            throw TunnelError.badToken(m)
+            throw TunnelError.badToken(m, permanent: Tunnel.isPermanentTokenFetchFailure(stderr: m))
         }
         let t = r.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
         guard ConnectionStore.isValidToken(t) else {
-            throw TunnelError.badToken("~/.ferret/token on \(host) is not 64 lowercase hex characters")
+            throw TunnelError.badToken("~/.ferret/token on \(host) is not 64 lowercase hex characters", permanent: true)
         }
         return t
+    }
+
+    /// True when `cat ~/.ferret/token` over SSH failed due to a missing/unreadable file rather than a
+    /// transient SSH transport/network timeout.
+    static func isPermanentTokenFetchFailure(stderr: String) -> Bool {
+        let low = stderr.lowercased()
+        return low.contains("no such file or directory")
+            || low.contains("cannot open")
+            || low.contains("is a directory")
+            || (low.contains("permission denied") && low.contains("token"))
     }
 
     struct Captured { var status: Int32; var stdout: String; var stderr: String }
@@ -637,6 +702,20 @@ final class Tunnel: @unchecked Sendable {
         check(sshAuthHint(stderr: "Host key verification failed.", host: "studio")?.contains("ssh studio") == true, "missing host key hint")
         check(sshAuthHint(stderr: "Permission denied (publickey).", host: "studio")?.contains("ssh-add") == true, "missing auth hint")
         check(sshAuthHint(stderr: "bind [127.0.0.1]:80: Permission denied", host: "studio") == nil, "bind permission error misclassified as auth")
+        check(TunnelError.portBusy(7878).isPermanent, "portBusy must be permanent")
+        check(TunnelError.spawnFailed("bad host").isPermanent, "spawnFailed must be permanent")
+        check(TunnelError.badToken("no file", permanent: true).isPermanent, "permanent badToken must be permanent")
+        check(!TunnelError.badToken("Connection timed out", permanent: false).isPermanent, "transient token fetch timeout must be retryable")
+        check(TunnelError.forwardTimedOut("auth failed", permanent: true).isPermanent, "permanent forwardTimedOut must be permanent")
+        check(!TunnelError.forwardTimedOut("no answer", permanent: false).isPermanent, "transient forwardTimedOut must be retryable")
+        check(isPermanentTokenFetchFailure(stderr: "cat: /home/u/.ferret/token: No such file or directory"), "missing remote token not permanent")
+        check(!isPermanentTokenFetchFailure(stderr: "ssh: connect to host studio port 22: Operation timed out"), "ssh timeout wrongly marked permanent")
+        let genTunnel = Tunnel()
+        let g1 = genTunnel.beginOpen()
+        let g2 = genTunnel.beginOpen()
+        check(g2 != g1 && !genTunnel.isCurrentOpenGen(g1) && genTunnel.isCurrentOpenGen(g2), "openGen did not invalidate older open")
+        genTunnel.close()
+        check(!genTunnel.isCurrentOpenGen(g2), "close did not invalidate openGen")
         if !isBindFailure("bind [127.0.0.1]:7878: Address already in use") { f.append("Tunnel: bind failure not recognised") }
         if isBindFailure("Permission denied (publickey).") { f.append("Tunnel: auth failure taken for bind failure") }
         if isBindFailure("bind [127.0.0.1]:80: Permission denied; channel_setup_fwd_listener_tcpip: cannot listen to port: 80; "

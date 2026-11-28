@@ -4648,3 +4648,219 @@ test("app.js: when #auth-overlay exists, lost() preserves the DOM non-destructiv
   assert.equal(nodes.get("auth-overlay").hidden, false, "#auth-overlay must be shown");
   assert.equal(globalThis.document.title, "ferret · not signed in", "must preserve ferret-desk KVO title contract");
 });
+
+test("isEmbeddedDesk detects the FerretDesk/<version> UA token without JS injection", () => {
+  assert.equal(C.isEmbeddedDesk("Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 FerretDesk/0.1.0"), true);
+  assert.equal(C.isEmbeddedDesk("FerretDesk/1.2.0-beta"), true);
+  assert.equal(C.isEmbeddedDesk("Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 Safari/605.1.15"), false);
+  assert.equal(C.isEmbeddedDesk("MyFerretDesk/0.1.0"), false);
+  assert.equal(C.isEmbeddedDesk(""), false);
+  assert.equal(C.isEmbeddedDesk(null), false);
+});
+
+test("healthDot and connectionWords surface Signal bridge disconnects and errors", () => {
+  const okModels = [{ profile: "local", reachable: true }];
+  assert.equal(C.healthDot({ connected: true, models: okModels, signal: { enabled: false, connected: false } }).state, "green");
+  assert.equal(C.healthDot({ connected: true, models: okModels, signal: { enabled: true, connected: true } }).state, "green");
+
+  const down = C.healthDot({ connected: true, models: okModels, signal: { enabled: true, connected: false, last_error: "socket refused" } });
+  assert.equal(down.state, "amber");
+  assert.match(down.tip, /Signal bridge: disconnected \(socket refused\)/);
+
+  const err = C.healthDot({ connected: true, models: okModels, signal: { enabled: true, connected: true, last_error: "rate limited" } });
+  assert.equal(err.state, "amber");
+  assert.match(err.tip, /Signal bridge error: rate limited/);
+
+  const words = C.connectionWords({ connected: true, everConnected: true, models: okModels, signal: { enabled: true, connected: false } });
+  assert.equal(words.short, "Live");
+  assert.match(words.tip, /Signal bridge: disconnected/);
+
+  assert.equal(C.healthDot({ connected: false, models: okModels, signal: { enabled: true, connected: true } }).state, "red");
+});
+
+test("proseTree captures fenced code language tags and supports 4-backtick nested fences", () => {
+  const plain = C.proseTree("```\nconst x = 1;\n```");
+  assert.equal(plain.length, 1);
+  assert.equal(plain[0].type, "pre");
+  assert.equal("lang" in plain[0], false, "omits lang property when fence has no language tag");
+
+  const tagged = C.proseTree("```diff\n-old\n+new\n```");
+  assert.deepEqual(tagged, [{ type: "pre", text: "-old\n+new", lang: "diff" }]);
+
+  const nested = C.proseTree("````markdown\nHere is a block:\n```js\nconsole.log(1);\n```\n````");
+  assert.equal(nested.length, 1);
+  assert.equal(nested[0].type, "pre");
+  assert.equal(nested[0].lang, "markdown");
+  assert.equal(nested[0].text, "Here is a block:\n```js\nconsole.log(1);\n```");
+});
+
+test("rewriteActionsForPhase and buildRewriteRule enforce request vs response phase constraints", () => {
+  const reqActs = C.rewriteActionsForPhase("request").map(([v]) => v);
+  const respActs = C.rewriteActionsForPhase("response").map(([v]) => v);
+  assert.ok(reqActs.includes("set_method") && reqActs.includes("set_path_query") && reqActs.includes("replace_url"));
+  assert.ok(!reqActs.includes("set_status"));
+  assert.ok(respActs.includes("set_status"));
+  assert.ok(!respActs.includes("set_method") && !respActs.includes("set_path_query") && !respActs.includes("replace_url"));
+
+  assert.match(C.buildRewriteRule({ name: "r1", phase: "response", actionType: "set_method", value: "POST" }).error, /request phase/i);
+  assert.match(C.buildRewriteRule({ name: "r1", phase: "response", actionType: "set_path_query", value: "/v2" }).error, /request phase/i);
+  assert.match(C.buildRewriteRule({ name: "r1", phase: "response", actionType: "replace_url", regex: "a", value: "b" }).error, /request phase/i);
+
+  const reqBuilt = C.buildRewriteRule({
+    name: "r-req", phase: "request", status: "200, 404",
+    extraMatchers: { headers: [{ name: "X-A", value_regex: "1" }], resp_headers: [{ name: "X-R", value_regex: "2" }], resp_body_regex: "err" },
+    actionType: "set_header", headerName: "X-Test", value: "1",
+  });
+  assert.equal(reqBuilt.rule.matchers.status, undefined, "request phase drops response status matcher");
+  assert.equal(reqBuilt.rule.matchers.resp_headers, undefined, "request phase drops resp_headers matcher");
+  assert.equal(reqBuilt.rule.matchers.resp_body_regex, undefined, "request phase drops resp_body_regex matcher");
+  assert.deepEqual(reqBuilt.rule.matchers.headers, [{ name: "X-A", value_regex: "1" }]);
+
+  const respBuilt = C.buildRewriteRule({
+    name: "r-resp", phase: "response", status: "200, 404",
+    extraMatchers: { resp_headers: [{ name: "X-R", value_regex: "2" }], resp_body_regex: "err" },
+    actionType: "set_header", headerName: "X-Test", value: "1",
+  });
+  assert.deepEqual(respBuilt.rule.matchers.status, ["200", "404"]);
+  assert.deepEqual(respBuilt.rule.matchers.resp_headers, [{ name: "X-R", value_regex: "2" }]);
+  assert.equal(respBuilt.rule.matchers.resp_body_regex, "err");
+});
+
+test("attachmentName derives MIME extensions and shouldPasteFiles distinguishes screenshots/Finder copies from rich text", () => {
+  assert.equal(C.attachmentName({ name: "report.pdf", type: "application/pdf" }), "report.pdf");
+  assert.equal(C.attachmentName({ name: "", type: "image/png" }), "pasted-image.png");
+  assert.equal(C.attachmentName({ name: "  ", type: "image/jpeg; charset=binary" }), "pasted-image.jpg");
+  assert.equal(C.attachmentName({ name: "", type: "text/plain" }), "pasted-file.txt");
+  assert.equal(C.attachmentName({ name: "", type: "application/octet-stream" }), "pasted-file");
+
+  assert.equal(C.shouldPasteFiles([], ""), false);
+  assert.equal(C.shouldPasteFiles([{ name: "image.png", type: "image/png" }], ""), true);
+  assert.equal(C.shouldPasteFiles([{ name: "capture.png" }], "capture.png"), true, "macOS Finder single-file copy attaches");
+  assert.equal(C.shouldPasteFiles([{ name: "a.png" }, { name: "b.pdf" }], "a.png\nb.pdf"), true, "macOS Finder multi-file copy attaches");
+  assert.equal(C.shouldPasteFiles([{ name: "image.png" }], "Col1\tCol2\n1\t2"), false, "spreadsheet cell text stays text paste");
+});
+
+test("switcherActions filters quick actions by query and context, and keySheet documents queue shortcut", () => {
+  const base = C.switcherActions("", { targetsSupported: false, inSession: false }).map((a) => a.id);
+  assert.ok(base.includes("new-mission") && base.includes("inbox") && base.includes("daemon-status") && base.includes("keys"));
+  assert.ok(!base.includes("targets") && !base.includes("toggle-inspector"));
+
+  const full = C.switcherActions("", { targetsSupported: true, inSession: true }).map((a) => a.id);
+  assert.ok(full.includes("targets") && full.includes("toggle-inspector"));
+
+  assert.deepEqual(C.switcherActions("signal", { targetsSupported: true, inSession: true }).map((a) => a.id), ["daemon-status"]);
+  assert.deepEqual(C.switcherActions("inspector", { targetsSupported: true, inSession: true }).map((a) => a.id), ["toggle-inspector"]);
+
+  const macRows = C.keySheet(true).flatMap((s) => s.rows);
+  const winRows = C.keySheet(false).flatMap((s) => s.rows);
+  assert.ok(macRows.some((r) => r.keys.join("+") === "Option+Enter" && /queue/i.test(r.text)));
+  assert.ok(winRows.some((r) => r.keys.join("+") === "Alt+Enter" && /queue/i.test(r.text)));
+});
+
+test("style.css palette honors Cross-Layer Contract #2, Ferret favicon branding, and WCAG 2.1 AA (>= 4.5:1) contrast", () => {
+  const css = readFileSync(join(here, "style.css"), "utf8");
+  const svg = readFileSync(join(here, "favicon.svg"), "utf8");
+  assert.ok(svg.includes("#111520"), "favicon.svg uses Ferret midnight-indigo backing");
+  assert.ok(!svg.includes("#2557d6"), "favicon.svg replaces legacy cobalt loom mark");
+
+  const parseVars = (block) => {
+    const vars = {};
+    for (const m of block.matchAll(/(--[a-z0-9-]+)\s*:\s*(#[0-9a-fA-F]{3,8})\s*;/g)) vars[m[1]] = m[2].toLowerCase();
+    return vars;
+  };
+  const darkBlock = css.match(/:root\s*\{([^}]+)\}/);
+  const lightBlock = css.match(/@media\s*\(prefers-color-scheme:\s*light\)\s*\{\s*:root\s*\{([^}]+)\}/);
+  assert.ok(darkBlock && lightBlock, "dark and light :root token blocks exist");
+  const dark = parseVars(darkBlock[1]);
+  const light = parseVars(lightBlock[1]);
+
+  // Cross-Layer Contract #2: exact backing surface hex shared with ferret-desk WKWebView.
+  assert.equal(dark["--bg"], "#111520");
+  assert.equal(light["--bg"], "#ffffff");
+
+  const toRgb = (hex) => {
+    const h = hex.slice(1);
+    const full = h.length === 3 ? h.split("").map((c) => c + c).join("") : h.slice(0, 6);
+    return [0, 2, 4].map((i) => parseInt(full.slice(i, i + 2), 16) / 255);
+  };
+  const relLum = (hex) => {
+    const [r, g, b] = toRgb(hex).map((c) => (c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4));
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  };
+  const contrast = (fg, bg) => {
+    const l1 = relLum(fg), l2 = relLum(bg);
+    return (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05);
+  };
+
+  for (const [mode, t] of [["dark", dark], ["light", light]]) {
+    const surfaces = ["--bg", "--bg-side", "--bg-2", "--surface-card"];
+    const textTokens = ["--strong", "--fg", "--dim", "--caption", "--accent", "--info", "--ok-soft", "--bad-soft", "--warn-soft", "--info-soft", "--attn-text"];
+    for (const s of surfaces) {
+      for (const f of textTokens) {
+        const ratio = contrast(t[f], t[s]);
+        assert.ok(ratio >= 4.5, `${mode}: ${f} (${t[f]}) on ${s} (${t[s]}) contrast ${ratio.toFixed(2)} < 4.5`);
+      }
+    }
+    for (const [f, s] of [
+      ["--on-accent-fill", "--accent-fill"],
+      ["--on-accent-fill", "--accent-btn"],
+      ["--on-attn", "--attn"],
+      ["--bad", "--bg"],
+      ["--bad", "--bg-2"],
+      ["--attn-text", "--attn-bg"],
+      ["--attn-text", "--attn-card"],
+      ["--attn-dim", "--attn-card"],
+      ["--strong", "--bubble"],
+      ["--fg", "--bubble"],
+      ["--strong", "--sel"],
+      ["--fg", "--code-bg"],
+      ["--strong", "--code-bg"],
+    ]) {
+      const ratio = contrast(t[f], t[s]);
+      assert.ok(ratio >= 4.5, `${mode}: ${f} (${t[f]}) on ${s} (${t[s]}) contrast ${ratio.toFixed(2)} < 4.5`);
+    }
+  }
+});
+
+test("app.js: embedded FerretDesk UA adds body.embedded-desk and lost() closes open dialogs and marks shell inert", async (t) => {
+  const classes = new Set();
+  const makeNode = (id) => ({ id, hidden: true, inert: false, textContent: "", value: "", dataset: {}, addEventListener() {}, focus() {}, setAttribute() {}, append() {} });
+  const ids = ["auth-overlay", "auth-overlay-reason", "auth-overlay-error", "auth-overlay-form", "auth-overlay-input", "auth-overlay-toggle", "auth-overlay-submit", "auth-overlay-retry", "left", "mid", "right"];
+  const nodes = new Map(ids.map((id) => [id, makeNode(id)]));
+  let closedDialogs = 0;
+  const fakeDialog = { open: true, close() { this.open = false; closedDialogs++; } };
+  const fake = {
+    document: {
+      title: "ferret",
+      getElementById: (id) => nodes.get(id) || null,
+      querySelectorAll: (sel) => (sel === "dialog[open]" ? [fakeDialog] : []),
+      createElement: (tag) => ({ tag, kids: [], append(...k) { this.kids.push(...k); }, setAttribute() {} }),
+      createTextNode: (text) => ({ textContent: text }),
+      body: {
+        classList: { toggle: (name, on) => (on ? classes.add(name) : classes.delete(name)), add: (name) => classes.add(name) },
+        replaceChildren: () => {},
+      },
+    },
+    navigator: { userAgent: "Mozilla/5.0 AppleWebKit/605.1.15 FerretDesk/0.1.0" },
+    window: { addEventListener() {} },
+    location: { hash: "", pathname: "/", search: "", reload() {} },
+    history: { replaceState() {} },
+    matchMedia: () => ({ matches: false, addEventListener() {} }),
+    sessionStorage: { getItem: () => null, setItem() {}, removeItem() {} },
+    fetch: async () => ({ ok: false, status: 401 }),
+  };
+  for (const [name, value] of Object.entries(fake)) {
+    const before = Object.getOwnPropertyDescriptor(globalThis, name);
+    Object.defineProperty(globalThis, name, { value, configurable: true, writable: true });
+    t.after(() => (before ? Object.defineProperty(globalThis, name, before) : delete globalThis[name]));
+  }
+  await import("./app.js?page=embedded-overlay-check");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(classes.has("embedded-desk"), true, "body.embedded-desk must be toggled from FerretDesk UA");
+  assert.equal(closedDialogs, 1, "open dialogs must close when #auth-overlay opens");
+  assert.equal(nodes.get("left").inert, true);
+  assert.equal(nodes.get("mid").inert, true);
+  assert.equal(nodes.get("right").inert, true);
+  assert.equal(nodes.get("auth-overlay").hidden, false);
+  assert.equal(globalThis.document.title, "ferret · not signed in");
+});
