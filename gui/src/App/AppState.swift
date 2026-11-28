@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import Network
+import Security
 import SwiftUI
 import UserNotifications
 import WebKit
@@ -123,11 +124,34 @@ final class AppState: ObservableObject {
     @Published private(set) var entryTick = 0
     /// Bumped to ask the always-alive menu-bar label to open the main window.
     @Published var openWindowTick = 0
+    struct DownloadNotice: Equatable {
+        let text: String
+        let fileURL: URL?
+    }
+
+    /// FIFO queue for navigation/focus/zoom commands so back-to-back mutations in one turn never overwrite each other.
+    struct NavActionQueue: Equatable {
+        private var items: [WebPane.NavAction] = []
+        mutating func enqueue(_ action: WebPane.NavAction) { items.append(action) }
+        mutating func drain() -> [WebPane.NavAction] {
+            let out = items
+            items.removeAll(keepingCapacity: true)
+            return out
+        }
+        mutating func clear() { items.removeAll(keepingCapacity: false) }
+    }
+
     /// The last problem saving connections / the Keychain, shown in ConnectionsView and the status banner.
     @Published var storageError: String? = nil
-    /// Non-blocking status toast for completed/failed downloads.
-    @Published var downloadNotice: String? = nil
+    /// Non-blocking status toast for completed/failed downloads (with optional file URL for "Reveal in Finder").
+    @Published var downloadNotice: DownloadNotice? = nil
     private var downloadNoticeTask: Task<Void, Never>?
+    /// When transient SSH auto-reconnect backoff is counting down, when the next attempt fires.
+    @Published var nextReconnectAt: Date? = nil
+    /// True when transient SSH auto-reconnect is paused waiting for the network path to return.
+    @Published var waitingForNetwork = false
+    /// Bumped whenever a Keychain token is stored or cleared so ConnectionsView refreshes its cached token map.
+    @Published private(set) var tokenPresenceEpoch = 0
 
     // MARK: desktop UX state (zoom, find, nav, connections sheet, compact menu bar)
 
@@ -143,11 +167,12 @@ final class AppState: ObservableObject {
     @Published private(set) var findTick = 0
     @Published private(set) var findFocusTick = 0
     private var pendingFindAction: WebPane.FindAction?
+    private var findDebounceTask: Task<Void, Never>?
 
     @Published var canGoBack = false
     @Published var canGoForward = false
     @Published private(set) var navTick = 0
-    private var pendingNavAction: WebPane.NavAction?
+    private var navQueue = NavActionQueue()
 
     @Published var showingConnectionsSheet = false
     @Published var editingConnection: Connection? = nil
@@ -257,6 +282,29 @@ final class AppState: ObservableObject {
         NSPasteboard.general.setString(DaemonClient.addressForPasteboard(base: base), forType: .string)
     }
 
+    /// Mints a fresh one-time login code (preserving the `/healthz` HMAC proof) and opens the daemon UI
+    /// in the default browser. Never writes any code or token to the pasteboard.
+    func openInDefaultBrowser() {
+        guard case .connected = link, let base = baseURL, let token, isTunnelAlive else { return }
+        let gen = generation
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let result = try await self.makeEntryURL(base: base, token: token)
+                guard gen == self.generation else { return }
+                switch result {
+                case .url(let u):
+                    NSWorkspace.shared.open(u)
+                case .identityMismatch(let why):
+                    self.failIdentity(why)
+                }
+            } catch {
+                guard gen == self.generation else { return }
+                self.showDownloadNotice("Could not open browser: \(error)")
+            }
+        }
+    }
+
     /// Reload (and Retry) = a new web pane, which asks for a fresh one-time code while preserving the
     /// operator's current `#/...` mission/tab route and per-connection ephemeral web store.
     func reload(preserveRoute: Bool = true) {
@@ -302,6 +350,8 @@ final class AppState: ObservableObject {
 
     func zoomReset() {
         pageZoom = 1.0
+        guard isConnected else { return }
+        enqueueNav(.resetZoom)
     }
 
     func openFind() {
@@ -312,6 +362,8 @@ final class AppState: ObservableObject {
     }
 
     func closeFind() {
+        findDebounceTask?.cancel()
+        findDebounceTask = nil
         findVisible = false
         findNotFound = false
         clearFindHighlight()
@@ -319,19 +371,41 @@ final class AppState: ObservableObject {
     }
 
     func clearFindHighlight() {
+        findDebounceTask?.cancel()
+        findDebounceTask = nil
         findNotFound = false
         guard isConnected else { return }
         pendingFindAction = .clear
         findTick += 1
     }
 
+    /// Debounced live-type search so typing a full word lands on the first match instead of advancing on every keystroke.
+    func findQueryChanged(_ newValue: String) {
+        findDebounceTask?.cancel()
+        findDebounceTask = nil
+        if newValue.isEmpty {
+            clearFindHighlight()
+            return
+        }
+        findNotFound = false
+        findDebounceTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(150))
+            guard !Task.isCancelled, let self, self.findVisible, self.findQuery == newValue else { return }
+            self.findNext()
+        }
+    }
+
     func findNext() {
+        findDebounceTask?.cancel()
+        findDebounceTask = nil
         guard isConnected, !findQuery.isEmpty else { return }
         pendingFindAction = .find(query: findQuery, backwards: false)
         findTick += 1
     }
 
     func findPrevious() {
+        findDebounceTask?.cancel()
+        findDebounceTask = nil
         guard isConnected, !findQuery.isEmpty else { return }
         pendingFindAction = .find(query: findQuery, backwards: true)
         findTick += 1
@@ -342,27 +416,28 @@ final class AppState: ObservableObject {
         return pendingFindAction
     }
 
+    private func enqueueNav(_ action: WebPane.NavAction) {
+        navQueue.enqueue(action)
+        navTick += 1
+    }
+
     func goBack() {
         guard isConnected else { return }
-        pendingNavAction = .back
-        navTick += 1
+        enqueueNav(.back)
     }
 
     func goForward() {
         guard isConnected else { return }
-        pendingNavAction = .forward
-        navTick += 1
+        enqueueNav(.forward)
     }
 
     func focusWebPane() {
         guard isConnected, !findVisible else { return }
-        pendingNavAction = .focus
-        navTick += 1
+        enqueueNav(.focus)
     }
 
-    func takeNavAction() -> WebPane.NavAction? {
-        defer { pendingNavAction = nil }
-        return pendingNavAction
+    func takeNavActions() -> [WebPane.NavAction] {
+        navQueue.drain()
     }
 
     func noteRouteFragment(_ fragment: String) {
@@ -374,6 +449,9 @@ final class AppState: ObservableObject {
     /// web-session evicted) or when `DaemonClient` detects a new daemon `pid`/`started_ms`.
     func handleWebSessionExpired() {
         guard isConnected else { return }
+        // Coalesce concurrent triggers (e.g. DaemonClient.onDaemonRestart + WebPane KVO firing back-to-back)
+        // when a fresh reload is already in flight so we don't abort it mid-load or burn autoReloadCount.
+        if webState == .loading && !webLoadedOnce { return }
         let now = Date()
         if now.timeIntervalSince(lastAutoReloadAt) > 15 {
             autoReloadCount = 0
@@ -403,15 +481,24 @@ final class AppState: ObservableObject {
         }
     }
 
-    func showDownloadNotice(_ text: String?) {
+    func showDownloadNotice(_ text: String?, fileURL: URL? = nil) {
         downloadNoticeTask?.cancel()
-        downloadNotice = text
-        guard text != nil else { return }
+        guard let text else {
+            downloadNotice = nil
+            return
+        }
+        downloadNotice = DownloadNotice(text: text, fileURL: fileURL)
+        let ttl: Duration = fileURL != nil ? .seconds(6) : .seconds(4)
         downloadNoticeTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(4))
+            try? await Task.sleep(for: ttl)
             guard !Task.isCancelled else { return }
             self?.downloadNotice = nil
         }
+    }
+
+    func revealDownloadInFinder() {
+        guard let url = downloadNotice?.fileURL else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([url])
     }
 
     /// Called once by every newly created web pane (connect, reload, the window built again): asks the
@@ -474,8 +561,13 @@ final class AppState: ObservableObject {
         daemonUnreachable = false
         canGoBack = false
         canGoForward = false
+        navQueue.clear()
+        findDebounceTask?.cancel()
+        findDebounceTask = nil
         findVisible = false
         findNotFound = false
+        nextReconnectAt = nil
+        waitingForNetwork = false
         if switchingConnection {
             pendingRoute = nil
             lastRouteFragment = nil
@@ -498,6 +590,7 @@ final class AppState: ObservableObject {
 
         connectTask = Task { [weak self] in
             guard let self else { return }
+            let connID = connection.id
             do {
                 let base: String
                 var tok: String?
@@ -505,10 +598,12 @@ final class AppState: ObservableObject {
                 switch connection.mode {
                 case .sshTunnel:
                     let cached: String?
-                    if connection.tokenSource == .fetchOverSsh,
-                       let stored = ConnectionStore.token(for: connection.id),
-                       ConnectionStore.isValidToken(stored) {
-                        cached = stored
+                    if connection.tokenSource == .fetchOverSsh {
+                        let stored = await Task.detached(priority: .userInitiated) {
+                            ConnectionStore.token(for: connID)
+                        }.value
+                        try Task.checkCancellation()
+                        cached = stored.flatMap { ConnectionStore.isValidToken($0) ? $0 : nil }
                     } else {
                         cached = nil
                     }
@@ -532,23 +627,33 @@ final class AppState: ObservableObject {
                             let fetched = try await self.tunnel.fetchToken(host: connection.sshHost)
                             if gen == self.generation { try self.checkTunnelAlive() }
                             tok = fetched
-                            if ConnectionStore.setToken(fetched, for: connection.id) {
+                            let kcStatus = await Task.detached(priority: .userInitiated) {
+                                ConnectionStore.setTokenDetailed(fetched, for: connID)
+                            }.value
+                            self.tokenPresenceEpoch += 1
+                            if kcStatus == errSecSuccess {
                                 self.storageError = nil
                             } else {
-                                self.storageError = "connected, but could not store the fetched token in the Keychain"
+                                self.storageError = ConnectionStore.keychainFailureMessage(status: kcStatus, action: "store the fetched token")
                             }
                         case .unreachable:
                             if let m = cachedOutcome.failure { throw ConnectError(m) }
                         }
                     } else if let fetched = r.token {
                         tok = fetched
-                        if ConnectionStore.setToken(fetched, for: connection.id) {
+                        let kcStatus = await Task.detached(priority: .userInitiated) {
+                            ConnectionStore.setTokenDetailed(fetched, for: connID)
+                        }.value
+                        self.tokenPresenceEpoch += 1
+                        if kcStatus == errSecSuccess {
                             self.storageError = nil
                         } else {
-                            self.storageError = "connected, but could not store the fetched token in the Keychain"
+                            self.storageError = ConnectionStore.keychainFailureMessage(status: kcStatus, action: "store the fetched token")
                         }
                     } else {
-                        tok = ConnectionStore.token(for: connection.id)
+                        tok = await Task.detached(priority: .userInitiated) {
+                            ConnectionStore.token(for: connID)
+                        }.value
                     }
                 case .direct:
                     if let problem = ConnectionStore.baseURLProblem(connection.baseURL) { throw ConnectError(problem) }
@@ -557,12 +662,17 @@ final class AppState: ObservableObject {
                     }
                     base = b
                     if connection.tokenSource == .localFile {
-                        guard let local = ConnectionStore.readLocalToken() else {
+                        let local = await Task.detached(priority: .userInitiated) {
+                            ConnectionStore.readLocalToken()
+                        }.value
+                        guard let local else {
                             throw ConnectError("could not read a valid 64-character hex token from \(ConnectionStore.ferretHome.appendingPathComponent("token").path)")
                         }
                         tok = local
                     } else {
-                        tok = ConnectionStore.token(for: connection.id)
+                        tok = await Task.detached(priority: .userInitiated) {
+                            ConnectionStore.token(for: connID)
+                        }.value
                     }
                 }
                 guard let tok, ConnectionStore.isValidToken(tok) else {
@@ -590,6 +700,8 @@ final class AppState: ObservableObject {
                 // is .connected, by tunnelDied. The web pane mints its login code when it is built.
                 self.backoffAttempt = 0
                 self.autoReloadCount = 0
+                self.nextReconnectAt = nil
+                self.waitingForNetwork = false
                 self.token = tok
                 self.baseURL = base
                 self.link = .connected(baseURL: base)
@@ -605,6 +717,11 @@ final class AppState: ObservableObject {
                 self.tunnel.close()
                 self.token = nil
                 self.baseURL = nil
+                self.nextReconnectAt = nil
+                self.waitingForNetwork = false
+                if let te = error as? Tunnel.TunnelError, te.isPermanent {
+                    self.reconnectable = false
+                }
                 let msg = (error as? ConnectError)?.description ?? (error as? Tunnel.TunnelError)?.description ?? error.localizedDescription
                 self.link = .failed(msg)
                 self.status = "failed"
@@ -633,6 +750,7 @@ final class AppState: ObservableObject {
         notificationSeeds.removeAll()
         canGoBack = false
         canGoForward = false
+        navQueue.clear()
         findVisible = false
         findNotFound = false
         Notifier.withdrawAll()
@@ -648,6 +766,7 @@ final class AppState: ObservableObject {
         connectTask?.cancel()
         backoffTask?.cancel()
         wakeProbeTask?.cancel()
+        findDebounceTask?.cancel()
         endBackgroundActivity()
         client.stop()
         tunnel.closeBlocking()
@@ -663,6 +782,10 @@ final class AppState: ObservableObject {
         backoffTask = nil
         wakeProbeTask?.cancel()
         wakeProbeTask = nil
+        findDebounceTask?.cancel()
+        findDebounceTask = nil
+        nextReconnectAt = nil
+        waitingForNetwork = false
         endBackgroundActivity()
         client.stop()
         tunnel.close()
@@ -680,6 +803,10 @@ final class AppState: ObservableObject {
         backoffTask = nil
         wakeProbeTask?.cancel()
         wakeProbeTask = nil
+        findDebounceTask?.cancel()
+        findDebounceTask = nil
+        nextReconnectAt = nil
+        waitingForNetwork = false
         endBackgroundActivity()
         client.stop()
         tunnel.close()
@@ -823,7 +950,14 @@ final class AppState: ObservableObject {
                 guard let self else { return }
                 let cameBack = up && !self.networkSatisfied
                 self.networkSatisfied = up
-                if cameBack { self.handleNetworkReturned() }
+                if cameBack {
+                    self.handleNetworkReturned()
+                } else if !up, case .failed = self.link, self.reconnectable, self.active?.mode == .sshTunnel {
+                    self.backoffTask?.cancel()
+                    self.backoffTask = nil
+                    self.nextReconnectAt = nil
+                    self.waitingForNetwork = true
+                }
             }
         }
         pathMonitor.start(queue: DispatchQueue(label: "ferret-desk.path"))
@@ -908,16 +1042,25 @@ final class AppState: ObservableObject {
         backoffTask?.cancel()
         guard networkSatisfied else {
             backoffTask = nil
+            nextReconnectAt = nil
+            waitingForNetwork = true
             return
         }
         let delay = Self.backoffDelay(attempt: backoffAttempt)
         backoffAttempt += 1
+        waitingForNetwork = false
+        nextReconnectAt = Date().addingTimeInterval(delay)
         backoffTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(delay))
             guard !Task.isCancelled else { return }
             guard let self, self.generation == gen, self.reconnectable,
                   case .failed = self.link, self.active?.id == connection.id else { return }
-            guard self.networkSatisfied else { return }
+            guard self.networkSatisfied else {
+                self.nextReconnectAt = nil
+                self.waitingForNetwork = true
+                return
+            }
+            self.nextReconnectAt = nil
             self.lastReconnectAt = Date()
             self.connect(connection, resetBackoff: false)
         }
@@ -937,11 +1080,14 @@ final class AppState: ObservableObject {
         var problems: [String] = []
         if !ConnectionStore.save(connections) { problems.append("could not write connections.json") }
         if let t = newToken, !t.isEmpty {
-            if !ConnectionStore.setToken(t, for: c.id) {
-                problems.append("could not store the token in the Keychain")
+            let status = ConnectionStore.setTokenDetailed(t, for: c.id)
+            tokenPresenceEpoch += 1
+            if status != errSecSuccess {
+                problems.append(ConnectionStore.keychainFailureMessage(status: status, action: "store the token"))
             }
         } else if clearToken {
             ConnectionStore.clearToken(for: c.id)
+            tokenPresenceEpoch += 1
         }
         storageError = problems.isEmpty ? nil : problems.joined(separator: "; ")
     }
@@ -951,6 +1097,7 @@ final class AppState: ObservableObject {
         connections.removeAll { $0.id == c.id }
         notificationSeeds.removeValue(forKey: c.id)
         ConnectionStore.clearToken(for: c.id)
+        tokenPresenceEpoch += 1
         storageError = ConnectionStore.save(connections) ? nil : "could not write connections.json"
         if UserDefaults.standard.string(forKey: Self.lastKey) == c.id.uuidString {
             UserDefaults.standard.removeObject(forKey: Self.lastKey)
@@ -969,7 +1116,8 @@ final class AppState: ObservableObject {
         }
     }
 
-    /// Bring the window forward; navigate the pane to `session` when given while a link is active/opening.
+    /// Bring the window forward; navigate the pane to `session` when given while a link is active/opening,
+    /// or kick off an immediate reconnect carrying `session` if the tunnel is currently `.failed` in backoff.
     func openWindow(focus session: String? = nil) {
         openWindowTick += 1
         if let session {
@@ -977,7 +1125,17 @@ final class AppState: ObservableObject {
             case .connected, .connecting:
                 pendingRoute = .session(session)
                 routeTick += 1
-            case .none, .failed:
+            case .failed:
+                if let a = active {
+                    pendingRoute = .session(session)
+                    routeTick += 1
+                    backoffTask?.cancel()
+                    backoffTask = nil
+                    nextReconnectAt = nil
+                    waitingForNetwork = false
+                    connect(a, resetBackoff: true)
+                }
+            case .none:
                 break
             }
         }
@@ -985,6 +1143,9 @@ final class AppState: ObservableObject {
         for w in NSApp.windows where w.canBecomeMain {
             if w.isMiniaturized { w.deminiaturize(nil) }
             w.makeKeyAndOrderFront(nil)
+        }
+        if isConnected {
+            focusWebPane()
         }
     }
 
@@ -1097,6 +1258,21 @@ enum SelfCheck {
         if AppState.backoffDelay(attempt: 0) != 2 || AppState.backoffDelay(attempt: 99) != 30 { failures.append("AppState.backoffDelay") }
         if Notifier.cut("a\nb", 10) != "a b" || Notifier.cut(String(repeating: "x", count: 20), 5).count != 5 {
             failures.append("Notifier.cut")
+        }
+        var navQ = AppState.NavActionQueue()
+        navQ.enqueue(.back)
+        navQ.enqueue(.focus)
+        navQ.enqueue(.resetZoom)
+        if navQ.drain() != [.back, .focus, .resetZoom] { failures.append("NavActionQueue FIFO order") }
+        if !navQ.drain().isEmpty { failures.append("NavActionQueue not empty after drain") }
+        if WindowCloseHider.closeDecision(hasAttachedSheet: true, isFullScreen: false) != .ignoreSheet {
+            failures.append("WindowCloseHider attached sheet")
+        }
+        if WindowCloseHider.closeDecision(hasAttachedSheet: false, isFullScreen: true) != .exitFullScreenThenHide {
+            failures.append("WindowCloseHider full screen")
+        }
+        if WindowCloseHider.closeDecision(hasAttachedSheet: false, isFullScreen: false) != .hideImmediately {
+            failures.append("WindowCloseHider normal close")
         }
         for f in failures { print("FAIL \(f)") }
         print(failures.isEmpty ? "self-check: all passed" : "self-check: \(failures.count) failed")

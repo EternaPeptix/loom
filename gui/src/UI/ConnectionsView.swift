@@ -1,7 +1,7 @@
 import SwiftUI
 
 /// Shown when nothing is connected (and inside the `⌘,` Manage Connections sheet): the saved connections,
-/// local daemon auto-detection, and add / edit / delete / connect actions.
+/// local daemon auto-detection (excluding any active SSH forward), and add / edit / delete / connect actions.
 /// See gui/DESIGN.md "Connections".
 struct ConnectionsView: View {
     @EnvironmentObject var state: AppState
@@ -10,8 +10,11 @@ struct ConnectionsView: View {
 
     @State private var editing: Connection? = nil
     @State private var deleting: Connection? = nil
+    @State private var selectedID: UUID? = nil
     @State private var localDaemon: ConnectionStore.LocalDaemonInfo? = nil
     @State private var probedLocal = false
+    /// Async-cached Keychain token presence so `List` body never runs synchronous Keychain IPC on `@MainActor`.
+    @State private var tokenPresent: [UUID: Bool] = [:]
 
     private var localAlreadySaved: Bool {
         guard let local = localDaemon else { return false }
@@ -21,13 +24,81 @@ struct ConnectionsView: View {
     }
 
     var body: some View {
+        Group {
+            if inSheet {
+                content
+            } else {
+                VStack(spacing: 0) {
+                    Spacer(minLength: 16)
+                    content
+                        .frame(maxWidth: 620, maxHeight: 540)
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 12)
+                                .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
+                        )
+                    Spacer(minLength: 16)
+                }
+                .padding(24)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(WebPane.adaptivePageColor)
+            }
+        }
+        .task {
+            await probeLocalDaemon()
+            // First run: only auto-open the blank add sheet if no local daemon was auto-detected.
+            if !inSheet && state.connections.isEmpty && !state.offeredFirstRun && localDaemon == nil {
+                state.offeredFirstRun = true
+                editing = Connection(name: "")
+            } else if !inSheet && state.connections.isEmpty && localDaemon != nil {
+                state.offeredFirstRun = true
+            }
+        }
+        .task(id: state.connections) {
+            await refreshTokenCache()
+        }
+        .onChange(of: state.tokenPresenceEpoch) { _, _ in
+            Task { await refreshTokenCache() }
+        }
+        .sheet(item: $editing) { c in
+            let isNew = !state.connections.contains(where: { $0.id == c.id })
+            ConnectionEditor(original: c, isNew: isNew, offerConnect: isNew || !state.isCurrentlyActive(c)) { saved, token, clearToken, connectNow in
+                state.upsert(saved, token: token, clearToken: clearToken)
+                editing = nil
+                if connectNow {
+                    state.connect(saved)
+                    onDismiss?()
+                }
+            } onCancel: { editing = nil }
+            .environmentObject(state)
+        }
+        .confirmationDialog("Delete this connection?", isPresented: Binding(
+            get: { deleting != nil }, set: { if !$0 { deleting = nil } }), presenting: deleting) { c in
+            let label = c.displayName
+            Button("Delete \(label)", role: .destructive) { state.remove(c); deleting = nil }
+            Button("Cancel", role: .cancel) { deleting = nil }
+        } message: { _ in
+            Text("This also removes its token from the Keychain.")
+        }
+    }
+
+    private var content: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Text("Connections").font(.title3)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Connections").font(.title3.weight(.semibold))
+                    if !inSheet {
+                        Text("Connect to a local or remote ferret daemon over SSH.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
                 Spacer()
                 Button {
                     editing = Connection(name: "")
-                } label: { Image(systemName: "plus") }
+                } label: {
+                    Label("Add", systemImage: "plus")
+                }
                 .help("Add a connection")
                 .accessibilityLabel("Add a connection")
                 if inSheet, let onDismiss {
@@ -41,6 +112,7 @@ struct ConnectionsView: View {
             if let local = localDaemon, !localAlreadySaved {
                 HStack(spacing: 10) {
                     Image(systemName: "desktopcomputer")
+                        .font(.title3)
                         .foregroundStyle(.secondary)
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Local daemon detected at \(local.baseURL)")
@@ -72,88 +144,163 @@ struct ConnectionsView: View {
                 }
                 .padding(.top, 8)
             } else {
-                List(state.connections) { c in
-                    let bad = invalidReason(c)
-                    let isActive = state.isCurrentlyActive(c)
-                    HStack {
-                        VStack(alignment: .leading) {
-                            HStack(spacing: 6) {
-                                Text(c.displayName)
-                                if isActive {
-                                    Text("Active")
-                                        .font(.caption2.weight(.medium))
-                                        .padding(.horizontal, 5)
-                                        .padding(.vertical, 1)
-                                        .background(Color.green.opacity(0.18), in: Capsule())
-                                }
-                            }
-                            Text(subtitle(c)).font(.caption).foregroundStyle(.secondary)
-                            if let bad { Text(bad).font(.caption).foregroundStyle(.red) }
-                        }
-                        Spacer()
-                        Button("Edit") { editing = c }
-                        Button("Delete", role: .destructive) { deleting = c }
-                        Button(isActive ? "Reconnect" : "Connect") {
-                            state.connect(c)
-                            onDismiss?()
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(bad != nil)
-                    }
-                    .padding(.vertical, 2)
-                    .contentShape(Rectangle())
-                    .onTapGesture(count: 2) {
-                        guard bad == nil else { return }
-                        state.connect(c)
-                        onDismiss?()
-                    }
+                List(state.connections, selection: $selectedID) { c in
+                    connectionRow(c)
+                        .tag(c.id)
                 }
-            }
-            Spacer()
-        }
-        .padding(16)
-        .task {
-            await probeLocalDaemon()
-            // First run: only auto-open the blank add sheet if no local daemon was auto-detected.
-            if !inSheet && state.connections.isEmpty && !state.offeredFirstRun && localDaemon == nil {
-                state.offeredFirstRun = true
-                editing = Connection(name: "")
-            } else if !inSheet && state.connections.isEmpty && localDaemon != nil {
-                state.offeredFirstRun = true
-            }
-        }
-        .sheet(item: $editing) { c in
-            let isNew = !state.connections.contains(where: { $0.id == c.id })
-            ConnectionEditor(original: c, isNew: isNew, offerConnect: isNew || !state.isCurrentlyActive(c)) { saved, token, clearToken, connectNow in
-                state.upsert(saved, token: token, clearToken: clearToken)
-                editing = nil
-                if connectNow {
-                    state.connect(saved)
+                .listStyle(.inset)
+                .scrollContentBackground(inSheet ? .automatic : .hidden)
+                .onKeyPress(.return) {
+                    guard let id = selectedID ?? state.connections.first?.id,
+                          let c = state.connections.first(where: { $0.id == id }),
+                          invalidReason(c) == nil,
+                          !isConnecting(c) else { return .ignored }
+                    state.connect(c)
                     onDismiss?()
+                    return .handled
                 }
-            } onCancel: { editing = nil }
-            .environmentObject(state)
+            }
+            if inSheet { Spacer(minLength: 0) }
         }
-        .confirmationDialog("Delete this connection?", isPresented: Binding(
-            get: { deleting != nil }, set: { if !$0 { deleting = nil } }), presenting: deleting) { c in
-            let label = c.displayName
-            Button("Delete \(label)", role: .destructive) { state.remove(c); deleting = nil }
-            Button("Cancel", role: .cancel) { deleting = nil }
-        } message: { _ in
-            Text("This also removes its token from the Keychain.")
+        .padding(18)
+    }
+
+    @ViewBuilder
+    private func connectionRow(_ c: Connection) -> some View {
+        let bad = invalidReason(c)
+        let connecting = isConnecting(c)
+        let connected = isConnected(c)
+        let failed = isFailed(c)
+        HStack(spacing: 10) {
+            Image(systemName: c.mode == .sshTunnel ? "terminal" : "network")
+                .font(.body)
+                .foregroundStyle(.secondary)
+                .frame(width: 20)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(c.displayName).font(.body.weight(.medium))
+                    if connected {
+                        statusCapsule("Active", color: .green)
+                    } else if connecting {
+                        statusCapsule("Connecting…", color: .orange)
+                    } else if failed {
+                        statusCapsule("Failed", color: .red)
+                    }
+                }
+                Text(verbatim: subtitle(c))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if let bad {
+                    Text(bad).font(.caption).foregroundStyle(.red)
+                }
+            }
+            Spacer(minLength: 8)
+            Button(connecting ? "Connecting…" : (connected ? "Reconnect" : "Connect")) {
+                state.connect(c)
+                onDismiss?()
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(bad != nil || connecting)
+            Menu {
+                Button("Edit…") { editing = c }
+                Divider()
+                Button("Delete…", role: .destructive) { deleting = c }
+            } label: {
+                Image(systemName: "ellipsis.circle")
+                    .foregroundStyle(.secondary)
+                    .padding(4)
+                    .contentShape(Rectangle())
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .help("Edit or delete \(c.displayName)")
+            .accessibilityLabel("More actions for \(c.displayName)")
         }
+        .padding(.vertical, 4)
+        .contentShape(Rectangle())
+        .onTapGesture(count: 2) {
+            guard bad == nil, !connecting else { return }
+            state.connect(c)
+            onDismiss?()
+        }
+        .contextMenu {
+            Button(connected ? "Reconnect" : "Connect") {
+                state.connect(c)
+                onDismiss?()
+            }
+            .disabled(bad != nil || connecting)
+            Button("Edit…") { editing = c }
+            Divider()
+            Button("Delete…", role: .destructive) { deleting = c }
+        }
+    }
+
+    private func statusCapsule(_ label: String, color: Color) -> some View {
+        Text(label)
+            .font(.caption2.weight(.medium))
+            .foregroundStyle(color)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 1)
+            .background(color.opacity(0.16), in: Capsule())
+    }
+
+    private func isConnecting(_ c: Connection) -> Bool {
+        guard state.active?.id == c.id else { return false }
+        if case .connecting = state.link { return true }
+        return false
+    }
+
+    private func isConnected(_ c: Connection) -> Bool {
+        guard state.active?.id == c.id else { return false }
+        if case .connected = state.link { return true }
+        return false
+    }
+
+    private func isFailed(_ c: Connection) -> Bool {
+        guard state.active?.id == c.id else { return false }
+        if case .failed = state.link { return true }
+        return false
+    }
+
+    private func refreshTokenCache() async {
+        let idsToCheck = state.connections.compactMap { c -> UUID? in
+            switch c.mode {
+            case .direct: return c.tokenSource == .localFile ? nil : c.id
+            case .sshTunnel: return c.tokenSource == .manual ? c.id : nil
+            }
+        }
+        guard !idsToCheck.isEmpty else {
+            tokenPresent = [:]
+            return
+        }
+        let result = await Task.detached(priority: .userInitiated) {
+            var map: [UUID: Bool] = [:]
+            for id in idsToCheck {
+                map[id] = ConnectionStore.hasToken(for: id)
+            }
+            return map
+        }.value
+        tokenPresent = result
     }
 
     private func probeLocalDaemon() async {
         guard !probedLocal else { return }
         probedLocal = true
-        if let info = ConnectionStore.localDaemonFromHome() {
+        let activeSSHPort: Int? = (state.active?.mode == .sshTunnel && state.link != .none)
+            ? state.active?.remotePort
+            : nil
+        if let info = ConnectionStore.localDaemonFromHome(),
+           !ConnectionStore.matchesActiveSSHTunnel(candidate: info.baseURL, activeSSHTunnelPort: activeSSHPort) {
             if await DaemonClient.quickHealthz(baseURL: info.baseURL, timeout: 1.5) {
                 localDaemon = info
                 return
             }
         }
         let defaultBase = "http://127.0.0.1:7878"
+        guard !ConnectionStore.matchesActiveSSHTunnel(candidate: defaultBase, activeSSHTunnelPort: activeSSHPort) else {
+            return
+        }
         if await DaemonClient.quickHealthz(baseURL: defaultBase, timeout: 1.5) {
             let hasToken = FileManager.default.isReadableFile(atPath: ConnectionStore.ferretHome.appendingPathComponent("token").path)
             localDaemon = ConnectionStore.LocalDaemonInfo(baseURL: defaultBase, hasToken: hasToken, pid: nil)
@@ -178,7 +325,7 @@ struct ConnectionsView: View {
         case .direct:
             if let bad = ConnectionStore.baseURLProblem(c.baseURL) { return bad }
             if c.tokenSource == .localFile { return nil }
-            if !ConnectionStore.hasToken(for: c.id) {
+            if tokenPresent[c.id] == false {
                 return "No token stored — click Edit to paste one or read ~/.ferret/token."
             }
             return nil
@@ -189,7 +336,7 @@ struct ConnectionsView: View {
             if !(1...65535).contains(c.remotePort) {
                 return "Remote port must be 1–65535."
             }
-            if c.tokenSource == .manual && !ConnectionStore.hasToken(for: c.id) {
+            if c.tokenSource == .manual && tokenPresent[c.id] == false {
                 return "No token stored — click Edit to paste one or switch to Fetch over SSH."
             }
             return nil
@@ -315,7 +462,7 @@ struct ConnectionEditor: View {
                         Text("Enter manually").tag(Connection.TokenSource.manual)
                     }
                     if draft.tokenSource == .localFile {
-                        Text("Reads \(ConnectionStore.ferretHome.appendingPathComponent("token").path) on connect.")
+                        Text(verbatim: "Reads \(ConnectionStore.ferretHome.appendingPathComponent("token").path) on connect.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
                 }

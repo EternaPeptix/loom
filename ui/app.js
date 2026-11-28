@@ -10,6 +10,7 @@ const $ = (id) => (typeof document.getElementById === "function" ? document.getE
 const PHONE = matchMedia("(max-width: 699px)");
 const COMPACT = matchMedia("(max-width: 699px), (max-height: 700px)"); // the whole session scrolls as one
 const COARSE = matchMedia("(pointer: coarse)");
+const EMBEDDED_DESK = typeof navigator === "object" && C.isEmbeddedDesk(navigator.userAgent);
 /** The one element that scrolls the chat: the session view where it scrolls as a whole, else the record's own scroller. */
 // Phones scroll the whole session as one, but only the Chat tab follows the stream: other tabs write to the hidden chat scroller.
 const chatScroller = () => (COMPACT.matches && S.section === "chat" ? $("view-session") : $("scroller"));
@@ -53,11 +54,15 @@ const S = {
   ask: null, // an inline confirmation waiting in the inspector: {kind:"compact"} | {kind:"lead", lead, value} | {kind:"role", lead, role, value}
   headAsk: null, // an inline confirmation waiting in the session header: {kind:"stop"|"archive", session}
   composerStopAsk: null, // inline stop confirmation inside the composer: {session, opener}
-  noise: { supported: null, data: null, error: null }, // GET /api/network/noise
-  rewrites: { supported: null, list: [], error: null, editing: null, askDelete: null, busy: false, formError: null }, // /api/traffic/rewrite-rules
+  noise: { supported: null, data: null, error: null, open: false, loading: false }, // GET /api/network/noise
+  rewrites: { supported: null, list: [], error: null, editing: null, askDelete: null, askDeleteFocus: false, busy: false, formError: null, open: false, toggling: new Set() }, // /api/traffic/rewrite-rules
+  harBusy: { importing: false, exporting: false },
   scopeForm: null, // persistent host-grant form for the open session
   mcpChecks: new Map(), // server name -> {busy, result, error}
-  gc: { busy: false, report: null, error: null, confirmApply: false },
+  gc: { busy: false, report: null, error: null, confirmApply: false, focusConfirm: false },
+  reload: { busy: false, report: "", error: "" },
+  statusRefreshing: false,
+  reconnecting: false,
   hiddenAt: 0,
   appStarted: false,
   section: "chat",
@@ -244,8 +249,11 @@ function prose(text) {
   };
   for (const block of C.proseTree(text)) {
     if (block.type === "pre") {
-      const pre = add(el("pre", "out"), el("code", "", block.text));
-      root.append(add(el("div", "codeblock reveal-copy"), pre, copyButton("Copy code", () => C.codeCopyText(block), { what: "Code", source: pre })));
+      const isDiff = block.lang && /^(diff|patch)$/i.test(block.lang);
+      const pre = isDiff ? outputBox(block.text, C.outputLineKinds(block.text)) : add(el("pre", "out"), el("code", "", block.text));
+      const wrap = el("div", "codeblock reveal-copy" + (block.lang ? " has-lang" : ""));
+      if (block.lang) wrap.append(el("span", "codeblock-lang", block.lang));
+      root.append(add(wrap, pre, copyButton("Copy code", () => C.codeCopyText(block), { what: "Code", source: pre })));
     } else if (block.type === "ul" || block.type === "ol") {
       const list = el(block.type);
       for (const item of block.items) { const li = el("li"); inline(li, item); list.append(li); }
@@ -362,7 +370,31 @@ function authHeaders(extra) {
   return { ...(extra || {}), Authorization: "Bearer " + secret };
 }
 
+function setAuthInert(on) {
+  if (on) {
+    for (const id of ["left", "mid", "right"]) {
+      const node = $(id);
+      if (node) node.inert = true;
+    }
+    return;
+  }
+  if (S.appStarted && document.body && document.body.classList) {
+    setDrawer("left", document.body.classList.contains("show-left"));
+    setDrawer("right", document.body.classList.contains("show-right"));
+  } else {
+    for (const id of ["left", "mid", "right"]) {
+      const node = $(id);
+      if (node) node.inert = false;
+    }
+  }
+}
+
 function showAuthOverlay(reason) {
+  if (typeof document.querySelectorAll === "function") {
+    for (const d of document.querySelectorAll("dialog[open]")) {
+      if (typeof d.close === "function") d.close();
+    }
+  }
   const overlay = $("auth-overlay");
   if (!overlay) {
     // Headless / fallback DOM without #auth-overlay: render the standalone sign-in card.
@@ -382,6 +414,7 @@ function showAuthOverlay(reason) {
       ? "The daemon could not be reached while signing in. Your open view and unsaved drafts are kept; click Retry once the daemon is running, or paste a new login code."
       : "Its sign-in lasts as long as the tab, and it has ended (or the daemon was restarted with a new token). Your open view and unsaved drafts are still here.";
   }
+  setAuthInert(true);
   overlay.hidden = false;
   if (typeof requestAnimationFrame === "function") {
     requestAnimationFrame(() => {
@@ -395,9 +428,12 @@ function hideAuthOverlay() {
   const overlay = $("auth-overlay");
   if (overlay) overlay.hidden = true;
   const input = $("auth-overlay-input");
-  if (input) input.value = "";
+  if (input) { input.value = ""; input.type = "password"; }
+  const toggle = $("auth-overlay-toggle");
+  if (toggle) { toggle.textContent = "Show"; toggle.setAttribute("aria-pressed", "false"); }
   const errEl = $("auth-overlay-error");
   if (errEl) { errEl.textContent = ""; errEl.hidden = true; }
+  setAuthInert(false);
 }
 
 /** Non-destructive sign-out recovery: preserves #app, drafts, and view while still updating document.title for ferret-desk KVO. */
@@ -429,15 +465,43 @@ async function resumeAfterAuth() {
 }
 
 function wireAuthOverlay() {
+  const overlay = $("auth-overlay");
   const form = $("auth-overlay-form");
   const input = $("auth-overlay-input");
+  const toggle = $("auth-overlay-toggle");
   const submit = $("auth-overlay-submit");
   const retry = $("auth-overlay-retry");
   const errEl = $("auth-overlay-error");
   if (!form || form.dataset.bound) return;
   form.dataset.bound = "1";
   const showErr = (msg) => { errEl.textContent = msg; errEl.hidden = false; };
-  const setBusy = (on) => { submit.disabled = on; retry.disabled = on; input.disabled = on; };
+  const setBusy = (on, mode = "") => {
+    submit.disabled = on;
+    retry.disabled = on;
+    input.disabled = on;
+    if (toggle) toggle.disabled = on;
+    submit.textContent = on && mode === "submit" ? "Signing in…" : "Sign in";
+    retry.textContent = on && mode === "retry" ? "Retrying…" : "Retry";
+  };
+  if (toggle) {
+    toggle.addEventListener("click", () => {
+      const shown = input.type === "text";
+      input.type = shown ? "password" : "text";
+      toggle.textContent = shown ? "Show" : "Hide";
+      toggle.setAttribute("aria-pressed", String(!shown));
+      input.focus({ preventScroll: true });
+    });
+  }
+  if (overlay) {
+    overlay.addEventListener("keydown", (e) => {
+      if (overlay.hidden || e.key !== "Tab" || typeof overlay.querySelectorAll !== "function") return;
+      const focusable = [...overlay.querySelectorAll("button:not([disabled]), input:not([disabled]), a[href]")].filter((n) => n.getClientRects && n.getClientRects().length);
+      if (!focusable.length) return;
+      const first = focusable[0], last = focusable[focusable.length - 1];
+      if (e.shiftKey && (document.activeElement === first || !overlay.contains(document.activeElement))) { e.preventDefault(); last.focus(); }
+      else if (!e.shiftKey && (document.activeElement === last || !overlay.contains(document.activeElement))) { e.preventDefault(); first.focus(); }
+    });
+  }
   const testBearer = async (token) => {
     const r = await fetch("/api/status", { credentials: "omit", headers: { Authorization: "Bearer " + token } });
     return r.ok;
@@ -447,7 +511,7 @@ function wireAuthOverlay() {
     errEl.hidden = true;
     const parsed = C.classifyAuthInput(input.value);
     if (parsed.error) return showErr(parsed.error);
-    setBusy(true);
+    setBusy(true, "submit");
     try {
       if (parsed.kind === "code" || parsed.kind === "code_or_token") {
         const res = await redeemCode(parsed.value);
@@ -474,7 +538,7 @@ function wireAuthOverlay() {
   });
   retry.addEventListener("click", async () => {
     errEl.hidden = true;
-    setBusy(true);
+    setBusy(true, "retry");
     try {
       if (await signIn()) {
         await resumeAfterAuth();
@@ -629,7 +693,7 @@ function renderList() {
     for (const row of group.rows) {
       const { info, depth, agentCount, agentsRunning, expanded, mark } = row;
       const wrap = el("div", "mission-row");
-      const a = el("a", `row d${Math.min(depth, 2)}${mark.mark === "needs_you" ? " needs" : ""}${info.id === S.openId && S.view === "session" ? " sel" : ""}${info.archived ? " arch" : ""}`);
+      const a = el("a", `row d${Math.min(depth, 2)}${mark.mark === "needs_you" ? " needs" : ""}${mark.mark === "fresh" ? " fresh" : ""}${info.id === S.openId && S.view === "session" ? " sel" : ""}${info.archived ? " arch" : ""}`);
       a.setAttribute("href", C.sessionHash(info.id));
       a.dataset.focusKey = "session:" + info.id;
       if (info.id === S.openId) a.setAttribute("aria-current", "page");
@@ -665,36 +729,43 @@ function renderList() {
 
 function renderDot() {
   const models = (S.status && S.status.models) || [];
-  const d = C.healthDot({ connected: S.connected, models });
+  const signal = S.status && S.status.signal;
+  const d = C.healthDot({ connected: S.connected, models, signal });
   const dot = $("dot");
   dot.className = "dot dot-" + d.state;
-  dot.title = d.tip;
+  dot.removeAttribute("title");
   const state = $("connection-state");
   // The sidebar line stays short ("Live", "Reconnecting…", "Offline"); the detail is its tooltip.
   const words = C.connectionWords({
-    connected: S.connected, everConnected: S.everConnected, attempts: S.attempts, statusError: S.statusError, models,
+    connected: S.connected, everConnected: S.everConnected, attempts: S.attempts, statusError: S.statusError, models, signal,
     lastUpdateText: S.lastUpdate ? `Last update ${ago(S.lastUpdate)}` : "Waiting for first update",
   });
   if (state) {
     state.textContent = words.short;
-    state.title = words.tip;
+    state.removeAttribute("title");
   }
   const wrap = $("connection-wrap");
   if (wrap) {
     wrap.title = words.tip + "\nClick to open Daemon & Signal status.";
-    wrap.setAttribute("aria-label", `Connection: ${words.short}. Open daemon and Signal status.`);
+    wrap.setAttribute("aria-label", `Daemon status: ${words.short}. Open daemon and Signal status.`);
   }
   // The bar speaks the loss of the connection only where the sidebar is a closed drawer (under 700px); beside the open sidebar it would be said twice.
   const bar = $("bar-connection");
   if (bar) bar.textContent = !S.connected && PHONE.matches ? `${words.short} · execution state unknown` : "";
   const banner = $("offline-banner");
   if (banner) {
-    const showOffline = !S.connected && !streamStopped && (S.everConnected || S.attempts >= 1);
+    // Under embedded ferret-desk, RootView's native StatusBanner handles transient drops; only show web banner if persistently offline.
+    const showOffline = !S.connected && !streamStopped && (EMBEDDED_DESK ? S.attempts >= 3 : (S.everConnected || S.attempts >= 1));
     banner.hidden = !showOffline;
     if (showOffline) {
       $("offline-banner-text").textContent = S.attempts >= 3
         ? "Offline — the daemon event stream is unreachable; execution state may be stale."
         : "Disconnected from the daemon event stream — reconnecting…";
+    }
+    const recBtn = $("offline-reconnect");
+    if (recBtn) {
+      recBtn.disabled = !!S.reconnecting;
+      recBtn.textContent = S.reconnecting ? "Reconnecting…" : "Reconnect now";
     }
   }
   $("bar-offline").hidden = S.connected || S.view !== "session";
@@ -720,10 +791,12 @@ function openDaemonStatus(opener = document.activeElement) {
   if (document.querySelector("dialog[open]")) return;
   statusOpener = opener;
   S.gc.confirmApply = false;
+  S.gc.focusConfirm = false;
+  S.reload.error = "";
   renderDaemonStatus();
   dialog.showModal();
   $("daemon-status-close").focus({ preventScroll: true });
-  loadStatus();
+  refreshDaemonStatus();
 }
 
 function closeDaemonStatus() {
@@ -731,16 +804,29 @@ function closeDaemonStatus() {
   if (dialog && dialog.open) dialog.close();
 }
 
+async function refreshDaemonStatus() {
+  if (S.statusRefreshing) return;
+  S.statusRefreshing = true;
+  const b = $("daemon-status-refresh");
+  if (b) { b.disabled = true; b.textContent = "Refreshing…"; }
+  try {
+    await Promise.all([loadStatus(), loadProfiles()]);
+  } finally {
+    S.statusRefreshing = false;
+    if (b) { b.disabled = false; b.textContent = "Refresh"; }
+  }
+}
+
 async function runGc(apply) {
   if (S.gc.busy) return;
   S.gc.busy = true;
   S.gc.error = null;
-  if (apply) S.gc.confirmApply = false;
+  if (apply) { S.gc.confirmApply = false; S.gc.focusConfirm = false; }
   renderDaemonStatus();
   try {
     const report = await api("POST", "/api/gc", { apply: !!apply });
     S.gc.report = report;
-    toast(C.formatGcReport(report));
+    if (!$("daemon-status")?.open) toast(C.formatGcReport(report));
     if (apply) loadStatus();
   } catch (e) {
     S.gc.error = e.message;
@@ -751,13 +837,24 @@ async function runGc(apply) {
 }
 
 async function reloadModelProfiles() {
+  if (S.reload.busy) return;
+  S.reload = { busy: true, report: "", error: "" };
+  if ($("daemon-status")?.open) renderDaemonStatus();
+  if (S.tab === "models") want("right");
   try {
     const report = await api("POST", "/api/models/reload", {});
-    toast(C.formatReloadReport(report));
+    const summary = C.formatReloadReport(report);
+    S.reload = { busy: false, report: summary, error: "" };
+    if (!$("daemon-status")?.open) toast(summary);
     await Promise.all([loadStatus(), loadProfiles(), S.tab === "models" ? loadModels() : Promise.resolve()]);
     if (S.view === "new") renderNewModels();
   } catch (e) {
-    notice(e.message);
+    S.reload = { busy: false, report: "", error: e.message };
+    if (!$("daemon-status")?.open) notice(e.message);
+  } finally {
+    S.reload.busy = false;
+    if ($("daemon-status")?.open) renderDaemonStatus();
+    if (S.tab === "models") want("right");
   }
 }
 
@@ -789,6 +886,7 @@ function renderDaemonStatus() {
   const diskText = st.disk && st.disk.total_bytes > 0
     ? `${gib(st.disk.free_bytes)} free of ${gib(st.disk.total_bytes)}`
     : "unknown";
+  const defaultModel = st.default_model || (S.profiles && S.profiles.default_model) || "";
   const daemonRows = [
     ["Event stream", S.connected ? "Connected" : S.attempts >= 3 ? "Offline" : "Reconnecting…"],
     ["Version", st.version],
@@ -800,7 +898,7 @@ function renderDaemonStatus() {
     ["Network mode", st.network || "unknown"],
     ["Egress", st.egress ? st.egress.level : ""],
     ["Monitor", st.monitor ? `${st.monitor.state} · ${C.num(st.monitor.open_flags)} open flags` : ""],
-    ["Default model", st.default_model || (S.profiles && S.profiles.default_model) || ""],
+    ["Default model", defaultModel],
     ["Sessions", `${C.num(st.sessions_total)} total · ${C.num(st.sessions_active)} active · ${C.num(st.sessions_running)} running`],
     ["Inbox open", C.num(st.inbox_open)],
     ["Home", st.home],
@@ -813,21 +911,29 @@ function renderDaemonStatus() {
   const sigSec = el("section", "status-section");
   const sigTone = sig.tone === "ok" ? "ok" : sig.tone === "bad" ? "bad" : sig.tone === "warn" ? "warn" : "dim";
   add(sigSec, add(el("div", "section-heading"), el("h3", "", "Signal bridge"), chip(sig.state, sigTone)));
-  if (sig.rows.length) sigSec.append(makeKv(sig.rows));
-  else if (!sig.available) sigSec.append(el("p", "dim field-note", "Signal bridge is disabled or not configured on this daemon."));
+  if (sig.rows.length) {
+    sigSec.append(makeKv(sig.rows.map(([k, v]) => [k, k === "Last error" ? el("span", "error", v) : v])));
+  } else if (!sig.available) {
+    sigSec.append(el("p", "dim field-note", "Signal bridge is disabled or not configured on this daemon."));
+  }
   frag.append(sigSec);
 
   // Models section
   const modSec = el("section", "status-section");
-  const reloadBtn = btn("Reload profiles", "small", reloadModelProfiles);
+  const reloadBtn = btn(S.reload.busy ? "Reloading…" : "Reload profiles", "small", reloadModelProfiles);
+  reloadBtn.disabled = S.reload.busy;
+  reloadBtn.dataset.focusKey = "daemon:reload-models";
   add(modSec, add(el("div", "section-heading"), el("h3", "", "Models"), reloadBtn));
+  if (S.reload.error) modSec.append(el("p", "error status-note", S.reload.error));
+  else if (S.reload.report) modSec.append(el("p", "okc status-note", S.reload.report));
   const models = st.models || [];
   if (!models.length) modSec.append(el("p", "dim field-note", "No model profiles configured."));
   else {
     const ul = el("ul", "status-models");
     for (const m of models) {
       const li = el("li", "status-model-row");
-      add(li, el("span", "mono", m.profile), el("span", "dim", m.model || ""), chip(m.reachable ? "reachable" : "unreachable", m.reachable ? "ok" : "warn"));
+      const meta = [m.model || "", m.context_window ? C.tokens(m.context_window) : ""].filter(Boolean).join(" · ");
+      add(li, el("span", "mono", m.profile), m.profile === defaultModel ? chip("default", "dim") : null, meta ? el("span", "dim", meta) : null, chip(m.reachable ? "reachable" : "unreachable", m.reachable ? "ok" : "warn"));
       if (m.detail && !m.reachable) li.append(el("span", "dim", m.detail));
       ul.append(li);
     }
@@ -841,23 +947,30 @@ function renderDaemonStatus() {
   const gcActions = el("div", "status-actions");
   const prevBtn = btn(S.gc.busy ? "Working…" : "Preview GC", "small", () => runGc(false));
   prevBtn.disabled = S.gc.busy;
-  const applyBtn = btn("Run GC…", "small danger", () => { S.gc.confirmApply = true; renderDaemonStatus(); });
+  prevBtn.dataset.focusKey = "daemon:gc-preview";
+  const applyBtn = btn("Run GC…", "small danger", () => { S.gc.confirmApply = true; S.gc.focusConfirm = true; renderDaemonStatus(); });
   applyBtn.disabled = S.gc.busy;
+  applyBtn.dataset.focusKey = "daemon:gc-run";
   add(gcActions, prevBtn, applyBtn);
   gcSec.append(gcActions);
   if (S.gc.confirmApply) {
     gcSec.append(confirmRow(
-      { text: "Delete unreferenced stored outputs from disk now?", yes: "Run GC", no: "Cancel" },
+      { text: "Delete unreferenced stored outputs from disk now?", yes: "Run GC", no: "Cancel", danger: true },
       () => runGc(true),
-      () => { S.gc.confirmApply = false; renderDaemonStatus(); },
+      () => { S.gc.confirmApply = false; S.gc.focusConfirm = false; renderDaemonStatus(); requestAnimationFrame(() => focusKey("daemon:gc-run")); },
       "gc:",
     ));
   }
-  if (S.gc.error) gcSec.append(el("p", "error", S.gc.error));
-  if (S.gc.report) gcSec.append(el("p", "dim field-note", C.formatGcReport(S.gc.report)));
+  if (S.gc.error) gcSec.append(el("p", "error status-note", S.gc.error));
+  if (S.gc.report) gcSec.append(el("p", "dim status-note", C.formatGcReport(S.gc.report)));
   frag.append(gcSec);
 
   preserveFocus(body, () => body.replaceChildren(frag));
+  if (S.gc.confirmApply && S.gc.focusConfirm) {
+    S.gc.focusConfirm = false;
+    const safe = body.querySelector('[data-focus-key="gc:ask:no"]');
+    if (safe) safe.focus({ preventScroll: true });
+  }
 }
 
 function renderEgressWarning() {
@@ -1305,7 +1418,9 @@ function handleEvent(ev) {
 }
 
 function reconnectNow() {
-  if (streamStopped) return;
+  if (streamStopped || S.reconnecting) return;
+  S.reconnecting = true;
+  renderDot();
   if (reconnectWake) {
     const wake = reconnectWake;
     reconnectWake = null;
@@ -1333,10 +1448,11 @@ async function connect() {
         headers: authHeaders({ Accept: "text/event-stream" }),
         signal: streamCtl.signal,
       });
-      if (r.status === 401) return lost();
+      if (r.status === 401) { S.reconnecting = false; return lost(); }
       if (!r.ok || !r.body) throw new Error("The event stream answered " + r.status + ".");
       const again = S.everConnected;
       S.connected = true;
+      S.reconnecting = false;
       S.connectedSince = Date.now();
       S.everConnected = true;
       S.attempts = 0;
@@ -1359,6 +1475,7 @@ async function connect() {
     clearTimeout(idle);
     // However the read ended, let go of the connection before another is opened.
     streamCtl.abort();
+    S.reconnecting = false;
     // After lost() the page shows the sign-in overlay: stop the loop until resumed.
     if (streamStopped) return;
     S.connected = false;
@@ -1404,6 +1521,7 @@ async function loadSessions() {
         for (const [id, now] of S.sessions.byId) if (held.has(id) && held.get(id) !== now) announceEnding(held.get(id), now);
         S.lastUpdate = Date.now();
         want("list", "header", "overview");
+        if (S.view === "new") renderPriorPicks();
         // The open session may only now be known: its ledger was not loaded before.
         const open = S.openId && S.sessions.byId.get(S.openId);
         if (open && open.mission && (S.ledger.mission !== open.mission || (!S.ledger.model && S.ledger.stale && !S.ledger.pending))) loadLedger();
@@ -1586,6 +1704,7 @@ function renderBar(info, chips) {
   $("bar-title").textContent = info.title || info.id;
   $("bar-details").hidden = false;
   $("bar-find").hidden = false;
+  $("open-right").hidden = false;
   $("bar-offline").hidden = S.connected;
 }
 function hideBarIdentity() {
@@ -1593,6 +1712,7 @@ function hideBarIdentity() {
   $("bar-run").hidden = true;
   $("bar-details").hidden = true;
   $("bar-find").hidden = true;
+  $("open-right").hidden = true;
   $("bar-offline").hidden = true;
 }
 function stopRunTimer() {
@@ -1962,6 +2082,10 @@ function cancelComposerStopConfirm(restore = true) {
 function askComposerStop(info, opener) {
   if (!info) return;
   hideHeadConfirm();
+  if (S.seat && !S.seatBusy.has(S.seat.session)) {
+    S.seat = null;
+    $("model-confirm").hidden = true;
+  }
   S.composerStopAsk = { session: info.id, opener };
   $("composer-stop-text").textContent = C.stopQuestion(info);
   $("composer-stop-confirm").hidden = false;
@@ -2430,7 +2554,7 @@ function buildSheet(info) {
     }
     runCard.append(srow("", null, { full: holder, cls: "run-actions" }));
     if (S.sheet.ask && S.sheet.ask.kind === "stop") {
-      const q = { text: C.stopQuestion(info), yes: "Stop it", no: "Keep running" };
+      const q = { text: C.stopQuestion(info), yes: "Stop it", no: "Keep running", danger: true };
       runCard.append(confirmRow(q, () => { S.sheet.ask = null; want("sheet"); sessionAction("stop"); requestAnimationFrame(() => focusKey("sheet:h:run")); }, () => { S.sheet.ask = null; want("sheet"); requestAnimationFrame(() => focusKey("sheet:stop")); }, "sheet:"));
     }
   }
@@ -2854,6 +2978,7 @@ function renderEvidence(panel) {
   const sarifBtn = info && info.mission ? btn("Export SARIF", "small", async (e) => {
     const b = e.currentTarget;
     b.disabled = true;
+    b.textContent = "Exporting…";
     try {
       await downloadAuthed(C.sarifUrl(info.mission), `${info.mission}.sarif.json`);
       toast("Downloaded SARIF report.");
@@ -2861,6 +2986,7 @@ function renderEvidence(panel) {
       notice(err.message);
     } finally {
       b.disabled = false;
+      b.textContent = "Export SARIF";
     }
   }) : null;
   if (sarifBtn) sarifBtn.dataset.focusKey = "evidence:sarif";
@@ -4450,10 +4576,14 @@ function renderInbox() {
   const groups = C.inboxGroups(S.inbox, rootTitle);
   for (const g of groups) g.root = rootId(g.mission);
   reconcileInbox($("inbox-list"), groups.flatMap(g => g.entries), "inbox", groups);
+  if (EMBEDDED_DESK) {
+    $("notif-state").textContent = "Notifications: managed in ferret-desk (menu bar & System Settings)";
+    $("notif-btn").hidden = true;
+    return;
+  }
   const granted = notificationsAvailable() && Notification.permission === "granted";
-  // When they are off, say why cleanly (also covering macOS WKWebView inside ferret-desk where Notification API is absent).
   const why = !notificationsAvailable()
-    ? "not available in this web view (desktop app notifications are managed in the menu bar and System Settings)"
+    ? "not available in this browser"
     : Notification.permission === "denied"
       ? "blocked in this browser's site settings"
       : "";
@@ -4545,16 +4675,18 @@ function renderPriorPicks() {
   const items = [el("span", "dim prior-picks-label", "Recent missions:")];
   for (const r of picks) {
     const active = current.has(r.mission);
-    const b = btn(`${r.mission} (${C.oneLine(r.title || r.id, 26)})`, "small" + (active ? " primary" : ""), () => {
+    const b = btn(`${r.mission} (${C.oneLine(r.title || r.id, 26)})`, "small", () => {
       const words = String($("f-prior").value || "").split(/[\s,]+/).filter(Boolean);
       const next = words.includes(r.mission) ? words.filter((w) => w !== r.mission) : [...words, r.mission];
       $("f-prior").value = next.join(" ");
       renderPriorPicks();
     });
+    b.setAttribute("aria-pressed", String(active));
+    b.dataset.focusKey = "prior:" + r.mission;
     b.title = `${r.mission}: ${r.title || r.id}`;
     items.push(b);
   }
-  box.replaceChildren(...items);
+  preserveFocus(box, () => box.replaceChildren(...items));
 }
 
 /** Fill the Pack select from S.packs, then the Role select; `packChanged` selects the pack's default role. */
@@ -4723,13 +4855,15 @@ function loadTab() {
 
 async function loadNoise() {
   const request = ++S.requests.noise;
+  S.noise.loading = true;
+  if (S.tab === "network") want("right");
   try {
     const data = await api("GET", "/api/network/noise");
     if (request !== S.requests.noise) return;
-    S.noise = { supported: true, data, error: null };
+    S.noise = { ...S.noise, supported: true, data, error: null, loading: false };
   } catch (e) {
     if (request !== S.requests.noise) return;
-    S.noise = { supported: e.status === 404 ? false : S.noise.supported, data: S.noise.data, error: e.status === 404 ? null : e.message };
+    S.noise = { ...S.noise, supported: e.status === 404 ? false : S.noise.supported, data: S.noise.data, error: e.status === 404 ? null : e.message, loading: false };
   }
   if (S.tab === "network") want("right");
 }
@@ -4937,16 +5071,19 @@ function noRepeat(button) {
 
 /** A question with two buttons, placed where the operator is looking. Focus lands on the question, and returns to `opener` when it closes. */
 function confirmRow(q, onYes, onNo, prefix = "") {
-  const box = el("div", "model-confirm");
+  const box = el("div", "model-confirm" + (q.danger ? " confirm-danger" : ""));
   box.setAttribute("role", "group");
   const text = el("p", "model-confirm-text", q.text);
   text.id = prefix.replace(/\W/g, "") + "ask-text";
   box.setAttribute("aria-labelledby", text.id);
-  const yes = btn(q.yes, "small primary", onYes);
+  const yes = btn(q.yes, q.danger ? "small danger" : "small primary", onYes);
   yes.dataset.focusKey = prefix + "ask:yes";
   noRepeat(yes);
   const no = btn(q.no, "small", onNo);
   no.dataset.focusKey = prefix + "ask:no";
+  box.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); onNo(); }
+  });
   add(box, text, add(el("span", "model-confirm-actions"), yes, no));
   return box;
 }
@@ -5045,7 +5182,8 @@ function renderModels(p, info) {
   }
   const refresh = btn("Refresh", "", () => loadModels());
   refresh.dataset.focusKey = "models:refresh";
-  const reload = btn("Reload profiles", "", reloadModelProfiles);
+  const reload = btn(S.reload.busy ? "Reloading…" : "Reload profiles", "", reloadModelProfiles);
+  reload.disabled = S.reload.busy;
   reload.dataset.focusKey = "models:reload";
   reload.title = "Re-read [models] from config.toml without restarting the daemon.";
   parts.push(
@@ -5421,10 +5559,13 @@ function scopeGrantForm() {
   const id = S.openId;
   if (S.scopeForm && S.scopeForm.session === id) return S.scopeForm;
   const box = el("div", "scope-grant");
+  const head = el("div", "scope-grant-head", "Grant hosts proactively");
   const hostsIn = ruleInput("Host(s) to grant, e.g. api.example.com");
   hostsIn.setAttribute("aria-label", "Hosts to grant");
+  hostsIn.dataset.focusKey = "scope:hosts";
   const noteIn = ruleInput("Reason (optional)");
   noteIn.setAttribute("aria-label", "Reason for host grant");
+  noteIn.dataset.focusKey = "scope:note";
   const noteEl = el("p", "rule-note dim");
   noteEl.setAttribute("role", "status");
   const grantBtn = btn("Grant hosts", "small", async () => {
@@ -5449,10 +5590,11 @@ function scopeGrantForm() {
       grantBtn.disabled = false;
     }
   });
+  grantBtn.dataset.focusKey = "scope:submit";
   for (const input of [hostsIn, noteIn]) {
     input.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.isComposing) { e.preventDefault(); grantBtn.click(); } });
   }
-  add(box, add(el("div", "rule-row"), hostsIn, noteIn, grantBtn), noteEl);
+  add(box, head, add(el("div", "rule-row"), hostsIn, noteIn, grantBtn), noteEl);
   S.scopeForm = { session: id, box };
   return S.scopeForm;
 }
@@ -5460,9 +5602,12 @@ function scopeGrantForm() {
 function noiseSection() {
   if (S.noise.supported !== true) return null;
   const d = el("details", "net-extra");
+  d.open = !!S.noise.open;
+  d.addEventListener("toggle", () => { S.noise.open = d.open; });
   const data = S.noise.data;
   const hosts = Array.isArray(data?.hosts) ? data.hosts : [];
   const head = el("summary", "", `Noise governor${data?.profile ? " · " + data.profile : ""}${hosts.length ? ` (${C.count(hosts.length, "host")})` : ""}`);
+  head.dataset.focusKey = "net:noise-summary";
   add(d, head);
   const inner = el("div", "net-extra-body");
   if (S.noise.error) inner.append(el("p", "error", S.noise.error));
@@ -5470,18 +5615,23 @@ function noiseSection() {
     inner.append(el("p", "dim field-note", `Profile: ${data.profile || "off"} · Assessment UA origins: ${C.num(data.assessment_ua_origins || 0)}`));
     if (hosts.length) {
       const t = el("table", "net");
+      const thead = el("thead");
       const htr = el("tr");
       add(htr, el("th", "", "Host"), el("th", "", "Sent"), el("th", "", "In-flight"), el("th", "", "Peak"), el("th", "", "Backoffs"));
-      t.append(htr);
+      thead.append(htr);
+      const tbody = el("tbody");
       for (const h of hosts) {
         const tr = el("tr");
         add(tr, el("td", "", h.host), el("td", "", C.num(h.sent)), el("td", "", C.num(h.inflight)), el("td", "", C.num(h.peak_inflight)), el("td", "", C.num(h.backoffs)));
-        t.append(tr);
+        tbody.append(tr);
       }
-      inner.append(t);
+      t.append(thead, tbody);
+      inner.append(add(el("div", "net-table-wrap"), t));
     } else inner.append(el("p", "dim field-note", "No per-host traffic recorded yet."));
   }
-  const ref = btn("Refresh noise status", "small", loadNoise);
+  const ref = btn(S.noise.loading ? "Refreshing…" : "Refresh noise status", "small", loadNoise);
+  ref.disabled = !!S.noise.loading;
+  ref.dataset.focusKey = "net:noise-refresh";
   inner.append(ref);
   d.append(inner);
   return d;
@@ -5491,39 +5641,55 @@ function rewriteSection() {
   if (S.rewrites.supported !== true) return null;
   const R = S.rewrites;
   const d = el("details", "net-extra");
-  if (R.editing || R.askDelete) d.open = true;
+  d.open = !!(R.open || R.editing || R.askDelete);
+  d.addEventListener("toggle", () => { R.open = d.open; });
   const enabledCount = R.list.filter((r) => r.enabled).length;
-  add(d, el("summary", "", `Proxy rewrite rules (${C.num(R.list.length)}${enabledCount ? `, ${enabledCount} enabled` : ""})`));
+  const sum = el("summary", "", `Proxy rewrite rules (${C.num(R.list.length)}${enabledCount ? `, ${enabledCount} enabled` : ""})`);
+  sum.dataset.focusKey = "net:rw-summary";
+  add(d, sum);
   const inner = el("div", "net-extra-body");
+  inner.append(el("p", "dim field-note", "Daemon-wide: rules apply to all intercepted proxy traffic across sessions."));
   if (R.error) inner.append(el("p", "error", R.error));
   const topRow = el("div", "net-actions");
   const addBtn = btn("Add rule", "small", () => {
+    R.open = true;
     R.editing = { id: 0, name: "", phase: "request", priority: 0, host: "", methods: "", url_regex: "", status: "", actionType: "set_header", headerName: "", regex: "", value: "", sensitive: false, note: "", enabled: false };
     R.formError = null;
-    want("right");
+    renderRewritesSlot();
+    requestAnimationFrame(() => focusKey("rw-form:name"));
   });
   addBtn.disabled = R.busy;
+  addBtn.dataset.focusKey = "net:rw-add";
   const refBtn = btn("Refresh", "small", loadRewriteRules);
+  refBtn.dataset.focusKey = "net:rw-refresh";
   add(topRow, addBtn, refBtn);
   inner.append(topRow);
   if (R.editing) {
     const f = el("form", "rewrite-form");
     const ed = R.editing;
+    const validActions = C.rewriteActionsForPhase(ed.phase);
+    if (!validActions.some(([v]) => v === ed.actionType)) ed.actionType = validActions[0][0];
     const inp = (label, key, placeholder = "", type = "text") => {
       const i = el("input");
       i.type = type;
       i.placeholder = placeholder;
       i.value = ed[key] ?? "";
+      i.dataset.focusKey = "rw-form:" + key;
       i.addEventListener("input", () => { ed[key] = i.value; });
       const l = el("label", "", label);
       l.append(i);
       return l;
     };
-    const sel = (label, key, opts) => {
+    const sel = (label, key, opts, onChangeExtra = null) => {
       const s = el("select");
+      s.dataset.focusKey = "rw-form:" + key;
       for (const [v, t] of opts) s.append(new Option(t, v));
       s.value = ed[key];
-      s.addEventListener("change", () => { ed[key] = s.value; want("right"); });
+      s.addEventListener("change", () => {
+        ed[key] = s.value;
+        if (onChangeExtra) onChangeExtra();
+        renderRewritesSlot();
+      });
       const l = el("label", "", label);
       l.append(s);
       return l;
@@ -5531,7 +5697,11 @@ function rewriteSection() {
     add(f,
       inp("Name", "name", "e.g. inject-staging-header"),
       add(el("div", "form-row"),
-        sel("Phase", "phase", [["request", "Request"], ["response", "Response"]]),
+        sel("Phase", "phase", [["request", "Request"], ["response", "Response"]], () => {
+          if (ed.phase !== "response") ed.status = "";
+          const allowed = C.rewriteActionsForPhase(ed.phase);
+          if (!allowed.some(([v]) => v === ed.actionType)) ed.actionType = allowed[0][0];
+        }),
         inp("Priority", "priority", "0", "number"),
       ),
       inp("Host matcher (optional)", "host", "example.com or *.example.com"),
@@ -5540,17 +5710,7 @@ function rewriteSection() {
         inp("URL regex (optional)", "url_regex", "/api/.*"),
       ),
       ed.phase === "response" ? inp("Status matcher (optional)", "status", "200 4xx") : null,
-      sel("Action", "actionType", [
-        ["set_header", "Set header"],
-        ["delete_header", "Delete header"],
-        ["replace_header", "Replace header (regex)"],
-        ["set_method", "Set method"],
-        ["set_path_query", "Set path/query"],
-        ["replace_url", "Replace URL (regex)"],
-        ["set_body", "Set body"],
-        ["replace_body", "Replace body (regex)"],
-        ["set_status", "Set status"],
-      ]),
+      sel("Action", "actionType", validActions),
     );
     if (["set_header", "delete_header", "replace_header"].includes(ed.actionType)) {
       f.append(inp("Header name", "headerName", "X-Custom-Header"));
@@ -5568,7 +5728,8 @@ function rewriteSection() {
       const cb = el("input");
       cb.type = "checkbox";
       cb.checked = !!ed.sensitive;
-      cb.addEventListener("change", () => { ed.sensitive = cb.checked; want("right"); });
+      cb.dataset.focusKey = "rw-form:sensitive";
+      cb.addEventListener("change", () => { ed.sensitive = cb.checked; renderRewritesSlot(); });
       f.append(add(el("label", "check"), cb, document.createTextNode(" Sensitive value (redacted on read)")));
     }
     f.append(inp("Note (optional)", "note", "Why this rule exists"));
@@ -5576,15 +5737,20 @@ function rewriteSection() {
     const saveBtn = btn(R.busy ? "Saving…" : ed.id ? "Update rule" : "Create rule (disabled)", "small primary", () => {});
     saveBtn.type = "submit";
     saveBtn.disabled = R.busy;
-    const cancelBtn = btn("Cancel", "small", () => { R.editing = null; R.formError = null; want("right"); });
+    saveBtn.dataset.focusKey = "rw-form:save";
+    const cancelBtn = btn("Cancel", "small", () => { R.editing = null; R.formError = null; renderRewritesSlot(); requestAnimationFrame(() => focusKey("net:rw-add")); });
+    cancelBtn.dataset.focusKey = "rw-form:cancel";
     f.append(add(el("div", "net-actions"), saveBtn, cancelBtn));
+    f.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); cancelBtn.click(); }
+    });
     f.addEventListener("submit", async (e) => {
       e.preventDefault();
       const built = C.buildRewriteRule(ed);
-      if (built.error) { R.formError = built.error; want("right"); return; }
+      if (built.error) { R.formError = built.error; renderRewritesSlot(); return; }
       R.busy = true;
       R.formError = null;
-      want("right");
+      renderRewritesSlot();
       try {
         if (ed.id) {
           await api("PUT", "/api/traffic/rewrite-rules/" + ed.id, built.rule);
@@ -5599,7 +5765,7 @@ function rewriteSection() {
         R.formError = err.message;
       } finally {
         R.busy = false;
-        want("right");
+        renderRewritesSlot();
       }
     });
     inner.append(f);
@@ -5611,15 +5777,27 @@ function rewriteSection() {
     for (const rule of R.list) {
       const item = el("li", "rewrite-item");
       const head = el("div", "rewrite-head");
-      const toggle = btn(rule.enabled ? "Disable" : "Enable", "small", async () => {
+      const toggling = R.toggling.has(rule.id);
+      const toggle = btn(toggling ? "Updating…" : (rule.enabled ? "Disable" : "Enable"), "small", async () => {
+        if (R.toggling.has(rule.id)) return;
+        R.open = true;
+        R.toggling.add(rule.id);
+        renderRewritesSlot();
         try {
           await api("POST", `/api/traffic/rewrite-rules/${rule.id}/toggle`, { enabled: !rule.enabled });
           await loadRewriteRules();
         } catch (err) { notice(err.message); }
+        finally {
+          R.toggling.delete(rule.id);
+          renderRewritesSlot();
+        }
       });
+      toggle.disabled = toggling;
+      toggle.dataset.focusKey = "rw-toggle:" + rule.id;
       const multiAction = Array.isArray(rule.actions) && rule.actions.length > 1;
       const edit = btn("Edit", "small", () => {
         if (multiAction) return;
+        R.open = true;
         const a0 = (rule.actions && rule.actions[0]) || { type: "set_header" };
         const m = rule.matchers || {};
         const extraMatchers = {};
@@ -5639,28 +5817,32 @@ function rewriteSection() {
           note: rule.note || "",
         };
         R.formError = null;
-        want("right");
+        renderRewritesSlot();
+        requestAnimationFrame(() => focusKey("rw-form:name"));
       });
+      edit.dataset.focusKey = "rw-edit:" + rule.id;
       if (multiAction) {
         edit.disabled = true;
         edit.title = "Multi-action rule — edit via the CLI so all actions are preserved.";
       }
-      const del = btn("Delete", "small danger", () => { R.askDelete = rule.id; want("right"); });
+      const del = btn("Delete", "small danger", () => { R.open = true; R.askDelete = rule.id; R.askDeleteFocus = true; renderRewritesSlot(); });
+      del.dataset.focusKey = "rw-del:" + rule.id;
       add(head, el("strong", "", rule.name || `#${rule.id}`), chip(rule.enabled ? "enabled" : "disabled", rule.enabled ? "ok" : "dim"), toggle, edit, del);
       item.append(head, el("div", "dim mono rewrite-summary", C.rewriteRuleSummary(rule)));
       if (rule.note) item.append(el("div", "dim field-note", rule.note));
       if (R.askDelete === rule.id) {
         item.append(confirmRow(
-          { text: `Delete rewrite rule "${rule.name}"?`, yes: "Delete", no: "Keep" },
+          { text: `Delete rewrite rule "${rule.name}"?`, yes: "Delete", no: "Keep", danger: true },
           async () => {
             R.askDelete = null;
+            R.askDeleteFocus = false;
             try {
               await api("DELETE", `/api/traffic/rewrite-rules/${rule.id}`);
               toast(`Deleted rewrite rule "${rule.name}".`);
               await loadRewriteRules();
             } catch (err) { notice(err.message); }
           },
-          () => { R.askDelete = null; want("right"); },
+          () => { R.askDelete = null; R.askDeleteFocus = false; renderRewritesSlot(); requestAnimationFrame(() => focusKey("rw-del:" + rule.id)); },
           `rw:${rule.id}:`,
         ));
       }
@@ -5672,16 +5854,42 @@ function rewriteSection() {
   return d;
 }
 
+function renderRewritesSlot() {
+  const slot = $("panel")?.querySelector(".net-rewrites-slot");
+  if (!slot) { want("right"); return; }
+  const rewrites = rewriteSection();
+  preserveFocus(slot, () => slot.replaceChildren(...(rewrites ? [rewrites] : [])));
+  if (S.rewrites.askDelete && S.rewrites.askDeleteFocus) {
+    S.rewrites.askDeleteFocus = false;
+    const safe = slot.querySelector(`[data-focus-key="rw:${S.rewrites.askDelete}:ask:no"]`);
+    if (safe) safe.focus({ preventScroll: true });
+  }
+}
+
 function renderNetwork(p) {
   const sel = getSelection();
   if (sel && !sel.isCollapsed && sel.rangeCount && p.contains(sel.getRangeAt(0).commonAncestorContainer)) return;
-  const active = document.activeElement;
-  if (S.scopeForm && S.scopeForm.box.contains(active) && active.tagName === "INPUT") return;
-  // A failed load (a damaged audit log among them) stays in view next to the decisions that arrive live.
-  const error = S.netError ? [el("p", "error", S.netError)] : [];
+  const form = scopeGrantForm();
+  // Keep persistent slot containers so updating Hosts granted or live decisions never steals focus from scope or rewrite forms.
+  let grantedSlot = p.querySelector(".net-granted-slot");
+  let decisionsSlot = p.querySelector(".net-decisions-slot");
+  let requestsSlot = p.querySelector(".net-requests-slot");
+  let noiseSlot = p.querySelector(".net-noise-slot");
+  let rewritesSlot = p.querySelector(".net-rewrites-slot");
+  if (!grantedSlot || !decisionsSlot || !requestsSlot || !noiseSlot || !rewritesSlot || form.box.parentNode !== p) {
+    grantedSlot = el("div", "net-granted-slot");
+    decisionsSlot = el("div", "net-decisions-slot");
+    requestsSlot = el("div", "net-requests-slot");
+    noiseSlot = el("div", "net-noise-slot");
+    rewritesSlot = el("div", "net-rewrites-slot");
+    p.replaceChildren(grantedSlot, form.box, decisionsSlot, requestsSlot, noiseSlot, rewritesSlot);
+  }
   const granted = S.ledger.model ? [el("p", "dim", C.scopeLine(S.ledger.model))] : [];
-  const parts = [...granted, scopeGrantForm().box];
-  if (S.net.length === 0) parts.push(...(error.length ? error : [el("p", "dim", "No network decisions recorded for this session.")]));
+  grantedSlot.replaceChildren(...granted);
+
+  const error = S.netError ? [el("p", "error", S.netError)] : [];
+  const decisionNodes = [];
+  if (S.net.length === 0) decisionNodes.push(...(error.length ? error : [el("p", "dim", "No network decisions recorded for this session.")]));
   else {
     const t = el("table", "net");
     for (const e of S.net.slice(-500).reverse().map(C.netRow)) {
@@ -5689,14 +5897,27 @@ function renderNetwork(p) {
       add(tr, el("td", "", clock(e.ts)), el("td", "", e.verdict), el("td", "", e.method), el("td", "", e.target), el("td", "", e.rule));
       t.append(tr);
     }
-    parts.push(...error, t);
+    decisionNodes.push(...error, add(el("div", "net-table-wrap"), t));
   }
-  parts.push(requestsSection());
+  decisionsSlot.replaceChildren(...decisionNodes);
+
+  preserveFocus(requestsSlot, () => requestsSlot.replaceChildren(requestsSection()));
+
   const noise = noiseSection();
-  if (noise) parts.push(noise);
-  const rewrites = rewriteSection();
-  if (rewrites) parts.push(rewrites);
-  preserveFocus(p, () => p.replaceChildren(...parts));
+  preserveFocus(noiseSlot, () => noiseSlot.replaceChildren(...(noise ? [noise] : [])));
+
+  // Skip rebuilding the rewrite form on background net events while the operator is actively typing inside it.
+  const active = document.activeElement;
+  const typingRewrite = !!(S.rewrites.editing && active && rewritesSlot.contains(active) && active.closest?.(".rewrite-form"));
+  if (!typingRewrite) {
+    const rewrites = rewriteSection();
+    preserveFocus(rewritesSlot, () => rewritesSlot.replaceChildren(...(rewrites ? [rewrites] : [])));
+    if (S.rewrites.askDelete && S.rewrites.askDeleteFocus) {
+      S.rewrites.askDeleteFocus = false;
+      const safe = rewritesSlot.querySelector(`[data-focus-key="rw:${S.rewrites.askDelete}:ask:no"]`);
+      if (safe) safe.focus({ preventScroll: true });
+    }
+  }
 }
 
 /** The session's captured requests under its decisions: filterable by host and status, newest first (U2), with HAR export/import. */
@@ -5714,7 +5935,9 @@ function requestsSection() {
     harFile.addEventListener("change", async () => {
       const file = harFile.files && harFile.files[0];
       harFile.value = "";
-      if (!file) return;
+      if (!file || S.harBusy.importing) return;
+      S.harBusy.importing = true;
+      want("right");
       try {
         const r = await fetch(`/api/missions/${encodeURIComponent(info.mission)}/har`, {
           method: "POST",
@@ -5730,11 +5953,16 @@ function requestsSection() {
         loadExchanges();
       } catch (e) {
         notice(e.message);
+      } finally {
+        S.harBusy.importing = false;
+        want("right");
       }
     });
-    const exportHar = btn("Export HAR", "small", async (e) => {
-      const b = e.currentTarget;
-      b.disabled = true;
+    const activeHost = S.exFilter.host !== "all" ? S.exFilter.host : "";
+    const exportHar = btn(S.harBusy.exporting ? "Exporting…" : activeHost ? "Export HAR (filtered)" : "Export HAR", "small", async () => {
+      if (S.harBusy.exporting) return;
+      S.harBusy.exporting = true;
+      want("right");
       try {
         const host = S.exFilter.host !== "all" ? S.exFilter.host : "";
         await downloadAuthed(C.harUrl(info.mission, { host }), `${info.mission}${host ? "-" + host : ""}.har`);
@@ -5742,11 +5970,15 @@ function requestsSection() {
       } catch (err) {
         notice(err.message);
       } finally {
-        b.disabled = false;
+        S.harBusy.exporting = false;
+        want("right");
       }
     });
+    exportHar.disabled = S.harBusy.exporting;
+    exportHar.title = activeHost ? `Export HAR filtered to host ${activeHost}` : "Export all captured requests as HAR 1.2";
     exportHar.dataset.focusKey = "net:export-har";
-    const importHar = btn("Import HAR…", "small", () => harFile.click());
+    const importHar = btn(S.harBusy.importing ? "Importing…" : "Import HAR…", "small", () => harFile.click());
+    importHar.disabled = S.harBusy.importing;
     importHar.dataset.focusKey = "net:import-har";
     add(head, add(el("div", "net-actions"), exportHar, importHar, harFile));
   }
@@ -6266,12 +6498,24 @@ function renderChips(c) {
   const box = $(c.chips);
   box.replaceChildren();
   box.hidden = !list.length;
+  let needsVisionNote = false;
   for (const a of list) {
     const chip = el("li", "attach-chip " + a.state);
     add(chip, a.file && a.state !== "failed" && C.isImageFile(a.file) ? chipThumb(a.file, a.name) : icon(a.state === "failed" ? "alert" : "source"), el("span", "attach-name", a.name));
     if (a.state === "uploading") add(chip, el("span", "attach-size", "Uploading…"));
-    else if (a.state === "failed") add(chip, el("span", "attach-error", a.error));
-    else add(chip, el("span", "attach-size", C.byteSize(a.size)));
+    else if (a.state === "failed") {
+      add(chip, el("span", "attach-error", a.error));
+      if (a.file) {
+        const retry = btn("Retry", "small attach-retry", () => {
+          a.state = "uploading";
+          a.error = "";
+          renderChips(c);
+          uploadOne(c, key, a, a.file);
+        });
+        retry.setAttribute("aria-label", "Retry uploading " + a.name);
+        add(chip, retry);
+      }
+    } else add(chip, el("span", "attach-size", C.byteSize(a.size)));
     const x = btn("×", "attach-x", () => {
       attachments.set(key, attachList(key).filter(o => o !== a));
       if (!attachList(key).length) attachments.delete(key);
@@ -6282,13 +6526,11 @@ function renderChips(c) {
     add(chip, x);
     if (a.state === "failed") chip.setAttribute("role", "alert");
     add(box, chip);
-    if (a.state !== "failed" && a.file && C.isImageFile(a.file) && c.key() && c.key() !== "new" && visionOff()) {
-      const note = el("li", "attach-note dim", C.NO_VISION_NOTE);
-      add(box, note);
-    } else if (a.state !== "failed" && a.file && C.isImageFile(a.file) && c.key() === "new" && newVisionOff()) {
-      add(box, el("li", "attach-note dim", C.NO_VISION_NOTE));
+    if (a.state !== "failed" && a.file && C.isImageFile(a.file)) {
+      if ((c.key() && c.key() !== "new" && visionOff()) || (c.key() === "new" && newVisionOff())) needsVisionNote = true;
     }
   }
+  if (needsVisionNote) add(box, el("li", "attach-note dim", C.NO_VISION_NOTE));
   c.changed();
 }
 
@@ -6304,7 +6546,7 @@ function addFiles(c, files) {
   const list = attachList(key);
   attachments.set(key, list);
   for (const file of files) {
-    const a = { id: ++attachSeq, name: file.name || "pasted-file", size: file.size, state: "uploading", path: "", error: "", ws, file };
+    const a = { id: ++attachSeq, name: C.attachmentName(file), size: file.size, state: "uploading", path: "", error: "", ws, file };
     list.push(a);
     uploadOne(c, key, a, file);
   }
@@ -6334,31 +6576,52 @@ async function uploadOne(c, key, a, file) {
   if (attachList(key).includes(a) && c.key() === key) renderChips(c);
 }
 
+let windowDropGuardWired = false;
 /** Wire one attach button, file input, drop zones and paste target to a context. */
 function wireAttach(c, { button, input, drops, paste, canDrop = () => true }) {
   $(button).addEventListener("click", () => $(input).click());
   $(input).addEventListener("change", () => { addFiles(c, [...$(input).files]); $(input).value = ""; });
   const hasFiles = (e) => e.dataTransfer && [...(e.dataTransfer.types || [])].includes("Files");
+  if (!windowDropGuardWired) {
+    windowDropGuardWired = true;
+    // Prevent accidental file drops outside the composer from navigating WKWebView / browser tab.
+    window.addEventListener("dragover", (e) => { if (hasFiles(e)) e.preventDefault(); });
+    window.addEventListener("drop", (e) => { if (hasFiles(e)) e.preventDefault(); });
+  }
   for (const id of drops) {
     const zone = $(id);
+    let depth = 0;
+    const clearDrop = () => { depth = 0; zone.classList.remove("drop-on"); };
+    window.addEventListener("dragend", clearDrop);
+    window.addEventListener("drop", clearDrop);
+    zone.addEventListener("dragenter", (e) => {
+      if (!hasFiles(e) || !canDrop()) return;
+      e.preventDefault();
+      depth++;
+      zone.classList.add("drop-on");
+    });
     zone.addEventListener("dragover", (e) => {
       if (!hasFiles(e) || !canDrop()) return;
       e.preventDefault();
       e.dataTransfer.dropEffect = "copy";
       zone.classList.add("drop-on");
     });
-    zone.addEventListener("dragleave", (e) => { if (!zone.contains(e.relatedTarget)) zone.classList.remove("drop-on"); });
+    zone.addEventListener("dragleave", () => {
+      depth = Math.max(0, depth - 1);
+      if (depth === 0) zone.classList.remove("drop-on");
+    });
     zone.addEventListener("drop", (e) => {
-      zone.classList.remove("drop-on");
+      clearDrop();
       if (!hasFiles(e) || !canDrop()) return;
       e.preventDefault();
+      e.stopPropagation();
       addFiles(c, [...e.dataTransfer.files]);
     });
   }
   $(paste).addEventListener("paste", (e) => {
     const files = [...((e.clipboardData && e.clipboardData.files) || [])];
-    // Text that arrives with a file (a copied cell also brings its picture) pastes as text.
-    if (!files.length || (e.clipboardData.getData("text/plain") || "") !== "") return;
+    const plain = (e.clipboardData && e.clipboardData.getData("text/plain")) || "";
+    if (!C.shouldPasteFiles(files, plain)) return;
     e.preventDefault();
     addFiles(c, files);
   });
@@ -6652,8 +6915,10 @@ function growMsg() {
   const key = msg.value + "|" + msg.clientWidth;
   if (msg.dataset.grown === key || msg.hidden) return;
   msg.dataset.grown = key;
+  const prevScroll = msg.scrollTop;
   msg.style.setProperty("height", "auto");
   msg.style.setProperty("height", msg.scrollHeight + "px");
+  if (prevScroll > 0) msg.scrollTop = prevScroll;
 }
 function cancelSeat() {
   if (!S.seat || S.seatBusy.has(S.seat.session)) return;
@@ -6859,51 +7124,87 @@ function openSwitcher() {
 function renderSwitcher() {
   const q = $("switcher-q").value;
   S.now = Date.now();
-  SW.rows = C.switcherRows(S.sessions, S.inbox, q, { now: S.now, activity: S.activity, since: S.connectedSince, showArchived: S.showArchived });
-  SW.active = Math.max(0, Math.min(SW.active, Math.min(SW.rows.length, SW_SHOWN) - 1));
+  const sessions = C.switcherRows(S.sessions, S.inbox, q, { now: S.now, activity: S.activity, since: S.connectedSince, showArchived: S.showArchived });
+  const actions = C.switcherActions(q, { targetsSupported: S.targets.supported === true, inSession: S.view === "session" });
+  const shownSessions = sessions.slice(0, SW_SHOWN);
+  SW.rows = [
+    ...shownSessions.map((row) => ({ kind: "session", row })),
+    ...actions.map((action) => ({ kind: "action", action })),
+  ];
+  SW.active = Math.max(0, Math.min(SW.active, SW.rows.length - 1));
   const list = $("switcher-list");
   const frag = document.createDocumentFragment();
-  SW.rows.slice(0, SW_SHOWN).forEach((row, i) => {
+  let actionSepShown = false;
+  SW.rows.forEach((entry, i) => {
+    if (entry.kind === "action" && !actionSepShown) {
+      actionSepShown = true;
+      const sep = el("li", "sw-sep", "Actions");
+      sep.setAttribute("role", "presentation");
+      frag.append(sep);
+    }
     const li = el("li", "sw-row" + (i === SW.active ? " active" : ""));
     li.id = "sw-" + i;
     li.setAttribute("role", "option");
     li.setAttribute("aria-selected", String(i === SW.active));
-    const m = add(el("span", "mark mark-" + (row.mark.tone || "dim")), icon(row.mark.icon), el("span", "sr-only", row.mark.words + ": "));
-    const main = add(el("span", "sw-main"),
-      add(el("span", "sw-line"), el("span", "sw-name", row.title), row.root ? null : el("span", "sw-kind dim", "agent")),
-      el("span", "sw-ident mono dim", row.identity.text));
-    if (row.reason) {
-      const why = add(el("span", "sw-reason tone-" + (row.reason.tone || "quiet")), icon(row.reason.icon), el("span", "", row.reason.text));
-      if (row.reason.tip) why.title = row.reason.tip;
-      main.append(why);
+    if (entry.kind === "session") {
+      const row = entry.row;
+      const m = add(el("span", "mark mark-" + (row.mark.tone || "dim")), icon(row.mark.icon), el("span", "sr-only", row.mark.words + ": "));
+      const main = add(el("span", "sw-main"),
+        add(el("span", "sw-line"), el("span", "sw-name", row.title), row.root ? null : el("span", "sw-kind dim", "agent")),
+        el("span", "sw-ident mono dim", row.identity.text));
+      if (row.reason) {
+        const why = add(el("span", "sw-reason tone-" + (row.reason.tone || "quiet")), icon(row.reason.icon), el("span", "", row.reason.text));
+        if (row.reason.tip) why.title = row.reason.tip;
+        main.append(why);
+      }
+      add(li, m, main);
+    } else {
+      const act = entry.action;
+      const m = add(el("span", "mark mark-info"), icon("chevron"));
+      const main = add(el("span", "sw-main"),
+        add(el("span", "sw-line"), el("span", "sw-name", act.title), el("span", "sw-kind dim", "action")),
+        el("span", "sw-ident dim", act.detail));
+      add(li, m, main);
     }
-    add(li, m, main);
     li.addEventListener("click", () => chooseSwitcher(i));
     frag.append(li);
   });
   list.replaceChildren(frag);
   const input = $("switcher-q");
   if (SW.rows.length) input.setAttribute("aria-activedescendant", "sw-" + SW.active); else input.removeAttribute("aria-activedescendant");
-  const more = SW.rows.length > SW_SHOWN ? `, first ${SW_SHOWN} shown: type to narrow` : "";
+  const more = sessions.length > SW_SHOWN ? `, first ${SW_SHOWN} shown: type to narrow` : "";
+  const counts = [];
+  if (sessions.length) counts.push(C.count(sessions.length, "session"));
+  if (actions.length) counts.push(C.count(actions.length, "action"));
   $("switcher-status").textContent = SW.rows.length
-    ? `${C.count(SW.rows.length, "session")}${q.trim() ? (SW.rows.length === 1 ? " matches" : " match") : ""}${more}`
-    : `No session matches "${q.trim()}"`;
+    ? `${counts.join(" · ")}${q.trim() ? " match" : ""}${more}`
+    : `No session or action matches "${q.trim()}"`;
   list.querySelector(".active")?.scrollIntoView({ block: "nearest" });
 }
 
 function moveSwitcher(delta) {
-  const n = Math.min(SW.rows.length, SW_SHOWN);
+  const n = SW.rows.length;
   if (!n) return;
   SW.active = (SW.active + delta + n) % n;
   renderSwitcher();
 }
 
 function chooseSwitcher(i = SW.active) {
-  const row = SW.rows[i];
-  if (!row) return;
+  const entry = SW.rows[i];
+  if (!entry) return;
   SW.chose = true;
   $("switcher").close();
-  const hash = C.sessionHash(row.id);
+  if (entry.kind === "action") {
+    const id = entry.action.id;
+    if (id === "new-mission") { if (location.hash === "#/new") route(); else location.hash = "#/new"; }
+    else if (id === "inbox") { if (location.hash === "#/inbox") route(); else location.hash = "#/inbox"; }
+    else if (id === "targets") { location.hash = C.targetHash(""); }
+    else if (id === "daemon-status") { openDaemonStatus(SW.opener); }
+    else if (id === "toggle-inspector") { setDrawer("left", false); setDrawer("right", !document.body.classList.contains("show-right")); }
+    else if (id === "keys") { openKeys(); }
+    return;
+  }
+  const hash = C.sessionHash(entry.row.id);
   if (location.hash === hash) route(); else location.hash = hash;
   // The record is on screen now: focus lands on its selected tab, so the keyboard goes on from there.
   setTimeout(() => document.querySelector('#mission-tabs [aria-selected="true"]')?.focus({ preventScroll: true }), 60);
@@ -6965,6 +7266,8 @@ function stepNeeds(dir) {
 
 function keyboard(e) {
   if (e.defaultPrevented) return; // a widget that handled the key itself (the agent rows) keeps it
+  const authEl = $("auth-overlay");
+  if (authEl && !authEl.hidden) return;
   const action = C.shortcutFor(e, { typing: C.typingTarget(e.target), mac: MAC });
   if (!action) return;
   const modal = document.querySelector("dialog[open]");
@@ -7801,17 +8104,30 @@ function wire() {
   });
   $("connection-wrap").addEventListener("click", (e) => openDaemonStatus(e.currentTarget));
   $("daemon-status-close").addEventListener("click", closeDaemonStatus);
-  $("daemon-status-refresh").addEventListener("click", () => { loadStatus(); loadProfiles(); });
+  $("daemon-status-refresh").addEventListener("click", refreshDaemonStatus);
   $("daemon-status").addEventListener("click", (e) => { if (e.target === $("daemon-status")) closeDaemonStatus(); });
+  $("daemon-status").addEventListener("cancel", (e) => {
+    if (S.gc.confirmApply) {
+      e.preventDefault();
+      S.gc.confirmApply = false;
+      S.gc.focusConfirm = false;
+      renderDaemonStatus();
+      requestAnimationFrame(() => focusKey("daemon:gc-run"));
+    }
+  });
   $("daemon-status").addEventListener("close", () => {
+    S.gc.confirmApply = false;
+    S.gc.focusConfirm = false;
     const o = statusOpener;
     statusOpener = null;
     if (o && document.contains(o)) o.focus({ preventScroll: true });
   });
   $("offline-reconnect").addEventListener("click", reconnectNow);
   $("btn-target-new").addEventListener("click", () => {
-    S.targetNew = S.targetNew ? null : { name: "", scope: "", exclude: "", upstream_insecure: "", intercept_passthrough: "", notes: "", busy: false, error: null };
+    const opening = !S.targetNew;
+    S.targetNew = opening ? { name: "", scope: "", exclude: "", upstream_insecure: "", intercept_passthrough: "", notes: "", busy: false, error: null } : null;
     renderTargets();
+    if (opening) requestAnimationFrame(() => focusKey("tn:name"));
   });
   $("agent-go-lead").addEventListener("click", () => {
     const id = $("agent-go-lead").dataset.lead;
@@ -7832,6 +8148,7 @@ function wire() {
   $("model-seat").addEventListener("change", (e) => {
     const info = S.sessions.byId.get(S.openId);
     if (!info) return;
+    hideComposerStopConfirm();
     const current = C.currentModel(S.rec, info);
     S.seatNote.delete(info.id);
     S.seat = e.target.value && e.target.value !== (current && current.profile) ? { session: info.id, profile: e.target.value } : null;
@@ -7874,7 +8191,7 @@ function wire() {
   $("imgview").addEventListener("close", () => { const o = imageOpener; imageOpener = null; if (o && document.contains(o)) o.focus({ preventScroll: true }); $("imgview-img").removeAttribute("src"); });
   $("imgview").addEventListener("click", (e) => { if (e.target === $("imgview")) closeImage(); });
   wireAttach(attachCtx.composer, {
-    button: "attach-btn", input: "attach-file", drops: ["composer", "scroller"], paste: "msg",
+    button: "attach-btn", input: "attach-file", drops: ["view-session"], paste: "msg",
     canDrop: () => !$("attach-btn").hidden && !$("msg").disabled,
   });
   wireAttach(attachCtx.start, { button: "f-attach", input: "f-file", drops: ["new-form"], paste: "f-message", canDrop: () => !$("f-attach").disabled });
@@ -8025,14 +8342,48 @@ $("picker").addEventListener("keydown", pickerEmptyKeys);
     window.addEventListener("pointercancel", done);
   });
   document.addEventListener("keydown", (e) => {
+    const authEl = $("auth-overlay");
+    if (authEl && !authEl.hidden) return;
     if (document.querySelector("dialog[open]")) return;
     const side = matchMedia("(max-width: 1099px)").matches && document.body.classList.contains("show-right") ? "right"
       : matchMedia("(max-width: 699px)").matches && document.body.classList.contains("show-left") ? "left" : null;
-    if (e.key === "Escape" && side) { e.preventDefault(); setDrawer(side, false); return; }
-    if (e.key === "Escape" && !side && !e.defaultPrevented && S.view === "session") {
-      if (!$("composer-stop-confirm").hidden) { e.preventDefault(); cancelComposerStopConfirm(); return; }
-      if (!$("shead-confirm").hidden) { e.preventDefault(); cancelHeadConfirm(); return; }
-      if (!$("find-bar").hidden) { e.preventDefault(); closeFind(); return; }
+    if (e.key === "Escape" && !e.defaultPrevented) {
+      if (side === "left") { e.preventDefault(); setDrawer("left", false); return; }
+      const dismissRightInline = () => {
+        if (S.view !== "session") return false;
+        if (S.ask) {
+          const opener = S.ask.kind === "compact" ? "ask:fold" : S.ask.kind === "lead" ? "ask:lead" : "ask:role:" + S.ask.role;
+          e.preventDefault(); askClose(opener); return true;
+        }
+        if (S.tab === "network" && S.rewrites.askDelete) {
+          const id = S.rewrites.askDelete;
+          e.preventDefault(); S.rewrites.askDelete = null; S.rewrites.askDeleteFocus = false; renderRewritesSlot();
+          requestAnimationFrame(() => focusKey("rw-del:" + id)); return true;
+        }
+        if (S.tab === "network" && S.rewrites.editing) {
+          e.preventDefault(); S.rewrites.editing = null; S.rewrites.formError = null; renderRewritesSlot();
+          requestAnimationFrame(() => focusKey("net:rw-add")); return true;
+        }
+        return false;
+      };
+      if (side === "right") {
+        if (!dismissRightInline()) { e.preventDefault(); setDrawer("right", false); }
+        return;
+      }
+      if (S.view === "session") {
+        const rightShown = document.body.classList.contains("show-right");
+        if (rightShown && $("right").contains(document.activeElement) && dismissRightInline()) return;
+        if (!$("composer-stop-confirm").hidden) { e.preventDefault(); cancelComposerStopConfirm(); return; }
+        if (S.seat && !S.seatBusy.has(S.seat.session)) { e.preventDefault(); cancelSeat(); return; }
+        if (!$("shead-confirm").hidden) { e.preventDefault(); cancelHeadConfirm(); return; }
+        if (rightShown && dismissRightInline()) return;
+        if (!$("find-bar").hidden) { e.preventDefault(); closeFind(); return; }
+      } else if (S.view === "targets" && S.targetNew) {
+        e.preventDefault(); S.targetNew = null; renderTargets(); $("btn-target-new")?.focus({ preventScroll: true }); return;
+      } else if (S.view === "target" && S.tp) {
+        if (S.tp.creds.ask) { e.preventDefault(); S.tp.creds.ask = null; renderTargetPage(); return; }
+        if (S.tp.edit) { e.preventDefault(); S.tp.edit = null; renderTargetPage(); return; }
+      }
     }
     if (e.key === "Tab" && side) {
       const focusable = [...$(side).querySelectorAll("button:not([disabled]):not([tabindex='-1']), a:not([tabindex='-1']), input:not([disabled]):not([tabindex='-1']), textarea:not([disabled]):not([tabindex='-1']), select:not([disabled]):not([tabindex='-1']), summary:not([tabindex='-1']), [tabindex='0']")].filter(n => n.getClientRects().length);
@@ -8281,6 +8632,7 @@ function renderTargets() {
   if (newBtn) {
     newBtn.hidden = S.targets.supported !== true;
     newBtn.textContent = S.targetNew ? "Cancel" : "New target";
+    newBtn.classList.toggle("primary", !S.targetNew);
   }
   const frag = document.createDocumentFragment();
   if (S.targetNew && S.targets.supported === true) {
@@ -8289,6 +8641,7 @@ function renderTargets() {
     const fld = (id, label, key, placeholder, multiline = false) => {
       const ctrl = multiline ? el("textarea", "mono") : el("input");
       ctrl.id = id;
+      ctrl.dataset.focusKey = "tn:" + key;
       if (!multiline) ctrl.type = "text";
       else ctrl.rows = 3;
       ctrl.placeholder = placeholder;
@@ -8316,8 +8669,13 @@ function renderTargets() {
     const save = btn(tn.busy ? "Creating…" : "Create target", "primary", () => {});
     save.type = "submit";
     save.disabled = tn.busy;
-    const cancel = btn("Cancel", "", () => { S.targetNew = null; renderTargets(); });
+    save.dataset.focusKey = "tn:submit";
+    const cancel = btn("Cancel", "", () => { S.targetNew = null; renderTargets(); $("btn-target-new")?.focus({ preventScroll: true }); });
+    cancel.dataset.focusKey = "tn:cancel";
     f.append(add(el("div", "form-row"), save, cancel));
+    f.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); cancel.click(); }
+    });
     f.addEventListener("submit", async (ev) => {
       ev.preventDefault();
       const built = C.targetCreateBody(tn);
@@ -8353,7 +8711,7 @@ function renderTargets() {
     }
     frag.append(ul);
   }
-  box.replaceChildren(frag);
+  preserveFocus(box, () => box.replaceChildren(frag));
 }
 
 const TP_FILTERS = () => ({ status: "all", kind: "all", text: "" });
@@ -8460,7 +8818,7 @@ function credsPanel(tp) {
         }
       }
       if (c.ask === p.profile) {
-        li.append(confirmRow({ text: `Delete the stored login ${p.profile} of ${tp.name}? This cannot be undone.`, yes: "Delete", no: "Keep" },
+        li.append(confirmRow({ text: `Delete the stored login ${p.profile} of ${tp.name}? This cannot be undone.`, yes: "Delete", no: "Keep", danger: true },
           () => deleteCred(tp, p.profile), () => { c.ask = null; renderTargetPage(); }, "cred:" + p.profile + ":"));
       }
       ul.append(li);
@@ -8537,6 +8895,7 @@ function scopeEditor(tp) {
   const area = (id, label, value, key, rows = 4, mono = true) => {
     const t = el("textarea", mono ? "mono" : "");
     t.id = id;
+    t.dataset.focusKey = "tscope:" + key;
     t.rows = rows;
     t.value = value;
     t.addEventListener("input", () => { tp.edit[key] = t.value; });
@@ -8557,7 +8916,13 @@ function scopeEditor(tp) {
   const save = btn(tp.edit.busy ? "Saving…" : "Save settings", "primary", () => {});
   save.type = "submit";
   save.disabled = tp.edit.busy;
-  add(f, err, add(el("div", "form-row"), save, btn("Cancel", "", () => { tp.edit = null; renderTargetPage(); })));
+  save.dataset.focusKey = "tscope:save";
+  const cancel = btn("Cancel", "", () => { tp.edit = null; renderTargetPage(); });
+  cancel.dataset.focusKey = "tscope:cancel";
+  add(f, err, add(el("div", "form-row"), save, cancel));
+  f.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); cancel.click(); }
+  });
   f.addEventListener("submit", async (ev) => {
     ev.preventDefault();
     const put = C.targetPut(tp.cfg, tp.edit.scope, tp.edit.exclude, {
@@ -8630,7 +8995,7 @@ function renderTargetPage() {
     }
     frag.append(ms);
   }
-  box.replaceChildren(frag);
+  preserveFocus(box, () => box.replaceChildren(frag));
   renderTargetTree();
 }
 
@@ -8790,6 +9155,9 @@ async function bootApp() {
 }
 
 async function start() {
+  if (EMBEDDED_DESK && document.body && document.body.classList) {
+    document.body.classList.add("embedded-desk");
+  }
   wireAuthOverlay();
   // A login address opened in a tab that already has the page changes only the fragment: load the
   // page again, so that the code is exchanged and leaves the address bar. Also when signed out.

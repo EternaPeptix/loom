@@ -14,7 +14,7 @@
   <aside id="left" class="col left" aria-label="Missions and inbox">
     <header class="lhead">
       <span class="brand">ferret</span>
-      <button id="connection-wrap" type="button" class="lconn lconn-btn" aria-haspopup="dialog" title="Daemon and Signal status"><span id="dot" class="dot dot-red" aria-hidden="true"></span><span id="connection-state" class="connection-state" role="status">Connecting…</span></button>
+      <button id="connection-wrap" type="button" class="lconn lconn-btn" aria-haspopup="dialog" title="Daemon and Signal status"><span id="dot" class="dot dot-red" aria-hidden="true"></span><span class="conn-prefix" aria-hidden="true">Daemon</span><span id="connection-state" class="connection-state" role="status">Connecting…</span><svg class="icon conn-chevron" viewBox="0 0 12 12" aria-hidden="true"><path d="M2.5 4.5 6 8l3.5-3.5"/></svg></button>
       <span class="spacer"></span>
       <button id="btn-inbox" type="button" class="btn">Inbox <span id="inbox-count" class="count" hidden>0</span></button>
       <button id="close-left" type="button" class="btn small drawer-btn" aria-label="Close missions">Close</button>
@@ -46,7 +46,7 @@
       <span id="bar-connection" class="bar-connection" role="status"></span>
       <span class="spacer"></span>
       <button id="bar-find" type="button" class="btn bar-find with-icon" aria-controls="find-bar" aria-expanded="false" aria-label="Find in this record" title="Find in this record" hidden><svg class="icon" viewBox="0 0 12 12" aria-hidden="true"><circle cx="5.2" cy="5.2" r="3"/><path d="M7.5 7.5l3 3"/></svg></button>
-      <button id="open-right" type="button" class="btn drawer-btn" aria-controls="right" aria-expanded="false">Inspector</button>
+      <button id="open-right" type="button" class="btn drawer-btn bar-inspector with-icon" aria-controls="right" aria-expanded="false" aria-label="Open inspector" title="Open inspector" hidden><svg class="icon" viewBox="0 0 14 14" aria-hidden="true"><rect x="1.5" y="2" width="11" height="10" rx="1.5"/><path d="M9 2v10"/></svg><span class="btn-label">Inspector</span></button>
     </div>
     <div id="notice" class="notice" role="alert" hidden>
       <span id="notice-text"></span>
@@ -159,6 +159,7 @@
         <p id="s-progress" class="progress-line" hidden></p>
         <section id="queue-box" class="queue-box" aria-label="Queued messages" hidden></section>
         <div class="composer-card">
+          <p class="drop-hint" aria-hidden="true">Drop files to attach to workspace</p>
           <div class="composer-heading"><span id="composer-recipient" class="dim"></span><span id="send-state" class="dim" role="status" aria-live="polite"></span></div>
           <div id="agent-bar" class="agent-bar" hidden>
             <p id="agent-note" class="agent-note-text dim">Viewing an agent session. Send messages in the lead session.</p>
@@ -241,6 +242,7 @@
     <section id="view-new" class="view newform" hidden>
       <header class="vhead"><h1 class="stitle">New mission</h1></header>
       <form id="new-form" class="form" autocomplete="off">
+        <p class="drop-hint" aria-hidden="true">Drop files to attach to workspace</p>
         <div class="field">
           <label for="f-workspace">Workspace</label>
           <div class="field-row">
@@ -363,7 +365,7 @@
       <button id="switcher-close" type="button" class="btn">Close</button>
     </header>
     <div class="sheet-body">
-      <input id="switcher-q" type="text" class="switcher-q" role="combobox" aria-expanded="true" aria-controls="switcher-list" aria-autocomplete="list" aria-label="Search by title, id, workspace, profile or role" placeholder="Title, id, workspace, profile or role" autocomplete="off" autocapitalize="off" spellcheck="false" enterkeyhint="go">
+      <input id="switcher-q" type="text" class="switcher-q" role="combobox" aria-expanded="true" aria-controls="switcher-list" aria-autocomplete="list" aria-label="Search missions, agents, or quick actions" placeholder="Title, id, workspace, profile, role, or action" autocomplete="off" autocapitalize="off" spellcheck="false" enterkeyhint="go">
       <p id="switcher-status" class="dim switcher-status" role="status" aria-live="polite"></p>
       <ul id="switcher-list" class="switcher-list" role="listbox" aria-label="Missions and agents"></ul>
     </div>
@@ -460,7 +462,10 @@
       <p class="dim">Run <code>ferret open</code> in a terminal (or use Reload / Reconnect in the desktop app), or paste a login URL, login code, or access token below.</p>
       <form id="auth-overlay-form" class="auth-overlay-form" autocomplete="off">
         <label for="auth-overlay-input" class="sr-only">Login URL, login code, or access token</label>
-        <input id="auth-overlay-input" type="password" placeholder="Paste ferret open URL, login code, or access token" spellcheck="false" autocapitalize="off" autocorrect="off">
+        <div class="auth-input-row">
+          <input id="auth-overlay-input" type="password" placeholder="Paste ferret open URL, login code, or access token" spellcheck="false" autocapitalize="off" autocorrect="off">
+          <button id="auth-overlay-toggle" type="button" class="btn small" aria-pressed="false" aria-label="Show token or login URL">Show</button>
+        </div>
         <div class="auth-overlay-actions">
           <button id="auth-overlay-submit" type="submit" class="btn primary">Sign in</button>
           <button id="auth-overlay-retry" type="button" class="btn">Retry</button>

@@ -27,6 +27,44 @@ enum WebState: Equatable {
 ///   HTTP status, `title`, `url`, `canGoBack`, `canGoForward`).
 /// - uses a per-connection non-persistent data store, so nothing the page stores touches disk and nothing
 ///   from another daemon on the same loopback host can be replayed.
+/// Minimal `WKWebView` subclass for desktop integration without JS injection:
+/// - routes WebKit's native context-menu "Reload" through `AppState.reload()` (fresh login code + route restore)
+/// - keeps the backing surface synced to Ferret's dark `#111520` / light `#FFFFFF` palette on appearance changes.
+@MainActor
+final class FerretWebView: WKWebView {
+    var onReloadRequested: (() -> Void)?
+
+    func syncBackingAppearance() {
+        underPageBackgroundColor = WebPane.adaptivePageNSColor
+        wantsLayer = true
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            self.layer?.backgroundColor = WebPane.adaptivePageNSColor.cgColor
+        }
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        syncBackingAppearance()
+    }
+
+    override func willOpenMenu(_ menu: NSMenu, with event: NSEvent) {
+        super.willOpenMenu(menu, with: event)
+        for item in menu.items {
+            let isReloadID = item.identifier?.rawValue == "WKMenuItemIdentifierReload"
+            let isReloadAction = item.action == #selector(WKWebView.reload(_:))
+                || item.action == #selector(WKWebView.reloadFromOrigin(_:))
+            if isReloadID || isReloadAction {
+                item.target = self
+                item.action = #selector(handleContextReload(_:))
+            }
+        }
+    }
+
+    @objc private func handleContextReload(_ sender: Any?) {
+        onReloadRequested?()
+    }
+}
+
 struct WebPane: NSViewRepresentable {
     enum Route: Equatable {
         case session(String)
@@ -43,7 +81,24 @@ struct WebPane: NSViewRepresentable {
         case back
         case forward
         case focus
+        case resetZoom
     }
+
+    /// Cross-layer UA token (`FerretDesk/<version>`) so the Web UI recognizes embedded mode without JS injection.
+    static var userAgentAppName: String {
+        let ver = (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return "FerretDesk/\((ver?.isEmpty == false) ? ver! : "0.1.0")"
+    }
+
+    /// Shared dark `#111520` (Ferret midnight-indigo) / light `#FFFFFF` backing surface matching `ui/style.css`.
+    static let darkPageNSColor = NSColor(srgbRed: 0x11 / 255.0, green: 0x15 / 255.0, blue: 0x20 / 255.0, alpha: 1.0)
+    static let lightPageNSColor = NSColor(srgbRed: 1.0, green: 1.0, blue: 1.0, alpha: 1.0)
+    static let adaptivePageNSColor = NSColor(name: NSColor.Name("FerretPageBackground")) { appearance in
+        let match = appearance.bestMatch(from: [.darkAqua, .aqua])
+        return match == .darkAqua ? darkPageNSColor : lightPageNSColor
+    }
+    static var adaptivePageColor: Color { Color(nsColor: adaptivePageNSColor) }
 
     /// Per-connection ephemeral data store (preserved across reloads of the same connection, cleared on switch/disconnect).
     let dataStore: WKWebsiteDataStore
@@ -55,7 +110,7 @@ struct WebPane: NSViewRepresentable {
     let routeTick: Int
     /// Bumped when Find Next / Previous / Clear waits in `takeFindAction`.
     let findTick: Int
-    /// Bumped when Back / Forward / Focus waits in `takeNavAction`.
+    /// Bumped when Back / Forward / Focus / ZoomReset actions wait in `takeNavActions`.
     let navTick: Int
     /// True while the native Find bar is open so `didFinish` does not steal focus from the Find input.
     var isFindBarOpen: Bool = false
@@ -65,8 +120,8 @@ struct WebPane: NSViewRepresentable {
     var takeRoute: () -> Route? = { nil }
     /// Hands out a pending Find command once.
     var takeFindAction: () -> FindAction? = { nil }
-    /// Hands out a pending Back/Forward/Focus command once.
-    var takeNavAction: () -> NavAction? = { nil }
+    /// Hands out all queued Back/Forward/Focus/ZoomReset actions in FIFO order.
+    var takeNavActions: () -> [NavAction] = { [] }
     /// Checked immediately before any navigation load against a tunneled daemon.
     var isTunnelAlive: () -> Bool = { true }
     /// Called once per created web view, which needs a fresh one-time code before it can load.
@@ -75,26 +130,34 @@ struct WebPane: NSViewRepresentable {
     var onRouteChanged: (String) -> Void = { _ in }
     var onSessionExpired: () -> Void = {}
     var onProcessTerminated: () -> Void = {}
+    var onReloadRequested: () -> Void = {}
     var onNavCapability: (Bool, Bool) -> Void = { _, _ in }
     var onFindResult: (Bool) -> Void = { _ in }
-    var onDownloadNotice: (String?) -> Void = { _ in }
+    var onDownloadNotice: (String?, URL?) -> Void = { _, _ in }
 
-    func makeNSView(context: Context) -> WKWebView {
+    func makeNSView(context: Context) -> FerretWebView {
         let config = WKWebViewConfiguration()
         config.websiteDataStore = dataStore
-        let view = WKWebView(frame: .zero, configuration: config)
+        config.applicationNameForUserAgent = WebPane.userAgentAppName
+        let view = FerretWebView(frame: .zero, configuration: config)
         view.navigationDelegate = context.coordinator
         view.uiDelegate = context.coordinator
         view.allowsBackForwardNavigationGestures = true
         view.allowsMagnification = true
         view.pageZoom = pageZoom
-        context.coordinator.attachObservers(to: view)
+        view.syncBackingAppearance()
+        #if DEBUG
+        view.isInspectable = true
+        #endif
+        let coord = context.coordinator
+        view.onReloadRequested = { [weak coord] in coord?.onReloadRequested() }
+        coord.attachObservers(to: view)
         let created = onCreated
         DispatchQueue.main.async { created() }   // after this view update, which must not publish changes
         return view
     }
 
-    func updateNSView(_ view: WKWebView, context: Context) {
+    func updateNSView(_ view: FerretWebView, context: Context) {
         let c = context.coordinator
         c.onState = onState
         c.isTunnelAlive = isTunnelAlive
@@ -102,6 +165,7 @@ struct WebPane: NSViewRepresentable {
         c.onRouteChanged = onRouteChanged
         c.onSessionExpired = onSessionExpired
         c.onProcessTerminated = onProcessTerminated
+        c.onReloadRequested = onReloadRequested
         c.onNavCapability = onNavCapability
         c.onFindResult = onFindResult
         c.onDownloadNotice = onDownloadNotice
@@ -122,7 +186,9 @@ struct WebPane: NSViewRepresentable {
         }
         if navTick != c.navTick {
             c.navTick = navTick
-            if let action = takeNavAction() { c.performNav(action, in: view) }
+            for action in takeNavActions() {
+                c.performNav(action, in: view)
+            }
         }
     }
 
@@ -263,9 +329,10 @@ struct WebPane: NSViewRepresentable {
         var onRouteChanged: (String) -> Void = { _ in }
         var onSessionExpired: () -> Void = {}
         var onProcessTerminated: () -> Void = {}
+        var onReloadRequested: () -> Void = {}
         var onNavCapability: (Bool, Bool) -> Void = { _, _ in }
         var onFindResult: (Bool) -> Void = { _ in }
-        var onDownloadNotice: (String?) -> Void = { _ in }
+        var onDownloadNotice: (String?, URL?) -> Void = { _, _ in }
 
         init(entryTick: Int, routeTick: Int, findTick: Int, navTick: Int, isTunnelAlive: @escaping () -> Bool) {
             self.entryTick = entryTick
@@ -365,10 +432,15 @@ struct WebPane: NSViewRepresentable {
             switch action {
             case .back:
                 if view.canGoBack { view.goBack() }
+                focusWebView(view)
             case .forward:
                 if view.canGoForward { view.goForward() }
+                focusWebView(view)
             case .focus:
                 focusWebView(view)
+            case .resetZoom:
+                view.pageZoom = 1.0
+                view.magnification = 1.0
             }
         }
 
@@ -417,7 +489,7 @@ struct WebPane: NSViewRepresentable {
                 case .download:
                     decisionHandler(.download)
                 case .downloadFailed(let code):
-                    onDownloadNotice("Download failed (HTTP \(code))")
+                    onDownloadNotice("Download failed (HTTP \(code))", nil)
                     decisionHandler(.cancel)
                 case .allow:
                     decisionHandler(.allow)
@@ -474,7 +546,7 @@ struct WebPane: NSViewRepresentable {
             let key = ObjectIdentifier(download)
             activeDownloads.removeValue(forKey: key)
             if let dest = downloadDestinations.removeValue(forKey: key) {
-                onDownloadNotice("Saved \(dest.lastPathComponent)")
+                onDownloadNotice("Saved \(dest.lastPathComponent)", dest)
             }
         }
 
@@ -484,7 +556,7 @@ struct WebPane: NSViewRepresentable {
             downloadDestinations.removeValue(forKey: key)
             let ns = error as NSError
             if ns.domain == NSURLErrorDomain && ns.code == NSURLErrorCancelled { return }
-            onDownloadNotice("Download failed: \(error.localizedDescription)")
+            onDownloadNotice("Download failed: \(error.localizedDescription)", nil)
         }
 
         // MARK: WKUIDelegate
@@ -672,6 +744,24 @@ struct WebPane: NSViewRepresentable {
             chk(isSameDocumentTarget(s1, s1), "identical session route not recognized")
             chk(!isSameDocumentTarget(s1o, s1), "different section treated as identical")
             chk(!isSameDocumentTarget(root, s1), "root treated as identical to session")
+        }
+        chk(userAgentAppName.hasPrefix("FerretDesk/") && userAgentAppName.count > "FerretDesk/".count,
+            "UA app token invalid: \(userAgentAppName)")
+        if let dark = darkPageNSColor.usingColorSpace(.sRGB) {
+            chk(Int((dark.redComponent * 255).rounded()) == 0x11
+                && Int((dark.greenComponent * 255).rounded()) == 0x15
+                && Int((dark.blueComponent * 255).rounded()) == 0x20,
+                "dark page backing color is not #111520")
+        } else {
+            f.append("WebPane: darkPageNSColor not convertible to sRGB")
+        }
+        if let light = lightPageNSColor.usingColorSpace(.sRGB) {
+            chk(Int((light.redComponent * 255).rounded()) == 0xFF
+                && Int((light.greenComponent * 255).rounded()) == 0xFF
+                && Int((light.blueComponent * 255).rounded()) == 0xFF,
+                "light page backing color is not #FFFFFF")
+        } else {
+            f.append("WebPane: lightPageNSColor not convertible to sRGB")
         }
         return f
     }

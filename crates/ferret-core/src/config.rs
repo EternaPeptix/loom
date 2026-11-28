@@ -1043,6 +1043,106 @@ impl MailCfg {
     }
 }
 
+/// Isolated guest-chat and unknown-sender gatekeeper configuration (`[signal.guests]`).
+/// Disabled by default (fail-closed: existing configs stay completely silent to non-owner senders).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SignalGuestsCfg {
+    pub enabled: bool,
+    /// Static pre-approved guest E.164 phone numbers or Signal UUIDs (validated like `allow_from`,
+    /// never `*`, no whitespace).
+    pub allow: Vec<String>,
+    /// Optional model profile name from `[models.*]` used for guest chats (default: `default_model`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Human-readable owner name shown in the guest safety preamble (default `"the owner"`).
+    pub owner_name: String,
+    /// Fixed auto-reply sent to unknown senders when `enabled = true` (zero LLM calls).
+    pub unknown_reply: String,
+    /// Notify the owner on Signal when a new unknown sender reaches out (default `true`).
+    pub notify_owner_on_unknown: bool,
+    /// Allow approved guests to leave notes for the owner via `/note` or `leave_note_for_owner` (default `true`).
+    pub allow_notes: bool,
+    /// Maximum conversation turns kept in per-guest rolling history (1..=100; default `20`).
+    pub max_history_turns: usize,
+    /// Maximum LLM turns per guest per rolling hour (1..=500; default `30`).
+    pub rate_limit_per_hour: u32,
+    /// Maximum characters in one guest reply message (200..=7500; default `1500`).
+    pub max_reply_chars: usize,
+    /// Hours before an unapproved unknown sender can receive another auto-reply (1..=720; default `24`).
+    pub unknown_cooldown_hours: u64,
+    /// Optional custom persona appended after the immutable safety preamble (max 2000 chars; default `""`).
+    pub persona: String,
+}
+
+impl Default for SignalGuestsCfg {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allow: Vec::new(),
+            model: None,
+            owner_name: "the owner".to_string(),
+            unknown_reply: "Hi! I'm an AI assistant. I've let my owner know you reached out — once they approve your contact, I'll be able to chat with you here.".to_string(),
+            notify_owner_on_unknown: true,
+            allow_notes: true,
+            max_history_turns: 20,
+            rate_limit_per_hour: 30,
+            max_reply_chars: 1500,
+            unknown_cooldown_hours: 24,
+            persona: String::new(),
+        }
+    }
+}
+
+impl SignalGuestsCfg {
+    pub fn check(&self) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        for guest in &self.allow {
+            if guest.is_empty()
+                || guest == "*"
+                || guest.chars().any(char::is_whitespace)
+                || !(valid_e164(guest) || valid_signal_uuid(guest))
+            {
+                return Err(format!(
+                    "signal.guests.allow entry `{guest}` is invalid; list explicit E.164 phone numbers (for example `+15550101`) or Signal UUIDs with no whitespace."
+                ));
+            }
+        }
+        if let Some(model) = self.model.as_deref() {
+            if model.trim().is_empty() || model != model.trim() {
+                return Err(
+                    "signal.guests.model must be a non-empty model profile name without surrounding whitespace.".into(),
+                );
+            }
+        }
+        let owner = self.owner_name.trim();
+        if owner.is_empty() || owner.chars().count() > 100 || owner.chars().any(char::is_control) {
+            return Err("signal.guests.owner_name must be 1 to 100 characters without control characters.".into());
+        }
+        if self.unknown_reply.trim().is_empty() || self.unknown_reply.chars().count() > 1000 {
+            return Err("signal.guests.unknown_reply must be non-empty and at most 1000 characters.".into());
+        }
+        if !(1..=100).contains(&self.max_history_turns) {
+            return Err("signal.guests.max_history_turns must be between 1 and 100.".into());
+        }
+        if !(1..=500).contains(&self.rate_limit_per_hour) {
+            return Err("signal.guests.rate_limit_per_hour must be between 1 and 500.".into());
+        }
+        if !(200..=7500).contains(&self.max_reply_chars) {
+            return Err("signal.guests.max_reply_chars must be between 200 and 7500.".into());
+        }
+        if !(1..=720).contains(&self.unknown_cooldown_hours) {
+            return Err("signal.guests.unknown_cooldown_hours must be between 1 and 720.".into());
+        }
+        if self.persona.chars().count() > 2000 {
+            return Err("signal.guests.persona must be at most 2000 characters.".into());
+        }
+        Ok(())
+    }
+}
+
 /// Operator two-way Signal bridge configuration (`[signal]`), talking to a local `signal-cli daemon --http`.
 /// Disabled by default; when enabled, `allow_from` MUST be non-empty and never `*` (fail closed).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1065,6 +1165,9 @@ pub struct SignalCfg {
     pub events: Vec<String>,
     /// Maximum characters of one outbound Signal message body (200..=7500; default 3500).
     pub max_chars: usize,
+    /// Optional isolated guest-chat and unknown-sender gatekeeper settings (`[signal.guests]`).
+    #[serde(default)]
+    pub guests: SignalGuestsCfg,
 }
 
 fn deserialize_allow_groups<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<String>, D::Error> {
@@ -1099,6 +1202,7 @@ impl Default for SignalCfg {
                 "error".into(),
             ],
             max_chars: 3500,
+            guests: SignalGuestsCfg::default(),
         }
     }
 }
@@ -1225,6 +1329,7 @@ impl SignalCfg {
         if !(200..=7500).contains(&self.max_chars) {
             return Err("signal.max_chars must be between 200 and 7500.".into());
         }
+        self.guests.check()?;
         Ok(())
     }
 }
@@ -1670,6 +1775,21 @@ impl Config {
         self.mcp.check().map_err(ConfigError::Invalid)?;
         self.mail.check().map_err(ConfigError::Invalid)?;
         self.signal.check().map_err(ConfigError::Invalid)?;
+        if self.signal.enabled && self.signal.guests.enabled {
+            if let Some(model) = self.signal.guests.model.as_deref() {
+                if !self.models.contains_key(model) {
+                    let names: Vec<&str> = self.models.keys().map(String::as_str).collect();
+                    let available = if names.is_empty() {
+                        "no model profiles are configured".to_string()
+                    } else {
+                        format!("configured models: {}", names.join(", "))
+                    };
+                    return Err(ConfigError::Invalid(format!(
+                        "signal.guests.model \"{model}\" is not one of the configured models ({available})."
+                    )));
+                }
+            }
+        }
         if let Some(ua) = self.network.target_user_agent.as_deref() {
             if ua.chars().any(char::is_control) {
                 return Err(ConfigError::Invalid(
@@ -2919,5 +3039,109 @@ allow_from = ["+15550199"]
 
         let bad_event = format!("{ok_cfg}events = [\"bogus\"]\n");
         assert!(Config::parse(&bad_event).unwrap().check().is_err());
+    }
+
+    #[test]
+    fn signal_guests_config_defaults_and_validation() {
+        // Default config keeps guests disabled (fail-closed) with safe defaults.
+        let def = Config::default();
+        assert!(!def.signal.guests.enabled);
+        assert!(def.signal.guests.allow.is_empty());
+        assert!(def.signal.guests.model.is_none());
+        assert_eq!(def.signal.guests.owner_name, "the owner");
+        assert_eq!(
+            def.signal.guests.unknown_reply,
+            "Hi! I'm an AI assistant. I've let my owner know you reached out — once they approve your contact, I'll be able to chat with you here."
+        );
+        assert!(def.signal.guests.notify_owner_on_unknown);
+        assert!(def.signal.guests.allow_notes);
+        assert_eq!(def.signal.guests.max_history_turns, 20);
+        assert_eq!(def.signal.guests.rate_limit_per_hour, 30);
+        assert_eq!(def.signal.guests.max_reply_chars, 1500);
+        assert_eq!(def.signal.guests.unknown_cooldown_hours, 24);
+        assert!(def.signal.guests.persona.is_empty());
+
+        let base = r#"
+[models.fast]
+base_url = "http://127.0.0.1:8000/v1"
+model = "fast-model"
+
+[signal]
+enabled = true
+http_url = "http://127.0.0.1:1337"
+account = "+15550100"
+recipient = "+15550199"
+allow_from = ["+15550199"]
+
+[signal.guests]
+enabled = true
+"#;
+        // Minimal enabled guests block passes with defaults (empty static allow list is valid).
+        let parsed = Config::parse(base).unwrap();
+        parsed.check().unwrap();
+        assert!(parsed.signal.guests.enabled);
+
+        // Valid static guests (E.164 + bare/prefixed UUIDs) and valid model profile pass.
+        let full = format!(
+            "{base}allow = [\"+15550101\", \"00000000-0000-4000-8000-000000000001\", \"u:00000000-0000-4000-8000-000000000002\", \"PNI:00000000-0000-4000-8000-000000000003\"]\nmodel = \"fast\"\nowner_name = \"Jordan\"\npersona = \"Friendly and concise.\"\n"
+        );
+        let parsed_full = Config::parse(&full).unwrap();
+        parsed_full.check().unwrap();
+        assert_eq!(parsed_full.signal.guests.model.as_deref(), Some("fast"));
+
+        // Unknown keys inside [signal.guests] are rejected.
+        assert!(Config::parse(&format!("{base}unknown_key = true\n")).is_err());
+
+        // Invalid allow entries (wildcard, whitespace, non-E.164, non-UUID) are rejected.
+        for bad in ["*", "", " +15550101", "+1555 0101", "15550101", "+1-555-0101", "guest", "not-a-uuid"] {
+            let cfg = format!("{base}allow = [\"{bad}\"]\n");
+            let err = Config::parse(&cfg).unwrap().check().unwrap_err().to_string();
+            assert!(err.contains("signal.guests.allow"), "{bad:?}: {err}");
+        }
+
+        // Missing or blank model profile is rejected when signal.enabled && signal.guests.enabled.
+        let bad_model = format!("{base}model = \"nonexistent\"\n");
+        let err = Config::parse(&bad_model).unwrap().check().unwrap_err().to_string();
+        assert!(err.contains("signal.guests.model"), "{err}");
+
+        let empty_model = format!("{base}model = \"   \"\n");
+        assert!(Config::parse(&empty_model).unwrap().check().is_err());
+
+        // When signal.guests.enabled = false, guests.model is not required to exist.
+        let disabled_guests = base.replacen(
+            "[signal.guests]\nenabled = true",
+            "[signal.guests]\nenabled = false\nmodel = \"nonexistent\"",
+            1,
+        );
+        Config::parse(&disabled_guests).unwrap().check().unwrap();
+
+        // Validation of numeric bounds, unknown_reply, owner_name, and persona.
+        for (line, needle) in [
+            ("unknown_reply = \"   \"", "unknown_reply"),
+            (&format!("unknown_reply = \"{}\"", "x".repeat(1001)), "unknown_reply"),
+            ("owner_name = \"\"", "owner_name"),
+            ("owner_name = \"bad\\nname\"", "owner_name"),
+            ("max_history_turns = 0", "max_history_turns"),
+            ("max_history_turns = 101", "max_history_turns"),
+            ("rate_limit_per_hour = 0", "rate_limit_per_hour"),
+            ("rate_limit_per_hour = 501", "rate_limit_per_hour"),
+            ("max_reply_chars = 199", "max_reply_chars"),
+            ("max_reply_chars = 7501", "max_reply_chars"),
+            ("unknown_cooldown_hours = 0", "unknown_cooldown_hours"),
+            ("unknown_cooldown_hours = 721", "unknown_cooldown_hours"),
+            (&format!("persona = \"{}\"", "p".repeat(2001)), "persona"),
+        ] {
+            let cfg = format!("{base}{line}\n");
+            let err = Config::parse(&cfg).unwrap().check().unwrap_err().to_string();
+            assert!(err.contains(needle), "{line}: {err}");
+        }
+
+        // Boundary values pass.
+        let boundaries = format!(
+            "{base}unknown_reply = \"{}\"\nmax_history_turns = 100\nrate_limit_per_hour = 500\nmax_reply_chars = 7500\nunknown_cooldown_hours = 720\npersona = \"{}\"\n",
+            "x".repeat(1000),
+            "p".repeat(2000),
+        );
+        Config::parse(&boundaries).unwrap().check().unwrap();
     }
 }

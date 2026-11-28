@@ -43,7 +43,7 @@ gui/
     Model/Connection.swift    a saved connection profile; load/save to Application Support; Keychain for secrets
     Net/Tunnel.swift          the ssh -N -L child process, port readiness, token fetch, teardown
     Net/DaemonClient.swift    minimal HTTP+SSE client to the tunneled daemon; publishes counts and inbox events
-    UI/RootView.swift         the window: a connection bar on top, the web pane filling the rest
+    UI/RootView.swift         the window: unified compact native toolbar, status/find bars, and the web pane filling the rest
     UI/ConnectionsView.swift  add / edit / pick / connect a connection
     UI/WebPane.swift          NSViewRepresentable around WKWebView; loads the tunneled daemon UI
 ```
@@ -195,8 +195,12 @@ with `fetch` too (not `EventSource`), through the tunnel. The pane:
 - restricts navigation to the `baseURL` origin (loopback): a navigation action to any other origin is
   cancelled and opened in the default browser instead (so links in fetched pages don't hijack the
   pane). Requests only ever leave for `127.0.0.1:<port>`.
-- exposes reload (a new web view with a fresh code) and a "copy address" affordance that copies the
-  daemon's base address only (scheme, host, port): no login code and no token reach the pasteboard;
+- exposes reload (a new web view with a fresh code), a "copy address" affordance that copies the
+  daemon's base address only (scheme, host, port: no login code and no token reach the pasteboard),
+  and "Open in Default Browser" (mints a single-use code and opens via `NSWorkspace`, never touching the pasteboard);
+- sets `applicationNameForUserAgent = "FerretDesk/<version>"` so the web UI can recognize embedded mode
+  without JS injection, and sets `underPageBackgroundColor` (plus matching SwiftUI overlays) to adaptive
+  `#111520` (dark) / `#FFFFFF` (light) to prevent white flashes;
 - shows a clear state when there is no connection, when the tunnel is connecting, and when the daemon
   is unreachable (with the error and a retry), rather than a blank white view.
 
@@ -216,8 +220,8 @@ Do not inject scripts into the page or read its contents; the pane only navigate
   `LSUIElement` is false, so the app also has a Dock icon (`Resources/AppIcon.icns`) with live waiting badge
   and appears in the app switcher; the main `Window` is opened on demand, on first launch and from the Dock,
   and closing it (`⌘W`) hides the window without quitting the app or tearing down the live view.
-- the main `Window` hosting `RootView` (a connection bar — active connection, state, reload — above
-  the `WebPane`).
+- the main `Window` hosting `RootView` (a unified compact native toolbar — active connection switcher,
+  state, back/forward, zoom indicator, reload, copy address, open in browser — above the `WebPane`).
 - notification setup (an explicit **Enable notifications…** menu action requests authorization;
   the delegate foregrounds the window and routes to a session). Launch does not prompt for consent.
 - lifecycle: restore the last-used connection on launch and connect to it; tear the tunnel down on

@@ -40,9 +40,10 @@ reaches it, authenticates, watches `/api/events` for the counts, and shows the p
 - `⌘F` / `⌘G` / `⇧⌘G` — Find in page (Next / Previous)
 - `⌘R` — Reload (mints a fresh login code while preserving your current route)
 - `⌘[` / `⌘]` — Back / Forward (trackpad swipes also work)
-- `⌘=` / `⌘-` / `⌘0` — Zoom In / Zoom Out / Actual Size (persisted across launches)
+- `⌘=` / `⌘+` / `⌘-` / `⌘0` — Zoom In / Zoom Out / Actual Size (resets both page zoom and trackpad pinch magnification; persisted across launches)
 - `⇧⌘I` — Open Inbox
-- `⇧⌘C` — Copy daemon base address
+- `⇧⌘C` — Copy daemon base address (never copies a code or token)
+- `⇧⌘O` — Open signed-in page in default browser (mints a single-use code, never touches the pasteboard)
 - `⌘W` — Hide the window without destroying the live view or unsent drafts (`⌘Q` quits and closes the tunnel)
 
 ## Build

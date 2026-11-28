@@ -23,6 +23,7 @@ pub mod fsview;
 pub mod render;
 pub mod serve;
 pub mod signal;
+mod signal_guests;
 pub mod ui;
 pub mod upload;
 pub mod wire;
