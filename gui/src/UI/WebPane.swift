@@ -29,10 +29,13 @@ enum WebState: Equatable {
 ///   from another daemon on the same loopback host can be replayed.
 /// Minimal `WKWebView` subclass for desktop integration without JS injection:
 /// - routes WebKit's native context-menu "Reload" through `AppState.reload()` (fresh login code + route restore)
+/// - routes trackpad pinch magnification into reflowing CSS `pageZoom` (optical bitmap magnification stays disabled)
 /// - keeps the backing surface synced to Ferret's dark `#111520` / light `#FFFFFF` palette on appearance changes.
 @MainActor
 final class FerretWebView: WKWebView {
     var onReloadRequested: (() -> Void)?
+    var onPinchZoom: ((CGFloat) -> Void)?
+    private var pinchZoom = WebPane.PinchZoomAccumulator()
 
     func syncBackingAppearance() {
         underPageBackgroundColor = WebPane.adaptivePageNSColor
@@ -45,6 +48,26 @@ final class FerretWebView: WKWebView {
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
         syncBackingAppearance()
+    }
+
+    override func magnify(with event: NSEvent) {
+        if abs(magnification - 1.0) > 0.001 {
+            magnification = 1.0
+        }
+        let phase = event.phase
+        let isStart = phase.contains(.began)
+        let isCancelled = phase.contains(.cancelled)
+        let isEnd = phase.contains(.ended) || isCancelled
+        if let next = pinchZoom.handle(
+            delta: event.magnification,
+            currentZoom: pageZoom,
+            isStart: isStart,
+            isEnd: isEnd,
+            isCancelled: isCancelled
+        ) {
+            pageZoom = next
+            onPinchZoom?(next)
+        }
     }
 
     override func willOpenMenu(_ menu: NSMenu, with event: NSEvent) {
@@ -82,6 +105,39 @@ struct WebPane: NSViewRepresentable {
         case forward
         case focus
         case resetZoom
+    }
+
+    /// Accumulates trackpad `NSEvent.magnification` deltas into clamped, 5%-snapped `pageZoom` updates.
+    /// Multiplicative `exp(delta)` keeps pinch-out / pinch-in symmetric and prevents negative scale values.
+    struct PinchZoomAccumulator: Equatable {
+        private(set) var active = false
+        private(set) var rawZoom: CGFloat = 1.0
+
+        nonisolated mutating func handle(delta: CGFloat,
+                                         currentZoom: CGFloat,
+                                         isStart: Bool,
+                                         isEnd: Bool,
+                                         isCancelled: Bool) -> CGFloat? {
+            if isCancelled {
+                active = false
+                return nil
+            }
+            let base = AppState.clampedZoom(currentZoom)
+            let diverged = active && abs(AppState.snappedZoom(rawZoom, step: AppState.pinchZoomStep) - base) > 0.001
+            if isStart || !active || diverged {
+                active = true
+                rawZoom = base
+            }
+            if delta.isFinite && delta != 0 {
+                let scaled = rawZoom * CGFloat(exp(Double(delta)))
+                rawZoom = AppState.clampedZoom(scaled)
+            }
+            let snapped = AppState.snappedZoom(rawZoom, step: AppState.pinchZoomStep)
+            if isEnd {
+                active = false
+            }
+            return abs(snapped - base) > 0.001 ? snapped : nil
+        }
     }
 
     /// Cross-layer UA token (`FerretDesk/<version>`) so the Web UI recognizes embedded mode without JS injection.
@@ -131,6 +187,7 @@ struct WebPane: NSViewRepresentable {
     var onSessionExpired: () -> Void = {}
     var onProcessTerminated: () -> Void = {}
     var onReloadRequested: () -> Void = {}
+    var onPinchZoom: (CGFloat) -> Void = { _ in }
     var onNavCapability: (Bool, Bool) -> Void = { _, _ in }
     var onFindResult: (Bool) -> Void = { _ in }
     var onDownloadNotice: (String?, URL?) -> Void = { _, _ in }
@@ -143,7 +200,8 @@ struct WebPane: NSViewRepresentable {
         view.navigationDelegate = context.coordinator
         view.uiDelegate = context.coordinator
         view.allowsBackForwardNavigationGestures = true
-        view.allowsMagnification = true
+        view.allowsMagnification = false
+        view.magnification = 1.0
         view.pageZoom = pageZoom
         view.syncBackingAppearance()
         #if DEBUG
@@ -151,6 +209,7 @@ struct WebPane: NSViewRepresentable {
         #endif
         let coord = context.coordinator
         view.onReloadRequested = { [weak coord] in coord?.onReloadRequested() }
+        view.onPinchZoom = { [weak coord] zoom in coord?.onPinchZoom(zoom) }
         coord.attachObservers(to: view)
         let created = onCreated
         DispatchQueue.main.async { created() }   // after this view update, which must not publish changes
@@ -166,9 +225,13 @@ struct WebPane: NSViewRepresentable {
         c.onSessionExpired = onSessionExpired
         c.onProcessTerminated = onProcessTerminated
         c.onReloadRequested = onReloadRequested
+        c.onPinchZoom = onPinchZoom
         c.onNavCapability = onNavCapability
         c.onFindResult = onFindResult
         c.onDownloadNotice = onDownloadNotice
+        if abs(view.magnification - 1.0) > 0.001 {
+            view.magnification = 1.0
+        }
         if abs(view.pageZoom - pageZoom) > 0.001 {
             view.pageZoom = pageZoom
         }
@@ -330,6 +393,7 @@ struct WebPane: NSViewRepresentable {
         var onSessionExpired: () -> Void = {}
         var onProcessTerminated: () -> Void = {}
         var onReloadRequested: () -> Void = {}
+        var onPinchZoom: (CGFloat) -> Void = { _ in }
         var onNavCapability: (Bool, Bool) -> Void = { _, _ in }
         var onFindResult: (Bool) -> Void = { _ in }
         var onDownloadNotice: (String?, URL?) -> Void = { _, _ in }
@@ -763,6 +827,51 @@ struct WebPane: NSViewRepresentable {
         } else {
             f.append("WebPane: lightPageNSColor not convertible to sRGB")
         }
+        // Pinch zoom accumulation: sub-step accumulation, symmetry, bounds clamping, ceiling reversal, cancel & external resync.
+        var pinch = PinchZoomAccumulator()
+        var z: CGFloat = 1.0
+        chk(pinch.handle(delta: 0.01, currentZoom: z, isStart: true, isEnd: false, isCancelled: false) == nil,
+            "pinch emitted before crossing 5% threshold")
+        if let step1 = pinch.handle(delta: 0.025, currentZoom: z, isStart: false, isEnd: false, isCancelled: false) {
+            chk(abs(step1 - 1.05) < 0.001, "pinch accumulated step expected 1.05, got \(step1)")
+            z = step1
+        } else {
+            f.append("WebPane: pinch failed to emit 1.05 after accumulating 0.035")
+        }
+        if let back = pinch.handle(delta: -0.035, currentZoom: z, isStart: false, isEnd: true, isCancelled: false) {
+            chk(abs(back - 1.0) < 0.001, "pinch symmetry expected 1.0, got \(back)")
+            z = back
+        } else {
+            f.append("WebPane: pinch symmetry failed to return to 1.0")
+        }
+        chk(!pinch.active, "pinch stayed active after isEnd")
+        if let hi = pinch.handle(delta: 3.0, currentZoom: z, isStart: true, isEnd: false, isCancelled: false) {
+            chk(abs(hi - AppState.maxZoom) < 0.001, "pinch upper clamp expected 2.0, got \(hi)")
+            z = hi
+        } else {
+            f.append("WebPane: pinch upper clamp did not emit 2.0")
+        }
+        // Reversing immediately at ceiling should respond without dead-zone lag.
+        if let rev = pinch.handle(delta: -0.04, currentZoom: z, isStart: false, isEnd: false, isCancelled: false) {
+            chk(rev < AppState.maxZoom, "pinch reversal at ceiling stayed stuck at 2.0")
+            z = rev
+        } else {
+            f.append("WebPane: pinch reversal at ceiling lagged")
+        }
+        // External zoom reset (⌘0) while gesture state was active must resync rather than jumping back.
+        chk(pinch.handle(delta: 0.0, currentZoom: 1.0, isStart: false, isEnd: false, isCancelled: false) == nil,
+            "pinch did not resync on external zoom change")
+        chk(abs(pinch.rawZoom - 1.0) < 0.001, "pinch rawZoom not resynced to 1.0")
+        // Lower clamp and non-finite delta guard.
+        if let lo = pinch.handle(delta: -5.0, currentZoom: 1.0, isStart: true, isEnd: false, isCancelled: false) {
+            chk(abs(lo - AppState.minZoom) < 0.001, "pinch lower clamp expected 0.5, got \(lo)")
+        } else {
+            f.append("WebPane: pinch lower clamp did not emit 0.5")
+        }
+        chk(pinch.handle(delta: .nan, currentZoom: 0.5, isStart: false, isEnd: false, isCancelled: false) == nil,
+            "pinch emitted on NaN delta")
+        chk(pinch.handle(delta: 0.2, currentZoom: 0.5, isStart: false, isEnd: true, isCancelled: true) == nil && !pinch.active,
+            "pinch cancel did not clear active state")
         return f
     }
     #endif

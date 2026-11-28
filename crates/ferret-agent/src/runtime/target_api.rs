@@ -56,6 +56,19 @@ pub struct NoiseStatusView {
     pub hosts: Vec<ferret_net::HostNoise>,
 }
 
+/// Result of importing bug-bounty scope entries into a target (`POST /api/targets/{name}/import-scope`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScopeImportResult {
+    pub target: String,
+    pub format: String,
+    pub added_scope: usize,
+    pub added_exclude: usize,
+    pub total_scope: usize,
+    pub total_exclude: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+}
+
 fn word<T: Serialize>(v: &T) -> String {
     serde_json::to_value(v).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default()
 }
@@ -163,6 +176,31 @@ impl Runtime {
         store.put(name, &cfg)?;
         self.inner.publish(BusEvent::Target { name: name.to_string() });
         self.target_show(name)
+    }
+
+    /// Parse a bug-bounty scope payload (`auto`, `hackerone`, `bugcrowd`, `intigriti`, `burp`, `csv`)
+    /// and merge its in-scope and out-of-scope entries into an existing target.
+    pub fn target_import_scope(&self, name: &str, format: &str, input: &str) -> Result<ScopeImportResult, String> {
+        let store = self.inner.target_store();
+        if !store.exists(name) {
+            return Err(format!(
+                "There is no target `{name}`; create it with `ferret target add {name} --scope <host>`."
+            ));
+        }
+        let imported = ferret_core::ingest::parse_bounty_scope(input, format)?;
+        let (cfg, added_scope, added_exclude) = store.merge_scope(name, &imported.in_scope, &imported.out_of_scope)?;
+        if added_scope > 0 || added_exclude > 0 {
+            self.inner.publish(BusEvent::Target { name: name.to_string() });
+        }
+        Ok(ScopeImportResult {
+            target: name.to_string(),
+            format: imported.format,
+            added_scope,
+            added_exclude,
+            total_scope: cfg.scope.len(),
+            total_exclude: cfg.exclude.len(),
+            notes: imported.notes,
+        })
     }
 
     /// The graph of a target; `status`, `kind` and `under` (a node id or locator) narrow the nodes, and the

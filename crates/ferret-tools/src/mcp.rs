@@ -936,6 +936,7 @@ impl Tool for McpTool {
                         response_cut: false,
                         unverified: false,
                         started: raw.started,
+                        principal: None,
                     },
                 )
             })

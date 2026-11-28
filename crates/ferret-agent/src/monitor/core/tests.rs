@@ -40,6 +40,7 @@ fn env_of(paths: &Paths) -> Arc<Env> {
         relaxed_profiles: BTreeSet::new(),
         mcp_hosts: Default::default(),
         box_shell: Default::default(),
+        box_bridge: false,
     })
 }
 
@@ -72,6 +73,7 @@ fn start(session: &str, mission: &str) -> Event {
         intercept: false,
         target: None,
         creds: None,
+        creds_profiles: Vec::new(),
         schema: ferret_core::event::SCHEMA,
     })
 }

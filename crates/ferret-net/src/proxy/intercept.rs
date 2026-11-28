@@ -214,9 +214,10 @@ impl Tap {
         lock(&self.d).resp_total
     }
 
-    /// The capture of the exchange as it stands; the host and port are added by [`CaptureCfg::send`].
+    /// The capture of the exchange as it stands; the port is added by [`CaptureCfg::send`].
     pub fn finish(
         &self,
+        host: &str,
         transport: Transport,
         method: &str,
         target: &str,
@@ -278,11 +279,16 @@ impl Tap {
             (request, response, target, error, request_bytes, response_bytes)
         };
 
+        let passive_signals = match response.as_deref() {
+            Some(resp) => crate::analyze::analyze_exchange(method, host, &target, d.status, &request, Some(resp)),
+            None => Vec::new(),
+        };
+
         Captured {
             ts_ms: self.ts_ms,
             transport,
             method: method.to_string(),
-            host: String::new(),
+            host: host.to_string(),
             port: 0,
             target,
             status: d.status,
@@ -294,6 +300,7 @@ impl Tap {
             truncated: req_truncated || resp_truncated,
             upstream_unverified,
             duration_ms: u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            passive_signals,
         }
     }
 }
@@ -380,7 +387,7 @@ async fn refuse_client(
     cx.record_best_effort(false, why.to_string(), Some(allowed.ip)).await;
     let tap = Tap::new(cap.grant.max_bytes, Vec::new());
     let target = format!("{}:{}", cx.host, cx.port);
-    cap.send(cx, tap.finish(Transport::Intercepted, "CONNECT", &target, Some(why.to_string()), unverified));
+    cap.send(cx, tap.finish(cx.host, Transport::Intercepted, "CONNECT", &target, Some(why.to_string()), unverified));
     if let Ok(refusing) = crate::tls::refusing_server_config() {
         let _ = tokio::time::timeout(Duration::from_secs(2), TlsAcceptor::from(refusing).accept(client)).await;
     }
@@ -531,6 +538,17 @@ async fn serve(
             rewrites.secrets(),
             rewrites.max_secret_len(),
         );
+        let resp_rewrite = rewrites.has_response_rules().then(|| {
+            let req_headers =
+                try_parse(&raw).ok().flatten().map(|(h, _)| h.headers).unwrap_or_else(|| head.headers.clone());
+            RespRewriteCtx {
+                rewrites: rewrites.clone(),
+                host: cx.host.to_string(),
+                req_method: req_method.clone(),
+                req_target: req_target.clone(),
+                req_headers,
+            }
+        });
         let head_request = req_method.eq_ignore_ascii_case("HEAD");
         let x = exchange(
             &mut cr,
@@ -545,9 +563,13 @@ async fn serve(
             &tap,
             idle,
             (!gov.is_off()).then_some((&*gov, cx.host)),
+            resp_rewrite.as_ref(),
         );
         let out = x.await;
-        cap.send(cx, tap.finish(Transport::Intercepted, &req_method, &req_target, out.error.clone(), unverified));
+        cap.send(
+            cx,
+            tap.finish(cx.host, Transport::Intercepted, &req_method, &req_target, out.error.clone(), unverified),
+        );
         if out.upgraded {
             let _ = pump(&mut cr, &mut cw, &mut ur, &mut uw, idle).await;
             return;
@@ -596,7 +618,7 @@ async fn raw_tls<CR, CW, UR, UW>(
     }
     let why = format!("not HTTP/1.1: {out} bytes out, {back} bytes in, not stored");
     let target = format!("{}:{}", cx.host, cx.port);
-    let mut c = tap.finish(Transport::Intercepted, "TLS", &target, Some(why), unverified);
+    let mut c = tap.finish(cx.host, Transport::Intercepted, "TLS", &target, Some(why), unverified);
     (c.request_bytes, c.response_bytes) = (out, back);
     cap.send(cx, c);
 }
@@ -648,8 +670,10 @@ impl Outcome {
 /// A response head as read from the destination, unchanged.
 struct RawResp {
     len: usize,
+    version: u8,
     code: u16,
-    is_final: bool,
+    reason: String,
+    headers: Vec<(String, Vec<u8>)>,
     framing: Option<Framing>,
     close: bool,
     retry_after: Option<String>,
@@ -700,7 +724,28 @@ fn raw_response_head(buf: &[u8], head_request: bool) -> Result<Option<RawResp>, 
                 .map(|s| s.trim().to_string())
         })
         .flatten();
-    Ok(Some(RawResp { len, code, is_final, framing, close, retry_after }))
+    let parsed_headers: Vec<(String, Vec<u8>)> = if is_final && code != 101 {
+        resp.headers
+            .iter()
+            .map(|h| {
+                let mut unfolded = Vec::with_capacity(h.value.len());
+                unfold_header_value(&mut unfolded, h.value);
+                (h.name.to_string(), unfolded)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Ok(Some(RawResp {
+        len,
+        version,
+        code,
+        reason: resp.reason.unwrap_or("").to_string(),
+        headers: parsed_headers,
+        framing,
+        close,
+        retry_after,
+    }))
 }
 
 /// How many of `data` belong to the body of a response with `framing`.
@@ -741,6 +786,7 @@ async fn exchange<CR, CW, UR, UW>(
     tap: &Tap,
     idle: Duration,
     pace: Option<(&crate::pace::Governor, &str)>,
+    resp_rewrite: Option<&RespRewriteCtx>,
 ) -> Outcome
 where
     CR: AsyncRead + Unpin,
@@ -787,27 +833,325 @@ where
     };
     // The response: heads (interim ones too), then the body as its head frames it.
     let download = async {
-        let mut sent = 0u64;
+        let mut cap_sent = 0u64;
         let mut chunk = vec![0u8; 16 * 1024];
+        let mut clean = true;
         let (code, mut framing, close) = loop {
             match raw_response_head(ubuf, head_request) {
                 Ok(Some(h)) => {
                     let bytes: Vec<u8> = ubuf.drain(..h.len.min(ubuf.len())).collect();
-                    if !send(cw, &bytes, idle).await {
-                        return Err("writing to the client failed".to_string());
-                    }
-                    sent = sent.saturating_add(bytes.len() as u64);
-                    let end = h.is_final.then_some(sent);
-                    tap.response(&bytes, end, h.is_final.then_some(h.code));
-                    if h.is_final {
+                    let Some(mut framing) = h.framing else {
+                        if !send(cw, &bytes, idle).await {
+                            return Err("writing to the client failed".to_string());
+                        }
+                        cap_sent = cap_sent.saturating_add(bytes.len() as u64);
+                        tap.response(&bytes, None, None);
+                        continue;
+                    };
+
+                    if h.code == 101 {
+                        if !send(cw, &bytes, idle).await {
+                            return Err("writing to the client failed".to_string());
+                        }
+                        cap_sent = cap_sent.saturating_add(bytes.len() as u64);
+                        tap.response(&bytes, Some(cap_sent), Some(h.code));
                         if let Some((gov, host)) = pace {
                             gov.note_response(host, h.code, h.retry_after.as_deref());
                         }
+                        break (h.code, framing, h.close);
                     }
-                    if let Some(f) = h.framing {
-                        break (h.code, f, h.close);
+
+                    let Some(rw_ctx) = resp_rewrite else {
+                        if !send(cw, &bytes, idle).await {
+                            return Err("writing to the client failed".to_string());
+                        }
+                        cap_sent = cap_sent.saturating_add(bytes.len() as u64);
+                        tap.response(&bytes, Some(cap_sent), Some(h.code));
+                        if let Some((gov, host)) = pace {
+                            gov.note_response(host, h.code, h.retry_after.as_deref());
+                        }
+                        break (h.code, framing, h.close);
+                    };
+
+                    let buffer_spec = if !head_request
+                        && !matches!(h.code, 204 | 304)
+                        && rw_ctx.rewrites.needs_response_body(
+                            &rw_ctx.host,
+                            &rw_ctx.req_method,
+                            &rw_ctx.req_target,
+                            &rw_ctx.req_headers,
+                            &h.headers,
+                        ) {
+                        match &framing {
+                            Framing::Length(n) if *n <= crate::rewrite::MAX_REWRITE_BODY_BYTES as u64 => {
+                                Some((false, crate::rewrite::MAX_REWRITE_BODY_BYTES))
+                            }
+                            Framing::Chunked(_) => {
+                                Some((true, crate::rewrite::MAX_REWRITE_BODY_BYTES + CHUNKED_REWRITE_RAW_SLACK))
+                            }
+                            Framing::UntilClose => Some((false, crate::rewrite::MAX_REWRITE_BODY_BYTES)),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+
+                    if let Some((is_chunked, cap_limit)) = buffer_spec {
+                        let mut raw_body = Vec::new();
+                        let mut overflowed = false;
+                        while !framing_done(&framing) {
+                            let data: Vec<u8> = if ubuf.is_empty() {
+                                match tokio::time::timeout(idle, ur.read(&mut chunk)).await {
+                                    Ok(Ok(n)) if n > 0 => chunk.get(..n).unwrap_or(&[]).to_vec(),
+                                    Ok(Ok(_)) if matches!(framing, Framing::UntilClose) => {
+                                        clean = false;
+                                        break;
+                                    }
+                                    Ok(Ok(_) | Err(_)) => {
+                                        return Err(
+                                            "the destination's connection ended in the middle of the response".into()
+                                        )
+                                    }
+                                    Err(_) => {
+                                        return Err(format!("the destination's response stalled for {}", human(idle)))
+                                    }
+                                }
+                            } else {
+                                std::mem::take(ubuf)
+                            };
+                            let k = frame_take(&mut framing, &data)?.min(data.len());
+                            let (mine, past) = data.split_at(k);
+                            raw_body.extend_from_slice(mine);
+                            if !past.is_empty() {
+                                clean = false;
+                            }
+                            if raw_body.len() > cap_limit && !framing_done(&framing) {
+                                overflowed = true;
+                                break;
+                            }
+                        }
+
+                        if overflowed {
+                            let rw = rw_ctx.rewrites.apply_response_for_capture(
+                                &rw_ctx.host,
+                                &rw_ctx.req_method,
+                                &rw_ctx.req_target,
+                                &rw_ctx.req_headers,
+                                h.code,
+                                &h.headers,
+                                None,
+                            );
+                            let (wire_head, cap_head, final_code, final_ra) = match rw {
+                                Some(rw) => {
+                                    let len_ovr =
+                                        body_len_for_status_change(head_request, h.code, rw.status, &rw.wire_headers);
+                                    let wh = render_response_head(
+                                        h.version,
+                                        h.code,
+                                        &h.reason,
+                                        rw.status,
+                                        &rw.wire_headers,
+                                        false,
+                                        h.close,
+                                        false,
+                                        len_ovr,
+                                    );
+                                    let ch = if rw.sensitive_applied {
+                                        render_response_head(
+                                            h.version,
+                                            h.code,
+                                            &h.reason,
+                                            rw.status,
+                                            &rw.captured_headers,
+                                            false,
+                                            h.close,
+                                            false,
+                                            len_ovr,
+                                        )
+                                    } else {
+                                        wh.clone()
+                                    };
+                                    let ra = header_retry_after(&rw.wire_headers);
+                                    (wh, ch, rw.status, ra)
+                                }
+                                None => (bytes.clone(), bytes, h.code, h.retry_after),
+                            };
+                            if !send(cw, &wire_head, idle).await {
+                                return Err("writing to the client failed".to_string());
+                            }
+                            cap_sent = cap_sent.saturating_add(cap_head.len() as u64);
+                            tap.response(&cap_head, Some(cap_sent), Some(final_code));
+                            if let Some((gov, host)) = pace {
+                                gov.note_response(host, final_code, final_ra.as_deref());
+                            }
+                            if !raw_body.is_empty() {
+                                if !send(cw, &raw_body, idle).await {
+                                    return Err("writing to the client failed".to_string());
+                                }
+                                tap.response(&raw_body, None, None);
+                            }
+                            break (final_code, framing, h.close);
+                        }
+
+                        let logical = if is_chunked {
+                            decode_chunked_body(&raw_body, crate::rewrite::MAX_REWRITE_BODY_BYTES).ok()
+                        } else if raw_body.len() <= crate::rewrite::MAX_REWRITE_BODY_BYTES {
+                            Some(raw_body.clone())
+                        } else {
+                            None
+                        };
+                        let rw = rw_ctx.rewrites.apply_response_for_capture(
+                            &rw_ctx.host,
+                            &rw_ctx.req_method,
+                            &rw_ctx.req_target,
+                            &rw_ctx.req_headers,
+                            h.code,
+                            &h.headers,
+                            logical.as_deref(),
+                        );
+                        let (wire_head, wire_body, cap_head, cap_body, final_code, final_ra) = match rw {
+                            Some(rw) if rw.body_changed => {
+                                let wb = rw.wire_body.unwrap_or_default();
+                                let cb = if rw.sensitive_applied {
+                                    rw.captured_body.unwrap_or_default()
+                                } else {
+                                    wb.clone()
+                                };
+                                let wh = render_response_head(
+                                    h.version,
+                                    h.code,
+                                    &h.reason,
+                                    rw.status,
+                                    &rw.wire_headers,
+                                    false,
+                                    h.close,
+                                    false,
+                                    Some(wb.len()),
+                                );
+                                let ch = if rw.sensitive_applied {
+                                    render_response_head(
+                                        h.version,
+                                        h.code,
+                                        &h.reason,
+                                        rw.status,
+                                        &rw.captured_headers,
+                                        false,
+                                        h.close,
+                                        false,
+                                        Some(cb.len()),
+                                    )
+                                } else {
+                                    wh.clone()
+                                };
+                                let ra = header_retry_after(&rw.wire_headers);
+                                (wh, wb, ch, cb, rw.status, ra)
+                            }
+                            Some(rw) => {
+                                let len_ovr =
+                                    body_len_for_status_change(head_request, h.code, rw.status, &rw.wire_headers);
+                                let wh = render_response_head(
+                                    h.version,
+                                    h.code,
+                                    &h.reason,
+                                    rw.status,
+                                    &rw.wire_headers,
+                                    false,
+                                    h.close,
+                                    false,
+                                    len_ovr,
+                                );
+                                let ch = if rw.sensitive_applied {
+                                    render_response_head(
+                                        h.version,
+                                        h.code,
+                                        &h.reason,
+                                        rw.status,
+                                        &rw.captured_headers,
+                                        false,
+                                        h.close,
+                                        false,
+                                        len_ovr,
+                                    )
+                                } else {
+                                    wh.clone()
+                                };
+                                let ra = header_retry_after(&rw.wire_headers);
+                                (wh, raw_body.clone(), ch, raw_body, rw.status, ra)
+                            }
+                            None => (bytes.clone(), raw_body.clone(), bytes, raw_body, h.code, h.retry_after),
+                        };
+
+                        if !send(cw, &wire_head, idle).await {
+                            return Err("writing to the client failed".to_string());
+                        }
+                        if !wire_body.is_empty() && !send(cw, &wire_body, idle).await {
+                            return Err("writing to the client failed".to_string());
+                        }
+                        cap_sent = cap_sent.saturating_add(cap_head.len() as u64);
+                        tap.response(&cap_head, Some(cap_sent), Some(final_code));
+                        if !cap_body.is_empty() {
+                            tap.response(&cap_body, None, None);
+                        }
+                        if let Some((gov, host)) = pace {
+                            gov.note_response(host, final_code, final_ra.as_deref());
+                        }
+                        let until_close = matches!(framing, Framing::UntilClose);
+                        return Ok((false, clean && !h.close && !until_close));
                     }
-                    continue;
+
+                    // Head-only response rewrite path (zero body buffering).
+                    let rw = rw_ctx.rewrites.apply_response_for_capture(
+                        &rw_ctx.host,
+                        &rw_ctx.req_method,
+                        &rw_ctx.req_target,
+                        &rw_ctx.req_headers,
+                        h.code,
+                        &h.headers,
+                        None,
+                    );
+                    let (wire_head, cap_head, final_code, final_ra) = match rw {
+                        Some(rw) => {
+                            let len_ovr = body_len_for_status_change(head_request, h.code, rw.status, &rw.wire_headers);
+                            let wh = render_response_head(
+                                h.version,
+                                h.code,
+                                &h.reason,
+                                rw.status,
+                                &rw.wire_headers,
+                                false,
+                                h.close,
+                                false,
+                                len_ovr,
+                            );
+                            let ch = if rw.sensitive_applied {
+                                render_response_head(
+                                    h.version,
+                                    h.code,
+                                    &h.reason,
+                                    rw.status,
+                                    &rw.captured_headers,
+                                    false,
+                                    h.close,
+                                    false,
+                                    len_ovr,
+                                )
+                            } else {
+                                wh.clone()
+                            };
+                            let ra = header_retry_after(&rw.wire_headers);
+                            (wh, ch, rw.status, ra)
+                        }
+                        None => (bytes.clone(), bytes, h.code, h.retry_after),
+                    };
+                    if !send(cw, &wire_head, idle).await {
+                        return Err("writing to the client failed".to_string());
+                    }
+                    cap_sent = cap_sent.saturating_add(cap_head.len() as u64);
+                    tap.response(&cap_head, Some(cap_sent), Some(final_code));
+                    if let Some((gov, host)) = pace {
+                        gov.note_response(host, final_code, final_ra.as_deref());
+                    }
+                    break (final_code, framing, h.close);
                 }
                 Ok(None) => {}
                 Err(m) => return Err(m),
@@ -824,7 +1168,6 @@ where
         if code == 101 {
             return Ok((true, false));
         }
-        let mut clean = true;
         while !framing_done(&framing) {
             let data: Vec<u8> = if ubuf.is_empty() {
                 match tokio::time::timeout(idle, ur.read(&mut chunk)).await {

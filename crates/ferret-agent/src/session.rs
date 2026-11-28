@@ -461,6 +461,10 @@ pub enum Input {
     /// The operator pressed stop. The runtime also cancels the running turn through [`Control`];
     /// this input covers what is left when no turn is running.
     Stop,
+    /// Epoch-tagged stop sent by the runtime (`Control::request_stop`). Ignored once a cancelling
+    /// turn or earlier idle stop has already satisfied this epoch, preventing a stale queued stop
+    /// from double-interrupting a newly resumed turn.
+    StopAt(u64),
     /// A `Constraint`, `Approval`, `Withdraw` or `Scope` kept on disk at `file` until it is recorded (see
     /// [`queue_input`]).
     Queued { file: PathBuf, input: Box<Input> },
@@ -853,10 +857,20 @@ pub struct Status {
     pub open_inbox: u32,
 }
 
+/// Internal turn + stop-epoch state shared between a session and its runtime handle.
+#[derive(Debug, Default)]
+struct ControlState {
+    token: CancellationToken,
+    /// Monotonically incremented each time `request_stop` is called.
+    stop_epoch: u64,
+    /// Highest `stop_epoch` already honored by a stopped turn or idle stop handler.
+    handled_epoch: u64,
+}
+
 /// The stop switch a session shares with whoever may stop it.
 #[derive(Debug, Default)]
 pub struct Control {
-    turn: Mutex<CancellationToken>,
+    state: Mutex<ControlState>,
     /// The harness is going down: a cancelled turn is recorded as cut by the restart, and a child is
     /// not settled by it.
     shutting: std::sync::atomic::AtomicBool,
@@ -872,7 +886,17 @@ impl Control {
 
     /// Cancel the turn that is running now, if any. A turn started later is not affected.
     pub fn stop_turn(&self) {
-        self.turn.lock().unwrap_or_else(|p| p.into_inner()).cancel();
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).token.cancel();
+    }
+
+    /// Cancel the running turn (if any) and mint a monotonic stop epoch for the companion
+    /// [`Input::StopAt`] channel signal so that once the active turn handles the cancellation,
+    /// the companion channel stop is recognized as stale and cannot cancel a subsequent turn.
+    pub(crate) fn request_stop(&self) -> u64 {
+        let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        st.stop_epoch = st.stop_epoch.saturating_add(1);
+        st.token.cancel();
+        st.stop_epoch
     }
 
     /// Cancel the running turn because the harness is shutting down. The session records the cut as
@@ -899,13 +923,34 @@ impl Control {
     /// Install and return the token of a new turn.
     pub(crate) fn begin_turn(&self) -> CancellationToken {
         let token = CancellationToken::new();
-        *self.turn.lock().unwrap_or_else(|p| p.into_inner()) = token.clone();
+        let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        st.token = token.clone();
         // Read after the token is installed: a shutdown or close that began before this point is seen
         // here; one that begins after it cancels the installed token.
         if self.is_shutting() || self.is_closed() {
             token.cancel();
         }
         token
+    }
+
+    /// Mark the active turn finished. When `stopped` is true, every stop epoch minted up to now has
+    /// been satisfied by this turn's cancellation so stale companion `Input::StopAt` messages in
+    /// the channel will not cancel a newly resumed turn.
+    pub(crate) fn finish_turn(&self, stopped: bool) {
+        let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if stopped {
+            st.handled_epoch = st.handled_epoch.max(st.stop_epoch);
+        }
+    }
+
+    pub(crate) fn is_stop_stale(&self, epoch: u64) -> bool {
+        let st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        epoch <= st.handled_epoch
+    }
+
+    pub(crate) fn mark_stop_handled(&self, epoch: u64) {
+        let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        st.handled_epoch = st.handled_epoch.max(epoch);
     }
 }
 
@@ -1568,8 +1613,14 @@ pub struct Session {
     /// Replies in a row that made no progress: nudged by the gate, cut off by the output limit with
     /// no complete call, or with only malformed calls.
     nudges: u32,
-    /// The gate's "ended without a tool call" nudge was given in this turn; it is given once.
+    /// The gate's "ended without a tool call" nudge was given since the last real tool call.
     text_nudged: bool,
+    /// Consecutive transient 0-token empty stops retried without an intervening non-empty response
+    /// or tool call.
+    empty_stop_retries: u32,
+    /// True after a `finish` tool call returned an error / was not accepted, until any non-`finish`
+    /// tool call runs. Suppresses `try_implicit_finish` so prose does not loop the same rejection.
+    finish_rejected_since_tool: bool,
     phase: Phase,
     st: State,
     published: Option<Status>,
@@ -1695,6 +1746,33 @@ fn headers_only_messages(messages: &[Message]) -> Vec<Message> {
             m
         })
         .collect()
+}
+
+/// Max retries for transient 0-token empty `FinishReason::Stop` provider glitches before burning a
+/// nudge or ending the turn.
+const EMPTY_STOP_RETRIES: u32 = 2;
+
+/// True when the model server returned an intermittent 0-token empty stop with no text, reasoning,
+/// complete tool calls, or malformed tool calls.
+fn is_transient_empty_stop(c: &Completion) -> bool {
+    let has_complete_or_malformed = c.tool_calls.iter().any(|t| t.complete || !t.name.is_empty());
+    c.finish == FinishReason::Stop
+        && c.text.trim().is_empty()
+        && c.reasoning.trim().is_empty()
+        && !has_complete_or_malformed
+        && c.usage.completion_tokens == 0
+}
+
+/// Short cancellation-aware backoff before retrying a transient 0-token empty stop.
+fn empty_stop_backoff(attempt: u32) -> Duration {
+    if cfg!(test) {
+        Duration::ZERO
+    } else {
+        match attempt {
+            1 => Duration::from_millis(500),
+            _ => Duration::from_millis(1_500),
+        }
+    }
 }
 
 /// Stalls of one step request after which the window is compacted (K2).
@@ -1894,6 +1972,8 @@ impl Session {
             token: CancellationToken::new(),
             nudges: 0,
             text_nudged: false,
+            empty_stop_retries: 0,
+            finish_rejected_since_tool: false,
             phase,
             st,
             published: None,
@@ -2434,6 +2514,14 @@ Name them when you start a new mission instead."
                 Ev::Input(Some(Input::Stop)) if self.deps.shared.is_child() => {
                     return Ok(End::Settled(self.stop_idle_child(texts::REASON_PARENT).await?));
                 }
+                Ev::Input(Some(Input::StopAt(epoch))) if self.deps.shared.is_child() => {
+                    if self.deps.control.is_stop_stale(epoch) {
+                        None
+                    } else {
+                        self.deps.control.mark_stop_handled(epoch);
+                        return Ok(End::Settled(self.stop_idle_child(texts::REASON_PARENT).await?));
+                    }
+                }
                 Ev::Input(Some(Input::PanicStop { reason })) if self.deps.shared.is_child() => {
                     self.note(Author::User, NoteKind::Approval, texts::panic_stopped(reason.as_deref()))?;
                     return Ok(End::Settled(self.stop_idle_child(texts::REASON_OPERATOR).await?));
@@ -2552,13 +2640,18 @@ Name them when you start a new mission instead."
                 let token = self.deps.control.begin_turn();
                 let woven = self.woven();
                 let res = self.compact(&woven, "operator", None, &token).await;
+                self.deps.control.finish_turn(token.is_cancelled());
                 if self.st.clock.as_ref().is_some_and(|c| c.running_from.is_some()) {
                     let _ = self.clock_set(false);
                 }
                 res?;
                 Ok(None)
             }
-            Input::Stop => {
+            Input::StopAt(epoch) if self.deps.control.is_stop_stale(epoch) => Ok(None),
+            Input::Stop | Input::StopAt(_) => {
+                if let Input::StopAt(epoch) = input {
+                    self.deps.control.mark_stop_handled(epoch);
+                }
                 self.stop_between_turns().await?;
                 Ok(None)
             }
@@ -2803,7 +2896,12 @@ Name them when you start a new mission instead."
                 }
             }
             Input::SwitchModel(sw) => self.switch_model(*sw)?,
-            Input::Resume | Input::Compact | Input::Stop | Input::Queued { .. } | Input::DrainQueued => {}
+            Input::Resume
+            | Input::Compact
+            | Input::Stop
+            | Input::StopAt(_)
+            | Input::Queued { .. }
+            | Input::DrainQueued => {}
         }
         Ok(out)
     }
@@ -2949,6 +3047,8 @@ Name them when you start a new mission instead."
         self.token = self.deps.control.begin_turn();
         self.nudges = 0;
         self.text_nudged = false;
+        self.empty_stop_retries = 0;
+        self.finish_rejected_since_tool = false;
         let renewed = renews_budget(trigger, self.st.last_end);
         self.append(Author::Harness, Event::TurnStart { trigger })?;
         self.clock_set(true)?;
@@ -3021,6 +3121,7 @@ Name them when you start a new mission instead."
     fn end_turn(&mut self, reason: TurnEndReason) -> R<()> {
         self.discard_continuation("the turn ended before the queued plan completed")?;
         self.append(Author::Harness, Event::TurnEnd { reason })?;
+        self.deps.control.finish_turn(reason == TurnEndReason::Stopped);
         if self.deps.control.is_shutting() {
             // The published status stays `running`, which is what makes the next start restore the session.
             return Ok(());
@@ -3069,6 +3170,7 @@ Name them when you start a new mission instead."
         let detail: String = settlement.report.lines().next().unwrap_or("").chars().take(DETAIL_CHARS).collect();
         self.append(Author::Harness, Event::TurnEnd { reason })?;
         self.append(Author::Harness, Event::SessionEnd { outcome, detail })?;
+        self.deps.control.finish_turn(d.outcome == ChildOutcome::Stopped);
         self.deps.ctx.capabilities.ptys.close_all().await;
         self.deps.ctx.jobs.kill_all(self.grace()).await;
         if let Some(m) = self.deps.shared.mcp() {
@@ -3198,35 +3300,76 @@ Name them when you start a new mission instead."
             )?;
             self.publish();
 
-            self.clock_set(false)?;
-            let Some(permit) = self.deps.limiter.acquire(self.deps.priority, &token).await else {
-                return self.cancelled().await;
+            let req_tools = w.tools.clone();
+            let mut total_attempts: u32 = 0;
+            let (result, queue_ms) = loop {
+                self.clock_set(false)?;
+                let Some(permit) = self.deps.limiter.acquire(self.deps.priority, &token).await else {
+                    return self.cancelled().await;
+                };
+                self.clock_set(true)?;
+                let request = ChatRequest {
+                    messages: messages.clone(),
+                    tools: req_tools.clone(),
+                    tool_choice: ToolChoice::Auto,
+                    max_tokens: self.deps.client.profile().max_output_tokens,
+                    seed: None,
+                    extra: Map::new(),
+                    images: ImageResolver::for_model(self.deps.client.profile().vision, &self.deps.ctx.blobs),
+                    // A free-form role's text is an answer to the operator and is never run.
+                    text_calls: self.deps.shared.role.termination == ferret_core::event::Termination::Explicit,
+                };
+                self.stall_armed = !stall_folded && est_tokens >= self.compact_at() / 2;
+                self.stall_hit = false;
+                let res = self.complete_streaming(&request, &req_id, &token).await?;
+                self.stall_armed = false;
+                let waited_ms = permit.waited_ms;
+                drop(permit);
+                match res {
+                    Ok((mut c, early)) => {
+                        total_attempts = total_attempts.saturating_add(c.attempts.max(1));
+                        if is_transient_empty_stop(&c) && self.empty_stop_retries < EMPTY_STOP_RETRIES {
+                            early.discard().await;
+                            self.empty_stop_retries = self.empty_stop_retries.saturating_add(1);
+                            tracing::warn!(
+                                session = %self.deps.shared.session,
+                                req_id = %req_id,
+                                retry = self.empty_stop_retries,
+                                max = EMPTY_STOP_RETRIES,
+                                "retrying transient 0-token empty stop from model provider"
+                            );
+                            let delay = empty_stop_backoff(self.empty_stop_retries);
+                            if !delay.is_zero() {
+                                self.clock_set(false)?;
+                                let cancelled = tokio::select! {
+                                    () = token.cancelled() => true,
+                                    () = tokio::time::sleep(delay) => false,
+                                };
+                                self.clock_set(true)?;
+                                if cancelled {
+                                    return self.cancelled().await;
+                                }
+                            } else if token.is_cancelled() {
+                                return self.cancelled().await;
+                            }
+                            continue;
+                        }
+                        if !is_transient_empty_stop(&c) {
+                            self.empty_stop_retries = 0;
+                        }
+                        c.attempts = total_attempts;
+                        break (Ok((c, early)), waited_ms);
+                    }
+                    Err(e) => break (Err(e), waited_ms),
+                }
             };
-            self.clock_set(true)?;
-            let request = ChatRequest {
-                messages,
-                tools: w.tools.clone(),
-                tool_choice: ToolChoice::Auto,
-                max_tokens: self.deps.client.profile().max_output_tokens,
-                seed: None,
-                extra: Map::new(),
-                images: ImageResolver::for_model(self.deps.client.profile().vision, &self.deps.ctx.blobs),
-                // A free-form role's text is an answer to the operator and is never run.
-                text_calls: self.deps.shared.role.termination == ferret_core::event::Termination::Explicit,
-            };
-            self.stall_armed = !stall_folded && est_tokens >= self.compact_at() / 2;
-            self.stall_hit = false;
-            let result = self.complete_streaming(&request, &req_id, &token).await?;
-            self.stall_armed = false;
-            let queue_ms = permit.waited_ms;
-            drop(permit);
             match result {
                 Ok((c, early)) => {
                     if c.usage.prompt_tokens > 0 {
                         self.estimator.calibrate(sent_chars, c.usage.prompt_tokens.saturating_sub(image_tokens));
                     }
                     self.refused_epoch = None;
-                    break (req_id, c, queue_ms, request.tools, early, observed);
+                    break (req_id, c, queue_ms, req_tools, early, observed);
                 }
                 Err(ModelError::Cancelled { .. }) if self.stall_hit && !token.is_cancelled() => {
                     // The same request stalled three times: compact the window (headers only) and ask again.
@@ -3712,8 +3855,11 @@ Name them when you start a new mission instead."
             match input {
                 Input::Compact => force = true,
                 Input::Resume => {}
+                // A companion stop whose epoch was already satisfied by a stopped turn must not
+                // cancel a newly resumed turn.
+                Input::StopAt(epoch) if self.deps.control.is_stop_stale(epoch) => {}
                 // What was sent after the stop is for the idle loop, once this turn has ended `Stopped`.
-                Input::Stop => {
+                Input::Stop | Input::StopAt(_) => {
                     self.token.cancel();
                     break;
                 }
@@ -4181,6 +4327,11 @@ Name them when you start a new mission instead."
         if calls.cancelled {
             return self.cancelled().await;
         }
+        if !complete.is_empty() {
+            // Real tool progress resets the consecutive text-nudge latch so a single transient
+            // glitch early in a long turn never causes a much later glitch to drop out immediately.
+            self.text_nudged = false;
+        }
         if c.finish == FinishReason::Length {
             if complete.is_empty() {
                 if let Some(flow) = self.give_up_if_stuck(texts::repeated_cut, &c.text)? {
@@ -4203,15 +4354,19 @@ Name them when you start a new mission instead."
         let ledger = if shared.journal.is_some() { shared.ledger().ok() } else { None };
         let running_jobs = self.running_jobs().await.len();
         let running_children = self.running_children().await.len();
+        let termination = self.st.termination.unwrap_or(Termination::Explicit);
+        // Wording names only the tools the role is shown (contract T1), not the registry's hidden ones.
+        let shown: Vec<String> = w_tools.iter().map(|t| t.name.clone()).collect();
         if c.text.trim().is_empty() && !c.reasoning.trim().is_empty() {
             if let Some(flow) = self.give_up_if_stuck(texts::repeated_reasoning, &c.text)? {
                 return Ok(flow);
             }
-            self.note(Author::Harness, NoteKind::Nudge, texts::REASONING_ONLY.to_string())?;
+            let text = texts::reasoning_only_nudge(&shown, termination, self.nudges);
+            self.note(Author::Harness, NoteKind::Nudge, text)?;
             return Ok(Flow::Next);
         }
-        let termination = self.st.termination.unwrap_or(Termination::Explicit);
         if self.deps.agents.implicit_finish
+            && !self.finish_rejected_since_tool
             && termination == Termination::Explicit
             && running_jobs == 0
             && running_children == 0
@@ -4223,8 +4378,6 @@ Name them when you start a new mission instead."
                 return Ok(flow);
             }
         }
-        // Wording names only the tools the role is shown (contract T1), not the registry's hidden ones.
-        let shown: Vec<String> = w_tools.iter().map(|t| t.name.clone()).collect();
         let verdict = gate::on_yield(&YieldCtx {
             termination,
             is_child: shared.is_child(),
@@ -4239,8 +4392,22 @@ Name them when you start a new mission instead."
         match verdict {
             Yield::End => Ok(Flow::End(TurnEndReason::Yielded)),
             Yield::Nudge(_) if self.text_nudged => {
-                // Contract T2: one "ended without a tool call" nudge per turn; the second such reply ends it.
-                Ok(Flow::End(TurnEndReason::Yielded))
+                if shared.is_child() {
+                    // Explicit-termination children/judges must NEVER end in `Yielded`, which
+                    // emits no `ChildCompleted` settlement and deadlocks the parent's await.
+                    let report = texts::gave_up_report(self.nudges, &c.text);
+                    Ok(Flow::Settle(delivery(ChildOutcome::Failed, report)))
+                } else if c.text.trim().is_empty() {
+                    // Exhausted empty/0-token replies on an explicit lead park visibly with an
+                    // operator inbox item instead of silently stalling in `phase: idle`.
+                    let park = gate::park_empty_reply(ledger.as_ref(), self.nudges.saturating_add(1));
+                    self.open_inbox(InboxKind::Parked, park)?;
+                    Ok(Flow::End(TurnEndReason::Parked))
+                } else {
+                    // Contract T2: one "ended without a tool call" nudge per consecutive prose
+                    // stretch on a lead; the second consecutive non-empty text reply ends it.
+                    Ok(Flow::End(TurnEndReason::Yielded))
+                }
             }
             Yield::Nudge(text) => {
                 self.text_nudged = true;
@@ -4479,10 +4646,19 @@ Name them when you start a new mission instead."
                 }
             }
             self.flush_emitted()?;
+            let skipped_after_ender = ender.is_some();
             if let Some(effect) = self.deps.shared.take_effect() {
                 if out.effect.is_none() {
                     ender = Some(call.name.clone());
                     out.effect = Some(effect);
+                }
+            }
+            if !skipped_after_ender {
+                self.empty_stop_retries = 0;
+                if policy_name == "finish" {
+                    self.finish_rejected_since_tool = !ok || out.effect.is_none();
+                } else {
+                    self.finish_rejected_since_tool = false;
                 }
             }
             if ok {
@@ -4784,6 +4960,7 @@ mod tests {
                 intercept: false,
                 target: None,
                 creds: None,
+                creds_profiles: Vec::new(),
                 title: "test".into(),
                 project_instructions: Vec::new(),
                 mcp: Vec::new(),
@@ -8663,9 +8840,11 @@ mod tests {
         fx.agents.max_nudges = 1;
         let end = run_with(fx.create(), vec![]).await;
         assert!(matches!(end, End::Settled(ref s) if s.outcome == ChildOutcome::Failed));
-        assert!(notes(&fx.sink.records(), NoteKind::Nudge).iter().any(|n| n == texts::REASONING_ONLY));
+        let nudges = notes(&fx.sink.records(), NoteKind::Nudge);
+        assert_eq!(nudges.len(), 1);
+        assert!(nudges[0].contains("reasoning") && nudges[0].contains("`finish`"), "{}", nudges[0]);
         assert_eq!(fx.server.requests().len(), 2);
-        assert!(!notes(&fx.sink.records(), NoteKind::Nudge).join(" ").contains("private thought"));
+        assert!(!nudges.join(" ").contains("private thought"));
     }
 
     #[tokio::test]
@@ -8717,7 +8896,10 @@ mod tests {
         .await;
         run_with(fx.create(), vec![user("go")]).await;
         assert_eq!(fx.server.requests().len(), 2);
-        assert_eq!(notes(&fx.sink.records(), NoteKind::Nudge), [texts::REASONING_ONLY]);
+        let nudges = notes(&fx.sink.records(), NoteKind::Nudge);
+        assert_eq!(nudges.len(), 1);
+        assert!(nudges[0].contains("reasoning") && nudges[0].contains("visible answer directly"), "{}", nudges[0]);
+        assert!(!nudges[0].contains("hidden"));
         assert_eq!(turn_ends(&fx.sink.records()), [TurnEndReason::Yielded]);
     }
     #[tokio::test]
@@ -9276,5 +9458,168 @@ mod tests {
         wait_until(&fx2.sink, "chat turn 2", |rs| count(rs, "turn_end") == 2).await;
         assert!(compactions(&fx2.sink.records()).is_empty());
         finish_task(tx2, task2).await;
+    }
+
+    #[tokio::test]
+    async fn transient_zero_token_empty_stops_are_retried_and_reset_after_progress() {
+        let mut role_def = core_role("lead");
+        role_def.tools.retain(|t| t != "conclude" && t != "request_scope");
+        let agents = AgentsCfg { verify_finish: false, ..AgentsCfg::default() };
+        let empty = || -> Action { Reply::text("").into() };
+        let script = seq(vec![
+            empty(),
+            empty(),
+            bash("echo recovered").into(),
+            empty(),
+            empty(),
+            finish_call("all good").into(),
+        ]);
+        let mut fx = Fx::build_with(role_def, "lead", false, true, agents, script).await;
+        let session = fx.create();
+        run_with(session, vec![user("go")]).await;
+        let rs = fx.sink.records();
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Finished], "{:?}", kinds(&rs));
+        assert!(notes(&rs, NoteKind::Nudge).is_empty(), "transient empty stops must not burn nudges");
+        assert_eq!(fx.server.requests().len(), 6, "2 retries + 1 success twice");
+        let responses: Vec<&ModelResponse> = rs
+            .iter()
+            .filter_map(|r| match &r.event {
+                Event::ModelResponse(m) => Some(m),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(responses.len(), 2, "only the recovered replies are recorded as ModelResponse");
+        assert_eq!(responses[0].attempts, 3);
+        assert_eq!(responses[1].attempts, 3);
+        assert_no_cache_break(&rs);
+    }
+
+    #[tokio::test]
+    async fn text_nudged_resets_after_real_tool_progress() {
+        let mut role_def = core_role("lead");
+        role_def.tools.retain(|t| t != "conclude" && t != "request_scope");
+        let agents = AgentsCfg { max_nudges: 3, verify_finish: false, ..AgentsCfg::default() };
+        let script = seq(vec![
+            Reply::text("early prose glitch").into(),
+            bash("echo progress").into(),
+            Reply::text("late prose glitch").into(),
+            finish_call("completed after second nudge").into(),
+        ]);
+        let mut fx = Fx::build_with(role_def, "lead", false, true, agents, script).await;
+        let session = fx.create();
+        run_with(session, vec![user("go")]).await;
+        let rs = fx.sink.records();
+        assert_eq!(notes(&rs, NoteKind::Nudge).len(), 2, "second prose after tool work gets nudged, not yielded");
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Finished]);
+        assert_eq!(fx.server.requests().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn explicit_child_never_strands_on_yielded_with_default_max_nudges() {
+        // 1) Verifier/judge child hitting repeated 0-token empty stops with default max_nudges=3
+        //    must settle Failed (emitting ChildCompleted) rather than Yielded.
+        let empty_script = seq(vec![Reply::text("").into(); 8]);
+        let agents = AgentsCfg { max_nudges: 3, verify_finish: false, ..AgentsCfg::default() };
+        let mut judge = Fx::build("verifier", true, true, agents.clone(), empty_script).await;
+        let session = judge.create_with(Budget::default(), Some((SessionId::from("s-lead"), "Verify".into())));
+        let End::Settled(s) = run_with(session, vec![]).await else {
+            panic!("explicit verifier child must settle, never yield");
+        };
+        assert_eq!(s.outcome, ChildOutcome::Failed);
+        let jrs = judge.sink.records();
+        assert!(!turn_ends(&jrs).contains(&TurnEndReason::Yielded), "{:?}", turn_ends(&jrs));
+        assert!(jrs.iter().any(|r| matches!(r.event, Event::ChildCompleted(_))));
+        // Step 1: 1 initial + 2 retries = 3 requests -> nudge; Step 2: retries exhausted -> 1 request -> settle Failed.
+        assert_eq!(judge.server.requests().len(), 4);
+
+        // 2) Worker child hitting 2 consecutive prose replies (implicit_finish=false, max_nudges=3)
+        //    must settle Failed rather than silently Yielded.
+        let prose_script = seq(vec![Reply::text("prose 1").into(), Reply::text("prose 2").into()]);
+        let worker_agents =
+            AgentsCfg { max_nudges: 3, implicit_finish: false, verify_finish: false, ..AgentsCfg::default() };
+        let mut worker = Fx::build("worker", true, true, worker_agents, prose_script).await;
+        let session = worker.create_with(Budget::default(), Some((SessionId::from("s-lead"), "Do work".into())));
+        let End::Settled(w) = run_with(session, vec![]).await else {
+            panic!("explicit worker child must settle Failed, never yield");
+        };
+        assert_eq!(w.outcome, ChildOutcome::Failed);
+        assert!(!turn_ends(&worker.sink.records()).contains(&TurnEndReason::Yielded));
+    }
+
+    #[tokio::test]
+    async fn explicit_lead_parks_visibly_on_exhausted_empty_stops_instead_of_silent_yielded() {
+        let agents = AgentsCfg { max_nudges: 3, verify_finish: false, ..AgentsCfg::default() };
+        let script = seq(vec![Reply::text("").into(); 8]);
+        let mut fx = Fx::build("lead", false, true, agents, script).await;
+        let session = fx.create();
+        run_with(session, vec![user("go")]).await;
+        let rs = fx.sink.records();
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Parked], "must park instead of silent Yielded");
+        let items = inbox(&rs);
+        assert_eq!(items.len(), 1, "must open a blocking Parked inbox item: {items:?}");
+        assert_eq!((items[0].kind, items[0].blocking), (InboxKind::Parked, true));
+        assert!(items[0].text.contains("empty reply"), "{}", items[0].text);
+        assert_eq!(fx.sink.last_status().unwrap().open_inbox, 1);
+        // Step 1: 3 attempts (initial + 2 retries) -> nudge; Step 2: 1 attempt -> park.
+        assert_eq!(fx.server.requests().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn reasoning_only_nudge_is_role_aware_for_verifier_and_escalates() {
+        let script = seq(vec![Reply::text("").with_reasoning("long hidden deliberation").into(); 4]);
+        let agents = AgentsCfg { max_nudges: 2, verify_finish: false, ..AgentsCfg::default() };
+        let mut fx = Fx::build("verifier", true, true, agents, script).await;
+        let session = fx.create_with(Budget::default(), Some((SessionId::from("s-lead"), "Judge it".into())));
+        let End::Settled(s) = run_with(session, vec![]).await else {
+            panic!("verifier must settle Failed after max reasoning-only nudges");
+        };
+        assert_eq!(s.outcome, ChildOutcome::Failed);
+        let nudges = notes(&fx.sink.records(), NoteKind::Nudge);
+        assert_eq!(nudges.len(), 2, "{nudges:?}");
+        assert!(nudges[0].contains("`verdict`") && !nudges[0].contains("`finish`"), "{}", nudges[0]);
+        assert!(nudges[0].contains("minimal"), "{}", nudges[0]);
+        assert_ne!(nudges[0], nudges[1], "repeated reasoning-only nudge should escalate");
+        assert!(nudges[1].contains("attempt 2") && nudges[1].contains("`verdict`"), "{}", nudges[1]);
+        assert!(!nudges.join(" ").contains("long hidden deliberation"));
+    }
+
+    #[tokio::test]
+    async fn rejected_finish_suppresses_implicit_finish_until_another_tool_runs() {
+        let script = seq(vec![
+            bash("echo 42").into(),
+            // 1st prose triggers implicit_finish -> rejected because goal is unconcluded.
+            Reply::text("First premature prose summary").into(),
+            // 2nd prose MUST NOT re-trigger implicit_finish; it gets a normal nudge instead.
+            Reply::text("Second prose without any tool call").into(),
+            // Any non-finish tool call resets `finish_rejected_since_tool`.
+            bash("echo 43").into(),
+            // 3rd prose may now trigger implicit_finish once more (rejected again since still unconcluded).
+            Reply::text("Third prose after new tool work").into(),
+            Reply::tool(
+                "report_blocker",
+                json!({"class": "impossible", "what": "blocked", "tried": "echo", "needs": "operator"}).to_string(),
+            )
+            .into(),
+        ]);
+        let agents = AgentsCfg { implicit_finish: true, max_nudges: 4, verify_finish: false, ..AgentsCfg::default() };
+        let mut fx = Fx::build("lead", false, true, agents, script).await;
+        fx.track_producers();
+        let session = fx.create();
+        run_with(session, vec![user("go")]).await;
+        let rs = fx.sink.records();
+        let implicit_finishes: Vec<_> = results(&rs)
+            .into_iter()
+            .filter(|r| r.name == "finish" && r.call_id.0.starts_with("implicit_finish_"))
+            .collect();
+        assert_eq!(
+            implicit_finishes.len(),
+            2,
+            "must skip implicit_finish on consecutive prose after rejection and re-enable after bash: {implicit_finishes:?}"
+        );
+        assert!(
+            notes(&rs, NoteKind::Nudge).iter().any(|n| n.contains("ended without a tool call")),
+            "second prose should fall through to normal gate nudge"
+        );
+        assert_eq!(turn_ends(&rs), vec![TurnEndReason::Blocked]);
     }
 }

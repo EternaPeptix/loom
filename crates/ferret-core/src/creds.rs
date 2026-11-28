@@ -619,6 +619,12 @@ impl Secrets {
 
     /// The set for injected items: each value, and the token of a `<scheme> <token>` header value.
     pub fn for_items(items: &[Item]) -> Secrets {
+        Self::for_many_items(items)
+    }
+
+    /// The unified secret set across multiple credential profiles' items: each value and, for a
+    /// `header` value `<scheme> <token>` (one space, token without spaces), the token too.
+    pub fn for_many_items<'a>(items: impl IntoIterator<Item = &'a Item>) -> Secrets {
         let mut all = Vec::new();
         for i in items {
             all.push(i.value.clone());
@@ -627,6 +633,15 @@ impl Secrets {
                     all.push(token.to_string());
                 }
             }
+        }
+        Secrets::new(all)
+    }
+
+    /// Combine multiple [`Secrets`] sets into one unified longest-first, deduplicated redactor.
+    pub fn union(sets: &[&Secrets]) -> Secrets {
+        let mut all = Vec::new();
+        for set in sets {
+            all.extend(set.values.iter().cloned());
         }
         Secrets::new(all)
     }
@@ -1004,5 +1019,31 @@ mod tests {
         let d = format!("{:?}", items[0]);
         assert!(!d.contains("tok-tok-tok") && d.contains("[redacted]"));
         assert!(!format!("{:?}", prof()).contains("abcdef123456"));
+    }
+
+    #[test]
+    fn secrets_for_many_items_and_union_redact_longest_first_across_principals() {
+        let user_a = [
+            item(ItemKind::Cookie, "sid", "user-a-session", "a.test"),
+            item(ItemKind::Header, "Authorization", "Bearer shared-token", "a.test"),
+        ];
+        let admin = [
+            item(ItemKind::Cookie, "sid", "user-a-session-extended-admin", "a.test"),
+            item(ItemKind::Header, "Authorization", "Bearer shared-token-admin-99", "a.test"),
+            item(ItemKind::Cookie, "short", "tiny", "a.test"),
+        ];
+
+        let many = Secrets::for_many_items(user_a.iter().chain(admin.iter()));
+        let text =
+            "a=user-a-session b=user-a-session-extended-admin c=Bearer shared-token-admin-99 d=shared-token e=tiny";
+        assert_eq!(many.redact(text), "a=[redacted] b=[redacted] c=[redacted] d=[redacted] e=tiny");
+
+        let s_a = Secrets::for_items(&user_a);
+        let s_admin = Secrets::for_items(&admin);
+        let merged = Secrets::union(&[&s_a, &s_admin]);
+        assert_eq!(merged, many);
+        assert_eq!(merged.redact(text), "a=[redacted] b=[redacted] c=[redacted] d=[redacted] e=tiny");
+        assert!(Secrets::union(&[]).is_empty());
+        assert!(!format!("{merged:?}").contains("shared-token"));
     }
 }

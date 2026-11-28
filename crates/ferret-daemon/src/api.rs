@@ -83,6 +83,7 @@
 //! | `POST /targets` (`TargetBody`; `name` required) | `runtime.target_create` (`409` for a name in use or a scope entry that is not valid) | `201` `TargetView` |
 //! | `GET /targets/{name}` | `runtime.target_show` (`404` for no such target) | `TargetView` |
 //! | `PUT /targets/{name}` (`TargetBody`; what is left out stays) | `runtime.target_update` | `TargetView` |
+//! | `POST /targets/{name}/import-scope` (`ScopeImportBody`, max 4 MiB) | `runtime.target_import_scope` (`404` for unknown target, `400`/`409` for parse/validation errors, `413` over 4 MiB) | `ScopeImportResult` |
 //! | `GET /targets/{name}/graph?status=&kind=&under=` | `runtime.target_graph`: nodes with status, missions and evidence keys; the edges between them | `GraphView` |
 //! | `GET /targets/{name}/exchanges?node=&limit={n}` | `runtime.target_exchanges`: the exchanges of every mission of the target with that node (id or locator), newest last | `[ExchangeEntry]` |
 //! | `GET /targets/{name}/creds` | `runtime.creds_list` (CONTRACTS-TRAFFIC-TARGETS S7; no values) | `[ProfileSummary]` |
@@ -176,8 +177,8 @@ use crate::ui;
 use crate::wire::{
     AnswerBody, ApprovalBody, ArchiveBody, CreatedSession, DirsView, DiskSpace, ErrorBody, FileLinesView, FilesView,
     GcBody, LinesView, McpCheckBody, MessageBody, MessageWhen, ModelBody, ModelsView, PanicBody, QueuedEditBody,
-    QueuedReceipt, ReleaseBody, RenameBody, RoleModelBody, RuleBody, ScopeBody, ScopeRevokeBody, SessionDetail,
-    SignalHealth, StatusView, UploadView, WithdrawBody,
+    QueuedReceipt, ReleaseBody, RenameBody, RoleModelBody, RuleBody, ScopeBody, ScopeImportBody, ScopeRevokeBody,
+    SessionDetail, SignalHealth, StatusView, UploadView, WithdrawBody,
 };
 use axum::body::{Body, Bytes};
 use axum::extract::rejection::BytesRejection;
@@ -239,6 +240,7 @@ const LINES_DEFAULT_END: u64 = 2_000;
 const LINES_MAX: u64 = 5_000;
 const KEEP_ALIVE: Duration = Duration::from_secs(15);
 const HAR_IMPORT_MAX_BYTES: usize = 32 * 1024 * 1024;
+const SCOPE_IMPORT_MAX_BYTES: usize = 4 * 1024 * 1024;
 /// Events a stream task may queue for a client that reads slowly before it waits for it.
 const STREAM_BUFFER: usize = 256;
 
@@ -294,6 +296,10 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/exchanges/{session}", get(session_exchanges))
         .route("/api/targets", get(targets).post(target_create))
         .route("/api/targets/{name}", get(target_show).put(target_update))
+        .route(
+            "/api/targets/{name}/import-scope",
+            post(target_import_scope).layer(DefaultBodyLimit::max(SCOPE_IMPORT_MAX_BYTES)),
+        )
         .route("/api/targets/{name}/graph", get(target_graph))
         .route("/api/targets/{name}/exchanges", get(target_exchanges))
         .route("/api/targets/{name}/creds", get(creds_list).post(creds_post))
@@ -1109,6 +1115,48 @@ async fn target_update(State(s): State<ApiState>, Path(name): Path<String>, body
     let body: TargetBody = json_body(&body)?;
     let rt = s.runtime.clone();
     Ok(Json(blocking(move || rt.target_update(&name, &body).map_err(rt_err)).await?).into_response())
+}
+
+async fn target_import_scope(
+    State(s): State<ApiState>,
+    Path(name): Path<String>,
+    body: Result<Bytes, BytesRejection>,
+) -> Res<Response> {
+    let body = body.map_err(|e| {
+        if e.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            ApiError::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "The scope import body is larger than {} MiB. Send a smaller scope file.",
+                    SCOPE_IMPORT_MAX_BYTES >> 20
+                ),
+            )
+        } else {
+            ApiError::bad_body(e.body_text())
+        }
+    })?;
+    let body: ScopeImportBody = json_body(&body)?;
+    let rt = s.runtime.clone();
+    let res = blocking(move || {
+        rt.target_import_scope(&name, &body.format, &body.payload).map_err(|e| {
+            if e.starts_with("There is no") || e.starts_with("No ") {
+                ApiError::new(StatusCode::NOT_FOUND, e)
+            } else if e.contains("empty")
+                || e.contains("unsupported scope format")
+                || e.contains("could not auto-detect")
+                || e.contains("parse")
+                || e.contains("JSON")
+                || e.contains("CSV")
+                || e.contains("invalid")
+            {
+                ApiError::new(StatusCode::BAD_REQUEST, e)
+            } else {
+                ApiError::new(StatusCode::CONFLICT, e)
+            }
+        })
+    })
+    .await?;
+    Ok(Json(res).into_response())
 }
 
 async fn target_graph(State(s): State<ApiState>, Path(name): Path<String>, q: RawQuery) -> Res<Response> {
@@ -4370,6 +4418,142 @@ done
         assert_eq!(s, 200, "{b_reason}");
         assert!(b_reason["connections_cut"].is_u64());
 
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn target_import_scope_route_enforces_auth_limits_and_merges_scope() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+
+        // 1. Unknown target -> 404.
+        let (st, b) = e.post("/api/targets/missing/import-scope", json!({"payload": "api.acme.test"})).await;
+        assert_eq!(st, 404, "{b}");
+
+        // 2. Create target.
+        let (st, b) = e.post("/api/targets", json!({"name": "acme", "scope": ["app.acme.test"]})).await;
+        assert_eq!(st, 201, "{b}");
+
+        // 3. Auth & CSRF gates apply to POST /api/targets/{name}/import-scope.
+        let r_unauth = e
+            .http
+            .post(e.url("/api/targets/acme/import-scope"))
+            .json(&json!({"payload": "api.acme.test"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_unauth.status().as_u16(), 401);
+        let r_csrf = e
+            .rq(Method::POST, "/api/targets/acme/import-scope")
+            .header(header::ORIGIN, "http://evil.example")
+            .json(&json!({"payload": "api.acme.test"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_csrf.status().as_u16(), 403);
+
+        // 4. Unknown field -> 400 (deny_unknown_fields).
+        let (st, _) =
+            e.post("/api/targets/acme/import-scope", json!({"payload": "api.acme.test", "extra": true})).await;
+        assert_eq!(st, 400);
+
+        // 5. Empty payload or unsupported format -> 400.
+        let (st, _) = e.post("/api/targets/acme/import-scope", json!({"payload": "   "})).await;
+        assert_eq!(st, 400);
+        let (st, _) =
+            e.post("/api/targets/acme/import-scope", json!({"format": "bogus", "payload": "api.acme.test"})).await;
+        assert_eq!(st, 400);
+
+        // 6. Valid HackerOne JSON with omitted format (defaults to "auto") -> 200 OK.
+        let h1 = serde_json::json!({
+            "structured_scopes": [
+                { "asset_type": "URL", "asset_identifier": "https://api.acme.test/v1", "eligible_for_submission": true },
+                { "asset_type": "WILDCARD", "asset_identifier": "*.cdn.acme.test", "eligible_for_submission": true },
+                { "asset_type": "URL", "asset_identifier": "https://status.acme.test", "eligible_for_submission": false }
+            ]
+        })
+        .to_string();
+        let (st, b) = e.post("/api/targets/acme/import-scope", json!({"payload": h1})).await;
+        assert_eq!(st, 200, "{b}");
+        assert_eq!(b["target"], "acme");
+        assert_eq!(b["format"], "hackerone");
+        assert_eq!(b["added_scope"], 2);
+        assert_eq!(b["added_exclude"], 1);
+        assert_eq!(b["total_scope"], 3);
+        assert_eq!(b["total_exclude"], 1);
+
+        // 7. Re-importing the same scope is idempotent (+0/+0).
+        let (st, b2) = e.post("/api/targets/acme/import-scope", json!({"format": "hackerone", "payload": h1})).await;
+        assert_eq!(st, 200, "{b2}");
+        assert_eq!(b2["added_scope"], 0);
+        assert_eq!(b2["added_exclude"], 0);
+        assert_eq!(b2["total_scope"], 3);
+        assert_eq!(b2["total_exclude"], 1);
+
+        // 8. Body over 4 MiB -> 413 Payload Too Large.
+        let oversized = format!(r#"{{"payload":"{}"}}"#, "a".repeat(SCOPE_IMPORT_MAX_BYTES + 64));
+        let r_big = e
+            .rq(Method::POST, "/api/targets/acme/import-scope")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(oversized)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_big.status().as_u16(), 413);
+
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn create_session_passes_through_multi_principal_creds_profiles_without_leaking_secrets() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        let (st, b) = e.post("/api/targets", json!({"name": "acme", "scope": ["*.acme.test"]})).await;
+        assert_eq!(st, 201, "{b}");
+        let secret_a = "tok-user-a-9f8e7d";
+        let secret_b = "tok-user-b-6c5b4a";
+        let (st, b) = e
+            .post(
+                "/api/targets/acme/creds",
+                json!({"set": {"profile": "user_a", "items": [{"kind": "header", "name": "Authorization", "value": format!("Bearer {secret_a}"), "host": "api.acme.test"}]}}),
+            )
+            .await;
+        assert_eq!(st, 200, "{b}");
+        let (st, b) = e
+            .post(
+                "/api/targets/acme/creds",
+                json!({"set": {"profile": "user_b", "items": [{"kind": "header", "name": "Authorization", "value": format!("Bearer {secret_b}"), "host": "api.acme.test"}]}}),
+            )
+            .await;
+        assert_eq!(st, 200, "{b}");
+
+        let (st, created) = e
+            .post(
+                "/api/sessions",
+                json!({
+                    "workspace": e.ws,
+                    "role": "chat",
+                    "target": "acme",
+                    "creds": "user_a",
+                    "creds_profiles": ["user_a", "user_b"]
+                }),
+            )
+            .await;
+        assert_eq!(st, 201, "{created}");
+        let raw = created.to_string();
+        assert!(!raw.contains(secret_a) && !raw.contains(secret_b), "secrets must never appear in SessionInfo");
+        assert_eq!(created["creds"]["profile"], "user_a");
+        let profiles: Vec<&str> = created["creds_profiles"]
+            .as_array()
+            .expect("creds_profiles array")
+            .iter()
+            .filter_map(|v| v["profile"].as_str())
+            .collect();
+        assert_eq!(profiles, vec!["user_a", "user_b"]);
+
+        let sid = created["id"].as_str().unwrap();
+        let (st, detail) = e.get(&format!("/api/sessions/{sid}")).await;
+        assert_eq!(st, 200, "{detail}");
+        assert_eq!(detail["creds"]["profile"], "user_a");
+        assert_eq!(detail["creds_profiles"].as_array().map(Vec::len), Some(2));
         e.rt.shutdown().await;
     }
 }

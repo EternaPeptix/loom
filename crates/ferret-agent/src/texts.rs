@@ -12,7 +12,7 @@
 //! never phrased as a judgment of the work or the worker. A well-evidenced negative conclusion is
 //! a reportable outcome, and the texts that gate `conclude`/`finish` say so.
 
-use ferret_core::event::{ChildOutcome, EvidenceGrade};
+use ferret_core::event::{ChildOutcome, EvidenceGrade, Termination};
 
 /// Longest excerpt of a model reply quoted back in a harness text.
 pub const REPLY_EXCERPT_CHARS: usize = 2_000;
@@ -330,7 +330,7 @@ pub fn scope_request(hosts: &[String], why: &str) -> String {
 /// The result of `request_scope`: nothing was granted.
 pub fn scope_requested(hosts: &[String]) -> String {
     format!(
-        "Your request for network access to {} is in the operator's inbox. Nothing is authorized yet. Carry on with what you can do without it, and do not try to reach {} until the authorization appears in your harness-state (the authorized hosts line) or the operator tells you so.",
+        "Your request for network access to {} is in the operator's inbox as an actionable approval item. Do not also call `ask_user` for the same scope approval — that would create a duplicate inbox item. Nothing is authorized yet. Carry on with what you can do without it, and do not try to reach {} until the authorization appears in your harness-state (the authorized hosts line) or the operator tells you so.",
         hosts.join(", "),
         if hosts.len() == 1 { "that host" } else { "those hosts" }
     )
@@ -1086,6 +1086,70 @@ pub fn same_verifier_profile(profile: &str) -> String {
 
 /// No reasoning is copied into the nudge or the operator's result.
 pub const REASONING_ONLY: &str = "The server ended with reasoning but no visible answer or complete tool call. Send one short complete tool call without a prose body, or provide a visible answer if your role permits plain replies. If no further work can be established, use your role's delivery or blocker tool.";
+
+/// Role-aware nudge when a model emits reasoning with no visible answer and no complete tool call.
+/// Names only tools present in `tools` (the role's shown tools) so judges, verifiers, researchers,
+/// and leads receive concrete next-step guidance instead of the same generic prompt every step.
+pub fn reasoning_only_nudge(tools: &[String], termination: Termination, attempt: u32) -> String {
+    let has = |name: &str| tools.iter().any(|t| t == name);
+    let is_verifier = has("verdict");
+    let first_steps: Vec<&str> = if is_verifier {
+        ["read", "out_read", "ledger", "log_search", "grep", "out_grep", "bash"]
+            .into_iter()
+            .filter(|t| has(t))
+            .take(3)
+            .collect()
+    } else {
+        ["bash", "http_send", "read", "grep", "web_fetch", "ledger", "glob"]
+            .into_iter()
+            .filter(|t| has(t))
+            .take(3)
+            .collect()
+    };
+    let mut examples: Vec<String> = first_steps.iter().map(|t| format!("`{t}`")).collect();
+    if is_verifier {
+        examples.push("`verdict`".to_string());
+    } else if has("finish") {
+        examples.push("`finish`".to_string());
+    }
+    let tool_hint = match examples.as_slice() {
+        [] => String::new(),
+        [one] => format!(" (such as {one})"),
+        [a, b] => format!(" (such as {a} or {b})"),
+        [init @ .., last] => format!(" (such as {}, or {last})", init.join(", ")),
+    };
+
+    let mut out = if attempt >= 2 {
+        format!(
+            "The server ended with reasoning but no visible answer or complete tool call again (attempt {attempt}). Stop deliberating: keep internal reasoning to one sentence and emit ONE short complete tool call right now{tool_hint} with no prose body."
+        )
+    } else {
+        format!(
+            "The server ended with reasoning but no visible answer or complete tool call. Keep internal reasoning minimal and emit ONE short complete tool call right now{tool_hint} with no prose body."
+        )
+    };
+
+    if termination == Termination::Free {
+        out.push_str(" Or provide a brief visible answer directly.");
+    } else {
+        let deliver = if is_verifier {
+            Some("To deliver your decision immediately, call `verdict`")
+        } else if has("finish") {
+            Some("To deliver your result, call `finish`")
+        } else {
+            None
+        };
+        let blocker = has("report_blocker");
+        match (deliver, blocker) {
+            (Some(d), true) => out.push_str(&format!(" {d}; if you cannot proceed, call `report_blocker`.")),
+            (Some(d), false) => out.push_str(&format!(" {d}.")),
+            (None, true) => out.push_str(" If you cannot proceed, call `report_blocker`."),
+            (None, false) => {}
+        }
+    }
+    out
+}
+
 pub fn repeated_reasoning(n: u32) -> String {
     format!("The model produced reasoning without a visible answer or complete tool call {n} times in a row.")
 }
@@ -1827,5 +1891,28 @@ mod tests {
         assert_eq!(mime_for("a.bin", Some("Image/WebP; q=1")), "image/webp");
         assert_eq!(mime_for("noext", None), "application/octet-stream");
         assert_eq!(mime_for(".hidden", None), "application/octet-stream");
+    }
+
+    #[test]
+    fn reasoning_only_nudge_tailors_to_shown_tools_and_escalates() {
+        let judge_tools: Vec<String> =
+            ["verdict", "read", "ledger", "report_blocker"].into_iter().map(String::from).collect();
+        let n1 = reasoning_only_nudge(&judge_tools, Termination::Explicit, 1);
+        assert!(n1.contains("`read`") && n1.contains("`ledger`") && n1.contains("`verdict`"), "{n1}");
+        assert!(n1.contains("`report_blocker`") && n1.contains("minimal"), "{n1}");
+        assert!(!n1.contains("`finish`") && !n1.contains("`bash`") && !n1.contains("visible answer directly"), "{n1}");
+
+        let n2 = reasoning_only_nudge(&judge_tools, Termination::Explicit, 2);
+        assert_ne!(n1, n2);
+        assert!(n2.contains("attempt 2") && n2.contains("Stop deliberating"), "{n2}");
+
+        let researcher_tools: Vec<String> = ["bash", "http_send", "finish"].into_iter().map(String::from).collect();
+        let r1 = reasoning_only_nudge(&researcher_tools, Termination::Explicit, 1);
+        assert!(r1.contains("`bash`") && r1.contains("`http_send`") && r1.contains("`finish`"), "{r1}");
+        assert!(!r1.contains("`verdict`") && !r1.contains("`report_blocker`"), "{r1}");
+
+        let chat_tools: Vec<String> = ["bash", "read"].into_iter().map(String::from).collect();
+        let c1 = reasoning_only_nudge(&chat_tools, Termination::Free, 1);
+        assert!(c1.contains("visible answer directly") && c1.contains("`bash`"), "{c1}");
     }
 }

@@ -321,6 +321,17 @@ pub struct ModelSwitched {
     pub reason: String,
 }
 
+/// A passive security signal detected while inspecting a captured HTTP exchange.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PassiveSignal {
+    pub kind: String,
+    /// "info" | "low" | "medium" | "high"
+    pub severity: String,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub detail: String,
+}
+
 /// What one MCP server offered when a mission started (docs/CONTRACTS-MCP.md M6). Recorded in the lead's
 /// `session_start` so every session of the mission, and a session opened from its log, presents the same
 /// tools for its whole life.
@@ -362,6 +373,12 @@ pub struct Exchange {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub upstream_unverified: bool,
     pub duration_ms: u64,
+    /// Passive security signals detected on the post-redaction exchange.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub passive_signals: Vec<PassiveSignal>,
+    /// Principal / credential profile used for this exchange (for example `"anon"` or `"user_a"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
 }
 
 /// The named target a mission works on, as recorded at its start (CONTRACTS-TRAFFIC-TARGETS T2, T5).
@@ -481,6 +498,9 @@ pub struct SessionStart {
     /// The credential profile attached to the mission's in-scope requests (S3); a child takes its lead's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub creds: Option<CredsRef>,
+    /// All credential profiles mounted on a multi-principal mission (names and redaction-safe summaries only, never values).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub creds_profiles: Vec<CredsRef>,
     /// Log format version; absent in logs written before the field existed (version 1). A log with
     /// a higher number is read-only for this build.
     #[serde(default = "schema_v1")]
@@ -1213,6 +1233,7 @@ mod tests {
                     intercept: false,
                     target: None,
                     creds: None,
+                    creds_profiles: Vec::new(),
                     title: "t".into(),
                     project_instructions: Vec::new(),
                     mcp: Vec::new(),
@@ -1567,5 +1588,88 @@ mod tests {
             assert_eq!(serde_json::from_value::<EvidenceGrade>(json!(word)).unwrap(), grade);
         }
         assert_eq!(EvidenceGrade::parse("Run"), None);
+    }
+
+    #[test]
+    fn passive_signal_exchange_and_session_start_creds_profiles_round_trip_and_stay_compat() {
+        let blob = BlobRef { id: BlobId::from("ab".repeat(32)), bytes: 12, lines: 1 };
+        let legacy_ex = Exchange {
+            id: "ex-aaaaaaaaaaaa".into(),
+            call_id: None,
+            source: "proxy".into(),
+            tool: None,
+            scheme: "https".into(),
+            tls: "intercepted".into(),
+            method: "GET".into(),
+            host: "api.acme.test".into(),
+            port: 443,
+            target: "/v1/me".into(),
+            status: Some(200),
+            error: None,
+            request: blob.clone(),
+            response: Some(blob.clone()),
+            request_bytes: 12,
+            response_bytes: 12,
+            truncated: false,
+            upstream_unverified: false,
+            duration_ms: 5,
+            passive_signals: Vec::new(),
+            principal: None,
+        };
+        let legacy_json = serde_json::to_string(&record(Event::Exchange(legacy_ex.clone()))).unwrap();
+        assert!(!legacy_json.contains("passive_signals"), "{legacy_json}");
+        assert!(!legacy_json.contains("principal"), "{legacy_json}");
+        let back: Record = serde_json::from_str(&legacy_json).unwrap();
+        assert_eq!(back.event, Event::Exchange(legacy_ex.clone()));
+
+        let sig = PassiveSignal {
+            kind: "cors_misconfig".into(),
+            severity: "high".into(),
+            summary: "ACAO: * with ACAC: true".into(),
+            detail: String::new(),
+        };
+        let sig_json = serde_json::to_string(&sig).unwrap();
+        assert!(!sig_json.contains("detail"), "{sig_json}");
+        assert_eq!(serde_json::from_str::<PassiveSignal>(&sig_json).unwrap(), sig);
+
+        let enriched = Exchange {
+            passive_signals: vec![
+                sig,
+                PassiveSignal {
+                    kind: "verbose_error".into(),
+                    severity: "medium".into(),
+                    summary: "SQL syntax error".into(),
+                    detail: "near '1'".into(),
+                },
+            ],
+            principal: Some("user_a".into()),
+            ..legacy_ex
+        };
+        let enriched_json = serde_json::to_string(&record(Event::Exchange(enriched.clone()))).unwrap();
+        assert!(enriched_json.contains("\"principal\":\"user_a\""));
+        assert!(enriched_json.contains("\"cors_misconfig\""));
+        let enriched_back: Record = serde_json::from_str(&enriched_json).unwrap();
+        assert_eq!(enriched_back.event, Event::Exchange(enriched));
+
+        // SessionStart creds_profiles is omitted when empty and round-trips safely when populated.
+        let mut start = match one_of_each().into_iter().find(|(k, _)| *k == "session_start").unwrap().1 {
+            Event::SessionStart(s) => s,
+            _ => unreachable!(),
+        };
+        let empty_start_json = serde_json::to_string(&record(Event::SessionStart(start.clone()))).unwrap();
+        assert!(!empty_start_json.contains("creds_profiles"), "{empty_start_json}");
+        assert_eq!(
+            serde_json::from_str::<Record>(&empty_start_json).unwrap().event,
+            Event::SessionStart(start.clone())
+        );
+
+        let p1 =
+            CredsRef { profile: "user_a".into(), summary: "user_a · 1 cookie · api.acme.test".into(), dropped: 0 };
+        let p2 = CredsRef { profile: "admin".into(), summary: "admin · 1 header · api.acme.test".into(), dropped: 0 };
+        start.creds = Some(p1.clone());
+        start.creds_profiles = vec![p1, p2];
+        let multi_json = serde_json::to_string(&record(Event::SessionStart(start.clone()))).unwrap();
+        assert!(multi_json.contains("creds_profiles") && multi_json.contains("\"admin\""));
+        assert_eq!(serde_json::from_str::<Record>(&multi_json).unwrap().event, Event::SessionStart(start));
     }
 }

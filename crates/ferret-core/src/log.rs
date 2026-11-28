@@ -1526,6 +1526,7 @@ mod tests {
             intercept: false,
             target: None,
             creds: None,
+            creds_profiles: Vec::new(),
             schema,
         })
     }

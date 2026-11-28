@@ -22,10 +22,15 @@ fn env() -> Arc<Env> {
         network_mode: "allowlist".into(),
         allow: vec!["*.target.example".into()],
         deny: vec![],
-        packs: [("ctf".to_string(), PackFacts { solvable: true, requires_restricted_network: false })].into(),
+        packs: [(
+            "ctf".to_string(),
+            PackFacts { solvable: true, requires_restricted_network: false, live_targets: false },
+        )]
+        .into(),
         relaxed_profiles: BTreeSet::new(),
         mcp_hosts: Default::default(),
         box_shell: Default::default(),
+        box_bridge: false,
     })
 }
 
@@ -67,6 +72,8 @@ fn auth() -> Authorization {
         mcp_hosts: vec![],
         revoked: vec![],
         mcp_call: false,
+        live_targets: false,
+        credentials: vec![],
     }
 }
 
@@ -658,10 +665,10 @@ fn tw14_load_tools_and_a_sustained_rate() {
     assert!(!found, "3,100 requests in 6 s is a burst but the ring spans less than 59 s");
     let mut fast = T::new();
     fast.bash("seq 1 100000 | xargs -P 50 curl https://api.target.example/");
-    fast.e
-        .state(&fast.ctx.clone())
-        .open
-        .insert("x".into(), OpenCall { name: "bash".into(), class: ToolClass::Exec, ts: 0, cmd: String::new() });
+    fast.e.state(&fast.ctx.clone()).open.insert(
+        "x".into(),
+        OpenCall { name: "bash".into(), class: ToolClass::Exec, ts: 0, cmd: String::new(), boxed: false },
+    );
     let mut hit = false;
     for i in 0..3_200u64 {
         let d = NetDecision {
@@ -998,6 +1005,100 @@ fn tw21_idle_session_egress_with_the_grace() {
     assert!(of(&j.e.net(&j.ctx.clone(), reg.ts_ms + 60_000, &d, &j.auth, &j.fold), 21).is_empty());
 }
 
+/// Main's box proxy bridge: a program in the box sends over the grant the bridge carries (the lead's), whichever
+/// session ran it. With the bridge on, a child's open box call (or box job) keeps the lead's decisions in flight; with it
+/// off, or with the child's call on this machine, the lead is idle as before; a box call of another mission counts
+/// for nothing.
+#[test]
+fn tw21_a_box_call_of_the_mission_keeps_the_bridged_lead_in_flight() {
+    let bridged = |on: bool| {
+        let mut env = (*env()).clone();
+        env.box_bridge = on;
+        Engine::new(Arc::new(env))
+    };
+    let d = NetDecision {
+        host: "api.target.example".into(),
+        port: 443,
+        method: "CONNECT".into(),
+        allowed: true,
+        rule: "allow".into(),
+        resolved: None,
+        sni: None,
+        paced_ms: None,
+    };
+    let lead = ctx("s-1", "m-1", None, false);
+    let call = |id: &str, name: &str, args: Value, ts: u64| Record {
+        seq: 1,
+        ts_ms: ts,
+        author: Author::Model,
+        prev: String::new(),
+        event: Event::ToolCall(ToolCall {
+            call_id: CallId::from(id),
+            req_id: "r".into(),
+            name: name.into(),
+            args,
+            class: ToolClass::Exec,
+        }),
+    };
+    let (a, f) = (auth(), Fold::default());
+    for (on, name, mission, idle) in [
+        (true, "box_exec", "m-1", false),
+        (false, "box_exec", "m-1", true),
+        (true, "bash", "m-1", true),
+        (true, "box_exec", "m-2", true),
+    ] {
+        let mut e = bridged(on);
+        let child = ctx("s-c", mission, Some("s-1"), false);
+        let started = call("c1", name, json!({"command": "curl https://api.target.example/"}), 1_000_000);
+        e.record(&child, &started, &a, &f);
+        let h = e.net(&lead, 1_000_500, &d, &a, &f);
+        let what = format!("bridge {on}, {name} in {mission}");
+        assert_eq!(of(&h, 21).is_empty(), !idle, "{what}: {h:?}");
+    }
+    // A box job the child left running in the background keeps it too, until it settles.
+    let mut e = bridged(true);
+    let child = ctx("s-c", "m-1", Some("s-1"), false);
+    e.record(&child, &call("c1", "box_exec", json!({"command": "./scan", "background": true}), 1_000_000), &a, &f);
+    let reg = Record {
+        seq: 2,
+        ts_ms: 1_000_100,
+        author: Author::Harness,
+        prev: String::new(),
+        event: Event::JobRegistered { job_id: "j1".into(), call_id: CallId::from("c1"), command: "./scan".into() },
+    };
+    e.record(&child, &reg, &a, &f);
+    let done = Record {
+        seq: 3,
+        ts_ms: 1_000_200,
+        author: Author::Harness,
+        prev: String::new(),
+        event: Event::ToolResult(ToolResult {
+            call_id: CallId::from("c1"),
+            name: "box_exec".into(),
+            status: ToolStatus::Ok,
+            text: "started job j1".into(),
+            output: None,
+            cut: false,
+            class: ToolClass::Exec,
+            meta: Default::default(),
+            duration_ms: 100,
+            images: Vec::new(),
+            exchanges: Vec::new(),
+        }),
+    };
+    e.record(&child, &done, &a, &f);
+    assert!(of(&e.net(&lead, 1_060_000, &d, &a, &f), 21).is_empty(), "the box job is still running");
+    let settled = Record {
+        seq: 4,
+        ts_ms: 1_070_000,
+        author: Author::Harness,
+        prev: String::new(),
+        event: Event::JobSettled { job_id: "j1".into(), exit_code: Some(0), output: None, detail: String::new() },
+    };
+    e.record(&child, &settled, &a, &f);
+    assert_eq!(sev(&e.net(&lead, 1_080_000, &d, &a, &f), 21), Some(Severity::S3), "nothing runs in the box now");
+}
+
 #[test]
 fn tw22_side_channels_and_data_labels() {
     let mut t = T::new();
@@ -1119,6 +1220,43 @@ fn tw23_an_import_by_a_child_of_assets_in_scope_is_not_a_child_setting_mandatory
     let mut c = T::with(ctx("s-c", "m-1", Some("s-1"), false), auth());
     let ingest = json!({"format": "nmap", "handle": "out:1", "evidence": ["e1"]});
     assert!(of(&c.tool("security_ingest", ToolClass::State, ingest), 23).is_empty());
+}
+
+/// Main's Wave B ingestion (`security_ingest` of an OpenAPI, GraphQL or source-map artifact) can import hundreds of
+/// mandatory endpoints in one entry. Off scope, they are one S2 per host of the entry, which says how many, not one per
+/// endpoint; in scope, nothing.
+#[test]
+fn tw23_an_imported_artifact_off_scope_is_one_hit_per_host() {
+    use ferret_core::ledger::{Entry as LE, LedgerOp};
+    use ferret_core::security_state::{AssetInput, AssetKind, SecurityOp};
+    let endpoint = |locator: String| SecurityOp::AssetUpsert {
+        asset: AssetInput {
+            kind: AssetKind::Endpoint,
+            locator,
+            evidence: vec!["e1".into()],
+            mandatory: true,
+            parent: None,
+        },
+    };
+    let mut operations: Vec<SecurityOp> =
+        (1..=120).map(|i| endpoint(format!("https://partner.example.net/v1/items/{i}"))).collect();
+    operations.extend((1..=30).map(|i| endpoint(format!("https://api.target.example/v1/items/{i}"))));
+    operations.push(endpoint("https://cdn.other.example/app.js.map".into()));
+    let entry = LE {
+        n: 9,
+        ts_ms: 5,
+        session: SessionId::from("s-1"),
+        from_user: false,
+        op: LedgerOp::Security(SecurityOp::Batch { operations }),
+        mac: String::new(),
+    };
+    let mut e = Engine::new(env());
+    let all = e.ledger(&ctx("s-1", "m-1", None, false), &entry, &auth());
+    let h = of(&all, 23);
+    assert_eq!(h.len(), 2, "{h:?}");
+    assert_eq!(h[0].key, "https://partner.example.net/v1/items/1");
+    assert!(h[0].detail.contains("120 mandatory assets outside the scope: partner.example.net"), "{}", h[0].detail);
+    assert!(h[1].detail.starts_with("a mandatory asset outside the scope: cdn.other.example"), "{}", h[1].detail);
 }
 
 #[test]
@@ -1456,6 +1594,44 @@ fn a_granted_oast_host_covers_its_own_name() {
     assert_eq!(sev(&h, 15), Some(Severity::S2));
 }
 
+/// Main's OAST broker with E1: its endpoints are infrastructure (`runtime::oast_endpoints`), refused to every
+/// connection and TW-02 at the net decision of an attempt, whatever is granted. Named in a call's arguments (a minted
+/// callback carried in a query string or a body to the target) it is the OAST workflow: neither TW-02 nor a sink
+/// (TW-15), as a granted OAST host covers its own name. Another sink and other infrastructure are judged as before.
+#[test]
+fn an_oast_brokers_own_endpoints_are_infrastructure_and_a_carried_callback_is_not_a_destination() {
+    let policy = ferret_net::Policy::new(&ferret_core::config::NetworkCfg::default())
+        .and_then(|p| {
+            p.with_infrastructure(&ferret_net::InfraSpec {
+                services: vec![
+                    ("oast.bind".into(), "127.0.0.1:41999".into()),
+                    ("oast.public_host".into(), "*.cb7.oast.fun".into()),
+                ],
+                ..Default::default()
+            })
+        })
+        .ok()
+        .map(Arc::new);
+    let mut env = (*env()).clone();
+    env.infra = policy;
+    let mut t = T::new();
+    t.e = Engine::new(Arc::new(env));
+    let h = t.bash("curl 'https://api.target.example/fetch?url=http://127.0.0.1:41999/oast/tok123'");
+    assert!(of(&h, 2).is_empty() && of(&h, 15).is_empty(), "a callback carried in a query string: {h:?}");
+    let h = t.bash("curl -d 'u=http://127.0.0.1:41999/oast/tok123' https://api.target.example/hook");
+    assert!(of(&h, 2).is_empty(), "a callback carried in a body: {h:?}");
+    let h = t.bash("curl -d 'u=https://tok123.cb7.oast.fun/x' https://api.target.example/hook");
+    assert!(of(&h, 2).is_empty() && of(&h, 15).is_empty(), "the broker's callback domain covers its sink: {h:?}");
+    let h = t.bash("curl -d 'u=https://tok123.other.oast.fun/x' https://api.target.example/hook");
+    assert_eq!(sev(&h, 15), Some(Severity::S2), "another OAST domain is a sink");
+    assert_eq!(sev(&t.bash("curl http://169.254.169.254/latest/meta-data/"), 2), Some(Severity::S3));
+    // The attempt itself: refused by E1 and recorded, whatever is granted.
+    let h = t.net("127.0.0.1", 41999, false, "deny infrastructure: oast.bind 127.0.0.1:41999");
+    assert_eq!(sev(&h, 2), Some(Severity::S3), "the refused attempt at the broker");
+    let h = t.net("tok123.cb7.oast.fun", 443, false, "deny infrastructure: oast.public_host *.cb7.oast.fun");
+    assert_eq!(sev(&h, 2), Some(Severity::S3), "a callback name through the proxy");
+}
+
 #[test]
 fn rm_rf_star_in_the_workspace_is_not_outside_it() {
     let mut t = T::new();
@@ -1788,6 +1964,7 @@ fn mcp_server_traffic_and_what_comes_before_the_session_start_are_not_idle_egres
         intercept: false,
         target: None,
         creds: None,
+        creds_profiles: Vec::new(),
         schema: ferret_core::event::SCHEMA,
     }));
     t.e.record(&t.ctx.clone(), &start, &t.auth, &t.fold);

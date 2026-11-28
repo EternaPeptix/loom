@@ -655,6 +655,7 @@ impl Core {
                     deny: env.deny.clone(),
                     solvable: p.solvable,
                     requires_restricted_network: p.requires_restricted_network,
+                    live_targets: p.live_targets,
                     role: role.to_string(),
                     mcp_hosts: env.mcp_hosts(pack),
                     ..AuthFacts::default()
@@ -822,6 +823,7 @@ impl Core {
             self.engine.blind_until(&ctx.session, self.started_ms.saturating_add(RESTART_BLIND_MS));
         }
         let target = p.target.clone();
+        let credentials = p.credentials.clone();
         let mcp_hosts = self.env.mcp_hosts(&pack);
         let ms = self.mstate(&mission, &pack, &role);
         if ms.prior.is_empty() && !prior.is_empty() {
@@ -839,6 +841,12 @@ impl Core {
                 ms.facts.target_exclude = t.exclude;
                 ms.cache = None;
             }
+        }
+        // And the credential profiles the operator attached to it (main's multi-principal profiles): names and
+        // redaction-safe summaries only.
+        if !credentials.is_empty() && ms.facts.credentials != credentials {
+            ms.facts.credentials = credentials;
+            ms.cache = None;
         }
         if !prior.is_empty() {
             self.engine.fleet.set_prior(&mission, prior);

@@ -1108,7 +1108,7 @@ reviewers = ["dsv41_review", "qwen4max", "mistral"]
     }
 
     fn consent_alibaba() -> &'static str {
-        "[monitor.recipients]\nctf = [\"alibaba\"]\nctf-generalist = [\"alibaba\"]\ncore = [\"alibaba\"]\nharnessmm = [\"alibaba\"]\nredteam = [\"alibaba\"]\nvr = [\"alibaba\"]\n"
+        "[monitor.recipients]\nctf = [\"alibaba\"]\nctf-generalist = [\"alibaba\"]\ncore = [\"alibaba\"]\nharnessmm = [\"alibaba\"]\nredteam = [\"alibaba\"]\nvr = [\"alibaba\"]\nwebapp = [\"alibaba\"]\n"
     }
 
     fn pick(c: &Config, packs: &Packs, profile: &str, pack: &str) -> Row {

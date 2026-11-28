@@ -43,7 +43,7 @@ impl Tool for RequestScope {
     fn spec(&self) -> ToolSpec {
         spec(
             "request_scope",
-            "Ask the operator to authorize network access to hosts outside the engagement's current scope. This grants nothing: the request goes to the operator's inbox and you keep working. Use it when the work needs a host the network policy refuses, and say why. Do not try to reach the host until the authorization appears in your harness-state.",
+            "Ask the operator to authorize network access to hosts outside the engagement's current scope. This grants nothing: it places an actionable approval item directly in the operator's inbox and you keep working (do not also send a separate user question for the same scope approval). Use it when the work needs a host the network policy refuses, and say why. Do not try to reach the host until the authorization appears in your harness-state.",
             ToolClass::State,
             &[
                 req("hosts", "array", "The hosts to authorize, one per entry: `api.example.test` or `*.example.test`, optionally with `:port`.")
@@ -126,6 +126,11 @@ mod tests {
         assert!(res.text.contains("Nothing is authorized yet") && res.text.contains("Carry on"), "{}", res.text);
         assert!(res.text.contains("api.example.test, *.cdn.example.test"), "{}", res.text);
         assert!(res.text.contains("harness-state"), "{}", res.text);
+        assert!(
+            res.text.contains("Do not also call `ask_user`") && res.text.contains("duplicate inbox item"),
+            "{}",
+            res.text
+        );
         let opened = items(&r);
         assert_eq!(opened.len(), 1, "{opened:?}");
         let item = &opened[0];

@@ -39,6 +39,7 @@ struct RootView: View {
                             onSessionExpired: { if state.paneEpoch == epoch { state.handleWebSessionExpired() } },
                             onProcessTerminated: { if state.paneEpoch == epoch { state.handleWebProcessTerminated() } },
                             onReloadRequested: { if state.paneEpoch == epoch { state.reload() } },
+                            onPinchZoom: { zoom in if state.paneEpoch == epoch { state.setZoom(zoom) } },
                             onNavCapability: { back, fwd in
                                 if state.paneEpoch == epoch {
                                     state.canGoBack = back
@@ -133,20 +134,34 @@ struct RootView: View {
         ToolbarItem(placement: .primaryAction) {
             HStack(spacing: 8) {
                 toolbarStatusCluster
-                if state.isConnected && abs(state.pageZoom - 1.0) > 0.01 {
+                if state.isConnected && abs(state.pageZoom - 1.0) > 0.005 {
+                    let zoomPct = Int((state.pageZoom * 100).rounded())
                     Button {
                         state.zoomReset()
                         state.focusWebPane()
                     } label: {
-                        Text("\(Int((state.pageZoom * 100).rounded()))%")
+                        Text("\(zoomPct)%")
                             .font(.caption.monospacedDigit().weight(.medium))
+                            .lineLimit(1)
+                            .fixedSize()
                             .padding(.horizontal, 7)
                             .padding(.vertical, 3)
                             .background(.quaternary.opacity(0.75), in: Capsule())
                     }
                     .buttonStyle(.plain)
-                    .help("Reset zoom to 100% (⌘0)")
-                    .accessibilityLabel("Zoom \(Int((state.pageZoom * 100).rounded())) percent. Click to reset.")
+                    .help("Reset zoom to 100% (⌘0) · Right-click for zoom controls")
+                    .accessibilityLabel("Zoom \(zoomPct) percent. Click to reset.")
+                    .contextMenu {
+                        Button("Zoom In") { state.zoomIn() }
+                            .disabled(state.pageZoom >= AppState.maxZoom - 0.001)
+                        Button("Zoom Out") { state.zoomOut() }
+                            .disabled(state.pageZoom <= AppState.minZoom + 0.001)
+                        Divider()
+                        Button("Actual Size (100%)") {
+                            state.zoomReset()
+                            state.focusWebPane()
+                        }
+                    }
                 }
             }
             .padding(.horizontal, 4)

@@ -29,7 +29,11 @@ use reqwest::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+    time::Duration,
+};
 use tokio::sync::{Barrier, Semaphore};
 use url::Url;
 
@@ -72,6 +76,7 @@ pub struct HttpState {
 
 pub struct HttpSend;
 pub struct HttpRepeat;
+pub struct HttpAuthzMatrix;
 
 fn fields() -> Vec<crate::params::Param> {
     vec![
@@ -89,6 +94,16 @@ fn fields() -> Vec<crate::params::Param> {
             "allow_quarantined",
             "boolean",
             "Explicitly permit requesting a quarantined logout, unsubscribe, or single-use token URL (default false).",
+        ),
+        opt(
+            "as_profile",
+            "string",
+            "Named mounted credential profile to inject for this request (or \"anon\" for unauthenticated). Strips existing auth headers and bypasses session jar cookies when switching away from the default profile.",
+        ),
+        opt(
+            "strip_auth",
+            "boolean",
+            "Strip existing auth headers, skip session jar cookies, and disable credential profile injection (default false).",
         ),
     ]
 }
@@ -136,53 +151,62 @@ impl Tool for HttpRepeat {
         if id.trim().is_empty() {
             return ToolOutput::error("Supply a complete request_id or last.");
         }
-        if id.starts_with("ex-") {
-            let mut r = match stored_request(ctx, id) {
-                Ok(r) => r,
-                Err(e) => return ToolOutput::error(e),
-            };
-            if let Some(p) = args.get("patch").and_then(Value::as_object) {
-                if let Err(e) = patch(&mut r, p) {
-                    return ToolOutput::error(e);
-                }
-            }
-            let mut out = run(ctx, "http_repeat", r, args).await;
-            out.more.push(format!(
-                "{id} was replayed from its stored request; its cookie jar and captured variables are not restored, so a session cookie must be in the headers or the patch."
-            ));
-            return out;
-        }
-        let state = ctx.capabilities.http.lock().await;
-        let id = if id == "last" {
-            state
-                .requests
-                .keys()
-                .max_by_key(|k| k.strip_prefix("rq").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0))
-                .map(String::as_str)
-                .unwrap_or("")
-        } else {
-            id
-        };
-        let mut request = state.requests.get(id).cloned().or_else(|| {
-            let mut matches = state.requests.iter().filter(|(k, _)| k.starts_with(id));
-            match (matches.next(), matches.next()) {
-                (Some((_, r)), None) => Some(r.clone()),
-                _ => None,
-            }
-        });
-        drop(state);
-        let Some(mut r) = request.take() else {
-            return ToolOutput::error(
-                "Request ID is unknown or ambiguous. Use a complete rq ID from this session; restart discards replay state.",
-            );
+        let (mut r, from_ex) = match resolve_saved_request(ctx, id).await {
+            Ok(found) => found,
+            Err(e) => return ToolOutput::error(e),
         };
         if let Some(p) = args.get("patch").and_then(Value::as_object) {
             if let Err(e) = patch(&mut r, p) {
                 return ToolOutput::error(e);
             }
         }
-        run(ctx, "http_repeat", r, args).await
+        let mut out = run(ctx, "http_repeat", r, args).await;
+        if from_ex {
+            out.more.push(format!(
+                "{id} was replayed from its stored request; its cookie jar and captured variables are not restored, so use `as_profile`, headers, or the patch for authentication."
+            ));
+        }
+        out
     }
+}
+
+async fn resolve_saved_request(ctx: &ToolCtx, raw_id: &str) -> Result<(Request, bool), String> {
+    let id = raw_id.trim();
+    if id.starts_with("ex-") {
+        return Ok((stored_request(ctx, id)?, true));
+    }
+    let state = ctx.capabilities.http.lock().await;
+    let resolved_id: String = if id == "last" {
+        state
+            .requests
+            .keys()
+            .max_by_key(|k| k.strip_prefix("rq").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0))
+            .cloned()
+            .unwrap_or_default()
+    } else if let Some(rest) = id.strip_prefix("req-") {
+        let alias = format!("rq{rest}");
+        if state.requests.contains_key(id) {
+            id.to_string()
+        } else if state.requests.contains_key(&alias) {
+            alias
+        } else {
+            id.to_string()
+        }
+    } else {
+        id.to_string()
+    };
+    let request = state.requests.get(&resolved_id).cloned().or_else(|| {
+        let mut matches = state.requests.iter().filter(|(k, _)| k.starts_with(&resolved_id));
+        match (matches.next(), matches.next()) {
+            (Some((_, r)), None) => Some(r.clone()),
+            _ => None,
+        }
+    });
+    drop(state);
+    request.map(|r| (r, false)).ok_or_else(|| {
+        "Request ID is unknown or ambiguous. Use a complete rq ID from this session or an ex- exchange ID; restart discards rq replay state."
+            .into()
+    })
 }
 
 /// Headers stripped when replaying proxy-captured exchanges (which may carry injected or rewritten
@@ -207,7 +231,7 @@ fn stored_request(ctx: &ToolCtx, id: &str) -> Result<Request, String> {
     let x = lookup(id).ok_or_else(|| {
         format!("No exchange {id} was recorded by this session. Copy the id from an http_send result or the log.")
     })?;
-    if x.source == "proxy" && x.tls == "intercepted" || x.method == "TLS" {
+    if x.method == "TLS" || (x.source == "proxy" && !matches!(x.tls.as_str(), "plain" | "intercepted")) {
         return Err(format!("{id} is not a replayable HTTP request."));
     }
     if x.tool.as_deref().is_some_and(|t| t.starts_with("mcp__")) {
@@ -236,16 +260,14 @@ fn stored_request(ctx: &ToolCtx, id: &str) -> Result<Request, String> {
             true
         })
         .collect();
-    let default_port = if x.scheme == "https" { 443 } else { 80 };
-    let host = if x.port == default_port { x.host.clone() } else { format!("{}:{}", x.host, x.port) };
-    let mut r = Request {
-        url: format!("{}://{host}{}", x.scheme, x.target),
-        method,
-        headers: filtered_headers,
-        body: String::new(),
-        body_base64: None,
-        json: None,
+    let url = if x.target.starts_with("http://") || x.target.starts_with("https://") {
+        x.target.clone()
+    } else {
+        let default_port = if x.scheme == "https" { 443 } else { 80 };
+        let host = if x.port == default_port { x.host.clone() } else { format!("{}:{}", x.host, x.port) };
+        format!("{}://{host}{}", x.scheme, x.target)
     };
+    let mut r = Request { url, method, headers: filtered_headers, body: String::new(), body_base64: None, json: None };
     if !body.is_empty() {
         r.body_base64 = Some(STANDARD.encode(&body));
     }
@@ -431,7 +453,7 @@ pub fn quarantined_locator(url_str: &str) -> Option<&'static str> {
 pub fn is_static_asset_locator(url_str: &str) -> bool {
     const STATIC_EXTS: &[&str] = &[
         ".css", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico", ".woff", ".woff2", ".ttf", ".eot", ".otf",
-        ".mp4", ".webm", ".mp3", ".map",
+        ".mp4", ".webm", ".mp3",
     ];
     let Ok(url) = Url::parse(url_str) else { return false };
     if url.query().is_some() {
@@ -541,11 +563,24 @@ fn extract_forms(headers: &BTreeMap<String, String>, body_text: &str) -> Vec<For
     forms
 }
 
-fn principal_tag(jar: &Jar, url: &Url, r: &Request) -> String {
+fn principal_tag(
+    resolved_principal: &str,
+    inject: Option<&ferret_net::Inject>,
+    explicit_profile: bool,
+    jar: Option<&Jar>,
+    url: &Url,
+    r: &Request,
+) -> String {
+    let host = url.host_str().unwrap_or_default();
+    if resolved_principal != "anon" && (explicit_profile || inject.is_some_and(|i| i.applies_to(host))) {
+        return resolved_principal.to_string();
+    }
     let mut material = Vec::new();
-    if let Some(cookie) = jar.cookies(url) {
-        if !cookie.is_empty() {
-            material.push(format!("jar={}", String::from_utf8_lossy(cookie.as_bytes())));
+    if let Some(jar) = jar {
+        if let Some(cookie) = jar.cookies(url) {
+            if !cookie.is_empty() {
+                material.push(format!("jar={}", String::from_utf8_lossy(cookie.as_bytes())));
+            }
         }
     }
     for (k, v) in &r.headers {
@@ -560,6 +595,19 @@ fn principal_tag(jar: &Jar, url: &Url, r: &Request) -> String {
     material.sort();
     let digest = hex::encode(Sha256::digest(material.join("\n").as_bytes()));
     format!("auth:{}", digest.get(..8).unwrap_or_default())
+}
+
+fn is_non_default_profile(ctx: &ToolCtx, as_profile: Option<&str>) -> bool {
+    let Some(name) = as_profile.map(str::trim).filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    if name == "anon" {
+        return true;
+    }
+    if let Some(def) = ctx.capabilities.default_profile.get().map(String::as_str).filter(|s| !s.is_empty()) {
+        return name != def;
+    }
+    !(name == "default" && ctx.capabilities.creds.get().is_some())
 }
 
 impl HttpState {
@@ -615,7 +663,7 @@ pub(crate) struct Exchange {
 type Sink<'a> = Option<(&'a str, &'a std::sync::Mutex<Vec<ferret_core::event::Exchange>>)>;
 
 pub(crate) async fn one(ctx: &ToolCtx, client: &Client, r: &Request) -> Result<Exchange, String> {
-    exchange(ctx, client, r, None, None).await
+    exchange(ctx, client, r, None, None, None, None).await
 }
 
 async fn exchange(
@@ -624,6 +672,8 @@ async fn exchange(
     r: &Request,
     sink: Sink<'_>,
     jar: Option<&Jar>,
+    inject_profile: Option<&ferret_net::Inject>,
+    principal: Option<&str>,
 ) -> Result<Exchange, String> {
     let started = std::time::Instant::now();
     let url = checked_url(&r.url)?;
@@ -656,14 +706,18 @@ async fn exchange(
     if body.len() > 2_000_000 {
         return Err("Request body exceeds two million bytes; use a smaller bounded request.".into());
     }
-    // The session's credential profile (S8): `http_send`/`http_repeat` only (`jar` is theirs), never the oracle.
+    // Credential profile injection (S8): explicit for `http_send`, `http_repeat`, and `http_authz_matrix`;
+    // `None` for `oracle.rs` (`http::one`).
     let mut shown: Option<Vec<(String, Vec<u8>)>> = None;
-    if let (Some(jar), Some(host)) = (jar, url.host_str()) {
+    if let (Some(inject), Some(host)) = (inject_profile, url.host_str()) {
         let had_cookie = headers.contains_key(reqwest::header::COOKIE);
         // reqwest sends the jar only on a request without a `Cookie` header of its own, so a jar cookie is
         // one the request "already sends" exactly then, and the jar is merged by hand if we add a header.
-        let jar_cookie =
-            if had_cookie { None } else { jar.cookies(&url).and_then(|v| v.to_str().ok().map(str::to_string)) };
+        let jar_cookie = if had_cookie {
+            None
+        } else {
+            jar.and_then(|j| j.cookies(&url)).and_then(|v| v.to_str().ok().map(str::to_string))
+        };
         let already: Vec<String> = jar_cookie
             .iter()
             .flat_map(|c| c.split(';'))
@@ -672,7 +726,7 @@ async fn exchange(
             .collect();
         let pairs: Vec<(String, Vec<u8>)> =
             headers.iter().map(|(k, v)| (k.as_str().to_string(), v.as_bytes().to_vec())).collect();
-        if let Some(mut inj) = crate::traffic::inject(ctx, host, &pairs, &already) {
+        if let Some(mut inj) = crate::traffic::inject_with(inject, host, &pairs, &already) {
             if let Some(jc) = jar_cookie.filter(|j| !j.is_empty()) {
                 for set in [&mut inj.real, &mut inj.shown] {
                     if let Some((_, v)) = set.iter_mut().find(|(n, _)| n.eq_ignore_ascii_case("cookie")) {
@@ -717,6 +771,7 @@ async fn exchange(
                     response_cut: false,
                     unverified: crate::web::insecure_for(ctx, &url),
                     started,
+                    principal,
                 };
                 if let Some(x) = crate::traffic::record(ctx, &made) {
                     out.lock().unwrap_or_else(|p| p.into_inner()).push(x);
@@ -772,6 +827,7 @@ async fn exchange(
             response_cut: truncated,
             unverified: crate::web::insecure_for(ctx, &url),
             started,
+            principal,
         };
         if let Some(x) = crate::traffic::record(ctx, &made) {
             ex_id = Some(x.id.clone());
@@ -797,13 +853,19 @@ async fn run(ctx: &ToolCtx, tool: &str, mut r: Request, args: &Map<String, Value
         Ok(u) => u.origin().ascii_serialization(),
         Err(e) => return ToolOutput::error(e),
     };
+    let as_profile = args.get("as_profile").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+    let strip_auth = args.get("strip_auth").and_then(Value::as_bool).unwrap_or(false);
+    let (inject_opt, resolved_principal) = match ctx.capabilities.resolve_profile(as_profile, strip_auth) {
+        Ok(v) => v,
+        Err(e) => return ToolOutput::error(e),
+    };
     let state = ctx.capabilities.http.lock().await;
     if state.requests.len() >= 1024 {
         return ToolOutput::error(
             "This session has 1024 saved HTTP requests. Start a fresh bounded child for further exchanges.",
         );
     }
-    let jar = state.jar.clone();
+    let session_jar = state.jar.clone();
     let variables = state.variables.clone();
     drop(state);
     let expanded = (|| -> Result<Url, String> {
@@ -839,9 +901,21 @@ async fn run(ctx: &ToolCtx, tool: &str, mut r: Request, args: &Map<String, Value
             ));
         }
     }
-    let principal = principal_tag(&jar, &parsed_url, &r);
-    let jar_for_inject = jar.clone();
-    let client = match client(ctx, jar, crate::web::insecure_for(ctx, &parsed_url)) {
+    if strip_auth || as_profile.is_some() {
+        r.headers.retain(|k, _| !is_sensitive_auth_header(k));
+    }
+    let skip_jar = strip_auth || is_non_default_profile(ctx, as_profile);
+    let active_jar = if skip_jar { Arc::new(Jar::default()) } else { session_jar };
+    let jar_for_inject = if skip_jar { None } else { Some(active_jar.clone()) };
+    let principal = principal_tag(
+        &resolved_principal,
+        inject_opt.as_deref(),
+        as_profile.is_some(),
+        jar_for_inject.as_deref(),
+        &parsed_url,
+        &r,
+    );
+    let client = match client(ctx, active_jar, crate::web::insecure_for(ctx, &parsed_url)) {
         Ok(c) => c,
         Err(e) => return ToolOutput::error(e),
     };
@@ -855,11 +929,13 @@ async fn run(ctx: &ToolCtx, tool: &str, mut r: Request, args: &Map<String, Value
         let slots = slots.clone();
         let client = &client;
         let r = &r;
-        let jar_ref = &jar_for_inject;
+        let jar_ref = jar_for_inject.as_deref();
+        let inject_ref = inject_opt.as_deref();
+        let principal_ref = principal.as_str();
         async move {
             barrier.wait().await;
             let _slot = slots.acquire().await.map_err(|_| "HTTP batch closed.".to_string())?;
-            exchange(ctx, client, r, Some((tool, made)), Some(jar_ref.as_ref())).await
+            exchange(ctx, client, r, Some((tool, made)), jar_ref, inject_ref, Some(principal_ref)).await
         }
     });
     let secs = args.get("timeout_s").and_then(Value::as_u64).unwrap_or(30).clamp(1, 120);
@@ -944,6 +1020,620 @@ fn capture(e: &Exchange, selector: &str) -> Option<String> {
     None
 }
 
+// ---- http_authz_matrix ---------------------------------------------------------------------------
+
+/// Maximum distinct principals probed in one `http_authz_matrix` call.
+const MAX_MATRIX_PRINCIPALS: usize = 16;
+
+/// Volatile JSON keys stripped recursively before comparing response structures across principals.
+const VOLATILE_JSON_KEYS: &[&str] = &[
+    "timestamp",
+    "timestamps",
+    "ts",
+    "time",
+    "request_id",
+    "requestid",
+    "req_id",
+    "trace_id",
+    "traceid",
+    "correlation_id",
+    "correlationid",
+    "span_id",
+    "nonce",
+    "date",
+    "expires_at",
+    "expiresat",
+    "created_at",
+    "updated_at",
+    "server_time",
+    "etag",
+    "csrf_token",
+    "csrf",
+    "x_request_id",
+    "duration_ms",
+    "latency_ms",
+];
+
+fn is_volatile_json_key(key: &str) -> bool {
+    let norm: String = key.trim().to_ascii_lowercase().replace('-', "_");
+    VOLATILE_JSON_KEYS.contains(&norm.as_str())
+}
+
+fn normalize_json_value(v: &Value) -> Value {
+    match v {
+        Value::Object(map) => {
+            let mut out = Map::new();
+            for (k, val) in map {
+                if !is_volatile_json_key(k) {
+                    out.insert(k.clone(), normalize_json_value(val));
+                }
+            }
+            Value::Object(out)
+        }
+        Value::Array(arr) => Value::Array(arr.iter().map(normalize_json_value).collect()),
+        other => other.clone(),
+    }
+}
+
+fn collect_json_features(v: &Value, path: &str, keys: &mut BTreeSet<String>, leaves: &mut BTreeMap<String, String>) {
+    match v {
+        Value::Object(map) => {
+            for (k, val) in map {
+                let child = format!("{path}.{k}");
+                keys.insert(child.clone());
+                collect_json_features(val, &child, keys, leaves);
+            }
+        }
+        Value::Array(arr) => {
+            let elem_path = format!("{path}[]");
+            keys.insert(elem_path.clone());
+            for (i, val) in arr.iter().take(64).enumerate() {
+                let idx_path = format!("{path}[{i}]");
+                collect_json_features(val, &idx_path, keys, leaves);
+            }
+        }
+        leaf => {
+            leaves.insert(path.to_string(), leaf.to_string());
+        }
+    }
+}
+
+fn jaccard_sets(a: &BTreeSet<String>, b: &BTreeSet<String>) -> f64 {
+    if a.is_empty() && b.is_empty() {
+        return 1.0;
+    }
+    let inter = a.intersection(b).count();
+    let union = a.union(b).count();
+    if union == 0 {
+        1.0
+    } else {
+        inter as f64 / union as f64
+    }
+}
+
+fn content_type_class(ct: &str) -> &'static str {
+    let low = ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    if low.is_empty() {
+        "empty"
+    } else if low.contains("json") {
+        "json"
+    } else if low.contains("html") {
+        "html"
+    } else if low.contains("xml") {
+        "xml"
+    } else if low.starts_with("text/") {
+        "text"
+    } else {
+        "binary"
+    }
+}
+
+fn text_tokens(body: &str) -> BTreeSet<String> {
+    body.chars()
+        .take(65_536)
+        .collect::<String>()
+        .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
+        .filter(|tok| !tok.is_empty())
+        .map(str::to_ascii_lowercase)
+        .take(4096)
+        .collect()
+}
+
+struct StructuralComparison {
+    exact_normalized_match: bool,
+    similarity: f64,
+    highlights: Vec<String>,
+}
+
+fn compare_responses(
+    base_status: u16,
+    base_ct: &str,
+    base_body: &str,
+    probe_status: u16,
+    probe_ct: &str,
+    probe_body: &str,
+) -> StructuralComparison {
+    let mut highlights = Vec::new();
+    if base_status != probe_status {
+        highlights.push(format!("status {base_status} -> {probe_status}"));
+    }
+    let base_class = content_type_class(base_ct);
+    let probe_class = content_type_class(probe_ct);
+    if base_class != probe_class {
+        highlights.push(format!("content-type {base_class} -> {probe_class}"));
+    }
+    if let (Ok(bj), Ok(pj)) = (serde_json::from_str::<Value>(base_body), serde_json::from_str::<Value>(probe_body)) {
+        let nb = normalize_json_value(&bj);
+        let np = normalize_json_value(&pj);
+        let exact = nb == np;
+        let (mut bkeys, mut bleaves) = (BTreeSet::new(), BTreeMap::new());
+        let (mut pkeys, mut pleaves) = (BTreeSet::new(), BTreeMap::new());
+        collect_json_features(&nb, "$", &mut bkeys, &mut bleaves);
+        collect_json_features(&np, "$", &mut pkeys, &mut pleaves);
+        let key_sim = jaccard_sets(&bkeys, &pkeys);
+        let b_leaf_set: BTreeSet<String> = bleaves.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        let p_leaf_set: BTreeSet<String> = pleaves.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        let leaf_sim = jaccard_sets(&b_leaf_set, &p_leaf_set);
+        let similarity = if exact { 1.0 } else { 0.4 * key_sim + 0.6 * leaf_sim };
+
+        if !exact {
+            for k in pkeys.difference(&bkeys).take(4) {
+                highlights.push(format!("+{k}"));
+            }
+            for k in bkeys.difference(&pkeys).take(4) {
+                highlights.push(format!("-{k}"));
+            }
+            for (k, bv) in &bleaves {
+                if highlights.len() >= 10 {
+                    break;
+                }
+                if let Some(pv) = pleaves.get(k) {
+                    if bv != pv {
+                        highlights.push(format!("~{k}: {} -> {}", crate::preview(bv, 40), crate::preview(pv, 40)));
+                    }
+                }
+            }
+        }
+        return StructuralComparison { exact_normalized_match: exact, similarity, highlights };
+    }
+
+    let exact = base_body == probe_body;
+    let similarity = if exact { 1.0 } else { jaccard_sets(&text_tokens(base_body), &text_tokens(probe_body)) };
+    if !exact {
+        highlights.push(format!("bytes {} -> {}", base_body.len(), probe_body.len()));
+        if let Some((bl, pl)) = base_body.lines().zip(probe_body.lines()).find(|(a, b)| a != b) {
+            highlights.push(format!("line diff: `{}` -> `{}`", crate::preview(bl, 40), crate::preview(pl, 40)));
+        }
+    }
+    StructuralComparison { exact_normalized_match: exact, similarity, highlights }
+}
+
+fn build_matrix_request(args: &Map<String, Value>) -> Result<Request, String> {
+    let url = args
+        .get("url")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or("Provide either `request_id` or `url`.")?
+        .to_string();
+    let method = args
+        .get("method")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("GET")
+        .to_string();
+    let mut headers = BTreeMap::new();
+    if let Some(hmap) = args.get("headers").and_then(Value::as_object) {
+        for (k, v) in hmap {
+            let val = v.as_str().ok_or_else(|| format!("Header `{k}` value must be a string."))?;
+            headers.insert(k.clone(), val.to_string());
+        }
+    }
+    let body = args.get("body").and_then(Value::as_str).unwrap_or_default().to_string();
+    let body_base64 = args.get("body_base64").and_then(Value::as_str).map(str::to_string);
+    let json_val = args.get("json").cloned();
+    let forms = usize::from(!body.is_empty()) + usize::from(body_base64.is_some()) + usize::from(json_val.is_some());
+    if forms > 1 {
+        return Err("Choose only one of `body`, `body_base64`, or `json`.".into());
+    }
+    Ok(Request { url, method, headers, body, body_base64, json: json_val })
+}
+
+#[async_trait]
+impl Tool for HttpAuthzMatrix {
+    fn spec(&self) -> ToolSpec {
+        spec(
+            "http_authz_matrix",
+            "Replay an HTTP request across multiple isolated principals (e.g. anon and mounted credential profiles) with strict cookie/header isolation, compare response structures against a baseline, record an Exchange per probe, and flag potential BOLA/IDOR authorization bypasses. Raw profile secrets are never exposed.",
+            ToolClass::Exec,
+            &[
+                opt(
+                    "request_id",
+                    "string",
+                    "Optional rq ID, req-* alias, ex- exchange ID (including proxy/intercepted captures), or last to replay. Mutually exclusive with url.",
+                ),
+                opt("url", "string", "Explicit http(s) URL to probe when request_id is omitted."),
+                opt("method", "string", "HTTP method when using url (default GET)."),
+                opt("headers", "object", "Non-auth request headers when using url (auth headers are stripped per principal).")
+                    .with("additionalProperties", json!({"type": "string"})),
+                opt("body", "string", "Plain text body when using url."),
+                opt("body_base64", "string", "Base64-encoded body when using url."),
+                opt("json", "object", "JSON body when using url.").with("additionalProperties", json!(true)),
+                opt(
+                    "principals",
+                    "array",
+                    "Principals to probe (\"anon\" or mounted profile names). Defaults to [\"anon\"] + all mounted profiles sorted; at least 2 required.",
+                )
+                .items("string"),
+                opt(
+                    "baseline",
+                    "string",
+                    "Reference principal for structural comparison (defaults to first non-\"anon\" principal, or first principal).",
+                ),
+                opt("timeout_s", "integer", "Whole matrix timeout in seconds (default 30, maximum 120).")
+                    .min(1)
+                    .max(120),
+                opt(
+                    "allow_quarantined",
+                    "boolean",
+                    "Explicitly permit probing a quarantined logout, unsubscribe, or single-use token URL (default false).",
+                ),
+            ],
+        )
+    }
+
+    async fn run(&self, ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
+        let req_id = args.get("request_id").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+        let has_url = args.get("url").and_then(Value::as_str).is_some_and(|s| !s.trim().is_empty());
+        if req_id.is_some() && has_url {
+            return ToolOutput::error("Provide either `request_id` or `url`, not both.");
+        }
+        let mut base_req = match req_id {
+            Some(id) => match resolve_saved_request(ctx, id).await {
+                Ok((r, _)) => r,
+                Err(e) => return ToolOutput::error(e),
+            },
+            None => match build_matrix_request(args) {
+                Ok(r) => r,
+                Err(e) => return ToolOutput::error(e),
+            },
+        };
+
+        let origin = match checked_url(&base_req.url) {
+            Ok(u) => u.origin().ascii_serialization(),
+            Err(e) => return ToolOutput::error(e),
+        };
+        let variables = {
+            let state = ctx.capabilities.http.lock().await;
+            state.variables.clone()
+        };
+        let expanded = (|| -> Result<Url, String> {
+            base_req.url = expand(&base_req.url, &variables, &origin)?;
+            let parsed = checked_url(&base_req.url)?;
+            if parsed.origin().ascii_serialization() != origin {
+                return Err("URL expansion cannot change the origin.".into());
+            }
+            base_req.body = expand(&base_req.body, &variables, &origin)?;
+            for v in base_req.headers.values_mut() {
+                *v = expand(v, &variables, &origin)?;
+            }
+            if let Some(v) = base_req.json.take() {
+                base_req.json = Some(expand_json(v, &variables, &origin)?);
+            }
+            Ok(parsed)
+        })();
+        let parsed_url = match expanded {
+            Ok(u) => u,
+            Err(e) => return ToolOutput::error(e),
+        };
+
+        let allow_quarantined = args.get("allow_quarantined").and_then(Value::as_bool).unwrap_or(false);
+        if !allow_quarantined {
+            if let Some(reason) = quarantined_locator(&base_req.url) {
+                return ToolOutput::error(format!(
+                    "Quarantined URL refused ({reason}): {}. Pass `allow_quarantined: true` only when the assignment explicitly tests this endpoint.",
+                    base_req.url
+                ));
+            }
+        }
+
+        // Strip all sensitive auth headers from the base request so nothing bleeds across principals.
+        base_req.headers.retain(|k, _| !is_sensitive_auth_header(k));
+
+        // Resolve requested principal list.
+        let mut principal_names: Vec<String> = Vec::new();
+        if let Some(arr) = args.get("principals").and_then(Value::as_array) {
+            for item in arr {
+                if let Some(s) = item.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                    if !principal_names.iter().any(|existing| existing == s) {
+                        principal_names.push(s.to_string());
+                    }
+                }
+            }
+        } else {
+            principal_names.push("anon".into());
+            for name in ctx.capabilities.mounted_profile_names() {
+                if !principal_names.iter().any(|existing| existing == &name) {
+                    principal_names.push(name);
+                }
+            }
+        }
+        if principal_names.len() < 2 {
+            let mounted = ctx.capabilities.mounted_profile_names();
+            return ToolOutput::error(format!(
+                "http_authz_matrix requires at least 2 distinct principals (got {}). Mounted profiles: {}. Mount credential profiles or pass explicit `principals`.",
+                principal_names.len(),
+                if mounted.is_empty() { "none".into() } else { mounted.join(", ") }
+            ));
+        }
+        if principal_names.len() > MAX_MATRIX_PRINCIPALS {
+            return ToolOutput::error(format!(
+                "http_authz_matrix accepts at most {MAX_MATRIX_PRINCIPALS} principals per call (got {}).",
+                principal_names.len()
+            ));
+        }
+
+        let mut resolved_principals: Vec<(String, Option<Arc<ferret_net::Inject>>, String)> = Vec::new();
+        for name in &principal_names {
+            match ctx.capabilities.resolve_profile(Some(name), name == "anon") {
+                Ok((inject, tag)) => resolved_principals.push((name.clone(), inject, tag)),
+                Err(e) => return ToolOutput::error(e),
+            }
+        }
+
+        let baseline_name = match args.get("baseline").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty())
+        {
+            Some(b) => {
+                if !principal_names.iter().any(|p| p == b) {
+                    return ToolOutput::error(format!(
+                        "Baseline principal `{b}` is not in the selected principals ({}).",
+                        principal_names.join(", ")
+                    ));
+                }
+                b.to_string()
+            }
+            None => principal_names
+                .iter()
+                .find(|p| p.as_str() != "anon")
+                .cloned()
+                .unwrap_or_else(|| principal_names[0].clone()),
+        };
+
+        let insecure = crate::web::insecure_for(ctx, &parsed_url);
+        let secs = args.get("timeout_s").and_then(Value::as_u64).unwrap_or(30).clamp(1, 120);
+        let made: std::sync::Mutex<Vec<ferret_core::event::Exchange>> = std::sync::Mutex::new(Vec::new());
+
+        struct ProbeResult {
+            name: String,
+            principal_tag: String,
+            outcome: Result<Exchange, String>,
+        }
+
+        let probe_fut = async {
+            let mut results = Vec::with_capacity(resolved_principals.len());
+            for (name, inject_opt, tag) in &resolved_principals {
+                // Strictly isolated per-principal cookie jar & HTTP client — zero cross-principal jar bleed.
+                let iso_jar = Arc::new(Jar::default());
+                let iso_client = match client(ctx, iso_jar, insecure) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        results.push(ProbeResult { name: name.clone(), principal_tag: tag.clone(), outcome: Err(e) });
+                        continue;
+                    }
+                };
+                let res = exchange(
+                    ctx,
+                    &iso_client,
+                    &base_req,
+                    Some(("http_authz_matrix", &made)),
+                    None,
+                    inject_opt.as_deref(),
+                    Some(tag.as_str()),
+                )
+                .await;
+                results.push(ProbeResult { name: name.clone(), principal_tag: tag.clone(), outcome: res });
+            }
+            results
+        };
+
+        let results = tokio::select! {
+            biased;
+            _ = ctx.cancel.cancelled() => {
+                return ToolOutput::denied("http_authz_matrix cancelled. Some probes may have reached the target.");
+            }
+            r = tokio::time::timeout(Duration::from_secs(secs), probe_fut) => match r {
+                Ok(v) => v,
+                Err(_) => return ToolOutput::error("http_authz_matrix timed out before completing all principal probes."),
+            },
+        };
+
+        // Defense-in-depth redactor covering session secrets plus any probed profile values.
+        let fallback_secrets = if ctx.capabilities.secrets.get().is_none() {
+            let mut all_items = Vec::new();
+            for (_, inj, _) in &resolved_principals {
+                if let Some(i) = inj {
+                    all_items.extend_from_slice(i.items());
+                }
+            }
+            if all_items.is_empty() {
+                None
+            } else {
+                Some(ferret_core::creds::Secrets::for_items(&all_items))
+            }
+        } else {
+            None
+        };
+        let redact = |s: &str| -> String {
+            if let Some(sec) = ctx.capabilities.secrets.get().filter(|x| !x.is_empty()) {
+                sec.redact(s).into_owned()
+            } else if let Some(sec) = fallback_secrets.as_ref().filter(|x| !x.is_empty()) {
+                sec.redact(s).into_owned()
+            } else {
+                s.to_string()
+            }
+        };
+
+        let baseline_probe = results.iter().find(|r| r.name == baseline_name);
+        let baseline_ex = baseline_probe.and_then(|r| r.outcome.as_ref().ok());
+        let baseline_status = baseline_ex.map(|e| e.status);
+        let baseline_ct = baseline_ex.and_then(|e| e.headers.get("content-type").map(String::as_str)).unwrap_or("");
+        let baseline_is_auth_2xx = baseline_name != "anon" && baseline_status.is_some_and(|s| (200..300).contains(&s));
+
+        let mut rows_json = Vec::new();
+        let mut anomalies: Vec<Value> = Vec::new();
+        let mut table_lines = Vec::new();
+        let mut diff_lines = Vec::new();
+        table_lines.push("principal | status | content-type | bytes | similarity | exchange_id | flag".to_string());
+        table_lines.push("--- | --- | --- | --- | --- | --- | ---".to_string());
+
+        for r in &results {
+            let is_baseline = r.name == baseline_name;
+            match &r.outcome {
+                Err(e) => {
+                    let clean_err = redact(e);
+                    table_lines.push(format!("{} | error | - | 0 | - | - | error", r.name));
+                    diff_lines.push(format!("- {}: error: {clean_err}", r.name));
+                    rows_json.push(json!({
+                        "principal": r.name,
+                        "principal_tag": r.principal_tag,
+                        "baseline": is_baseline,
+                        "error": clean_err,
+                        "flags": [],
+                    }));
+                }
+                Ok(ex) => {
+                    let ct = ex.headers.get("content-type").map(String::as_str).unwrap_or("-");
+                    let ct_short = ct.split(';').next().unwrap_or("-").trim();
+                    let ex_id = ex.ex_id.as_deref().unwrap_or("-");
+                    let body_len = ex.body_text.len();
+                    let mut flags: Vec<String> = Vec::new();
+                    let (sim_str, similarity_opt, exact_opt, highlights) = if is_baseline {
+                        ("1.00 (baseline)".to_string(), Some(1.0), Some(true), Vec::new())
+                    } else if let Some(bex) = baseline_ex {
+                        let cmp =
+                            compare_responses(bex.status, baseline_ct, &bex.body_text, ex.status, ct, &ex.body_text);
+                        let same_ct_class = {
+                            let bc = content_type_class(baseline_ct);
+                            let pc = content_type_class(ct);
+                            bc == pc || bc == "empty" || pc == "empty"
+                        };
+                        let probe_is_2xx = (200..300).contains(&ex.status);
+                        let len_close = {
+                            let max_len = bex.body_text.len().max(body_len);
+                            let min_len = bex.body_text.len().min(body_len);
+                            max_len > 0 && (min_len as f64 / max_len as f64) >= 0.85
+                        };
+                        if baseline_is_auth_2xx
+                            && probe_is_2xx
+                            && same_ct_class
+                            && (cmp.exact_normalized_match
+                                || cmp.similarity >= 0.70
+                                || (ex.status == bex.status && len_close && cmp.similarity >= 0.50))
+                        {
+                            flags.push("potential_bola_idor".into());
+                            let reason = if r.name == "anon" {
+                                format!(
+                                    "unauthenticated `anon` received HTTP {} with {:.2} structural similarity to authenticated baseline `{}` (HTTP {})",
+                                    ex.status, cmp.similarity, baseline_name, bex.status
+                                )
+                            } else {
+                                format!(
+                                    "non-baseline principal `{}` received HTTP {} with {:.2} structural similarity to baseline `{}` (HTTP {})",
+                                    r.name, ex.status, cmp.similarity, baseline_name, bex.status
+                                )
+                            };
+                            anomalies.push(json!({
+                                "flag": "potential_bola_idor",
+                                "principal": r.name,
+                                "baseline": baseline_name,
+                                "status": ex.status,
+                                "similarity": (cmp.similarity * 100.0).round() / 100.0,
+                                "exchange_id": ex.ex_id,
+                                "reason": reason,
+                            }));
+                        }
+                        let clean_highlights: Vec<String> = cmp.highlights.iter().map(|h| redact(h)).collect();
+                        if !clean_highlights.is_empty() {
+                            diff_lines.push(format!("- {}: {}", r.name, clean_highlights.join("; ")));
+                        } else if cmp.exact_normalized_match {
+                            diff_lines
+                                .push(format!("- {}: identical normalized structure to `{baseline_name}`", r.name));
+                        }
+                        (
+                            format!("{:.2}", cmp.similarity),
+                            Some((cmp.similarity * 100.0).round() / 100.0),
+                            Some(cmp.exact_normalized_match),
+                            clean_highlights,
+                        )
+                    } else {
+                        ("-".to_string(), None, None, Vec::new())
+                    };
+                    let flag_cell = if flags.is_empty() { "-".to_string() } else { flags.join(",") };
+                    table_lines.push(format!(
+                        "{} | {} | {} | {} | {} | {} | {}",
+                        r.name, ex.status, ct_short, body_len, sim_str, ex_id, flag_cell
+                    ));
+                    rows_json.push(json!({
+                        "principal": r.name,
+                        "principal_tag": r.principal_tag,
+                        "baseline": is_baseline,
+                        "status": ex.status,
+                        "content_type": ct_short,
+                        "body_bytes": body_len,
+                        "similarity": similarity_opt,
+                        "exact_normalized_match": exact_opt,
+                        "exchange_id": ex.ex_id,
+                        "flags": flags,
+                        "diff_highlights": highlights,
+                    }));
+                }
+            }
+        }
+
+        let mut report = format!(
+            "Target: {} {}\nBaseline: {}\nFlags: {}\n\n{}\n",
+            base_req.method,
+            redact(&base_req.url),
+            baseline_name,
+            if anomalies.is_empty() {
+                "none".to_string()
+            } else {
+                anomalies.iter().filter_map(|a| a.get("reason").and_then(Value::as_str)).collect::<Vec<_>>().join("; ")
+            },
+            table_lines.join("\n"),
+        );
+        if !diff_lines.is_empty() {
+            report.push_str("\nDiff highlights:\n");
+            report.push_str(&diff_lines.join("\n"));
+            report.push('\n');
+        }
+        let report = redact(&report);
+        let recorded = std::mem::take(&mut *made.lock().unwrap_or_else(|p| p.into_inner()));
+        let any_err = results.iter().any(|r| r.outcome.is_err());
+        let outcome = if anomalies.is_empty() {
+            format!("{} principals probed; no authz anomalies", results.len())
+        } else {
+            format!("{} principals probed; {} potential_bola_idor flag(s)", results.len(), anomalies.len())
+        };
+        let mut meta = Map::new();
+        meta.insert("baseline".into(), json!(baseline_name));
+        meta.insert("anomalies".into(), Value::Array(anomalies));
+        meta.insert("matrix".into(), Value::Array(rows_json));
+        ToolOutput {
+            status: if any_err { ToolStatus::Error } else { ToolStatus::Ok },
+            outcome,
+            more: vec![
+                "isolated per-principal cookie jars; redirects not followed; auth headers stripped before injection"
+                    .into(),
+            ],
+            body: Body::Raw(report.into_bytes()),
+            meta,
+        }
+        .with_exchanges(&recorded)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1020,6 +1710,7 @@ mod tests {
         assert!(quarantined_locator("https://example.test/api/users/42").is_none());
         assert!(is_static_asset_locator("https://example.test/assets/app.woff2"));
         assert!(!is_static_asset_locator("https://example.test/assets/app.png?file=x"));
+        assert!(!is_static_asset_locator("https://example.test/assets/app.js.map"));
         assert_eq!(
             route_template("/api/users/42/items/550e8400-e29b-41d4-a716-446655440000/0123456789abcdef"),
             "/api/users/{id}/items/{uuid}/{hex}"
@@ -1163,17 +1854,23 @@ mod tests {
         let tool_req = b"GET /api/data HTTP/1.1\r\nHost: target.example\r\nAuthorization: [redacted]\r\nCookie: sid=ok\r\nX-Custom: keep\r\n\r\n";
         let tool_blob = ctx.blobs.put_bytes(tool_req).unwrap();
 
-        let make_ex = |id: &str, source: &str, tool: Option<&str>, blob: ferret_core::blob::BlobRef| {
+        let make_ex = |id: &str,
+                       source: &str,
+                       tls: &str,
+                       scheme: &str,
+                       port: u16,
+                       tool: Option<&str>,
+                       blob: ferret_core::blob::BlobRef| {
             ferret_core::event::Exchange {
                 id: id.into(),
                 call_id: None,
                 source: source.into(),
                 tool: tool.map(str::to_string),
-                scheme: "http".into(),
-                tls: if source == "proxy" { "plain".into() } else { "tool".into() },
+                scheme: scheme.into(),
+                tls: tls.into(),
                 method: "GET".into(),
                 host: "target.example".into(),
-                port: 80,
+                port,
                 target: "/api/data".into(),
                 status: Some(200),
                 error: None,
@@ -1184,12 +1881,25 @@ mod tests {
                 truncated: false,
                 upstream_unverified: false,
                 duration_ms: 1,
+                passive_signals: Vec::new(),
+                principal: None,
             }
         };
+        let intercepted_req = b"POST /api/orders HTTP/1.1\r\nHost: target.example\r\nAuthorization: Bearer mitm-secret\r\nCookie: sid=mitm\r\nContent-Type: application/json\r\nX-Trace: ok\r\n\r\n{\"id\":1}";
+        let intercepted_blob = ctx.blobs.put_bytes(intercepted_req).unwrap();
+        let tunnel_blob = ctx.blobs.put_bytes(b"").unwrap();
+        let mut tunnel_ex = make_ex("ex-tunnel", "proxy", "tunnel", "https", 443, None, tunnel_blob);
+        tunnel_ex.method = "TLS".into();
+
         let map = std::collections::HashMap::from([
-            ("ex-mcp".to_string(), make_ex("ex-mcp", "tool", Some("mcp__gh__issues"), mcp_blob)),
-            ("ex-proxy".to_string(), make_ex("ex-proxy", "proxy", None, proxy_blob)),
-            ("ex-tool".to_string(), make_ex("ex-tool", "tool", Some("http_send"), tool_blob)),
+            ("ex-mcp".to_string(), make_ex("ex-mcp", "tool", "tool", "http", 80, Some("mcp__gh__issues"), mcp_blob)),
+            ("ex-proxy".to_string(), make_ex("ex-proxy", "proxy", "plain", "http", 80, None, proxy_blob)),
+            (
+                "ex-intercepted".to_string(),
+                make_ex("ex-intercepted", "proxy", "intercepted", "https", 443, None, intercepted_blob),
+            ),
+            ("ex-tunnel".to_string(), tunnel_ex),
+            ("ex-tool".to_string(), make_ex("ex-tool", "tool", "tool", "http", 80, Some("http_send"), tool_blob)),
         ]);
         let _ = ctx.capabilities.exchange_lookup.set(Arc::new(move |id| map.get(id).cloned()));
 
@@ -1197,7 +1907,10 @@ mod tests {
         let err = stored_request(&ctx, "ex-mcp").unwrap_err();
         assert!(err.contains("MCP"), "{err}");
 
-        // Proxy-captured exchanges strip all sensitive auth headers and redacted placeholders.
+        // Opaque TLS tunnels remain refused.
+        assert!(stored_request(&ctx, "ex-tunnel").is_err());
+
+        // Proxy-captured plain HTTP exchanges strip all sensitive auth headers and redacted placeholders.
         let proxy_replayed = stored_request(&ctx, "ex-proxy").unwrap();
         for forbidden in ["Authorization", "Proxy-Authorization", "Cookie", "X-Api-Key", "X-Auth-Token", "X-Redacted"] {
             assert!(
@@ -1208,10 +1921,235 @@ mod tests {
         }
         assert_eq!(proxy_replayed.headers.get("X-Custom").map(String::as_str), Some("keepme"));
 
+        // Proxy-captured intercepted HTTPS exchanges ARE now replayable, with auth headers stripped.
+        let mitm_replayed = stored_request(&ctx, "ex-intercepted").unwrap();
+        assert_eq!(mitm_replayed.url, "https://target.example/api/data");
+        assert_eq!(mitm_replayed.method, "POST");
+        assert!(!mitm_replayed.headers.keys().any(|k| k.eq_ignore_ascii_case("Authorization")));
+        assert!(!mitm_replayed.headers.keys().any(|k| k.eq_ignore_ascii_case("Cookie")));
+        assert_eq!(mitm_replayed.headers.get("X-Trace").map(String::as_str), Some("ok"));
+        assert!(mitm_replayed.body_base64.is_some());
+
         // Tool exchanges strip redacted auth placeholders while preserving ordinary headers.
         let tool_replayed = stored_request(&ctx, "ex-tool").unwrap();
         assert!(!tool_replayed.headers.keys().any(|k| k.eq_ignore_ascii_case("Authorization")));
         assert_eq!(tool_replayed.headers.get("Cookie").map(String::as_str), Some("sid=ok"));
         assert_eq!(tool_replayed.headers.get("X-Custom").map(String::as_str), Some("keep"));
+    }
+
+    #[tokio::test]
+    async fn multi_principal_as_profile_strip_auth_and_authz_matrix_bola_detection() {
+        use axum::{
+            http::{HeaderMap, StatusCode},
+            routing::get,
+            Router,
+        };
+        use ferret_core::creds::{Item, ItemKind, Secrets};
+        use ferret_net::Inject;
+
+        const SECRET_A: &str = "Bearer tok-alice-secret-1111";
+        const SECRET_B: &str = "Bearer tok-bob-secret-2222";
+        const COOKIE_A: &str = "alice-cookie-secret-3333";
+        const COOKIE_B: &str = "bob-cookie-secret-4444";
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new()
+            // Vulnerable BOLA endpoint: ignores ownership and returns Alice's invoice for any user (and echoes a header).
+            .route(
+                "/api/invoices/42",
+                get(|h: HeaderMap| async move {
+                    let auth = h.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("");
+                    let ts = if auth == SECRET_A { "2026-11-28T00:00:01Z" } else { "2026-11-28T00:00:09Z" };
+                    let req_id = if auth == SECRET_A { "r-1" } else { "r-2" };
+                    if auth == SECRET_A || auth == SECRET_B {
+                        (
+                            StatusCode::OK,
+                            [("content-type", "application/json"), ("set-cookie", "leak=from-server; Path=/")],
+                            json!({
+                                "id": 42,
+                                "owner": "alice",
+                                "amount_cents": 9900,
+                                "timestamp": ts,
+                                "request_id": req_id,
+                                "echo_auth": auth,
+                            })
+                            .to_string(),
+                        )
+                    } else {
+                        (
+                            StatusCode::UNAUTHORIZED,
+                            [("content-type", "application/json"), ("set-cookie", "anon=1; Path=/")],
+                            json!({"error": "unauthorized"}).to_string(),
+                        )
+                    }
+                }),
+            )
+            // Properly protected endpoint: only Alice gets 200; Bob gets 403; anon gets 401.
+            .route(
+                "/api/private/42",
+                get(|h: HeaderMap| async move {
+                    let auth = h.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("");
+                    if auth == SECRET_A {
+                        (
+                            StatusCode::OK,
+                            [("content-type", "application/json")],
+                            json!({"secret": "alice-only"}).to_string(),
+                        )
+                    } else if auth == SECRET_B {
+                        (
+                            StatusCode::FORBIDDEN,
+                            [("content-type", "application/json")],
+                            json!({"error": "forbidden"}).to_string(),
+                        )
+                    } else {
+                        (
+                            StatusCode::UNAUTHORIZED,
+                            [("content-type", "application/json")],
+                            json!({"error": "login required"}).to_string(),
+                        )
+                    }
+                }),
+            )
+            // Echo endpoint for verifying as_profile / strip_auth header & jar isolation.
+            .route(
+                "/whoami",
+                get(|h: HeaderMap| async move {
+                    let auth = h.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("-");
+                    let cookie = h.get("cookie").and_then(|v| v.to_str().ok()).unwrap_or("-");
+                    format!("auth={auth}|cookie={cookie}")
+                }),
+            )
+            .route("/set-jar", get(|| async { ([("set-cookie", "jar_sid=jar-alice; Path=/")], "ok") }));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let e = crate::testutil::env();
+        let items_a = vec![
+            Item {
+                kind: ItemKind::Header,
+                name: "Authorization".into(),
+                value: SECRET_A.into(),
+                host: "127.0.0.1".into(),
+            },
+            Item { kind: ItemKind::Cookie, name: "sid".into(), value: COOKIE_A.into(), host: "127.0.0.1".into() },
+        ];
+        let items_b = vec![
+            Item {
+                kind: ItemKind::Header,
+                name: "Authorization".into(),
+                value: SECRET_B.into(),
+                host: "127.0.0.1".into(),
+            },
+            Item { kind: ItemKind::Cookie, name: "sid".into(), value: COOKIE_B.into(), host: "127.0.0.1".into() },
+        ];
+        let all_items: Vec<Item> = items_a.iter().chain(items_b.iter()).cloned().collect();
+        let inj_a = Arc::new(Inject::new(items_a));
+        let inj_b = Arc::new(Inject::new(items_b));
+        e.ctx.capabilities.creds.set(inj_a.clone()).unwrap();
+        e.ctx.capabilities.default_profile.set("user_a".into()).unwrap();
+        e.ctx
+            .capabilities
+            .creds_profiles
+            .set(BTreeMap::from([("user_a".into(), inj_a), ("user_b".into(), inj_b)]))
+            .unwrap();
+        e.ctx.capabilities.secrets.set(Arc::new(Secrets::for_items(&all_items))).unwrap();
+
+        // Populate session jar under default user_a.
+        let jar_res = e.call("http_send", json!({"request":{"url":format!("http://{addr}/set-jar")}})).await;
+        assert_eq!(jar_res.status, ToolStatus::Ok);
+        assert_eq!(jar_res.exchanges[0].principal.as_deref(), Some("profile:user_a"));
+
+        // `strip_auth: true` strips caller auth headers AND skips session jar & default profile.
+        let stripped = e
+            .call(
+                "http_send",
+                json!({
+                    "request": {
+                        "url": format!("http://{addr}/whoami"),
+                        "headers": {"Authorization": "Bearer manual", "Cookie": "c=1"}
+                    },
+                    "strip_auth": true
+                }),
+            )
+            .await;
+        assert_eq!(stripped.status, ToolStatus::Ok, "{}", stripped.text);
+        assert!(stripped.text.contains("auth=-|cookie=-"), "{}", stripped.text);
+        assert_eq!(stripped.exchanges[0].principal.as_deref(), Some("anon"));
+
+        // `as_profile: "user_b"` strips caller auth headers, skips user_a's jar, injects user_b, redacts secrets!
+        let as_b = e
+            .call(
+                "http_send",
+                json!({
+                    "request": {
+                        "url": format!("http://{addr}/whoami"),
+                        "headers": {"Authorization": "Bearer manual"}
+                    },
+                    "as_profile": "user_b"
+                }),
+            )
+            .await;
+        assert_eq!(as_b.status, ToolStatus::Ok, "{}", as_b.text);
+        assert_eq!(as_b.exchanges[0].principal.as_deref(), Some("profile:user_b"));
+        assert!(!as_b.text.contains("jar_sid"), "user_a jar must not bleed into user_b: {}", as_b.text);
+        assert!(
+            !as_b.text.contains("tok-bob") && !as_b.text.contains("bob-cookie"),
+            "no raw secret leak: {}",
+            as_b.text
+        );
+        assert!(as_b.text.contains("auth=[redacted]|cookie=sid=[redacted]"), "{}", as_b.text);
+
+        // `http_authz_matrix` detects BOLA on `/api/invoices/42` despite differing volatile keys, with ZERO secret leak!
+        let bola = e
+            .call("http_authz_matrix", json!({"url": format!("http://{addr}/api/invoices/42"), "baseline": "user_a"}))
+            .await;
+        assert_eq!(bola.status, ToolStatus::Ok, "{}", bola.text);
+        assert_eq!(bola.exchanges.len(), 3, "one Exchange per principal");
+        let principals: Vec<&str> = bola.exchanges.iter().filter_map(|x| x.principal.as_deref()).collect();
+        assert_eq!(principals, ["anon", "profile:user_a", "profile:user_b"]);
+        assert!(bola.text.contains("potential_bola_idor"), "{}", bola.text);
+        let meta_str = serde_json::to_string(&bola.meta).unwrap();
+        for secret in ["tok-alice", "tok-bob", "alice-cookie", "bob-cookie"] {
+            assert!(!bola.text.contains(secret), "secret `{secret}` leaked in matrix report: {}", bola.text);
+            assert!(!meta_str.contains(secret), "secret `{secret}` leaked in matrix meta");
+            for ex in &bola.exchanges {
+                let req_txt = String::from_utf8_lossy(&e.ctx.blobs.read_all(&ex.request.id).unwrap()).into_owned();
+                assert!(!req_txt.contains(secret), "secret `{secret}` leaked in request blob: {req_txt}");
+                if let Some(resp) = &ex.response {
+                    let resp_txt = String::from_utf8_lossy(&e.ctx.blobs.read_all(&resp.id).unwrap()).into_owned();
+                    assert!(!resp_txt.contains(secret), "secret `{secret}` leaked in response blob: {resp_txt}");
+                }
+            }
+        }
+        let anomalies = bola.meta.get("anomalies").and_then(Value::as_array).unwrap();
+        assert_eq!(anomalies.len(), 1, "{anomalies:?}");
+        assert_eq!(anomalies[0]["principal"], "user_b");
+        assert_eq!(anomalies[0]["flag"], "potential_bola_idor");
+
+        // Properly protected endpoint raises ZERO BOLA flags.
+        let safe = e
+            .call("http_authz_matrix", json!({"url": format!("http://{addr}/api/private/42"), "baseline": "user_a"}))
+            .await;
+        assert_eq!(safe.status, ToolStatus::Ok, "{}", safe.text);
+        assert!(!safe.text.contains("potential_bola_idor"), "{}", safe.text);
+        assert_eq!(safe.meta.get("anomalies").and_then(Value::as_array).unwrap().len(), 0);
+
+        // Unknown principal or <2 principals fail cleanly.
+        let bad_p = e
+            .call(
+                "http_authz_matrix",
+                json!({"url": format!("http://{addr}/api/private/42"), "principals": ["anon", "nope"]}),
+            )
+            .await;
+        assert_eq!(bad_p.status, ToolStatus::Error);
+        assert!(bad_p.text.contains("nope") && bad_p.text.contains("user_a"), "{}", bad_p.text);
+
+        let too_few = e
+            .call("http_authz_matrix", json!({"url": format!("http://{addr}/api/private/42"), "principals": ["anon"]}))
+            .await;
+        assert_eq!(too_few.status, ToolStatus::Error);
+        assert!(too_few.text.contains("at least 2"), "{}", too_few.text);
+
+        server.abort();
     }
 }

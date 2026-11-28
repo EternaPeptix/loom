@@ -130,17 +130,22 @@
 //!     daemon's port (`sandbox.daemon_port`), the `host:port` of every model profile's `base_url` (those of the
 //!     start-up configuration, of the live set, and of every profile a reload made live since the start, kept after
 //!     a later reload removes or changes it: `Inner::infra_config`), the services the daemon talks to for the
-//!     operator (`service_endpoints`: the Signal bridge's signal-cli, `signal.http_url`, with `[signal]` enabled, and the
-//!     mail inbox's IMAP server, `mail.host` on `mail.port`, with `[mail]` enabled and `imaps`; each on its port), the
+//!     operator (`service_endpoints`: the Signal bridge's signal-cli, `signal.http_url`, with `[signal]` enabled, the
+//!     mail inbox's IMAP server, `mail.host` on `mail.port`, with `[mail]` enabled and `imaps`, each on its port, and
+//!     with `[oast]` enabled the OAST broker's endpoints, `oast_endpoints`: its listeners on the addresses they are
+//!     bound to, the poll endpoint, the callback host and the names under its DNS domain), the
 //!     box's `ssh_host` when the box is enabled, and `network.infrastructure`; `Runtime::start` parses them once
 //!     and refuses to start on an entry it cannot read (`The network configuration cannot be used: …`). The
 //!     spec also carries what `crate::infra` resolved (the box's Docker host from `ssh -G`, the addresses of
 //!     every named entry, this machine's own addresses), at start and every `RESOLVE_EVERY`; a `box.ssh_host`
 //!     of the form `user@host` or `ssh://user@host:2222` is reduced to its host, and one whose host the policy
-//!     cannot read is left out with a warning. `Runtime::start` sets `config.sandbox.infra_ports` (the loopback
-//!     ports of model endpoints, of signal-cli and of `network.infrastructure`, `crate::infra::loopback_ports`) and adds
-//!     the services' files to `config.sandbox.unreadable_paths` (`service_secret_paths`: `mail.password_file` and
-//!     `mail.maildir_path` with `[mail]` enabled, signal-cli's store under `$XDG_DATA_HOME` with `[signal]` enabled; the
+//!     cannot read is left out with a warning. `Runtime::start` starts the OAST broker first (with `[oast]` enabled)
+//!     and writes the addresses its listeners were bound to back into `config.oast` (a port 0 becomes the port bound),
+//!     so every policy, the sandbox and the monitor see the real ones. It sets `config.sandbox.infra_ports` (the loopback
+//!     ports of model endpoints, of signal-cli, of the OAST listeners and of `network.infrastructure`,
+//!     `crate::infra::loopback_ports`) and adds the services' files to `config.sandbox.unreadable_paths`
+//!     (`service_secret_paths`: `mail.password_file` and `mail.maildir_path` with `[mail]` enabled, signal-cli's store
+//!     under `$XDG_DATA_HOME` with `[signal]` enabled, `oast.external_token_file` with `[oast]` in `external` mode; the
 //!     default `~/.local/share/signal-cli` is one of the sandbox's credential stores); `sandbox_cfg_for`
 //!     adds those of the endpoints of the profiles `Inner::infra_config` holds, when the sandbox is made: a running
 //!     session's sandbox keeps the ports it was made with.
@@ -402,6 +407,15 @@
 //! moved to `logs/box-counters.jsonl`: `{"ts_ms", "mission", "chain", "rules": [{"rule", "packets", "bytes",
 //! "drop"}]}` with the deltas since the last poll. A box that cannot be read is logged once until it can be again.
 //! `Runtime::box_counters_now()` polls and records now and returns the deltas.
+//!
+//! ## The box proxy bridge and the floor (main's Wave B with the monitor, ef34aa4)
+//! With `[box] proxy_bridge`, `box_for` gives the mission's box the credentials and listener port of the lead's grant
+//! (else of the session that makes the box): what a program in the box sends over HTTP(S) is that session's, decided by
+//! its policy (`session_policy`: the infrastructure deny and the revoked hosts, `mission_floor`) with the veto, SNI
+//! binding, the canary and lab-listener checks, recorded in its `net.jsonl`, and registered in the proxy's one live
+//! registry, so `cut_mission`, `revoke_scope`, a hold, `set_policy` and `panic_stop_all` end it like the session's own
+//! connections. The box chain holds the direct egress from the same policy (`box_egress`); the counters above read that
+//! chain only (a bridged request goes to the host, `INPUT`, and is in the net records instead).
 //!
 //! ## Notifying the operator
 //! For every `inbox_opened` and every `End::Fatal`. `kind` is the inbox kind in snake case
@@ -799,7 +813,7 @@ use crate::pack::{self, Packs, PromptEnv, RoleDef};
 use crate::prior;
 mod creds_api;
 mod target_api;
-mod targets;
+pub(crate) mod targets;
 use crate::rtools::{
     self, ChildCopy, ChildInfo, Orchestrator, Producer, Run, Settlement, Shared, SpawnReq, Vote, Workspace,
 };
@@ -841,7 +855,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
-pub use target_api::{ca_rotate, ca_show, ExchangeEntry, GraphView, NoiseStatusView, TargetBody, TargetView};
+pub use target_api::{
+    ca_rotate, ca_show, ExchangeEntry, GraphView, NoiseStatusView, ScopeImportResult, TargetBody, TargetView,
+};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
@@ -937,6 +953,10 @@ pub struct NewSession {
     /// (CONTRACTS-TRAFFIC-TARGETS S3). Refused without `target`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub creds: Option<String>,
+    /// Named credential profiles of `target` mounted for multi-principal testing (`as_profile`,
+    /// `http_authz_matrix`). Refused without `target`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub creds_profiles: Vec<String>,
     /// Decrypt the mission's HTTPS (CONTRACTS-TRAFFIC-TARGETS I1): `Some(false)` turns it off for a pack that
     /// asks for it, `Some(true)` turns it on for one that does not. Absent = the pack decides. Fixed for the
     /// mission; `[network] intercept = "always"|"never"` overrides it.
@@ -1001,6 +1021,10 @@ pub struct SessionMeta {
     /// an agent inherits it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub creds: Option<ferret_core::event::CredsRef>,
+    /// All credential profiles mounted on a multi-principal mission (name and summary only, never values);
+    /// an agent inherits them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub creds_profiles: Vec<ferret_core::event::CredsRef>,
 }
 
 /// The key of [`SessionMeta::role_models`] that stands for every role the lead starts (`may_spawn`),
@@ -1554,11 +1578,13 @@ pub(crate) fn infra_spec(config: &Config) -> InfraSpec {
 }
 
 /// The services the daemon talks to for the operator, as `(config key, host:port)`, for the infrastructure deny (E1):
-/// the Signal bridge's signal-cli (`signal.http_url`, when `[signal]` is enabled) and the mail inbox's IMAP server
-/// (`mail.host` on `mail.port`, when `[mail]` is enabled with `backend = "imaps"`). A command that reached signal-cli
-/// could read the operator's replies or send as the bridge; one that reached the IMAP server could try the mailbox
-/// past the inbox's sender filter. Like a model endpoint, each is refused on its port, and a loopback one is refused
-/// by the sandbox too (`crate::infra::loopback_ports`).
+/// the Signal bridge's signal-cli (`signal.http_url`, when `[signal]` is enabled), the mail inbox's IMAP server
+/// (`mail.host` on `mail.port`, when `[mail]` is enabled with `backend = "imaps"`) and, when `[oast]` is enabled, the
+/// OAST callback broker's endpoints ([`oast_endpoints`]). A command that reached signal-cli could read the operator's
+/// replies or send as the bridge; one that reached the IMAP server could try the mailbox past the inbox's sender
+/// filter; one that reached the broker could send a callback `oast_poll` grades as executed evidence. Like a model
+/// endpoint, each is refused on its port, and a loopback one is refused by the sandbox too
+/// (`crate::infra::loopback_ports`).
 pub(crate) fn service_endpoints(config: &Config) -> Vec<(String, String)> {
     let mut out = Vec::new();
     if config.signal.enabled {
@@ -1571,6 +1597,75 @@ pub(crate) fn service_endpoints(config: &Config) -> Vec<(String, String)> {
     if mail.enabled && mail.backend == ferret_core::config::MailBackend::Imaps && !host.is_empty() {
         let host = if host.contains(':') { format!("[{host}]") } else { host.to_string() };
         out.push(("mail.host".to_string(), format!("{host}:{}", mail.port)));
+    }
+    if config.oast.enabled {
+        out.extend(oast_endpoints(&config.oast));
+    }
+    out
+}
+
+/// The OAST callback broker's endpoints (`[oast]`, main's Wave B), for the infrastructure deny (E1): in `local` mode its
+/// HTTP listener (`oast.bind`) and DNS listener (`oast.dns_bind`), each on the address it is bound to (`Runtime::start`
+/// starts the broker first and writes the bound addresses back, so a port 0 is the port really bound; an unbound port 0
+/// is left out); in `external` mode the endpoint it polls with the operator's token (`oast.external_poll_url`); in both,
+/// the callback host it mints URLs under when `oast.public_host` names one (on the port of the minted URL: the one
+/// written, else 80 in `local` mode and the poll URL's scheme port in `external` mode, and a poll host without
+/// `public_host` is the poll endpoint itself), and every name under the domain it mints DNS names in
+/// (`*.{domain}`, every port; an IP literal has none). A callback is evidence only when no command of ferret's could
+/// send it: no grant reaches these, and an OAST host is never a way around the infrastructure deny.
+pub(crate) fn oast_endpoints(cfg: &ferret_core::config::OastCfg) -> Vec<(String, String)> {
+    use ferret_core::config::OastMode;
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut push = |key: &str, e: String| {
+        if !out.iter().any(|(_, x)| x.eq_ignore_ascii_case(&e)) {
+            out.push((key.to_string(), e));
+        }
+    };
+    let bound = |raw: &str| raw.trim().parse::<std::net::SocketAddr>().ok().filter(|a| a.port() != 0);
+    let public = cfg.public_host.as_deref().map(str::trim).filter(|h| !h.is_empty());
+    let scheme = match cfg.mode {
+        OastMode::Local => "http".to_string(),
+        OastMode::External => cfg
+            .external_poll_url
+            .as_deref()
+            .and_then(|u| u.trim().split_once("://"))
+            .map_or_else(|| "https".to_string(), |(s, _)| s.to_ascii_lowercase()),
+    };
+    match cfg.mode {
+        OastMode::Local => {
+            if let Some(a) = bound(&cfg.bind) {
+                push("oast.bind", a.to_string());
+            }
+            if let Some(a) = cfg.dns_bind.as_deref().and_then(bound) {
+                push("oast.dns_bind", a.to_string());
+            }
+        }
+        OastMode::External => {
+            if let Some(e) = cfg.external_poll_url.as_deref().and_then(endpoint_of) {
+                push("oast.external_poll_url", e);
+            }
+        }
+    }
+    let callback = public.map(str::to_string).or_else(|| match cfg.mode {
+        OastMode::External => cfg
+            .external_poll_url
+            .as_deref()
+            .and_then(endpoint_of)
+            .and_then(|e| e.rsplit_once(':').map(|(h, _)| h.to_string())),
+        OastMode::Local => None,
+    });
+    if let Some(authority) = callback {
+        if let Some(e) = endpoint_of(&format!("{scheme}://{authority}")) {
+            push("oast.public_host", e);
+        }
+        let domain = match authority.strip_prefix('[') {
+            Some(v6) => v6.split(']').next().unwrap_or("").to_string(),
+            None => authority.split(':').next().unwrap_or("").to_string(),
+        };
+        let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+        if !domain.is_empty() && domain.parse::<std::net::IpAddr>().is_err() {
+            push("oast.public_host", format!("*.{domain}"));
+        }
     }
     out
 }
@@ -1606,6 +1701,13 @@ pub(crate) fn service_secret_paths(config: &Config) -> Vec<String> {
     if config.signal.enabled {
         if let Some(data) = std::env::var_os("XDG_DATA_HOME").filter(|d| Path::new(d).is_absolute()) {
             push(&Path::new(&data).join("signal-cli").display().to_string());
+        }
+    }
+    // The bearer token the OAST broker polls its external server with: a command that read it could read the
+    // mission's callbacks there, or plant one.
+    if config.oast.enabled && config.oast.mode == ferret_core::config::OastMode::External {
+        if let Some(p) = config.oast.external_token_file.as_deref() {
+            push(p);
         }
     }
     out
@@ -2564,6 +2666,7 @@ struct ActiveSession {
     control: Arc<Control>,
     shared: Arc<Shared>,
     jobs: Arc<JobTable>,
+    proxy_grant: ferret_net::SessionGrant,
     task: JoinHandle<()>,
 }
 
@@ -2795,6 +2898,7 @@ struct Parts {
     control: Arc<Control>,
     shared: Arc<Shared>,
     jobs: Arc<JobTable>,
+    proxy_grant: ferret_net::SessionGrant,
 }
 
 /// What `activate` found out about a session.
@@ -2883,6 +2987,10 @@ struct Inner {
     recordings: Mutex<HashMap<String, Arc<creds_api::Recording>>>,
     /// Persistent operator-only proxy rewrite rules (`<home>/rewrite_rules.json`).
     rewrites: ferret_net::RewriteStore,
+    /// Optional Out-of-Band Application Security Testing callback broker (`[oast]`).
+    oast: Option<Arc<ferret_tools::oast::OastBroker>>,
+    /// Deduplication cache for live proxy `(target, host, ip)` resolution writes to `TargetStore`.
+    resolves_seen: Mutex<HashSet<(String, String, String)>>,
 }
 
 impl Inner {
@@ -3175,6 +3283,9 @@ impl Drop for Inner {
     /// Let go of the tasks without `shutdown` (the daemon unwinding) as a shutdown does, before their
     /// inputs close: an agent is then cut for the next start, not settled as stopped by the operator.
     fn drop(&mut self) {
+        if let Some(oast) = &self.oast {
+            oast.shutdown();
+        }
         let st = self.state.get_mut().unwrap_or_else(|p| p.into_inner());
         for a in st.known.values().filter_map(|k| k.active.as_ref()) {
             a.control.stop_for_shutdown();
@@ -3258,6 +3369,18 @@ impl Orchestrator for Orch {
         session: &SessionId,
     ) -> Option<Result<(String, Vec<ferret_core::target::NodeView>), String>> {
         self.up().ok()?.target_nodes_of(session)
+    }
+
+    fn find_duplicate_findings(
+        &self,
+        session: &SessionId,
+        vuln_class: &str,
+        surface: &str,
+        param_or_sink: &str,
+    ) -> Vec<ferret_core::target::TargetFinding> {
+        self.up()
+            .map(|inner| inner.target_duplicate_findings(session, vuln_class, surface, param_or_sink))
+            .unwrap_or_default()
     }
 
     async fn spawn(&self, parent: &SessionId, req: SpawnReq) -> Result<SessionId, String> {
@@ -3658,12 +3781,14 @@ impl Inner {
         }
     }
 
-    /// Stop one session: cancel its turn and tell it.
+    /// Stop one session: cancel its turn and tell it with a monotonic stop epoch so that once
+    /// the cancelled turn unwinds, the companion channel stop cannot double-interrupt a newly
+    /// resumed turn.
     fn stop_one(&self, id: &SessionId) {
         let st = self.st();
         if let Some(a) = st.known.get(id).and_then(|k| k.active.as_ref()) {
-            a.control.stop_turn();
-            let _ = a.inputs.send(Input::Stop);
+            let epoch = a.control.request_stop();
+            let _ = a.inputs.send(Input::StopAt(epoch));
         }
     }
 
@@ -4091,7 +4216,44 @@ impl Inner {
             let inner = weak.upgrade().ok_or_else(|| SHUTTING.to_string())?;
             inner.box_egress(&mission)
         });
-        let made = MissionBox::new(host, meta.mission.as_str(), source);
+        let made = if self.config.boxed.proxy_bridge {
+            let lead_grant = st
+                .known
+                .values()
+                .find(|k| k.meta.parent.is_none() && k.meta.mission == meta.mission)
+                .and_then(|k| k.active.as_ref())
+                .map(|a| a.proxy_grant.clone());
+            let session_grant = st.known.get(session).and_then(|k| k.active.as_ref()).map(|a| a.proxy_grant.clone());
+            let grant = lead_grant.or(session_grant).ok_or_else(|| {
+                "The box proxy bridge needs an active session proxy grant, but neither the mission lead nor this session is active."
+                    .to_string()
+            })?;
+            let proxy_port = grant.port;
+            let bridge_port = self
+                .config
+                .boxed
+                .proxy_bridge_port
+                .unwrap_or_else(|| deterministic_box_bridge_port(meta.mission.as_str(), proxy_port));
+            let ca_pem = if meta.intercept {
+                let ca = ferret_net::tls::Ca::load_or_create(&self.paths.ca_dir()).map_err(|e| {
+                    format!("HTTPS interception is on for this mission but the CA cannot be loaded for the box: {e}")
+                })?;
+                Some(ca.cert_pem.as_bytes().to_vec())
+            } else {
+                None
+            };
+            let bridge = ferret_tools::boxctl::BoxProxyBridge {
+                proxy_port,
+                proxy_auth: Some((grant.user.clone(), grant.password.clone())),
+                bridge_port,
+                bridge_gateway_ip: String::new(),
+                ca_pem,
+            };
+            bridge.validate_config()?;
+            MissionBox::new_with_bridge(host, meta.mission.as_str(), source, Some(bridge))
+        } else {
+            MissionBox::new(host, meta.mission.as_str(), source)
+        };
         st.boxes.insert(meta.mission, made.clone());
         Ok(made)
     }
@@ -4668,12 +4830,20 @@ impl Inner {
                 }
             }
         }
-        // S11: the mission's profile items, shared by its sessions, reach the proxy and the tools.
-        if let Some((inject, secrets)) = self.mission_creds(meta) {
-            self.proxy.set_inject(id, Some(inject.clone()));
-            let _ = capabilities.creds.set(inject);
-            let _ = capabilities.secrets.set(secrets.clone());
-            let _ = traffic.secrets.set(secrets);
+        // Mission identity & optional OAST callback broker reach every session (lead and children).
+        let _ = capabilities.mission_id.set(meta.mission.as_str().to_string());
+        if let Some(oast) = &self.oast {
+            let _ = capabilities.oast.set(oast.clone());
+        }
+        // S11 + Wave B multi-principal: the mission's profile items, shared by its sessions, reach
+        // the proxy and the tools (with one union secret set covering every mounted profile).
+        if let Some(mounted) = self.mission_creds(meta) {
+            self.proxy.set_inject(id, Some(mounted.default_inject.clone()));
+            let _ = capabilities.creds.set(mounted.default_inject);
+            let _ = capabilities.creds_profiles.set(mounted.profiles);
+            let _ = capabilities.default_profile.set(mounted.default_name);
+            let _ = capabilities.secrets.set(mounted.secrets.clone());
+            let _ = traffic.secrets.set(mounted.secrets);
         }
         #[cfg(test)]
         lock(&SESSION_TOOLS).push((id.clone(), capabilities.clone()));
@@ -4755,7 +4925,7 @@ impl Inner {
             control: control.clone(),
         };
         revoke.armed = false;
-        Ok((deps, Parts { control, shared, jobs }))
+        Ok((deps, Parts { control, shared, jobs, proxy_grant: grant }))
     }
 
     /// The `session_start` of a session whose `deps` were built.
@@ -4805,6 +4975,7 @@ impl Inner {
             intercept: meta.intercept,
             target: meta.target.clone(),
             creds: meta.creds.clone(),
+            creds_profiles: meta.creds_profiles.clone(),
             title: meta.title.clone(),
             project_instructions: env.project_instructions,
             mcp: Vec::new(),
@@ -4814,7 +4985,7 @@ impl Inner {
     /// Spawn the task driving `session` and record it as the active one of `id`. The state lock is
     /// held by the caller so that the task cannot end before it is recorded.
     fn launch(self: &Arc<Self>, st: &mut State, id: &SessionId, session: Session, parts: Parts) {
-        let Parts { control, shared, jobs } = parts;
+        let Parts { control, shared, jobs, proxy_grant } = parts;
         let mcp_shared = shared.clone();
         let gen = self.next_gen.fetch_add(1, Ordering::SeqCst);
         let (inputs, rx) = unbounded_channel();
@@ -4854,7 +5025,7 @@ impl Inner {
             }
         });
         if let Some(k) = st.known.get_mut(id) {
-            k.active = Some(ActiveSession { gen, inputs, control, shared, jobs, task });
+            k.active = Some(ActiveSession { gen, inputs, control, shared, jobs, proxy_grant, task });
         }
     }
 
@@ -5368,6 +5539,7 @@ impl Inner {
                 prior: Vec::new(),
                 target: p.meta.target.clone(),
                 creds: p.meta.creds.clone(),
+                creds_profiles: p.meta.creds_profiles.clone(),
             };
             let explicit = prole.termination == Termination::Explicit;
             st.known.insert(child_id.clone(), Known::new(meta.clone(), idle_status()));
@@ -6188,6 +6360,14 @@ fn record_net(inner: &Inner, session: SessionId, decision: NetDecision) {
     inner.publish(BusEvent::Net { session, entry });
 }
 
+/// Derive a deterministic unprivileged TCP port in `38000..=57999` on the Docker bridge gateway
+/// for a mission when `[box] proxy_bridge = true` and `proxy_bridge_port` is omitted.
+fn deterministic_box_bridge_port(mission: &str, proxy_port: u16) -> u16 {
+    let hex = ferret_core::sha256_hex(format!("ferret-box-bridge:{mission}:{proxy_port}").as_bytes());
+    let raw = u16::from_str_radix(&hex[..4], 16).unwrap_or(proxy_port);
+    38_000 + (raw % 20_000)
+}
+
 /// Where the proxy's decisions that name no session are kept, under `logs/`.
 const UNATTRIBUTED_NET: &str = "net-unattributed.jsonl";
 
@@ -6215,7 +6395,16 @@ fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
 /// The proxy's audit hook: appends the decision to the session's `net.jsonl` as a chained line, syncs
 /// it to disk, and then publishes the same entry as [`BusEvent::Net`]; so an allowed connection is on
 /// record before it is used. A decision that names no session goes to `logs/net-unattributed.jsonl`.
+#[cfg_attr(not(test), allow(dead_code))]
 fn net_audit(paths: Paths, bus: broadcast::Sender<BusEvent>) -> ferret_net::AuditFn {
+    net_audit_with_inner(paths, bus, None)
+}
+
+fn net_audit_with_inner(
+    paths: Paths,
+    bus: broadcast::Sender<BusEvent>,
+    inner_cell: Option<Arc<std::sync::OnceLock<Weak<Inner>>>>,
+) -> ferret_net::AuditFn {
     let writer = ferret_net::netlog::NetLogWriter::new();
     Arc::new(move |session: Option<&SessionId>, decision: &NetDecision| {
         let entry = NetEntry { ts_ms: now_ms(), decision: decision.clone() };
@@ -6233,6 +6422,11 @@ fn net_audit(paths: Paths, bus: broadcast::Sender<BusEvent>) -> ferret_net::Audi
             ));
         }
         writer.append(&dir.join("net.jsonl"), &entry)?;
+        if let Some(ip) = decision.resolved.as_deref() {
+            if let Some(inner) = inner_cell.as_ref().and_then(|c| c.get()).and_then(Weak::upgrade) {
+                inner.target_resolves(&audit_session, entry.ts_ms, &decision.host, ip);
+            }
+        }
         let _ = bus.send(BusEvent::Net { session: audit_session, entry });
         Ok(())
     })
@@ -6247,6 +6441,23 @@ pub struct Runtime {
 impl Runtime {
     /// Bring the runtime up over `paths` and restore what was running. See *Start*.
     pub async fn start(mut config: Config, paths: Paths) -> Result<Runtime, String> {
+        // The OAST broker binds first: its listeners are infrastructure (E1, `oast_endpoints`) on the addresses they are
+        // bound to, which a port 0 learns only now. They are written back, so every policy, the sandbox's infrastructure
+        // ports and the monitor's infrastructure class see the real ones.
+        let oast = if config.oast.enabled {
+            let broker = ferret_tools::oast::OastBroker::start(&config.oast)
+                .await
+                .map_err(|e| format!("The OAST callback broker cannot be started: {e}"))?;
+            if let Some(a) = broker.http_addr() {
+                config.oast.bind = a.to_string();
+            }
+            if let Some(a) = broker.dns_addr() {
+                config.oast.dns_bind = Some(a.to_string());
+            }
+            Some(broker)
+        } else {
+            None
+        };
         // The loopback ports of infrastructure that no command may reach, whatever loopback it is allowed.
         config.sandbox.infra_ports = crate::infra::loopback_ports(&config);
         // And the files of the services the daemon talks to for the operator (the mail password, the maildir).
@@ -6315,7 +6526,8 @@ impl Runtime {
         let (notices, _) = broadcast::channel(NOTICES_CAPACITY);
         let (net_tx, mut net_rx) = unbounded_channel();
         let (capture_tx, mut capture_rx) = unbounded_channel::<(SessionId, ferret_net::Captured)>();
-        let audit = net_audit(paths.clone(), bus.clone());
+        let audit_inner = Arc::new(std::sync::OnceLock::new());
+        let audit = net_audit_with_inner(paths.clone(), bus.clone(), Some(audit_inner.clone()));
         let proxy = Proxy::start_with(config.daemon.proxy_port, net_tx, Some(audit), Default::default())
             .await
             .map_err(|e| e.to_string())?;
@@ -6375,7 +6587,10 @@ impl Runtime {
             mission_creds: Mutex::new(HashMap::new()),
             recordings: Mutex::new(HashMap::new()),
             rewrites,
+            oast,
+            resolves_seen: Mutex::new(HashSet::new()),
         });
+        let _ = audit_inner.set(Arc::downgrade(&inner));
 
         let weak = Arc::downgrade(&inner);
         let forwarder = tokio::spawn(async move {
@@ -6834,8 +7049,9 @@ impl Runtime {
         }
         // The target is read once, here: the lead records it (scope and summary) and the agents inherit it.
         let target = inner.target_ref(new.target.as_deref())?;
-        // S11: a profile is refused here, before the folder or any log exists.
-        let creds = inner.start_creds(target.as_ref(), new.creds.as_deref())?;
+        // S11 + Wave B multi-principal: profiles are refused here, before the folder or any log exists.
+        let (creds, creds_profiles) =
+            inner.start_creds_profiles(target.as_ref(), new.creds.as_deref(), &new.creds_profiles)?;
         let (model, window, from_config) = inner.facts(&profile_name).await?;
         // The earlier missions to recall can refuse the request too, so they are read before the folder is made.
         let (prior_ids, recalled) = self.recall_earlier(&new.prior).await?;
@@ -6879,6 +7095,7 @@ impl Runtime {
                 role_models,
                 target,
                 creds,
+                creds_profiles,
             };
             inner.st().known.insert(id.clone(), Known::new(meta.clone(), idle_status()));
             (made, workspace, created, id, meta)
@@ -9489,6 +9706,9 @@ impl Runtime {
         }
         // The self-probe's commands and decoys must not outlive the daemon.
         ferret_tools::sandbox::selfprobe::stop();
+        if let Some(oast) = &inner.oast {
+            oast.shutdown();
+        }
         if let Some(host) = &inner.box_host {
             host.shutdown().await;
         }
@@ -10102,7 +10322,7 @@ mod tests {
         })
         .await;
         let packs = e.rt.packs();
-        assert_eq!(packs.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["core", "aaa"]);
+        assert_eq!(packs.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["core", "aaa", "webapp"]);
         let aaa = &packs[1];
         assert_eq!((aaa.description.as_str(), aaa.default_role.as_str(), aaa.intercept), ("Test pack.", "mid", true));
         let names: Vec<_> = aaa.roles.iter().map(|r| r.name.as_str()).collect();
@@ -10689,6 +10909,114 @@ mod tests {
         assert_eq!(check("imap.example.test", 443), "allow imap.example.test:443", "only the service's port");
         assert!(e.rt.inner.config.sandbox.infra_ports.contains(&1337), "{:?}", e.rt.inner.config.sandbox.infra_ports);
         e.rt.shutdown().await;
+    }
+
+    /// E1 with main's OAST broker (`[oast]`): its listener is infrastructure on the port it was really bound to (a
+    /// `bind` with port 0 is written back at the start), so no grant reaches it, no session's policy lets a command
+    /// send it a callback, and the sandbox refuses its loopback port; a callback from outside ferret's commands still
+    /// lands in the mission's interactions.
+    #[tokio::test]
+    async fn no_grant_reaches_the_oast_broker_and_a_callback_from_outside_still_lands() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let e = env_with(Script::new(|_, _| finish("ok")), false, |c| {
+            c.oast.enabled = true;
+            c.oast.mode = ferret_core::config::OastMode::Local;
+            c.oast.bind = "127.0.0.1:0".into();
+        })
+        .await;
+        let broker = e.rt.inner.oast.clone().expect("the broker is started");
+        let port = broker.http_addr().map(|a| a.port()).unwrap_or(0);
+        assert_ne!(port, 0);
+        assert_eq!(e.rt.inner.config.oast.bind, format!("127.0.0.1:{port}"), "the bound address is written back");
+        assert!(e.rt.inner.config.sandbox.infra_ports.contains(&port), "{:?}", e.rt.inner.config.sandbox.infra_ports);
+        let info = e.rt.create_session(e.new_session(Some("go"))).await.unwrap();
+        let id = info.meta.id.clone();
+        until("idle", || e.rt.session(&id).is_some_and(|s| s.status.phase == Phase::Idle)).await;
+        for bad in [format!("127.0.0.1:{port}"), format!("localhost:{port}")] {
+            let err = e.rt.grant_scope(&id, std::slice::from_ref(&bad), None).await.unwrap_err();
+            assert!(
+                err.contains("deny infrastructure: oast.bind") && err.contains("nothing was granted"),
+                "{bad}: {err}"
+            );
+        }
+        let rule = e.rt.inner.proxy.check_name(&id, "127.0.0.1", port).map(|v| v.rule).unwrap_or_default();
+        assert_eq!(rule, format!("deny infrastructure: oast.bind 127.0.0.1:{port}"));
+        // The floor's veto and the monitor's infrastructure class know it too.
+        let floor = infra_policy(&e.rt.inner.config, &crate::infra::Resolution::default()).unwrap();
+        assert!(floor.infrastructure_refusal(&format!("127.0.0.1:{port}")).is_some());
+        // A callback from outside (the target under test) is recorded for the mission that minted the token.
+        let minted = broker.mint(info.meta.mission.as_str(), id.as_str(), Some("ssrf"), None);
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        s.write_all(
+            format!("GET /oast/{} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n", minted.token).as_bytes(),
+        )
+        .await
+        .unwrap();
+        let mut answer = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut answer)).await;
+        let seen = broker.poll(info.meta.mission.as_str(), Some(&minted.token), None).await.unwrap();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        e.rt.shutdown().await;
+    }
+
+    /// The OAST endpoints the infrastructure deny takes (`oast_endpoints`) for each mode, and the external token file
+    /// among the services' files.
+    #[test]
+    fn the_oast_brokers_endpoints_are_infrastructure_in_both_modes() {
+        use ferret_core::config::{OastCfg, OastMode};
+        let pairs = |v: Vec<(String, String)>| v.into_iter().map(|(k, e)| format!("{k} {e}")).collect::<Vec<_>>();
+        // Local, not bound yet (port 0): nothing of the listener, nothing without a public host.
+        let unbound = OastCfg { enabled: true, ..OastCfg::default() };
+        assert!(oast_endpoints(&unbound).is_empty());
+        let local = OastCfg {
+            enabled: true,
+            mode: OastMode::Local,
+            bind: "0.0.0.0:8099".into(),
+            dns_bind: Some("127.0.0.1:5353".into()),
+            public_host: Some("oast.example.test:8080".into()),
+            ..OastCfg::default()
+        };
+        assert_eq!(
+            pairs(oast_endpoints(&local)),
+            [
+                "oast.bind 0.0.0.0:8099",
+                "oast.dns_bind 127.0.0.1:5353",
+                "oast.public_host oast.example.test:8080",
+                "oast.public_host *.oast.example.test",
+            ]
+        );
+        let local80 = OastCfg { public_host: Some("Oast.Example.Test".into()), dns_bind: None, ..local.clone() };
+        assert_eq!(
+            pairs(oast_endpoints(&local80)),
+            ["oast.bind 0.0.0.0:8099", "oast.public_host Oast.Example.Test:80", "oast.public_host *.oast.example.test"]
+        );
+        // External: the endpoint it polls, and the callback host (the poll host itself when no public host is set).
+        let external = OastCfg {
+            enabled: true,
+            mode: OastMode::External,
+            external_poll_url: Some("https://poll.example.test/api/poll".into()),
+            external_token_file: Some("/nonexistent/oast.token".into()),
+            ..OastCfg::default()
+        };
+        assert_eq!(
+            pairs(oast_endpoints(&external)),
+            ["oast.external_poll_url poll.example.test:443", "oast.public_host *.poll.example.test"]
+        );
+        let with_public = OastCfg { public_host: Some("203.0.113.9:8443".into()), ..external.clone() };
+        assert_eq!(
+            pairs(oast_endpoints(&with_public)),
+            ["oast.external_poll_url poll.example.test:443", "oast.public_host 203.0.113.9:8443"],
+            "an IP literal has no DNS names under it"
+        );
+        let mut c = Config { oast: external, ..Config::default() };
+        assert!(service_endpoints(&c).iter().any(|(k, _)| k == "oast.external_poll_url"));
+        assert_eq!(service_secret_paths(&c), ["/nonexistent/oast.token"]);
+        check_infrastructure(&c).unwrap();
+        c.oast.enabled = false;
+        assert!(service_endpoints(&c).is_empty() && service_secret_paths(&c).is_empty());
+        c.oast = local;
+        check_infrastructure(&c).unwrap();
+        assert!(crate::infra::loopback_ports(&c).contains(&8099) && crate::infra::loopback_ports(&c).contains(&5353));
     }
 
     /// E1 for the services' files: with `[mail]` enabled, the IMAP password file and the maildir are unreadable to a
@@ -11404,6 +11732,7 @@ mod tests {
             truncated: false,
             upstream_unverified: false,
             duration_ms: 3,
+            passive_signals: Vec::new(),
         }
     }
 
@@ -17851,10 +18180,10 @@ done
         let handle = pending_task.abort_handle();
         {
             let mut st = e.rt.inner.st();
-            let (shared, jobs, mut meta) = {
+            let (shared, jobs, proxy_grant, mut meta) = {
                 let lead_known = st.known.get(&lead).unwrap();
                 let a = lead_known.active.as_ref().unwrap();
-                (a.shared.clone(), a.jobs.clone(), lead_known.meta.clone())
+                (a.shared.clone(), a.jobs.clone(), a.proxy_grant.clone(), lead_known.meta.clone())
             };
             meta.id = kid.clone();
             meta.parent = Some(lead.clone());
@@ -17869,6 +18198,7 @@ done
                 control: Arc::new(Control::new()),
                 shared,
                 jobs,
+                proxy_grant,
                 task: pending_task,
             });
             st.known.insert(kid.clone(), k);
@@ -19141,6 +19471,8 @@ done
             truncated: false,
             upstream_unverified: false,
             duration_ms: 4,
+            passive_signals: Vec::new(),
+            principal: None,
         };
         // Push the exchange through the active session's traffic queue so the session appends it to its log.
         {
@@ -19616,5 +19948,486 @@ done
         assert!(sys_content.contains("&lt;&lt;&lt;END_UNTRUSTED_GUEST_NOTE&gt;&gt;&gt;"), "{sys_content}");
 
         e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn multi_principal_creds_profiles_mount_union_secrets_and_inherit_to_children() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        e.rt.target_create(&target_body(&["*.acme.test", "acme.test"], &[])).unwrap();
+        let secret_a = "alice-super-secret-cookie-111";
+        let secret_b = "bob-super-secret-cookie-222";
+        e.rt.creds_set("acme", "user_a", vec![cookie_item("api.acme.test", "sid", secret_a)]).unwrap();
+        e.rt.creds_set("acme", "user_b", vec![cookie_item("api.acme.test", "sid", secret_b)]).unwrap();
+
+        // Refused without target even when only `creds_profiles` is set.
+        let mut no_target = e.new_session(None);
+        no_target.creds_profiles = vec!["user_a".into(), "user_b".into()];
+        assert!(e.rt.create_session(no_target).await.unwrap_err().contains("target"));
+
+        // Start mission with `creds = None`, `creds_profiles = ["user_a", "user_b", "user_a"]` (dedup + first default).
+        let mut new = e.new_session(None);
+        new.target = Some("acme".into());
+        new.creds_profiles = vec!["user_a".into(), "user_b".into(), "user_a".into()];
+        let info = e.rt.create_session(new).await.unwrap();
+        let lead = info.meta.id.clone();
+
+        assert_eq!(info.meta.creds.as_ref().map(|c| c.profile.as_str()), Some("user_a"));
+        let prof_names: Vec<&str> = info.meta.creds_profiles.iter().map(|c| c.profile.as_str()).collect();
+        assert_eq!(prof_names, vec!["user_a", "user_b"]);
+
+        let start = start_of(&e, &lead);
+        assert_eq!(start.creds.as_ref().map(|c| c.profile.as_str()), Some("user_a"));
+        assert_eq!(start.creds_profiles.len(), 2);
+
+        // Capabilities on lead carry mission_id, default_profile, both profiles, and union Secrets!
+        let lead_tools = tools_of(&lead);
+        assert_eq!(lead_tools.mission_id.get().map(String::as_str), Some(info.meta.mission.as_str()));
+        assert_eq!(lead_tools.default_profile.get().map(String::as_str), Some("user_a"));
+        assert_eq!(lead_tools.mounted_profile_names(), vec!["user_a".to_string(), "user_b".to_string()]);
+        let union_sec = lead_tools.secrets.get().expect("union secrets");
+        let combined = format!("a={secret_a} b={secret_b}");
+        let redacted = union_sec.redact(&combined);
+        assert!(!redacted.contains(secret_a) && !redacted.contains(secret_b), "{redacted}");
+
+        // Child inherits `creds_profiles`, `default_profile`, `mission_id`, and union `Secrets`!
+        let child =
+            e.rt.inner
+                .spawn_child(
+                    &lead,
+                    SpawnReq {
+                        role: "worker".into(),
+                        mode: SpawnMode::Fresh,
+                        brief: Brief { question: "test authz".into(), ..Brief::default() },
+                        budget: Budget::default(),
+                        call_id: CallId::from("c-mp"),
+                        title: "authz child".into(),
+                        awaited: false,
+                        harness: false,
+                        prerequisite: None,
+                        workspace: Workspace::Shared,
+                    },
+                )
+                .await
+                .unwrap();
+        let child_start = start_of(&e, &child);
+        assert_eq!(child_start.creds.as_ref().map(|c| c.profile.as_str()), Some("user_a"));
+        assert_eq!(child_start.creds_profiles.len(), 2);
+        let child_tools = tools_of(&child);
+        assert_eq!(child_tools.mounted_profile_names(), vec!["user_a".to_string(), "user_b".to_string()]);
+        assert_eq!(child_tools.mission_id.get().map(String::as_str), Some(info.meta.mission.as_str()));
+        let child_redacted = child_tools.secrets.get().unwrap().redact(&combined);
+        assert!(!child_redacted.contains(secret_a) && !child_redacted.contains(secret_b));
+
+        e.rt.shutdown().await;
+        // Zero secret values written to lead or child session directories.
+        for sid in [&lead, &child] {
+            for f in files_under(&e.rt.inner.paths.session_dir(sid)) {
+                let text = String::from_utf8_lossy(&std::fs::read(&f).unwrap()).into_owned();
+                assert!(!text.contains(secret_a) && !text.contains(secret_b), "leak in {}", f.display());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn oast_broker_lifecycle_mounts_on_sessions_when_enabled_and_disabled_cleanly() {
+        // Default: disabled -> no broker mounted.
+        let disabled = env(Script::new(|_, _| finish("ok"))).await;
+        let id = disabled.rt.create_session(disabled.new_session(None)).await.unwrap().meta.id;
+        assert!(tools_of(&id).oast.get().is_none());
+        disabled.rt.shutdown().await;
+
+        // Enabled (local mode): broker starts, mounts on every session, and isolates missions.
+        let enabled = env_with(Script::new(|_, _| finish("ok")), false, |c| {
+            c.oast.enabled = true;
+            c.oast.mode = ferret_core::config::OastMode::Local;
+            c.oast.bind = "127.0.0.1:0".into();
+        })
+        .await;
+        let info = enabled.rt.create_session(enabled.new_session(None)).await.unwrap();
+        let tools = tools_of(&info.meta.id);
+        let broker = tools.oast.get().expect("oast broker mounted").clone();
+        assert!(broker.http_addr().is_some());
+        let minted = broker.mint(info.meta.mission.as_str(), info.meta.id.as_str(), Some("ssrf"), None);
+        assert!(!minted.token.is_empty() && minted.http_url.contains(&minted.token));
+        enabled.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn box_proxy_bridge_wires_bridge_config_and_conditional_ca_pem() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeDocker::new(dir.path());
+
+        // 1. Bridge disabled -> proxy_bridge() is None (non-bridge mode unchanged).
+        let e_off = box_env(&fake).await;
+        let (id_off, _) = idle_lead(&e_off).await;
+        let b_off = e_off.rt.inner.orch.box_access(&id_off).await.unwrap();
+        assert!(b_off.proxy_bridge().is_none());
+        e_off.rt.shutdown().await;
+
+        // 2. Bridge enabled with explicit port + intercept=true -> BoxProxyBridge carries session
+        // proxy listener port, Basic auth credentials, dynamic gateway discovery, and CA PEM.
+        let mut cfg_on = fake.cfg();
+        cfg_on.proxy_bridge = true;
+        cfg_on.proxy_bridge_port = Some(18443);
+        let e_on = env_with(Script::new(|_, _| finish("ok")), false, move |c| {
+            c.boxed = cfg_on;
+            with_os_sandbox(c);
+        })
+        .await;
+
+        let mut new_mitm = e_on.new_session(Some("go"));
+        new_mitm.intercept = Some(true);
+        let id_mitm = e_on.rt.create_session(new_mitm).await.unwrap().meta.id;
+        until("mitm lead idle", || e_on.has(&id_mitm, |ev| matches!(ev, Event::TurnEnd { .. }))).await;
+        let mitm_session_port = e_on.rt.inner.proxy.session_port(&id_mitm).expect("active session proxy port");
+        assert_ne!(
+            mitm_session_port,
+            e_on.rt.proxy_port(),
+            "must bind session proxy listener, not shared reference port"
+        );
+        let b_mitm = e_on.rt.inner.orch.box_access(&id_mitm).await.unwrap();
+        let br = b_mitm.proxy_bridge().expect("proxy bridge wired");
+        assert_eq!(br.proxy_port, mitm_session_port);
+        assert!(br.proxy_auth.is_some(), "proxy bridge must carry session Basic auth credentials");
+        assert_eq!(br.bridge_port, 18443);
+        assert!(br.bridge_gateway_ip.is_empty(), "gateway IP is dynamically discovered during ready()");
+        let ca_pem = br.ca_pem.as_deref().expect("MITM CA PEM staged when intercept=true");
+        assert!(String::from_utf8_lossy(ca_pem).contains("BEGIN CERTIFICATE"));
+        // Running ready() resolves the Docker bridge IPv4 gateway dynamically from `docker network inspect`.
+        b_mitm.ready().await.unwrap();
+        let resolved = b_mitm.resolved_proxy_bridge().expect("resolved proxy bridge after ready()");
+        assert!(!resolved.bridge_gateway_ip.is_empty());
+        assert_eq!(resolved.proxy_port, mitm_session_port);
+        assert!(resolved.proxy_auth.is_some());
+        b_mitm.teardown().await;
+
+        // 3. Bridge enabled + intercept=false -> BoxProxyBridge present with session port/auth, ca_pem is None.
+        let mut new_plain = e_on.new_session(Some("go"));
+        new_plain.intercept = Some(false);
+        let id_plain = e_on.rt.create_session(new_plain).await.unwrap().meta.id;
+        until("plain lead idle", || e_on.has(&id_plain, |ev| matches!(ev, Event::TurnEnd { .. }))).await;
+        let plain_session_port = e_on.rt.inner.proxy.session_port(&id_plain).expect("active session proxy port");
+        let b_plain = e_on.rt.inner.orch.box_access(&id_plain).await.unwrap();
+        let br_plain = b_plain.proxy_bridge().expect("proxy bridge wired");
+        assert_eq!(br_plain.proxy_port, plain_session_port);
+        assert_ne!(br_plain.proxy_port, e_on.rt.proxy_port());
+        assert!(br_plain.proxy_auth.is_some());
+        assert!(br_plain.ca_pem.is_none());
+        e_on.rt.shutdown().await;
+    }
+
+    /// Main's box proxy bridge under the floor (E1, E4): what the box sends through the bridge reaches the proxy on the
+    /// lead's grant, so the infrastructure deny and the mission's revoked hosts refuse it as they refuse the lead's own
+    /// commands; a bridged tunnel is in the one live registry, so a revoke ends it at once, and a panic ends the rest and
+    /// stops the bridge with the box.
+    #[tokio::test]
+    async fn what_the_box_sends_through_the_bridge_is_under_the_floor_and_the_one_registry() {
+        use base64::Engine as _;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        async fn connect(addr: &(String, u16), creds: &str, to: &str) -> (String, tokio::net::TcpStream) {
+            let mut s = tokio::net::TcpStream::connect((addr.0.as_str(), addr.1)).await.unwrap();
+            s.write_all(format!("CONNECT {to} HTTP/1.1\r\nProxy-Authorization: Basic {creds}\r\n\r\n").as_bytes())
+                .await
+                .unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                match tokio::time::timeout(Duration::from_secs(5), s.read_exact(&mut byte)).await {
+                    Ok(Ok(_)) => head.push(byte[0]),
+                    _ => break,
+                }
+            }
+            (String::from_utf8_lossy(&head).into_owned(), s)
+        }
+        async fn closes(s: &mut tokio::net::TcpStream) -> bool {
+            let mut rest = Vec::new();
+            tokio::time::timeout(Duration::from_secs(2), s.read_to_end(&mut rest)).await.is_ok()
+        }
+        let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = echo.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = echo.accept().await {
+                tokio::spawn(async move {
+                    let (mut r, mut w) = s.split();
+                    let _ = tokio::io::copy(&mut r, &mut w).await;
+                });
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let fake = FakeDocker::new(dir.path());
+        let mut cfg = fake.cfg();
+        cfg.proxy_bridge = true;
+        cfg.proxy_bridge_port = Some(std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port());
+        let e = env_with(Script::new(|_, _| finish("ok")), false, move |c| {
+            c.boxed = cfg;
+            with_os_sandbox(c);
+        })
+        .await;
+        let (id, _) = idle_lead(&e).await;
+        let dest = format!("127.0.0.1:{port}");
+        e.rt.grant_scope(&id, std::slice::from_ref(&dest), None).await.unwrap();
+        let b = e.rt.inner.orch.box_access(&id).await.unwrap();
+        b.ready().await.unwrap();
+        let bridge = b.resolved_proxy_bridge().expect("the bridge is resolved");
+        assert_eq!(Some(bridge.proxy_port), e.rt.inner.proxy.session_port(&id), "the bridge carries the lead's grant");
+        let (user, pass) = bridge.proxy_auth.clone().unwrap();
+        let creds = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"));
+        let at = (bridge.bridge_gateway_ip.clone(), bridge.bridge_port);
+        // The infrastructure deny holds for the box as for the lead's own commands (cloud metadata here).
+        let (head, _) = connect(&at, &creds, "169.254.169.254:80").await;
+        assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+        // A granted host is reached, on a tunnel registered under the lead.
+        let (head, mut tunnel) = connect(&at, &creds, &dest).await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        tunnel.write_all(b"ping").await.unwrap();
+        let mut got = [0u8; 4];
+        tunnel.read_exact(&mut got).await.unwrap();
+        // The operator's revoke ends it at once, and the next one is refused.
+        let receipt = e.rt.revoke_scope(&id, std::slice::from_ref(&dest), Some("test")).await.unwrap();
+        assert!(receipt.connections_cut >= 1, "{receipt:?}");
+        assert!(closes(&mut tunnel).await, "the bridged tunnel is cut by the revoke");
+        let (head, _) = connect(&at, &creds, &dest).await;
+        assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+        // Granted again, then the kill-switch: the tunnel is cut, and the bridge goes with the box.
+        e.rt.grant_scope(&id, std::slice::from_ref(&dest), None).await.unwrap();
+        let (head, mut tunnel) = connect(&at, &creds, &dest).await;
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        let report = e.rt.panic_stop_all(None).await.unwrap();
+        assert!(report.connections_cut >= 1 && report.boxes_torn_down == 1, "{report:?}");
+        assert!(closes(&mut tunnel).await, "the bridged tunnel is cut by the panic");
+        assert!(
+            tokio::net::TcpStream::connect((at.0.as_str(), at.1)).await.is_err(),
+            "the bridge stopped with the box"
+        );
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn target_store_full_sync_cross_mission_dups_and_bounty_scope_import() {
+        let e = env(Script::new(|_, _| finish("ok"))).await;
+        e.rt.target_create(&target_body(&["*.acme.test"], &["vpn.acme.test"])).unwrap();
+
+        // 1. Bounty scope import API (missing target -> 404 sentence; Burp/CSV/H1 merges cleanly).
+        let miss = e.rt.target_import_scope("nope", "auto", "app.acme.test").unwrap_err();
+        assert!(miss.starts_with("There is no target"), "{miss}");
+        let h1_csv = "identifier,asset_type,eligible_for_submission\napi.acme.test,URL,true\npartners.acme.test,DOMAIN,true\nlegacy.acme.test,URL,false\n";
+        let imported = e.rt.target_import_scope("acme", "hackerone", h1_csv).unwrap();
+        assert_eq!(imported.target, "acme");
+        assert_eq!(imported.format, "hackerone");
+        assert_eq!(imported.added_scope, 2);
+        assert_eq!(imported.added_exclude, 1);
+        assert_eq!(imported.total_scope, 3);
+        assert_eq!(imported.total_exclude, 2);
+
+        // 2. Mission 1 syncs Passive, SecurityFinding, Disposition, DeadEnd, and Resolves into TargetStore.
+        let mut m1_new = e.new_session(None);
+        m1_new.target = Some("acme".into());
+        let m1_id = e.rt.create_session(m1_new).await.unwrap().meta.id;
+
+        let mut ex = exchange("api.acme.test", "GET", "/v1/invoices/42?expand=1");
+        ex.passive_signals.push(ferret_core::event::PassiveSignal {
+            kind: "cors_misconfig".into(),
+            severity: "high".into(),
+            summary: "Wildcard CORS with credentials".into(),
+            detail: "ACAO: *".into(),
+        });
+        // Duplicate signal on same exchange is deduplicated.
+        ex.passive_signals.push(ex.passive_signals[0].clone());
+        e.rt.inner.target_exchange(&m1_id, 100, &ex);
+        e.rt.inner.target_resolves(&m1_id, 101, "api.acme.test", "203.0.113.42");
+        e.rt.inner.target_resolves(&m1_id, 102, "api.acme.test", "203.0.113.42");
+
+        // Record DeadEnd, Disposition (ruled_out + needs_follow_up), and SecurityFinding via ledger ops.
+        let mut state = LedgerState::default();
+        let mut apply_sync = |op: ferret_core::ledger::LedgerOp| {
+            let n = state.entries + 1;
+            state.apply(&ferret_core::ledger::Entry {
+                n,
+                ts_ms: 200 + n,
+                session: m1_id.clone(),
+                from_user: false,
+                op: op.clone(),
+                mac: String::new(),
+            });
+            e.rt.inner.target_ledger(&m1_id, &op, &state);
+        };
+        apply_sync(ferret_core::ledger::LedgerOp::DeadEnd {
+            what: "https://api.acme.test/admin/debug".into(),
+            why: "Returns 404 across all methods".into(),
+        });
+        apply_sync(ferret_core::ledger::LedgerOp::Security(ferret_core::security_state::SecurityOp::CoverageRecord {
+            surface: "https://api.acme.test/login".into(),
+            risk_area: "SQL Injection".into(),
+            outcome: ferret_core::security_state::SurfaceOutcome::RuledOut,
+            control: Some("parameterized query".into()),
+            location: None,
+            reason: Some("tested payloads".into()),
+            evidence: vec![],
+            asset: None,
+        }));
+        apply_sync(ferret_core::ledger::LedgerOp::Security(ferret_core::security_state::SecurityOp::FindingRecord {
+            finding: Box::new(ferret_core::security_state::FindingInput {
+                title: "IDOR on invoices".into(),
+                description: "User B can read User A invoice.".into(),
+                impact: "PII leak".into(),
+                target: "https://api.acme.test".into(),
+                severity: Some(ferret_core::security_state::FindingSeverity::High),
+                cvss_breakdown: None,
+                evidence: vec![],
+                counterevidence: "Checked anon and owner.".into(),
+                confidence: ferret_core::security_state::FindingConfidence::High,
+                confidence_rationale: None,
+                severity_change_conditions: "None".into(),
+                technical_analysis: None,
+                remediation_steps: None,
+                assumptions: None,
+                poc_description: None,
+                poc_handle: None,
+                fix_effort: None,
+                endpoint: Some("/v1/invoices/42".into()),
+                method: Some("GET".into()),
+                cve: None,
+                cwe: Some("CWE-639".into()),
+                code_locations: vec![],
+                fix_verification: None,
+                http_exchanges: vec![],
+                asset: None,
+                claim: None,
+            }),
+        }));
+
+        let store = e.rt.inner.target_store();
+        assert!(store.verify("acme").unwrap());
+        assert_eq!(store.passive_signals("acme").unwrap().len(), 1);
+        assert_eq!(store.resolves("acme").unwrap().len(), 1);
+        assert_eq!(store.dead_ends("acme").unwrap().len(), 1);
+        assert_eq!(store.dispositions("acme").unwrap().len(), 1);
+        assert_eq!(store.security_findings("acme").unwrap().len(), 1);
+
+        // 3. Mission 2 sees prior findings/dispositions/dead ends/passive signals in `# Target` prompt AND detects cross-mission duplicate!
+        let mut m2_new = e.new_session(None);
+        m2_new.target = Some("acme".into());
+        let m2_id = e.rt.create_session(m2_new).await.unwrap().meta.id;
+        let m2_start = start_of(&e, &m2_id);
+        assert!(m2_start.system_prompt.contains("IDOR on invoices"), "{}", m2_start.system_prompt);
+        assert!(m2_start.system_prompt.contains("cors_misconfig"), "{}", m2_start.system_prompt);
+
+        let dups =
+            e.rt.inner.orch.find_duplicate_findings(&m2_id, "CWE-639", "https://api.acme.test/v1/invoices/99", "");
+        assert_eq!(dups.len(), 1, "mission 2 must detect mission 1's 3-axis duplicate");
+        // Mission 1 does NOT self-match as a prior-mission duplicate.
+        let self_dups =
+            e.rt.inner.orch.find_duplicate_findings(&m1_id, "CWE-639", "https://api.acme.test/v1/invoices/99", "");
+        assert!(self_dups.is_empty());
+
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn stop_followed_immediately_by_message_does_not_double_interrupt() {
+        // 1) Operator clicks Stop while Turn 1 is stalled in a model request and immediately sends
+        //    a follow-up message with zero delay: Turn 1 ends Stopped, Turn 2 runs to completion
+        //    with a fresh uncancelled token and zero spurious second Interrupted event.
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_c = calls.clone();
+        let e = env(Script::new(move |body, _| {
+            if mentions(body, "CONTINUEMARK1") {
+                Action::Reply(Reply::text("resumed cleanly"))
+            } else {
+                calls_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Action::Stall { ms: 600_000 }
+            }
+        }))
+        .await;
+        let mut req = e.new_session(Some("start stalled turn"));
+        req.role = Some("chat".into());
+        let id = e.rt.create_session(req).await.unwrap().meta.id;
+        until("stalled request started", || calls.load(std::sync::atomic::Ordering::SeqCst) >= 1).await;
+
+        e.rt.stop(&id).await.unwrap();
+        e.rt.send_message(&id, "CONTINUEMARK1").await.unwrap();
+
+        until("second turn yielded", || {
+            let ends: Vec<TurnEndReason> = e
+                .records(&id)
+                .into_iter()
+                .filter_map(|r| match r.event {
+                    Event::TurnEnd { reason } => Some(reason),
+                    _ => None,
+                })
+                .collect();
+            ends.len() >= 2
+        })
+        .await;
+        let rs = e.records(&id);
+        let ends: Vec<TurnEndReason> = rs
+            .iter()
+            .filter_map(|r| match r.event {
+                Event::TurnEnd { reason } => Some(reason),
+                _ => None,
+            })
+            .collect();
+        let interrupted = rs.iter().filter(|r| matches!(r.event, Event::Interrupted { .. })).count();
+        assert_eq!(ends, vec![TurnEndReason::Stopped, TurnEndReason::Yielded], "{:?}", e.kinds(&id));
+        assert_eq!(interrupted, 1, "must record exactly one Interrupted event, not double-interrupt");
+        assert!(
+            rs.iter().any(|r| matches!(&r.event, Event::ModelResponse(m) if m.text.contains("resumed cleanly"))),
+            "resumed turn must complete cleanly"
+        );
+
+        // 2) Exact channel-ordering race: Input::User arrives in the active input channel ahead of
+        //    stop_one()'s companion Input::StopAt(epoch) while Turn 1 is stalled, plus a duplicate
+        //    stop() while unwinding. Turn 1's cancellation marks the epoch handled so Turn 2
+        //    ignores the stale StopAt and runs cleanly without double-interrupting.
+        let calls2 = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls2_c = calls2.clone();
+        let e2 = env(Script::new(move |body, _| {
+            if mentions(body, "CONTINUEMARK2") {
+                Action::Reply(Reply::text("second turn ran"))
+            } else {
+                calls2_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Action::Stall { ms: 600_000 }
+            }
+        }))
+        .await;
+        let mut req2 = e2.new_session(Some("initial work"));
+        req2.role = Some("chat".into());
+        let id2 = e2.rt.create_session(req2).await.unwrap().meta.id;
+        until("stalled request started", || calls2.load(std::sync::atomic::Ordering::SeqCst) >= 1).await;
+
+        e2.rt.send_message(&id2, "CONTINUEMARK2").await.unwrap();
+        e2.rt.stop(&id2).await.unwrap();
+        e2.rt.stop(&id2).await.unwrap();
+
+        until("second turn completes without double-interrupt", || {
+            let ends: Vec<TurnEndReason> = e2
+                .records(&id2)
+                .into_iter()
+                .filter_map(|r| match r.event {
+                    Event::TurnEnd { reason } => Some(reason),
+                    _ => None,
+                })
+                .collect();
+            ends.len() >= 2
+        })
+        .await;
+        let rs2 = e2.records(&id2);
+        let ends2: Vec<TurnEndReason> = rs2
+            .iter()
+            .filter_map(|r| match r.event {
+                Event::TurnEnd { reason } => Some(reason),
+                _ => None,
+            })
+            .collect();
+        let interrupted2 = rs2.iter().filter(|r| matches!(r.event, Event::Interrupted { .. })).count();
+        assert_eq!(ends2, vec![TurnEndReason::Stopped, TurnEndReason::Yielded], "{:?}", e2.kinds(&id2));
+        assert_eq!(interrupted2, 1, "stale StopAt from Turn 1 must never double-interrupt Turn 2");
+        assert!(
+            rs2.iter().any(|r| matches!(&r.event, Event::ModelResponse(m) if m.text.contains("second turn ran"))),
+            "Turn 2 must run cleanly after Turn 1 stopped"
+        );
+
+        e.rt.shutdown().await;
+        e2.rt.shutdown().await;
     }
 }

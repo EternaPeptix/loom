@@ -178,13 +178,17 @@ final class AppState: ObservableObject {
     @Published var editingConnection: Connection? = nil
 
     nonisolated static let backoffDelays: [TimeInterval] = [2, 5, 10, 20, 30]
+    nonisolated static let minZoom: CGFloat = 0.5
+    nonisolated static let maxZoom: CGFloat = 2.0
+    nonisolated static let keyboardZoomStep: CGFloat = 0.1
+    nonisolated static let pinchZoomStep: CGFloat = 0.05
     private static let lastKey = "ferret-desk.lastConnection"
     private static let zoomKey = "ferret-desk.pageZoom"
     private static let compactMenuBarKey = "ferret-desk.compactMenuBar"
 
     init() {
-        let savedZoom = UserDefaults.standard.double(forKey: Self.zoomKey)
-        self.pageZoom = (savedZoom >= 0.5 && savedZoom <= 2.5) ? CGFloat(savedZoom) : 1.0
+        let savedZoom = UserDefaults.standard.object(forKey: Self.zoomKey) as? Double
+        self.pageZoom = Self.restoreZoom(from: savedZoom)
         if UserDefaults.standard.object(forKey: Self.compactMenuBarKey) != nil {
             self.compactMenuBar = UserDefaults.standard.bool(forKey: Self.compactMenuBarKey)
         } else {
@@ -340,16 +344,55 @@ final class AppState: ObservableObject {
 
     // MARK: web pane zoom / find / navigation / recovery
 
+    nonisolated static func clampedZoom(_ factor: CGFloat) -> CGFloat {
+        guard factor.isFinite else { return 1.0 }
+        return min(maxZoom, max(minZoom, factor))
+    }
+
+    nonisolated static func restoreZoom(from stored: Double?) -> CGFloat {
+        guard let stored, stored.isFinite, stored > 0 else { return 1.0 }
+        return snappedZoom(CGFloat(stored), step: 0.01)
+    }
+
+    nonisolated static func snappedZoom(_ factor: CGFloat, step: CGFloat = pinchZoomStep) -> CGFloat {
+        let clamped = clampedZoom(factor)
+        let safeStep = (step.isFinite && step > 0) ? step : pinchZoomStep
+        let snapped = (clamped / safeStep).rounded() * safeStep
+        let rounded = clampedZoom((snapped * 100).rounded() / 100)
+        return abs(rounded - 1.0) < 0.001 ? 1.0 : rounded
+    }
+
+    nonisolated static func steppedZoom(from current: CGFloat, direction: Int) -> CGFloat {
+        let clamped = clampedZoom(current)
+        let eps: CGFloat = 0.0001
+        let next: CGFloat
+        if direction > 0 {
+            next = (floor((clamped + eps) / keyboardZoomStep) + 1) * keyboardZoomStep
+        } else if direction < 0 {
+            next = (ceil((clamped - eps) / keyboardZoomStep) - 1) * keyboardZoomStep
+        } else {
+            next = clamped
+        }
+        return snappedZoom(next, step: keyboardZoomStep)
+    }
+
+    func setZoom(_ factor: CGFloat) {
+        let next = Self.snappedZoom(factor, step: 0.01)
+        if abs(pageZoom - next) > 0.001 {
+            pageZoom = next
+        }
+    }
+
     func zoomIn() {
-        pageZoom = min(2.5, (pageZoom * 10 + 1).rounded() / 10)
+        setZoom(Self.steppedZoom(from: pageZoom, direction: 1))
     }
 
     func zoomOut() {
-        pageZoom = max(0.5, (pageZoom * 10 - 1).rounded() / 10)
+        setZoom(Self.steppedZoom(from: pageZoom, direction: -1))
     }
 
     func zoomReset() {
-        pageZoom = 1.0
+        setZoom(1.0)
         guard isConnected else { return }
         enqueueNav(.resetZoom)
     }
@@ -1256,6 +1299,25 @@ enum SelfCheck {
         if Counts().compactMenuLabel != "ferret" { failures.append("Counts.compactMenuLabel empty") }
         if Counts(running: 1, runningAgents: 1).summary != "1 mission running · 1 agent running" { failures.append("Counts.summary singular") }
         if AppState.backoffDelay(attempt: 0) != 2 || AppState.backoffDelay(attempt: 99) != 30 { failures.append("AppState.backoffDelay") }
+        if AppState.clampedZoom(.nan) != 1.0 || AppState.clampedZoom(.infinity) != 1.0 { failures.append("AppState.clampedZoom non-finite") }
+        if AppState.clampedZoom(0.2) != 0.5 || AppState.clampedZoom(2.5) != 2.0 { failures.append("AppState.clampedZoom bounds") }
+        if AppState.restoreZoom(from: nil) != 1.0 || AppState.restoreZoom(from: 0) != 1.0 || AppState.restoreZoom(from: -1) != 1.0 {
+            failures.append("AppState.restoreZoom invalid defaults to 1.0")
+        }
+        if AppState.restoreZoom(from: 2.5) != 2.0 || AppState.restoreZoom(from: 0.3) != 0.5 || abs(AppState.restoreZoom(from: 1.25) - 1.25) > 0.001 {
+            failures.append("AppState.restoreZoom clamping")
+        }
+        if abs(AppState.snappedZoom(1.13) - 1.15) > 0.001 || abs(AppState.snappedZoom(1.02) - 1.0) > 0.001 || AppState.snappedZoom(2.9) != 2.0 {
+            failures.append("AppState.snappedZoom 5% step")
+        }
+        if abs(AppState.steppedZoom(from: 1.0, direction: 1) - 1.1) > 0.001
+            || abs(AppState.steppedZoom(from: 1.0, direction: -1) - 0.9) > 0.001
+            || abs(AppState.steppedZoom(from: 1.15, direction: 1) - 1.2) > 0.001
+            || abs(AppState.steppedZoom(from: 1.15, direction: -1) - 1.1) > 0.001
+            || AppState.steppedZoom(from: 2.0, direction: 1) != 2.0
+            || AppState.steppedZoom(from: 0.5, direction: -1) != 0.5 {
+            failures.append("AppState.steppedZoom keyboard steps")
+        }
         if Notifier.cut("a\nb", 10) != "a b" || Notifier.cut(String(repeating: "x", count: 20), 5).count != 5 {
             failures.append("Notifier.cut")
         }

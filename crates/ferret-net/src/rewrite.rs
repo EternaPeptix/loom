@@ -729,6 +729,19 @@ pub struct RewrittenRawHead {
     pub sensitive_applied: bool,
 }
 
+/// Result of rewriting an HTTP response with separate wire and capture-safe headers and bodies.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RewrittenResponseCapture {
+    pub status: u16,
+    pub wire_headers: HeaderList,
+    pub captured_headers: HeaderList,
+    pub wire_body: Option<Vec<u8>>,
+    pub captured_body: Option<Vec<u8>>,
+    pub body_changed: bool,
+    pub applied_ids: Vec<u64>,
+    pub sensitive_applied: bool,
+}
+
 fn collect_sensitive_values(compiled: &[CompiledRule]) -> (Vec<String>, Secrets, usize) {
     let mut raw = Vec::new();
     let mut seen = HashSet::new();
@@ -933,6 +946,37 @@ impl RewriteSet {
         })
     }
 
+    /// Whether at least one enabled response-phase rewrite rule is active.
+    pub fn has_response_rules(&self) -> bool {
+        self.rules.iter().any(|r| r.phase == RewritePhase::Response)
+    }
+
+    /// Whether any enabled response-phase rule matching this request could inspect or mutate the
+    /// response body (skipped when the response carries a non-`identity` `Content-Encoding`).
+    pub fn needs_response_body(
+        &self,
+        host: &str,
+        req_method: &str,
+        req_target: &str,
+        req_headers: &[(String, Vec<u8>)],
+        resp_headers: &[(String, Vec<u8>)],
+    ) -> bool {
+        if !self.rules.iter().any(|r| r.phase == RewritePhase::Response && r.touches_body) {
+            return false;
+        }
+        let compressed = resp_headers.iter().any(|(n, v)| {
+            n.eq_ignore_ascii_case("content-encoding") && !v.trim_ascii().eq_ignore_ascii_case(b"identity")
+        });
+        if compressed {
+            return false;
+        }
+        self.rules.iter().any(|r| {
+            r.phase == RewritePhase::Response
+                && r.touches_body
+                && r.matches_request(host, req_method, req_target, req_headers, None)
+        })
+    }
+
     /// Apply enabled response-phase rules against a complete buffered response (head + optional text body).
     #[allow(clippy::too_many_arguments)]
     pub fn apply_response(
@@ -945,16 +989,45 @@ impl RewriteSet {
         resp_headers: &[(String, Vec<u8>)],
         resp_body: Option<&[u8]>,
     ) -> Option<RewrittenResponse> {
+        let rw = self.apply_response_for_capture(
+            host,
+            req_method,
+            req_target,
+            req_headers,
+            status,
+            resp_headers,
+            resp_body,
+        )?;
+        Some((rw.status, rw.wire_headers, rw.wire_body, rw.applied_ids))
+    }
+
+    /// Like [`RewriteSet::apply_response`], also returning capture-safe headers and body where
+    /// every applied `sensitive: true` action substitutes `[redacted]` instead of the raw secret.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_response_for_capture(
+        &self,
+        host: &str,
+        req_method: &str,
+        req_target: &str,
+        req_headers: &[(String, Vec<u8>)],
+        status: u16,
+        resp_headers: &[(String, Vec<u8>)],
+        resp_body: Option<&[u8]>,
+    ) -> Option<RewrittenResponseCapture> {
         if self.rules.is_empty() {
             return None;
         }
-        let compressed = resp_headers
-            .iter()
-            .any(|(n, v)| n.eq_ignore_ascii_case("content-encoding") && !v.eq_ignore_ascii_case(b"identity"));
+        let compressed = resp_headers.iter().any(|(n, v)| {
+            n.eq_ignore_ascii_case("content-encoding") && !v.trim_ascii().eq_ignore_ascii_case(b"identity")
+        });
         let mut cur_status = status;
         let mut cur_headers = resp_headers.to_vec();
+        let mut cap_headers = resp_headers.to_vec();
         let mut cur_body = resp_body.map(|b| b.to_vec());
+        let mut cap_body = resp_body.map(|b| b.to_vec());
         let mut applied = Vec::new();
+        let mut body_changed = false;
+        let mut sensitive_applied = false;
 
         for rule in self.rules.iter().filter(|r| r.phase == RewritePhase::Response) {
             if rule.touches_body {
@@ -983,16 +1056,41 @@ impl RewriteSet {
             let mut next_status = cur_status;
             let mut next_headers = cur_headers.clone();
             let mut next_body = cur_body.clone();
-            if apply_response_actions(&rule.actions, &mut next_status, &mut next_headers, &mut next_body).is_ok()
+            if apply_response_actions(&rule.actions, &mut next_status, &mut next_headers, &mut next_body, false).is_ok()
                 && (next_status != cur_status || next_headers != cur_headers || next_body != cur_body)
             {
+                let this_body_changed = next_body != cur_body;
+                let mut cap_s = cur_status;
+                let mut next_cap_headers = cap_headers.clone();
+                let mut next_cap_body = cap_body.clone();
+                if apply_response_actions(&rule.actions, &mut cap_s, &mut next_cap_headers, &mut next_cap_body, true)
+                    .is_err()
+                {
+                    // Never fall back to unredacted bytes when capture-side expansion exceeds bounds.
+                    if rule.has_sensitive && this_body_changed {
+                        next_cap_body = Some(REDACTED.as_bytes().to_vec());
+                    }
+                }
                 cur_status = next_status;
                 cur_headers = next_headers;
+                cap_headers = next_cap_headers;
                 cur_body = next_body;
+                cap_body = next_cap_body;
+                body_changed |= this_body_changed;
                 applied.push(rule.id);
+                sensitive_applied |= rule.has_sensitive;
             }
         }
-        (!applied.is_empty()).then_some((cur_status, cur_headers, cur_body, applied))
+        (!applied.is_empty()).then_some(RewrittenResponseCapture {
+            status: cur_status,
+            wire_headers: cur_headers,
+            captured_headers: cap_headers,
+            wire_body: cur_body,
+            captured_body: cap_body,
+            body_changed,
+            applied_ids: applied,
+            sensitive_applied,
+        })
     }
 }
 
@@ -1058,6 +1156,7 @@ fn apply_response_actions(
     status: &mut u16,
     headers: &mut Vec<(String, Vec<u8>)>,
     body: &mut Option<Vec<u8>>,
+    redact_sensitive: bool,
 ) -> Result<(), ()> {
     for a in actions {
         if let CompiledAction::DeleteHeader(name) = a {
@@ -1066,15 +1165,20 @@ fn apply_response_actions(
     }
     for a in actions {
         match a {
-            CompiledAction::SetHeader(name, val, _) => {
+            CompiledAction::SetHeader(name, val, sensitive) => {
                 headers.retain(|(n, _)| !n.eq_ignore_ascii_case(name));
-                headers.push((name.clone(), val.as_bytes().to_vec()));
+                let out_val = if redact_sensitive && *sensitive { REDACTED.as_bytes() } else { val.as_bytes() };
+                headers.push((name.clone(), out_val.to_vec()));
             }
-            CompiledAction::ReplaceHeader(name, re, rep, _) => {
+            CompiledAction::ReplaceHeader(name, re, rep, sensitive) => {
                 for (n, v) in headers.iter_mut() {
                     if n.eq_ignore_ascii_case(name) {
                         if let Ok(s) = std::str::from_utf8(v) {
-                            let next = re.replace_all(s, rep.as_str()).into_owned();
+                            let next = if redact_sensitive && *sensitive {
+                                re.replace_all(s, regex::NoExpand(REDACTED)).into_owned()
+                            } else {
+                                re.replace_all(s, rep.as_str()).into_owned()
+                            };
                             if !no_crlf_nul(&next) {
                                 return Err(());
                             }
@@ -1088,16 +1192,21 @@ fn apply_response_actions(
     }
     for a in actions {
         match a {
-            CompiledAction::SetBody(val, _) => {
-                if val.len() > MAX_REWRITE_BODY_BYTES {
+            CompiledAction::SetBody(val, sensitive) => {
+                if !redact_sensitive && val.len() > MAX_REWRITE_BODY_BYTES {
                     return Err(());
                 }
-                *body = Some(val.as_bytes().to_vec());
+                let out_val = if redact_sensitive && *sensitive { REDACTED.as_bytes() } else { val.as_bytes() };
+                *body = Some(out_val.to_vec());
             }
-            CompiledAction::ReplaceBody(re, rep, _) => {
+            CompiledAction::ReplaceBody(re, rep, sensitive) => {
                 let Some(b) = body.as_deref() else { return Err(()) };
                 let Ok(s) = std::str::from_utf8(b) else { return Err(()) };
-                let next = re.replace_all(s, rep.as_str()).into_owned();
+                let next = if redact_sensitive && *sensitive {
+                    re.replace_all(s, regex::NoExpand(REDACTED)).into_owned()
+                } else {
+                    re.replace_all(s, rep.as_str()).into_owned()
+                };
                 if next.len() > MAX_REWRITE_BODY_BYTES {
                     return Err(());
                 }
@@ -1777,5 +1886,102 @@ mod tests {
         assert!(cap.contains("X-Short-Pin: [redacted]\r\n"), "{cap}");
         assert!(cap.contains("X-Public: hello\r\n") && cap.contains("X-Chained: matched\r\n"), "{cap}");
         assert!(!cap.contains("active-token-123456") && !cap.contains("9876"), "{cap}");
+    }
+
+    #[test]
+    fn response_rewrite_for_capture_mutates_wire_and_redacts_sensitive_actions() {
+        let rules = vec![
+            RewriteRule {
+                id: 10,
+                name: "mutate response head and body".into(),
+                enabled: true,
+                phase: RewritePhase::Response,
+                priority: 1,
+                matchers: RewriteMatcher {
+                    host: Some("api.test".into()),
+                    status: vec!["403".into()],
+                    ..Default::default()
+                },
+                actions: vec![
+                    RewriteAction::SetStatus { value: 200 },
+                    RewriteAction::DeleteHeader { name: "X-Remove".into() },
+                    RewriteAction::SetHeader {
+                        name: "X-Secret-Token".into(),
+                        value: Some("Bearer resp-secret-999999".into()),
+                        sensitive: true,
+                    },
+                    RewriteAction::SetHeader {
+                        name: "X-Short-Pin".into(),
+                        value: Some("4242".into()),
+                        sensitive: true,
+                    },
+                    RewriteAction::SetHeader { name: "X-Public".into(), value: Some("ok".into()), sensitive: false },
+                    RewriteAction::ReplaceBody {
+                        regex: "DENIED".into(),
+                        value: Some("secret-payload-7777".into()),
+                        sensitive: true,
+                    },
+                ],
+                note: String::new(),
+            },
+            RewriteRule {
+                id: 11,
+                name: "chained on rewritten status".into(),
+                enabled: true,
+                phase: RewritePhase::Response,
+                priority: 2,
+                matchers: RewriteMatcher {
+                    host: Some("api.test".into()),
+                    status: vec!["200".into()],
+                    resp_headers: vec![HeaderMatch {
+                        name: "X-Secret-Token".into(),
+                        value_regex: "resp-secret".into(),
+                    }],
+                    ..Default::default()
+                },
+                actions: vec![RewriteAction::SetHeader {
+                    name: "X-Chained".into(),
+                    value: Some("yes".into()),
+                    sensitive: false,
+                }],
+                note: String::new(),
+            },
+        ];
+        let set = RewriteSet::compile(&rules);
+        assert!(set.has_response_rules());
+        assert!(set.needs_response_body("api.test", "GET", "/item", &[], &[]));
+        assert!(!set.needs_response_body(
+            "api.test",
+            "GET",
+            "/item",
+            &[],
+            &[("Content-Encoding".into(), b"gzip".to_vec())],
+        ));
+        assert!(!set.needs_response_body("other.test", "GET", "/item", &[], &[]));
+
+        let resp_hdrs = vec![("X-Remove".into(), b"bye".to_vec()), ("Content-Type".into(), b"text/plain".to_vec())];
+        let rw = set
+            .apply_response_for_capture("api.test", "GET", "/item", &[], 403, &resp_hdrs, Some(b"status=DENIED"))
+            .unwrap();
+        assert_eq!(rw.status, 200);
+        assert!(rw.body_changed);
+        assert!(rw.sensitive_applied);
+        assert_eq!(rw.applied_ids, vec![10, 11]);
+        assert_eq!(rw.wire_body.as_deref(), Some(&b"status=secret-payload-7777"[..]));
+        assert_eq!(rw.captured_body.as_deref(), Some(&b"status=[redacted]"[..]));
+
+        let find_hdr = |list: &HeaderList, name: &str| -> Option<String> {
+            list.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, v)| String::from_utf8_lossy(v).into())
+        };
+        assert_eq!(find_hdr(&rw.wire_headers, "X-Remove"), None);
+        assert_eq!(find_hdr(&rw.wire_headers, "X-Secret-Token").as_deref(), Some("Bearer resp-secret-999999"));
+        assert_eq!(find_hdr(&rw.wire_headers, "X-Short-Pin").as_deref(), Some("4242"));
+        assert_eq!(find_hdr(&rw.wire_headers, "X-Public").as_deref(), Some("ok"));
+        assert_eq!(find_hdr(&rw.wire_headers, "X-Chained").as_deref(), Some("yes"));
+
+        assert_eq!(find_hdr(&rw.captured_headers, "X-Secret-Token").as_deref(), Some("[redacted]"));
+        assert_eq!(find_hdr(&rw.captured_headers, "X-Short-Pin").as_deref(), Some("[redacted]"));
+        assert_eq!(find_hdr(&rw.captured_headers, "X-Public").as_deref(), Some("ok"));
+        assert_eq!(find_hdr(&rw.captured_headers, "X-Chained").as_deref(), Some("yes"));
     }
 }

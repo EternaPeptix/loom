@@ -2988,6 +2988,223 @@ impl Owed {
     }
 }
 
+/// Extra raw byte headroom allowed while buffering chunked transfer framing up to
+/// [`crate::rewrite::MAX_REWRITE_BODY_BYTES`] of decoded body bytes.
+pub(super) const CHUNKED_REWRITE_RAW_SLACK: usize = 64 * 1024;
+
+/// Request context carried into response forwarding so enabled response-phase rewrite rules can
+/// match and mutate upstream responses safely.
+pub(super) struct RespRewriteCtx {
+    pub rewrites: crate::rewrite::RewriteSet,
+    pub host: String,
+    pub req_method: String,
+    pub req_target: String,
+    pub req_headers: Vec<(String, Vec<u8>)>,
+}
+
+/// Decodes a complete HTTP/1.1 `chunked` wire body into its logical payload, rejecting payloads
+/// larger than `max_out` or malformed framing.
+pub(super) fn decode_chunked_body(raw: &[u8], max_out: usize) -> Result<Vec<u8>, &'static str> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    loop {
+        while raw.get(i).is_some_and(|b| matches!(b, b' ' | b'\t')) {
+            i += 1;
+        }
+        let mut size: usize = 0;
+        let mut any_digit = false;
+        while let Some(&b) = raw.get(i) {
+            let Some(d) = char::from(b).to_digit(16) else { break };
+            any_digit = true;
+            size = size.checked_mul(16).and_then(|s| s.checked_add(d as usize)).ok_or("chunk size overflow")?;
+            if size > max_out {
+                return Err("chunk exceeds rewrite limit");
+            }
+            i += 1;
+        }
+        if !any_digit {
+            return Err("missing chunk size");
+        }
+        let mut saw_nl = false;
+        while let Some(&b) = raw.get(i) {
+            i += 1;
+            if b == b'\n' {
+                saw_nl = true;
+                break;
+            }
+        }
+        if !saw_nl {
+            return Err("incomplete chunk size line");
+        }
+        if size == 0 {
+            loop {
+                let mut line_empty = true;
+                let mut trailer_nl = false;
+                while let Some(&b) = raw.get(i) {
+                    i += 1;
+                    if b == b'\n' {
+                        trailer_nl = true;
+                        break;
+                    }
+                    if b != b'\r' {
+                        line_empty = false;
+                    }
+                }
+                if !trailer_nl {
+                    return Err("incomplete chunked trailer");
+                }
+                if line_empty {
+                    return Ok(out);
+                }
+            }
+        }
+        if out.len().checked_add(size).is_none_or(|n| n > max_out) {
+            return Err("decoded chunked body exceeds rewrite limit");
+        }
+        let end = i.checked_add(size).filter(|&e| e <= raw.len()).ok_or("truncated chunk data")?;
+        out.extend_from_slice(&raw[i..end]);
+        i = end;
+        if raw.get(i) == Some(&b'\r') {
+            i += 1;
+        }
+        if raw.get(i) != Some(&b'\n') {
+            return Err("missing CRLF after chunk data");
+        }
+        i += 1;
+    }
+}
+
+fn reason_phrase(orig_code: u16, orig_reason: &str, code: u16) -> &str {
+    if code == orig_code {
+        return orig_reason;
+    }
+    match code {
+        200 => "OK",
+        201 => "Created",
+        202 => "Accepted",
+        203 => "Non-Authoritative Information",
+        204 => "No Content",
+        205 => "Reset Content",
+        206 => "Partial Content",
+        301 => "Moved Permanently",
+        302 => "Found",
+        303 => "See Other",
+        304 => "Not Modified",
+        307 => "Temporary Redirect",
+        308 => "Permanent Redirect",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        402 => "Payment Required",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        409 => "Conflict",
+        410 => "Gone",
+        412 => "Precondition Failed",
+        413 => "Payload Too Large",
+        415 => "Unsupported Media Type",
+        422 => "Unprocessable Entity",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        501 => "Not Implemented",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        504 => "Gateway Timeout",
+        _ => "",
+    }
+}
+
+pub(super) fn has_framing_header(headers: &[(String, Vec<u8>)]) -> bool {
+    headers.iter().any(|(n, _)| n.eq_ignore_ascii_case("content-length") || n.eq_ignore_ascii_case("transfer-encoding"))
+}
+
+pub(super) fn header_retry_after(headers: &[(String, Vec<u8>)]) -> Option<String> {
+    headers
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case("retry-after"))
+        .and_then(|(_, v)| std::str::from_utf8(v).ok())
+        .map(|s| s.trim().to_string())
+}
+
+pub(super) fn body_len_for_status_change(
+    head_request: bool,
+    orig_code: u16,
+    new_code: u16,
+    headers: &[(String, Vec<u8>)],
+) -> Option<usize> {
+    (!head_request && matches!(orig_code, 204 | 304) && !matches!(new_code, 204 | 304) && !has_framing_header(headers))
+        .then_some(0)
+}
+
+/// Renders an HTTP/1.x final response head safely, stripping hop-by-hop framing overrides and
+/// keeping `Content-Length` / `Transfer-Encoding` consistent.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn render_response_head(
+    version: u8,
+    orig_code: u16,
+    orig_reason: &str,
+    new_code: u16,
+    headers: &[(String, Vec<u8>)],
+    force_close: bool,
+    emit_close: bool,
+    strip_marker: bool,
+    body_len_override: Option<usize>,
+) -> Vec<u8> {
+    let reason = reason_phrase(orig_code, orig_reason, new_code);
+    let mut out = format!("HTTP/1.{version} {new_code} {reason}\r\n").into_bytes();
+    let has_te =
+        body_len_override.is_none() && headers.iter().any(|(n, _)| n.eq_ignore_ascii_case("transfer-encoding"));
+    for (name, val) in headers {
+        if strip_marker && name.eq_ignore_ascii_case(MARKER) {
+            continue;
+        }
+        if ["connection", "keep-alive", "proxy-connection", "te", "upgrade"]
+            .iter()
+            .any(|d| name.eq_ignore_ascii_case(d))
+        {
+            continue;
+        }
+        if body_len_override.is_some()
+            && ["content-length", "transfer-encoding", "trailer"].iter().any(|d| name.eq_ignore_ascii_case(d))
+        {
+            continue;
+        }
+        if has_te && name.eq_ignore_ascii_case("content-length") {
+            continue;
+        }
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(b": ");
+        unfold_header_value(&mut out, val);
+        out.extend_from_slice(b"\r\n");
+    }
+    if let Some(len) = body_len_override {
+        out.extend_from_slice(format!("Content-Length: {len}\r\n").as_bytes());
+    }
+    if force_close || emit_close {
+        out.extend_from_slice(b"Connection: close\r\n");
+    }
+    out.extend_from_slice(b"\r\n");
+    out
+}
+
+/// Wire bytes and optional distinct capture-safe bytes produced by [`HeadFilter`].
+struct PushOut {
+    wire: Vec<u8>,
+    cap: Option<Vec<u8>>,
+}
+
+struct PendingBody {
+    version: u8,
+    code: u16,
+    reason: String,
+    headers: Vec<(String, Vec<u8>)>,
+    retry_after: Option<String>,
+    is_chunked: bool,
+    raw_body: Vec<u8>,
+    cap_limit: usize,
+    prior_wire: Vec<u8>,
+}
+
 /// Response heads from the destination, written again without any `X-Ferret-Proxy` header (see
 /// [`response_head`]). Interim (1xx) heads are treated the same way. The body after the final head is
 /// passed on up to the end that head gives it; bytes after that end are dropped.
@@ -2995,11 +3212,19 @@ struct HeadFilter {
     buf: Vec<u8>,
     /// The request was `HEAD`: the response has no body whatever its headers say.
     head_request: bool,
+    /// Client sent pipelined data after the request: never buffer `UntilClose` bodies.
+    forbid_until_close_buffer: bool,
+    /// Optional active response-phase rewrite context.
+    resp_rewrite: Option<RespRewriteCtx>,
+    /// Buffered body waiting for body-touching response rewrite rules.
+    pending_body: Option<PendingBody>,
     /// How the body after the final head is framed; `None` until that head has been read.
     body: Option<Framing>,
-    /// Bytes handed out so far (for capture).
+    /// Wire bytes handed out so far.
     emitted: usize,
-    /// Where the body starts in the bytes handed out, once the final head is out (for capture).
+    /// Capture bytes handed out so far (used for exact `head_end` tracking).
+    cap_emitted: usize,
+    /// Where the body starts in the capture bytes handed out, once the final head is out.
     head_end: Option<usize>,
     /// The status of the final head (for capture and noise governor backoff).
     status: Option<u16>,
@@ -3019,12 +3244,16 @@ enum Framing {
 }
 
 impl HeadFilter {
-    fn new(head_request: bool) -> Self {
+    fn new(head_request: bool, forbid_until_close_buffer: bool, resp_rewrite: Option<RespRewriteCtx>) -> Self {
         Self {
             buf: Vec::new(),
             head_request,
+            forbid_until_close_buffer,
+            resp_rewrite,
+            pending_body: None,
             body: None,
             emitted: 0,
+            cap_emitted: 0,
             head_end: None,
             status: None,
             retry_after: None,
@@ -3035,6 +3264,10 @@ impl HeadFilter {
     /// The final head has been read.
     fn head_done(&self) -> bool {
         self.body.is_some()
+    }
+
+    fn has_pending_body(&self) -> bool {
+        self.pending_body.is_some()
     }
 
     /// The response is complete; nothing further from the destination is relayed.
@@ -3051,36 +3284,309 @@ impl HeadFilter {
         matches!(self.body, Some(Framing::UntilClose))
     }
 
-    /// Takes the next bytes from the destination; returns what may be sent to the client now.
-    fn push(&mut self, data: &[u8]) -> Result<Vec<u8>, String> {
+    /// Takes the next bytes from the destination; returns what may be sent to the client and tap now.
+    fn push(&mut self, data: &[u8]) -> Result<PushOut, String> {
         let out = self.push_inner(data)?;
-        self.emitted = self.emitted.saturating_add(out.len());
+        self.emitted = self.emitted.saturating_add(out.wire.len());
+        let cap_len = out.cap.as_ref().map_or(out.wire.len(), Vec::len);
+        self.cap_emitted = self.cap_emitted.saturating_add(cap_len);
         Ok(out)
     }
 
-    fn push_inner(&mut self, data: &[u8]) -> Result<Vec<u8>, String> {
+    /// Flushes any buffered body when the upstream connection reaches EOF.
+    fn flush_eof(&mut self) -> PushOut {
+        if self.pending_body.is_none() {
+            return PushOut { wire: Vec::new(), cap: None };
+        }
+        let try_rewrite_body = self.finished() || self.until_close();
+        let out = self.finalize_pending(try_rewrite_body);
+        self.emitted = self.emitted.saturating_add(out.wire.len());
+        let cap_len = out.cap.as_ref().map_or(out.wire.len(), Vec::len);
+        self.cap_emitted = self.cap_emitted.saturating_add(cap_len);
+        out
+    }
+
+    fn push_inner(&mut self, data: &[u8]) -> Result<PushOut, String> {
+        if self.pending_body.is_some() {
+            return self.push_pending(data);
+        }
         if self.body.is_some() {
-            return self.pass(data);
+            return Ok(PushOut { wire: self.pass(data)?, cap: None });
         }
         self.buf.extend_from_slice(data);
-        let mut out = Vec::new();
+        let mut wire_prefix = Vec::new();
         while let Some(h) = response_head(&self.buf, self.head_request)? {
-            out.extend_from_slice(&h.head);
             self.buf.drain(..h.len.min(self.buf.len()));
-            if let Some(framing) = h.body {
-                self.head_end = Some(self.emitted.saturating_add(out.len()));
-                self.status = Some(h.code);
-                self.retry_after = h.retry_after;
+            let Some(framing) = h.body else {
+                wire_prefix.extend_from_slice(&h.head);
+                continue;
+            };
+            let buffer_spec = if h.code != 101 && !self.head_request && !matches!(h.code, 204 | 304) {
+                let needs_body = self.resp_rewrite.as_ref().is_some_and(|ctx| {
+                    ctx.rewrites.needs_response_body(
+                        &ctx.host,
+                        &ctx.req_method,
+                        &ctx.req_target,
+                        &ctx.req_headers,
+                        &h.headers,
+                    )
+                });
+                if needs_body {
+                    match &framing {
+                        Framing::Length(n) if *n <= crate::rewrite::MAX_REWRITE_BODY_BYTES as u64 => {
+                            Some((false, crate::rewrite::MAX_REWRITE_BODY_BYTES))
+                        }
+                        Framing::Chunked(_) => {
+                            Some((true, crate::rewrite::MAX_REWRITE_BODY_BYTES + CHUNKED_REWRITE_RAW_SLACK))
+                        }
+                        Framing::UntilClose if !self.forbid_until_close_buffer => {
+                            Some((false, crate::rewrite::MAX_REWRITE_BODY_BYTES))
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            if let Some((is_chunked, cap_limit)) = buffer_spec {
                 self.body = Some(framing);
+                self.pending_body = Some(PendingBody {
+                    version: h.version,
+                    code: h.code,
+                    reason: h.reason,
+                    headers: h.headers,
+                    retry_after: h.retry_after,
+                    is_chunked,
+                    raw_body: Vec::new(),
+                    cap_limit,
+                    prior_wire: wire_prefix,
+                });
                 let rest = std::mem::take(&mut self.buf);
-                out.append(&mut self.pass(&rest)?);
-                return Ok(out);
+                return self.push_pending(&rest);
             }
+
+            let (wire_head, cap_head, final_code, retry_after) = if h.code != 101 {
+                if let Some(ctx) = &self.resp_rewrite {
+                    if let Some(rw) = ctx.rewrites.apply_response_for_capture(
+                        &ctx.host,
+                        &ctx.req_method,
+                        &ctx.req_target,
+                        &ctx.req_headers,
+                        h.code,
+                        &h.headers,
+                        None,
+                    ) {
+                        let len_ovr =
+                            body_len_for_status_change(self.head_request, h.code, rw.status, &rw.wire_headers);
+                        let wh = render_response_head(
+                            h.version,
+                            h.code,
+                            &h.reason,
+                            rw.status,
+                            &rw.wire_headers,
+                            true,
+                            true,
+                            true,
+                            len_ovr,
+                        );
+                        let ch = if rw.sensitive_applied {
+                            Some(render_response_head(
+                                h.version,
+                                h.code,
+                                &h.reason,
+                                rw.status,
+                                &rw.captured_headers,
+                                true,
+                                true,
+                                true,
+                                len_ovr,
+                            ))
+                        } else {
+                            None
+                        };
+                        let ra = header_retry_after(&rw.wire_headers);
+                        (wh, ch, rw.status, ra)
+                    } else {
+                        (h.head, None, h.code, h.retry_after)
+                    }
+                } else {
+                    (h.head, None, h.code, h.retry_after)
+                }
+            } else {
+                (h.head, None, h.code, h.retry_after)
+            };
+
+            self.status = Some(final_code);
+            self.retry_after = retry_after;
+            self.body = Some(framing);
+            let rest = std::mem::take(&mut self.buf);
+            let mut passed = self.pass(&rest)?;
+            let cap = match cap_head {
+                Some(ch) => {
+                    let mut cap_out = wire_prefix.clone();
+                    cap_out.extend_from_slice(&ch);
+                    self.head_end = Some(self.cap_emitted.saturating_add(cap_out.len()));
+                    cap_out.extend_from_slice(&passed);
+                    Some(cap_out)
+                }
+                None => {
+                    self.head_end = Some(self.cap_emitted.saturating_add(wire_prefix.len() + wire_head.len()));
+                    None
+                }
+            };
+            wire_prefix.extend_from_slice(&wire_head);
+            wire_prefix.append(&mut passed);
+            return Ok(PushOut { wire: wire_prefix, cap });
         }
         if self.buf.len() > MAX_HEAD {
             return Err(format!("the destination sent a response head larger than {} KiB", MAX_HEAD / 1024));
         }
-        Ok(out)
+        Ok(PushOut { wire: wire_prefix, cap: None })
+    }
+
+    fn push_pending(&mut self, data: &[u8]) -> Result<PushOut, String> {
+        let part = self.pass(data)?;
+        if let Some(p) = self.pending_body.as_mut() {
+            p.raw_body.extend_from_slice(&part);
+        }
+        if self.finished() {
+            return Ok(self.finalize_pending(true));
+        }
+        if self.pending_body.as_ref().is_some_and(|p| p.raw_body.len() > p.cap_limit) {
+            return Ok(self.finalize_pending(false));
+        }
+        Ok(PushOut { wire: Vec::new(), cap: None })
+    }
+
+    fn finalize_pending(&mut self, try_rewrite_body: bool) -> PushOut {
+        let Some(p) = self.pending_body.take() else {
+            return PushOut { wire: Vec::new(), cap: None };
+        };
+        let logical_body = if try_rewrite_body {
+            if p.is_chunked {
+                decode_chunked_body(&p.raw_body, crate::rewrite::MAX_REWRITE_BODY_BYTES).ok()
+            } else if p.raw_body.len() <= crate::rewrite::MAX_REWRITE_BODY_BYTES {
+                Some(p.raw_body.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let rw = self.resp_rewrite.as_ref().and_then(|ctx| {
+            ctx.rewrites.apply_response_for_capture(
+                &ctx.host,
+                &ctx.req_method,
+                &ctx.req_target,
+                &ctx.req_headers,
+                p.code,
+                &p.headers,
+                logical_body.as_deref(),
+            )
+        });
+
+        match rw {
+            Some(rw) if rw.body_changed => {
+                let wire_body = rw.wire_body.unwrap_or_default();
+                let wire_head = render_response_head(
+                    p.version,
+                    p.code,
+                    &p.reason,
+                    rw.status,
+                    &rw.wire_headers,
+                    true,
+                    true,
+                    true,
+                    Some(wire_body.len()),
+                );
+                self.status = Some(rw.status);
+                self.retry_after = header_retry_after(&rw.wire_headers);
+                let mut wire = p.prior_wire.clone();
+                wire.extend_from_slice(&wire_head);
+                wire.extend_from_slice(&wire_body);
+
+                let cap = if rw.sensitive_applied {
+                    let cap_body = rw.captured_body.unwrap_or_default();
+                    let cap_head = render_response_head(
+                        p.version,
+                        p.code,
+                        &p.reason,
+                        rw.status,
+                        &rw.captured_headers,
+                        true,
+                        true,
+                        true,
+                        Some(cap_body.len()),
+                    );
+                    let mut cap_out = p.prior_wire;
+                    cap_out.extend_from_slice(&cap_head);
+                    self.head_end = Some(self.cap_emitted.saturating_add(cap_out.len()));
+                    cap_out.extend_from_slice(&cap_body);
+                    Some(cap_out)
+                } else {
+                    self.head_end = Some(self.cap_emitted.saturating_add(p.prior_wire.len() + wire_head.len()));
+                    None
+                };
+                PushOut { wire, cap }
+            }
+            Some(rw) => {
+                let len_ovr = body_len_for_status_change(self.head_request, p.code, rw.status, &rw.wire_headers);
+                let wire_head = render_response_head(
+                    p.version,
+                    p.code,
+                    &p.reason,
+                    rw.status,
+                    &rw.wire_headers,
+                    true,
+                    true,
+                    true,
+                    len_ovr,
+                );
+                self.status = Some(rw.status);
+                self.retry_after = header_retry_after(&rw.wire_headers);
+                let mut wire = p.prior_wire.clone();
+                wire.extend_from_slice(&wire_head);
+                wire.extend_from_slice(&p.raw_body);
+
+                let cap = if rw.sensitive_applied {
+                    let cap_head = render_response_head(
+                        p.version,
+                        p.code,
+                        &p.reason,
+                        rw.status,
+                        &rw.captured_headers,
+                        true,
+                        true,
+                        true,
+                        len_ovr,
+                    );
+                    let mut cap_out = p.prior_wire;
+                    cap_out.extend_from_slice(&cap_head);
+                    self.head_end = Some(self.cap_emitted.saturating_add(cap_out.len()));
+                    cap_out.extend_from_slice(&p.raw_body);
+                    Some(cap_out)
+                } else {
+                    self.head_end = Some(self.cap_emitted.saturating_add(p.prior_wire.len() + wire_head.len()));
+                    None
+                };
+                PushOut { wire, cap }
+            }
+            None => {
+                let wire_head =
+                    render_response_head(p.version, p.code, &p.reason, p.code, &p.headers, true, true, true, None);
+                self.status = Some(p.code);
+                self.retry_after = p.retry_after;
+                let mut wire = p.prior_wire;
+                wire.extend_from_slice(&wire_head);
+                self.head_end = Some(self.cap_emitted.saturating_add(wire.len()));
+                wire.extend_from_slice(&p.raw_body);
+                PushOut { wire, cap: None }
+            }
+        }
     }
 
     /// The bytes of `data`, which follow the final head, that belong to the body.
@@ -3110,8 +3616,14 @@ struct RespHead {
     len: usize,
     /// For a final head, how the body after it is framed; `None` for an interim (1xx) head.
     body: Option<Framing>,
+    /// The HTTP minor version (`0` or `1`).
+    version: u8,
     /// The status code.
     code: u16,
+    /// The status reason phrase as sent.
+    reason: String,
+    /// Filtered headers ready for response-phase rewrite rules.
+    headers: Vec<(String, Vec<u8>)>,
     /// `Retry-After` header value if present and valid UTF-8.
     retry_after: Option<String>,
 }
@@ -3191,12 +3703,17 @@ fn response_head(buf: &[u8], head_request: bool) -> Result<Option<RespHead>, Str
         let connection = ["connection", "keep-alive", "proxy-connection"].iter().any(|d| name.eq_ignore_ascii_case(d));
         is_final && (connection || (coding.is_some() && name.eq_ignore_ascii_case("content-length")))
     };
-    let mut head = format!("HTTP/1.{version} {code} {}\r\n", resp.reason.unwrap_or("")).into_bytes();
+    let reason = resp.reason.unwrap_or("").to_string();
+    let mut head = format!("HTTP/1.{version} {code} {reason}\r\n").into_bytes();
+    let mut parsed_headers = Vec::new();
     for h in resp.headers.iter().filter(|h| !h.name.eq_ignore_ascii_case(MARKER) && !dropped(h.name)) {
+        let mut unfolded = Vec::with_capacity(h.value.len());
+        unfold_header_value(&mut unfolded, h.value);
         head.extend_from_slice(h.name.as_bytes());
         head.extend_from_slice(b": ");
-        unfold_header_value(&mut head, h.value);
+        head.extend_from_slice(&unfolded);
         head.extend_from_slice(b"\r\n");
+        parsed_headers.push((h.name.to_string(), unfolded));
     }
     if is_final {
         head.extend_from_slice(b"Connection: close\r\n");
@@ -3211,7 +3728,7 @@ fn response_head(buf: &[u8], head_request: bool) -> Result<Option<RespHead>, Str
                 .map(|s| s.trim().to_string())
         })
         .flatten();
-    Ok(Some(RespHead { head, len: n, body, code, retry_after }))
+    Ok(Some(RespHead { head, len: n, body, version, code, reason, headers: parsed_headers, retry_after }))
 }
 
 /// What the relay of a forwarded request needs.
@@ -3226,6 +3743,8 @@ struct Fwd {
     head_request: bool,
     /// Noise governor + destination host for 429/503 backoff updates.
     pace: Option<(Arc<crate::pace::Governor>, String)>,
+    /// Active response-phase rewrite context (only for command traffic with enabled response rules).
+    resp_rewrite: Option<RespRewriteCtx>,
 }
 
 /// How a relay ended. The flag says whether anything from the destination had been sent to the client.
@@ -3383,6 +3902,27 @@ async fn download(
                 return Pump::Bad("the destination closed the connection before it answered".to_string())
             }
             Ok(0) => {
+                if let Some(f) = filter.as_mut() {
+                    let flushed = f.flush_eof();
+                    if let Some((gov, host)) = pace {
+                        if !f.noted {
+                            if let Some(code) = f.status {
+                                f.noted = true;
+                                gov.note_response(host, code, f.retry_after.as_deref());
+                            }
+                        }
+                    }
+                    if !flushed.wire.is_empty() {
+                        flow.wrote.store(true, Ordering::Relaxed);
+                        if write_counted(w, &flushed.wire, flow).await.is_err() {
+                            return Pump::Stop("writing to the client failed");
+                        }
+                        if let Some(t) = tap {
+                            let cap_bytes = flushed.cap.as_deref().unwrap_or(&flushed.wire);
+                            t.response(cap_bytes, f.head_end.map(|h| h as u64), f.status);
+                        }
+                    }
+                }
                 let _ = w.shutdown().await;
                 return Pump::Ended;
             }
@@ -3391,12 +3931,12 @@ async fn download(
         };
         flow.touch();
         let chunk = buf.get(..n).unwrap_or(&[]);
-        let out = match filter.as_mut() {
+        let (wire_out, cap_out): (Cow<'_, [u8]>, Option<Vec<u8>>) = match filter.as_mut() {
             Some(f) => match f.push(chunk) {
-                Ok(v) => Cow::Owned(v),
+                Ok(p) => (Cow::Owned(p.wire), p.cap),
                 Err(m) => return Pump::Bad(m),
             },
-            None => Cow::Borrowed(chunk),
+            None => (Cow::Borrowed(chunk), None),
         };
         if let (Some((gov, host)), Some(f)) = (pace, filter.as_mut()) {
             if !f.noted {
@@ -3406,17 +3946,20 @@ async fn download(
                 }
             }
         }
-        if !out.is_empty() {
+        if !wire_out.is_empty() {
             flow.wrote.store(true, Ordering::Relaxed);
-            if write_counted(w, &out, flow).await.is_err() {
+            if write_counted(w, &wire_out, flow).await.is_err() {
                 return Pump::Stop("writing to the client failed");
             }
             if let (Some(t), Some(f)) = (tap, filter.as_ref()) {
-                t.response(&out, f.head_end.map(|h| h as u64), f.status);
+                let cap_bytes = cap_out.as_deref().unwrap_or(&wire_out);
+                t.response(cap_bytes, f.head_end.map(|h| h as u64), f.status);
             }
         }
         // One request, one response: what follows its end is not relayed.
-        let over = filter.as_ref().is_some_and(|f| f.finished() || (f.until_close() && flow.response_until_close()));
+        let over = filter.as_ref().is_some_and(|f| {
+            !f.has_pending_body() && (f.finished() || (f.until_close() && flow.response_until_close()))
+        });
         if over {
             let _ = w.shutdown().await;
             return Pump::Ended;
@@ -3469,7 +4012,12 @@ async fn relay(
     };
     let is_forward = forward.is_some();
     let (owed, filter, grace, pace) = match forward {
-        Some(f) => (Some(f.owed), Some(HeadFilter::new(f.head_request)), Some(f.grace.min(idle)), f.pace),
+        Some(f) => (
+            Some(f.owed),
+            Some(HeadFilter::new(f.head_request, f.further, f.resp_rewrite)),
+            Some(f.grace.min(idle)),
+            f.pace,
+        ),
         None => (None, None, None, None),
     };
     let to_up = upload(&mut cr, &mut uw, &flow, owed, tap);
@@ -3618,7 +4166,7 @@ async fn forward(
     });
     let finish = |error: Option<String>| {
         if let (Some(c), Some(t)) = (capture, &tap) {
-            c.send(cx, t.finish(crate::capture::Transport::Plain, &req_method, &req_path, error, false));
+            c.send(cx, t.finish(cx.host, crate::capture::Transport::Plain, &req_method, &req_path, error, false));
         }
     };
     // The bytes of the body that arrived with the head, what the client still owes, and what it sent
@@ -3652,12 +4200,20 @@ async fn forward(
         return answer(&mut client, cx.shared, slot, status, "", &text).await;
     }
 
+    let resp_rewrite = (command_traffic && rewrites.has_response_rules()).then(|| RespRewriteCtx {
+        rewrites: rewrites.clone(),
+        host: cx.host.to_string(),
+        req_method: req_method.clone(),
+        req_target: req_path.clone(),
+        req_headers: headers,
+    });
     let fwd = Fwd {
         owed,
         further: further_request(past),
         grace: cx.shared.limits.forward_grace,
         head_request: req_method.eq_ignore_ascii_case("HEAD"),
         pace: (command_traffic && !gov.is_off()).then(|| (gov, cx.host.to_string())),
+        resp_rewrite,
     };
     let end = tokio::select! {
         r = relay(&mut client, &mut up, idle, Some(fwd), tap.as_ref()) => r,
@@ -6791,5 +7347,88 @@ mod tests {
             raw(g.port, format!("CONNECT 127.0.0.1:{infra_port} HTTP/1.1\r\n{}\r\n", auth(&g)).as_bytes()).await;
         assert_eq!(status(&tunnel), 403, "{tunnel}");
         assert!(timeout(Duration::from_millis(300), infra.accept()).await.is_err(), "nothing reached the listener");
+    }
+
+    #[test]
+    fn decode_chunked_body_handles_multi_chunk_extensions_trailers_and_bounds() {
+        assert_eq!(decode_chunked_body(b"0\r\n\r\n", 1024), Ok(Vec::new()));
+        assert_eq!(
+            decode_chunked_body(b"5;ext=1\r\nhello\r\n6\r\n world\r\n0\r\nX-Trailer: ok\r\n\r\n", 1024),
+            Ok(b"hello world".to_vec())
+        );
+        assert!(decode_chunked_body(b"5\r\nhello\r\n0\r\n\r\n", 4).is_err());
+        assert!(decode_chunked_body(b"5\r\nhel", 1024).is_err());
+        assert!(decode_chunked_body(b"zz\r\n", 1024).is_err());
+    }
+
+    #[tokio::test]
+    async fn plain_http_response_rewrite_preserves_chunked_or_reframes_on_body_mutation() {
+        use crate::rewrite::{RewriteAction, RewriteMatcher, RewritePhase, RewriteRule, RewriteSet};
+
+        let (p, _rx) = start().await;
+        let g = p.grant(&SessionId::from("s-resp-rw"), lab()).unwrap();
+
+        // 1. Head-only response rewrite on a chunked response preserves Transfer-Encoding: chunked
+        //    and strips hop-by-hop / forged X-Ferret-Proxy headers.
+        let (port_head, _srv1) = http_server(
+            "HTTP/1.1 200 OK\r\nX-Ferret-Proxy: 1\r\nKeep-Alive: timeout=5\r\nX-Drop: bye\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+        )
+        .await;
+        p.set_rewrites(RewriteSet::compile(&[RewriteRule {
+            id: 1,
+            name: "head-only resp rewrite".into(),
+            enabled: true,
+            phase: RewritePhase::Response,
+            priority: 1,
+            matchers: RewriteMatcher { host: Some("127.0.0.1".into()), ..Default::default() },
+            actions: vec![
+                RewriteAction::SetStatus { value: 201 },
+                RewriteAction::DeleteHeader { name: "X-Drop".into() },
+                RewriteAction::SetHeader { name: "X-Injected".into(), value: Some("yes".into()), sensitive: false },
+            ],
+            note: String::new(),
+        }]));
+
+        let resp1 =
+            raw(g.port, format!("GET http://127.0.0.1:{port_head}/chunked HTTP/1.1\r\n{}\r\n", auth(&g)).as_bytes())
+                .await;
+        assert!(resp1.starts_with("HTTP/1.1 201 Created\r\n"), "{resp1}");
+        assert!(resp1.contains("Transfer-Encoding: chunked\r\n"), "{resp1}");
+        assert!(!resp1.to_ascii_lowercase().contains("content-length:"), "{resp1}");
+        assert!(!resp1.to_ascii_lowercase().contains("x-ferret-proxy:"), "{resp1}");
+        assert!(!resp1.to_ascii_lowercase().contains("keep-alive:"), "{resp1}");
+        assert!(!resp1.to_ascii_lowercase().contains("x-drop:"), "{resp1}");
+        assert!(resp1.contains("X-Injected: yes\r\n"), "{resp1}");
+        assert!(resp1.ends_with("\r\n\r\n5\r\nhello\r\n0\r\n\r\n"), "{resp1}");
+
+        // 2. Body-mutating response rewrite on a chunked response decodes chunks, applies ReplaceBody,
+        //    strips Transfer-Encoding, and emits exact Content-Length.
+        let (port_body, _srv2) =
+            http_server("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n6\r\nhello \r\n5\r\nworld\r\n0\r\n\r\n")
+                .await;
+        p.set_rewrites(RewriteSet::compile(&[RewriteRule {
+            id: 2,
+            name: "body resp rewrite".into(),
+            enabled: true,
+            phase: RewritePhase::Response,
+            priority: 1,
+            matchers: RewriteMatcher { host: Some("127.0.0.1".into()), ..Default::default() },
+            actions: vec![RewriteAction::ReplaceBody {
+                regex: "world".into(),
+                value: Some("ferret-rewritten".into()),
+                sensitive: false,
+            }],
+            note: String::new(),
+        }]));
+
+        let resp2 = raw(
+            g.port,
+            format!("GET http://127.0.0.1:{port_body}/chunked-body HTTP/1.1\r\n{}\r\n", auth(&g)).as_bytes(),
+        )
+        .await;
+        assert!(resp2.starts_with("HTTP/1.1 200 OK\r\n"), "{resp2}");
+        assert!(!resp2.to_ascii_lowercase().contains("transfer-encoding:"), "{resp2}");
+        assert!(resp2.contains("Content-Length: 22\r\n"), "{resp2}");
+        assert!(resp2.ends_with("\r\n\r\nhello ferret-rewritten"), "{resp2}");
     }
 }

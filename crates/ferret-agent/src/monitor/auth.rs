@@ -7,11 +7,13 @@
 //!   *answer part* of their inbox answers, the rules in force, the approvals not yet used (`[scope] text`, from the
 //!   ledger: `ferret approve`, the web UI, Signal's `/approve`), the operator's grants with the operator's own notes and
 //!   their `[lab]` / `[prod]` marks, the configured allow and deny lists and network mode, the box targets, the pack's
-//!   `solvable` and `requires_restricted_network` flags and the role, the `scope` and `exclude` of the mission's named
+//!   `solvable`, `requires_restricted_network` and `live_targets` flags and the role, the `scope` and `exclude` of the mission's named
 //!   target as its lead's start recorded them (`SessionMeta::target`, CONTRACTS-TRAFFIC-TARGETS T2), and the hosts the
 //!   configured MCP servers of the mission's pack add to its sessions (each server's `hosts` and the host of its `url`,
 //!   CONTRACTS-MCP M4), and the hosts the operator revoked from the mission (`<mission dir>/scope_revoked.json`, what
-//!   `ferret scope revoke`, Signal's `/scope revoke` and the web UI's Revoke write). An agent's `why`, a ledger note by
+//!   `ferret scope revoke`, Signal's `/scope revoke` and the web UI's Revoke write), and the credential profiles the
+//!   operator attached to the mission (`credentials`: `creds` and main's multi-principal `creds_profiles` from the lead's
+//!   start, each `{profile} ({summary})`, never a value; they authorize no host). An agent's `why`, a ledger note by
 //!   an agent, a goal or rule host that no operator grant backs, and a ledger asset never enter it (the deterministic
 //!   authorization of a host is the configured allow list, an operator grant, a `[lab]` mark or the target's scope,
 //!   less the target's exclusions and the revoked hosts).
@@ -26,11 +28,12 @@
 //!   (`for_mcp_call`), whose server reaches them through its own grant, and for the monitor's reading of an allowed net
 //!   decision toward them (the server's traffic, attributed to the session that owns it). `is_mcp_host` says whether a
 //!   host is one.
-//! - `Mark::Lab` is given only by `ferret scope --lab` or a restricted-network pack. Loopback and link-local addresses are
-//!   `Mark::None` unless an operator said otherwise.
+//! - `Mark::Lab` is given only by `ferret scope --lab` or a restricted-network pack (one without `live_targets`).
+//!   Loopback and link-local addresses are `Mark::None` unless an operator said otherwise.
 //! - A **real-target mission** is defined once, here, and every other place in the monitor uses it (§2.5 triage, §2.6
 //!   refusal and the `unreviewed_pause_min` rule, §2.8, the opaque-code row of §4.4, §5.2 item 11, D9, D15):
-//!   `Authorization::has_real_targets()`. It is false for a pack that `requires_restricted_network`; otherwise it is
+//!   `Authorization::has_real_targets()`. It is false for a pack that `requires_restricted_network` and does not
+//!   declare `live_targets` (`restricted_lab`: main's `webapp` works on live bug-bounty targets, D16); otherwise it is
 //!   true when the network mode is `open`, or when any configured `allow` entry is not covered by an active
 //!   `[lab]` grant of the same text, or when any active grant is not marked `[lab]`, or when the mission's target has
 //!   a scope (a named target is the operator's real system: there is no `[lab]` mark for one). A mission in
@@ -64,7 +67,9 @@
 //! `the_strictest_mark_wins_and_lapsed_grants_give_nothing`, `real_targets_are_derived_from_mode_allow_list_and_grants`;
 //! after the merge of targets and MCP: `the_target_scope_and_mcp_hosts_authorize_and_exclusions_do_not`; after the merge
 //! of main (da5d310): `the_operators_approvals_not_yet_used_are_in_the_block`; after the merge of main (6be589b):
-//! `a_revoked_host_is_not_authorized_whatever_covers_it`, `mcp_hosts_authorize_only_an_mcp_tools_call`.
+//! `a_revoked_host_is_not_authorized_whatever_covers_it`, `mcp_hosts_authorize_only_an_mcp_tools_call`; after the merge
+//! of main (ef34aa4): `the_attached_credential_profiles_and_live_targets_are_in_the_block` and the live-targets case of
+//! `real_targets_are_derived_from_mode_allow_list_and_grants`.
 
 use ferret_core::ledger::{Entry, LedgerState};
 use ferret_core::MissionId;
@@ -123,6 +128,12 @@ pub struct AuthFacts {
     /// (since, entry) of the hosts the operator revoked from the mission (`scope_revoked.json`): an entry counts for
     /// what is judged at `since` or later.
     pub revoked: Vec<(u64, String)>,
+    /// The pack works on the operator's live systems (`live_targets`, main's `webapp`): its restricted network is not a
+    /// lab.
+    pub live_targets: bool,
+    /// The credential profiles the operator attached to the mission (main's multi-principal `creds_profiles`, the
+    /// default one first), as the lead's start recorded them: each one's name and redaction-safe summary.
+    pub credentials: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -162,6 +173,13 @@ pub struct Authorization {
     /// Set by `for_mcp_call` only: the MCP servers' hosts authorize (an MCP tool's call). Never serialized.
     #[serde(skip)]
     pub mcp_call: bool,
+    /// The pack works on the operator's live systems: a restricted network is not a lab for it (`restricted_lab`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub live_targets: bool,
+    /// The credential profiles the operator attached to the mission (names and redaction-safe summaries; never a
+    /// value): acting as each of them (main's `as_profile`, `http_authz_matrix`) is the operator's choice.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub credentials: Vec<String>,
 }
 
 impl Authorization {
@@ -172,7 +190,7 @@ impl Authorization {
     /// True when the mission can reach hosts that are not labs (see the CONTRACT): the one definition of a
     /// real-target mission.
     pub fn has_real_targets(&self) -> bool {
-        if self.requires_restricted_network {
+        if self.restricted_lab() {
             return false;
         }
         if self.network_mode == "open" {
@@ -186,6 +204,12 @@ impl Authorization {
         self.allow.iter().any(|a| !lab_grant(a))
             || self.grants.iter().any(|g| self.active(g) && g.mark != Mark::Lab)
             || !self.target_scope.is_empty()
+    }
+
+    /// True when the pack's restricted network makes every host of the mission a lab (D16): the pack requires a
+    /// restricted network and does not work on live targets.
+    pub fn restricted_lab(&self) -> bool {
+        self.requires_restricted_network && !self.live_targets
     }
 
     /// The deterministic authorization of `host` (on `port`, when known): see the CONTRACT.
@@ -269,6 +293,8 @@ impl Authorization {
             mcp_hosts: facts.mcp_hosts.clone(),
             revoked: facts.revoked.iter().filter(|(t, _)| *t <= upto_ms).map(|(_, h)| h.clone()).collect(),
             mcp_call: false,
+            live_targets: facts.live_targets,
+            credentials: facts.credentials.clone(),
         }
     }
 
@@ -316,6 +342,8 @@ mod tests {
             mcp_hosts: vec![],
             revoked: vec![],
             mcp_call: false,
+            live_targets: false,
+            credentials: vec![],
         }
     }
 
@@ -371,6 +399,40 @@ mod tests {
         a.requires_restricted_network = true;
         a.network_mode = "open".into();
         assert!(!a.has_real_targets(), "a restricted-network pack is a lab");
+        // Main's webapp pack works on live bug-bounty targets behind its restricted network: not a lab.
+        a.live_targets = true;
+        a.network_mode = "allowlist".into();
+        assert!(!a.restricted_lab());
+        assert!(a.has_real_targets(), "an unmarked grant of a live-targets pack is a real target");
+        a.grants = vec![grant("juice.lab.example", Mark::Lab, 0)];
+        assert!(!a.has_real_targets(), "its [lab] grants are still labs");
+        a.target_scope = vec!["*.program.example".into()];
+        assert!(a.has_real_targets(), "and a named target is the operator's real system");
+    }
+
+    /// Main's multi-principal credential profiles and the webapp pack's live targets reach the block from the facts. A
+    /// profile is its name and redaction-safe summary, and it authorizes no host.
+    #[test]
+    fn the_attached_credential_profiles_and_live_targets_are_in_the_block() {
+        let facts = AuthFacts {
+            network_mode: "allowlist".into(),
+            requires_restricted_network: true,
+            live_targets: true,
+            credentials: vec![
+                "user_a (user_a · 1 cookie · api.acme.example)".into(),
+                "admin (admin · 1 header)".into(),
+            ],
+            ..AuthFacts::default()
+        };
+        let a = Authorization::build(&MissionId::from("m-1"), &[], 10, &facts);
+        assert_eq!(a.credentials, facts.credentials);
+        assert!(a.live_targets && !a.restricted_lab());
+        assert!(!a.authorizes("api.acme.example", None), "a credential profile is no grant");
+        let json = serde_json::to_string(&a).unwrap_or_default();
+        assert!(json.contains("\"credentials\":[\"user_a (user_a") && json.contains("\"live_targets\":true"), "{json}");
+        let without = Authorization::build(&MissionId::from("m-1"), &[], 10, &AuthFacts::default());
+        let json = serde_json::to_string(&without).unwrap_or_default();
+        assert!(!json.contains("credentials") && !json.contains("live_targets"), "{json}");
     }
 
     #[test]

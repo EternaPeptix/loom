@@ -811,6 +811,41 @@ impl Tool for SecurityRecord {
         if let Err(e) = synthesize_inline_evidence(&inline_ctx, &state, &mut op, &mut notes).await {
             return ToolOutput::error(e);
         }
+        // Check prior missions on the mounted target for non-blocking cross-mission 3-axis duplicates
+        // BEFORE appending so the newly recorded finding never matches itself.
+        let mut cross_mission_dups: Vec<Value> = Vec::new();
+        let mut check_finding_dups = |op: &SecurityOp| {
+            if let SecurityOp::FindingRecord { finding } = op {
+                let (vuln_class, surface, param_or_sink) = crate::runtime::targets::finding_dedup_axes(
+                    finding.cwe.as_deref(),
+                    &finding.title,
+                    &finding.target,
+                    finding.endpoint.as_deref(),
+                    &finding.code_locations,
+                );
+                for prior in self.0.orch.find_duplicate_findings(&self.0.session, &vuln_class, &surface, &param_or_sink)
+                {
+                    cross_mission_dups.push(json!({
+                        "id": prior.id,
+                        "mission": prior.mission,
+                        "title": prior.title,
+                        "vuln_class": prior.vuln_class,
+                        "surface": prior.surface,
+                        "param_or_sink": prior.param_or_sink,
+                        "severity": prior.severity,
+                        "confidence": prior.confidence,
+                    }));
+                }
+            }
+        };
+        match &op {
+            SecurityOp::Batch { operations } => {
+                for elem in operations {
+                    check_finding_dups(elem);
+                }
+            }
+            single => check_finding_dups(single),
+        }
         // Shared::ledger_append serializes all structural validation and writes under the journal lock.
         let applied = op.clone();
         match self.0.ledger_append(false, LedgerOp::Security(op)) {
@@ -822,6 +857,19 @@ impl Tool for SecurityRecord {
                 result.insert("entry".into(), json!(entry.n));
                 if !notes.is_empty() {
                     result.insert("normalized".into(), json!(notes));
+                }
+                if !cross_mission_dups.is_empty() {
+                    let count = cross_mission_dups.len();
+                    let prior_missions: Vec<&str> =
+                        cross_mission_dups.iter().filter_map(|d| d.get("mission").and_then(Value::as_str)).collect();
+                    result.insert(
+                        "duplicate_note".into(),
+                        json!(format!(
+                            "Non-blocking cross-mission duplicate note: {count} prior finding(s) in mission(s) {} already match this 3-axis (vuln_class, surface, param_or_sink) key. Your finding was still recorded; verify whether this is a new variant or a duplicate before reporting.",
+                            prior_missions.join(", ")
+                        )),
+                    );
+                    result.insert("duplicate_findings".into(), Value::Array(cross_mission_dups));
                 }
                 result.extend(touched_report(&before, &state.security, &addressed));
                 output(&result)
@@ -1185,17 +1233,69 @@ impl Tool for SecurityQuery {
     }
 }
 
+fn infer_fallback_origin(shared: &Shared, ledger: &LedgerState) -> Option<String> {
+    use ferret_core::security_state::AssetKind;
+    let mut origins: BTreeSet<String> = BTreeSet::new();
+    for asset in ledger.security.assets.values() {
+        match asset.kind {
+            AssetKind::Service | AssetKind::Endpoint => {
+                if let Ok(u) = url::Url::parse(&asset.locator) {
+                    if matches!(u.scheme(), "http" | "https") {
+                        if let Some(h) = u.host_str() {
+                            let origin = match u.port() {
+                                Some(p) => format!("{}://{h}:{p}", u.scheme()),
+                                None => format!("{}://{h}", u.scheme()),
+                            };
+                            origins.insert(origin);
+                        }
+                    }
+                }
+            }
+            AssetKind::Host if !asset.locator.trim().is_empty() => {
+                origins.insert(format!("https://{}", asset.locator.trim()));
+            }
+            _ => {}
+        }
+    }
+    if origins.len() == 1 {
+        return origins.into_iter().next();
+    }
+    shared.traffic.mission.all().last().map(|x| {
+        let scheme = if x.scheme.is_empty() { "https" } else { x.scheme.as_str() };
+        let default_port = (scheme == "https" && x.port == 443) || (scheme == "http" && x.port == 80);
+        if default_port || x.port == 0 {
+            format!("{scheme}://{}", x.host)
+        } else {
+            format!("{scheme}://{}:{}", x.host, x.port)
+        }
+    })
+}
+
 #[async_trait]
 impl Tool for SecurityIngest {
     fn spec(&self) -> ToolSpec {
         spec(
             "security_ingest",
-            "Import asset observations from an existing scanner-output blob. Supply attested evidence IDs citing that exact output; record evidence first. Supported formats: nmap XML, nuclei JSONL, ffuf JSON, netexec JSON, BloodHound JSON. Scanner hits remain unverified observations and grant no scope. No scans or network requests are performed.",
+            "Import asset observations from an existing scanner or API-artifact blob. Supply attested evidence IDs citing that exact output; record evidence first. Supported formats: nmap XML, nuclei JSONL, ffuf JSON, netexec JSON, BloodHound JSON, openapi (OpenAPI 3.x / Swagger 2.x JSON), graphql (introspection JSON), sourcemap (JS .js.map JSON). Imported hits remain unverified observations and grant no scope. No scans or network requests are performed.",
             ToolClass::State,
             &[
-                req("format", "string", "Scanner format.").one_of(&["nmap", "nuclei", "ffuf", "netexec", "bloodhound"]),
-                req("handle", "string", "Existing observed out: handle of scanner output."),
-                req("evidence", "array", "Attested evidence IDs citing the scanner output.").items("string"),
+                req("format", "string", "Artifact or scanner format.").one_of(&[
+                    "nmap",
+                    "nuclei",
+                    "ffuf",
+                    "netexec",
+                    "bloodhound",
+                    "openapi",
+                    "graphql",
+                    "sourcemap",
+                ]),
+                req("handle", "string", "Existing observed out: handle of scanner or artifact output."),
+                req("evidence", "array", "Attested evidence IDs citing the output blob.").items("string"),
+                opt(
+                    "source_url",
+                    "string",
+                    "Optional origin URL (e.g. https://api.example.test/graphql) used to resolve relative paths in openapi, graphql, or sourcemap artifacts.",
+                ),
             ],
         )
     }
@@ -1243,24 +1343,54 @@ impl Tool for SecurityIngest {
             }
             Err(e) => return ToolOutput::error(format!("The scanner output could not be read: {e}.")),
         }
-        let bytes = match ctx.blobs.read_all(&blob) {
+        let raw_bytes = match ctx.blobs.read_all(&blob) {
             Ok(b) => b,
             Err(e) => return ToolOutput::error(format!("Read the scanner output again before importing it: {e}.")),
         };
-        if bytes.len() > 2 * 1024 * 1024 {
+        if raw_bytes.len() > 2 * 1024 * 1024 {
             return ToolOutput::error("The scanner output exceeds 2 MiB; nothing was imported.");
         }
-        let format = args.get("format").and_then(Value::as_str).unwrap_or("");
-        let assets = match scanners::parse(format, &bytes, &evidence) {
-            Ok(v) => v,
-            Err(e) => return ToolOutput::error(e),
+        let secrets = ctx.capabilities.secrets.get().or_else(|| self.0.traffic.secrets.get()).filter(|s| !s.is_empty());
+        let bytes = match secrets {
+            Some(s) => s.redact_bytes(&raw_bytes).into_owned(),
+            None => raw_bytes,
         };
-        let count = assets.len();
-        let operations = assets.into_iter().map(|asset| SecurityOp::AssetUpsert { asset }).collect();
+        let format = args.get("format").and_then(Value::as_str).unwrap_or("");
+        let source_url = args.get("source_url").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+        let fallback_origin = infer_fallback_origin(&self.0, &ledger);
+        let parsed =
+            match scanners::parse_with_options(format, &bytes, &evidence, source_url, fallback_origin.as_deref()) {
+                Ok(v) => v,
+                Err(e) => return ToolOutput::error(e),
+            };
+        let count = parsed.assets.len();
+        let sample_endpoints: Vec<String> = parsed
+            .sample_endpoints
+            .into_iter()
+            .map(|s| match secrets {
+                Some(sec) => sec.redact(&s).into_owned(),
+                None => s,
+            })
+            .collect();
+        let operations = parsed.assets.into_iter().map(|asset| SecurityOp::AssetUpsert { asset }).collect();
         match self.0.ledger_append(false, LedgerOp::Security(SecurityOp::Batch { operations })) {
-            Ok((entry, state)) => output(
-                &json!({"entry":entry.n,"parsed_assets":count,"canonical_assets":state.security.assets.len(),"scope_granted":false}),
-            ),
+            Ok((entry, state)) => {
+                let mut body = json!({
+                    "entry": entry.n,
+                    "format": format,
+                    "discovered_surfaces": parsed.total_discovered,
+                    "parsed_assets": count,
+                    "canonical_assets": state.security.assets.len(),
+                    "scope_granted": false,
+                });
+                if parsed.truncated {
+                    body["truncated"] = json!(true);
+                }
+                if !sample_endpoints.is_empty() {
+                    body["sample_endpoints"] = json!(sample_endpoints);
+                }
+                output(&body)
+            }
             Err(e) => ToolOutput::error(e),
         }
     }
@@ -1964,5 +2094,144 @@ mod tests {
         assert_eq!(q.status, Status::Ok, "{}", q.text);
         assert_eq!(r.shared.ledger().unwrap().entries, before_entries);
         assert!(r.shared.ledger().unwrap().security.assets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn security_ingest_supports_openapi_graphql_sourcemap_and_keeps_map_mandatory() {
+        let r = rig("lead", false, true);
+
+        // 1. OpenAPI 3.x spec with server URL
+        let oa = r.output(
+            r#"{
+                "openapi": "3.0.3",
+                "servers": [{"url": "https://api.acme.test/v1"}],
+                "paths": {
+                    "/users/{id}": {"get": {"summary": "Get user"}},
+                    "/admin/export": {"post": {"summary": "Export records"}}
+                }
+            }"#,
+            "http_send",
+            ToolClass::Exec,
+        );
+        evidence(&r, &oa);
+        let res = r.call("security_ingest", json!({"format": "openapi", "handle": oa, "evidence": ["e1"]})).await;
+        assert_eq!(res.status, Status::Ok, "{}", res.text);
+        let body = body_json(&res.text);
+        assert_eq!(body["format"], "openapi");
+        assert_eq!(body["discovered_surfaces"], 2);
+        assert_eq!(body["parsed_assets"], 2);
+        assert!(body["sample_endpoints"].as_array().unwrap().len() == 2);
+
+        // 2. GraphQL introspection with explicit source_url
+        let gql = r.output(
+            r#"{
+                "data": {
+                    "__schema": {
+                        "queryType": {"name": "Query"},
+                        "mutationType": {"name": "Mutation"},
+                        "types": [
+                            {"name": "Query", "fields": [{"name": "invoice", "args": [], "type": {"kind": "SCALAR", "name": "String"}}]},
+                            {"name": "Mutation", "fields": [{"name": "deleteInvoice", "args": [], "type": {"kind": "SCALAR", "name": "Boolean"}}]}
+                        ]
+                    }
+                }
+            }"#,
+            "http_send",
+            ToolClass::Exec,
+        );
+        evidence(&r, &gql);
+        let res = r
+            .call(
+                "security_ingest",
+                json!({"format": "graphql", "handle": gql, "evidence": ["e2"], "source_url": "https://api.acme.test/graphql"}),
+            )
+            .await;
+        assert_eq!(res.status, Status::Ok, "{}", res.text);
+        let body = body_json(&res.text);
+        assert_eq!(body["discovered_surfaces"], 2);
+        let locs: Vec<String> =
+            r.shared.ledger().unwrap().security.assets.values().map(|a| a.locator.clone()).collect();
+        assert!(locs.iter().any(|l| l == "https://api.acme.test/graphql#query:invoice"), "{locs:?}");
+        assert!(locs.iter().any(|l| l == "https://api.acme.test/graphql#mutation:deleteInvoice"), "{locs:?}");
+
+        // 3. JS sourcemap with embedded API route + source files
+        let sm = r.output(
+            r#"{
+                "version": 3,
+                "sources": ["webpack:///src/billing.ts"],
+                "sourcesContent": ["export async function load() { return fetch('/api/internal/billing', { method: 'POST' }); }"],
+                "mappings": "AAAA"
+            }"#,
+            "http_send",
+            ToolClass::Exec,
+        );
+        evidence(&r, &sm);
+        let res = r
+            .call(
+                "security_ingest",
+                json!({"format": "sourcemap", "handle": sm, "evidence": ["e3"], "source_url": "https://app.acme.test/static/app.js.map"}),
+            )
+            .await;
+        assert_eq!(res.status, Status::Ok, "{}", res.text);
+        let locs: Vec<String> =
+            r.shared.ledger().unwrap().security.assets.values().map(|a| a.locator.clone()).collect();
+        assert!(locs.iter().any(|l| l == "https://app.acme.test/api/internal/billing"), "{locs:?}");
+
+        // 4. `.map` URLs in ffuf scanner output remain mandatory (not demoted as static assets).
+        let ffuf = r.output(
+            r#"{"results":[{"url":"https://app.acme.test/static/bundle.js.map","status":200},{"url":"https://app.acme.test/static/logo.png","status":200}]}"#,
+            "bash",
+            ToolClass::Exec,
+        );
+        evidence(&r, &ffuf);
+        let res = r.call("security_ingest", json!({"format": "ffuf", "handle": ffuf, "evidence": ["e4"]})).await;
+        assert_eq!(res.status, Status::Ok, "{}", res.text);
+        let assets = r.shared.ledger().unwrap().security.assets;
+        let map_asset = assets.values().find(|a| a.locator.ends_with("bundle.js.map")).unwrap();
+        let png_asset = assets.values().find(|a| a.locator.ends_with("logo.png")).unwrap();
+        assert!(map_asset.mandatory, ".map source maps must remain mandatory");
+        assert!(!png_asset.mandatory, ".png static assets remain non-mandatory");
+    }
+
+    #[tokio::test]
+    async fn security_record_reports_non_blocking_cross_mission_duplicate_note() {
+        let r = rig("lead", false, true);
+        let run_out = r.output("HTTP/1.1 200 OK\n{\"owner\":\"victim\"}\n", "http_send", ToolClass::Exec);
+        r.orch.duplicate_findings.lock().unwrap().push(ferret_core::target::TargetFinding {
+            id: "fn-prior0001".into(),
+            mission: "m-previous".into(),
+            title: "Prior IDOR on invoices".into(),
+            vuln_class: "CWE-639".into(),
+            surface: "https://api.acme.test/v1/invoices/12".into(),
+            param_or_sink: String::new(),
+            severity: "high".into(),
+            confidence: "high".into(),
+            at_ms: 1000,
+        });
+        let res = r
+            .call(
+                "security_record",
+                json!({"operation": {
+                    "action": "finding_record",
+                    "title": "IDOR on /v1/invoices/99",
+                    "description": "User B can read User A's invoice.",
+                    "impact": "Cross-tenant PII exposure.",
+                    "target": "https://api.acme.test",
+                    "endpoint": "/v1/invoices/99",
+                    "method": "GET",
+                    "cwe": "CWE-639",
+                    "severity": "high",
+                    "confidence": "high",
+                    "evidence": [run_out],
+                    "counterevidence": "Tested as anon (401) and user_b (200).",
+                    "severity_change_conditions": "None."
+                }}),
+            )
+            .await;
+        assert_eq!(res.status, Status::Ok, "duplicate note must be non-blocking: {}", res.text);
+        let body = body_json(&res.text);
+        assert!(body["duplicate_note"].as_str().unwrap().contains("m-previous"), "{body}");
+        assert_eq!(body["duplicate_findings"][0]["id"], "fn-prior0001");
+        assert_eq!(r.shared.ledger().unwrap().security.findings.len(), 1);
     }
 }

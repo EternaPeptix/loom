@@ -2,6 +2,48 @@
 
 ## Unreleased
 
+### Monitor and main (ef34aa4) together
+
+Main's Wave B (box proxy bridge, multi-principal credential profiles, passive analyzer, OAST, ingestion, the `webapp`
+pack) and its session robustness fixes meet the monitor's floor (E1-E4) and the shadow monitor (M1, M2) here; each keeps
+both sides' guarantees.
+
+- **The box proxy bridge is under the floor.** With `[box] proxy_bridge`, what a program in the box sends over HTTP(S)
+  reaches the proxy on the grant the bridge carries (the lead's, else the session that made the box), so that session's
+  policy applies to it (the infrastructure deny, the mission's revoked hosts, a hold), with the veto, SNI binding, the
+  canary and lab-listener checks, and its connections are in the one live registry: `cut`, `cut_mission`,
+  `revoke_scope`, `set_policy` and `ferret panic` end them (a runtime test goes through the bridge). Main's `INPUT -i
+  fb-+ -j DROP` and `FERRET-ALL6` stand; the bridge's `INPUT 1` accept opens one gateway port to its own mission only;
+  the box chain still holds the direct egress, from the same policy. The box counters (E4f) read the mission's chain,
+  which a bridged request does not pass: it is a net decision of the bridge's session instead.
+- **TW-21 with the bridge.** A bridged request is recorded for the bridge's session whichever session ran the program,
+  so with the bridge on, a box call (`box_exec`, `box_reset`, `bash` of a box-shell role) or a box job of any session of
+  the mission keeps the mission's decisions in flight. Without the bridge nothing changes.
+- **OAST endpoints are infrastructure (E1).** With `[oast]` enabled, the broker's HTTP and DNS listeners on the
+  addresses they are bound to (the broker now starts first, and a port 0 is written back to `oast.bind` and
+  `oast.dns_bind`), the external poll endpoint, the callback host (`oast.public_host`, else the poll host) and every
+  name under its DNS domain are services of the daemon (`deny infrastructure: oast.bind 127.0.0.1:…`): no grant reaches
+  them (`grant_scope` refuses one), the sandbox refuses their loopback ports and `oast.external_token_file` is
+  unreadable to commands. A callback `oast_poll` grades as executed evidence therefore comes from the target, never
+  from ferret's own commands. An attempt at one through the proxy is refused and is TW-02 at its net decision; named in
+  a call's arguments (the callback a payload carries to the target, in a query string or a body) a broker endpoint is
+  neither TW-02 nor a sink (TW-15), as a granted OAST host covers its own name.
+- **Multi-principal profiles in the authorization.** The profiles the operator attached (`creds`, main's
+  `creds_profiles`: names and summaries) are in the AUTHORIZATION block (`Authorization::credentials`); they authorize
+  no host. TW-06 is unchanged: the union redactor keeps every profile's values out of the records.
+- **Ingestion and TW-23.** An imported artifact (`security_ingest` of OpenAPI, GraphQL or a source map, up to 500
+  mandatory endpoints in one entry) off scope is one TW-23 hit per host, with the count, not one per endpoint. A
+  running mission keeps the target scope its lead's start recorded after an `import-scope`, for its policy and the
+  monitor alike; the passive analyzer's signals are target data the monitor does not read.
+- **The `webapp` pack.** `[monitor.recipients]` needs a `webapp` line like any new pack (the worked example has it).
+  The pack declares `live_targets = true` (a new optional pack key): it works on live bug-bounty targets, so the
+  monitor does not count its restricted network as a lab (D16), and a webapp mission with an unmarked grant or a named
+  target is a real-target mission (keep-going needs `--real-targets`).
+- **Session robustness.** Main's stop epoch (`Input::StopAt`) runs the monitor's one stop body between turns
+  (`stop_between_turns`: the records, the jobs, the children, the MCP connections closed) after marking the epoch
+  handled; a stale companion stop is dropped. Main's parked empty-reply lead ends `Parked`, which keep-going never
+  reopens.
+
 ### Monitor and main (6be589b) together
 
 Main's Wave A built the scope revoke, the live cutoff and a kill-switch beside the monitor's floor (E1-E4); each is one

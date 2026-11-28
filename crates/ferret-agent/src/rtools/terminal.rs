@@ -5121,6 +5121,8 @@ mod tests {
             truncated: false,
             upstream_unverified: false,
             duration_ms: 1,
+            passive_signals: Vec::new(),
+            principal: None,
         });
     }
 

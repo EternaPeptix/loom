@@ -342,6 +342,13 @@ and a cookie or header your request sends itself overrides it.` Without intercep
 `(http_send, web_fetch, and plain-HTTP requests from commands; a command's HTTPS goes through an opaque tunnel
 and carries nothing)`. A secret value never reaches `meta.json`, a record, the prompt or an API
 answer.
+
+S11a. **Several profiles (main's Wave B, with the monitor in ef34aa4).** `NewSession::creds_profiles` mounts more
+profiles than the default one; `SessionMeta::creds_profiles` and `session_start.creds_profiles` carry their `CredsRef`s
+(names and S10 lines only), every agent inherits them, and one union redactor (`Secrets::union`) covers every mounted
+profile's values. The monitor reads the lead's start record and lists the profiles in its AUTHORIZATION block
+(`docs/MONITOR.md` §2.4, `Authorization::credentials`, `{profile} ({summary})`): acting as each one is the operator's
+choice; a profile authorizes no host, and its values never reach the monitor either.
 ## U. UI (`ui/`, fixture)
 
 U1. **Exchanges.** A tool row with exchanges (or a `bash` row during which the proxy captured some)

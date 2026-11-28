@@ -168,6 +168,8 @@ cap_add = []               # capabilities added back (all are dropped first); st
 sync_max_mb = 64           # most data copied from the workspace into /work by one call
 sync_file_max_mb = 16      # largest single file copied
 get_max_mb = 64            # most data one box_get brings back
+proxy_bridge = false       # true: forward the mission egress proxy into the box via SSH reverse tunnel + tightly-scoped INPUT rule, and stage the MITM CA at /tmp/ferret-ca.pem (0444)
+# proxy_bridge_port = 18080  # optional fixed bridge port on the Docker host (1..=65535); omitted = pick a free port
 
 [agents]
 max_children = 6           # child sessions running at once within one mission
@@ -232,6 +234,20 @@ require_auth_pass = false                       # true: inspect topmost trusted 
 max_age_minutes = 120                           # only return messages newer than this many minutes; 0 = unbounded
 max_messages = 20                               # most messages returned per read (1..=50)
 # roles = ["lead", "worker"]                    # optional roles allowed to call inbox_read; empty = every non-read-only role
+
+[oast]
+# Optional Out-of-Band Application Security Testing (OAST) callback broker (`oast_mint` / `oast_poll`)
+# for blind SSRF, XXE, XSS, and SSTI verification. Off by default. See docs/RUN.md and docs/SECURITY_STATE.md.
+# Every endpoint of the broker (its listeners as bound, the poll endpoint, the callback host and the names under its
+# DNS domain) is infrastructure: refused to every command whatever is granted (docs/MONITOR.md E1). Give public_host a
+# domain of its own: no name under it can be a target.
+enabled = false
+mode = "local"                                  # "local" (embedded HTTP + optional UDP DNS listener) or "external" (polling broker)
+bind = "127.0.0.1:0"                            # local HTTP listener socket address (`0` picks a free port)
+# public_host = "oast.example.test"             # optional hostname (or host:port) advertised in minted callback URLs and DNS names; example
+# dns_bind = "127.0.0.1:5353"                   # optional UDP DNS listener socket address in local mode (`0` picks a free port)
+# external_poll_url = "https://oast.example.test/poll"  # required when mode = "external" (https://, or plaintext http:// on loopback only); example
+# external_token_file = "~/.ferret/keys/oast.token"     # optional bearer token file for external_poll_url (regular file, mode 0600, max 4 KiB)
 
 [signal]
 # Optional two-way Signal bridge talking to a local `signal-cli daemon --http` instance for phone alerts and
@@ -337,7 +353,8 @@ tripwires_only_profiles = ["local"]   # profiles whose missions are watched by t
 # Worked example: one operator's fleet, decided 2026-11-16 (the profile names, hosts and ids are theirs; replace them).
 #   - The LAN-hosted DeepSeek profile (dsv41) has no reviewer without a new recipient, so a Qwen model hosted by
 #     Alibaba (qwen4max) reviews it, with the operator's consent for each pack (ctf, core, harnessmm, redteam, vr).
-#     ctf-generalist, a pack added after that decision, needs its own line like any new pack (shown here with the same consent).
+#     ctf-generalist and webapp, packs added after that decision, need their own lines like any new pack (shown here with
+#     the same consent).
 #     For a mission with real targets that reviewer is sent features only (hashes, lengths, classes), and secrets are redacted in every case.
 #   - The four profiles hosted by Alibaba declare that provider as their recipient: it already receives their traffic,
 #     so qwen4max is not a new recipient for the DeepSeek-on-Alibaba missions.
@@ -359,6 +376,7 @@ tripwires_only_profiles = ["local"]   # profiles whose missions are watched by t
 # harnessmm = ["alibaba"]
 # redteam = ["alibaba"]
 # vr = ["alibaba"]
+# webapp = ["alibaba"]
 # [monitor.content]
 # new_recipient_real_targets = "features"
 # [models.dsv41]

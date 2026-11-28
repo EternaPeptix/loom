@@ -728,6 +728,8 @@ pub fn import_har(
                 truncated: false,
                 upstream_unverified: false,
                 duration_ms: parsed.duration_ms,
+                passive_signals: Vec::new(),
+                principal: None,
             },
         });
     }
@@ -921,6 +923,8 @@ mod tests {
             truncated: false,
             upstream_unverified: false,
             duration_ms: 42,
+            passive_signals: Vec::new(),
+            principal: None,
         };
 
         let (har, meta) = export_har(&[(1_700_000_000_000, &ex1)], &blobs, &HarExportOptions::default()).unwrap();
@@ -1051,6 +1055,8 @@ mod tests {
             truncated: false,
             upstream_unverified: false,
             duration_ms: 12,
+            passive_signals: Vec::new(),
+            principal: None,
         };
 
         // Default export sanitizes automatically (sanitize == true by default).

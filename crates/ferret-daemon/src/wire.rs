@@ -454,8 +454,22 @@ pub struct ScopeRevokeBody {
     pub reason: Option<String>,
 }
 
-/// The answers to `POST /api/sessions/{id}/scope/revoke` and `POST /api/panic`.
-pub use ferret_agent::{PanicReport, ScopeRevokeReceipt};
+/// The answers to `POST /api/sessions/{id}/scope/revoke`, `POST /api/panic` and
+/// `POST /api/targets/{name}/import-scope`.
+pub use ferret_agent::{PanicReport, ScopeImportResult, ScopeRevokeReceipt};
+
+fn default_auto() -> String {
+    "auto".to_string()
+}
+
+/// Body of `POST /api/targets/{name}/import-scope`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopeImportBody {
+    #[serde(default = "default_auto")]
+    pub format: String,
+    pub payload: String,
+}
 
 /// Body of `POST /api/panic`. Optional; an empty body or `{}` stops everything without a reason.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -590,5 +604,17 @@ mod tests {
         let parsed: SignalStatusView = serde_json::from_str(legacy).unwrap();
         assert!(!parsed.guests_enabled);
         assert_eq!((parsed.guests_approved, parsed.guests_pending), (0, 0));
+    }
+
+    #[test]
+    fn scope_import_body_defaults_format_to_auto_and_denies_unknown_fields() {
+        let b: ScopeImportBody = serde_json::from_str(r#"{"payload":"a.test"}"#).unwrap();
+        assert_eq!(b.format, "auto");
+        assert_eq!(b.payload, "a.test");
+
+        let explicit: ScopeImportBody = serde_json::from_str(r#"{"format":"hackerone","payload":"{}"}"#).unwrap();
+        assert_eq!(explicit.format, "hackerone");
+
+        assert!(serde_json::from_str::<ScopeImportBody>(r#"{"payload":"a.test","extra":1}"#).is_err());
     }
 }

@@ -1,0 +1,101 @@
+name = "webapp"
+description = "Live bug-bounty and web AppSec assessments: multi-principal authorization testing, MITM passive-signal triage, OAST blind-callback verification, scoped inbox workflows, and independent read-only triage judging without requiring a local oracle."
+default_role = "lead"
+preamble = "harness.md"
+requires_restricted_network = true
+# The targets are the operator's live systems (bug-bounty scope): the monitor does not count this pack's restricted
+# network as a lab.
+live_targets = true
+command_guard = "offensive"
+target_concurrency = 2
+intercept = true
+
+# Engagement lead: qualifies authorized scope, delegates recon, authz matrix testing, and active
+# exploitation, curates structured findings and coverage, and finishes through the triage judge.
+[roles.lead]
+require_traffic = true
+description = "Owns a live web AppSec or bug-bounty engagement end to end: qualifies scope, coordinates recon, authz, and exploit specialists, maintains structured findings and coverage, and gates delivery through triage_judge."
+prompt = "roles/lead.md"
+termination = "explicit"
+may_spawn = ["recon_mapper", "authz_tester", "exploit_worker", "triage_judge"]
+verify_finish = true
+verifier = "triage_judge"
+tools = [
+  "bash", "job_wait", "job_kill", "job_list", "read", "write", "edit", "glob", "grep", "out_read", "out_grep", "web_fetch",
+  "box_exec", "box_get", "box_reset",
+  "plan", "step", "note", "claim", "claim_update", "evidence", "ledger", "pin", "log_search", "reflect",
+  "security_record", "security_query", "security_ingest", "traffic_query", "traffic_diff",
+  "http_send", "http_repeat", "http_authz_matrix", "oast_mint", "oast_poll", "inbox_read", "codec_calc",
+  "cve_lookup", "cve_search", "advisory_lookup", "dep_scan",
+  "agent_spawn", "agent_fanout", "attempt", "agent_adopt", "agent_message", "agent_stop", "decide", "verify",
+  "request_scope", "conclude", "finish", "ask_user", "report_blocker", "wait", "ask_for",
+]
+hidden_tools = ["out_read", "out_grep", "claim_update", "step", "wait", "conclude", "job_list", "pin", "reflect", "ask_for"]
+
+# Attack-surface mapper: enumerates in-scope routes, ingests OpenAPI/GraphQL/JS-sourcemap artifacts,
+# reviews MITM passive signals, and registers typed assets and initial coverage leads.
+[roles.recon_mapper]
+require_traffic = true
+description = "Maps authorized web attack surfaces: ingests OpenAPI, GraphQL, JS-sourcemap, and scanner blobs, reviews passive MITM signals, and records typed assets and leads."
+prompt = "roles/recon_mapper.md"
+termination = "explicit"
+max_steps = 25
+tools = [
+  "bash", "job_wait", "job_kill", "job_list", "read", "write", "edit", "glob", "grep", "out_read", "out_grep", "web_fetch",
+  "box_exec", "box_get", "box_reset",
+  "note", "claim", "claim_update", "evidence", "ledger", "pin", "log_search", "reflect",
+  "security_record", "security_query", "security_ingest", "traffic_query", "traffic_diff",
+  "http_send", "codec_calc", "cve_lookup", "advisory_lookup", "dep_scan",
+  "finish", "report_blocker", "wait", "hand_off",
+]
+hidden_tools = ["out_read", "out_grep", "claim_update", "wait", "job_list", "pin", "reflect"]
+
+# Multi-principal authorization specialist: tests BOLA/IDOR/BFLA and tenant isolation across named
+# credential profiles and anonymous sessions with structural response diffs.
+[roles.authz_tester]
+require_traffic = true
+description = "Tests multi-principal authorization (BOLA, IDOR, BFLA, tenant isolation) using http_authz_matrix, differential replays, and traffic diffs."
+prompt = "roles/authz_tester.md"
+termination = "explicit"
+max_steps = 30
+tools = [
+  "bash", "job_wait", "job_kill", "job_list", "read", "write", "edit", "glob", "grep", "out_read", "out_grep",
+  "note", "claim", "claim_update", "evidence", "ledger", "pin", "log_search", "reflect",
+  "security_record", "security_query", "traffic_query", "traffic_diff",
+  "http_send", "http_repeat", "http_authz_matrix", "codec_calc",
+  "finish", "report_blocker", "wait", "hand_off",
+]
+hidden_tools = ["out_read", "out_grep", "claim_update", "wait", "job_list", "pin", "reflect"]
+
+# Active exploitation and blind-OOB specialist: reproduces vulnerabilities with minimal PoCs,
+# benign controls, OAST callbacks, scoped inbox verification, and isolated box helpers.
+[roles.exploit_worker]
+require_traffic = true
+description = "Reproduces and verifies web vulnerabilities with minimal PoCs, benign controls, OAST blind callbacks, scoped inbox checks, and isolated box helpers."
+prompt = "roles/exploit_worker.md"
+termination = "explicit"
+max_steps = 35
+tools = [
+  "bash", "job_wait", "job_kill", "job_list", "read", "write", "edit", "glob", "grep", "out_read", "out_grep", "web_fetch",
+  "box_exec", "box_get", "box_reset",
+  "note", "claim", "claim_update", "evidence", "ledger", "pin", "log_search", "reflect",
+  "security_record", "security_query", "traffic_query", "traffic_diff",
+  "http_send", "http_repeat", "oast_mint", "oast_poll", "inbox_read", "codec_calc",
+  "finish", "report_blocker", "wait", "hand_off",
+]
+hidden_tools = ["out_read", "out_grep", "claim_update", "wait", "job_list", "pin", "reflect"]
+
+# Independent strictly read-only triage judge: checks scope, findings, coverage, and captured
+# traffic/OAST evidence without touching targets or mutating mission state.
+[roles.triage_judge]
+description = "Strictly read-only triage verifier: audits scope, structured findings, coverage dispositions, and captured HTTP/OAST evidence without running commands or mutating state."
+prompt = "roles/triage_judge.md"
+termination = "explicit"
+read_only = true
+max_steps = 15
+tools = [
+  "read", "glob", "grep", "out_read", "out_grep",
+  "ledger", "log_search", "security_query", "traffic_query", "traffic_diff",
+  "verdict", "report_blocker",
+]
+hidden_tools = ["out_read", "out_grep"]

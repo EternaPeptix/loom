@@ -74,11 +74,18 @@ pub(crate) struct Injected {
 
 const REDACTED: &str = "[redacted]";
 
-/// Applies the session's credential profile items (S8) to `headers` for a request to `host`, with
-/// `ferret_net::inject::apply` semantics. `already` = cookie names the client sends anyway. `None` when the
-/// session has no items, none is for `host`, or nothing was added (the request goes out as it is).
-pub(crate) fn inject(ctx: &ToolCtx, host: &str, headers: &[(String, Vec<u8>)], already: &[String]) -> Option<Injected> {
-    let inject = ctx.capabilities.creds.get().filter(|i| i.applies_to(host))?;
+/// Applies `inject` to `headers` for a request to `host`, with `ferret_net::inject::apply` semantics.
+/// `already` = cookie names the client sends anyway. `None` when none of `inject`'s items apply to
+/// `host` or nothing was added (the request goes out as it is).
+pub(crate) fn inject_with(
+    inject: &ferret_net::Inject,
+    host: &str,
+    headers: &[(String, Vec<u8>)],
+    already: &[String],
+) -> Option<Injected> {
+    if !inject.applies_to(host) {
+        return None;
+    }
     let mut real = headers.to_vec();
     if ferret_net::inject::apply(inject.items(), host, &mut real, already) == 0 {
         return None;
@@ -88,6 +95,14 @@ pub(crate) fn inject(ctx: &ToolCtx, host: &str, headers: &[(String, Vec<u8>)], a
     let mut shown = headers.to_vec();
     ferret_net::inject::apply(&masked, host, &mut shown, already);
     Some(Injected { real, shown })
+}
+
+/// Applies the session's default credential profile items (S8) to `headers` for a request to `host`, with
+/// `ferret_net::inject::apply` semantics. `already` = cookie names the client sends anyway. `None` when the
+/// session has no items, none is for `host`, or nothing was added (the request goes out as it is).
+pub(crate) fn inject(ctx: &ToolCtx, host: &str, headers: &[(String, Vec<u8>)], already: &[String]) -> Option<Injected> {
+    let inject = ctx.capabilities.creds.get()?;
+    inject_with(inject, host, headers, already)
 }
 
 /// What a tool knows of one exchange.
@@ -106,6 +121,8 @@ pub struct Made<'a> {
     /// The request was sent without verifying the server certificate (S12).
     pub unverified: bool,
     pub started: Instant,
+    /// Principal identity under which this request ran (e.g. `"anon"`, `"profile:user_a"`, `"auth:..."`).
+    pub principal: Option<&'a str>,
 }
 
 /// Stores the messages and returns the record. `None` when the blob store refuses (a harness fault the
@@ -121,6 +138,16 @@ pub fn record(ctx: &ToolCtx, made: &Made<'_>) -> Option<Exchange> {
     }
     let request_msg = mask(secrets.map(|s| &**s), made.request);
     let response_msg = made.response.map(|r| mask(secrets.map(|s| &**s), r));
+    let host = made.url.host_str().unwrap_or_default().to_string();
+    let target = target_of(made.url);
+    let passive_signals = ferret_net::analyze::analyze_exchange(
+        made.method,
+        &host,
+        &target,
+        made.status,
+        &request_msg,
+        response_msg.as_deref(),
+    );
     let (req, req_cut) = bounded(&request_msg);
     let request = ctx.blobs.put_bytes(req).ok()?;
     let (response, resp_cut) = match &response_msg {
@@ -138,9 +165,9 @@ pub fn record(ctx: &ToolCtx, made: &Made<'_>) -> Option<Exchange> {
         scheme: made.url.scheme().to_string(),
         tls: "tool".into(),
         method: made.method.to_string(),
-        host: made.url.host_str().unwrap_or_default().to_string(),
+        host,
         port: made.url.port_or_known_default().unwrap_or(0),
-        target: target_of(made.url),
+        target,
         status: made.status,
         error: made.error.as_ref().map(|e| match secrets {
             Some(s) => s.redact(e).into_owned(),
@@ -153,6 +180,8 @@ pub fn record(ctx: &ToolCtx, made: &Made<'_>) -> Option<Exchange> {
         truncated: req_cut || resp_cut || made.response_cut,
         upstream_unverified: made.unverified,
         duration_ms: made.started.elapsed().as_millis() as u64,
+        passive_signals,
+        principal: made.principal.map(str::to_string),
     })
 }
 

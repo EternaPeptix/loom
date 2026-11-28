@@ -344,6 +344,21 @@ pub fn on_yield(ctx: &YieldCtx<'_>) -> Yield {
     Yield::Nudge(paragraphs.join("\n\n"))
 }
 
+/// Operator inbox text when an explicit-termination lead receives repeated empty replies after
+/// retries and nudges are exhausted, so it parks visibly instead of silently dropping to idle.
+pub fn park_empty_reply(ledger: Option<&LedgerState>, replies: u32) -> String {
+    let mut text = format!(
+        "The model returned an empty reply {} in a row without calling a tool or ending its turn.",
+        plural(replies as usize, "time", "times")
+    );
+    if let Some(block) = open_block(ledger) {
+        text.push_str("\n\n");
+        text.push_str(&block);
+    }
+    text.push_str("\n\nSend the session a message to resume it.");
+    text
+}
+
 pub fn looks_like_call(text: &str) -> bool {
     const MARKERS: [&str; 4] = ["<｜DSML｜", "<tool_call", "<function_call", "<invoke"];
     if MARKERS.iter().any(|m| text.contains(m)) {
@@ -1021,6 +1036,10 @@ To keep working, call a tool. To deliver your result, call finish; if the assign
             text,
             "The session replied 5 times in a row without calling a tool or ending its turn.\n\nSend the session a message to resume it."
         );
+        let empty = park_empty_reply(Some(&l), 2);
+        assert!(empty.starts_with("The model returned an empty reply 2 times in a row"), "{empty}");
+        assert!(empty.contains("plan step p2 (doing): Fix the parser"), "{empty}");
+        assert!(empty.ends_with("Send the session a message to resume it."), "{empty}");
     }
 
     fn with_goal(open_step: bool) -> LedgerState {

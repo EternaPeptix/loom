@@ -5,15 +5,18 @@
 use super::*;
 use ferret_core::event::TargetRef;
 use ferret_core::ledger::{ClaimStatus, LedgerOp, LedgerState};
-use ferret_core::security_state::{canonical_locator, AssetKind, CoverageDisposition, SecurityOp};
+use ferret_core::security_state::{
+    canonical_locator, AssetKind, CodeLocation, CoverageDisposition, Finding, FindingStatus, SecurityOp, SurfaceOutcome,
+};
 use ferret_core::target::{
-    claim_hosts, locator_host, node_id, path_template, registrable_domain, summary, GraphLine, NodeKind, Scope,
+    claim_hosts, locator_host, node_id, path_template, registrable_domain, GraphLine, NodeKind, Scope, TargetFinding,
     TargetStore,
 };
+use std::net::IpAddr;
 use std::time::Instant;
 
-/// The network sentence with what the target adds (T2) and, for a lead whose mission has a credential
-/// profile, the line that says it is attached (S11). Without a target it is unchanged.
+/// The network sentence with what the target adds (T2) and, for a lead whose mission has credential
+/// profile(s), the line that says they are attached (S11 + multi-principal). Without a target it is unchanged.
 pub(super) fn network_with_target(text: String, meta: &SessionMeta) -> String {
     let Some(t) = meta.target.as_ref() else { return text };
     let mut s = format!("{text} Target `{}` adds these to what can be reached: {}.", t.name, t.scope.join(", "));
@@ -30,6 +33,14 @@ pub(super) fn network_with_target(text: String, meta: &SessionMeta) -> String {
             " Credential profile {} is attached to your requests to those hosts ({via}); you never see its values, and a cookie or header your request sends itself overrides it.",
             c.summary
         ));
+        if meta.creds_profiles.len() > 1 {
+            let names: Vec<&str> = meta.creds_profiles.iter().map(|p| p.profile.as_str()).collect();
+            s.push_str(&format!(
+                " Additional mounted credential profiles available via `as_profile` / `http_authz_matrix` (default `{}`): {} (plus `anon`).",
+                c.profile,
+                names.join(", ")
+            ));
+        }
     }
     s
 }
@@ -122,20 +133,20 @@ impl Inner {
         TargetStore::new(self.paths.targets_dir())
     }
 
-    /// The target a new mission names (T2), with its scope and summary as of now. `None` for no name.
+    /// The target a new mission names (T2), with its scope and full summary as of now. `None` for no name.
     pub(super) fn target_ref(&self, name: Option<&str>) -> Result<Option<TargetRef>, String> {
         let Some(name) = name.map(str::trim).filter(|n| !n.is_empty()) else { return Ok(None) };
         let store = self.target_store();
         let cfg = store.get(name)?;
         Scope::parse(&cfg.scope, &cfg.exclude)?;
-        let nodes = store.nodes(name)?;
+        let summary_text = store.summary(name)?;
         Ok(Some(TargetRef {
             name: name.to_string(),
             scope: cfg.scope.clone(),
             exclude: cfg.exclude.clone(),
             upstream_insecure: cfg.upstream_insecure.clone(),
             intercept_passthrough: cfg.intercept_passthrough.clone(),
-            summary: summary(name, &cfg, &nodes),
+            summary: summary_text,
         }))
     }
 
@@ -206,8 +217,51 @@ impl Inner {
         }
     }
 
-    /// An exchange of a session whose mission has a target (T4): the host, its domain, the service and the
-    /// endpoint, when the host is in scope.
+    /// Prior-mission findings in the mission target's graph matching the 3-axis key
+    /// `(vuln_class, surface, param_or_sink)`. Empty when the mission has no target or on read error.
+    pub(super) fn target_duplicate_findings(
+        &self,
+        session: &SessionId,
+        vuln_class: &str,
+        surface: &str,
+        param_or_sink: &str,
+    ) -> Vec<TargetFinding> {
+        let Some((t, mission)) = self.target_of(session) else { return Vec::new() };
+        match self.target_store().find_duplicate_findings(&t.name, vuln_class, surface, param_or_sink) {
+            Ok(matches) => matches.into_iter().filter(|f| f.mission != mission).collect(),
+            Err(e) => {
+                tracing::warn!(target_name = %t.name, "duplicate finding lookup failed: {e}");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Record a host -> IP DNS resolution observed by the proxy audit hook, deduplicated per `(target, host, ip)`.
+    pub(super) fn target_resolves(&self, session: &SessionId, ts: u64, host: &str, ip: &str) {
+        let host = host.trim().trim_end_matches('.').trim_matches(['[', ']']).to_ascii_lowercase();
+        let ip = ip.trim().trim_matches(['[', ']']).to_string();
+        if host.is_empty() || host.parse::<IpAddr>().is_ok() || ip.parse::<IpAddr>().is_err() {
+            return;
+        }
+        let Some((t, mission)) = self.target_of(session) else { return };
+        let Ok(scope) = Scope::parse(&t.scope, &t.exclude) else { return };
+        if scope.excluded(&host) || scope.excluded(&ip) || (!scope.contains(&host) && !scope.contains(&ip)) {
+            return;
+        }
+        {
+            let mut seen = lock(&self.resolves_seen);
+            if seen.len() >= 4096 {
+                seen.clear();
+            }
+            if !seen.insert((t.name.clone(), host.clone(), ip.clone())) {
+                return;
+            }
+        }
+        self.target_write(&t, vec![GraphLine::Resolves { host, ip, mission, at_ms: ts, prev: String::new() }]);
+    }
+
+    /// An exchange of a session whose mission has a target (T4 + Wave B passive signals): the host, its
+    /// domain, the service, the endpoint, and deduplicated passive signals when the host is in scope.
     pub(super) fn target_exchange(&self, session: &SessionId, ts: u64, x: &ferret_core::event::Exchange) {
         let Some((t, mission)) = self.target_of(session) else { return };
         let Ok(scope) = Scope::parse(&t.scope, &t.exclude) else { return };
@@ -223,16 +277,51 @@ impl Inner {
         l.edge("runs", &hid, &sid);
         let eid = l.node(NodeKind::Endpoint, &ep, &ev);
         l.edge("serves", &sid, &eid);
+        if !x.passive_signals.is_empty() {
+            let path = x.target.split(['?', '#']).next().unwrap_or("/");
+            let path = if path.is_empty() { "/" } else { path };
+            let mut seen_passive: HashSet<(&str, &str)> = HashSet::new();
+            for sig in &x.passive_signals {
+                if seen_passive.insert((sig.kind.as_str(), sig.summary.as_str())) {
+                    l.out.push(GraphLine::Passive {
+                        mission: l.mission.clone(),
+                        exchange_id: x.id.clone(),
+                        host: host.clone(),
+                        path: path.to_string(),
+                        signal: sig.clone(),
+                        at_ms: ts,
+                        prev: String::new(),
+                    });
+                }
+            }
+        }
         self.target_write(&t, l.out);
     }
 
-    /// A ledger op the mission's ledger took (T4): assets and coverage of the security state, and claims.
+    /// A ledger op the mission's ledger took (T4 + Wave B): assets, coverage, structured findings,
+    /// risk-area dispositions, dead ends, host -> IP resolves, and claims.
     pub(super) fn target_ledger(&self, session: &SessionId, op: &LedgerOp, state: &LedgerState) {
         let Some((t, mission)) = self.target_of(session) else { return };
         let Ok(scope) = Scope::parse(&t.scope, &t.exclude) else { return };
         let mut l = Lines { out: Vec::new(), mission, session: session.as_str().to_string(), ts: now_ms() };
         match op {
             LedgerOp::Security(s) => security_lines(&mut l, s, state),
+            LedgerOp::DeadEnd { what, why } => {
+                let what_t = what.trim();
+                let why_t = why.trim();
+                if what_t.is_empty() {
+                    return;
+                }
+                let surface = extract_dead_end_surface(what_t);
+                let summary = if why_t.is_empty() { what_t.to_string() } else { format!("{what_t}: {why_t}") };
+                l.out.push(GraphLine::DeadEnd {
+                    mission: l.mission.clone(),
+                    surface,
+                    summary,
+                    at_ms: l.ts,
+                    prev: String::new(),
+                });
+            }
             LedgerOp::ClaimUpdate { id, status, .. } => {
                 let Some(c) = state.claims.iter().find(|c| &c.id == id) else { return };
                 let status = match status {
@@ -265,6 +354,175 @@ impl Inner {
         }
         self.target_write(&t, l.out);
     }
+}
+
+/// Curated vulnerability-class tokens used when a finding has no explicit CWE.
+const VULN_CLASS_TOKENS: &[(&str, &str)] = &[
+    ("missing authentication", "missing_authentication"),
+    ("missing authorization", "missing_authorization"),
+    ("broken access control", "broken_access_control"),
+    ("incorrect authorization", "incorrect_authorization"),
+    ("default credentials", "default_credentials"),
+    ("hardcoded credentials", "hardcoded_credentials"),
+    ("hardcoded secret", "hardcoded_secret"),
+    ("hardcoded password", "hardcoded_password"),
+    ("session fixation", "session_fixation"),
+    ("open redirect", "open_redirect"),
+    ("path traversal", "path_traversal"),
+    ("directory traversal", "path_traversal"),
+    ("command injection", "command_injection"),
+    ("sql injection", "sql_injection"),
+    ("sqli", "sql_injection"),
+    ("code injection", "code_injection"),
+    ("template injection", "template_injection"),
+    ("ssti", "template_injection"),
+    ("xpath injection", "xpath_injection"),
+    ("ldap injection", "ldap_injection"),
+    ("deserialization", "deserialization"),
+    ("ssrf", "ssrf"),
+    ("server-side request forgery", "ssrf"),
+    ("xss", "xss"),
+    ("cross-site scripting", "xss"),
+    ("csrf", "csrf"),
+    ("xxe", "xxe"),
+    ("race condition", "race_condition"),
+    ("toctou", "race_condition"),
+    ("information disclosure", "information_disclosure"),
+    ("insecure direct object reference", "idor"),
+    ("idor", "idor"),
+    ("bola", "bola"),
+    ("bfla", "bfla"),
+    ("auth bypass", "auth_bypass"),
+];
+
+/// Compute the 3-axis `(vuln_class, surface, param_or_sink)` tuple shared by `GraphLine::SecurityFinding`
+/// writes and cross-mission `TargetStore::find_duplicate_findings` lookups.
+pub(crate) fn finding_dedup_axes(
+    cwe: Option<&str>,
+    title: &str,
+    target: &str,
+    endpoint: Option<&str>,
+    code_locations: &[CodeLocation],
+) -> (String, String, String) {
+    let vuln_class = if let Some(raw) = cwe.map(str::trim).filter(|s| !s.is_empty()) {
+        raw.to_string()
+    } else {
+        let low = title.to_ascii_lowercase();
+        VULN_CLASS_TOKENS
+            .iter()
+            .find_map(|(needle, canon)| low.contains(needle).then(|| (*canon).to_string()))
+            .unwrap_or_else(|| title.trim().to_string())
+    };
+
+    let raw_ep = endpoint.map(str::trim).filter(|s| !s.is_empty()).map(|ep| match ep.split_once(char::is_whitespace) {
+        Some((m, rest))
+            if matches!(
+                m.to_ascii_uppercase().as_str(),
+                "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS" | "TRACE"
+            ) =>
+        {
+            rest.trim()
+        }
+        _ => ep,
+    });
+
+    let surface = match raw_ep {
+        Some(ep) if ep.starts_with("http://") || ep.starts_with("https://") => {
+            ep.split(['?', '#']).next().unwrap_or(ep).to_string()
+        }
+        Some(ep) if ep.starts_with('/') => {
+            let path = ep.split(['?', '#']).next().unwrap_or(ep);
+            let t = target.trim();
+            if let Ok(u) = url::Url::parse(t) {
+                if let Some(h) = u.host_str() {
+                    let host_port = match u.port() {
+                        Some(p) => format!("{h}:{p}"),
+                        None => h.to_string(),
+                    };
+                    format!("{}://{host_port}{path}", u.scheme())
+                } else {
+                    path.to_string()
+                }
+            } else if !t.is_empty() && !t.chars().any(char::is_whitespace) {
+                let host = t.split('/').next().unwrap_or(t);
+                format!("https://{host}{path}")
+            } else {
+                path.to_string()
+            }
+        }
+        Some(ep) => ep.split(['?', '#']).next().unwrap_or(ep).to_string(),
+        None => target.trim().to_string(),
+    };
+
+    let param_or_sink = if let Some(ep) = raw_ep {
+        if let Some((_, after_q)) = ep.split_once('?') {
+            let query = after_q.split('#').next().unwrap_or(after_q);
+            let mut keys: Vec<String> = query
+                .split('&')
+                .filter_map(|pair| {
+                    let k = pair.split('=').next().unwrap_or("").trim().to_ascii_lowercase();
+                    (!k.is_empty()).then_some(k)
+                })
+                .collect();
+            keys.sort();
+            keys.dedup();
+            keys.join(",")
+        } else if let Some(loc) = code_locations.first() {
+            format!("{}:{}", loc.file.trim(), loc.start_line)
+        } else {
+            String::new()
+        }
+    } else if let Some(loc) = code_locations.first() {
+        format!("{}:{}", loc.file.trim(), loc.start_line)
+    } else {
+        String::new()
+    };
+
+    (vuln_class, surface, param_or_sink)
+}
+
+fn extract_dead_end_surface(what: &str) -> String {
+    for tok in what.split_whitespace() {
+        let cleaned = tok.trim_matches(|c: char| matches!(c, '"' | '\'' | '`' | '(' | ')' | ',' | ';' | '<' | '>'));
+        if cleaned.starts_with("http://") || cleaned.starts_with("https://") {
+            return cleaned.to_string();
+        }
+    }
+    what.to_string()
+}
+
+fn format_disposition_note(control: Option<&str>, location: Option<&str>, reason: Option<&str>) -> String {
+    let mut parts = Vec::new();
+    if let Some(r) = reason.map(str::trim).filter(|s| !s.is_empty()) {
+        parts.push(r.to_string());
+    }
+    if let Some(c) = control.map(str::trim).filter(|s| !s.is_empty()) {
+        parts.push(format!("control: {c}"));
+    }
+    if let Some(loc) = location.map(str::trim).filter(|s| !s.is_empty()) {
+        parts.push(format!("at {loc}"));
+    }
+    parts.join("; ")
+}
+
+fn push_security_finding_line(l: &mut Lines, f: &Finding) {
+    if f.status != FindingStatus::Active {
+        return;
+    }
+    let (vuln_class, surface, param_or_sink) =
+        finding_dedup_axes(f.cwe.as_deref(), &f.title, &f.target, f.endpoint.as_deref(), &f.code_locations);
+    l.out.push(GraphLine::SecurityFinding {
+        id: f.id.clone(),
+        mission: l.mission.clone(),
+        title: f.title.clone(),
+        vuln_class,
+        surface,
+        param_or_sink,
+        severity: f.severity.as_str().to_string(),
+        confidence: f.confidence.as_str().to_string(),
+        at_ms: l.ts,
+        prev: String::new(),
+    });
 }
 
 /// The graph lines of one security op (a batch is flattened).
@@ -308,6 +566,40 @@ fn security_lines(l: &mut Lines, op: &SecurityOp, state: &LedgerState) {
                 AssetKind::File | AssetKind::Identity => {}
             }
         }
+        SecurityOp::RelationAdd { relation } => {
+            if relation.kind.eq_ignore_ascii_case("resolves") {
+                let from = state.security.assets.get(&relation.from);
+                let to = state.security.assets.get(&relation.to);
+                if let (Some(f), Some(t)) = (from, to) {
+                    let host = locator_host(NodeKind::Host, &f.locator);
+                    let ip = locator_host(NodeKind::Ip, &t.locator);
+                    if !host.is_empty() && host.parse::<IpAddr>().is_err() && ip.parse::<IpAddr>().is_ok() {
+                        l.out.push(GraphLine::Resolves {
+                            host,
+                            ip,
+                            mission: l.mission.clone(),
+                            at_ms: l.ts,
+                            prev: String::new(),
+                        });
+                    }
+                }
+            }
+        }
+        SecurityOp::FactAssert { fact, .. } => {
+            if fact.predicate.eq_ignore_ascii_case("resolves") && fact.args.len() >= 2 {
+                let host = fact.args[0].trim().trim_end_matches('.').to_ascii_lowercase();
+                let ip = fact.args[1].trim().trim_matches(['[', ']']).to_string();
+                if !host.is_empty() && host.parse::<IpAddr>().is_err() && ip.parse::<IpAddr>().is_ok() {
+                    l.out.push(GraphLine::Resolves {
+                        host,
+                        ip,
+                        mission: l.mission.clone(),
+                        at_ms: l.ts,
+                        prev: String::new(),
+                    });
+                }
+            }
+        }
         SecurityOp::CoverageSet { asset, disposition } => {
             let Some(a) = state
                 .security
@@ -338,6 +630,52 @@ fn security_lines(l: &mut Lines, op: &SecurityOp, state: &LedgerState) {
                 ts_ms: l.ts,
                 prev: String::new(),
             });
+        }
+        SecurityOp::CoverageRecord { surface, risk_area, outcome, control, location, reason, .. } => {
+            if matches!(outcome, SurfaceOutcome::RuledOut | SurfaceOutcome::NeedsFollowUp) {
+                l.out.push(GraphLine::Disposition {
+                    mission: l.mission.clone(),
+                    surface: surface.clone(),
+                    risk_area: risk_area.clone(),
+                    disposition: outcome.as_str().to_string(),
+                    note: format_disposition_note(control.as_deref(), location.as_deref(), reason.as_deref()),
+                    at_ms: l.ts,
+                    prev: String::new(),
+                });
+            }
+        }
+        SecurityOp::CoverageUpdate { id, outcome, control, location, reason, .. } => {
+            if matches!(outcome, SurfaceOutcome::RuledOut | SurfaceOutcome::NeedsFollowUp) {
+                let entry = state.security.surface_coverage.get(id).or_else(|| {
+                    state.security.resolve(id).ok().and_then(|rid| state.security.surface_coverage.get(&rid))
+                });
+                if let Some(entry) = entry {
+                    l.out.push(GraphLine::Disposition {
+                        mission: l.mission.clone(),
+                        surface: entry.surface.clone(),
+                        risk_area: entry.risk_area.clone(),
+                        disposition: outcome.as_str().to_string(),
+                        note: format_disposition_note(control.as_deref(), location.as_deref(), reason.as_deref()),
+                        at_ms: l.ts,
+                        prev: String::new(),
+                    });
+                }
+            }
+        }
+        SecurityOp::FindingRecord { finding } => {
+            let id = finding.id();
+            if let Some(f) = state.security.findings.get(&id) {
+                push_security_finding_line(l, f);
+            }
+        }
+        SecurityOp::FindingUpdate { update } => {
+            let finding =
+                state.security.findings.get(&update.id).or_else(|| {
+                    state.security.resolve(&update.id).ok().and_then(|rid| state.security.findings.get(&rid))
+                });
+            if let Some(f) = finding {
+                push_security_finding_line(l, f);
+            }
         }
         _ => {}
     }

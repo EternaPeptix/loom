@@ -198,6 +198,9 @@ pub struct Config {
     pub mail: MailCfg,
     /// Optional two-way Signal bridge via a local `signal-cli daemon --http` for alerts and phone replies.
     pub signal: SignalCfg,
+    /// Optional Out-of-Band Application Security Testing (OAST) callback broker (`oast_mint` / `oast_poll`).
+    #[serde(default)]
+    pub oast: OastCfg,
 }
 
 /// What a model profile is for. Absent means an agent profile.
@@ -1646,6 +1649,12 @@ pub struct BoxCfg {
     pub sync_file_max_mb: u64,
     /// Most megabytes one `box_get` brings back.
     pub get_max_mb: u64,
+    /// Route container HTTP/HTTPS traffic through the mission's `ferret-net` proxy bridge and stage the MITM CA.
+    #[serde(default)]
+    pub proxy_bridge: bool,
+    /// Explicit TCP port on the Docker bridge gateway used for the proxy bridge (`None` = auto-select).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_bridge_port: Option<u16>,
 }
 
 impl Default for BoxCfg {
@@ -1667,7 +1676,131 @@ impl Default for BoxCfg {
             sync_max_mb: 64,
             sync_file_max_mb: 16,
             get_max_mb: 64,
+            proxy_bridge: false,
+            proxy_bridge_port: None,
         }
+    }
+}
+
+/// Callback broker mode for `[oast]`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OastMode {
+    /// Embedded loopback/LAN HTTP (+ optional UDP DNS) callback listener.
+    #[default]
+    Local,
+    /// External polling server (e.g. Interactsh / self-hosted broker) over HTTPS or loopback HTTP.
+    External,
+}
+
+impl OastMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OastMode::Local => "local",
+            OastMode::External => "external",
+        }
+    }
+}
+
+/// Out-of-Band Application Security Testing (`[oast]`) callback broker configuration.
+/// Disabled by default.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct OastCfg {
+    pub enabled: bool,
+    pub mode: OastMode,
+    /// Local HTTP listener socket address (default `"127.0.0.1:0"`).
+    pub bind: String,
+    /// Optional public hostname (or `host:port`) advertised in minted callback URLs and DNS names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_host: Option<String>,
+    /// Optional UDP DNS listener socket address for local OAST mode (for example `"127.0.0.1:0"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_bind: Option<String>,
+    /// Polling endpoint URL when `mode = "external"`. Must be `https://` or loopback `http://`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_poll_url: Option<String>,
+    /// Optional path to a private (0600) file holding the bearer token for `external_poll_url`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_token_file: Option<String>,
+}
+
+impl Default for OastCfg {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: OastMode::Local,
+            bind: "127.0.0.1:0".to_string(),
+            public_host: None,
+            dns_bind: None,
+            external_poll_url: None,
+            external_token_file: None,
+        }
+    }
+}
+
+impl OastCfg {
+    pub fn check(&self) -> Result<(), String> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if let Some(raw) = self.public_host.as_deref() {
+            if raw.trim().is_empty()
+                || raw != raw.trim()
+                || raw.chars().any(|c| c.is_whitespace() || c.is_control())
+                || raw.contains("://")
+                || raw.contains('/')
+                || raw.contains('?')
+                || raw.contains('#')
+            {
+                return Err(format!(
+                    "oast.public_host `{raw}` must be a non-empty host (or host:port) without a scheme, path, whitespace, or control characters."
+                ));
+            }
+        }
+        if let Some(raw) = self.dns_bind.as_deref() {
+            if raw.parse::<std::net::SocketAddr>().is_err() {
+                return Err(format!(
+                    "oast.dns_bind `{raw}` must be a valid socket address (for example `127.0.0.1:0` or `127.0.0.1:5353`)."
+                ));
+            }
+        }
+        match self.mode {
+            OastMode::Local => {
+                if self.bind.parse::<std::net::SocketAddr>().is_err() {
+                    return Err(format!(
+                        "oast.bind `{}` must be a valid socket address (for example `127.0.0.1:0`).",
+                        self.bind
+                    ));
+                }
+            }
+            OastMode::External => {
+                let raw_url =
+                    self.external_poll_url.as_deref().map(str::trim).filter(|s| !s.is_empty()).ok_or_else(|| {
+                        "oast.external_poll_url is required when oast.mode = \"external\".".to_string()
+                    })?;
+                let u = url::Url::parse(raw_url)
+                    .map_err(|_| format!("oast.external_poll_url `{raw_url}` must be an http:// or https:// URL."))?;
+                if !matches!(u.scheme(), "http" | "https") || u.host_str().is_none() {
+                    return Err(format!(
+                        "oast.external_poll_url `{raw_url}` must be an http:// or https:// URL with a host."
+                    ));
+                }
+                if u.scheme() == "http" && !is_loopback_url_host(&u) {
+                    return Err(format!(
+                        "oast.external_poll_url `{raw_url}` uses plaintext http:// for a non-loopback host; allow only http://127.0.0.1, http://localhost, http://[::1], or https:// for a remote OAST server."
+                    ));
+                }
+                if let Some(tok_file) = self.external_token_file.as_deref() {
+                    if tok_file.trim().is_empty() || tok_file.chars().any(char::is_control) {
+                        return Err(
+                            "oast.external_token_file must be a non-empty file path without control characters.".into(),
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1724,6 +1857,11 @@ impl BoxCfg {
                     "box.{key} \"{image}\" is not pinned. A tag can be moved to a different image after it was checked, so ferret takes only name@sha256:<64 hex digits> or an image ID sha256:<64 hex digits>. Find the ID with `docker image inspect --format '{{{{.Id}}}}' <tag>` on the Docker host."
                 ));
             }
+        }
+        if self.proxy_bridge_port == Some(0) {
+            return Err(
+                "box.proxy_bridge_port must be between 1 and 65535 (or omitted for automatic port selection).".into()
+            );
         }
         if !self.enabled {
             return Ok(());
@@ -1925,6 +2063,7 @@ impl Config {
         self.mcp.check().map_err(ConfigError::Invalid)?;
         self.mail.check().map_err(ConfigError::Invalid)?;
         self.signal.check().map_err(ConfigError::Invalid)?;
+        self.oast.check().map_err(ConfigError::Invalid)?;
         if self.signal.enabled && self.signal.guests.enabled {
             let check_guest_model = |field: &str, model: &str| -> Result<(), ConfigError> {
                 if !self.models.contains_key(model) {
@@ -3583,6 +3722,100 @@ enabled = true
         master_off.check().unwrap();
         for pack in ["core", "vr", "redteam", "ctf", "ctf-generalist"] {
             assert!(!master_off.agents.project_instructions_enabled_for_pack(pack), "{pack}");
+        }
+    }
+
+    #[test]
+    fn box_proxy_bridge_defaults_and_port_validation() {
+        let def = BoxCfg::default();
+        assert!(!def.proxy_bridge);
+        assert_eq!(def.proxy_bridge_port, None);
+        let serialized = serde_json::to_value(&def).unwrap();
+        assert!(serialized.get("proxy_bridge_port").is_none());
+
+        let parsed = box_cfg("proxy_bridge = true\nproxy_bridge_port = 18080\n").unwrap();
+        assert!(parsed.boxed.proxy_bridge);
+        assert_eq!(parsed.boxed.proxy_bridge_port, Some(18080));
+
+        // Port 0 is rejected whether enabled or disabled.
+        let err_enabled = box_cfg("proxy_bridge = true\nproxy_bridge_port = 0\n").unwrap_err();
+        assert!(err_enabled.contains("proxy_bridge_port"), "{err_enabled}");
+        let err_disabled = Config::parse("[box]\nproxy_bridge_port = 0\n").unwrap().check().unwrap_err().to_string();
+        assert!(err_disabled.contains("proxy_bridge_port"), "{err_disabled}");
+    }
+
+    #[test]
+    fn oast_config_defaults_and_validation() {
+        let def = Config::default();
+        assert!(!def.oast.enabled);
+        assert_eq!(def.oast.mode, OastMode::Local);
+        assert_eq!(def.oast.bind, "127.0.0.1:0");
+        assert_eq!(def.oast.public_host, None);
+        assert_eq!(def.oast.dns_bind, None);
+        assert_eq!(def.oast.external_poll_url, None);
+        assert_eq!(def.oast.external_token_file, None);
+        def.check().unwrap();
+
+        // Disabled [oast] does not fail even with incomplete fields, while unknown keys still fail parse.
+        assert!(Config::parse("[oast]\nunknown_key = 1\n").is_err());
+        Config::parse("[oast]\nenabled = false\nmode = \"external\"\n").unwrap().check().unwrap();
+
+        // Local mode valid configurations.
+        let local = Config::parse(
+            "[oast]\nenabled = true\nmode = \"local\"\nbind = \"127.0.0.1:0\"\ndns_bind = \"127.0.0.1:5353\"\npublic_host = \"oast.example.test:8080\"\n",
+        )
+        .unwrap();
+        local.check().unwrap();
+        assert_eq!(local.oast.mode, OastMode::Local);
+        assert_eq!(local.oast.dns_bind.as_deref(), Some("127.0.0.1:5353"));
+        assert_eq!(local.oast.public_host.as_deref(), Some("oast.example.test:8080"));
+
+        // Local mode bad bind, dns_bind, and public_host.
+        for bad in [
+            "[oast]\nenabled = true\nbind = \"not-a-sockaddr\"\n",
+            "[oast]\nenabled = true\ndns_bind = \"localhost:53\"\n",
+            "[oast]\nenabled = true\npublic_host = \"\"\n",
+            "[oast]\nenabled = true\npublic_host = \"https://oast.example.test\"\n",
+            "[oast]\nenabled = true\npublic_host = \"oast example.test\"\n",
+            "[oast]\nenabled = true\npublic_host = \"oast.example.test/path\"\n",
+        ] {
+            assert!(Config::parse(bad).unwrap().check().is_err(), "{bad}");
+        }
+
+        // External mode requires external_poll_url and enforces loopback-or-HTTPS.
+        assert!(Config::parse("[oast]\nenabled = true\nmode = \"external\"\n")
+            .unwrap()
+            .check()
+            .unwrap_err()
+            .to_string()
+            .contains("external_poll_url"));
+
+        for ok_url in [
+            "https://oast.example.com/poll",
+            "https://192.168.1.5:8443/poll",
+            "http://127.0.0.1:9999/poll",
+            "http://localhost:9999/poll",
+            "http://[::1]:9999/poll",
+        ] {
+            let cfg = Config::parse(&format!(
+                "[oast]\nenabled = true\nmode = \"external\"\nexternal_poll_url = \"{ok_url}\"\nexternal_token_file = \"/tmp/oast.tok\"\n"
+            ))
+            .unwrap();
+            cfg.check().unwrap_or_else(|e| panic!("{ok_url}: {e}"));
+        }
+
+        for bad_url in [
+            "http://oast.example.com/poll",
+            "http://10.0.0.5:9999/poll",
+            "http://0.0.0.0:9999/poll",
+            "http://evil.localhost/poll",
+            "ftp://oast.example.com/poll",
+        ] {
+            let cfg = Config::parse(&format!(
+                "[oast]\nenabled = true\nmode = \"external\"\nexternal_poll_url = \"{bad_url}\"\n"
+            ))
+            .unwrap();
+            assert!(cfg.check().is_err(), "{bad_url}");
         }
     }
 }

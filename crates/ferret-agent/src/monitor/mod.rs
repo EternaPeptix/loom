@@ -433,6 +433,7 @@ mod tests {
             relaxed_profiles: Default::default(),
             mcp_hosts: Default::default(),
             box_shell: Default::default(),
+            box_bridge: false,
         }
     }
 
@@ -462,6 +463,7 @@ mod tests {
                 intercept: false,
                 target: None,
                 creds: None,
+                creds_profiles: Vec::new(),
                 schema: ferret_core::event::SCHEMA,
             }),
         )

@@ -27,7 +27,9 @@
 //!   resolves when the record is read.
 //! - `read_journal(paths, mission, key)` reads a mission's journal as `Journal::read` does (verified) when the key is
 //!   known, else as unverified lines (a replay of a copy); it returns the entries it understands and says which.
-//! - `prime` also gives the mission's named target (`meta.json`'s, else the `session_start`'s). `last_shell_dir(log,
+//! - `prime` also gives the mission's named target (`meta.json`'s, else the `session_start`'s) and the credential
+//!   profiles attached to it (`creds`, then main's `creds_profiles`, as `{profile} ({summary})`, from the same record;
+//!   never a value). `last_shell_dir(log,
 //!   upto)` is the one read back from a cursor: the meta `cwd` of the last `bash` result in the `SHELL_DIR_BYTES` before
 //!   `upto` (where a restarted session's shell is, for the relative paths of its next commands).
 //!
@@ -313,6 +315,9 @@ pub struct Primed {
     pub started_ms: u64,
     /// The mission's named target, as the session's `meta.json` (else its `session_start`) recorded it.
     pub target: Option<ferret_core::event::TargetRef>,
+    /// The credential profiles attached to the mission (`creds`, then main's multi-principal `creds_profiles`), as
+    /// `{profile} ({summary})`, from the same record: names and redaction-safe summaries, never a value.
+    pub credentials: Vec<String>,
 }
 
 /// Find out who the session in directory `dir` is (see the contract).
@@ -363,6 +368,17 @@ pub fn prime(dir: &Path, name: &str) -> Option<Primed> {
     let relaxed = s.model.lineage.as_ref().is_some_and(|l| l.alignment == ferret_core::lineage::Alignment::Relaxed);
     let skip_below = if copied { forked.unwrap_or(u64::MAX) } else { 0 };
     let target = meta.as_ref().and_then(|m| m.target.clone()).or_else(|| s.target.clone());
+    let (creds, profiles) = match &meta {
+        Some(m) if m.creds.is_some() || !m.creds_profiles.is_empty() => (m.creds.clone(), m.creds_profiles.clone()),
+        _ => (s.creds.clone(), s.creds_profiles.clone()),
+    };
+    let mut credentials: Vec<String> = Vec::new();
+    for c in creds.iter().chain(profiles.iter()) {
+        let line = format!("{} ({})", c.profile, c.summary);
+        if !credentials.contains(&line) {
+            credentials.push(line);
+        }
+    }
     Some(Primed {
         ctx: SessionCtx { session, mission, parent, pack, role, relaxed, workspace },
         profile,
@@ -370,6 +386,7 @@ pub fn prime(dir: &Path, name: &str) -> Option<Primed> {
         skip_below,
         started_ms: start_rec.ts_ms,
         target,
+        credentials,
     })
 }
 
@@ -598,6 +615,7 @@ mod tests {
                 intercept: false,
                 target: None,
                 creds: None,
+                creds_profiles: Vec::new(),
                 schema: ferret_core::event::SCHEMA,
             })
         };
@@ -653,6 +671,16 @@ mod tests {
             intercept_passthrough: vec![],
             summary: String::new(),
         };
+        let user_a = ferret_core::event::CredsRef {
+            profile: "user_a".into(),
+            summary: "user_a · 1 cookie · api.acme.example".into(),
+            dropped: 0,
+        };
+        let admin = ferret_core::event::CredsRef {
+            profile: "admin".into(),
+            summary: "admin · 1 header · api.acme.example".into(),
+            dropped: 0,
+        };
         log.append(
             Author::Harness,
             Event::SessionStart(ferret_core::event::SessionStart {
@@ -679,12 +707,18 @@ mod tests {
                 mcp: Vec::new(),
                 intercept: false,
                 target: Some(target.clone()),
-                creds: None,
+                creds: Some(user_a.clone()),
+                creds_profiles: vec![user_a.clone(), admin.clone()],
                 schema: ferret_core::event::SCHEMA,
             }),
         )
         .expect("start");
         assert_eq!(prime(&dir, "s-1").and_then(|p| p.target), Some(target), "the target of the session's start");
+        // Main's multi-principal profiles: the default one first, each once, name and summary only.
+        assert_eq!(
+            prime(&dir, "s-1").map(|p| p.credentials).unwrap_or_default(),
+            ["user_a (user_a · 1 cookie · api.acme.example)", "admin (admin · 1 header · api.acme.example)"]
+        );
         let moved = |dir: &str| {
             let mut meta = serde_json::Map::new();
             meta.insert(ferret_core::event::META_CWD.into(), serde_json::json!(dir));

@@ -4929,3 +4929,224 @@ test("Wave A helpers: sanitized HAR/SARIF URLs, scope revocation, and panic kill
     "Revoked a.test, x.b.test (0 connections cut). Not granted by itself, refused from now on: x.b.test.",
   );
 });
+
+test("Wave B helpers: passive signal summarization, severity ranking, and principal formatting", () => {
+  // Empty / invalid inputs produce a zeroed summary.
+  assert.deepEqual(C.summarizePassiveSignals(null), {
+    total: 0,
+    maxSeverity: null,
+    counts: { high: 0, medium: 0, low: 0, info: 0 },
+    badge: "",
+    tooltip: "",
+    items: [],
+  });
+  assert.equal(C.summarizePassiveSignals([]).total, 0);
+
+  // Mixed severities: ranked high > medium > low > info, unknown/case normalized cleanly.
+  const mixed = C.summarizePassiveSignals([
+    { kind: "missing_security_headers", severity: "info", summary: "Missing CSP header" },
+    { kind: "cookie_insecure", severity: "LOW", summary: "Session cookie lacks HttpOnly" },
+    { kind: "cors_misconfig", severity: "High", summary: "Reflected Origin with ACAC: true", detail: "Origin: https://evil.example" },
+    { kind: "verbose_error", severity: "medium", summary: "Stack trace leaked in 500 body" },
+    { kind: "custom_note", severity: "bogus", summary: "Normalized to info" },
+    { kind: "secret_leak", severity: "high", summary: "AWS key prefix observed" },
+  ]);
+  assert.equal(mixed.total, 6);
+  assert.equal(mixed.maxSeverity, "high");
+  assert.deepEqual(mixed.counts, { high: 2, medium: 1, low: 1, info: 2 });
+  assert.equal(mixed.badge, "2 high · 1 medium · 1 low · 2 info");
+  assert.deepEqual(
+    mixed.items.map((s) => `${s.severity}:${s.kind}`),
+    [
+      "high:cors_misconfig",
+      "high:secret_leak",
+      "medium:verbose_error",
+      "low:cookie_insecure",
+      "info:missing_security_headers",
+      "info:custom_note",
+    ],
+  );
+  assert.match(mixed.tooltip, /^\[HIGH\] cors_misconfig: Reflected Origin with ACAC: true\n\[HIGH\] secret_leak:/);
+
+  // Single medium/low/info maxSeverity ranking checks.
+  assert.equal(C.summarizePassiveSignals([{ kind: "a", severity: "medium", summary: "m" }]).maxSeverity, "medium");
+  assert.equal(C.summarizePassiveSignals([{ kind: "a", severity: "low", summary: "l" }]).maxSeverity, "low");
+  assert.equal(C.summarizePassiveSignals([{ kind: "a", severity: "info", summary: "i" }]).maxSeverity, "info");
+
+  // Principal formatting.
+  assert.equal(C.formatPrincipal(null), null);
+  assert.equal(C.formatPrincipal("   "), null);
+  assert.equal(C.formatPrincipal("profile:   "), null);
+  assert.equal(C.formatPrincipal("auth:   "), null);
+  assert.deepEqual(C.formatPrincipal("anon"), {
+    raw: "anon",
+    label: "anon",
+    name: null,
+    kind: "anon",
+    tip: "Sent without mounted credentials (anonymous).",
+  });
+  assert.equal(C.formatPrincipal("ANONYMOUS").label, "anon");
+  assert.deepEqual(C.formatPrincipal("auth:1a2b3c4d"), {
+    raw: "auth:1a2b3c4d",
+    label: "auth:1a2b3c4d",
+    name: null,
+    kind: "auth",
+    tip: "Sent with ad-hoc request auth headers (not a mounted profile).",
+  });
+  assert.equal(C.formatPrincipal("AUTH:deadbeef").label, "auth:deadbeef");
+  assert.equal(C.formatPrincipal("AUTH:deadbeef").kind, "auth");
+  assert.deepEqual(C.formatPrincipal("profile:user_b"), {
+    raw: "profile:user_b",
+    label: "profile:user_b",
+    name: "user_b",
+    kind: "profile",
+    tip: "Sent with credential profile user_b.",
+  });
+  assert.deepEqual(C.formatPrincipal("  admin  "), {
+    raw: "admin",
+    label: "profile:admin",
+    name: "admin",
+    kind: "profile",
+    tip: "Sent with credential profile admin.",
+  });
+
+  // exchangeOf + exchangeRow preserve passive_signals and principal without altering legacy marks.
+  const ex = C.exchangeOf(
+    exRec("ex-waveb0000001", {
+      principal: "profile:user_b",
+      passive_signals: [
+        { kind: "weak_jwt", severity: "medium", summary: "alg=none accepted", detail: "Header decoded alg=none" },
+      ],
+    }),
+  );
+  assert.equal(ex.principal, "profile:user_b");
+  assert.equal(ex.passive_signals.length, 1);
+  const row = C.exchangeRow(ex);
+  assert.deepEqual(row.marks, []);
+  assert.equal(row.principal.label, "profile:user_b");
+  assert.equal(row.passive.maxSeverity, "medium");
+  assert.equal(row.passive.badge, "1 medium");
+});
+
+test("Wave B helpers: multi-principal credsProfilesOf, buildNewSession creds_profiles, and webapp pack metadata", () => {
+  // session_start stores creds and creds_profiles into store.start.
+  const store = C.createRecordStore("s-1");
+  C.applyRecord(store, {
+    seq: 0,
+    ts_ms: 10,
+    kind: "session_start",
+    creds: { profile: "user_a", summary: "user_a · 1 cookie", dropped: 0 },
+    creds_profiles: [
+      { profile: "user_a", summary: "user_a · 1 cookie", dropped: 0 },
+      { profile: "user_b", summary: "user_b · 1 header", dropped: 0 },
+    ],
+    tools: [],
+  });
+  assert.deepEqual(
+    C.credsProfilesOf(store.start).map((c) => c.profile),
+    ["user_a", "user_b"],
+  );
+  // Merges start + SessionInfo cleanly without duplicates.
+  assert.deepEqual(
+    C.credsProfilesOf(null, {
+      creds: { profile: "default", summary: "default · 1 cookie", dropped: 0 },
+      creds_profiles: [
+        { profile: "default", summary: "", dropped: 0 },
+        { profile: "admin", summary: "admin · 1 header", dropped: 1 },
+      ],
+    }),
+    [
+      { profile: "default", summary: "default · 1 cookie", dropped: 0 },
+      { profile: "admin", summary: "admin · 1 header", dropped: 1 },
+    ],
+  );
+  assert.deepEqual(C.credsProfilesOf(null, null), []);
+
+  // buildNewSession sends creds_profiles only with target and deduplicates.
+  const base = { workspace: "/w", message: "test authz" };
+  assert.deepEqual(
+    C.buildNewSession({ ...base, target: "acme", creds: "user_a", credsProfiles: ["user_a", " user_b ", "user_a", "none", ""] }).body.creds_profiles,
+    ["user_a", "user_b"],
+  );
+  assert.equal("creds_profiles" in C.buildNewSession({ ...base, target: "", credsProfiles: ["user_a"] }).body, false);
+  assert.equal("creds_profiles" in C.buildNewSession({ ...base, target: "acme", credsProfiles: [] }).body, false);
+
+  // webapp pack renders cleanly via packRoleSummary & roleGroups.
+  const webapp = {
+    name: "webapp",
+    description: "Live bug-bounty and web AppSec assessments.",
+    default_role: "lead",
+    intercept: true,
+    requires_restricted_network: true,
+    roles: [
+      { name: "lead", description: "Owns engagement", top_level: true, starts_agents: true },
+      { name: "recon_mapper", description: "Maps attack surfaces", top_level: false, starts_agents: false },
+      { name: "authz_tester", description: "Multi-principal authz", top_level: false, starts_agents: false },
+      { name: "exploit_worker", description: "Reproduces vulns", top_level: false, starts_agents: false },
+      { name: "triage_judge", description: "Read-only triage verifier", top_level: false, starts_agents: false },
+    ],
+  };
+  const groups = C.roleGroups(webapp);
+  assert.equal(groups.length, 2);
+  assert.deepEqual(groups[0].roles.map((r) => r.name), ["lead"]);
+  assert.deepEqual(groups[1].roles.map((r) => r.name), ["recon_mapper", "authz_tester", "exploit_worker", "triage_judge"]);
+  const summary = C.packRoleSummary(webapp, "lead", "open");
+  assert.deepEqual(summary.flags, ["MITM proxy intercept", "Requires restricted network"]);
+  assert.match(summary.warning, /restricted network/i);
+});
+
+test("GUI zoom scaling: layoutQueries, clampInspectorWidth, and zoom-resilient CSS breakpoints", () => {
+  // Embedded desktop keeps desktop shell across zoom levels; browser keeps mobile breakpoints.
+  assert.deepEqual(C.layoutQueries(false), {
+    narrow: "(max-width: 1099px)",
+    phone: "(max-width: 699px)",
+    compact: "(max-width: 699px), (max-height: 700px)",
+  });
+  assert.deepEqual(C.layoutQueries(true), {
+    narrow: "(max-width: 860px)",
+    phone: "(max-width: 560px)",
+    compact: "(max-width: 560px), (max-height: 560px)",
+  });
+
+  // Inspector width clamping scales proportionally on zoom-out when un-dragged and clamps explicit widths on zoom-in.
+  assert.deepEqual(C.clampInspectorWidth(null, 2133, true), { value: 520, min: 240, max: 600 });
+  assert.deepEqual(C.clampInspectorWidth(null, 1707, true), { value: 461, min: 240, max: 600 });
+  assert.deepEqual(C.clampInspectorWidth(null, 1280, true), { value: 360, min: 240, max: 537 });
+  assert.deepEqual(C.clampInspectorWidth(480, 1440, true), { value: 480, min: 240, max: 600 });
+  assert.deepEqual(C.clampInspectorWidth(700, 2400, true), { value: 600, min: 240, max: 600 });
+  // At 130%-150% zoom on a laptop window (861..1099px CSS width), embedded inspector stays docked with 38% cap and 260px min.
+  assert.deepEqual(C.clampInspectorWidth(480, 960, true), { value: 364, min: 260, max: 364 });
+  assert.deepEqual(C.clampInspectorWidth(120, 960, true), { value: 260, min: 260, max: 364 });
+  assert.deepEqual(C.clampInspectorWidth(NaN, 960, true), { value: 326, min: 260, max: 364 });
+  // Standard browser at 1200px uses 240px min and 42% cap (504px).
+  assert.deepEqual(C.clampInspectorWidth(600, 1200, false), { value: 504, min: 240, max: 504 });
+  assert.deepEqual(C.clampInspectorWidth(100, 1200, false), { value: 240, min: 240, max: 504 });
+  assert.deepEqual(C.clampInspectorWidth(undefined, 0, false), { value: 360, min: 240, max: 537 });
+
+  // Style contract: fluid sidebar/chat/composer/gutters, symmetric prose, zoom-in compression, and zero @container rules (WebKit pageZoom quirk).
+  const css = readFileSync(join(here, "style.css"), "utf8");
+  assert.match(css, /--sidebar-width:\s*clamp\(188px,\s*19\.5vw,\s*380px\)/);
+  assert.match(css, /--gutter-x:\s*clamp\(12px,\s*2vw,\s*28px\)/);
+  assert.match(css, /\.show-right\s+\.layout\s*\{\s*grid-template-columns:\s*var\(--sidebar-width\)\s+minmax\(0,\s*1fr\)\s+clamp\(240px,\s*var\(--inspector-width,\s*clamp\(360px,\s*27vw,\s*520px\)\),\s*42vw\)/);
+  assert.match(css, /\.scroller\s*>\s*\*\s*\{\s*width:\s*min\(100%,\s*clamp\(520px,\s*84%,\s*1040px\)\)/);
+  assert.match(css, /\.composer\s*>\s*\*\s*\{\s*width:\s*min\(100%,\s*clamp\(520px,\s*84%,\s*1040px\)\)/);
+  assert.match(css, /\.scroller\s+\.prose\s*\{\s*max-width:\s*none;\s*\}/);
+  assert.match(css, /\.embedded-desk\s+\.lhead\s*\{\s*display:\s*grid;/);
+  assert.match(css, /\.lnew\s+\.btn\s*\{[^}]*overflow:\s*hidden;[^}]*text-overflow:\s*ellipsis;/);
+  assert.match(css, /@media\s*\(max-height:\s*680px\),\s*\(max-width:\s*1020px\)/);
+  assert.match(css, /@media\s*\(max-width:\s*1099px\)\s*and\s*\(min-width:\s*861px\)[\s\S]*?body\.embedded-desk\.show-right\s+\.layout/);
+  assert.match(css, /@media\s*\(max-width:\s*860px\)[\s\S]*?body\.embedded-desk\s+\.right/);
+  assert.match(css, /@media\s*\(max-width:\s*560px\)[\s\S]*?body\.embedded-desk\s+\.bar/);
+  assert.match(css, /@media\s*\(max-width:\s*560px\),\s*\(max-height:\s*560px\)[\s\S]*?body\.embedded-desk\s+\.view\.session/);
+  const cssNoComments = css.replace(/\/\*[\s\S]*?\*\//g, "");
+  assert.doesNotMatch(cssNoComments, /@container\b/, "avoid @container in style.css due to WebKit pageZoom physical-pixel evaluation");
+
+  // Every brace in style.css must stay balanced.
+  let depth = 0;
+  for (const ch of css) {
+    if (ch === "{") depth++;
+    else if (ch === "}") depth--;
+    assert.ok(depth >= 0, "unexpected closing brace in style.css");
+  }
+  assert.equal(depth, 0, "unclosed brace in style.css");
+});

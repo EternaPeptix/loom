@@ -261,7 +261,7 @@ To keep authorized offensive work unblocked, the monitor does **not** judge:
 
 | id | control | what it closes |
 |---|---|---|
-| **E1** | **Implicit infrastructure deny in every policy, beating grants** (deny is checked first, `ferret_net::policy`). It covers: the daemon bind:port; every ferret proxy listener except the session's own (per-session listeners, #39); every model endpoint in the configuration (LAN, tailnet or loopback); the Signal bridge's signal-cli and the mail inbox's IMAP server when enabled; box and rootbox Docker hosts (`:2375/:2376`, `docker.sock`); DevTools and inspector ports 9222 and 9229; desktop-app ports listed in config; 169.254.0.0/16, `fd00:ec2::254`, `metadata.*`; tailnet infrastructure from config. Plus `ferret scope revoke` (ScopeRevoke, audit opp. 21). The login code comes off `/usr/bin/open` argv (audit batch 1) | DevTools cookie theft and UI driving; daemon API use; Docker-as-root; credential borrowing via other listeners |
+| **E1** | **Implicit infrastructure deny in every policy, beating grants** (deny is checked first, `ferret_net::policy`). It covers: the daemon bind:port; every ferret proxy listener except the session's own (per-session listeners, #39); every model endpoint in the configuration (LAN, tailnet or loopback); the Signal bridge's signal-cli and the mail inbox's IMAP server when enabled; the OAST broker's listeners, poll endpoint and callback names when `[oast]` is enabled; box and rootbox Docker hosts (`:2375/:2376`, `docker.sock`); DevTools and inspector ports 9222 and 9229; desktop-app ports listed in config; 169.254.0.0/16, `fd00:ec2::254`, `metadata.*`; tailnet infrastructure from config. Plus `ferret scope revoke` (ScopeRevoke, audit opp. 21). The login code comes off `/usr/bin/open` argv (audit batch 1) | DevTools cookie theft and UI driving; daemon API use; Docker-as-root; credential borrowing via other listeners |
 | **E2** | **Fetch-service deny in every network mode**: `com.apple.trustd(.agent)`, `ocspd`, `nsurlsessiond(.NSURLSessionProxyService)`, `com.apple.WebKit.*`. This extends #41's `deny_all`-only rule. Then default-deny `mach-lookup` with a probed allowlist. **Self-probe** at start and hourly: an AIA fetch, a background URL session, `osascript -l JavaScript`, and a procargs credential read against a local listener. Any success sets "egress unbounded" | Two-way HTTP outside the proxy |
 | **E3** | **Process identity and limits** (built). RLIMIT_NPROC per sandboxed command (`sandbox.nproc_headroom`). libproc / `/proc` inspection (`ferret_tools::procinfo`; `ps` is never run), with signals still sent on Unknown and the pid record kept. A per-session sandbox identity: a process is a session's when its sandbox may read the session's temp dir and not the ferret home (`sandbox_check`, probed at start; the design's "read-allow on `/private/var/empty/ferret-<sid>`" cannot work: that path cannot exist and a missing path is always refused), with pids enumerated by it (fallback: `FERRET_SANDBOX_ID` in the environment plus known process groups, stated best effort). A 60 s census of processes and listening sockets per session (`GET /api/census`, `POST /api/sessions/{id}/census/kill`; the kill stops whole process groups verified to be the session's, so a fork-and-exit hopper whose group a census has seen cannot outrun it; a stopped lead counts as ended; archiving a session stops what it still has running once its tasks have ended; the oracle's replay leftovers are stopped when the replay returns; a probe that could not run is retried and a census without identity is notified and never reads as empty). RLIMIT_NPROC is `base - headroom` exactly, and a command is refused when the user already holds that many. On bubblewrap, one cgroup per session (not built) | Orphans with cleared environments; fork bombs disabling the responder |
 | **E4** | **Proxy controls** (built). (a) `Proxy::cut(session)` and `cut_mission(mission)` (as built: `Runtime::cut_mission` over `Proxy::cut_sessions`): per-entry cancellation of tunnels and forwards, including reference grants. (b) Synchronous veto in the audit hook (`ferret_net::proxy` already runs the audit hook before the `200`): `Err` yields a `502` for S4 destination classes and canary hosts. (c) SNI binding: read the ClientHello before relaying; SNI must be the CONNECT host or another granted name; ECH refused; `sni` recorded in `NetDecision`. (d) Canary users in the session table (CN-1). (e) Lab-port listener identity: the process listening on a granted loopback port is checked at connect, and a listener inside any ferret sandbox identity is refused (TW-05). (f) Per-rule ACCEPT and DROP counters of each mission's box chain, polled every 60 s | Pause leaves tunnels open; fronting; squatting; CN-1 silent |
@@ -383,6 +383,69 @@ one implementation that keeps both sides' guarantees:
   workspace is not tied to a pack). The tripwires' normalization strips the same bidirectional controls as main's
   sanitizer of untrusted output (`U+061C` added), so a bidi-smuggled `<harness` tag is TW-27's.
 
+**The floor and main's Wave B (ef34aa4) together.** Main's Wave B (5710384) added a box proxy bridge, multi-principal
+credential profiles, a passive analyzer, an OAST callback broker, attack-surface ingestion and the `webapp` pack; f889526
+made sessions sturdier. Where they meet the floor and the monitor:
+- *The box proxy bridge.* With `[box] proxy_bridge`, a program in the box reaches the proxy through a forwarder on the
+  mission network's gateway (`INPUT 1 -i fb-<m> -p tcp -d <gateway> --dport <bridge port> -j ACCEPT`, before main's
+  `INPUT -i fb-+ -j DROP`) with the credentials of the grant the bridge carries: the lead's, or the session that made the
+  box when the lead had no task. Its requests are that session's: its policy (the infrastructure deny, the mission's
+  revoked hosts, a hold), the veto, SNI binding, the canary checks and the lab-listener check apply, and its connections
+  are in the one live registry, so `cut`, `cut_mission`, `revoke_scope`, `set_policy` and the panic end them (tested
+  through the bridge: an infrastructure destination is refused, a revoke cuts a bridged tunnel and refuses the next one,
+  a panic cuts the rest and stops the forwarder with the box). The bridge and the box rules do not open a path around
+  each other: the chain still holds the box's direct egress, built from the same policy (`box_egress`), so it reaches
+  nothing the bridge's policy refuses; the bridge reaches, under the proxy's rules, names the chain cannot hold
+  (wildcards, `allow`, the target's scope); the accept rule opens one port of the gateway to its own mission's bridge
+  only, IPv6 stays dropped (`FERRET-ALL6`), and the rule goes with the box. The box counters (E4f) read the mission's
+  chain, which a bridged request (to the host, `INPUT`) does not pass: it is in the bridge session's net records
+  instead. Residuals: the bridge's credential is in the environment of every program in the box, so a program of any
+  session that reaches the bridge acts as that session (under its policy, recorded for it); in remote mode the accept
+  rule is installed while the `ssh -R` forward is still coming up (and stays while a forward that failed is retried, as
+  when another program holds that port on the gateway), so whatever holds the port on the Docker host is reachable from
+  the box until the forward does (§9.5 X5).
+- *TW-21 with the bridge.* A bridged request is recorded for the bridge's session, whichever session ran the program, so
+  with the bridge on (`Env::box_bridge`) a box call (`box_exec`, `box_reset`, `bash` of a box-shell role) or a box job
+  (one a box call started) of any session of the mission counts as in flight for the mission's decisions. Without the
+  bridge nothing changes.
+- *OAST endpoints are infrastructure (E1).* With `[oast]` enabled the broker's endpoints are services of the daemon
+  (`runtime::oast_endpoints`, in `InfraSpec.services`): in `local` mode its HTTP and DNS listeners on the addresses they
+  are bound to (the broker starts before anything else and a port 0 is written back to `oast.bind` / `oast.dns_bind`), in
+  `external` mode the endpoint it polls, and in both the callback host of `oast.public_host` (else the poll host) on the
+  minted URL's port and every name under its DNS domain (`*.{domain}`). Rule `deny infrastructure: oast.bind
+  127.0.0.1:{port}`; the sandbox refuses their loopback ports, `oast.external_token_file` is unreadable to commands, the
+  floor's veto and the monitor's infrastructure class (TW-02) know them. So a callback that `oast_poll` grades as
+  executed evidence never comes from ferret's own commands, only from the target, and an OAST host is never a way around
+  the deny: a grant of one is refused (`grant_scope`), and an attempt at one (through the proxy) is refused and is
+  TW-02 at its net decision, whatever is granted. Named in a call's arguments, a broker endpoint is the callback a
+  payload carries to the target (in a query string or a body, which the destination reading of §6.1 does not always
+  tell from a destination): it is neither TW-02 nor a sink (`Engine::oast_endpoint`, an infrastructure rule labelled
+  `oast.…`), as a granted OAST host covers the sink it carries; another OAST domain is still a sink (TW-15). A lab the
+  agent runs in its own sandbox cannot call the broker back (the sandbox refuses the port), and a command that skips
+  the proxy to reach the broker's loopback port is refused by the sandbox without a net decision (TW-08 counts the
+  refusals).
+- *Multi-principal profiles.* The credential profiles the operator attached to the mission (`creds` and main's
+  `creds_profiles`: names and S10 summaries, never values) are in the AUTHORIZATION block (`Authorization::credentials`),
+  so acting as each one (`as_profile`, `http_authz_matrix`) is the operator's choice to the reviewer; they authorize no
+  host. TW-06 is unchanged: the union redactor (`Secrets::union`) keeps every mounted profile's values out of the
+  records, so the credential index never learns them, and a use is flagged only for a mission that never saw the value.
+- *Ingestion and TW-23.* `security_ingest` of an OpenAPI, GraphQL or source-map artifact marks every endpoint mandatory
+  (up to 500 in one ledger entry); off scope, an entry is one TW-23 hit per host, which says how many, not one per
+  endpoint. The operator's `import-scope` changes the target for later missions; a running mission keeps the scope its
+  lead's start recorded, for its policy and for the monitor alike. The passive analyzer's signals (on `exchange` records
+  and in the target graph) and ingested artifacts are target-controlled data: the monitor's sources are unchanged and
+  read neither, and nothing of them enters the AUTHORIZATION block (an artifact's hosts grant no scope).
+- *The `webapp` pack.* Its consent needs its own `[monitor.recipients]` line like every pack's (M1). Its facts: not
+  solvable, a restricted network, interception on, and `live_targets = true`: it works on the operator's live
+  bug-bounty targets, so its restricted network is not a lab (D16): `Authorization::restricted_lab` is false for it, and
+  a webapp mission with an unmarked grant or a named target is a real-target mission (keep-going needs `--real-targets`,
+  a new-recipient reviewer gets features, TW-12, TW-14 and TW-23 judge its hosts as real).
+- *Session robustness.* Main's stop epoch (`Input::StopAt`) reaches the one stop body: a stop between turns marks its
+  epoch handled and runs `stop_between_turns` (jobs, children, the `interrupted` and `Stopped` records, MCP connections
+  closed), and a stale companion stop is dropped. A panic sends `PanicStop` and closes the session's inputs, so nothing
+  of it outlives the panic. A lead whose empty replies are exhausted now parks (`Parked`), which keep-going never
+  reopens (K2 reads `Finished`), and an explicit child settles `Failed` instead of `Yielded`.
+
 Until E1–E4 are deployed, tripwires detect attempts but do not close these routes (§9.5).
 
 ### 2.3 What the monitor observes
@@ -432,7 +495,9 @@ Two views. Agent-influenced strings always go inside DATA, never in harness-comp
    - the operator's approvals not yet used, `[scope] text` (`ferret approve`, the web UI, Signal's `/approve`);
    - operator grants with operator-written notes and `[lab]`/`[prod]` marks;
    - config allow and deny lists, network mode;
-   - box targets, pack flags (`solvable`, `requires_restricted_network`), the role;
+   - box targets, pack flags (`solvable`, `requires_restricted_network`, `live_targets`), the role;
+   - the credential profiles the operator attached to the mission (names and redaction-safe summaries, the lead's start
+     record: main's multi-principal `creds_profiles`), which authorize no host;
    - the `scope` and `exclude` of the mission's named target, as its lead's start recorded them
      (CONTRACTS-TRAFFIC-TARGETS T2), the hosts the pack's configured MCP servers add to its sessions (each server's
      `hosts` and its `url` host, CONTRACTS-MCP M4), and the hosts the operator revoked from the mission
@@ -1117,9 +1182,9 @@ As built after the merge of main (da5d310, the ferret rebrand):
 | TW-18 oversight loops | records | a lead's `agent_message` or `agent_stop` to its gate verifier: S2. ≥3 finish refusals in a row for the same reason: S1 (main's finish gates refuse one gap at a time, so a refusal that names another gap starts the count again). A re-finish in a reopened turn with no new run evidence: S1 | R1 / R0 | sh |
 | TW-19 evidence fabrication | ledger evidence; args | an evidence quote found in the session's own earlier bash or write args: S2. A local listener on a target port serving flag-shaped content: S3 | R1 / R3 | sh |
 | TW-20 process census | census by sandbox identity at settle, stop, pause, and every 60 s | any survivor after stop or settle: S2. A listening or connecting survivor: S3. The harness's own MCP servers are not survivors: a session's MCP connections close when a turn of it ends finished or stopped and when it settles (CONTRACTS-MCP M3), and `ferret mcp check` runs its server under an identity of its own and stops what it left | R1 / R3 | S3 P |
-| TW-21 idle-session egress | net decision versus exec, job and web intervals (2 s grace), at the time its process connected (the record's time less its `paced_ms`) | a decision for a session with nothing in flight; not one before the session's `session_start` (a lead's MCP servers are listed through its proxy before it), nor one toward a host of the mission's MCP servers while the session's last turn has not ended finished or stopped (a server's own traffic: an allowed decision, or a refusal by a `deny` rule its own grant applies; an allowlist or `deny_all` miss toward such a host is the session's own command) | S3 → R3 (R5 only with cross-mission attribution) | P |
+| TW-21 idle-session egress | net decision versus exec, job and web intervals (2 s grace), at the time its process connected (the record's time less its `paced_ms`); with main's box proxy bridge, also the box calls and box jobs of every session of the mission | a decision for a session with nothing in flight (with the bridge, none of the mission's box calls or jobs either); not one before the session's `session_start` (a lead's MCP servers are listed through its proxy before it), nor one toward a host of the mission's MCP servers while the session's last turn has not ended finished or stopped (a server's own traffic: an allowed decision, or a refusal by a `deny` rule its own grant applies; an allowlist or `deny_all` miss toward such a host is the session's own command) | S3 → R3 (R5 only with cross-mission attribution) | P |
 | TW-22 side channels | command text; E2 refusals | `security verify-cert\|find-certificate`, `nscurl`, `osascript -l JavaScript`; swift, swiftc, clang or cc building code that names `NSURLSession`, `WKWebView` or `SecTrust`; python `ctypes` loading Foundation or Security; DNS labels over 40 characters or high entropy | refused attempt S2, S3 on repeat; a self-probe success: global "egress unbounded" | P |
-| TW-23 off-scope mandatory assets | a child's `security_record` call; ledger `asset_upsert` | a child's `security_record` sets `mandatory: true` (what it chose: `security_ingest` sets the flag itself on every host it imports, so the ledger cannot tell, and an import in scope is nothing), or any `mandatory` asset lies outside scope | S2 → R1 | sh |
+| TW-23 off-scope mandatory assets | a child's `security_record` call; ledger `asset_upsert` | a child's `security_record` sets `mandatory: true` (what it chose: `security_ingest` sets the flag itself on every host it imports, so the ledger cannot tell, and an import in scope is nothing), or any `mandatory` asset lies outside scope (one hit per host of a ledger entry, with the count: an imported artifact is one entry) | S2 → R1 | sh |
 | TW-24 canaries | any record, net decision, proxy auth | §6.4 | read S3 → R3; use S4 → R4; use in another mission → R5 cohort | P |
 | TW-25 language shift | reasoning and args | script shift against the session's baseline (0% CJK runs measured for dsv41, dseek and qwen; 1.2% for necromicon) | S1; S2 with a gated call | sh |
 | TW-26 build and open-run files | file writes | Makefile, `build.rs`, `package.json` scripts, `.envrc`, `.vscode/tasks.json`, `.pre-commit-config.yaml`, `AGENTS.md` and `CLAUDE.md` (read into the system prompt of later sessions on the workspace in the packs that load workspace instructions: every pack but the security packs, which leave them out unless `agents.project_instructions_in_security_packs` is set; S1 in every pack all the same, because a workspace is not tied to a pack) | S1; listed on the Finished item for the operator | sh |
@@ -1168,7 +1233,7 @@ Stated in full in §9.5. In short:
 - opaque HTTPS bodies to granted hosts;
 - target-side SSRF;
 - Host-header fronting;
-- box and rootbox egress beyond counters;
+- box and rootbox egress beyond counters (a bridged box request is a net decision, of the bridge's session);
 - prose steganography;
 - best-effort census where the identity probe fails.
 
@@ -1585,7 +1650,7 @@ Decided by the operator on 2026-11-16. Where the table says "default" the design
 | D13 | A bare-loopback grant in an existing mission | default: revoke it once `ferret scope revoke` exists; E1 makes it inert for infrastructure ports in any case |
 | D14 | Fetch services | default: deny in all modes; `allow_fetch_services` only knowingly, which marks egress unbounded and refuses keep-going |
 | D15 | Monitor-down behaviour | `pause_real_targets` |
-| D16 | Lab marking | default: `ferret scope --lab` for lab hosts in core missions; restricted-network packs count as labs automatically |
+| D16 | Lab marking | default: `ferret scope --lab` for lab hosts in core missions; restricted-network packs count as labs automatically, unless the pack declares `live_targets` (main's `webapp`, merge ef34aa4) |
 | D17 | Paging | default: set `notify.command` to reach a phone for `FERRET_KIND=monitor` with `FERRET_LEVEL` in {pause, contain, halt}; the desktop notification alone does not page |
 | D18 | Retention of review inputs | 30 days, collected by `ferret gc` |
 
@@ -1597,7 +1662,7 @@ The operator's running missions are not touched by any phase: the monitor starts
 - **X2. Inside-scope harm through opaque HTTPS.** CONNECT tunnels are opaque (`ferret_net::proxy`). Method, path and body of HTTPS requests to granted hosts are invisible except in arguments and referenced scripts. A compiled binary or runtime-built request can move value or reach users on a granted host before anyone sees it. G8 and the "opaque code" class cover the common shapes only. Closing this needs TLS termination with a ferret CA for hosts marked real, which this design does not include.
 - **X3. Target-side SSRF.** After a host is granted, the target can fetch anything on the agent's behalf. Only arguments reveal it.
 - **X4. Domain fronting by Host header** inside a TLS session whose SNI matches a granted name, on CDNs that still route by Host. SNI binding does not stop it. Nor does it stop a **real ECH hello** whose public name is the granted destination (Chromium's placeholder ECH extension passes by the same rule; the proxy cannot tell the two apart), a second hello later in the stream and a tunnel that upgrades to TLS after a plaintext start.
-- **X5. Box and rootbox egress.** The box has per-destination counters but no per-connection record or content. The rootbox is shared by every mission and its egress is unlogged until it is isolated per mission (a prerequisite listed in §9.3); keep-going is refused for rootbox roles until then, but Duty W sees only command text there.
+- **X5. Box and rootbox egress.** The box has per-destination counters but no per-connection record or content (with main's proxy bridge its HTTP(S) requests through the bridge are per-connection net decisions of the bridge's session; what goes out directly through the chain is not). The rootbox is shared by every mission and its egress is unlogged until it is isolated per mission (a prerequisite listed in §9.3); keep-going is refused for rootbox roles until then, but Duty W sees only command text there.
 - **X6. Covert channels that carry no tool traffic:** steganography in prose, timing, file metadata in a shared workspace, and the blob existence oracle until the build that scopes stored outputs to the mission (#36) is the one that runs. The monitor watches channels, not meaning.
 - **X7. Process identity.** It depends on a private macOS sandbox query, unprobed here. Where it fails, the census falls back to process groups and environments, which `env -i` and double forks defeat.
 - **X8. Reviewer refusals and redaction gaps.** Providers may refuse offensive content (as one provider did during a published incident's forensics); a refusal is a missed detection, held as "not cleared" but not reviewed. Redaction is pattern- and index-based: unknown-format secrets and third-party PII can reach a reviewer whose recipient already receives that mission's data.

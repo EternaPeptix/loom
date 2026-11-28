@@ -38,6 +38,7 @@ pub mod security;
 pub mod terminal;
 #[cfg(test)]
 pub(crate) mod testkit;
+pub mod traffic_tools;
 
 use crate::pack::RoleDef;
 use async_trait::async_trait;
@@ -311,6 +312,17 @@ pub trait Orchestrator: Send + Sync {
         _session: &SessionId,
     ) -> Option<Result<(String, Vec<ferret_core::target::NodeView>), String>> {
         None
+    }
+    /// Look up prior-mission findings in the mission target's graph matching the 3-axis key
+    /// `(vuln_class, surface, param_or_sink)` (non-blocking cross-mission duplicate check).
+    fn find_duplicate_findings(
+        &self,
+        _session: &SessionId,
+        _vuln_class: &str,
+        _surface: &str,
+        _param_or_sink: &str,
+    ) -> Vec<ferret_core::target::TargetFinding> {
+        Vec::new()
     }
     /// The box of the mission of `session`, made ready to be used. The errors are the sentences the box
     /// tools return: no box configured ([`boxtools::NO_BOX`], the default), a session that works in its own
@@ -619,6 +631,8 @@ pub fn tool(name: &str, shared: &Arc<Shared>) -> Option<Arc<dyn ferret_tools::To
         "security_record" => Arc::new(security::SecurityRecord(s)),
         "security_query" => Arc::new(security::SecurityQuery(s)),
         "security_ingest" => Arc::new(security::SecurityIngest(s)),
+        "traffic_query" => Arc::new(traffic_tools::TrafficQuery(s)),
+        "traffic_diff" => Arc::new(traffic_tools::TrafficDiff(s)),
         "pin" => Arc::new(misc::Pin(s)),
         "log_search" => Arc::new(misc::LogSearch(s)),
         "finish" => Arc::new(terminal::Finish(s)),
@@ -694,6 +708,7 @@ pub fn known_tools() -> Vec<String> {
     names.extend(NAMES.iter().map(|n| n.to_string()));
     names.extend(BOX_NAMES.iter().map(|n| n.to_string()));
     names.extend(MAIL_NAMES.iter().map(|n| n.to_string()));
+    names.extend(TRAFFIC_NAMES.iter().map(|n| n.to_string()));
     names
 }
 
@@ -703,6 +718,9 @@ pub const BOX_NAMES: &[&str] = &["box_exec", "box_get", "box_reset"];
 
 /// Scoped read-only email tool. Not in [`NAMES`]: retrieved mail observations may be quoted as `Read` evidence.
 pub const MAIL_NAMES: &[&str] = &["inbox_read"];
+
+/// Read-only HTTP traffic inspection tools. Not in [`NAMES`]: captured exchange views may be quoted as `Read` evidence.
+pub const TRAFFIC_NAMES: &[&str] = &["traffic_query", "traffic_diff"];
 
 /// The names [`tool`] knows, other than [`BOX_NAMES`].
 pub const NAMES: &[&str] = &[

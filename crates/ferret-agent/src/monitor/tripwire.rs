@@ -372,6 +372,8 @@ mod tests {
             mcp_hosts: vec![],
             revoked: vec![],
             mcp_call: false,
+            live_targets: false,
+            credentials: vec![],
         };
         assert!(inline_check(&call, &auth).is_err());
     }

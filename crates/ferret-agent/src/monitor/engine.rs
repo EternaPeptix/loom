@@ -28,8 +28,9 @@
 //!   other prose field (`State` and
 //!   `Terminal` tools: `finish`, `claim`, `report_blocker`, ledger tools, `agent_message`) are ignored except by
 //!   TW-03, TW-17, TW-24 and TW-26 (all prose), TW-06 (ledger prose, and credentials in any argument) and TW-19
-//!   (evidence quotes); `[lab]` grants and restricted-network packs relax C7 and C8 only; loopback and link-local are
-//!   never implicitly lab; hosts the operator granted or the configuration allows are never C1 (`authorized` is
+//!   (evidence quotes); `[lab]` grants and restricted-network packs relax C7 and C8 only (a pack that declares
+//!   `live_targets`, main's `webapp`, is not a lab for its restricted network: `Authorization::restricted_lab`);
+//!   loopback and link-local are never implicitly lab; hosts the operator granted or the configuration allows are never C1 (`authorized` is
 //!   `Authorization::authorizes`: grants, `allow`, the mission target's scope less its exclusions and less the hosts the
 //!   operator revoked; the pack's MCP hosts only for the call of an MCP tool, `Authorization::for_mcp_call`, since main's
 //!   P0-7 keeps them off the session's own policy; a net decision toward one counts as authorized only when it was
@@ -47,7 +48,10 @@
 //!   allowed one, or a refusal by a `deny` rule the server's own grant applies too (an allowlist or `deny_all` miss
 //!   toward such a host is the session's own command, P0-7).
 //!   A decision is judged at the time its process connected: the record's time less its `paced_ms`, the time a
-//!   connection waited for the egress noise governor before the proxy judged and recorded it.
+//!   connection waited for the egress noise governor before the proxy judged and recorded it. With main's box proxy
+//!   bridge (`Env::box_bridge`), a program in the box sends over the grant the bridge carries (the lead's), whichever
+//!   session ran it: a box call (`in_box`) or a box job (one a box call started) of any session of the mission counts
+//!   as in flight for the mission's decisions; a box call of another mission does not.
 //!   A session freed for being quiet keeps its start, its shell directory and its `blind_until`. TW-06's index (`log::SecretIndex`) holds, per hashed value, the missions whose own results
 //!   showed it; a use flags only a mission that never saw the value itself; one mission's flood evicts only its own
 //!   tags, and new tags are handed to the core to persist (`take_new_secrets`) and come back with `restore_secrets`.
@@ -55,7 +59,9 @@
 //!   TW-01 refused connections whose host the session's own arguments name (S1; S2 at 3 distinct hosts in 30 minutes or
 //!   5 over the mission; S3 when the host was steered, which nothing does before M4); TW-02 an attempt at an
 //!   infrastructure or metadata destination (`deny infrastructure: ...` rules, an allowed connection to one is S4),
-//!   `docker.sock` in arguments, and the floor's vetoes; TW-03 `request_scope` shapes (a wildcard, a registrable domain
+//!   `docker.sock` in arguments, and the floor's vetoes (an endpoint of main's OAST broker, an infrastructure rule
+//!   labelled `oast.…`, named in arguments is the callback a payload carries: neither TW-02 nor a TW-15 sink there;
+//!   an attempt at one is TW-02 at its net decision); TW-03 `request_scope` shapes (a wildcard, a registrable domain
 //!   in no operator text, a `why` that claims an authorization no operator text holds; operator text is the goal, the
 //!   operator's messages and answers, the rules, the approvals not yet used, the grants, `allow` and the target's scope); TW-04 bypass encodings in
 //!   destinations and scope requests (S2, S3 on repeat); TW-05 the floor's squatter events, and encoded or `zz` names
@@ -72,7 +78,8 @@
 //!   of an ended session (`census`); TW-21 a net decision for a session with nothing in flight (2 s grace); TW-22
 //!   side-channel commands and long or high-entropy DNS labels; TW-23 a child's `security_record` call that sets
 //!   `mandatory: true` (what it chose; `security_ingest` sets the flag on every host it imports, so the ledger cannot
-//!   tell) and any mandatory asset off scope;
+//!   tell) and any mandatory asset off scope (one hit per host of a ledger entry, with the count: main's ingestion of an
+//!   OpenAPI, GraphQL or source-map artifact is one entry of up to 500 endpoints);
 //!   TW-24 the canaries the core was given (`set_canaries`; M10 makes them) and the floor's decoy events; TW-25 a
 //!   run of another script in a session whose baseline has none; TW-26 build and open-run files (with `AGENTS.md` and
 //!   `CLAUDE.md`, which later sessions on the workspace read as instructions: main's P0-4 keeps them out of the
@@ -118,7 +125,9 @@
 //! `a_revoked_host_under_the_targets_scope_is_outside_the_authorization`,
 //! `tw18_refusals_that_name_another_gap_each_time_are_not_a_finish_loop`,
 //! `tw23_an_import_by_a_child_of_assets_in_scope_is_not_a_child_setting_mandatory_assets`,
-//! `a_hits_key_and_detail_carry_no_arabic_letter_mark`.
+//! `a_hits_key_and_detail_carry_no_arabic_letter_mark`. After the merge of main (ef34aa4):
+//! `tw21_a_box_call_of_the_mission_keeps_the_bridged_lead_in_flight`, `tw23_an_imported_artifact_off_scope_is_one_hit_per_host`,
+//! `an_oast_brokers_own_endpoints_are_infrastructure_and_a_carried_callback_is_not_a_destination`.
 
 #![allow(clippy::too_many_arguments)]
 
@@ -156,6 +165,9 @@ const KEEP_INTERVALS: usize = 20_000;
 pub struct PackFacts {
     pub solvable: bool,
     pub requires_restricted_network: bool,
+    /// The pack works on the operator's live systems (`live_targets`, main's `webapp`): its restricted network is not a
+    /// lab (D16).
+    pub live_targets: bool,
 }
 
 /// The static facts the tripwires need: where the ferret home is, what the configuration allows and denies, the packs.
@@ -179,6 +191,10 @@ pub struct Env {
     pub mcp_hosts: BTreeMap<String, Vec<String>>,
     /// The roles (pack, role) whose `bash` runs in the box (`default_shell = "box"`).
     pub box_shell: BTreeSet<(String, String)>,
+    /// `[box]` is enabled with main's `proxy_bridge`: what a program in the box sends over HTTP(S) reaches the proxy on
+    /// the grant the bridge carries (the lead's), so its net decisions are recorded for that session, whichever session
+    /// ran the program (TW-21).
+    pub box_bridge: bool,
 }
 
 impl std::fmt::Debug for Env {
@@ -203,7 +219,14 @@ impl Env {
             .into_iter()
             .filter_map(|n| {
                 packs.get(&n).map(|p| {
-                    (n, PackFacts { solvable: p.solvable, requires_restricted_network: p.requires_restricted_network })
+                    (
+                        n,
+                        PackFacts {
+                            solvable: p.solvable,
+                            requires_restricted_network: p.requires_restricted_network,
+                            live_targets: p.live_targets,
+                        },
+                    )
                 })
             })
             .collect();
@@ -258,6 +281,7 @@ impl Env {
             relaxed_profiles,
             mcp_hosts,
             box_shell,
+            box_bridge: config.boxed.enabled && config.boxed.proxy_bridge,
         }
     }
 
@@ -320,6 +344,8 @@ struct OpenCall {
     class: ToolClass,
     ts: u64,
     cmd: String,
+    /// The call runs a command in the mission's box (`Engine::in_box`).
+    boxed: bool,
 }
 
 #[derive(Default)]
@@ -329,6 +355,10 @@ struct SessionState {
     /// Closed intervals in which a call or a job ran: (start, end).
     intervals: VecDeque<(u64, u64)>,
     jobs: BTreeMap<String, u64>,
+    /// The jobs of `jobs` that a box call started (a `box_exec` in the background): they run in the box.
+    box_jobs: BTreeSet<String>,
+    /// Closed intervals in which a box call or a box job ran: (start, end).
+    box_intervals: VecDeque<(u64, u64)>,
     recent_args: VecDeque<String>,
     named: BTreeSet<String>,
     refusals: VecDeque<(u64, &'static str)>,
@@ -844,6 +874,8 @@ impl Engine {
                 open: std::mem::take(&mut st.open),
                 intervals: std::mem::take(&mut st.intervals),
                 jobs: std::mem::take(&mut st.jobs),
+                box_jobs: std::mem::take(&mut st.box_jobs),
+                box_intervals: std::mem::take(&mut st.box_intervals),
                 ptys: std::mem::take(&mut st.ptys),
                 ..kept
             };
@@ -1004,13 +1036,20 @@ impl Engine {
             Event::ToolCall(c) => self.on_call(ctx, rec, c, auth, fold, &mut out),
             Event::ToolResult(r) => self.on_result(ctx, rec, r, auth, fold, &mut out),
             Event::ModelResponse(m) => self.on_response(ctx, rec, m, &mut out),
-            Event::JobRegistered { job_id, .. } => {
-                self.state(ctx).jobs.insert(job_id.clone(), rec.ts_ms);
+            Event::JobRegistered { job_id, call_id, .. } => {
+                let st = self.state(ctx);
+                st.jobs.insert(job_id.clone(), rec.ts_ms);
+                if st.open.get(call_id.as_str()).is_some_and(|c| c.boxed) && st.box_jobs.len() < 4_096 {
+                    st.box_jobs.insert(job_id.clone());
+                }
             }
             Event::JobSettled { job_id, .. } => {
                 let st = self.state(ctx);
                 if let Some(start) = st.jobs.remove(job_id) {
                     push_interval(&mut st.intervals, start, rec.ts_ms);
+                    if st.box_jobs.remove(job_id) {
+                        push_interval(&mut st.box_intervals, start, rec.ts_ms);
+                    }
                 }
             }
             Event::ChildSpawned(c) => {
@@ -1154,9 +1193,10 @@ impl Engine {
         auth.authorizes(host, port)
     }
 
-    /// True when `host` is a lab for this mission: marked so, or any host of a restricted-network pack.
+    /// True when `host` is a lab for this mission: marked so, or any host of a restricted-network pack that does not
+    /// work on live targets (`Authorization::restricted_lab`).
     fn is_lab(&self, auth: &Authorization, host: &str, port: Option<u16>) -> bool {
-        auth.requires_restricted_network || auth.mark_of(host, port) == Some(Mark::Lab)
+        auth.restricted_lab() || auth.mark_of(host, port) == Some(Mark::Lab)
     }
 
     fn infra_class(&self, host: &str, port: u16) -> Option<String> {
@@ -1192,12 +1232,19 @@ impl Engine {
         let action = pat::scan_form(&view.action_text());
         let hosts: Vec<String> = pat::hosts_in(&action);
         let base = self.command_dir(ctx, &view);
+        let boxed = self.in_box(ctx, &view);
         {
             let all_l = pat::cut(&view.all, KEEP_ARGS_BYTES).to_lowercase();
             let st = self.state(ctx);
             st.open.insert(
                 c.call_id.as_str().to_string(),
-                OpenCall { name: view.name.clone(), class: view.class, ts: rec.ts_ms, cmd: view.command.clone() },
+                OpenCall {
+                    name: view.name.clone(),
+                    class: view.class,
+                    ts: rec.ts_ms,
+                    cmd: view.command.clone(),
+                    boxed,
+                },
             );
             for h in &hosts {
                 if st.named.len() < 512 {
@@ -1530,7 +1577,7 @@ impl Engine {
                 ));
             }
             // TW-12
-            if !non_lab.is_empty() || (!hosts.is_empty() && !auth.requires_restricted_network) {
+            if !non_lab.is_empty() || (!hosts.is_empty() && !auth.restricted_lab()) {
                 if let Some(m) = PERSIST_TARGET.first(&bare) {
                     let any_lab = hosts.iter().any(|h| self.is_lab(auth, h, None));
                     let sev = if any_lab && non_lab.is_empty() { Severity::S2 } else { Severity::S3 };
@@ -1834,6 +1881,11 @@ impl Engine {
         }
         let mut named: BTreeSet<String> = BTreeSet::new();
         for (h, port) in &ported {
+            // A minted OAST callback in a payload is the OAST workflow, not an attempt at the broker (that is refused,
+            // and judged, at its net decision).
+            if self.oast_endpoint(h, *port) {
+                continue;
+            }
             let rule = match port {
                 Some(p) => self.infra_class(h, *p),
                 None => self.infra_class(h, 443).or_else(|| self.infra_class(h, 80)),
@@ -1884,17 +1936,30 @@ impl Engine {
     }
 
     /// The sink `dscan` names when no grant or allow entry covers the host that carries it (the whole host, so a granted
-    /// `abc.oast.pro` covers its own name), as the name the pattern found.
+    /// `abc.oast.pro` covers its own name), as the name the pattern found. An endpoint of the configured OAST broker
+    /// (`oast_endpoint`) covers the sink it carries too: a minted callback is what a payload carries to the target.
     fn unauthorized_sink(&self, auth: &Authorization, dscan: &str) -> Option<String> {
         let m = SINK.first(dscan)?;
         let sink = m.trim_matches(|c: char| !c.is_ascii_alphanumeric()).to_lowercase();
         let carriers: Vec<String> = pat::hosts_in(dscan).into_iter().filter(|h| h.contains(&sink)).collect();
         let covered = if carriers.is_empty() {
-            self.authorized(auth, &sink, None)
+            self.authorized(auth, &sink, None) || self.oast_endpoint(&sink, None)
         } else {
-            carriers.iter().all(|h| self.authorized(auth, h, None))
+            carriers.iter().all(|h| self.authorized(auth, h, None) || self.oast_endpoint(h, None))
         };
         (!covered).then_some(sink)
+    }
+
+    /// True when `host` (on `port`, else on 443 or 80) is an endpoint of the configured OAST broker: an infrastructure
+    /// rule of `runtime::oast_endpoints` (labelled `oast.…`). Every connection to one is refused (E1) and is TW-02 at
+    /// its net decision; named in a call's arguments it is the callback a payload carries to the target, which is
+    /// neither TW-02 nor a sink.
+    fn oast_endpoint(&self, host: &str, port: Option<u16>) -> bool {
+        let oast = |rule: Option<String>| rule.is_some_and(|r| r.starts_with("deny infrastructure: oast."));
+        match port {
+            Some(p) => oast(self.infra_class(host, p)),
+            None => oast(self.infra_class(host, 443)) || oast(self.infra_class(host, 80)),
+        }
     }
 
     fn bypass_in(&self, ctx: &SessionCtx, rec: &Record, scan: &str, dests: &[String], fold: &Fold, out: &mut Vec<Hit>) {
@@ -2147,7 +2212,12 @@ impl Engine {
         {
             let st = self.state(ctx);
             match &open {
-                Some(call) => push_interval(&mut st.intervals, call.ts, rec.ts_ms),
+                Some(call) => {
+                    push_interval(&mut st.intervals, call.ts, rec.ts_ms);
+                    if call.boxed {
+                        push_interval(&mut st.box_intervals, call.ts, rec.ts_ms);
+                    }
+                }
                 // A call that began before the monitor's memory (a restart): its own duration says when it ran.
                 None if r.duration_ms > 0 => {
                     push_interval(&mut st.intervals, rec.ts_ms.saturating_sub(r.duration_ms), rec.ts_ms)
@@ -2522,6 +2592,14 @@ impl Engine {
         // A decision is judged at the time the process connected: a connection the noise governor held back was
         // recorded `paced_ms` after that.
         let at = ts_ms.saturating_sub(d.paced_ms.unwrap_or(0));
+        // With main's box proxy bridge, a program in the box sends through the grant the bridge carries (the lead's),
+        // whichever session of the mission ran it: a box call or job of any session of the mission is in flight for
+        // the mission's decisions.
+        let box_busy = self.env.box_bridge
+            && self
+                .sessions
+                .values()
+                .any(|s| s.ctx.as_ref().is_some_and(|c| c.mission == ctx.mission) && s.box_busy_at(at));
         if let Some(st) = self.sessions.get(&ctx.session) {
             let before_start = st.started_ms != 0 && at < st.started_ms;
             // A refusal is the server's only when its own grant could have made it (a `deny` rule: the deny list, a
@@ -2529,7 +2607,7 @@ impl Engine {
             let mcp_open = auth.is_mcp_host(&host, Some(port))
                 && (d.allowed || d.rule.starts_with("deny "))
                 && !self.ended.contains(ctx.session.as_str());
-            if at >= st.blind_until && !before_start && !mcp_open && !st.busy_at(at) {
+            if at >= st.blind_until && !before_start && !mcp_open && !st.busy_at(at) && !box_busy {
                 self.fleet.idle_egress(&ctx.mission, &ctx.session, &host, port, at);
                 out.push(self.mk(
                     ctx,
@@ -2679,6 +2757,9 @@ impl Engine {
                 other => flat.push(other),
             }
         }
+        // The mandatory assets off scope of this entry, by host: (the first locator, how many). One entry can be a whole
+        // import (`security_ingest` of an OpenAPI document or a scan: up to 500 assets, most of them on a few hosts).
+        let mut off_hosts: Vec<(String, String, usize)> = Vec::new();
         for op in flat {
             if let SecurityOp::AssetUpsert { asset } = op {
                 let host = pat::hosts_in(&asset.locator)
@@ -2688,26 +2769,26 @@ impl Engine {
                 let off = !host.is_empty()
                     && host.contains('.')
                     && !self.authorized(auth, &host, None)
-                    && !auth.requires_restricted_network;
+                    && !auth.restricted_lab();
                 // A child's own choice of `mandatory` is judged at its `security_record` call (`child_mandatory`):
                 // `security_ingest` sets the flag itself on every host it imports, so the ledger cannot tell.
                 if asset.mandatory && off {
-                    out.push(self.mk(
-                        ctx,
-                        &rec,
-                        23,
-                        Category::ScopeEscape,
-                        Severity::S2,
-                        Basis::Action,
-                        asset.locator.clone(),
-                        format!("a mandatory asset outside the scope: {host}"),
-                        false,
-                    ));
+                    match off_hosts.iter_mut().find(|(h, _, _)| *h == host) {
+                        Some((_, _, n)) => *n = n.saturating_add(1),
+                        None => off_hosts.push((host.clone(), asset.locator.clone(), 1)),
+                    }
                 }
                 if off {
                     self.fleet.asset_offscope(&ctx.mission, entry.ts_ms);
                 }
             }
+        }
+        for (host, first, n) in off_hosts {
+            let detail = match n {
+                1 => format!("a mandatory asset outside the scope: {host}"),
+                n => format!("{n} mandatory assets outside the scope: {host}"),
+            };
+            out.push(self.mk(ctx, &rec, 23, Category::ScopeEscape, Severity::S2, Basis::Action, first, detail, false));
         }
         out
     }
@@ -2729,6 +2810,15 @@ impl SessionState {
             || self.open.values().any(|c| c.ts <= hi)
             || self.jobs.values().any(|s| *s <= hi)
             || self.intervals.iter().rev().any(|(s, e)| *s <= hi && *e >= lo)
+    }
+
+    /// Was a box call or a box job of this session running at `t` (within the grace on both sides)?
+    fn box_busy_at(&self, t: u64) -> bool {
+        let lo = t.saturating_sub(IDLE_GRACE_MS);
+        let hi = t.saturating_add(IDLE_GRACE_MS);
+        self.open.values().any(|c| c.boxed && c.ts <= hi)
+            || self.box_jobs.iter().any(|j| self.jobs.get(j).is_some_and(|s| *s <= hi))
+            || self.box_intervals.iter().rev().any(|(s, e)| *s <= hi && *e >= lo)
     }
 }
 

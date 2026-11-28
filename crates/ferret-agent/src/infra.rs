@@ -17,7 +17,8 @@
 //! - `resolve(config, ssh_g, lookup, local)` (pure over its three injected inputs): with the box enabled,
 //!   the Docker host named by `[box] ssh_host` and the `hostname` that `ssh -G` resolves it to, every port;
 //!   the host of each model endpoint (on its port); the host of each service the daemon talks to for the operator
-//!   (`runtime::service_endpoints`: the Signal bridge's signal-cli, the mail inbox's IMAP server, on its port); each
+//!   (`runtime::service_endpoints`: the Signal bridge's signal-cli, the mail inbox's IMAP server, the OAST broker's
+//!   endpoints, on its port; a `*.domain` entry of the broker's is a wildcard and is not looked up); each
 //!   `network.infrastructure` entry that is a plain name, with its port. Each name is looked up, and every address found is a `Resolution::addrs` entry
 //!   whose label is the entry's. IP literals, `localhost` names, wildcards and CIDR blocks are not looked
 //!   up (the policy reads them as written). A Docker host's loopback or unspecified address is dropped (an
@@ -117,7 +118,8 @@ fn is_local(ip: IpAddr) -> bool {
 
 /// The ports of the infrastructure entries that name this machine (`localhost`, a loopback or unspecified
 /// address) with a port: a model endpoint's, a service's (the Signal bridge's signal-cli, usually
-/// `127.0.0.1:1337`) and a `network.infrastructure` entry's. The sandbox refuses them to every command whatever
+/// `127.0.0.1:1337`; the OAST broker's listeners on the ports they were bound to) and a `network.infrastructure`
+/// entry's. The sandbox refuses them to every command whatever
 /// loopback it allows (`SandboxCfg::infra_ports`).
 pub fn loopback_ports(config: &Config) -> Vec<u16> {
     let entries = config

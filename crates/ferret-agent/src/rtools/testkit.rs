@@ -50,6 +50,8 @@ pub struct FakeOrch {
     pub boxed: Mutex<Option<Result<Arc<ferret_tools::boxctl::MissionBox>, String>>>,
     /// What `target_nodes` answers (T5); unset means the mission has no target.
     pub target: Mutex<Option<(String, Vec<ferret_core::target::NodeView>)>>,
+    /// Prior-mission findings returned by `find_duplicate_findings` in tests.
+    pub duplicate_findings: Mutex<Vec<ferret_core::target::TargetFinding>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -217,6 +219,16 @@ impl Orchestrator for FakeOrch {
         _session: &SessionId,
     ) -> Option<Result<(String, Vec<ferret_core::target::NodeView>), String>> {
         lock(&self.target).clone().map(Ok)
+    }
+
+    fn find_duplicate_findings(
+        &self,
+        _session: &SessionId,
+        _vuln_class: &str,
+        _surface: &str,
+        _param_or_sink: &str,
+    ) -> Vec<ferret_core::target::TargetFinding> {
+        lock(&self.duplicate_findings).clone()
     }
 
     async fn box_access(&self, _session: &SessionId) -> Result<Arc<ferret_tools::boxctl::MissionBox>, String> {

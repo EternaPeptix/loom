@@ -1868,6 +1868,7 @@ default_role = "lead"
 preamble = "harness.md"               # optional; the built-in preamble otherwise
 requires_restricted_network = false   # true: sessions refused while [network] mode = "open"
 solvable = false                      # true: roles are told the task was built to be solved; conclude refuses unreachable
+live_targets = false                  # true: the pack works on the operator's live systems; the monitor does not count its restricted network as a lab
 
 [roles.lead]
 description = "…"

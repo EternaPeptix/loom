@@ -227,8 +227,10 @@ fn traffic_record_redacts_both_messages() {
         response_cut: false,
         unverified: false,
         started: std::time::Instant::now(),
+        principal: Some("profile:default"),
     };
     let x = traffic::record(&e.ctx, &made).unwrap();
+    assert_eq!(x.principal.as_deref(), Some("profile:default"));
     let (req, resp) = (blob_text(&e, &x.request), blob_text(&e, x.response.as_ref().unwrap()));
     assert!(req.contains("a=[redacted]") && !req.contains(COOKIE_VALUE), "{req}");
     assert!(resp.contains("echo [redacted]") && !resp.contains("header-secret"), "{resp}");
@@ -251,6 +253,7 @@ fn traffic_record_keeps_everything_without_secrets() {
         response_cut: false,
         unverified: false,
         started: std::time::Instant::now(),
+        principal: None,
     };
     let x = traffic::record(&e.ctx, &made).unwrap();
     assert_eq!(blob_text(&e, &x.request).as_bytes(), request.as_slice());
