@@ -581,6 +581,10 @@ pub struct StartOpts {
     /// needs --target
     #[arg(long, value_name = "PROFILE", requires = "target")]
     pub creds: Option<String>,
+    /// Additional credential profile(s) of the target (`ferret creds`) mounted for multi-principal
+    /// testing (`http_send`/`http_authz_matrix`); repeatable, needs --target
+    #[arg(long = "creds-profile", value_name = "PROFILE", requires = "target")]
+    pub creds_profiles: Vec<String>,
     /// Do not decrypt HTTPS for this mission, whatever its pack says (`[network] intercept = "pack"` only)
     #[arg(long)]
     pub no_intercept: bool,
@@ -900,6 +904,9 @@ pub enum TargetAction {
     Show(TargetShowArgs),
     /// Change what a target covers: add or remove scope and exclude entries
     Scope(TargetScopeArgs),
+    /// Import in-scope and out-of-scope entries from a bug-bounty or Burp scope file
+    #[command(name = "import-scope")]
+    ImportScope(TargetImportScopeArgs),
 }
 
 /// `ferret creds`. No subcommand prints a value; `set` takes values only as arguments.
@@ -1082,6 +1089,20 @@ pub struct TargetScopeArgs {
     /// Exclude entries to remove; repeatable
     #[arg(long, value_name = "ENTRY")]
     pub unexclude: Vec<String>,
+}
+
+#[derive(Args, Debug, Clone, PartialEq, Eq)]
+pub struct TargetImportScopeArgs {
+    /// Target name
+    pub target: String,
+    /// Path to a scope file (HackerOne, Bugcrowd, Intigriti, Burp JSON, or CSV; max 4 MiB)
+    pub file: PathBuf,
+    /// Input format: auto, hackerone, bugcrowd, intigriti, burp, or csv
+    #[arg(long, default_value = "auto", value_parser = ["auto", "hackerone", "bugcrowd", "intigriti", "burp", "csv"])]
+    pub format: String,
+    /// Output raw JSON
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Subcommand, Debug, Clone, Copy, PartialEq, Eq)]
@@ -1542,6 +1563,16 @@ fn new_session(opts: &StartOpts, message: Option<String>, cwd: &Path, prior: Vec
         target: opts.target.clone().filter(|t| !t.trim().is_empty()),
         intercept: opts.no_intercept.then_some(false),
         creds: opts.creds.clone().filter(|c| !c.trim().is_empty()),
+        creds_profiles: {
+            let mut out = Vec::new();
+            for p in &opts.creds_profiles {
+                let p = p.trim();
+                if !p.is_empty() && !out.iter().any(|x: &String| x == p) {
+                    out.push(p.to_string());
+                }
+            }
+            out
+        },
     }
 }
 
@@ -3043,7 +3074,35 @@ async fn cmd_target(paths: &Paths, action: TargetAction) -> Result<i32, String> 
             outln(&format!("target {}: scope {}; exclude {}", v.name, v.scope.join(", "), v.exclude.join(", ")))
                 .map(|()| 0)
         }
+        TargetAction::ImportScope(a) => {
+            let payload = read_scope_import_file(&a.file)?;
+            let res = c.target_import_scope(&a.target, &a.format, &payload).await?;
+            if a.json {
+                return json_out(&res);
+            }
+            outln(&render::scope_import_summary(&res)).map(|()| 0)
+        }
     }
+}
+
+/// Maximum size of a bug-bounty scope file read by `ferret target import-scope` (4 MiB).
+const SCOPE_IMPORT_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+fn read_scope_import_file(path: &Path) -> Result<String, String> {
+    let f = std::fs::File::open(path)
+        .map_err(|e| format!("Could not read scope file `{}`: {e}", path.display()))?;
+    let mut bytes = Vec::new();
+    f.take((SCOPE_IMPORT_MAX_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("Could not read scope file `{}`: {e}", path.display()))?;
+    if bytes.len() > SCOPE_IMPORT_MAX_BYTES {
+        return Err(format!(
+            "Scope file `{}` exceeds the {} MiB limit.",
+            path.display(),
+            SCOPE_IMPORT_MAX_BYTES >> 20
+        ));
+    }
+    String::from_utf8(bytes).map_err(|e| format!("Scope file `{}` is not valid UTF-8: {e}", path.display()))
 }
 
 /// `ferret creds` (S2, S7). `set` builds items from `--cookie name=value` / `--header 'Name: value'` (a
@@ -3940,12 +3999,14 @@ mod tests {
             create_workspace: true,
             target: Some("acme".into()),
             creds: Some("default".into()),
+            creds_profiles: vec!["user_a".into(), " user_b ".into(), "user_a".into(), "".into()],
             no_intercept: true,
             agent_models: vec![("worker".into(), "fast".into()), (ANY_ROLE.into(), "big".into())],
         };
         let n = new_session(&opts, None, cwd, vec![MissionId::from("m-1"), MissionId::from("m-2")]);
         assert_eq!(n.intercept, Some(false));
         assert_eq!(n.creds.as_deref(), Some("default"));
+        assert_eq!(n.creds_profiles, vec!["user_a".to_string(), "user_b".to_string()]);
         assert_eq!(n.prior, [MissionId::from("m-1"), MissionId::from("m-2")]);
         assert_eq!(
             n.role_models,
@@ -4845,5 +4906,94 @@ mod tests {
         cfg.check().expect("docs/config.example.toml must pass Config::check");
         assert_eq!(cfg.signal.inbox_delay_secs, 0);
         assert!(!cfg.agents.project_instructions_in_security_packs);
+        assert!(!cfg.boxed.proxy_bridge);
+        assert_eq!(cfg.boxed.proxy_bridge_port, None);
+        assert!(!cfg.oast.enabled);
+        assert_eq!(cfg.oast.mode, ferret_core::config::OastMode::Local);
+    }
+
+    #[test]
+    fn wave_b_creds_profile_and_target_import_scope_cli_parse_and_cap() {
+        // Repeatable --creds-profile works alongside --creds on `run` and `chat`, and requires --target.
+        let Command::Run(r) = ok(&[
+            "run",
+            "--target",
+            "acme",
+            "--creds",
+            "user_a",
+            "--creds-profile",
+            "user_a",
+            "--creds-profile",
+            "user_b",
+            "check authz",
+        ]) else {
+            panic!("not run");
+        };
+        assert_eq!(r.start.creds.as_deref(), Some("user_a"));
+        assert_eq!(r.start.creds_profiles, vec!["user_a", "user_b"]);
+
+        let Command::Chat(c) =
+            ok(&["chat", "--target", "acme", "--creds-profile", "admin", "--creds-profile", "viewer"])
+        else {
+            panic!("not chat");
+        };
+        assert_eq!(c.start.creds, None);
+        assert_eq!(c.start.creds_profiles, vec!["admin", "viewer"]);
+
+        // --creds-profile without --target is rejected.
+        rejected(&["run", "--creds-profile", "user_a", "go"]);
+        rejected(&["chat", "--creds-profile", "user_a"]);
+
+        // `ferret target import-scope <target> <file> [--format ...] [--json]`
+        let Command::Target { action: TargetAction::ImportScope(a) } =
+            ok(&["target", "import-scope", "acme", "scope.json"])
+        else {
+            panic!("not target import-scope");
+        };
+        assert_eq!(a.target, "acme");
+        assert_eq!(a.file, PathBuf::from("scope.json"));
+        assert_eq!(a.format, "auto");
+        assert!(!a.json);
+
+        let Command::Target { action: TargetAction::ImportScope(a) } =
+            ok(&["target", "import-scope", "acme", "h1.json", "--format", "hackerone", "--json"])
+        else {
+            panic!("not target import-scope explicit");
+        };
+        assert_eq!(a.format, "hackerone");
+        assert!(a.json);
+
+        for fmt in ["auto", "hackerone", "bugcrowd", "intigriti", "burp", "csv"] {
+            assert!(matches!(
+                ok(&["target", "import-scope", "acme", "f.txt", "--format", fmt]),
+                Command::Target { action: TargetAction::ImportScope(_) }
+            ));
+        }
+        rejected(&["target", "import-scope", "acme", "f.txt", "--format", "invalid"]);
+        rejected(&["target", "import-scope", "acme"]);
+
+        // 4 MiB file cap enforced on read_scope_import_file.
+        let tmp = tempfile::tempdir().unwrap();
+        let ok_file = tmp.path().join("ok.csv");
+        std::fs::write(&ok_file, "api.acme.test\n").unwrap();
+        assert_eq!(read_scope_import_file(&ok_file).unwrap(), "api.acme.test\n");
+
+        let big_file = tmp.path().join("big.csv");
+        std::fs::write(&big_file, vec![b'a'; SCOPE_IMPORT_MAX_BYTES + 1]).unwrap();
+        let err = read_scope_import_file(&big_file).unwrap_err();
+        assert!(err.contains("4 MiB"), "{err}");
+
+        // Summary formatter sanitizes notes/target and displays counts.
+        let summary = render::scope_import_summary(&ferret_agent::ScopeImportResult {
+            target: "acme".into(),
+            format: "hackerone".into(),
+            added_scope: 2,
+            added_exclude: 1,
+            total_scope: 5,
+            total_exclude: 2,
+            notes: vec!["ignored \x1b[31mapp\x1b[0m".into()],
+        });
+        assert!(summary.contains("imported scope into acme (hackerone): +2 in-scope (total 5), +1 exclude (total 2)"));
+        assert!(!summary.contains('\x1b'), "{summary}");
     }
 }

@@ -293,6 +293,17 @@ const CORE_FILES: [(&str, &str); 4] = [
     ("roles/chat.md", include_str!("../../../packs/core/roles/chat.md")),
 ];
 
+const WEBAPP_TOML: &str = include_str!("../../../packs/webapp/pack.toml");
+const WEBAPP_PREAMBLE: &str = include_str!("../../../packs/webapp/harness.md");
+const WEBAPP_FILES: [(&str, &str); 6] = [
+    ("harness.md", WEBAPP_PREAMBLE),
+    ("roles/lead.md", include_str!("../../../packs/webapp/roles/lead.md")),
+    ("roles/recon_mapper.md", include_str!("../../../packs/webapp/roles/recon_mapper.md")),
+    ("roles/authz_tester.md", include_str!("../../../packs/webapp/roles/authz_tester.md")),
+    ("roles/exploit_worker.md", include_str!("../../../packs/webapp/roles/exploit_worker.md")),
+    ("roles/triage_judge.md", include_str!("../../../packs/webapp/roles/triage_judge.md")),
+];
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawPack {
@@ -595,11 +606,25 @@ fn builtin_pack() -> Result<Pack, String> {
     parse_pack("<built-in core>", CORE_TOML, CORE_PREAMBLE, &read)
 }
 
+fn builtin_webapp_pack() -> Result<Pack, String> {
+    let read = |rel: &str| -> Result<String, String> {
+        let rel = rel.strip_prefix("./").unwrap_or(rel);
+        WEBAPP_FILES
+            .iter()
+            .find(|(p, _)| *p == rel)
+            .map(|(_, t)| (*t).to_string())
+            .ok_or_else(|| format!("pack <built-in webapp>: file {rel} is not embedded in the binary"))
+    };
+    parse_pack("<built-in webapp>", WEBAPP_TOML, WEBAPP_PREAMBLE, &read)
+}
+
 impl Packs {
     pub fn builtin() -> Result<Packs, String> {
         let core = builtin_pack()?;
+        let webapp = builtin_webapp_pack()?;
         let mut packs = BTreeMap::new();
         packs.insert(core.name.clone(), core);
+        packs.insert(webapp.name.clone(), webapp);
         Ok(Packs { packs })
     }
 
@@ -775,6 +800,7 @@ mod tests {
     #[test]
     fn builtin_loads() {
         let p = Packs::builtin().unwrap();
+        assert_eq!(p.names(), vec!["core".to_string(), "webapp".to_string()]);
         let core = p.get("core").unwrap();
         for r in ["lead", "worker", "verifier", "chat"] {
             assert!(!core.roles[r].prompt.is_empty());
@@ -785,13 +811,28 @@ mod tests {
         assert!(core.roles["lead"].verify_finish);
         assert_eq!(core.roles["lead"].verifier.as_deref(), Some("verifier"));
         assert_eq!(p.role(None, None).unwrap().name, "lead");
+
+        let webapp = p.get("webapp").unwrap();
+        assert_eq!(webapp.default_role, "lead");
+        assert!(webapp.requires_restricted_network);
+        assert!(webapp.command_guard);
+        assert!(webapp.intercept);
+        assert!(!webapp.solvable);
+        assert!(!webapp.preamble.is_empty());
+        for r in ["lead", "recon_mapper", "authz_tester", "exploit_worker", "triage_judge"] {
+            assert!(!webapp.roles[r].prompt.is_empty(), "webapp/{r} prompt empty");
+            assert!(!webapp.roles[r].require_oracle, "webapp/{r} must not require oracle");
+        }
+        assert!(webapp.roles["triage_judge"].read_only);
+        assert_eq!(webapp.roles["lead"].verifier.as_deref(), Some("triage_judge"));
+        p.check_tools(&crate::rtools::known_tools()).unwrap();
     }
 
     #[test]
     fn directory_pack_loads_with_defaults() {
         let d = mk(GOOD);
         let p = Packs::load(d.path()).unwrap();
-        assert_eq!(p.names(), vec!["core".to_string(), "mine".to_string()]);
+        assert_eq!(p.names(), vec!["core".to_string(), "mine".to_string(), "webapp".to_string()]);
         let a = p.role(Some("mine"), None).unwrap();
         assert_eq!(a.prompt, "Role A.");
         assert_eq!(a.termination, Termination::Explicit);
@@ -827,7 +868,7 @@ mod tests {
     #[test]
     fn missing_dir_is_fine_and_core_can_be_replaced() {
         let d = tempfile::tempdir().unwrap();
-        assert_eq!(Packs::load(&d.path().join("nope")).unwrap().names(), vec!["core"]);
+        assert_eq!(Packs::load(&d.path().join("nope")).unwrap().names(), vec!["core", "webapp"]);
         let c = d.path().join("c");
         fs::create_dir(&c).unwrap();
         fs::write(
@@ -1059,7 +1100,14 @@ mod tests {
     #[test]
     fn check_tools_names_nearest() {
         let p = Packs::builtin().unwrap();
-        let mut known: Vec<String> = p.get("core").unwrap().roles.values().flat_map(|r| r.tools.clone()).collect();
+        let mut known: Vec<String> = p
+            .names()
+            .iter()
+            .filter_map(|n| p.get(n))
+            .flat_map(|pack| pack.roles.values().flat_map(|r| r.tools.clone()))
+            .collect();
+        known.sort();
+        known.dedup();
         assert!(p.check_tools(&known).is_ok());
         known.retain(|t| t != "grep");
         known.push("grap".into());
@@ -1583,12 +1631,12 @@ mod tests {
         assert!(!gen.roles["flag_judge"].tools.iter().any(|t| t == "security_record"));
 
         let vr = packs.get("vr").unwrap();
-        assert_eq!(vr.roles["researcher"].tools.len(), 52);
-        assert_eq!(shown_count(&vr.roles["researcher"]), 42);
-        assert_eq!(vr.roles["scout"].tools.len(), 40);
-        assert_eq!(shown_count(&vr.roles["scout"]), 33);
-        assert_eq!(vr.roles["judge"].tools.len(), 17);
-        assert_eq!(shown_count(&vr.roles["judge"]), 14);
+        assert_eq!(vr.roles["researcher"].tools.len(), 57);
+        assert_eq!(shown_count(&vr.roles["researcher"]), 47);
+        assert_eq!(vr.roles["scout"].tools.len(), 45);
+        assert_eq!(shown_count(&vr.roles["scout"]), 38);
+        assert_eq!(vr.roles["judge"].tools.len(), 19);
+        assert_eq!(shown_count(&vr.roles["judge"]), 16);
         assert_eq!(vr.roles["chat"].tools.len(), 16);
         assert_eq!(shown_count(&vr.roles["chat"]), 12);
         for role_name in ["researcher", "scout"] {
@@ -1598,6 +1646,11 @@ mod tests {
                 "security_ingest",
                 "http_send",
                 "http_repeat",
+                "http_authz_matrix",
+                "oast_mint",
+                "oast_poll",
+                "traffic_query",
+                "traffic_diff",
                 "codec_calc",
                 "bin_survey",
                 "bin_decompile",
@@ -1612,8 +1665,44 @@ mod tests {
         }
         assert!(vr.roles["judge"].read_only);
         assert!(vr.roles["judge"].tools.iter().any(|t| t == "security_query"));
+        assert!(vr.roles["judge"].tools.iter().any(|t| t == "traffic_query"));
+        assert!(vr.roles["judge"].tools.iter().any(|t| t == "traffic_diff"));
         assert!(!vr.roles["judge"].tools.iter().any(|t| t == "security_record"));
         assert!(!vr.roles["judge"].tools.iter().any(|t| t.starts_with("box_")));
+        assert!(!vr.roles["judge"].tools.iter().any(|t| t.starts_with("oast_") || t == "http_authz_matrix"));
+
+        // Exact role tool counts from Wave B Stage 1 (#165) for embedded & shipped `webapp` pack.
+        let webapp = packs.get("webapp").unwrap();
+        assert_eq!(webapp.default_role, "lead");
+        assert!(webapp.requires_restricted_network);
+        assert!(webapp.command_guard);
+        assert!(webapp.intercept);
+        assert!(!webapp.solvable);
+        assert_eq!(webapp.roles["lead"].tools.len(), 56);
+        assert_eq!(shown_count(&webapp.roles["lead"]), 46);
+        assert!(webapp.roles["lead"].verify_finish && webapp.roles["lead"].require_traffic);
+        assert_eq!(webapp.roles["lead"].verifier.as_deref(), Some("triage_judge"));
+        assert_eq!(webapp.roles["recon_mapper"].tools.len(), 37);
+        assert_eq!(shown_count(&webapp.roles["recon_mapper"]), 30);
+        assert_eq!(webapp.roles["recon_mapper"].max_steps, Some(25));
+        assert_eq!(webapp.roles["authz_tester"].tools.len(), 31);
+        assert_eq!(shown_count(&webapp.roles["authz_tester"]), 24);
+        assert_eq!(webapp.roles["authz_tester"].max_steps, Some(30));
+        assert_eq!(webapp.roles["exploit_worker"].tools.len(), 37);
+        assert_eq!(shown_count(&webapp.roles["exploit_worker"]), 30);
+        assert_eq!(webapp.roles["exploit_worker"].max_steps, Some(35));
+        let tj = &webapp.roles["triage_judge"];
+        assert_eq!(tj.tools.len(), 12);
+        assert_eq!(shown_count(tj), 10);
+        assert!(tj.read_only);
+        assert_eq!(tj.max_steps, Some(15));
+        for forbidden in ["security_record", "security_ingest", "write", "edit", "bash", "web_fetch"] {
+            assert!(!tj.tools.iter().any(|t| t == forbidden), "webapp/triage_judge must not have `{forbidden}`");
+        }
+        assert!(
+            !tj.tools.iter().any(|t| t.starts_with("box_") || t.starts_with("http_") || t.starts_with("oast_")),
+            "webapp/triage_judge must not have box_*, http_*, or oast_* tools"
+        );
 
         // Universal prompt-vs-TOML parity AND read-only least-privilege invariant across ALL shipped packs.
         for pack_name in packs.names() {
@@ -1639,8 +1728,8 @@ mod tests {
                         role.name
                     );
                     assert!(
-                        !role.tools.iter().any(|t| t.starts_with("box_")),
-                        "{pack_name}/{}: read_only role must not have box_* tools",
+                        !role.tools.iter().any(|t| t.starts_with("box_") || t.starts_with("oast_") || t == "http_authz_matrix"),
+                        "{pack_name}/{}: read_only role must not have box_*/oast_*/http_authz_matrix tools",
                         role.name
                     );
                 }

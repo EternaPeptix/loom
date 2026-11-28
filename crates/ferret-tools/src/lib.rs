@@ -69,6 +69,7 @@ pub mod http;
 pub mod jobs;
 pub mod mail;
 pub mod mcp;
+pub mod oast;
 pub mod oracle;
 pub mod outputs;
 pub mod outview;
@@ -294,6 +295,9 @@ impl Registry {
         r.add(Arc::new(pty::PtyClose));
         r.add(Arc::new(http::HttpSend));
         r.add(Arc::new(http::HttpRepeat));
+        r.add(Arc::new(http::HttpAuthzMatrix));
+        r.add(Arc::new(oast::OastMint));
+        r.add(Arc::new(oast::OastPoll));
         r.add(Arc::new(codec::CodecCalc));
         r.add(Arc::new(binary::BinSurvey));
         r.add(Arc::new(binary::BinDecompile));

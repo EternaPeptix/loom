@@ -9,11 +9,33 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 const MAX_ASSETS: usize = 500;
+const SAMPLE_ENDPOINTS_LIMIT: usize = 20;
 
+pub(super) struct IngestParsed {
+    pub assets: Vec<AssetInput>,
+    pub total_discovered: usize,
+    pub truncated: bool,
+    pub sample_endpoints: Vec<String>,
+}
+
+#[cfg(test)]
 pub(super) fn parse(format: &str, bytes: &[u8], evidence: &[String]) -> Result<Vec<AssetInput>, String> {
+    parse_with_options(format, bytes, evidence, None, None).map(|r| r.assets)
+}
+
+pub(super) fn parse_with_options(
+    format: &str,
+    bytes: &[u8],
+    evidence: &[String],
+    source_url: Option<&str>,
+    fallback_origin: Option<&str>,
+) -> Result<IngestParsed, String> {
     let input = std::str::from_utf8(bytes).map_err(|_| {
         "Scanner output must be UTF-8; convert or split the source output before importing it.".to_string()
     })?;
+    if matches!(format, "openapi" | "graphql" | "sourcemap") {
+        return parse_surface_artifact(format, input, evidence, source_url, fallback_origin);
+    }
     let mut assets = BTreeMap::new();
     if format == "nmap" {
         nmap(input, evidence, &mut assets)?;
@@ -105,7 +127,7 @@ pub(super) fn parse(format: &str, bytes: &[u8], evidence: &[String]) -> Result<V
             }
             _ => {
                 return Err(
-                    "Choose nmap, nuclei, ffuf, netexec, or bloodhound; unsupported scanner formats are not guessed."
+                    "Choose nmap, nuclei, ffuf, netexec, bloodhound, openapi, graphql, or sourcemap; unsupported formats are not guessed."
                         .into(),
                 )
             }
@@ -119,7 +141,145 @@ pub(super) fn parse(format: &str, bytes: &[u8], evidence: &[String]) -> Result<V
     // ahead of generic and non-mandatory static/quarantined endpoints.
     let mut ordered: Vec<_> = assets.into_iter().collect();
     ordered.sort_by_key(|(id, asset)| (asset.parent.is_some(), priority_rank(asset), id.clone()));
-    Ok(ordered.into_iter().map(|(_, asset)| asset).collect())
+    let assets: Vec<AssetInput> = ordered.into_iter().map(|(_, asset)| asset).collect();
+    let sample_endpoints = assets
+        .iter()
+        .filter(|a| a.kind == AssetKind::Endpoint)
+        .take(SAMPLE_ENDPOINTS_LIMIT)
+        .map(|a| a.locator.clone())
+        .collect();
+    let total_discovered = assets.len();
+    Ok(IngestParsed { assets, total_discovered, truncated: false, sample_endpoints })
+}
+
+fn parse_origin(raw: &str) -> Option<(String, String, String)> {
+    let u = url::Url::parse(raw.trim()).ok()?;
+    if !matches!(u.scheme(), "http" | "https") {
+        return None;
+    }
+    let host = u.host_str()?.trim_end_matches('.').to_ascii_lowercase();
+    let host_port = match u.port() {
+        Some(p) if host.contains(':') => format!("[{host}]:{p}"),
+        Some(p) => format!("{host}:{p}"),
+        None => host,
+    };
+    let path = u.path().trim_end_matches('/').to_string();
+    Some((u.scheme().to_string(), host_port, path))
+}
+
+fn parse_surface_artifact(
+    format: &str,
+    input: &str,
+    evidence: &[String],
+    source_url: Option<&str>,
+    fallback_origin: Option<&str>,
+) -> Result<IngestParsed, String> {
+    let surfaces = match format {
+        "openapi" => ferret_core::ingest::parse_openapi(input)?,
+        "graphql" => ferret_core::ingest::parse_graphql_introspection(input)?,
+        "sourcemap" => ferret_core::ingest::parse_js_sourcemap(input, source_url.or(fallback_origin))?,
+        _ => unreachable!(),
+    };
+    if surfaces.is_empty() {
+        return Err(format!("The {format} artifact contains no discoverable surfaces; nothing was imported."));
+    }
+    let origin = source_url.and_then(parse_origin).or_else(|| fallback_origin.and_then(parse_origin));
+    let total_discovered = surfaces.len();
+    let mut assets: BTreeMap<String, AssetInput> = BTreeMap::new();
+    let mut sample_endpoints: Vec<String> = Vec::new();
+    let mut truncated = false;
+
+    for surface in &surfaces {
+        let (kind, locator, mandatory) = match format {
+            "sourcemap" if surface.method.eq_ignore_ascii_case("SOURCE") => {
+                (AssetKind::File, surface.path.clone(), false)
+            }
+            "graphql" => {
+                let op_slug = format!("{}:{}", surface.method.to_ascii_lowercase(), surface.path);
+                if let Some((scheme, host_port, base_path)) = &origin {
+                    let gql_path = if base_path.is_empty() { "/graphql" } else { base_path.as_str() };
+                    (AssetKind::Endpoint, format!("{scheme}://{host_port}{gql_path}#{op_slug}"), true)
+                } else {
+                    (AssetKind::File, format!("graphql {op_slug}"), true)
+                }
+            }
+            _ => {
+                if surface.path.starts_with("http://") || surface.path.starts_with("https://") {
+                    let mand = ferret_tools::http::quarantined_locator(&surface.path).is_none()
+                        && !is_non_sourcemap_static_asset(&surface.path);
+                    (AssetKind::Endpoint, surface.path.clone(), mand)
+                } else if let Some(host) = surface.host.as_deref().map(str::trim).filter(|h| !h.is_empty()) {
+                    let scheme = origin.as_ref().map_or("https", |(s, _, _)| s.as_str());
+                    let path = if surface.path.starts_with('/') {
+                        surface.path.clone()
+                    } else {
+                        format!("/{}", surface.path)
+                    };
+                    let url = format!("{scheme}://{host}{path}");
+                    let mand = ferret_tools::http::quarantined_locator(&url).is_none()
+                        && !is_non_sourcemap_static_asset(&url);
+                    (AssetKind::Endpoint, url, mand)
+                } else if let Some((scheme, host_port, _)) = &origin {
+                    let path = if surface.path.starts_with('/') {
+                        surface.path.clone()
+                    } else {
+                        format!("/{}", surface.path)
+                    };
+                    let url = format!("{scheme}://{host_port}{path}");
+                    let mand = ferret_tools::http::quarantined_locator(&url).is_none()
+                        && !is_non_sourcemap_static_asset(&url);
+                    (AssetKind::Endpoint, url, mand)
+                } else {
+                    (AssetKind::File, format!("{} {}", surface.method, surface.path), true)
+                }
+            }
+        };
+
+        let sample_label = if kind == AssetKind::Endpoint {
+            format!("{} {}", surface.method, locator)
+        } else {
+            locator.clone()
+        };
+        if sample_endpoints.len() < SAMPLE_ENDPOINTS_LIMIT && !sample_endpoints.contains(&sample_label) {
+            sample_endpoints.push(sample_label);
+        }
+
+        let input_asset = AssetInput { kind, locator, evidence: evidence.to_vec(), mandatory, parent: None };
+        let Ok(id) = input_asset.id() else { continue };
+        if assets.contains_key(&id) {
+            continue;
+        }
+        if assets.len() >= MAX_ASSETS {
+            truncated = true;
+            continue;
+        }
+        assets.insert(id, input_asset);
+    }
+
+    if assets.is_empty() {
+        return Err(format!(
+            "The {format} artifact yielded no canonical asset locators; pass `source_url` (for example https://app.example.test) to resolve relative endpoints."
+        ));
+    }
+
+    let mut ordered: Vec<_> = assets.into_iter().collect();
+    ordered.sort_by_key(|(id, asset)| (asset.parent.is_some(), priority_rank(asset), id.clone()));
+    Ok(IngestParsed {
+        assets: ordered.into_iter().map(|(_, asset)| asset).collect(),
+        total_discovered,
+        truncated,
+        sample_endpoints,
+    })
+}
+
+/// Static asset check that intentionally keeps `.map` JS source maps indexed as high-value assets.
+fn is_non_sourcemap_static_asset(locator: &str) -> bool {
+    if let Ok(u) = url::Url::parse(locator) {
+        if u.path().to_ascii_lowercase().ends_with(".map") {
+            return false;
+        }
+    }
+    ferret_tools::http::is_static_asset_locator(locator)
 }
 
 fn priority_rank(asset: &AssetInput) -> u8 {
@@ -165,7 +325,7 @@ fn add(
 ) -> Result<String, String> {
     let mandatory = kind != AssetKind::Endpoint
         || (ferret_tools::http::quarantined_locator(locator).is_none()
-            && !ferret_tools::http::is_static_asset_locator(locator));
+            && !is_non_sourcemap_static_asset(locator));
     let input = AssetInput { kind, locator: locator.into(), evidence: evidence.to_vec(), mandatory, parent };
     let id = input.id()?;
     if !assets.contains_key(&id) && assets.len() >= MAX_ASSETS {

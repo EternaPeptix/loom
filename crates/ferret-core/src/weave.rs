@@ -766,6 +766,7 @@ mod tests {
                     intercept: false,
                     target: None,
                     creds: None,
+                    creds_profiles: Vec::new(),
                     title: String::new(),
                     project_instructions: Vec::new(),
                     mcp: Vec::new(),

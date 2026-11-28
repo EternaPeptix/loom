@@ -43,6 +43,8 @@ pub struct Captured {
     pub truncated: bool,
     pub upstream_unverified: bool,
     pub duration_ms: u64,
+    /// Passive security signals detected on the post-redaction request/response bytes.
+    pub passive_signals: Vec<ferret_core::event::PassiveSignal>,
 }
 
 /// Where captures go: the session id and the exchange.

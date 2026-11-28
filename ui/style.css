@@ -1548,6 +1548,25 @@ button.attach-open:hover { border-color: var(--accent-line); background: var(--a
 .exrow.tone-bad .ex-status { color: var(--bad-soft); }
 .exrow.tone-warn .ex-status { color: var(--warn-soft); }
 .ex-mark { font-size: 11px; color: var(--warn-soft); border: 1px solid var(--warn-line); border-radius: var(--r-pill); padding: 0 6px; }
+.ex-principal { flex: 0 0 auto; font-family: var(--mono); font-size: 11px; line-height: 17px; border-radius: var(--r-pill); padding: 0 7px; border: 1px solid var(--line-2); }
+.ex-principal-anon { color: var(--dim); background: var(--bg-3); border-color: var(--line-2); }
+.ex-principal-auth { color: var(--warn-soft); background: var(--attn-bg); border-color: var(--warn-line); }
+.ex-principal-profile { color: var(--info-soft); background: var(--accent-tint); border-color: var(--accent-line); }
+.ex-passive { flex: 0 0 auto; font-size: 11px; font-weight: 600; line-height: 17px; border-radius: var(--r-pill); padding: 0 7px; border: 1px solid transparent; }
+.ex-sev-high { color: var(--bad-soft); background: var(--bad-bg); border-color: var(--bad-line); }
+.ex-sev-medium { color: var(--warn-soft); background: var(--attn-bg); border-color: var(--warn-line); }
+.ex-sev-low { color: var(--info-soft); background: var(--accent-tint); border-color: var(--accent-line); }
+.ex-sev-info { color: var(--dim); background: var(--bg-3); border-color: var(--line-2); }
+.ex-signals { margin: 8px 14px 0; padding: 8px 12px; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--bg-2); }
+.ex-signal-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.ex-signal-head h3 { margin: 0; font-size: 12px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; color: var(--dim); }
+.ex-signal-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.ex-signal-item { padding: 4px 0; border-top: 1px solid var(--line); font-size: 12px; }
+.ex-signal-item:first-child { border-top: 0; padding-top: 0; }
+.ex-signal-top { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; }
+.ex-signal-kind { font-size: 11px; color: var(--strong); }
+.ex-signal-summary { color: var(--fg); overflow-wrap: anywhere; }
+.ex-signal-detail { margin: 2px 0 0; font-size: 11px; overflow-wrap: anywhere; white-space: pre-wrap; }
 .ex-error { flex-basis: 100%; overflow-wrap: anywhere; }
 .net-requests { margin-top: 14px; }
 .net-requests h3 { font-size: 13px; margin: 0 0 6px; }
@@ -1632,6 +1651,13 @@ a.id-target:hover { background: var(--bg-3); }
 .tcred-cmd { display: flex; align-items: center; gap: 6px; margin: 4px 0; }
 .tcred-cmd code { overflow-wrap: anywhere; font-size: 12px; }
 .id-creds { cursor: default; }
+.creds-badges { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+.creds-detail-list { display: flex; flex-direction: column; gap: 4px; }
+.creds-detail-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.f-creds-profiles { margin-top: 6px; display: flex; flex-direction: column; gap: 4px; }
+.f-creds-profiles-label { font-size: 12px; }
+.f-creds-profiles-list { display: flex; flex-wrap: wrap; gap: 6px 12px; }
+.f-creds-profile-opt { font-size: 12px; }
 
 /* ---- offline banner, inline stop confirmation, daemon status, prose tables, brief details, network & targets controls ---- */
 .offline-banner { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 12px; flex: 0 0 auto; padding: 7px 16px; background: var(--bad-bg); border-bottom: 1px solid var(--bad-line); color: var(--bad-soft); font-size: 13px; }

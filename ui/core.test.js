@@ -4909,3 +4909,168 @@ test("Wave A helpers: sanitized HAR/SARIF URLs, scope revocation, and panic kill
     "Panic stop complete: 0 connections cut · 0 sessions stopped · 0 boxes torn down · 0 rewrite rules disabled.",
   );
 });
+
+test("Wave B helpers: passive signal summarization, severity ranking, and principal formatting", () => {
+  // Empty / invalid inputs produce a zeroed summary.
+  assert.deepEqual(C.summarizePassiveSignals(null), {
+    total: 0,
+    maxSeverity: null,
+    counts: { high: 0, medium: 0, low: 0, info: 0 },
+    badge: "",
+    tooltip: "",
+    items: [],
+  });
+  assert.equal(C.summarizePassiveSignals([]).total, 0);
+
+  // Mixed severities: ranked high > medium > low > info, unknown/case normalized cleanly.
+  const mixed = C.summarizePassiveSignals([
+    { kind: "missing_security_headers", severity: "info", summary: "Missing CSP header" },
+    { kind: "cookie_insecure", severity: "LOW", summary: "Session cookie lacks HttpOnly" },
+    { kind: "cors_misconfig", severity: "High", summary: "Reflected Origin with ACAC: true", detail: "Origin: https://evil.example" },
+    { kind: "verbose_error", severity: "medium", summary: "Stack trace leaked in 500 body" },
+    { kind: "custom_note", severity: "bogus", summary: "Normalized to info" },
+    { kind: "secret_leak", severity: "high", summary: "AWS key prefix observed" },
+  ]);
+  assert.equal(mixed.total, 6);
+  assert.equal(mixed.maxSeverity, "high");
+  assert.deepEqual(mixed.counts, { high: 2, medium: 1, low: 1, info: 2 });
+  assert.equal(mixed.badge, "2 high · 1 medium · 1 low · 2 info");
+  assert.deepEqual(
+    mixed.items.map((s) => `${s.severity}:${s.kind}`),
+    [
+      "high:cors_misconfig",
+      "high:secret_leak",
+      "medium:verbose_error",
+      "low:cookie_insecure",
+      "info:missing_security_headers",
+      "info:custom_note",
+    ],
+  );
+  assert.match(mixed.tooltip, /^\[HIGH\] cors_misconfig: Reflected Origin with ACAC: true\n\[HIGH\] secret_leak:/);
+
+  // Single medium/low/info maxSeverity ranking checks.
+  assert.equal(C.summarizePassiveSignals([{ kind: "a", severity: "medium", summary: "m" }]).maxSeverity, "medium");
+  assert.equal(C.summarizePassiveSignals([{ kind: "a", severity: "low", summary: "l" }]).maxSeverity, "low");
+  assert.equal(C.summarizePassiveSignals([{ kind: "a", severity: "info", summary: "i" }]).maxSeverity, "info");
+
+  // Principal formatting.
+  assert.equal(C.formatPrincipal(null), null);
+  assert.equal(C.formatPrincipal("   "), null);
+  assert.equal(C.formatPrincipal("profile:   "), null);
+  assert.equal(C.formatPrincipal("auth:   "), null);
+  assert.deepEqual(C.formatPrincipal("anon"), {
+    raw: "anon",
+    label: "anon",
+    name: null,
+    kind: "anon",
+    tip: "Sent without mounted credentials (anonymous).",
+  });
+  assert.equal(C.formatPrincipal("ANONYMOUS").label, "anon");
+  assert.deepEqual(C.formatPrincipal("auth:1a2b3c4d"), {
+    raw: "auth:1a2b3c4d",
+    label: "auth:1a2b3c4d",
+    name: null,
+    kind: "auth",
+    tip: "Sent with ad-hoc request auth headers (not a mounted profile).",
+  });
+  assert.equal(C.formatPrincipal("AUTH:deadbeef").label, "auth:deadbeef");
+  assert.equal(C.formatPrincipal("AUTH:deadbeef").kind, "auth");
+  assert.deepEqual(C.formatPrincipal("profile:user_b"), {
+    raw: "profile:user_b",
+    label: "profile:user_b",
+    name: "user_b",
+    kind: "profile",
+    tip: "Sent with credential profile user_b.",
+  });
+  assert.deepEqual(C.formatPrincipal("  admin  "), {
+    raw: "admin",
+    label: "profile:admin",
+    name: "admin",
+    kind: "profile",
+    tip: "Sent with credential profile admin.",
+  });
+
+  // exchangeOf + exchangeRow preserve passive_signals and principal without altering legacy marks.
+  const ex = C.exchangeOf(
+    exRec("ex-waveb0000001", {
+      principal: "profile:user_b",
+      passive_signals: [
+        { kind: "weak_jwt", severity: "medium", summary: "alg=none accepted", detail: "Header decoded alg=none" },
+      ],
+    }),
+  );
+  assert.equal(ex.principal, "profile:user_b");
+  assert.equal(ex.passive_signals.length, 1);
+  const row = C.exchangeRow(ex);
+  assert.deepEqual(row.marks, []);
+  assert.equal(row.principal.label, "profile:user_b");
+  assert.equal(row.passive.maxSeverity, "medium");
+  assert.equal(row.passive.badge, "1 medium");
+});
+
+test("Wave B helpers: multi-principal credsProfilesOf, buildNewSession creds_profiles, and webapp pack metadata", () => {
+  // session_start stores creds and creds_profiles into store.start.
+  const store = C.createRecordStore("s-1");
+  C.applyRecord(store, {
+    seq: 0,
+    ts_ms: 10,
+    kind: "session_start",
+    creds: { profile: "user_a", summary: "user_a · 1 cookie", dropped: 0 },
+    creds_profiles: [
+      { profile: "user_a", summary: "user_a · 1 cookie", dropped: 0 },
+      { profile: "user_b", summary: "user_b · 1 header", dropped: 0 },
+    ],
+    tools: [],
+  });
+  assert.deepEqual(
+    C.credsProfilesOf(store.start).map((c) => c.profile),
+    ["user_a", "user_b"],
+  );
+  // Merges start + SessionInfo cleanly without duplicates.
+  assert.deepEqual(
+    C.credsProfilesOf(null, {
+      creds: { profile: "default", summary: "default · 1 cookie", dropped: 0 },
+      creds_profiles: [
+        { profile: "default", summary: "", dropped: 0 },
+        { profile: "admin", summary: "admin · 1 header", dropped: 1 },
+      ],
+    }),
+    [
+      { profile: "default", summary: "default · 1 cookie", dropped: 0 },
+      { profile: "admin", summary: "admin · 1 header", dropped: 1 },
+    ],
+  );
+  assert.deepEqual(C.credsProfilesOf(null, null), []);
+
+  // buildNewSession sends creds_profiles only with target and deduplicates.
+  const base = { workspace: "/w", message: "test authz" };
+  assert.deepEqual(
+    C.buildNewSession({ ...base, target: "acme", creds: "user_a", credsProfiles: ["user_a", " user_b ", "user_a", "none", ""] }).body.creds_profiles,
+    ["user_a", "user_b"],
+  );
+  assert.equal("creds_profiles" in C.buildNewSession({ ...base, target: "", credsProfiles: ["user_a"] }).body, false);
+  assert.equal("creds_profiles" in C.buildNewSession({ ...base, target: "acme", credsProfiles: [] }).body, false);
+
+  // webapp pack renders cleanly via packRoleSummary & roleGroups.
+  const webapp = {
+    name: "webapp",
+    description: "Live bug-bounty and web AppSec assessments.",
+    default_role: "lead",
+    intercept: true,
+    requires_restricted_network: true,
+    roles: [
+      { name: "lead", description: "Owns engagement", top_level: true, starts_agents: true },
+      { name: "recon_mapper", description: "Maps attack surfaces", top_level: false, starts_agents: false },
+      { name: "authz_tester", description: "Multi-principal authz", top_level: false, starts_agents: false },
+      { name: "exploit_worker", description: "Reproduces vulns", top_level: false, starts_agents: false },
+      { name: "triage_judge", description: "Read-only triage verifier", top_level: false, starts_agents: false },
+    ],
+  };
+  const groups = C.roleGroups(webapp);
+  assert.equal(groups.length, 2);
+  assert.deepEqual(groups[0].roles.map((r) => r.name), ["lead"]);
+  assert.deepEqual(groups[1].roles.map((r) => r.name), ["recon_mapper", "authz_tester", "exploit_worker", "triage_judge"]);
+  const summary = C.packRoleSummary(webapp, "lead", "open");
+  assert.deepEqual(summary.flags, ["MITM proxy intercept", "Requires restricted network"]);
+  assert.match(summary.warning, /restricted network/i);
+});

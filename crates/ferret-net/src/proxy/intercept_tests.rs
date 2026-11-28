@@ -900,3 +900,205 @@ async fn revoke_and_revoke_hosts_immediately_sever_active_intercepted_https_tunn
     assert!(matches!(closed, Ok(0) | Err(_)), "expected EOF/error after session revoke: {closed:?}");
     assert!(started.elapsed() < Duration::from_millis(500));
 }
+
+// ---- live response rewrites (plain + MITM HTTPS) & post-redaction passive signals ----
+
+#[tokio::test]
+async fn plain_http_response_rewrite_mutates_wire_redacts_capture_and_emits_passive_signals() {
+    let mut e = env(cg(4096)).await;
+    let resp_secret = "resp-secret-plain-99999";
+    let body_secret = "body-secret-plain-88888";
+    e.proxy.set_rewrites(RewriteSet::compile(&[RewriteRule {
+        id: 1,
+        name: "plain resp rewrite".into(),
+        enabled: true,
+        phase: RewritePhase::Response,
+        priority: 1,
+        matchers: RewriteMatcher { host: Some("127.0.0.1".into()), status: vec!["403".into()], ..Default::default() },
+        actions: vec![
+            RewriteAction::SetStatus { value: 200 },
+            RewriteAction::SetHeader {
+                name: "X-Resp-Secret".into(),
+                value: Some(resp_secret.into()),
+                sensitive: true,
+            },
+            RewriteAction::SetHeader {
+                name: "X-Short-Resp".into(),
+                value: Some("7777".into()),
+                sensitive: true,
+            },
+            RewriteAction::SetHeader {
+                name: "X-Resp-Tag".into(),
+                value: Some("rewritten".into()),
+                sensitive: false,
+            },
+            RewriteAction::ReplaceBody {
+                regex: "PLACEHOLDER".into(),
+                value: Some(body_secret.into()),
+                sensitive: true,
+            },
+        ],
+        note: String::new(),
+    }]));
+
+    let port = plain_server(
+        "HTTP/1.1 403 Forbidden\r\nContent-Type: text/html\r\nSet-Cookie: session=abc; Path=/\r\nContent-Length: 24\r\n\r\n<html>PLACEHOLDER</html>",
+    )
+    .await;
+
+    let req = plain_get(&e, port, "");
+    let wire_resp = plain_via_proxy(&e, req).await;
+    assert!(wire_resp.starts_with("HTTP/1.1 200 OK\r\n"), "{wire_resp}");
+    assert!(wire_resp.contains(&format!("X-Resp-Secret: {resp_secret}\r\n")), "{wire_resp}");
+    assert!(wire_resp.contains("X-Short-Resp: 7777\r\n"), "{wire_resp}");
+    assert!(wire_resp.contains("X-Resp-Tag: rewritten\r\n"), "{wire_resp}");
+    let expected_body = format!("<html>{body_secret}</html>");
+    assert!(wire_resp.contains(&format!("Content-Length: {}\r\n", expected_body.len())), "{wire_resp}");
+    assert!(wire_resp.ends_with(&format!("\r\n\r\n{expected_body}")), "{wire_resp}");
+
+    let c = next(&mut e.rx).await;
+    assert_eq!(c.status, Some(200));
+    let cap_resp = text(c.response.as_ref().unwrap());
+    assert!(cap_resp.contains("X-Resp-Secret: [redacted]\r\n"), "{cap_resp}");
+    assert!(cap_resp.contains("X-Short-Resp: [redacted]\r\n"), "{cap_resp}");
+    assert!(cap_resp.contains("X-Resp-Tag: rewritten\r\n"), "{cap_resp}");
+    assert!(cap_resp.ends_with("\r\n\r\n<html>[redacted]</html>"), "{cap_resp}");
+    assert!(!cap_resp.contains(resp_secret) && !cap_resp.contains(body_secret) && !cap_resp.contains("7777"), "{cap_resp}");
+
+    // Passive signals are computed on the post-redaction exchange and never contain raw secrets.
+    assert!(c.passive_signals.iter().any(|s| s.kind == "cookie_insecure"), "{:?}", c.passive_signals);
+    assert!(c.passive_signals.iter().any(|s| s.kind == "missing_security_headers"), "{:?}", c.passive_signals);
+    for s in &c.passive_signals {
+        assert!(!s.summary.contains(resp_secret) && !s.detail.contains(resp_secret));
+        assert!(!s.summary.contains(body_secret) && !s.detail.contains(body_secret));
+        assert!(!s.summary.contains("7777") && !s.detail.contains("7777"));
+    }
+}
+
+#[tokio::test]
+async fn intercepted_https_response_rewrite_reframes_chunked_keep_alive_redacts_and_analyzes_post_redaction() {
+    let mut e = env(CaptureGrant { max_bytes: 4096, ..intercepting() }).await;
+    let mitm_secret = "mitm-resp-secret-55555";
+    let aws_synth = format!("{}{}", "AKIA", "0123456789ABCDEF");
+    e.proxy.set_rewrites(RewriteSet::compile(&[RewriteRule {
+        id: 2,
+        name: "mitm chunked resp rewrite".into(),
+        enabled: true,
+        phase: RewritePhase::Response,
+        priority: 1,
+        matchers: RewriteMatcher { host: Some("127.0.0.1".into()), url_regex: Some("^/api".into()), ..Default::default() },
+        actions: vec![
+            RewriteAction::SetHeader {
+                name: "X-Mitm-Secret".into(),
+                value: Some(mitm_secret.into()),
+                sensitive: true,
+            },
+            RewriteAction::SetHeader {
+                name: "X-Mitm-Pin".into(),
+                value: Some("3333".into()),
+                sensitive: true,
+            },
+            RewriteAction::SetHeader {
+                name: "X-Mitm-Public".into(),
+                value: Some("ok".into()),
+                sensitive: false,
+            },
+            RewriteAction::ReplaceBody {
+                regex: "SECRET_SLOT".into(),
+                value: Some(aws_synth.clone()),
+                sensitive: true,
+            },
+        ],
+        note: String::new(),
+    }]));
+
+    let port = tls_server(|mut s| async move {
+        let _ = http_requests(&mut s, |head| {
+            if head.starts_with("GET /api") {
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Credentials: true\r\nSet-Cookie: auth_token=tokval; Path=/\r\nTransfer-Encoding: chunked\r\n\r\n6\r\n<html>\r\n12\r\nSECRET_SLOT</html>\r\n0\r\n\r\n".to_string()
+            } else {
+                ok_reply(head)
+            }
+        })
+        .await;
+    })
+    .await;
+
+    let mut s = tunnel_tls(&e, port, true).await.expect("client trusts ferret CA");
+    // Request 1: chunked response rewritten to Content-Length on keep-alive TLS stream.
+    let r1 = roundtrip(&mut s, "GET /api/data HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await;
+    assert!(r1.starts_with("HTTP/1.1 200 OK\r\n"), "{r1}");
+    assert!(!r1.to_ascii_lowercase().contains("transfer-encoding:"), "{r1}");
+    assert!(r1.contains(&format!("X-Mitm-Secret: {mitm_secret}\r\n")), "{r1}");
+    assert!(r1.contains("X-Mitm-Pin: 3333\r\n"), "{r1}");
+    assert!(r1.contains("X-Mitm-Public: ok\r\n"), "{r1}");
+    let expected_body = format!("<html>{aws_synth}</html>");
+    assert!(r1.contains(&format!("Content-Length: {}\r\n", expected_body.len())), "{r1}");
+    assert!(r1.ends_with(&format!("\r\n\r\n{expected_body}")), "{r1}");
+
+    // Request 2 on the SAME keep-alive TLS connection proves framing remained 100% valid.
+    let r2 = roundtrip(&mut s, "GET /next HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await;
+    assert!(r2.ends_with("you asked: GET /next HTTP/1.1"), "{r2}");
+
+    let c1 = next(&mut e.rx).await;
+    let cap_resp = text(c1.response.as_ref().unwrap());
+    assert!(cap_resp.contains("X-Mitm-Secret: [redacted]\r\n"), "{cap_resp}");
+    assert!(cap_resp.contains("X-Mitm-Pin: [redacted]\r\n"), "{cap_resp}");
+    assert!(cap_resp.contains("X-Mitm-Public: ok\r\n"), "{cap_resp}");
+    assert!(cap_resp.ends_with("\r\n\r\n<html>[redacted]</html>"), "{cap_resp}");
+    assert!(!cap_resp.contains(mitm_secret) && !cap_resp.contains("3333") && !cap_resp.contains(&aws_synth), "{cap_resp}");
+
+    // Post-redaction passive analysis catches CORS, insecure cookie, and missing security headers,
+    // while NEVER re-triggering secret_leak on the redacted [redacted] replacement!
+    assert!(c1.passive_signals.iter().any(|sig| sig.kind == "cors_misconfig"), "{:?}", c1.passive_signals);
+    assert!(c1.passive_signals.iter().any(|sig| sig.kind == "cookie_insecure"), "{:?}", c1.passive_signals);
+    assert!(c1.passive_signals.iter().any(|sig| sig.kind == "missing_security_headers"), "{:?}", c1.passive_signals);
+    assert!(!c1.passive_signals.iter().any(|sig| sig.kind == "secret_leak"), "{:?}", c1.passive_signals);
+
+    let c2 = next(&mut e.rx).await;
+    assert_eq!(c2.target, "/next");
+    assert!(c2.passive_signals.is_empty(), "{:?}", c2.passive_signals);
+}
+
+#[tokio::test]
+async fn intercepted_https_head_only_rewrite_on_204_to_200_adds_content_length_zero_for_keep_alive() {
+    let mut e = env(intercepting()).await;
+    e.proxy.set_rewrites(RewriteSet::compile(&[RewriteRule {
+        id: 3,
+        name: "upgrade 204 to 200".into(),
+        enabled: true,
+        phase: RewritePhase::Response,
+        priority: 1,
+        matchers: RewriteMatcher { host: Some("127.0.0.1".into()), status: vec!["204".into()], ..Default::default() },
+        actions: vec![
+            RewriteAction::SetStatus { value: 200 },
+            RewriteAction::SetHeader { name: "X-Upgraded".into(), value: Some("1".into()), sensitive: false },
+        ],
+        note: String::new(),
+    }]));
+
+    let port = tls_server(|mut s| async move {
+        let _ = http_requests(&mut s, |head| {
+            if head.starts_with("GET /empty") {
+                "HTTP/1.1 204 No Content\r\n\r\n".to_string()
+            } else {
+                ok_reply(head)
+            }
+        })
+        .await;
+    })
+    .await;
+
+    let mut s = tunnel_tls(&e, port, true).await.unwrap();
+    let r1 = roundtrip(&mut s, "GET /empty HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await;
+    assert!(r1.starts_with("HTTP/1.1 200 OK\r\n"), "{r1}");
+    assert!(r1.contains("X-Upgraded: 1\r\n"), "{r1}");
+    assert!(r1.contains("Content-Length: 0\r\n"), "{r1}");
+
+    // Keep-alive still works cleanly for request 2.
+    let r2 = roundtrip(&mut s, "GET /after HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").await;
+    assert!(r2.ends_with("you asked: GET /after HTTP/1.1"), "{r2}");
+    let c1 = next(&mut e.rx).await;
+    assert_eq!(c1.status, Some(200));
+    let _c2 = next(&mut e.rx).await;
+}

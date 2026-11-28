@@ -316,6 +316,20 @@ needs `/bin/sh`, `/bin/bash`, `setsid` (util-linux) and `/usr/bin/tar` (GNU tar,
 `--format=pax`); Docker supplies the init. Files go in and out through `docker exec ... tar` as user 1000, not
 `docker cp`, which cannot write to a read-only root or see the tmpfs `/work`.
 
+Optional **proxy bridge + MITM CA injection** (`[box] proxy_bridge = true`, optional `proxy_bridge_port`
+`1..=65535`): when enabled, the daemon dynamically discovers each mission bridge's actual Docker IPv4
+gateway (`fb-<short>`) via `docker network inspect`, forwards traffic to the mission's per-session egress
+proxy listener with per-session proxy authentication in **both** remote SSH (`-R`) and local Docker socket
+modes (via a supervised local TCP forwarder), inserts a single tightly-scoped
+`INPUT 1 -i fb-<short> -p tcp -d <gateway> --dport <port> -j ACCEPT` rule ahead of the unconditional
+`INPUT -i fb-+ -j DROP` (IPv6 `FERRET-ALL6` remains dropped; per-mission `INPUT` `ACCEPT` rules are swept
+cleanly on teardown and reconcile), stages the mission's MITM CA certificate into the container at
+`/tmp/ferret-ca.pem` (`0444`) via `/tmp` tmpfs `docker exec ... tar` before first execution and after
+`box_reset`, and injects `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`,
+`REQUESTS_CA_BUNDLE`, and `CURL_CA_BUNDLE` into `box_exec`. Containerized tools (`nuclei`, `ffuf`, `sqlmap`,
+`curl`, Playwright, Python, etc.) therefore automatically obey mission scope, noise pacing, credential
+injection, rewrite rules, HTTPS MITM capture, and passive signal analysis.
+
 Notes. The box needs the OS sandbox: `[sandbox] mode = "none"` and a `sandbox.unix_sockets` entry that
 names the box's socket (or anything in `<ferret home>/keys`) are refused. `docker_cli` and `ssh` are looked
 up on the daemon's `PATH` once, at start; the docker client runs with a fixed `PATH` and an empty
@@ -557,14 +571,19 @@ Missions that work on the same thing can share a scope and what they found:
 
 ```
 ferret target add acme --scope acme.test --scope '*.acme.test' --scope 10.20.0.0/24 --exclude vpn.acme.test
+ferret target import-scope acme hackerone-scope.json --format auto
 ferret run -w /path/to/workspace --target acme "map the API and test the login"
 ferret target show acme --nodes
 ```
 
 The scope is reachable from the mission even with `network.mode = "deny_all"`; the excluded entries never
-are. The lead starts with a `# Target acme` section (scope, untested services and endpoints, findings) and
-the next mission against `acme` sees what the earlier ones tested. `ferret target scope acme --add HOST
---remove HOST --exclude HOST` edits it; the target's files are under `~/.ferret/targets/acme/`.
+are. `ferret target import-scope <target> <file> [--format auto|hackerone|bugcrowd|intigriti|burp|csv] [--json]`
+reads a bug-bounty or Burp Suite scope file (up to 4 MiB), parses in-scope and out-of-scope entries, and
+merges them idempotently into the target (`POST /api/targets/{name}/import-scope`). The lead starts with a
+`# Target acme` section (scope, untested services and endpoints, findings, ruled-out dispositions, dead ends,
+DNS resolutions, and high/medium passive signals) and the next mission against `acme` sees what earlier ones
+tested. `ferret target scope acme --add HOST --remove HOST --exclude HOST` edits it; the target's files are
+under `~/.ferret/targets/acme/`.
 
 Exit status of `run` and `send`: 0 after `Finished` or `Yielded`; 2 when you are needed (`Asked`,
 `Blocked`, `Parked`: the inbox item was printed); 1 after `Stopped`, `BudgetExhausted` or an error.
@@ -609,7 +628,7 @@ Exit status of `run` and `send`: 0 after `Finished` or `Yielded`; 2 when you are
 | `ferret window <session> [--json]` | what is in the model's context, and what was folded out |
 | `ferret net <session> [-n <limit>] [--json]` / `ferret net --noise [--json]` | network decisions and granted hosts for a session, or (`--noise`) live egress noise-governor status |
 | `ferret out <handle> [--lines a:b]` | print a stored tool output |
-| `ferret target list\|add\|show\|scope` | manage shared target scopes and graphs (`list`/`ls` `--json`; `show <name> [--nodes [--status S] [--kind K] [--under LOC]] [--json]`) |
+| `ferret target list\|add\|show\|scope\|import-scope` | manage shared target scopes and graphs (`list`/`ls` `--json`; `show <name> [--nodes [--status S] [--kind K] [--under LOC]] [--json]`; `import-scope <target> <file> [--format auto\|hackerone\|bugcrowd\|intigriti\|burp\|csv] [--json]`) |
 | `ferret creds list\|show\|record\|set\|rm <target> [--profile <name>]` | manage target credential profiles (accepts positional `<target>` or `--target <name>`; `--json` on `list`/`show`; `list` alias `ls`, `rm` aliases `remove`/`delete`) |
 | `ferret ca show` / `ca rotate` | print the HTTPS interception CA certificate path and SHA-256 fingerprint, or rotate the CA |
 | `ferret gc [--apply]` | delete stored outputs that nothing refers to (dry run unless `--apply`) |
@@ -630,6 +649,8 @@ it from the first one, as `ferret models role` sets later),
 `-t/--title`, `--attended` (do not resume by itself after a restart), `--max-steps`, `--max-minutes`,
 `--prior <mission>` (repeatable: earlier missions to recall; not with `chat --session`, which continues a
 mission that has already started), `--target <name>`, `--creds <profile>` (requires `--target`),
+`--creds-profile <profile>` (repeatable; requires `--target`, mounts multiple named credential profiles for
+multi-principal testing with `http_send`, `http_repeat`, and `http_authz_matrix`),
 `--no-intercept` (disable HTTPS interception when `[network] intercept = "pack"`);
 and for display `--reasoning`, `--full`, `-v` (includes `#seq` record numbers), `--no-exchanges`.
 A `<session>` is an id, a prefix, a unique 4+ character suffix, or `last` (and commands accepting a
@@ -740,6 +761,48 @@ executed since the last rejection, opens one non-blocking question in your inbox
 nothing is delivered as finished. `finish` is also refused while the session has running jobs or
 running agents. `[agents] verify_finish = false` in the config turns verification off for every role:
 the finish is then delivered at once, marked `not verified`.
+
+### Live Web AppSec & Bug-Bounty (`packs/webapp` and Wave B tools)
+
+The built-in `webapp` pack (overrideable under `~/.ferret/packs/webapp/`) is designed for live authorized
+bug-bounty and web AppSec assessments. Unlike `ctf` and `redteam`, `webapp` requires **no local `.ferret/security-oracle.json`**,
+enables `intercept = true` and `requires_restricted_network = true`, and coordinates five roles: `lead`
+(verifier-gated), `recon_mapper`, `authz_tester`, `exploit_worker`, and strictly read-only `triage_judge`.
+
+```
+ferret target add acme --scope '*.acme.test'
+ferret target import-scope acme scope.json --format auto
+ferret run --pack webapp --target acme --creds user_a --creds-profile user_a --creds-profile user_b \
+  -w /path/to/workspace "Assess authorized web scope for BOLA/IDOR, auth bypass, and blind SSRF"
+```
+
+- **Multi-principal authorization testing (`--creds-profile` & `http_authz_matrix`):** Pass repeatable
+  `--creds-profile <name>` (alongside optional default `--creds <name>`) or select multiple profiles in the
+  web UI's New Mission form (mounted profiles show as badges in the session header and Session tab). Agents
+  can switch principals with `http_send` / `http_repeat` (`as_profile`, `strip_auth`) or run isolated
+  cross-principal structural diffs with `http_authz_matrix` without ever seeing raw cookie or token values.
+  Each captured exchange records its `principal` (`anon`, `profile:user_b`, etc.), shown as a badge in the
+  web UI Network tab and exchange inspector.
+- **Live response rewrites & passive analyzer signals:** Operator proxy rewrite rules (`ferret rewrite`)
+  apply live to both requests and responses across plain HTTP and intercepted HTTPS MITM while preserving
+  HTTP/1.1 framing and redacting `sensitive: true` values before capture. Every captured exchange is scanned
+  post-redaction by an 8-detector passive analyzer (`cors_misconfig`, `cookie_insecure`, `reflected_input`,
+  `verbose_error`, `weak_jwt`, `secret_leak`, `sourcemap_exposed`, `missing_security_headers`); severity
+  pills (`high`, `medium`, `low`, `info`) and full signal details appear in the web UI Network tab and
+  exchange inspector.
+- **Traffic querying & diffing (`traffic_query` / `traffic_diff`):** Agents (including read-only verifiers
+  such as `triage_judge` and `vr`'s `judge`) can search captured exchanges by host, path, method, status,
+  principal, or passive signal kind/severity with `traffic_query` and compare two exchanges structurally
+  (headers, status, normalized JSON/text body diff) with `traffic_diff`.
+- **Attack-surface artifact ingestion (`security_ingest`):** Beyond `nmap`, `nuclei`, `ffuf`, `netexec`,
+  and `bloodhound`, `security_ingest` accepts `openapi` (OpenAPI 3.x / Swagger 2.x JSON), `graphql`
+  (GraphQL introspection JSON), and `sourcemap` (JavaScript `.js.map` source maps) from attested `out:`
+  blobs to register endpoints and parameters deterministically without executing target code.
+- **Out-of-Band callback broker (`[oast]` / `oast_mint` & `oast_poll`):** Disabled by default. Enable
+  `[oast]` in `~/.ferret/config.toml` with `mode = "local"` (embedded HTTP listener on `bind` plus optional
+  UDP DNS listener on `dns_bind`, advertised via optional `public_host`) or `mode = "external"`
+  (`external_poll_url` over `https://` or loopback `http://`, with optional mode-`0600` `external_token_file`).
+  Agents mint mission-scoped callback URLs/DNS names with `oast_mint` and await interactions with `oast_poll`.
 
 ## Files
 

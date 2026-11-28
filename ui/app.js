@@ -1849,10 +1849,24 @@ function renderIdentity(info) {
   const tchip = $("s-target");
   tchip.hidden = !tgt;
   if (tgt) { tchip.textContent = "target " + tgt.name; tchip.setAttribute("href", C.targetHash(tgt.name)); tchip.title = "Open the target's page"; }
-  const cref = C.credsRefOf(S.rec && S.rec.start);
+  const cprofs = C.credsProfilesOf(S.rec && S.rec.start, info);
   const cchip = $("s-creds");
-  cchip.hidden = !cref;
-  if (cref) { cchip.textContent = "creds " + cref.profile; cchip.title = cref.summary; }
+  cchip.hidden = !cprofs.length;
+  if (cprofs.length === 1) {
+    cchip.className = "id-chip id-creds";
+    cchip.textContent = "creds " + cprofs[0].profile;
+    cchip.title = cprofs[0].summary || ("Mounted credential profile: " + cprofs[0].profile);
+  } else if (cprofs.length > 1) {
+    cchip.className = "creds-badges";
+    cchip.title = "";
+    cchip.replaceChildren(...cprofs.map((c) => {
+      const b = el("span", "id-chip id-creds", "creds " + c.profile);
+      b.title = c.summary || ("Mounted credential profile: " + c.profile);
+      return b;
+    }));
+  } else {
+    cchip.replaceChildren();
+  }
   $("s-role").textContent = chips.role.text;
   $("s-role").title = chips.role.tip;
   const id = $("s-id");
@@ -4853,6 +4867,9 @@ async function submitNew(ev, create = false) {
     unattended: $("f-unattended").checked,
     target: $("f-target").value,
     creds: $("f-creds-field").hidden ? "" : $("f-creds").value,
+    credsProfiles: $("f-creds-field").hidden
+      ? []
+      : [...document.querySelectorAll('#f-creds-profiles-wrap input[type="checkbox"]:checked')].map((i) => i.value),
     // Only for a folder the operator chose to make: the picker's New folder, or the answer to the question below.
     createWorkspace: create || (pickerCreate !== null && workspace === pickerCreate),
   });
@@ -6170,8 +6187,21 @@ function renderSessionTab(p, info) {
   row("created", new Date(info.created_ms).toLocaleString());
   const b = S.rec && S.rec.start ? S.rec.start.budget : null;
   row("budget", b ? budgetWords(b) : "loading\u2026");
-  const cref = C.credsRefOf(S.rec && S.rec.start);
-  if (cref) row("credentials", cref.summary || cref.profile);
+  const cprofs = C.credsProfilesOf(S.rec && S.rec.start, info);
+  if (cprofs.length === 1) {
+    row("credentials", cprofs[0].summary || cprofs[0].profile);
+  } else if (cprofs.length > 1) {
+    const list = el("div", "creds-detail-list");
+    for (const c of cprofs) {
+      const line = el("div", "creds-detail-row");
+      const badge = el("span", "id-chip id-creds", c.profile);
+      badge.title = c.summary || ("Mounted credential profile: " + c.profile);
+      line.append(badge);
+      if (c.summary) line.append(el("span", "dim", c.summary));
+      list.append(line);
+    }
+    row("credentials", list);
+  }
   row("unattended", info.unattended ? "yes" : "no");
   row("context window", info.context_window ? C.tokens(info.context_window) : "unknown");
   if (info.parent) row("parent", link(info.parent, "#/s/" + encodeURIComponent(info.parent)));
@@ -8558,9 +8588,24 @@ function exchangeButton(x, key) {
   b.dataset.focusKey = key || "ex:" + x.id;
   b.dataset.exchange = x.id;
   add(b, el("span", "ex-method", x.method), el("span", "ex-where mono", row.where), el("span", "ex-status", row.status), el("span", "ex-size dim", row.size), el("span", "ex-time dim", row.time));
+  if (row.principal) {
+    const pb = el("span", "ex-principal ex-principal-" + row.principal.kind, row.principal.label);
+    pb.title = row.principal.tip;
+    b.append(pb);
+  }
+  if (row.passive.total > 0) {
+    const sig = el("span", "ex-passive ex-sev-" + row.passive.maxSeverity, row.passive.badge);
+    sig.title = row.passive.tooltip;
+    b.append(sig);
+  }
   for (const m of row.marks) { const mark = el("span", "ex-mark", m.text); mark.title = m.tip; b.append(mark); }
   if (row.words) b.append(el("span", "ex-error dim", row.words));
-  b.setAttribute("aria-label", `${row.text}${row.marks.length ? " · " + row.marks.map((m) => m.text).join(", ") : ""}`);
+  const extra = [
+    row.principal ? row.principal.label : "",
+    row.passive.total > 0 ? row.passive.badge : "",
+    ...row.marks.map((m) => m.text),
+  ].filter(Boolean);
+  b.setAttribute("aria-label", `${row.text}${extra.length ? " · " + extra.join(", ") : ""}`);
   b.addEventListener("click", (e) => openExchange(x, e.currentTarget));
   return b;
 }
@@ -8697,9 +8742,48 @@ function renderExchange() {
   const info = [x.id, row.status, row.size, row.time].filter(Boolean).join(" · ");
   $("exview-info").textContent = info;
   const marks = $("exview-marks");
-  marks.replaceChildren(...row.marks.map((m) => { const c = chip(m.text, "dim"); c.title = m.tip; return c; }));
+  const markEls = [];
+  if (row.principal) {
+    const pb = el("span", "ex-principal ex-principal-" + row.principal.kind, row.principal.label);
+    pb.title = row.principal.tip;
+    markEls.push(pb);
+  }
+  if (row.passive.total > 0) {
+    const sig = el("span", "ex-passive ex-sev-" + row.passive.maxSeverity, row.passive.badge);
+    sig.title = row.passive.tooltip;
+    markEls.push(sig);
+  }
+  for (const m of row.marks) { const c = chip(m.text, "dim"); c.title = m.tip; markEls.push(c); }
+  marks.replaceChildren(...markEls);
   const how = x.source === "proxy" ? "Captured by ferret's proxy" : `Sent by ${x.tool || "a tool"}`;
   $("exview-how").textContent = how + (x.call_id ? ` · call ${x.call_id}` : "");
+  const sigBox = $("exview-signals");
+  if (sigBox) {
+    if (row.passive.total > 0) {
+      sigBox.hidden = false;
+      const head = el("div", "ex-signal-head");
+      add(
+        head,
+        el("h3", "", "Passive signals"),
+        el("span", "ex-passive ex-sev-" + row.passive.maxSeverity, row.passive.badge),
+      );
+      const ul = el("ul", "ex-signal-list");
+      for (const s of row.passive.items) {
+        const li = el("li", "ex-signal-item");
+        const top = el("div", "ex-signal-top");
+        top.append(el("span", "ex-passive ex-sev-" + s.severity, s.severity));
+        if (s.kind) top.append(el("span", "ex-signal-kind mono", s.kind));
+        if (s.summary) top.append(el("span", "ex-signal-summary", s.summary));
+        li.append(top);
+        if (s.detail) li.append(el("p", "ex-signal-detail dim", s.detail));
+        ul.append(li);
+      }
+      sigBox.replaceChildren(head, ul);
+    } else {
+      sigBox.hidden = true;
+      sigBox.replaceChildren();
+    }
+  }
   const reveal = $("exview-reveal");
   const secrets = v.req !== null && C.messageView(v.req).hasSecrets || v.res !== null && C.messageView(v.res).hasSecrets;
   reveal.hidden = !secrets;
@@ -8763,6 +8847,30 @@ async function loadFormCreds() {
   sel.replaceChildren(new Option("none", ""), ...names.map((n) => new Option(n, n)));
   sel.value = names.includes(keep) ? keep : "";
   field.hidden = names.length === 0;
+  const wrap = $("f-creds-profiles-wrap");
+  if (wrap) {
+    const prevChecked = new Set(
+      [...wrap.querySelectorAll('input[type="checkbox"]:checked')].map((i) => i.value),
+    );
+    if (names.length > 1) {
+      const label = el("span", "dim f-creds-profiles-label", "Multi-principal profiles (optional):");
+      const boxes = el("div", "f-creds-profiles-list");
+      for (const n of names) {
+        const l = el("label", "check f-creds-profile-opt");
+        const cb = el("input");
+        cb.type = "checkbox";
+        cb.value = n;
+        cb.checked = prevChecked.has(n);
+        l.append(cb, document.createTextNode(" " + n));
+        boxes.append(l);
+      }
+      wrap.replaceChildren(label, boxes);
+      wrap.hidden = false;
+    } else {
+      wrap.replaceChildren();
+      wrap.hidden = true;
+    }
+  }
 }
 
 function showTargets() {

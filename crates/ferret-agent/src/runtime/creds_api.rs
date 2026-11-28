@@ -129,8 +129,22 @@ pub(super) struct Recording {
     pub task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
+/// Mounted credential profiles for a mission: default profile name & injector, all named profile
+/// injectors (`as_profile` / `http_authz_matrix`), and the union secret redaction set across all of them.
+pub(super) struct MountedCreds {
+    pub default_name: String,
+    pub default_inject: Arc<Inject>,
+    pub profiles: BTreeMap<String, Arc<Inject>>,
+    pub secrets: Arc<Secrets>,
+}
+
 /// The items of a mission while one of its sessions holds them (S11).
-pub(super) type MissionCreds = (Weak<Inject>, Weak<Secrets>);
+pub(super) struct MissionCreds {
+    pub default_name: String,
+    pub default_inject: Weak<Inject>,
+    pub profiles: BTreeMap<String, Weak<Inject>>,
+    pub secrets: Weak<Secrets>,
+}
 
 const KEEP_ENDED_MS: u64 = 10 * 60 * 1000;
 /// How long a stop waits for an exchange that was in flight when the grant was revoked.
@@ -230,69 +244,155 @@ impl Inner {
         }
     }
 
-    /// What a lead's start records for `creds` (S11): refused without a target, for a name that is not
-    /// valid, a profile that does not exist or does not open.
-    pub(super) fn start_creds(
+    /// What a lead's start records for `creds` and `creds_profiles` (S11 + Wave B multi-principal):
+    /// refused without a target, for a name that is not valid, or for any profile that does not exist
+    /// or does not open. Names are trimmed and deduplicated preserving order, with `default_name`
+    /// first if set, else the first entry of `extra`.
+    pub(super) fn start_creds_profiles(
         &self,
         target: Option<&TargetRef>,
-        name: Option<&str>,
-    ) -> Result<Option<CredsRef>, String> {
-        let Some(name) = name.map(str::trim).filter(|n| !n.is_empty()) else { return Ok(None) };
+        default_name: Option<&str>,
+        extra: &[String],
+    ) -> Result<(Option<CredsRef>, Vec<CredsRef>), String> {
+        let mut names: Vec<String> = Vec::new();
+        let mut push_unique = |raw: &str| {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() && !names.iter().any(|existing| existing == trimmed) {
+                names.push(trimmed.to_string());
+            }
+        };
+        if let Some(d) = default_name {
+            push_unique(d);
+        }
+        let had_extra = extra.iter().any(|s| !s.trim().is_empty());
+        for p in extra {
+            push_unique(p);
+        }
+        if names.is_empty() {
+            return Ok((None, Vec::new()));
+        }
         let Some(t) = target else {
             return Err(format!(
-                "A credential profile belongs to a target: give the mission a target as well as the profile {name}."
+                "A credential profile belongs to a target: give the mission a target as well as the profile {}.",
+                names[0]
             ));
         };
-        check_profile_name(name)?;
-        let profile = self.creds_store().get(&t.name, name).map_err(|e| {
-            if e.starts_with("There is no credential profile") {
-                format!(
-                    "There is no profile {name} for target {}; list them with `ferret creds list --target {}`.",
-                    t.name, t.name
-                )
-            } else {
-                e
-            }
-        })?;
         let scope = Scope::parse(&t.scope, &t.exclude)?;
-        let (kept, dropped) = ferret_core::creds::effective(&profile.items, &scope);
-        Ok(Some(CredsRef {
-            profile: name.to_string(),
-            summary: ferret_core::creds::summary_line(name, &kept, dropped),
-            dropped,
-        }))
+        let store = self.creds_store();
+        let mut refs: Vec<CredsRef> = Vec::with_capacity(names.len());
+        for name in &names {
+            check_profile_name(name)?;
+            let profile = store.get(&t.name, name).map_err(|e| {
+                if e.starts_with("There is no credential profile") {
+                    format!(
+                        "There is no profile {name} for target {}; list them with `ferret creds list --target {}`.",
+                        t.name, t.name
+                    )
+                } else {
+                    e
+                }
+            })?;
+            let (kept, dropped) = ferret_core::creds::effective(&profile.items, &scope);
+            refs.push(CredsRef {
+                profile: name.clone(),
+                summary: ferret_core::creds::summary_line(name, &kept, dropped),
+                dropped,
+            });
+        }
+        let primary = refs.first().cloned();
+        // Keep single-profile `new.creds` serialization 100% backward-compatible when `creds_profiles` was not supplied.
+        let list = if had_extra || refs.len() > 1 { refs } else { Vec::new() };
+        Ok((primary, list))
     }
 
-    /// The items of the mission of `meta`, shared by its sessions (S11). `None` without `creds` or when the
-    /// profile cannot be read now.
-    pub(super) fn mission_creds(&self, meta: &SessionMeta) -> Option<(Arc<Inject>, Arc<Secrets>)> {
-        let c = meta.creds.as_ref()?;
+    /// The items of the mission of `meta`, shared by its sessions (S11 + multi-principal). `None` when no
+    /// profiles are configured or none can be read now.
+    pub(super) fn mission_creds(&self, meta: &SessionMeta) -> Option<MountedCreds> {
+        let mut names: Vec<String> = Vec::new();
+        let mut push_unique = |name: &str| {
+            let trimmed = name.trim();
+            if !trimmed.is_empty() && !names.iter().any(|n| n == trimmed) {
+                names.push(trimmed.to_string());
+            }
+        };
+        if let Some(c) = meta.creds.as_ref() {
+            push_unique(&c.profile);
+        }
+        for c in &meta.creds_profiles {
+            push_unique(&c.profile);
+        }
+        if names.is_empty() {
+            return None;
+        }
         let mut map = lock(&self.mission_creds);
-        map.retain(|_, (i, s)| i.strong_count() > 0 && s.strong_count() > 0);
-        if let Some((i, s)) = map.get(&meta.mission) {
-            if let (Some(i), Some(s)) = (i.upgrade(), s.upgrade()) {
-                return Some((i, s));
+        map.retain(|_, c| c.default_inject.strong_count() > 0 && c.secrets.strong_count() > 0);
+        if let Some(cached) = map.get(&meta.mission) {
+            if let (Some(default_inject), Some(secrets)) = (cached.default_inject.upgrade(), cached.secrets.upgrade()) {
+                let mut profiles = BTreeMap::new();
+                let mut all_ok = !cached.profiles.is_empty();
+                for (name, w) in &cached.profiles {
+                    if let Some(inj) = w.upgrade() {
+                        profiles.insert(name.clone(), inj);
+                    } else {
+                        all_ok = false;
+                        break;
+                    }
+                }
+                if all_ok {
+                    return Some(MountedCreds {
+                        default_name: cached.default_name.clone(),
+                        default_inject,
+                        profiles,
+                        secrets,
+                    });
+                }
             }
         }
         let Some(t) = meta.target.as_ref() else {
-            tracing::warn!(session = %meta.id, profile = %c.profile, "a mission with credentials has no target; none attached");
+            tracing::warn!(session = %meta.id, profile = %names[0], "a mission with credentials has no target; none attached");
             return None;
         };
-        let loaded = self.creds_store().get(&t.name, &c.profile).and_then(|p| {
-            let scope = Scope::parse(&t.scope, &t.exclude)?;
-            Ok(ferret_core::creds::effective(&p.items, &scope).0)
-        });
-        let items = match loaded {
-            Ok(items) => items,
+        let scope = match Scope::parse(&t.scope, &t.exclude) {
+            Ok(s) => s,
             Err(e) => {
-                tracing::warn!(target_name = %t.name, profile = %c.profile, "credential profile not attached: {e}");
+                tracing::warn!(target_name = %t.name, "credential profiles not attached because target scope failed to parse: {e}");
                 return None;
             }
         };
-        let secrets = Arc::new(Secrets::for_items(&items));
-        let inject = Arc::new(Inject::new(items));
-        map.insert(meta.mission.clone(), (Arc::downgrade(&inject), Arc::downgrade(&secrets)));
-        Some((inject, secrets))
+        let store = self.creds_store();
+        let mut profiles: BTreeMap<String, Arc<Inject>> = BTreeMap::new();
+        let mut secret_sets: Vec<Secrets> = Vec::new();
+        let mut default_name: Option<String> = None;
+        for name in &names {
+            match store.get(&t.name, name) {
+                Ok(p) => {
+                    let kept = ferret_core::creds::effective(&p.items, &scope).0;
+                    secret_sets.push(Secrets::for_items(&kept));
+                    profiles.insert(name.clone(), Arc::new(Inject::new(kept)));
+                    if default_name.is_none() {
+                        default_name = Some(name.clone());
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(target_name = %t.name, profile = %name, "credential profile not attached: {e}");
+                }
+            }
+        }
+        let default_name = default_name?;
+        let default_inject = profiles.get(&default_name)?.clone();
+        let secret_refs: Vec<&Secrets> = secret_sets.iter().collect();
+        let secrets = Arc::new(Secrets::union(&secret_refs));
+        let weak_profiles = profiles.iter().map(|(k, v)| (k.clone(), Arc::downgrade(v))).collect();
+        map.insert(
+            meta.mission.clone(),
+            MissionCreds {
+                default_name: default_name.clone(),
+                default_inject: Arc::downgrade(&default_inject),
+                profiles: weak_profiles,
+                secrets: Arc::downgrade(&secrets),
+            },
+        );
+        Some(MountedCreds { default_name, default_inject, profiles, secrets })
     }
 }
 

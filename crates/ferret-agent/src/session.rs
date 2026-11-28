@@ -4715,6 +4715,7 @@ mod tests {
                 intercept: false,
                 target: None,
                 creds: None,
+                creds_profiles: Vec::new(),
                 title: "test".into(),
                 project_instructions: Vec::new(),
                 mcp: Vec::new(),
@@ -8246,6 +8247,8 @@ mod tests {
             let mut fx = Fx::new("chat", false, false, script).await;
             fx.ctx.cfg = Arc::new(ferret_core::config::ToolsCfg { speculate, ..(*fx.ctx.cfg).clone() });
             fx.window = Some(window);
+            // Keep size-triggered compaction above the tool-schema + single-result footprint so step 2 runs.
+            fx.context.compact_at_tokens = 12_000;
             let mut session = fx.create();
             session.registry.add(Arc::new(EchoViewChars));
             // The session is configured with the global bound; the call gets the window's.
@@ -8274,6 +8277,8 @@ mod tests {
         ]);
         let mut fx = Fx::new("chat", false, false, script).await;
         fx.window = Some(window);
+        // Keep size-triggered compaction above the tool-schema + single-result footprint so step 2 runs.
+        fx.context.compact_at_tokens = 12_000;
         let line = format!("{{\"k\":\"{}\"}}", "v".repeat(240));
         let text: String = (0..2_000).map(|_| format!("{line}\n")).collect();
         std::fs::write(fx.ctx.workspace.join("big.jsonl"), &text).unwrap();

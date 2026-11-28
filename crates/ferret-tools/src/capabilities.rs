@@ -24,6 +24,14 @@ pub struct SessionTools {
     /// The credential profile items the session attaches to its in-scope requests (CONTRACTS-TRAFFIC-TARGETS
     /// S8), set by the runtime before the first call; unset = none.
     pub creds: OnceLock<Arc<ferret_net::Inject>>,
+    /// Named credential profiles mounted for multi-principal HTTP testing (`as_profile`, `http_authz_matrix`).
+    pub creds_profiles: OnceLock<BTreeMap<String, Arc<ferret_net::Inject>>>,
+    /// Name of the default credential profile when `creds` is mounted (e.g. `"user_a"`).
+    pub default_profile: OnceLock<String>,
+    /// The mission id owning this session (used by mission-scoped tools such as OAST).
+    pub mission_id: OnceLock<String>,
+    /// Optional OAST callback broker mounted for blind out-of-band testing (`oast_mint`, `oast_poll`).
+    pub oast: OnceLock<Arc<crate::oast::OastBroker>>,
     /// The session secret set (S5), set by the runtime with `creds`; unset = nothing to redact.
     pub secrets: OnceLock<Arc<ferret_core::creds::Secrets>>,
     /// The proxy URL with the session's tool credential (S9), set by the runtime; unset = the command proxy
@@ -53,10 +61,93 @@ impl SessionTools {
             oracle_contract: crate::oracle::ContractCache::default(),
             exchange_lookup: OnceLock::new(),
             creds: OnceLock::new(),
+            creds_profiles: OnceLock::new(),
+            default_profile: OnceLock::new(),
+            mission_id: OnceLock::new(),
+            oast: OnceLock::new(),
             secrets: OnceLock::new(),
             tool_proxy: OnceLock::new(),
             upstream_insecure: OnceLock::new(),
             target_scope: OnceLock::new(),
+        }
+    }
+
+    /// Sorted names of all mounted credential profiles (excluding `"anon"`).
+    pub fn mounted_profile_names(&self) -> Vec<String> {
+        if let Some(map) = self.creds_profiles.get() {
+            let mut names: Vec<String> = map.keys().filter(|k| !k.is_empty() && k.as_str() != "anon").cloned().collect();
+            names.sort();
+            names.dedup();
+            return names;
+        }
+        if self.creds.get().is_some() {
+            let name = self
+                .default_profile
+                .get()
+                .map(String::as_str)
+                .filter(|s| !s.is_empty() && *s != "anon")
+                .unwrap_or("default");
+            return vec![name.to_string()];
+        }
+        Vec::new()
+    }
+
+    /// Resolve which credential profile to inject and its canonical principal label (`"anon"` or
+    /// `"profile:<name>"`).
+    ///
+    /// - `strip_auth == true` or `as_profile == Some("anon")` -> `(None, "anon")`
+    /// - `as_profile == Some(name)` -> lookup in `creds_profiles` (or legacy default `creds` if
+    ///   `creds_profiles` is unset and `name` matches `default_profile` / `"default"`), otherwise an
+    ///   error naming all mounted profiles.
+    /// - `as_profile == None` -> default `creds` + `default_profile` if mounted (`profile:<name>` or
+    ///   `profile:default`), else `(None, "anon")`.
+    pub fn resolve_profile(
+        &self,
+        as_profile: Option<&str>,
+        strip_auth: bool,
+    ) -> Result<(Option<Arc<ferret_net::Inject>>, String), String> {
+        let requested = as_profile.map(str::trim).filter(|s| !s.is_empty());
+        if strip_auth || requested == Some("anon") {
+            return Ok((None, "anon".into()));
+        }
+        if let Some(name) = requested {
+            if let Some(map) = self.creds_profiles.get() {
+                if let Some(inject) = map.get(name) {
+                    return Ok((Some(inject.clone()), format!("profile:{name}")));
+                }
+            } else if let Some(inject) = self.creds.get() {
+                let default_name = self
+                    .default_profile
+                    .get()
+                    .map(String::as_str)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("default");
+                if name == default_name {
+                    return Ok((Some(inject.clone()), format!("profile:{name}")));
+                }
+            }
+            let mounted = self.mounted_profile_names();
+            return if mounted.is_empty() {
+                Err(format!(
+                    "Unknown credential profile `{name}`: no credential profiles are mounted in this session (only `anon` is available)."
+                ))
+            } else {
+                Err(format!(
+                    "Unknown credential profile `{name}`. Available profiles: anon, {}.",
+                    mounted.join(", ")
+                ))
+            };
+        }
+        let default_name =
+            self.default_profile.get().map(String::as_str).filter(|s| !s.is_empty()).unwrap_or("default");
+        let default_inject = self
+            .creds
+            .get()
+            .cloned()
+            .or_else(|| self.default_profile.get().and_then(|d| self.creds_profiles.get()?.get(d).cloned()));
+        match default_inject {
+            Some(inject) => Ok((Some(inject), format!("profile:{default_name}"))),
+            None => Ok((None, "anon".into())),
         }
     }
 }
@@ -191,5 +282,66 @@ mod tests {
         let _b = target_permit("admission.test", &c).await.unwrap();
         c.cancel();
         assert!(target_permit("admission.test", &c).await.is_err());
+    }
+
+    #[test]
+    fn resolve_profile_handles_multi_principal_anon_strip_and_legacy_creds() {
+        use ferret_core::creds::{Item, ItemKind};
+        let make_inject = |tok: &str| {
+            Arc::new(ferret_net::Inject::new(vec![Item {
+                kind: ItemKind::Header,
+                name: "Authorization".into(),
+                value: format!("Bearer {tok}"),
+                host: "api.test".into(),
+            }]))
+        };
+
+        // Unmounted session resolves default & anon to (None, "anon") and rejects named profiles.
+        let empty = SessionTools::default();
+        assert_eq!(empty.mounted_profile_names(), Vec::<String>::new());
+        let (inj, tag) = empty.resolve_profile(None, false).unwrap();
+        assert!(inj.is_none() && tag == "anon");
+        let (inj, tag) = empty.resolve_profile(Some("anon"), false).unwrap();
+        assert!(inj.is_none() && tag == "anon");
+        let err = empty.resolve_profile(Some("admin"), false).unwrap_err();
+        assert!(err.contains("no credential profiles"), "{err}");
+
+        // Legacy single-profile session (`creds` only).
+        let legacy = SessionTools::default();
+        legacy.creds.set(make_inject("legacy-tok")).unwrap();
+        assert_eq!(legacy.mounted_profile_names(), vec!["default".to_string()]);
+        let (inj, tag) = legacy.resolve_profile(None, false).unwrap();
+        assert!(inj.is_some() && tag == "profile:default");
+        let (inj, tag) = legacy.resolve_profile(None, true).unwrap();
+        assert!(inj.is_none() && tag == "anon");
+
+        // Multi-principal session with `creds_profiles` + `default_profile`.
+        let multi = SessionTools::default();
+        let user_a = make_inject("tok-a");
+        let user_b = make_inject("tok-b");
+        multi.creds.set(user_a.clone()).unwrap();
+        multi.default_profile.set("user_a".into()).unwrap();
+        multi
+            .creds_profiles
+            .set(BTreeMap::from([("user_a".into(), user_a), ("user_b".into(), user_b)]))
+            .unwrap();
+        assert_eq!(multi.mounted_profile_names(), vec!["user_a".to_string(), "user_b".to_string()]);
+
+        let (inj, tag) = multi.resolve_profile(None, false).unwrap();
+        assert_eq!(tag, "profile:user_a");
+        assert_eq!(inj.unwrap().items()[0].value, "Bearer tok-a");
+
+        let (inj, tag) = multi.resolve_profile(Some("user_b"), false).unwrap();
+        assert_eq!(tag, "profile:user_b");
+        assert_eq!(inj.unwrap().items()[0].value, "Bearer tok-b");
+
+        let (inj, tag) = multi.resolve_profile(Some("anon"), false).unwrap();
+        assert!(inj.is_none() && tag == "anon");
+
+        let (inj, tag) = multi.resolve_profile(Some("user_b"), true).unwrap();
+        assert!(inj.is_none() && tag == "anon");
+
+        let err = multi.resolve_profile(Some("ghost"), false).unwrap_err();
+        assert!(err.contains("ghost") && err.contains("user_a") && err.contains("user_b"), "{err}");
     }
 }

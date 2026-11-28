@@ -171,12 +171,122 @@ pub const ALL_CHAIN: &str = "FERRET-ALL";
 pub const ALL_CHAIN6: &str = "FERRET-ALL6";
 /// The bounded, non-executable `/dev/shm` tmpfs mount passed to `docker run`.
 pub const SHM_TMPFS: &str = "/dev/shm:rw,noexec,nosuid,nodev,size=64m";
+/// Path inside the container where the MITM CA certificate is staged read-only (`0444`).
+pub const CA_CONTAINER_PATH: &str = "/tmp/ferret-ca.pem";
 /// The directory (under `<ferret home>/keys`) that is `HOME` and `DOCKER_CONFIG` of the docker client: empty.
 const DOCKER_DIR: &str = "box-docker";
 /// The directory (under `<ferret home>/keys`) the launcher processes start in.
 const RUN_DIR: &str = "box-run";
 /// The hardened OCI/Docker seccomp profile written under `<ferret home>/keys` and sent by the CLI host.
 const SECCOMP_FILE: &str = "box-seccomp.json";
+
+/// Proxy bridge and optional MITM CA plumbing connecting a `[box]` container to `ferret-net`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct BoxProxyBridge {
+    /// Local `ferret-net` proxy port on the daemon host (`127.0.0.1:<proxy_port>`).
+    pub proxy_port: u16,
+    /// Optional `(user, password)` Basic auth credentials for `ferret-net::Proxy`. Redacted in `Debug`.
+    pub proxy_auth: Option<(String, String)>,
+    /// Port listening on the Docker host's bridge gateway (`<bridge_gateway_ip>:<bridge_port>`).
+    pub bridge_port: u16,
+    /// IPv4 address of the Docker bridge gateway reachable from the mission container.
+    /// Leave empty (`""`) to auto-discover dynamically from `docker network inspect`.
+    pub bridge_gateway_ip: String,
+    /// Optional MITM CA certificate PEM bytes staged read-only (`0444`) at `/tmp/ferret-ca.pem`.
+    pub ca_pem: Option<Vec<u8>>,
+}
+
+impl std::fmt::Debug for BoxProxyBridge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BoxProxyBridge")
+            .field("proxy_port", &self.proxy_port)
+            .field("proxy_auth", &self.proxy_auth.as_ref().map(|(u, _)| (u.as_str(), "[redacted]")))
+            .field("bridge_port", &self.bridge_port)
+            .field("bridge_gateway_ip", &self.bridge_gateway_ip)
+            .field("ca_pem", &self.ca_pem.as_ref().map(|b| format!("<{} bytes>", b.len())))
+            .finish()
+    }
+}
+
+impl BoxProxyBridge {
+    fn validate_auth(&self) -> Result<(), String> {
+        if let Some((user, pass)) = &self.proxy_auth {
+            let bad = |s: &str| {
+                s.is_empty()
+                    || s.chars().any(|c| c.is_whitespace() || c.is_control() || matches!(c, '@' | ':' | '/' | '?' | '#'))
+            };
+            if bad(user) {
+                return Err("BoxProxyBridge.proxy_auth username must be non-empty and contain no URL delimiters, whitespace, or control characters.".into());
+            }
+            if bad(pass) {
+                return Err("BoxProxyBridge.proxy_auth password must be non-empty and contain no URL delimiters, whitespace, or control characters.".into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate bridge configuration before network creation. Returns `Ok(None)` when `bridge_gateway_ip`
+    /// is empty (requesting dynamic IPv4 gateway discovery via `docker network inspect`), or `Ok(Some(ip))`
+    /// when an explicit IPv4 gateway was provided.
+    pub fn validate_config(&self) -> Result<Option<Ipv4Addr>, String> {
+        if self.proxy_port == 0 {
+            return Err("BoxProxyBridge.proxy_port must be non-zero.".into());
+        }
+        if self.bridge_port == 0 {
+            return Err("BoxProxyBridge.bridge_port must be non-zero.".into());
+        }
+        self.validate_auth()?;
+        let gw = self.bridge_gateway_ip.trim();
+        if gw.is_empty() {
+            return Ok(None);
+        }
+        let ip = gw
+            .parse::<Ipv4Addr>()
+            .map_err(|_| format!("BoxProxyBridge.bridge_gateway_ip `{}` is not a valid IPv4 address.", self.bridge_gateway_ip))?;
+        if ip.is_unspecified() {
+            return Err("BoxProxyBridge.bridge_gateway_ip must not be 0.0.0.0.".into());
+        }
+        Ok(Some(ip))
+    }
+
+    /// Validate a resolved bridge (requiring a concrete non-empty IPv4 `bridge_gateway_ip`) so nothing
+    /// untrusted ever enters iptables, ssh argv, or listener binds.
+    pub fn validate(&self) -> Result<Ipv4Addr, String> {
+        self.validate_config()?
+            .ok_or_else(|| "BoxProxyBridge.bridge_gateway_ip is empty; resolve the Docker network gateway first.".into())
+    }
+
+    /// HTTP proxy URL reachable from inside the container (`http://[user:pass@]<bridge_gateway_ip>:<bridge_port>`).
+    pub fn proxy_url(&self) -> String {
+        let host = self.bridge_gateway_ip.trim();
+        match &self.proxy_auth {
+            Some((user, pass)) => format!("http://{user}:{pass}@{host}:{}", self.bridge_port),
+            None => format!("http://{host}:{}", self.bridge_port),
+        }
+    }
+
+    /// Container exec environment variables for routing HTTP/HTTPS traffic through the bridged proxy
+    /// (and trusting `/tmp/ferret-ca.pem` when `ca_pem` is present).
+    pub fn exec_env(&self) -> Vec<(String, String)> {
+        let proxy = self.proxy_url();
+        let mut env = vec![
+            ("HTTP_PROXY".into(), proxy.clone()),
+            ("HTTPS_PROXY".into(), proxy.clone()),
+            ("ALL_PROXY".into(), proxy.clone()),
+            ("http_proxy".into(), proxy.clone()),
+            ("https_proxy".into(), proxy.clone()),
+            ("all_proxy".into(), proxy),
+            ("NO_PROXY".into(), "localhost,127.0.0.1".into()),
+            ("no_proxy".into(), "localhost,127.0.0.1".into()),
+        ];
+        if self.ca_pem.is_some() {
+            for key in ["SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "NODE_EXTRA_CA_CERTS", "CURL_CA_BUNDLE"] {
+                env.push((key.into(), CA_CONTAINER_PATH.into()));
+            }
+        }
+        env
+    }
+}
 
 /// Hardened default-deny OCI/Docker seccomp profile for `[box]` containers (x86_64 & aarch64).
 ///
@@ -505,9 +615,27 @@ pub fn work_dir(cwd: Option<&str>) -> Result<String, String> {
 /// `docker exec` of one command (I1): `script` is the last argument and is never read by anything but the
 /// inner `bash -c` in the container.
 pub fn exec_args(n: &Names, call_id: &str, cwd: &str, script: &str) -> Vec<String> {
+    exec_args_with_bridge(n, call_id, cwd, script, None)
+}
+
+/// [`exec_args`] with optional [`BoxProxyBridge`] proxy and CA environment variables injected into
+/// the container command. Byte-for-byte identical to [`exec_args`] when `bridge` is `None`.
+pub fn exec_args_with_bridge(
+    n: &Names,
+    call_id: &str,
+    cwd: &str,
+    script: &str,
+    bridge: Option<&BoxProxyBridge>,
+) -> Vec<String> {
     let mut a = strings(["exec", "--user", BOX_USER, "--workdir"]);
     a.push(cwd.to_string());
     a.extend(strings(["--env", "HOME=/tmp", "--env", "TERM=dumb"]));
+    if let Some(b) = bridge {
+        for (k, v) in b.exec_env() {
+            a.push("--env".into());
+            a.push(format!("{k}={v}"));
+        }
+    }
     a.push(n.container.clone());
     a.extend(strings(["/bin/bash", "-c", EXEC_WRAP, "_"]));
     a.push(pid_file(call_id));
@@ -545,6 +673,23 @@ pub fn push_args(n: &Names) -> Vec<String> {
     a.push(format!("--directory={WORK}"));
     a.push("--no-same-owner".into());
     a
+}
+
+/// `docker exec` of a tar that stages the read-only (`0444`) MITM CA certificate into `/tmp/ferret-ca.pem`
+/// (on the container's `/tmp` tmpfs, never touching the read-only rootfs).
+pub fn stage_ca_args(n: &Names) -> Vec<String> {
+    let mut a = strings(["exec", "--interactive", "--user", BOX_USER, "--env", TAR_PATH]);
+    a.push(n.container.clone());
+    a.extend(strings([TAR, "--extract", "-U", "--file=-", "--directory=/tmp", "--no-same-owner"]));
+    a
+}
+
+/// Builds a ustar tar stream containing `ferret-ca.pem` with read-only permissions (`0444`).
+pub fn ca_tar_bytes(ca_pem: &[u8]) -> Vec<u8> {
+    let mut tar = Vec::with_capacity(ca_pem.len() + 2048);
+    boxfs::append_file(&mut tar, "ferret-ca.pem", 0o444, 0, ca_pem);
+    boxfs::finish_tar(&mut tar);
+    tar
 }
 
 /// `docker exec` of a tar that writes `path` (absolute, in the container) as a pax stream on stdout (I7). The
@@ -622,14 +767,62 @@ iptables -w 5 -C FERRET-ALL -i \"$2\" -j \"$1\" && iptables -w 5 -C \"$1\" -j DR
 ip6tables -w 5 -C FERRET-ALL6 -j DROP && \
 ip6tables -w 5 -C INPUT -i 'fb-+' -j FERRET-ALL6 && ip6tables -w 5 -C FORWARD -i 'fb-+' -j FERRET-ALL6 && \
 ip6tables -w 5 -C INPUT -i \"$2\" -j DROP && ip6tables -w 5 -C FORWARD -i \"$2\" -j DROP";
-/// The script that removes the mission's jump from `FERRET-ALL`, its chain and its per-interface IPv6 drops.
-/// Nothing else: `FERRET-ALL`, `INPUT -i fb-+ -j DROP`, and `FERRET-ALL6` stay.
+/// The script that removes the mission's jump from `FERRET-ALL`, any bridge `INPUT -i "$2" ... -j ACCEPT`
+/// rule, its chain, and its per-interface IPv6 drops. Nothing else: `FERRET-ALL`, `INPUT -i fb-+ -j DROP`,
+/// and `FERRET-ALL6` stay.
 const RULES_REMOVE: &str = ": ferret-rules-remove; \
+iface=$2; iptables -w 5 -S INPUT 2>/dev/null | while IFS= read -r r; do \
+case \"$r\" in \"-A INPUT \"*) b=${r#-A INPUT }; \
+case \" $b \" in *\" -i $iface \"*\" -j ACCEPT \"*) set -f; set -- $b; set +f; iptables -w 5 -D INPUT \"$@\" 2>/dev/null || : ;; esac ;; \
+esac; done; \
 while iptables -w 5 -D FERRET-ALL -i \"$2\" -j \"$1\" 2>/dev/null; do :; done; \
 iptables -w 5 -F \"$1\" 2>/dev/null; iptables -w 5 -X \"$1\" 2>/dev/null; \
 for c in INPUT FORWARD; do while ip6tables -w 5 -D \"$c\" -i \"$2\" -j DROP 2>/dev/null; do :; done; done; exit 0";
 
-fn helper_args(cfg: &BoxCfg, interactive: bool, script: &str, n: &Names) -> Vec<String> {
+/// Bridge-enabled variant of [`RULES_APPLY`]: inserts ONE tightly-scoped `INPUT 1` rule allowing TCP from
+/// this mission's bridge `$2` (`fb-<short>`) ONLY to `<bridge_gateway_ip>` (`$3`) port `<bridge_port>` (`$4`)
+/// strictly BEFORE the unconditional `INPUT -i fb-+ -j DROP`. All other host ports and IPv6 remain dropped.
+const RULES_APPLY_BRIDGE: &str = ": ferret-rules-apply; \
+iptables -w 5 -N FERRET-ALL 2>/dev/null; \
+iptables -w 5 -C FERRET-ALL -j DROP 2>/dev/null || iptables -w 5 -A FERRET-ALL -j DROP || exit 1; \
+iptables -w 5 -C DOCKER-USER -i 'fb-+' -j FERRET-ALL 2>/dev/null || iptables -w 5 -I DOCKER-USER 1 -i 'fb-+' -j FERRET-ALL || exit 1; \
+while iptables -w 5 -D INPUT -i 'fb-+' -j FERRET-ALL 2>/dev/null; do :; done; \
+iptables -w 5 -C INPUT -i 'fb-+' -j DROP 2>/dev/null || iptables -w 5 -I INPUT 1 -i 'fb-+' -j DROP || exit 1; \
+while iptables -w 5 -D INPUT -i \"$2\" -p tcp -d \"$3\" --dport \"$4\" -j ACCEPT 2>/dev/null; do :; done; \
+iptables -w 5 -I INPUT 1 -i \"$2\" -p tcp -d \"$3\" --dport \"$4\" -j ACCEPT || exit 1; \
+iptables-restore -w 5 --noflush || exit 1; \
+iptables -w 5 -C FERRET-ALL -i \"$2\" -j \"$1\" 2>/dev/null || iptables -w 5 -I FERRET-ALL 1 -i \"$2\" -j \"$1\" || exit 1; \
+ip6tables -w 5 -N FERRET-ALL6 2>/dev/null; \
+ip6tables -w 5 -C FERRET-ALL6 -j DROP 2>/dev/null || ip6tables -w 5 -A FERRET-ALL6 -j DROP || exit 1; \
+for c in INPUT FORWARD; do ip6tables -w 5 -C \"$c\" -i 'fb-+' -j FERRET-ALL6 2>/dev/null || ip6tables -w 5 -I \"$c\" 1 -i 'fb-+' -j FERRET-ALL6 || exit 1; done; \
+for c in INPUT FORWARD; do ip6tables -w 5 -C \"$c\" -i \"$2\" -j DROP 2>/dev/null || ip6tables -w 5 -I \"$c\" 1 -i \"$2\" -j DROP || exit 1; done";
+
+/// Bridge-enabled variant of [`RULES_CHECK`]: verifies the mission's tightly-scoped `INPUT` bridge rule
+/// alongside all standard `FERRET-ALL`, `INPUT DROP`, and `FERRET-ALL6` invariants.
+const RULES_CHECK_BRIDGE: &str = ": ferret-rules-check; \
+iptables -w 5 -C FERRET-ALL -j DROP && \
+iptables -w 5 -C DOCKER-USER -i 'fb-+' -j FERRET-ALL && \
+iptables -w 5 -C INPUT -i 'fb-+' -j DROP && \
+iptables -w 5 -C INPUT -i \"$2\" -p tcp -d \"$3\" --dport \"$4\" -j ACCEPT && \
+! iptables -w 5 -C INPUT -i 'fb-+' -j FERRET-ALL 2>/dev/null && \
+iptables -w 5 -C FERRET-ALL -i \"$2\" -j \"$1\" && iptables -w 5 -C \"$1\" -j DROP && \
+ip6tables -w 5 -C FERRET-ALL6 -j DROP && \
+ip6tables -w 5 -C INPUT -i 'fb-+' -j FERRET-ALL6 && ip6tables -w 5 -C FORWARD -i 'fb-+' -j FERRET-ALL6 && \
+ip6tables -w 5 -C INPUT -i \"$2\" -j DROP && ip6tables -w 5 -C FORWARD -i \"$2\" -j DROP";
+
+/// Bridge-enabled variant of [`RULES_REMOVE`]: removes the mission's exact `INPUT` bridge rule plus any
+/// stale `INPUT -i "$2" ... -j ACCEPT` rule, its `FERRET-ALL` jump, mission chain, and per-interface IPv6 drops.
+const RULES_REMOVE_BRIDGE: &str = ": ferret-rules-remove; \
+while iptables -w 5 -D INPUT -i \"$2\" -p tcp -d \"$3\" --dport \"$4\" -j ACCEPT 2>/dev/null; do :; done; \
+iface=$2; iptables -w 5 -S INPUT 2>/dev/null | while IFS= read -r r; do \
+case \"$r\" in \"-A INPUT \"*) b=${r#-A INPUT }; \
+case \" $b \" in *\" -i $iface \"*\" -j ACCEPT \"*) set -f; set -- $b; set +f; iptables -w 5 -D INPUT \"$@\" 2>/dev/null || : ;; esac ;; \
+esac; done; \
+while iptables -w 5 -D FERRET-ALL -i \"$2\" -j \"$1\" 2>/dev/null; do :; done; \
+iptables -w 5 -F \"$1\" 2>/dev/null; iptables -w 5 -X \"$1\" 2>/dev/null; \
+for c in INPUT FORWARD; do while ip6tables -w 5 -D \"$c\" -i \"$2\" -j DROP 2>/dev/null; do :; done; done; exit 0";
+
+fn helper_args_extra(cfg: &BoxCfg, interactive: bool, script: &str, n: &Names, extra: &[String]) -> Vec<String> {
     let mut a = strings(["run", "--rm"]);
     if interactive {
         a.push("--interactive".into());
@@ -653,7 +846,12 @@ fn helper_args(cfg: &BoxCfg, interactive: bool, script: &str, n: &Names) -> Vec<
     a.push("_".into());
     a.push(n.chain.clone());
     a.push(n.iface.clone());
+    a.extend(extra.iter().cloned());
     a
+}
+
+fn helper_args(cfg: &BoxCfg, interactive: bool, script: &str, n: &Names) -> Vec<String> {
+    helper_args_extra(cfg, interactive, script, n, &[])
 }
 
 /// The helper run that installs the chain (its stdin is [`rules_text`]).
@@ -661,14 +859,59 @@ pub fn rules_args(cfg: &BoxCfg, n: &Names) -> Vec<String> {
     helper_args(cfg, true, RULES_APPLY, n)
 }
 
+/// [`rules_args`] with optional [`BoxProxyBridge`] `INPUT 1` accept rule strictly before `INPUT -i fb-+ -j DROP`.
+pub fn rules_args_with_bridge(
+    cfg: &BoxCfg,
+    n: &Names,
+    bridge: Option<&BoxProxyBridge>,
+) -> Result<Vec<String>, String> {
+    match bridge {
+        None => Ok(rules_args(cfg, n)),
+        Some(b) => {
+            let gw = b.validate()?;
+            Ok(helper_args_extra(cfg, true, RULES_APPLY_BRIDGE, n, &[gw.to_string(), b.bridge_port.to_string()]))
+        }
+    }
+}
+
 /// The helper run that removes the mission's jump, chain and IPv6 drops.
 pub fn rules_remove_args(cfg: &BoxCfg, n: &Names) -> Vec<String> {
     helper_args(cfg, false, RULES_REMOVE, n)
 }
 
+/// [`rules_remove_args`] with optional [`BoxProxyBridge`] `INPUT` accept rule cleanup.
+pub fn rules_remove_args_with_bridge(
+    cfg: &BoxCfg,
+    n: &Names,
+    bridge: Option<&BoxProxyBridge>,
+) -> Result<Vec<String>, String> {
+    match bridge {
+        None => Ok(rules_remove_args(cfg, n)),
+        Some(b) => {
+            let gw = b.validate()?;
+            Ok(helper_args_extra(cfg, false, RULES_REMOVE_BRIDGE, n, &[gw.to_string(), b.bridge_port.to_string()]))
+        }
+    }
+}
+
 /// The helper run that checks that the mission's rules are all in place (its status says).
 pub fn rules_check_args(cfg: &BoxCfg, n: &Names) -> Vec<String> {
     helper_args(cfg, false, RULES_CHECK, n)
+}
+
+/// [`rules_check_args`] with optional [`BoxProxyBridge`] `INPUT` accept rule verification.
+pub fn rules_check_args_with_bridge(
+    cfg: &BoxCfg,
+    n: &Names,
+    bridge: Option<&BoxProxyBridge>,
+) -> Result<Vec<String>, String> {
+    match bridge {
+        None => Ok(rules_check_args(cfg, n)),
+        Some(b) => {
+            let gw = b.validate()?;
+            Ok(helper_args_extra(cfg, false, RULES_CHECK_BRIDGE, n, &[gw.to_string(), b.bridge_port.to_string()]))
+        }
+    }
 }
 
 /// The `iptables-restore` input for the chain: an explicit flush, each allowed address, drop. There is no
@@ -712,6 +955,33 @@ pub fn ssh_args(cfg: &BoxCfg, socket: &Path) -> Vec<String> {
     a.push("--".into());
     a.push(cfg.ssh_host.clone());
     a
+}
+
+/// Pure argv builder for reverse-forwarding the daemon host's local `ferret-net` proxy port onto
+/// the remote Docker host's bridge gateway (`-R <bridge_gateway_ip>:<bridge_port>:127.0.0.1:<proxy_port>`).
+pub fn reverse_proxy_forward_args(cfg: &BoxCfg, bridge: &BoxProxyBridge) -> Result<Vec<String>, String> {
+    if cfg.ssh_host.trim().is_empty() {
+        return Err("box.ssh_host is empty; reverse SSH proxy forwarding requires a remote SSH host.".into());
+    }
+    let gw = bridge.validate()?;
+    let mut a = strings([
+        "-N",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ExitOnForwardFailure=yes",
+        "-o",
+        "ControlPath=none",
+        "-o",
+        "ForwardAgent=no",
+        "-o",
+        "ServerAliveInterval=15",
+        "-R",
+    ]);
+    a.push(format!("{gw}:{}:127.0.0.1:{}", bridge.bridge_port, bridge.proxy_port));
+    a.push("--".into());
+    a.push(cfg.ssh_host.clone());
+    Ok(a)
 }
 
 // ---- egress --------------------------------------------------------------------------------------
@@ -1307,6 +1577,8 @@ struct State {
     paused: bool,
     /// The mission's box was torn down through this handle; it makes nothing again (L1). `forget` keeps it.
     closed: bool,
+    /// Whether `/tmp/ferret-ca.pem` has been staged into the currently running container.
+    ca_staged: bool,
     /// The names and addresses the running container was created with (its `/etc/hosts`).
     created_hosts: Hosts,
     /// The names and addresses the grants give now, as of the last time the rules were brought to them.
@@ -1317,6 +1589,7 @@ impl State {
     fn forget(&mut self) {
         self.paused = false;
         self.up = false;
+        self.ca_staged = false;
         self.pushed.clear();
         self.verified = None;
         self.created_hosts.clear();
@@ -1332,6 +1605,14 @@ pub struct PushReport {
     pub notes: Vec<String>,
 }
 
+/// Maximum concurrent TCP proxy connections bridged from one local `[box]` container.
+const MAX_LOCAL_BRIDGE_CONNS: usize = 128;
+
+struct ProxyForwardHandle {
+    target: (Ipv4Addr, u16, u16),
+    forward: Forward,
+}
+
 /// One mission's container, network and rules. All changes are made one at a time, and the lock that
 /// orders them is the host's lock of the mission, so it holds across every handle of the same mission
 /// and against [`teardown_mission`] and [`reconcile`] (R1).
@@ -1340,6 +1621,11 @@ pub struct MissionBox {
     names: Names,
     home: String,
     source: EgressSource,
+    bridge: Option<BoxProxyBridge>,
+    /// Resolved bridge with a concrete IPv4 gateway (populated from explicit config or `docker network inspect`).
+    resolved_bridge: StdMutex<Option<BoxProxyBridge>>,
+    /// Supervised reverse SSH tunnel (remote mode) or local TCP bridge forwarder (local mode); stopped on teardown & drop.
+    proxy_forward: StdMutex<Option<ProxyForwardHandle>>,
     /// The mission's lock on the host: held by everything that creates, changes or removes the box.
     lifecycle: Arc<Mutex<()>>,
     state: Mutex<State>,
@@ -1347,20 +1633,100 @@ pub struct MissionBox {
     told: StdMutex<HashSet<String>>,
 }
 
+impl Drop for MissionBox {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.proxy_forward.lock() {
+            if let Some(h) = guard.take() {
+                h.forward.stop.notify_waiters();
+                h.forward.stop.notify_one();
+                h.forward.task.abort();
+            }
+        }
+    }
+}
+
 impl MissionBox {
     pub fn new(host: Arc<DockerHost>, mission: &str, source: EgressSource) -> Arc<MissionBox> {
+        Self::new_with_bridge(host, mission, source, None)
+    }
+
+    /// Like [`MissionBox::new`], optionally wiring a [`BoxProxyBridge`] for bridged `ferret-net` proxy
+    /// access, reverse SSH forwarding (remote mode) or local TCP forwarding (local socket mode),
+    /// dynamic per-mission Docker bridge gateway discovery, tightly-scoped `INPUT 1` firewall rule,
+    /// read-only `/tmp/ferret-ca.pem` staging, and container proxy/CA environment injection.
+    pub fn new_with_bridge(
+        host: Arc<DockerHost>,
+        mission: &str,
+        source: EgressSource,
+        bridge: Option<BoxProxyBridge>,
+    ) -> Arc<MissionBox> {
         let home = host.home_hash();
         let names = names(mission);
+        let initial_resolved = bridge
+            .as_ref()
+            .filter(|b| !b.bridge_gateway_ip.trim().is_empty())
+            .cloned();
         Arc::new(MissionBox {
             lifecycle: host.mission_lock(&names.short),
             names,
             home,
             host,
             source,
+            bridge,
+            resolved_bridge: StdMutex::new(initial_resolved),
+            proxy_forward: StdMutex::new(None),
             state: Mutex::new(State::default()),
             wildcards: StdMutex::new(Vec::new()),
             told: StdMutex::new(HashSet::new()),
         })
+    }
+
+    pub fn proxy_bridge(&self) -> Option<&BoxProxyBridge> {
+        self.bridge.as_ref()
+    }
+
+    /// The resolved [`BoxProxyBridge`] with a concrete IPv4 bridge gateway (available immediately when
+    /// configured explicitly, or after `ready()` discovers the per-mission Docker bridge IPAM gateway).
+    pub fn resolved_proxy_bridge(&self) -> Option<BoxProxyBridge> {
+        self.resolved_bridge
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn effective_bridge(&self) -> Option<BoxProxyBridge> {
+        self.resolved_proxy_bridge().or_else(|| {
+            self.bridge
+                .as_ref()
+                .filter(|b| !b.bridge_gateway_ip.trim().is_empty())
+                .cloned()
+        })
+    }
+
+    /// Resolve the bridge gateway IP (from explicit config or `docker network inspect`) after the mission's
+    /// Docker bridge network exists.
+    async fn resolve_bridge_locked(&self) -> Result<Option<BoxProxyBridge>, String> {
+        let Some(cfg_bridge) = &self.bridge else {
+            return Ok(None);
+        };
+        let gw = match cfg_bridge.validate_config()? {
+            Some(ip) => ip,
+            None => {
+                let looked = self.host.docker(&network_inspect_args(&self.names), None, SMALL_OUT).await?;
+                if !looked.ok() {
+                    return Err(format!(
+                        "Inspecting the box network {} for its bridge gateway failed: {}",
+                        self.names.network,
+                        looked.why()
+                    ));
+                }
+                inspect_network_gateway(&looked.stdout)?
+            }
+        };
+        let mut resolved = cfg_bridge.clone();
+        resolved.bridge_gateway_ip = gw.to_string();
+        *self.resolved_bridge.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(resolved.clone());
+        Ok(Some(resolved))
     }
 
     pub fn names(&self) -> &Names {
@@ -1373,6 +1739,154 @@ impl MissionBox {
 
     async fn run_ok(&self, what: &str, args: Vec<String>) -> Result<DockerOut, String> {
         self.host.run_ok(what, &args, None).await
+    }
+
+    /// Start (or restart if target changed) the proxy bridge forwarder:
+    /// - Remote SSH mode (`docker_socket == ""`): supervised `ssh -N -R <gw>:<bridge_port>:127.0.0.1:<proxy_port>`.
+    /// - Local Docker socket mode (`docker_socket != ""`): supervised local Tokio TCP listener on
+    ///   `<gw>:<bridge_port>` forwarding bidirectionally to `127.0.0.1:<proxy_port>`.
+    async fn ensure_proxy_forward(&self, bridge: Option<&BoxProxyBridge>) -> Result<(), String> {
+        let Some(bridge) = bridge else {
+            return Ok(());
+        };
+        let gw = bridge.validate()?;
+        let want_target = (gw, bridge.bridge_port, bridge.proxy_port);
+        {
+            let guard = self.proxy_forward.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(existing) = guard.as_ref() {
+                if existing.target == want_target && !existing.forward.task.is_finished() {
+                    return Ok(());
+                }
+            }
+        }
+        // Stop any stale forwarder targeting an old gateway/port.
+        self.stop_proxy_forward().await;
+
+        let forward = if self.host.cfg.docker_socket.is_empty() {
+            let args = reverse_proxy_forward_args(&self.host.cfg, bridge)?;
+            let stop = Arc::new(tokio::sync::Notify::new());
+            let (program, run_dir, stop2, mission) = (
+                self.host.ssh_program.clone(),
+                self.host.run_dir.clone(),
+                stop.clone(),
+                self.names.mission.clone(),
+            );
+            let task = tokio::spawn(async move {
+                let mut backoff = Duration::from_secs(1);
+                loop {
+                    let started = Instant::now();
+                    let mut cmd = tokio::process::Command::new(&program);
+                    cmd.args(&args)
+                        .env_clear()
+                        .envs(DockerHost::ssh_env())
+                        .current_dir(&run_dir)
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::piped())
+                        .kill_on_drop(true);
+                    match cmd.spawn() {
+                        Ok(mut child) => {
+                            let stopped = tokio::select! {
+                                _ = child.wait() => false,
+                                () = stop2.notified() => { let _ = child.kill().await; true }
+                            };
+                            if stopped {
+                                break;
+                            }
+                            tracing::warn!(mission = %mission, "box: the reverse proxy ssh forward ended");
+                        }
+                        Err(e) => {
+                            tracing::warn!(mission = %mission, "box: reverse proxy ssh could not start: {e}");
+                        }
+                    }
+                    if started.elapsed() > Duration::from_secs(60) {
+                        backoff = Duration::from_secs(1);
+                    }
+                    tokio::select! {
+                        () = tokio::time::sleep(backoff) => {}
+                        () = stop2.notified() => break,
+                    }
+                    backoff = (backoff * 2).min(Duration::from_secs(30));
+                }
+            });
+            Forward { task, stop }
+        } else {
+            let bind_addr = std::net::SocketAddr::from((gw, bridge.bridge_port));
+            let listener = tokio::net::TcpListener::bind(bind_addr).await.map_err(|e| {
+                format!(
+                    "Binding the local box proxy bridge listener on {bind_addr} failed: {e}. Check box.proxy_bridge_port and bridge gateway reachability."
+                )
+            })?;
+            let upstream = std::net::SocketAddr::from(([127, 0, 0, 1], bridge.proxy_port));
+            let stop = Arc::new(tokio::sync::Notify::new());
+            let stop2 = stop.clone();
+            let mission = self.names.mission.clone();
+            let task = tokio::spawn(async move {
+                let sem = Arc::new(tokio::sync::Semaphore::new(MAX_LOCAL_BRIDGE_CONNS));
+                loop {
+                    let accepted = tokio::select! {
+                        biased;
+                        () = stop2.notified() => break,
+                        res = listener.accept() => res,
+                    };
+                    let Ok((mut inbound, _peer)) = accepted else {
+                        continue;
+                    };
+                    let Ok(permit) = sem.clone().try_acquire_owned() else {
+                        drop(inbound);
+                        continue;
+                    };
+                    let conn_stop = stop2.clone();
+                    let mission_c = mission.clone();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        let Ok(mut out) = tokio::net::TcpStream::connect(upstream).await else {
+                            tracing::debug!(mission = %mission_c, "box proxy bridge: failed to connect to local proxy {upstream}");
+                            return;
+                        };
+                        let _ = tokio::select! {
+                            biased;
+                            () = conn_stop.notified() => Ok((0, 0)),
+                            res = tokio::io::copy_bidirectional(&mut inbound, &mut out) => res,
+                        };
+                    });
+                }
+            });
+            Forward { task, stop }
+        };
+
+        let mut guard = self.proxy_forward.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = Some(ProxyForwardHandle { target: want_target, forward });
+        Ok(())
+    }
+
+    async fn stop_proxy_forward(&self) {
+        let handle = {
+            let mut guard = self.proxy_forward.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.take()
+        };
+        if let Some(h) = handle {
+            h.forward.stop.notify_waiters();
+            h.forward.stop.notify_one();
+            if tokio::time::timeout(Duration::from_secs(5), h.forward.task).await.is_err() {
+                tracing::warn!(mission = %self.names.mission, "box: proxy bridge forwarder did not stop in time");
+            }
+        }
+    }
+
+    /// Stage `/tmp/ferret-ca.pem` (`0444`, read-only tar into `/tmp` tmpfs) if the bridge has a CA cert.
+    async fn stage_ca_if_needed(&self, st: &mut State) -> Result<(), String> {
+        if st.ca_staged {
+            return Ok(());
+        }
+        let Some(pem) = self.bridge.as_ref().and_then(|b| b.ca_pem.as_deref()) else {
+            return Ok(());
+        };
+        self.host
+            .run_ok("Staging the proxy CA certificate", &stage_ca_args(&self.names), Some(ca_tar_bytes(pem)))
+            .await?;
+        st.ca_staged = true;
+        Ok(())
     }
 
     /// Whether the container exists and is running now.
@@ -1402,11 +1916,10 @@ impl MissionBox {
     }
 
     async fn install_rules(&self, plan: &Egress) -> Result<(), String> {
+        let bridge = self.effective_bridge();
+        let args = rules_args_with_bridge(&self.host.cfg, &self.names, bridge.as_ref())?;
         let text = rules_text(&self.names, &plan.allowed).into_bytes();
-        self.host
-            .run_ok("Installing the egress rules", &rules_args(&self.host.cfg, &self.names), Some(text))
-            .await
-            .map(|_| ())
+        self.host.run_ok("Installing the egress rules", &args, Some(text)).await.map(|_| ())
     }
 
     /// Remove the container so that it never runs with rules that are not the grants' (best effort).
@@ -1473,7 +1986,8 @@ impl MissionBox {
             if attempt > 0 {
                 tokio::time::sleep(self.host.retry_delay()).await;
             }
-            let args = rules_check_args(&self.host.cfg, &self.names);
+            let bridge = self.effective_bridge();
+            let args = rules_check_args_with_bridge(&self.host.cfg, &self.names, bridge.as_ref())?;
             if matches!(self.host.docker(&args, None, SMALL_OUT).await, Ok(o) if o.ok()) {
                 return self.rules_ok(st).await;
             }
@@ -1526,10 +2040,20 @@ impl MissionBox {
         if st.closed {
             return Err(BOX_CLOSED.to_string());
         }
+        if let Some(b) = &self.bridge {
+            b.validate_config()?;
+        }
         self.host.ensure_forward().await?;
         if st.up {
             if self.is_running().await {
-                return self.verify_rules(st).await;
+                let resolved = match self.effective_bridge() {
+                    Some(b) => Some(b),
+                    None => self.resolve_bridge_locked().await?,
+                };
+                self.ensure_proxy_forward(resolved.as_ref()).await?;
+                self.verify_rules(st).await?;
+                self.stage_ca_if_needed(st).await?;
+                return Ok(());
             }
             st.forget();
         }
@@ -1545,8 +2069,11 @@ impl MissionBox {
                     st.paused = paused;
                     // What it was created with is not known: its names count as pending until `box_reset`.
                     st.wanted_hosts = plan.hosts.clone();
+                    let resolved = self.resolve_bridge_locked().await?;
+                    self.ensure_proxy_forward(resolved.as_ref()).await?;
                     self.install_rules(&plan).await?;
                     self.rules_ok(st).await?;
+                    self.stage_ca_if_needed(st).await?;
                     return Ok(());
                 }
                 ContainerFound::Stale(why) => {
@@ -1569,8 +2096,12 @@ impl MissionBox {
         }
         // Leftovers of an earlier box of this mission (stopped container, network).
         let _ = self.host.docker(&rm_args(&self.names), None, SMALL_OUT).await;
+        // 1. Create or adopt the mission's bridge network first so its IPAM gateway exists.
         self.make_network().await?;
-        // The container starts only once the rules that confine it are in place.
+        // 2. Discover/validate the concrete bridge gateway IP, then start the proxy forwarder.
+        let resolved = self.resolve_bridge_locked().await?;
+        self.ensure_proxy_forward(resolved.as_ref()).await?;
+        // 3. The container starts only once the rules that confine it are in place.
         self.install_rules(&plan).await?;
         self.run_ok(
             "Starting the box",
@@ -1582,6 +2113,7 @@ impl MissionBox {
         st.created_hosts.clone_from(&plan.hosts);
         st.wanted_hosts = plan.hosts;
         st.verified = Some(Instant::now());
+        self.stage_ca_if_needed(st).await?;
         Ok(())
     }
 
@@ -1656,7 +2188,9 @@ impl MissionBox {
         let mut st = self.state.lock().await;
         st.forget();
         st.closed = true;
-        teardown_names_locked(&self.host, &self.names).await;
+        self.stop_proxy_forward().await;
+        let bridge = self.effective_bridge();
+        teardown_names_locked_with_bridge(&self.host, &self.names, bridge.as_ref()).await;
     }
 
     /// The granted names whose addresses differ from what the running container was created with: their rules
@@ -1760,7 +2294,8 @@ impl MissionBox {
     /// The program that runs one command in the box (I1). `cwd` is relative to `/work`.
     pub fn launcher(&self, call_id: &str, cwd: Option<&str>, script: &str) -> Result<Launcher, String> {
         let dir = work_dir(cwd)?;
-        let (program, args) = self.host.argv(&exec_args(&self.names, call_id, &dir, script));
+        let bridge = self.effective_bridge();
+        let (program, args) = self.host.argv(&exec_args_with_bridge(&self.names, call_id, &dir, script, bridge.as_ref()));
         let pid = pid_file(call_id);
         let (host, n) = (self.host.clone(), self.names.clone());
         let stop = move |sig: i32| {
@@ -1918,6 +2453,31 @@ enum Found {
     Foreign { attached: usize, why: String },
 }
 
+/// Extract the IPv4 bridge gateway address from `docker network inspect --format '{{json .}}'`
+/// (`/IPAM/Config/*/Gateway`).
+pub fn inspect_network_gateway(json: &[u8]) -> Result<Ipv4Addr, String> {
+    let parsed: serde_json::Value = serde_json::from_slice(json)
+        .map_err(|e| format!("Docker network inspect JSON could not be parsed for bridge gateway: {e}."))?;
+    let obj = match &parsed {
+        serde_json::Value::Array(arr) => arr.first().unwrap_or(&parsed),
+        other => other,
+    };
+    let configs = obj
+        .pointer("/IPAM/Config")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("Docker network inspect JSON has no `/IPAM/Config` array for bridge gateway discovery.")?;
+    for cfg in configs {
+        if let Some(gw) = cfg.get("Gateway").and_then(serde_json::Value::as_str) {
+            if let Ok(ip) = gw.trim().parse::<Ipv4Addr>() {
+                if !ip.is_unspecified() {
+                    return Ok(ip);
+                }
+            }
+        }
+    }
+    Err("Docker network inspect JSON contained no usable IPv4 IPAM gateway address.".into())
+}
+
 /// Judge the JSON of `docker network inspect --format '{{json .}}'` (R5).
 fn inspect_network(json: &[u8], n: &Names, home: &str) -> Result<Found, String> {
     let v: serde_json::Value = serde_json::from_slice(json)
@@ -1944,6 +2504,10 @@ fn inspect_network(json: &[u8], n: &Names, home: &str) -> Result<Found, String> 
 /// last, and only when the container is gone and the network is gone or was not there: while either exists
 /// the chain (and `FERRET-ALL` behind it) is what confines the bridge (R1).
 async fn teardown_names_locked(host: &DockerHost, n: &Names) {
+    teardown_names_locked_with_bridge(host, n, None).await;
+}
+
+async fn teardown_names_locked_with_bridge(host: &DockerHost, n: &Names, bridge: Option<&BoxProxyBridge>) {
     let container = host.docker(&rm_args(n), None, SMALL_OUT).await;
     match container {
         Ok(o) if o.ok() || o.stderr.contains("No such container") => {}
@@ -1967,7 +2531,9 @@ async fn teardown_names_locked(host: &DockerHost, n: &Names) {
             return;
         }
     }
-    match host.docker(&rules_remove_args(&host.cfg, n), None, SMALL_OUT).await {
+    let rm_rules_args = rules_remove_args_with_bridge(&host.cfg, n, bridge)
+        .unwrap_or_else(|_| rules_remove_args(&host.cfg, n));
+    match host.docker(&rm_rules_args, None, SMALL_OUT).await {
         Ok(o) if o.ok() => {}
         Ok(o) => tracing::warn!(mission = %n.mission, "box: the egress chain was not removed: {}", o.why()),
         Err(e) => tracing::warn!(mission = %n.mission, "box: the egress chain was not removed: {e}"),
@@ -2045,9 +2611,13 @@ case "$sub" in
   run)
     case " $* " in
       *" --entrypoint /bin/sh "*)
-        # The helper: the last two arguments are the chain and the interface. Its three scripts are told apart
-        # by their first word; the chain is a file here, so tests can see when it exists.
-        chain=""; iface=""; for a in "$@"; do chain="$iface"; iface="$a"; done
+        # The helper: the arguments after `_` are chain, iface (and optional gateway IP + port for bridge mode).
+        seen_us=0; chain=""; iface=""
+        for a in "$@"; do
+          if [ "$seen_us" = "1" ]; then chain="$a"; seen_us=2
+          elif [ "$seen_us" = "2" ]; then iface="$a"; seen_us=3
+          elif [ "$a" = "_" ]; then seen_us=1; fi
+        done
         [ -f "$D/rules.fail" ] && { echo "iptables: failed" >&2; exit 1; }
         if [ -f "$D/rules.fail.count" ]; then n=$(cat "$D/rules.fail.count"); if [ "$n" -gt 0 ]; then echo $((n-1)) > "$D/rules.fail.count"; echo "iptables: transient" >&2; exit 1; fi; fi
         case "$*" in
@@ -2131,7 +2701,8 @@ case "$sub" in
               done
               if [ -f "$D/net-$last" ]; then echo "Error response from daemon: network with name $last already exists" >&2; exit 1; fi
               touch "$D/net-$last"; echo "$iface" > "$D/netif-$last"
-              printf '{"Name":"%s","Driver":"bridge","EnableIPv6":false,"Labels":{"ferret.home":"%s","ferret.mission":"%s"},"Options":{"com.docker.network.bridge.name":"%s"},"Containers":{}}\n' "$last" "$h" "$m" "$iface" > "$D/netjson-$last"
+              gw="127.0.0.1"; [ -f "$D/net.gateway" ] && gw=$(cat "$D/net.gateway")
+              printf '{"Name":"%s","Driver":"bridge","EnableIPv6":false,"Labels":{"ferret.home":"%s","ferret.mission":"%s"},"Options":{"com.docker.network.bridge.name":"%s"},"IPAM":{"Config":[{"Subnet":"127.0.0.0/8","Gateway":"%s"}]},"Containers":{}}\n' "$last" "$h" "$m" "$iface" "$gw" > "$D/netjson-$last"
               echo netid; exit 0;;
       inspect) for a in "$@"; do last="$a"; done
               if [ -f "$D/netjson-$last" ]; then cat "$D/netjson-$last"; exit 0; fi
@@ -2163,6 +2734,7 @@ case "$sub" in
         case "$a" in
           --directory=/) a="--directory=$D";;
           --directory=/work*) a="--directory=$D${a#--directory=}";;
+          --directory=/tmp*) mkdir -p "$D/tmp"; a="--directory=$D${a#--directory=}";;
         esac
         set -- "$@" "$a"
       done
@@ -3322,6 +3894,7 @@ case "$op" in
   -A) has "$c" || exit 1; echo "$c|$*" >> "$F"; exit 0;;
   -I) case "$1" in [0-9]*) shift;; esac; has "$c" || exit 1; { echo "$c|$*"; cat "$F"; } > "$S/t"; mv "$S/t" "$F"; exit 0;;
   -D) grep -qxF "$c|$*" "$F" || exit 1; grep -vxF "$c|$*" "$F" > "$S/t"; mv "$S/t" "$F"; exit 0;;
+  -S) has "$c" || exit 1; grep "^$c|" "$F" | while IFS= read -r l; do printf '%s\n' "-A $c ${l#*|}"; done; exit 0;;
   -F) has "$c" || exit 1; grep -v "^$c|" "$F" > "$S/t"; mv "$S/t" "$F"; exit 0;;
   -X) has "$c" || exit 1; grep -q "^$c|" "$F" && exit 1; grep -vxF "$c" "$C" > "$S/t"; mv "$S/t" "$C"; exit 0;;
 esac
@@ -3352,13 +3925,17 @@ exit 2
 
         /// Run one of the helper's scripts the way the helper container does, with the stub tools.
         fn run(&self, script: &str, n: &Names, stdin: &str) -> bool {
+            self.run_with_extra(script, n, &[], stdin)
+        }
+
+        fn run_with_extra(&self, script: &str, n: &Names, extra: &[&str], stdin: &str) -> bool {
             use std::io::Write;
-            let mut child = std::process::Command::new("/bin/sh")
-                .arg("-c")
-                .arg(script)
-                .arg("_")
-                .arg(&n.chain)
-                .arg(&n.iface)
+            let mut cmd = std::process::Command::new("/bin/sh");
+            cmd.arg("-c").arg(script).arg("_").arg(&n.chain).arg(&n.iface);
+            for e in extra {
+                cmd.arg(e);
+            }
+            let mut child = cmd
                 .env_clear()
                 .env("PATH", format!("{}:/usr/bin:/bin", self.dir.display()))
                 .stdin(Stdio::piped())
@@ -4022,5 +4599,385 @@ exit 2
                 "expected Stale for {label}"
             );
         }
+    }
+
+    #[test]
+    fn proxy_bridge_iptables_rule_order_and_cleanup_preserve_host_isolation() {
+        let t = Tables::new();
+        let n = names("m-bridge");
+        let n2 = names("m-bridge-other");
+        let allowed: BTreeSet<Allowed> =
+            [Allowed { ip: "203.0.113.7".parse().unwrap(), port: Some(443) }].into_iter().collect();
+        let gw = "172.28.0.1";
+        let port = "18080";
+        let gw2 = "172.29.0.1";
+        let port2 = "18081";
+        let bridge_rule = format!("-i {} -p tcp -d {gw} --dport {port} -j ACCEPT", n.iface);
+        let bridge_rule2 = format!("-i {} -p tcp -d {gw2} --dport {port2} -j ACCEPT", n2.iface);
+
+        // Apply bridge rules: tightly-scoped INPUT 1 ACCEPT lands strictly BEFORE unconditional INPUT -i fb-+ -j DROP.
+        assert!(t.run_with_extra(RULES_APPLY_BRIDGE, &n, &[gw, port], &rules_text(&n, &allowed)));
+        assert_eq!(t.chain("iptables", "INPUT"), [bridge_rule.clone(), "-i fb-+ -j DROP".to_string()]);
+        // IPv6 remains unconditionally dropped in both INPUT and FORWARD.
+        assert_eq!(t.chain("ip6tables", ALL_CHAIN6), ["-j DROP"]);
+        assert_eq!(
+            t.chain("ip6tables", "INPUT"),
+            [format!("-i {} -j DROP", n.iface), "-i fb-+ -j FERRET-ALL6".to_string()]
+        );
+        assert!(t.run_with_extra(RULES_CHECK_BRIDGE, &n, &[gw, port], ""));
+
+        // Re-applying is idempotent and keeps exact order (no duplicates).
+        assert!(t.run_with_extra(RULES_APPLY_BRIDGE, &n, &[gw, port], &rules_text(&n, &allowed)));
+        assert_eq!(t.chain("iptables", "INPUT"), [bridge_rule.clone(), "-i fb-+ -j DROP".to_string()]);
+
+        // Add a second mission bridge rule so we can prove cleanup never touches sibling missions.
+        assert!(t.run_with_extra(RULES_APPLY_BRIDGE, &n2, &[gw2, port2], &rules_text(&n2, &BTreeSet::new())));
+        assert_eq!(
+            t.chain("iptables", "INPUT"),
+            [bridge_rule2.clone(), bridge_rule.clone(), "-i fb-+ -j DROP".to_string()]
+        );
+
+        // Removing via RULES_REMOVE_BRIDGE removes ONLY m1's rule, leaving m2 and INPUT -i fb-+ -j DROP intact.
+        assert!(t.run_with_extra(RULES_REMOVE_BRIDGE, &n, &[gw, port], ""));
+        assert_eq!(t.chain("iptables", "INPUT"), [bridge_rule2.clone(), "-i fb-+ -j DROP".to_string()]);
+        assert_eq!(t.chain("ip6tables", ALL_CHAIN6), ["-j DROP"]);
+        assert!(!t.run_with_extra(RULES_CHECK_BRIDGE, &n, &[gw, port], ""));
+
+        // Plain RULES_REMOVE (used by `teardown_mission` / `reconcile` without knowing the bridge port/gw)
+        // ALSO sweeps any `INPUT -i <iface> ... -j ACCEPT` rule, including Linux canonical `-S` flag order!
+        {
+            let p = t.dir.join("iptables.rules");
+            let cur = std::fs::read_to_string(&p).unwrap();
+            let linux_canonical =
+                format!("INPUT|-d 172.30.0.1/32 -i {} -p tcp -m tcp --dport 39000 -j ACCEPT\n{cur}", n2.iface);
+            std::fs::write(&p, linux_canonical).unwrap();
+        }
+        assert!(t.run(RULES_REMOVE, &n2, ""));
+        assert_eq!(t.chain("iptables", "INPUT"), ["-i fb-+ -j DROP"]);
+        assert_eq!(t.chain("ip6tables", ALL_CHAIN6), ["-j DROP"]);
+
+        // Non-bridge helpers remain byte-for-byte identical.
+        let cfg = sample_cfg();
+        assert_eq!(rules_args_with_bridge(&cfg, &n, None).unwrap(), rules_args(&cfg, &n));
+        assert_eq!(rules_check_args_with_bridge(&cfg, &n, None).unwrap(), rules_check_args(&cfg, &n));
+        assert_eq!(rules_remove_args_with_bridge(&cfg, &n, None).unwrap(), rules_remove_args(&cfg, &n));
+        assert_eq!(exec_args_with_bridge(&n, "c1", "/work", "id", None), exec_args(&n, "c1", "/work", "id"));
+    }
+
+    #[test]
+    fn reverse_proxy_forward_args_auth_debug_and_gateway_inspection_work() {
+        let cfg = sample_cfg();
+        let bridge = BoxProxyBridge {
+            proxy_port: 31280,
+            proxy_auth: Some(("sess-user".into(), "top-secret-pw-9876".into())),
+            bridge_port: 18080,
+            bridge_gateway_ip: "172.28.0.1".into(),
+            ca_pem: Some(b"PEM".to_vec()),
+        };
+        // Custom Debug MUST redact the proxy password and never leak it.
+        let dbg = format!("{bridge:?}");
+        assert!(!dbg.contains("top-secret-pw-9876"), "password leaked in Debug: {dbg}");
+        assert!(dbg.contains("[redacted]") && dbg.contains("sess-user"), "{dbg}");
+
+        // proxy_url embeds Basic auth credentials when configured.
+        assert_eq!(bridge.proxy_url(), "http://sess-user:top-secret-pw-9876@172.28.0.1:18080");
+        assert_eq!(
+            BoxProxyBridge { proxy_auth: None, ..bridge.clone() }.proxy_url(),
+            "http://172.28.0.1:18080"
+        );
+
+        // validate_config allows empty bridge_gateway_ip (auto-discovery), whereas validate requires a concrete IP.
+        let auto = BoxProxyBridge { bridge_gateway_ip: String::new(), ..bridge.clone() };
+        assert_eq!(auto.validate_config().unwrap(), None);
+        assert!(auto.validate().is_err());
+
+        // Bad auth chars / empty user/pass are rejected.
+        for bad_auth in [
+            Some(("".into(), "pw".into())),
+            Some(("u".into(), "".into())),
+            Some(("u@bad".into(), "pw".into())),
+            Some(("u".into(), "p:w".into())),
+            Some(("u".into(), "p/w".into())),
+            Some(("u".into(), "p w".into())),
+            Some(("u".into(), "p\nw".into())),
+        ] {
+            assert!(
+                BoxProxyBridge { proxy_auth: bad_auth, ..bridge.clone() }.validate_config().is_err()
+            );
+        }
+
+        // inspect_network_gateway parses Docker IPAM Config Gateway (object or array) and rejects missing/0.0.0.0.
+        assert_eq!(
+            inspect_network_gateway(br#"{"IPAM":{"Config":[{"Subnet":"172.21.0.0/16","Gateway":"172.21.0.1"}]}}"#)
+                .unwrap(),
+            Ipv4Addr::new(172, 21, 0, 1)
+        );
+        assert_eq!(
+            inspect_network_gateway(br#"[{"IPAM":{"Config":[{"Gateway":"172.25.0.1"}]}}]"#).unwrap(),
+            Ipv4Addr::new(172, 25, 0, 1)
+        );
+        assert!(inspect_network_gateway(br#"{"IPAM":{"Config":[{"Gateway":"0.0.0.0"}]}}"#).is_err());
+        assert!(inspect_network_gateway(br#"{"IPAM":{"Config":[]}}"#).is_err());
+
+        assert_eq!(
+            reverse_proxy_forward_args(&cfg, &bridge).unwrap(),
+            [
+                "-N",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ExitOnForwardFailure=yes",
+                "-o",
+                "ControlPath=none",
+                "-o",
+                "ForwardAgent=no",
+                "-o",
+                "ServerAliveInterval=15",
+                "-R",
+                "172.28.0.1:18080:127.0.0.1:31280",
+                "--",
+                "ferret-box",
+            ]
+        );
+        // Invalid gateway / port / ssh_host are rejected before touching argv.
+        assert!(reverse_proxy_forward_args(
+            &cfg,
+            &BoxProxyBridge { bridge_gateway_ip: "172.28.0.1; id".into(), ..bridge.clone() }
+        )
+        .is_err());
+        assert!(reverse_proxy_forward_args(&cfg, &BoxProxyBridge { bridge_port: 0, ..bridge.clone() }).is_err());
+        assert!(reverse_proxy_forward_args(&cfg, &BoxProxyBridge { proxy_port: 0, ..bridge.clone() }).is_err());
+        assert!(reverse_proxy_forward_args(&BoxCfg { ssh_host: String::new(), ..cfg }, &bridge).is_err());
+    }
+
+    fn free_loopback_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    }
+
+    #[tokio::test]
+    async fn proxy_bridge_discovers_gateway_stages_readonly_ca_injects_auth_env_and_restages_on_reset() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let f = FakeDocker::new(dir.path());
+        let pem = b"-----BEGIN CERTIFICATE-----\nMIIFakeFerretCA==\n-----END CERTIFICATE-----\n".to_vec();
+        let bridge_port = free_loopback_port();
+        let bridge = BoxProxyBridge {
+            proxy_port: 31280,
+            proxy_auth: Some(("boxuser".into(), "boxpass123".into())),
+            bridge_port,
+            bridge_gateway_ip: String::new(), // auto-discover via `docker network inspect`
+            ca_pem: Some(pem.clone()),
+        };
+        let b = MissionBox::new_with_bridge(f.host(), "m-br", source(&["203.0.113.7"]), Some(bridge));
+        assert!(b.resolved_proxy_bridge().is_none(), "not yet discovered before ready()");
+        b.ready().await.unwrap();
+
+        // 0. Gateway dynamically discovered from `docker network inspect` IPAM Config.
+        let resolved = b.resolved_proxy_bridge().expect("resolved bridge after ready()");
+        assert_eq!(resolved.bridge_gateway_ip, "127.0.0.1");
+        let want_proxy_url = format!("http://boxuser:boxpass123@127.0.0.1:{bridge_port}");
+        assert_eq!(resolved.proxy_url(), want_proxy_url);
+
+        // 1. Helper call used RULES_APPLY_BRIDGE with the discovered gateway IP & bridge port arguments.
+        let runs = f.sub("run");
+        let helper = &runs[0];
+        assert!(helper.iter().any(|a| a == RULES_APPLY_BRIDGE), "{helper:?}");
+        assert_eq!(&helper[helper.len() - 2..], ["127.0.0.1", &bridge_port.to_string()]);
+
+        // 2. CA certificate was staged via tar exec into /tmp/ferret-ca.pem with mode 0444 (never `docker cp`).
+        assert!(f.sub("cp").is_empty(), "must never invoke docker cp on read-only rootfs");
+        let staged_path = f.dir.join("tmp/ferret-ca.pem");
+        assert_eq!(std::fs::read(&staged_path).unwrap(), pem);
+        assert_eq!(std::fs::metadata(&staged_path).unwrap().permissions().mode() & 0o777, 0o444);
+
+        // 3. Container exec argv injects all authenticated proxy + CA environment variables.
+        let launch = b.launch("call-br", None, "true").unwrap();
+        let argv = &launch.launcher.args;
+        for (k, v) in [
+            ("HTTP_PROXY", want_proxy_url.as_str()),
+            ("HTTPS_PROXY", want_proxy_url.as_str()),
+            ("ALL_PROXY", want_proxy_url.as_str()),
+            ("http_proxy", want_proxy_url.as_str()),
+            ("https_proxy", want_proxy_url.as_str()),
+            ("all_proxy", want_proxy_url.as_str()),
+            ("NO_PROXY", "localhost,127.0.0.1"),
+            ("no_proxy", "localhost,127.0.0.1"),
+            ("SSL_CERT_FILE", "/tmp/ferret-ca.pem"),
+            ("REQUESTS_CA_BUNDLE", "/tmp/ferret-ca.pem"),
+            ("NODE_EXTRA_CA_CERTS", "/tmp/ferret-ca.pem"),
+            ("CURL_CA_BUNDLE", "/tmp/ferret-ca.pem"),
+        ] {
+            let pair = format!("{k}={v}");
+            assert!(
+                argv.windows(2).any(|w| w == ["--env", pair.as_str()]),
+                "missing --env {pair} in {argv:?}"
+            );
+        }
+
+        // 4. Reset removes & recreates the container and re-stages /tmp/ferret-ca.pem.
+        let stage_count_before = f.sub("exec").iter().filter(|c| c.iter().any(|a| a == "--directory=/tmp")).count();
+        assert_eq!(stage_count_before, 1);
+        b.reset().await.unwrap();
+        let stage_count_after = f.sub("exec").iter().filter(|c| c.iter().any(|a| a == "--directory=/tmp")).count();
+        assert_eq!(stage_count_after, 2, "CA must be re-staged after box reset");
+        assert_eq!(std::fs::read(&staged_path).unwrap(), pem);
+
+        // 5. Teardown calls RULES_REMOVE_BRIDGE with the discovered bridge gateway IP and port and stops listener.
+        let mark = f.calls().len();
+        b.teardown().await;
+        assert!(b.proxy_forward.lock().unwrap().is_none(), "local TCP bridge listener must stop on teardown");
+        let all_calls = f.calls();
+        let remove_call = all_calls[mark..]
+            .iter()
+            .find(|c| c.iter().any(|a| a == RULES_REMOVE_BRIDGE))
+            .expect("bridge remove helper call");
+        assert_eq!(&remove_call[remove_call.len() - 2..], ["127.0.0.1", &bridge_port.to_string()]);
+
+        // 6. Verify non-bridge mode does ZERO CA staging and injects ZERO proxy/CA env vars.
+        let plain = MissionBox::new(f.host(), "m-plain", source(&[]));
+        let mark = f.calls().len();
+        plain.ready().await.unwrap();
+        assert!(
+            !f.calls()[mark..].iter().any(|c| c.iter().any(|a| a == "--directory=/tmp")),
+            "non-bridge mode must not stage CA"
+        );
+        let plain_launch = plain.launch("call-plain", None, "true").unwrap();
+        assert!(
+            !plain_launch.launcher.args.iter().any(|a| a.contains("HTTP_PROXY") || a.contains("SSL_CERT_FILE")),
+            "{:?}",
+            plain_launch.launcher.args
+        );
+    }
+
+    #[tokio::test]
+    async fn local_proxy_bridge_forwards_real_http_traffic_through_ferret_net_proxy_with_basic_auth() {
+        use axum::{routing::get, Router};
+        use ferret_core::SessionId;
+
+        // 1. Start a real target HTTP server on loopback.
+        let target_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target_listener.local_addr().unwrap();
+        let target_app = Router::new().route("/hello", get(|| async { "proxied-through-box-bridge" }));
+        let target_srv = tokio::spawn(async move { axum::serve(target_listener, target_app).await.unwrap() });
+
+        // 2. Start a real `ferret-net::proxy::Proxy` and issue a session grant allowing `127.0.0.1:<target_port>`.
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let proxy = ferret_net::proxy::Proxy::start(0, tx).await.unwrap();
+        let net_cfg = NetworkCfg {
+            mode: NetworkMode::Allowlist,
+            allow_private: vec!["127.0.0.0/8".into()],
+            allow: vec![format!("127.0.0.1:{}", target_addr.port())],
+            ..NetworkCfg::default()
+        };
+        let pol = Policy::new(&net_cfg).unwrap();
+        let grant = proxy.grant(&SessionId::from("s-box-bridge"), pol).unwrap();
+
+        // 3. Bring up a local-socket MissionBox with dynamic gateway discovery (`""` -> `127.0.0.1`) + Basic auth.
+        let dir = tempfile::tempdir().unwrap();
+        let f = FakeDocker::new(dir.path());
+        let bridge_port = free_loopback_port();
+        let bridge = BoxProxyBridge {
+            proxy_port: grant.port,
+            proxy_auth: Some((grant.user.clone(), grant.password.clone())),
+            bridge_port,
+            bridge_gateway_ip: String::new(),
+            ca_pem: None,
+        };
+        let b = MissionBox::new_with_bridge(f.host(), "m-e2e-bridge", source(&[]), Some(bridge));
+        b.ready().await.unwrap();
+        let resolved = b.resolved_proxy_bridge().expect("resolved bridge");
+        assert_eq!(resolved.bridge_gateway_ip, "127.0.0.1");
+
+        // 4. Send a real HTTP request using the bridge's authenticated `proxy_url()` -> 200 OK from target!
+        let authed_client = reqwest::Client::builder()
+            .no_proxy()
+            .proxy(reqwest::Proxy::all(resolved.proxy_url()).unwrap())
+            .build()
+            .unwrap();
+        let resp = authed_client.get(format!("http://{target_addr}/hello")).send().await.unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        assert_eq!(resp.text().await.unwrap(), "proxied-through-box-bridge");
+
+        // 5. Same bridge WITHOUT proxy credentials gets 407 Proxy Authentication Required from `ferret-net::Proxy`.
+        let unauthed_client = reqwest::Client::builder()
+            .no_proxy()
+            .proxy(reqwest::Proxy::all(format!("http://127.0.0.1:{bridge_port}")).unwrap())
+            .build()
+            .unwrap();
+        let denied = unauthed_client.get(format!("http://{target_addr}/hello")).send().await.unwrap();
+        assert_eq!(denied.status().as_u16(), 407);
+
+        // 6. Teardown cleanly stops the local bridge forwarder so the port closes.
+        b.teardown().await;
+        assert!(
+            tokio::net::TcpStream::connect(("127.0.0.1", bridge_port)).await.is_err(),
+            "local bridge listener should close after teardown"
+        );
+        proxy.shutdown();
+        target_srv.abort();
+    }
+
+    #[tokio::test]
+    async fn remote_ssh_proxy_bridge_discovers_non_loopback_gateway_and_stops_on_teardown() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let fake_docker = FakeDocker::new(&root.join("docker-fake"));
+        // Simulate a real per-mission Docker bridge gateway (e.g. 172.22.0.1, NOT docker0's 172.17.0.1).
+        std::fs::write(fake_docker.dir.join("net.gateway"), "172.22.0.1").unwrap();
+        std::fs::create_dir_all(root.join("keys")).unwrap();
+
+        // Fake ssh: handles both `-L` (docker socket forward) and `-R` (reverse proxy bridge forward).
+        let ssh = root.join("ssh");
+        let script = format!(
+            "#!/bin/sh\nfor a in \"$@\"; do printf '%s ' \"$a\"; done >> '{r}/ssh.calls'\necho '' >> '{r}/ssh.calls'\n\
+             sock=''; prev=''; for a in \"$@\"; do [ \"$prev\" = '-L' ] && sock=\"${{a%%:*}}\"; prev=\"$a\"; done\n\
+             [ -n \"$sock\" ] && : > \"$sock\"\nexec sleep 300\n",
+            r = root.display()
+        );
+        std::fs::write(&ssh, script).unwrap();
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let cfg = BoxCfg {
+            enabled: true,
+            ssh_host: "ferret-box".into(),
+            remote_socket: "/var/run/docker.sock".into(),
+            docker_socket: String::new(),
+            docker_cli: fake_docker.cli.display().to_string(),
+            image: DIGEST.into(),
+            helper_image: format!("helper@{DIGEST}"),
+            ..BoxCfg::default()
+        };
+        let host = DockerHost::new_in(&cfg, &root, root.as_os_str()).unwrap();
+        let bridge = BoxProxyBridge {
+            proxy_port: 31280,
+            proxy_auth: Some(("s1".into(), "pw1".into())),
+            bridge_port: 18080,
+            bridge_gateway_ip: String::new(), // auto-discover 172.22.0.1 from `docker network inspect`
+            ca_pem: None,
+        };
+        let b = MissionBox::new_with_bridge(host.clone(), "m-ssh-br", source(&[]), Some(bridge));
+        b.ready().await.unwrap();
+
+        let resolved = b.resolved_proxy_bridge().expect("resolved bridge");
+        assert_eq!(resolved.bridge_gateway_ip, "172.22.0.1");
+        assert_eq!(resolved.proxy_url(), "http://s1:pw1@172.22.0.1:18080");
+
+        // Wait briefly for the spawned reverse `-R` ssh invocation to log its argv with discovered 172.22.0.1.
+        let mut saw_reverse = false;
+        for _ in 0..40 {
+            if let Ok(log) = std::fs::read_to_string(root.join("ssh.calls")) {
+                if log.contains("-R 172.22.0.1:18080:127.0.0.1:31280 -- ferret-box") {
+                    saw_reverse = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(saw_reverse, "expected reverse proxy ssh forward invocation with discovered 172.22.0.1");
+
+        b.teardown().await;
+        assert!(b.proxy_forward.lock().unwrap().is_none(), "reverse proxy forward must stop on teardown");
+        host.shutdown().await;
     }
 }

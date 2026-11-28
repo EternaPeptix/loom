@@ -5,6 +5,7 @@
 //! policy, resolves names itself, and reports every decision so it lands in that session's log.
 //! See `docs/DESIGN.md` §11.
 
+pub mod analyze;
 pub mod capture;
 pub mod inject;
 pub mod netlog;
@@ -14,6 +15,7 @@ pub mod proxy;
 pub mod rewrite;
 pub mod tls;
 
+pub use analyze::{analyze_exchange, PASSIVE_MAX_BODY_BYTES, PASSIVE_MAX_SIGNALS};
 pub use capture::{CaptureGrant, CaptureSink, Captured, Transport};
 pub use inject::Inject;
 pub use pace::{render_noise_profile_prompt, Governor, HostNoise, NoiseProfile};
@@ -23,5 +25,5 @@ pub use proxy::{
 };
 pub use rewrite::{
     AssessmentUa, HeaderMatch, RewriteAction, RewriteMatcher, RewritePhase, RewriteRule, RewriteSet, RewriteStore,
-    RewrittenHead, RewrittenRawHead,
+    RewrittenHead, RewrittenRawHead, RewrittenResponseCapture,
 };

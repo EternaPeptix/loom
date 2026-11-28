@@ -1661,7 +1661,17 @@ function step(store, rec) {
       push(store, { ...base(rec), kind: "line", sub: "request", detail: true, tone: "dim", text: `request ${rec.req_id}: step ${rec.step}, epoch ${rec.epoch}, about ${tokens(rec.est_tokens)} tokens${rec.purpose && rec.purpose !== "step" ? " (" + rec.purpose + ")" : ""}` });
       break;
     case "session_start":
-      store.start = { target: rec.target || null, budget: rec.budget || {}, tools: (rec.tools || []).length, mcpTools: countMcpTools(rec.tools), termination: rec.termination, reasoning_replay: rec.reasoning_replay, model: rec.model ? modelEntry(rec, rec.model) : null };
+      store.start = {
+        target: rec.target || null,
+        creds: rec.creds || null,
+        creds_profiles: Array.isArray(rec.creds_profiles) ? rec.creds_profiles : [],
+        budget: rec.budget || {},
+        tools: (rec.tools || []).length,
+        mcpTools: countMcpTools(rec.tools),
+        termination: rec.termination,
+        reasoning_replay: rec.reasoning_replay,
+        model: rec.model ? modelEntry(rec, rec.model) : null,
+      };
       if (rec.model) store.models.push(modelEntry(rec, rec.model));
       break;
     case "turn_start":
@@ -2634,6 +2644,18 @@ export function buildNewSession(form) {
   // A credential profile (S3) goes with a target only; "none" or empty sends nothing.
   const creds = String(form.creds || "").trim();
   if (target && creds && creds !== "none") body.creds = creds;
+  // Multi-principal credential profiles (Wave B) go with a target only; deduplicated and trimmed.
+  const rawProfiles = Array.isArray(form.credsProfiles)
+    ? form.credsProfiles
+    : typeof form.credsProfiles === "string"
+      ? form.credsProfiles.split(/[\s,]+/)
+      : [];
+  const credsProfiles = [];
+  for (const p of rawProfiles) {
+    const name = String(p || "").trim();
+    if (name && name !== "none" && !credsProfiles.includes(name)) credsProfiles.push(name);
+  }
+  if (target && credsProfiles.length) body.creds_profiles = credsProfiles;
   // `core` is the daemon's default pack: a core mission's body names none.
   if (form.pack && form.pack !== "core") body.pack = String(form.pack);
   // Only a role that starts agents has an agents' model: the choice for every role goes with it, before its first agent.
@@ -5201,6 +5223,78 @@ export function mcpServersModel(list) {
 
 const blobRefOf = (r) => (r && typeof r === "object" && typeof r.id === "string" && r.id ? { id: r.id, bytes: Number(r.bytes) || 0, lines: Number(r.lines) || 0 } : null);
 
+export const PASSIVE_SEVERITIES = ["high", "medium", "low", "info"];
+const PASSIVE_SEVERITY_RANK = { high: 3, medium: 2, low: 1, info: 0 };
+
+/** Normalize a passive signal severity string to `high | medium | low | info`. */
+export function normalizePassiveSeverity(sev) {
+  const s = String(sev || "").trim().toLowerCase();
+  return s in PASSIVE_SEVERITY_RANK ? s : "info";
+}
+
+function passiveSignalsOf(list) {
+  if (!Array.isArray(list)) return [];
+  const out = [];
+  for (const s of list) {
+    if (!s || typeof s !== "object") continue;
+    const kind = typeof s.kind === "string" ? s.kind.trim() : "";
+    const summary = typeof s.summary === "string" ? s.summary.trim() : "";
+    if (!kind && !summary) continue;
+    const detail = typeof s.detail === "string" ? s.detail.trim() : "";
+    out.push({ kind, severity: normalizePassiveSeverity(s.severity), summary, detail });
+  }
+  return out;
+}
+
+/**
+ * Summarize `exchange.passive_signals`: counts per severity, highest severity (`high > medium > low > info`),
+ * concise badge text, multi-line tooltip, and signals sorted highest severity first.
+ */
+export function summarizePassiveSignals(signals) {
+  const counts = { high: 0, medium: 0, low: 0, info: 0 };
+  const items = passiveSignalsOf(signals)
+    .map((sig, idx) => ({ sig, idx }))
+    .sort((a, b) => (PASSIVE_SEVERITY_RANK[b.sig.severity] - PASSIVE_SEVERITY_RANK[a.sig.severity]) || (a.idx - b.idx))
+    .map((x) => x.sig);
+  for (const sig of items) counts[sig.severity]++;
+  const total = items.length;
+  const maxSeverity = PASSIVE_SEVERITIES.find((sev) => counts[sev] > 0) || null;
+  const badge = total
+    ? PASSIVE_SEVERITIES.filter((sev) => counts[sev] > 0).map((sev) => `${counts[sev]} ${sev}`).join(" · ")
+    : "";
+  const tooltip = items
+    .map((sig) => {
+      const tag = `[${sig.severity.toUpperCase()}]`;
+      const body = sig.kind && sig.summary ? `${sig.kind}: ${sig.summary}` : (sig.summary || sig.kind);
+      return `${tag} ${body}`;
+    })
+    .join("\n");
+  return { total, maxSeverity, counts, badge, tooltip, items };
+}
+
+/**
+ * Format `exchange.principal` cleanly for Network rows and the exchange inspector:
+ * `"anon"` / `"anonymous"` → `anon`; `"auth:<hash>"` → `auth:<hash>` (ad-hoc auth headers);
+ * `"profile:user_b"` or `"user_b"` → `profile:user_b`; empty/null → `null`.
+ */
+export function formatPrincipal(principal) {
+  if (typeof principal !== "string") return null;
+  const raw = principal.trim();
+  if (!raw) return null;
+  const lower = raw.toLowerCase();
+  if (lower === "anon" || lower === "anonymous") {
+    return { raw: "anon", label: "anon", name: null, kind: "anon", tip: "Sent without mounted credentials (anonymous)." };
+  }
+  if (lower.startsWith("auth:")) {
+    const tag = raw.slice("auth:".length).trim();
+    if (!tag) return null;
+    return { raw, label: `auth:${tag}`, name: null, kind: "auth", tip: "Sent with ad-hoc request auth headers (not a mounted profile)." };
+  }
+  const name = lower.startsWith("profile:") ? raw.slice("profile:".length).trim() : raw;
+  if (!name) return null;
+  return { raw, label: `profile:${name}`, name, kind: "profile", tip: `Sent with credential profile ${name}.` };
+}
+
 /** An `exchange` record (or one row of GET /api/exchanges/{session}) as the UI holds it; null when it is not one. */
 export function exchangeOf(rec) {
   if (!rec || typeof rec !== "object" || typeof rec.id !== "string" || !rec.id) return null;
@@ -5228,6 +5322,8 @@ export function exchangeOf(rec) {
     truncated: !!rec.truncated,
     upstream_unverified: !!rec.upstream_unverified,
     duration_ms: Number(rec.duration_ms) || 0,
+    passive_signals: passiveSignalsOf(rec.passive_signals),
+    principal: typeof rec.principal === "string" && rec.principal.trim() ? rec.principal.trim() : null,
   };
 }
 
@@ -5276,8 +5372,11 @@ export function exchangeRow(ex) {
   if (ex.upstream_unverified) marks.push({ key: "unverified", text: "server not verified", tip: "ferret did not verify this server's certificate: the target lists it as upstream_insecure." });
   if (ex.truncated) marks.push({ key: "cut", text: "cut", tip: "A body passed the capture limit and was stored only up to it; the sizes are the true ones." });
   const head = `${ex.method} ${exchangeWhere(ex)}`;
+  const passive = summarizePassiveSignals(ex.passive_signals);
+  const principal = formatPrincipal(ex.principal);
   return {
     id: ex.id, head, method: ex.method, where: exchangeWhere(ex), status, tone: STATUS_CLASS_TONE[cls], cls, size, time, marks,
+    passive, principal,
     text: [head, status, size, time].filter(Boolean).join(" · "),
     words: ex.error && ex.status === null ? ex.error : "",
   };
@@ -5793,6 +5892,28 @@ export function credsRefOf(start) {
   const c = start && start.creds;
   if (!c || !c.profile) return null;
   return { profile: String(c.profile), summary: String(c.summary || ""), dropped: Number(c.dropped) || 0 };
+}
+
+/**
+ * All mounted credential profiles of a session from `session_start` and/or `SessionInfo` (`creds` + `creds_profiles`),
+ * deduplicated by profile name with the primary profile first. Never exposes secret values.
+ */
+export function credsProfilesOf(start, info = null) {
+  const byName = new Map();
+  const push = (c) => {
+    if (!c || typeof c !== "object" || !c.profile) return;
+    const profile = String(c.profile).trim();
+    if (!profile) return;
+    const next = { profile, summary: String(c.summary || ""), dropped: Number(c.dropped) || 0 };
+    const existing = byName.get(profile);
+    if (!existing) byName.set(profile, next);
+    else if (!existing.summary && next.summary) byName.set(profile, next);
+  };
+  if (start && start.creds) push(start.creds);
+  if (info && info.creds) push(info.creds);
+  if (start && Array.isArray(start.creds_profiles)) for (const c of start.creds_profiles) push(c);
+  if (info && Array.isArray(info.creds_profiles)) for (const c of info.creds_profiles) push(c);
+  return [...byName.values()];
 }
 
 // ---------------------------------------------------------------------------------------------

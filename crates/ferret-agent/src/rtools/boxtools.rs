@@ -100,13 +100,16 @@ impl Tool for BoxExec {
             Err(e) => return ToolOutput::error(e),
         };
         let cwd = args.get("cwd").and_then(Value::as_str);
+        if let Err(e) = ferret_tools::boxctl::work_dir(cwd) {
+            return ToolOutput::error(e);
+        }
+        if let Err(e) = b.ready().await {
+            return ToolOutput::error(format!("The box could not be made ready, so nothing was run. {e}"));
+        }
         let launch = match b.launch(ctx.call_id.as_str(), cwd, command) {
             Ok(l) => l,
             Err(e) => return ToolOutput::error(e),
         };
-        if let Err(e) = b.ready().await {
-            return ToolOutput::error(format!("The box could not be made ready, so nothing was run. {e}"));
-        }
         let pushed = match b.push(ctx.sandbox.clone(), ctx.workspace.clone()).await {
             Ok(p) => p,
             Err(e) => {

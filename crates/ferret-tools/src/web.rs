@@ -450,6 +450,18 @@ async fn follow(
                 builder = builder.header(k.as_str(), v.as_slice());
             }
         }
+        let principal = if injected.is_some() {
+            let name = ctx
+                .capabilities
+                .default_profile
+                .get()
+                .map(String::as_str)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("default");
+            format!("profile:{name}")
+        } else {
+            "anon".into()
+        };
         let resp = match builder.send().await {
             Ok(r) => r,
             // A refused CONNECT looks like any failure to connect: the proxy is asked again (see [`Tunnel`]).
@@ -471,6 +483,7 @@ async fn follow(
                     response_cut: false,
                     unverified: insecure,
                     started,
+                    principal: Some(&principal),
                 };
                 made.extend(traffic::record(ctx, &made_one));
                 return request_error(ctx, &e, &current, &hops, None);
@@ -490,6 +503,7 @@ async fn follow(
                 response_cut: false,
                 unverified: insecure,
                 started,
+                principal: Some(&principal),
             };
             made.extend(traffic::record(ctx, &made_one));
             let target = resp.headers().get(header::LOCATION).and_then(|v| v.to_str().ok()).map(str::to_string);
@@ -518,7 +532,7 @@ async fn follow(
                 continue;
             }
         }
-        return finish(ctx, resp, &hops, raw, proxied, insecure, (&req_wire, started, made)).await;
+        return finish(ctx, resp, &hops, raw, proxied, insecure, (&req_wire, started, made, &principal)).await;
     }
 }
 
@@ -568,7 +582,7 @@ async fn finish(
     raw: bool,
     proxied: bool,
     unverified: bool,
-    (req_wire, started, made): (&[u8], std::time::Instant, &mut Vec<ferret_core::event::Exchange>),
+    (req_wire, started, made, principal): (&[u8], std::time::Instant, &mut Vec<ferret_core::event::Exchange>, &str),
 ) -> ToolOutput {
     let status = resp.status();
     let content_type =
@@ -599,6 +613,7 @@ async fn finish(
             response_cut: matches!(ended, Ended::Limit),
             unverified,
             started,
+            principal: Some(principal),
         };
         made.extend(traffic::record(ctx, &made_one));
     }
@@ -1176,20 +1191,22 @@ mod tests {
         };
         // Inside the tunnel of an https URL only the origin speaks: its 403 is an observation.
         let https = [Url::parse("https://origin.test/x").unwrap()];
-        let r = finish(&e.ctx, answer(), &https, false, true, false, (b"", std::time::Instant::now(), &mut Vec::new()))
-            .await;
+        let r =
+            finish(&e.ctx, answer(), &https, false, true, false, (b"", std::time::Instant::now(), &mut Vec::new(), "anon"))
+                .await;
         assert_eq!(
             (r.status, r.outcome.as_str(), raw_body(&r).as_str()),
             (ToolStatus::Ok, "HTTP 403", "origin says no")
         );
         // The answer to an http URL through the proxy is the proxy's.
         let http = [Url::parse("http://origin.test/x").unwrap()];
-        let r = finish(&e.ctx, answer(), &http, false, true, false, (b"", std::time::Instant::now(), &mut Vec::new()))
-            .await;
+        let r =
+            finish(&e.ctx, answer(), &http, false, true, false, (b"", std::time::Instant::now(), &mut Vec::new(), "anon"))
+                .await;
         assert_eq!(r.status, ToolStatus::Denied);
         // Without a proxy there is no proxy to answer.
         assert_eq!(
-            finish(&e.ctx, answer(), &http, false, false, false, (b"", std::time::Instant::now(), &mut Vec::new()))
+            finish(&e.ctx, answer(), &http, false, false, false, (b"", std::time::Instant::now(), &mut Vec::new(), "anon"))
                 .await
                 .status,
             ToolStatus::Ok

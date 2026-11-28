@@ -4594,6 +4594,7 @@ mod tests {
             attachments: Vec::new(),
             target: None,
             creds: None,
+            creds_profiles: Vec::new(),
             intercept: None,
         }
     }

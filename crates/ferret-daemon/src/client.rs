@@ -65,8 +65,8 @@
 use crate::wire::{
     AnswerBody, ApprovalBody, ArchiveBody, CreatedSession, DaemonFile, ErrorBody, GcBody, LinesView, McpCheckBody,
     McpCheckView, McpServerView, MessageBody, MessageWhen, ModelBody, ModelsView, PanicBody, PanicReport,
-    QueuedEditBody, RecordsPage, ReleaseBody, RenameBody, RoleModelBody, RuleBody, ScopeBody, ScopeReceipt,
-    ScopeRevokeReceipt, SessionDetail, StatusView, UploadView, WithdrawBody,
+    QueuedEditBody, RecordsPage, ReleaseBody, RenameBody, RoleModelBody, RuleBody, ScopeBody, ScopeImportBody,
+    ScopeImportResult, ScopeReceipt, ScopeRevokeReceipt, SessionDetail, StatusView, UploadView, WithdrawBody,
 };
 use ferret_agent::runtime::{
     BusEvent, ExchangeEntry, InboxEntry, LedgerView, MissionInfo, MissionModels, ModelSwitchReceipt, ModelsReload,
@@ -756,6 +756,21 @@ impl Client {
         self.call(Method::PUT, &format!("/api/targets/{}", segment(name)), &[], Some(body)).await
     }
 
+    /// `POST /api/targets/{name}/import-scope`: parse and merge a bug-bounty or Burp scope payload into a target.
+    pub async fn target_import_scope(
+        &self,
+        name: &str,
+        format: &str,
+        payload: &str,
+    ) -> Result<ScopeImportResult, String> {
+        let body = serde_json::to_value(ScopeImportBody {
+            format: format.to_string(),
+            payload: payload.to_string(),
+        })
+        .map_err(|e| format!("The scope import request cannot be encoded ({e})."))?;
+        self.call(Method::POST, &format!("/api/targets/{}/import-scope", segment(name)), &[], Some(body)).await
+    }
+
     pub async fn target_graph(&self, name: &str) -> Result<GraphView, String> {
         self.target_graph_filtered(name, None, None, None).await
     }
@@ -1418,6 +1433,7 @@ pub(crate) mod testkit {
                 role_models: Default::default(),
                 target: None,
                 creds: None,
+                creds_profiles: Vec::new(),
             },
             active: false,
             status: status(Phase::Idle),
@@ -2199,5 +2215,38 @@ mod tests {
         );
         assert_eq!(seen[2].target, "/api/missions/m-1/har?host=a.test&limit=10");
         assert_eq!(seen[3].target, "/api/missions/m-1/har?host=a.test&sanitize=false");
+    }
+
+    #[tokio::test]
+    async fn target_import_scope_calls_import_route_with_format_and_payload() {
+        let script = Script::default().route(
+            "POST",
+            "/api/targets/acme/import-scope",
+            200,
+            serde_json::json!({
+                "target": "acme",
+                "format": "hackerone",
+                "added_scope": 2,
+                "added_exclude": 1,
+                "total_scope": 3,
+                "total_exclude": 1,
+                "notes": ["skipped mobile asset"]
+            })
+            .to_string(),
+        );
+        let (client, shared) = start(script).await;
+        let res = client.target_import_scope("acme", "hackerone", "{\"targets\":{}}").await.unwrap();
+        assert_eq!(res.target, "acme");
+        assert_eq!(res.format, "hackerone");
+        assert_eq!((res.added_scope, res.added_exclude, res.total_scope, res.total_exclude), (2, 1, 3, 1));
+        assert_eq!(res.notes, vec!["skipped mobile asset"]);
+
+        let seen = shared.lock().unwrap().seen.clone();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].target, "/api/targets/acme/import-scope");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&seen[0].body).unwrap(),
+            serde_json::json!({"format": "hackerone", "payload": "{\"targets\":{}}"})
+        );
     }
 }

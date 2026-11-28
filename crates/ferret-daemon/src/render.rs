@@ -577,8 +577,26 @@ pub fn record(rec: &Record, style: &Style, opts: &RecordOpts) -> String {
                 // One line per captured exchange.
                 let status =
                     x.status.map(|c| c.to_string()).or_else(|| x.error.clone()).unwrap_or_else(|| "no response".into());
-                let line =
+                let mut line =
                     format!("⇄ {} {} {}://{}{} · {} · {}", x.id, x.method, x.scheme, x.host, x.target, status, x.source);
+                if let Some(p) = x.principal.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                    line.push_str(&format!(" · {}", flat(p)));
+                }
+                if !x.passive_signals.is_empty() {
+                    let top = x
+                        .passive_signals
+                        .iter()
+                        .map(|s| s.severity.as_str())
+                        .max_by_key(|sev| match sev.to_ascii_lowercase().as_str() {
+                            "high" => 3,
+                            "medium" => 2,
+                            "low" => 1,
+                            _ => 0,
+                        })
+                        .unwrap_or("info");
+                    let word = if x.passive_signals.len() == 1 { "signal" } else { "signals" };
+                    line.push_str(&format!(" · {} {word} ({})", x.passive_signals.len(), flat(top)));
+                }
                 out.push(paint(style, DIM, &line));
             }
         }
@@ -1413,6 +1431,26 @@ pub fn target_nodes(g: &ferret_agent::runtime::GraphView) -> String {
     out
 }
 
+/// `ferret target import-scope`: summary of imported in-scope / excluded entries and notes, sanitized.
+pub fn scope_import_summary(res: &ferret_agent::ScopeImportResult) -> String {
+    let mut out = format!(
+        "imported scope into {} ({}): +{} in-scope (total {}), +{} exclude (total {})",
+        flat(&res.target),
+        flat(&res.format),
+        res.added_scope,
+        res.total_scope,
+        res.added_exclude,
+        res.total_exclude,
+    );
+    for note in &res.notes {
+        let note = flat(note);
+        if !note.trim().is_empty() {
+            out.push_str(&format!("\n  note: {note}"));
+        }
+    }
+    out
+}
+
 /// `ferret creds list` / `show` summary row, sanitized against untrusted target names.
 pub fn creds_summary_row(p: &ferret_core::creds::ProfileSummary) -> String {
     let plural = |n: usize, w: &str| if n == 1 { format!("{n} {w}") } else { format!("{n} {w}s") };
@@ -1803,6 +1841,7 @@ mod tests {
                 intercept: false,
                 target: None,
                 creds: None,
+                creds_profiles: Vec::new(),
                 title: s.into(),
                 project_instructions: Vec::new(),
                 mcp: Vec::new(),
@@ -2055,6 +2094,7 @@ mod tests {
             intercept: false,
             target: None,
             creds: None,
+            creds_profiles: Vec::new(),
             title: String::new(),
             project_instructions: Vec::new(),
             mcp: Vec::new(),
@@ -2500,6 +2540,7 @@ mod tests {
             role_models: Default::default(),
             target: None,
             creds: None,
+            creds_profiles: Vec::new(),
         }
     }
 
@@ -3060,6 +3101,8 @@ mod tests {
             truncated: false,
             upstream_unverified: false,
             duration_ms: 5,
+            passive_signals: Vec::new(),
+            principal: None,
         });
         assert!(!record(&rec(Author::Harness, ex.clone()), &MONO, &RecordOpts::default()).is_empty());
         assert_eq!(

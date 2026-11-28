@@ -17,6 +17,7 @@
 //! - [`sarif`]   SARIF 2.1.0 export for structured security findings and surface coverage
 //! - [`scorecard`] what a session's work took: steps, malformed calls, refusals, verdicts
 //! - [`config`]  configuration file and on-disk layout
+//! - [`ingest`]  pure-Rust parsers for bounty scopes, OpenAPI/Swagger, GraphQL introspection, and JS sourcemaps
 
 pub mod admit;
 pub mod blob;
@@ -28,6 +29,7 @@ pub mod event;
 pub mod har;
 pub mod ids;
 pub mod image;
+pub mod ingest;
 pub mod journal;
 pub mod ledger;
 pub mod log;

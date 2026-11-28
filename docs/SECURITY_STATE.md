@@ -193,6 +193,9 @@ The supported input shapes are deliberately explicit:
 | `ffuf` | JSON object with `results` array; every result has an absolute `url`. |
 | `netexec` | JSON array, or `hosts`/`results` array, with `host`/`hostname`/`ip`, optional numeric `port` and documented `protocol`. Plain console output is unsupported. |
 | `bloodhound` | JSON `data` array and supported `meta.type`; objects supply `Properties.name` or `ObjectIdentifier`. |
+| `openapi` | OpenAPI 3.x or Swagger 2.x JSON specification; extracts endpoints, HTTP methods, parameters, hosts, and auth hints (up to 2,000 surfaces). |
+| `graphql` | GraphQL introspection JSON (`__schema` / `data.__schema`); extracts `QUERY`, `MUTATION`, and `SUBSCRIPTION` operations and arguments (up to 2,000 surfaces). |
+| `sourcemap` | JavaScript `.js.map` source map JSON (`sources` / `sourcesContent`); extracts source paths and embedded API routes (up to 2,000 surfaces). |
 
 Imports are limited to 2 MiB and 500 canonical assets. Required-field, parse, or validation errors
 reject the entire import. A single atomic sealed batch makes assets and their containing-host
@@ -237,10 +240,86 @@ Exports are **sanitized by default** (`sanitize=true`, setting `log._sanitized =
 - **`[network.assessment_ua]`**: optional `{ origins = ["https://app.example.test"], reference = "bb-42" }`.
   Attaches `User-Agent: Ferret-Assessment/1.0 (engagement=bb-42)` ONLY on exact approved `(scheme, host, port)`
   origins when a request has no explicit `User-Agent`, never leaking across cross-origin redirects.
-- **Operator-only proxy rewrite rules**: managed exclusively via `/api/traffic/rewrite-rules` and
-  `ferret rewrite list [--json]|add|enable|disable|rm|example` (never exposed as an agent tool). Rules are created disabled,
-  stored atomically in `<ferret home>/rewrite_rules.json` (0600), refuse mutating framing/hop/`Host`/`Proxy-*`
-  headers or `CONNECT`, mask `sensitive: true` values on API reads, and reload live without restarting.
+- **Operator-only proxy rewrite rules (request & live response rewrites)**: managed exclusively via
+  `/api/traffic/rewrite-rules` and `ferret rewrite list [--json]|add|enable|disable|rm|example` (never exposed
+  as an agent tool). Rules are created disabled, stored atomically in `<ferret home>/rewrite_rules.json`
+  (0600), refuse mutating framing/hop/`Host`/`Proxy-*` headers or `CONNECT`, mask `sensitive: true` values on
+  API reads, and reload live without restarting. Response rewrites run live across both plain HTTP and
+  intercepted HTTPS MITM, preserving HTTP/1.1 framing (streaming head-only rewrites, decoding chunked bodies
+  and emitting exact `Content-Length` on body mutations, falling back to head-only above the body cap) and
+  redacting all `sensitive: true` values before capture and passive analysis.
+- **Post-redaction passive traffic analyzer (`Exchange.passive_signals`)**: every captured exchange (both
+  egress-proxy and in-process `http_send`/`http_repeat`/`http_authz_matrix`/`web_fetch` traffic) is analyzed
+  strictly on post-redaction bytes (never re-triggering on `[redacted]` and never leaking raw cookies, tokens,
+  or JWTs into `summary`/`detail`). Eight built-in detectors emit up to 16 deduplicated signals per exchange:
+  `cors_misconfig`, `cookie_insecure`, `reflected_input`, `verbose_error`, `weak_jwt`, `secret_leak`,
+  `sourcemap_exposed`, and `missing_security_headers` (`high` / `medium` / `low` / `info`). Signals appear as
+  severity pills and inspector details in the Web UI Network tab and can be queried via `traffic_query`.
+
+## Live Web AppSec pack (`packs/webapp`), multi-principal authz, and traffic tools
+
+- **`packs/webapp`:** Live bug-bounty and web AppSec pack (`lead`, `recon_mapper`, `authz_tester`,
+  `exploit_worker`, and strictly read-only `triage_judge`) with `requires_restricted_network = true`,
+  `command_guard = "offensive"`, `intercept = true`, and zero `.ferret/security-oracle.json` requirement.
+  `packs/vr` (`researcher`, `scout`, and read-only `judge`) also exposes the Wave B web/OAST/traffic tools.
+- **Multi-principal credential profiles (`--creds-profile` & `http_authz_matrix`):** Missions against a target
+  can mount multiple named credential profiles via repeatable `--creds-profile <name>` (or `NewSession.creds_profiles`
+  alongside backward-compatible `creds`). Mounted profile names and redaction-safe summaries (never secret
+  values) are recorded on `SessionStart.creds_profiles` and `SessionMeta.creds_profiles` and displayed as
+  badges in the Web UI. `http_send` and `http_repeat` accept `as_profile` and `strip_auth` (using isolated
+  ephemeral cookie jars whenever switching away from the default profile or stripping auth), while
+  `http_authz_matrix` replays a request across isolated per-principal jars (e.g. `anon`, `user_a`, `user_b`),
+  tags every recorded `Exchange.principal` (`anon`, `profile:<name>`), performs normalized structural diffs
+  (stripping volatile keys), and flags potential BOLA/IDOR authorization differentials while redacting all
+  secrets.
+- **Read-only traffic investigation (`traffic_query` & `traffic_diff`):** Both active roles and read-only
+  verifiers (`triage_judge`, `vr/judge`) can query captured mission exchanges by host, path, method, status,
+  principal, or passive signal (`traffic_query`) and diff headers/bodies between two captured exchanges
+  (`traffic_diff`) without making live target requests.
+
+## Bug-bounty scope import & enriched target graph
+
+- **Scope import (`ferret target import-scope` / `POST /api/targets/{name}/import-scope`):** Operator-only
+  endpoint (guarded by bearer auth, `Host`/`Origin` CSRF middleware, `deny_unknown_fields`, and a 4 MiB body
+  cap) that parses HackerOne (JSON/CSV), Bugcrowd (JSON/CSV), Intigriti (JSON), Burp Suite scope JSON
+  (regex-to-host/wildcard conversion), or generic CSV (`format = "auto"` auto-detects) and merges deduplicated
+  in-scope and excluded entries into the target (`ScopeImportResult`).
+- **Enriched cross-mission target graph:** In addition to nodes, edges, coverage, and claims, target graphs
+  persist hash-chained `resolves` (host→IP), `security_finding` (enabling cross-mission duplicate detection),
+  `disposition` (`ruled_out`/`needs_follow_up`), `dead_end`, and high/medium `passive` signal records,
+  summarized compactly (≤ 8 KiB) into new missions targeting that scope.
+
+## Out-of-Band callback broker (`[oast]`: `oast_mint` & `oast_poll`)
+
+Disabled by default. When `[oast] enabled = true` is configured in `config.toml`:
+- **`mode = "local"`:** Starts an embedded HTTP listener (`bind`, default `127.0.0.1:0`, matching
+  `/oast/<token>` and `Host: <token>.*`) and optional UDP DNS listener (`dns_bind`, RFC 1035 parser answering
+  synthetic `127.0.0.1` A records), advertising `public_host` when set.
+- **`mode = "external"`:** Polls an external OAST server at `external_poll_url` (`https://`, or plaintext
+  `http://` strictly on loopback) using an optional private (`0600`, max 4 KiB) bearer token file
+  (`external_token_file`), with a 4 MiB response cap.
+- **Mission isolation & evidence grading:** Tokens and recorded interactions (bounded to 1,024 per mission,
+  64 KiB body cap) are strictly isolated per mission. `oast_mint` is a `Read` tool; `oast_poll` is an `Exec`
+  tool that sets `EvidenceGrade::Run` only when at least one real callback interaction is observed (and
+  `Read` on zero interactions or errors), and is never granted to `read_only` verifier roles.
+
+## Container proxy bridge & MITM CA injection (`[box] proxy_bridge`)
+
+Disabled by default (`proxy_bridge = false`). When `[box] proxy_bridge = true` is configured (with optional
+`proxy_bridge_port` `1..=65535`):
+- The daemon dynamically discovers each mission bridge's actual Docker IPv4 gateway (`fb-<short>`) via
+  `docker network inspect`, bridges traffic to the mission's per-session egress proxy listener with
+  per-session proxy authentication in **both** remote SSH (`-R` reverse forward) and local Docker socket
+  modes (supervised local TCP forwarder, cleaned up on teardown/drop), and inserts one tightly-scoped
+  `INPUT 1 -i fb-<short> -p tcp -d <gateway> --dport <port> -j ACCEPT` rule ahead of unconditional
+  `INPUT -i fb-+ -j DROP` (IPv6 `FERRET-ALL6` stays dropped). On mission teardown and daemon reconcile,
+  per-mission `INPUT` `ACCEPT` rules matching `-i fb-<short>` are swept cleanly while leaving
+  `INPUT -i fb-+ -j DROP` and other missions' rules untouched.
+- The mission's MITM CA certificate is staged at `/tmp/ferret-ca.pem` (`0444`) inside the writable `/tmp`
+  tmpfs via `docker exec ... tar` (never `docker cp` on the read-only rootfs) before first exec and after
+  `box_reset`, and `box_exec` injects proxy and CA environment variables (`HTTP_PROXY`, `HTTPS_PROXY`,
+  `SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`). Non-bridge mode remains
+  byte-for-byte unchanged.
 
 ## Operator-scoped read-only email inbox (`[mail]` / `inbox_read`)
 

@@ -157,6 +157,17 @@ impl Traffic {
             Transport::Intercepted => ("https", "intercepted"),
         };
         let call_id = self.attribute(cap.ts_ms);
+        let passive_signals = cap
+            .passive_signals
+            .into_iter()
+            .map(|mut s| {
+                if let Some(sec) = secrets {
+                    s.summary = sec.redact(&s.summary).into_owned();
+                    s.detail = sec.redact(&s.detail).into_owned();
+                }
+                s
+            })
+            .collect();
         let x = Exchange {
             id: new_exchange_id(),
             call_id,
@@ -177,6 +188,8 @@ impl Traffic {
             truncated: cap.truncated,
             upstream_unverified: cap.upstream_unverified,
             duration_ms: cap.duration_ms,
+            passive_signals,
+            principal: None,
         };
         lock(&self.pending).push(x);
         true
@@ -488,6 +501,7 @@ mod tests {
             truncated: false,
             upstream_unverified: false,
             duration_ms: 3,
+            passive_signals: Vec::new(),
         }
     }
 
@@ -566,6 +580,36 @@ mod tests {
         assert_eq!((xs[0].request_bytes, xs[0].response_bytes), counted);
     }
 
+    #[test]
+    fn ingest_copies_and_redacts_passive_signals_from_proxy_captures() {
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = BlobStore::open(dir.path()).unwrap();
+        let t = Traffic::none();
+        let secret = "s3cr3t-passive-val-991";
+        let item = ferret_core::creds::Item {
+            kind: ferret_core::creds::ItemKind::Header,
+            name: "X-Api-Key".into(),
+            value: secret.into(),
+            host: "t.test".into(),
+        };
+        let _ = t.secrets.set(Arc::new(ferret_core::creds::Secrets::for_items(&[item])));
+        let mut c = cap(1);
+        c.passive_signals.push(ferret_core::event::PassiveSignal {
+            kind: "cors_misconfig".into(),
+            severity: "high".into(),
+            summary: format!("ACAO reflects origin with {secret}"),
+            detail: format!("detail containing {secret}"),
+        });
+        assert!(t.ingest(&blobs, c));
+        let (xs, _) = t.take_pending();
+        assert_eq!(xs[0].passive_signals.len(), 1);
+        let sig = &xs[0].passive_signals[0];
+        assert_eq!(sig.kind, "cors_misconfig");
+        assert_eq!(sig.severity, "high");
+        assert!(!sig.summary.contains(secret) && sig.summary.contains("[redacted]"), "{}", sig.summary);
+        assert!(!sig.detail.contains(secret) && sig.detail.contains("[redacted]"), "{}", sig.detail);
+    }
+
     fn make_role(require_traffic: bool) -> crate::pack::RoleDef {
         let mut r = crate::pack::Packs::builtin().unwrap().role(None, Some("lead")).unwrap().clone();
         r.require_traffic = require_traffic;
@@ -597,6 +641,8 @@ mod tests {
             truncated: false,
             upstream_unverified: false,
             duration_ms: 2,
+            passive_signals: Vec::new(),
+            principal: None,
         }
     }
 

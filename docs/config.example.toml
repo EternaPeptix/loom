@@ -150,6 +150,8 @@ cap_add = []               # capabilities added back (all are dropped first); st
 sync_max_mb = 64           # most data copied from the workspace into /work by one call
 sync_file_max_mb = 16      # largest single file copied
 get_max_mb = 64            # most data one box_get brings back
+proxy_bridge = false       # true: forward the mission egress proxy into the box via SSH reverse tunnel + tightly-scoped INPUT rule, and stage the MITM CA at /tmp/ferret-ca.pem (0444)
+# proxy_bridge_port = 18080  # optional fixed bridge port on the Docker host (1..=65535); omitted = pick a free port
 
 [agents]
 max_children = 6           # child sessions running at once within one mission
@@ -214,6 +216,17 @@ require_auth_pass = false                       # true: inspect topmost trusted 
 max_age_minutes = 120                           # only return messages newer than this many minutes; 0 = unbounded
 max_messages = 20                               # most messages returned per read (1..=50)
 # roles = ["lead", "worker"]                    # optional roles allowed to call inbox_read; empty = every non-read-only role
+
+[oast]
+# Optional Out-of-Band Application Security Testing (OAST) callback broker (`oast_mint` / `oast_poll`)
+# for blind SSRF, XXE, XSS, and SSTI verification. Off by default. See docs/RUN.md and docs/SECURITY_STATE.md.
+enabled = false
+mode = "local"                                  # "local" (embedded HTTP + optional UDP DNS listener) or "external" (polling broker)
+bind = "127.0.0.1:0"                            # local HTTP listener socket address (`0` picks a free port)
+# public_host = "oast.example.test"             # optional hostname (or host:port) advertised in minted callback URLs and DNS names; example
+# dns_bind = "127.0.0.1:5353"                   # optional UDP DNS listener socket address in local mode (`0` picks a free port)
+# external_poll_url = "https://oast.example.test/poll"  # required when mode = "external" (https://, or plaintext http:// on loopback only); example
+# external_token_file = "~/.ferret/keys/oast.token"     # optional bearer token file for external_poll_url (regular file, mode 0600, max 4 KiB)
 
 [signal]
 # Optional two-way Signal bridge talking to a local `signal-cli daemon --http` instance for phone alerts and

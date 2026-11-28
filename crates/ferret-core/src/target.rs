@@ -99,6 +99,15 @@ fn in_cidr(ip: IpAddr, net: IpAddr, bits: u8) -> bool {
 }
 
 impl Entry {
+    fn canonical_key(&self) -> String {
+        match self {
+            Entry::Host(n) => n.clone(),
+            Entry::Glob(suffix) => format!("*{suffix}"),
+            Entry::Ip(ip) => ip.to_string(),
+            Entry::Cidr(ip, bits) => format!("{ip}/{bits}"),
+        }
+    }
+
     fn matches(&self, host: &str) -> bool {
         let h = norm_host(host);
         match self {
@@ -265,6 +274,115 @@ pub enum GraphLine {
         ts_ms: u64,
         prev: String,
     },
+    /// Host → IP resolution edge observed for an in-scope host or IP.
+    Resolves {
+        host: String,
+        ip: String,
+        mission: String,
+        at_ms: u64,
+        #[serde(default)]
+        prev: String,
+    },
+    /// Structured security finding indexed on a 3-axis `(vuln_class, surface, param_or_sink)` key
+    /// for cross-mission deduplication and target summary highlights.
+    SecurityFinding {
+        id: String,
+        mission: String,
+        title: String,
+        vuln_class: String,
+        surface: String,
+        param_or_sink: String,
+        severity: String,
+        confidence: String,
+        at_ms: u64,
+        #[serde(default)]
+        prev: String,
+    },
+    /// Recorded risk-area disposition (`ruled_out` / `needs_follow_up`) on a target surface.
+    Disposition {
+        mission: String,
+        surface: String,
+        risk_area: String,
+        disposition: String,
+        note: String,
+        at_ms: u64,
+        #[serde(default)]
+        prev: String,
+    },
+    /// Recorded dead-end exploration note on a target surface so later missions avoid repeating it.
+    DeadEnd {
+        mission: String,
+        surface: String,
+        summary: String,
+        at_ms: u64,
+        #[serde(default)]
+        prev: String,
+    },
+    /// Passive security signal captured on an in-scope HTTP exchange.
+    Passive {
+        mission: String,
+        exchange_id: String,
+        host: String,
+        path: String,
+        signal: crate::event::PassiveSignal,
+        at_ms: u64,
+        #[serde(default)]
+        prev: String,
+    },
+}
+
+/// A persisted structured finding from a target's graph, used for cross-mission deduplication.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TargetFinding {
+    pub id: String,
+    pub mission: String,
+    pub title: String,
+    pub vuln_class: String,
+    pub surface: String,
+    pub param_or_sink: String,
+    pub severity: String,
+    pub confidence: String,
+    pub at_ms: u64,
+}
+
+/// A persisted host → IP resolution record.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TargetResolves {
+    pub host: String,
+    pub ip: String,
+    pub mission: String,
+    pub at_ms: u64,
+}
+
+/// A persisted risk-area disposition (`ruled_out` / `needs_follow_up`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TargetDisposition {
+    pub mission: String,
+    pub surface: String,
+    pub risk_area: String,
+    pub disposition: String,
+    pub note: String,
+    pub at_ms: u64,
+}
+
+/// A persisted dead-end exploration record.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TargetDeadEnd {
+    pub mission: String,
+    pub surface: String,
+    pub summary: String,
+    pub at_ms: u64,
+}
+
+/// A persisted passive security signal from a captured exchange.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TargetPassive {
+    pub mission: String,
+    pub exchange_id: String,
+    pub host: String,
+    pub path: String,
+    pub signal: crate::event::PassiveSignal,
+    pub at_ms: u64,
 }
 
 /// A node as the API and the UI see it (T7).
@@ -395,7 +513,12 @@ impl GraphLine {
             GraphLine::NodeSeen { prev, .. }
             | GraphLine::Edge { prev, .. }
             | GraphLine::Coverage { prev, .. }
-            | GraphLine::Finding { prev, .. } => *prev = p.to_string(),
+            | GraphLine::Finding { prev, .. }
+            | GraphLine::Resolves { prev, .. }
+            | GraphLine::SecurityFinding { prev, .. }
+            | GraphLine::Disposition { prev, .. }
+            | GraphLine::DeadEnd { prev, .. }
+            | GraphLine::Passive { prev, .. } => *prev = p.to_string(),
         }
     }
     fn prev(&self) -> &str {
@@ -403,9 +526,171 @@ impl GraphLine {
             GraphLine::NodeSeen { prev, .. }
             | GraphLine::Edge { prev, .. }
             | GraphLine::Coverage { prev, .. }
-            | GraphLine::Finding { prev, .. } => prev,
+            | GraphLine::Finding { prev, .. }
+            | GraphLine::Resolves { prev, .. }
+            | GraphLine::SecurityFinding { prev, .. }
+            | GraphLine::Disposition { prev, .. }
+            | GraphLine::DeadEnd { prev, .. }
+            | GraphLine::Passive { prev, .. } => prev,
         }
     }
+}
+
+fn surface_in_scope(surface: &str, scope: &Scope) -> bool {
+    let trimmed = surface.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let without_method = match trimmed.split_once(char::is_whitespace) {
+        Some((first, rest))
+            if matches!(
+                first.to_ascii_uppercase().as_str(),
+                "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS" | "TRACE"
+            ) =>
+        {
+            rest.trim()
+        }
+        _ => trimmed,
+    };
+    if let Ok(u) = url::Url::parse(without_method) {
+        if matches!(u.scheme(), "http" | "https" | "ws" | "wss") {
+            return u.host_str().is_some_and(|h| scope.contains(&norm_host(h)));
+        }
+    }
+    if without_method.starts_with('/') {
+        return true;
+    }
+    let lead = without_method.split(['/', '?', '#']).next().unwrap_or("");
+    let hostport = lead.rsplit_once('@').map_or(lead, |(_, h)| h);
+    let candidate = if let Some(v6) = hostport.strip_prefix('[') {
+        v6.split_once(']').map_or(v6, |(h, _)| h)
+    } else if hostport.parse::<IpAddr>().is_ok() {
+        hostport
+    } else {
+        hostport.split_once(':').map_or(hostport, |(h, _)| h)
+    };
+    let cand_norm = norm_host(candidate);
+    if !cand_norm.is_empty() && scope.excluded(&cand_norm) {
+        return false;
+    }
+    if cand_norm.parse::<IpAddr>().is_ok() {
+        return scope.contains(&cand_norm);
+    }
+    true
+}
+
+fn normalize_vuln_class(raw: &str) -> String {
+    let lower = raw.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return String::new();
+    }
+    if let Some(rest) = lower.strip_prefix("cwe") {
+        let rest = rest.trim_start_matches(['-', '_', ':', ' ']);
+        if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()) {
+            let digits = rest.trim_start_matches('0');
+            let digits = if digits.is_empty() { "0" } else { digits };
+            return format!("cwe-{digits}");
+        }
+    }
+    let mut out = String::with_capacity(lower.len());
+    let mut prev_sep = false;
+    for ch in lower.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+            prev_sep = false;
+        } else if !prev_sep && !out.is_empty() {
+            out.push('_');
+            prev_sep = true;
+        }
+    }
+    while out.ends_with('_') {
+        out.pop();
+    }
+    out
+}
+
+fn normalize_path_part(path: &str) -> String {
+    let lower = path.to_ascii_lowercase();
+    let templated = path_template(&lower);
+    let mut collapsed = String::with_capacity(templated.len());
+    let mut prev_slash = false;
+    for ch in templated.chars() {
+        if ch == '/' {
+            if !prev_slash {
+                collapsed.push('/');
+                prev_slash = true;
+            }
+        } else {
+            collapsed.push(ch);
+            prev_slash = false;
+        }
+    }
+    if collapsed.len() > 1 {
+        while collapsed.ends_with('/') {
+            collapsed.pop();
+        }
+    }
+    if collapsed.is_empty() {
+        "/".to_string()
+    } else {
+        collapsed
+    }
+}
+
+fn normalize_surface(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let without_method = match trimmed.split_once(char::is_whitespace) {
+        Some((first, rest))
+            if matches!(
+                first.to_ascii_uppercase().as_str(),
+                "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS" | "TRACE"
+            ) =>
+        {
+            let rest = rest.trim();
+            if rest.starts_with('/') || rest.contains("://") {
+                rest
+            } else {
+                trimmed
+            }
+        }
+        _ => trimmed,
+    };
+    if let Ok(u) = url::Url::parse(without_method) {
+        if matches!(u.scheme(), "http" | "https") {
+            if let Some(h) = u.host_str() {
+                let host = norm_host(h);
+                let host_port = match u.port() {
+                    Some(p) => {
+                        if host.contains(':') {
+                            format!("[{host}]:{p}")
+                        } else {
+                            format!("{host}:{p}")
+                        }
+                    }
+                    None => host,
+                };
+                let p = normalize_path_part(u.path());
+                return format!("{host_port}{p}");
+            }
+        }
+    }
+    let no_query = without_method.split(['?', '#']).next().unwrap_or(without_method).trim();
+    if no_query.starts_with('/') {
+        return normalize_path_part(no_query);
+    }
+    if let Some((lead, rest)) = no_query.split_once('/') {
+        let lead_norm = norm_host(lead);
+        let p = normalize_path_part(&format!("/{rest}"));
+        return format!("{lead_norm}{p}");
+    }
+    norm_host(no_query)
+}
+
+fn normalize_param_or_sink(raw: &str) -> String {
+    raw.split_whitespace().collect::<Vec<_>>().join(" ").to_ascii_lowercase()
 }
 
 /// The targets under `~/.ferret/targets`.
@@ -549,6 +834,22 @@ impl TargetStore {
                 GraphLine::Edge { from, to, .. } => known.contains(from) && known.contains(to),
                 GraphLine::Coverage { node, .. } => known.contains(node),
                 GraphLine::Finding { nodes, .. } => nodes.iter().any(|n| known.contains(n)),
+                GraphLine::Resolves { host, ip, .. } => {
+                    let h = norm_host(host);
+                    let i = norm_host(ip);
+                    !h.is_empty()
+                        && !i.is_empty()
+                        && !scope.excluded(&h)
+                        && !scope.excluded(&i)
+                        && (scope.contains(&h) || scope.contains(&i))
+                }
+                GraphLine::SecurityFinding { surface, .. }
+                | GraphLine::Disposition { surface, .. }
+                | GraphLine::DeadEnd { surface, .. } => surface_in_scope(surface, &scope),
+                GraphLine::Passive { host, .. } => {
+                    let h = norm_host(host);
+                    !h.is_empty() && scope.contains(&h)
+                }
             })
             .map(|g| match g {
                 GraphLine::Finding { nodes, claim, text, status, evidence, mission, session, ts_ms, prev } => {
@@ -591,11 +892,24 @@ impl TargetStore {
         let (lines, _) = read_graph(&self.graph_path(name)?)?;
         let mut out: Vec<EdgeView> = Vec::new();
         for g in lines {
-            if let GraphLine::Edge { kind, from, to, .. } = g {
-                let e = EdgeView { kind, from, to };
-                if !out.contains(&e) {
-                    out.push(e);
+            match g {
+                GraphLine::Edge { kind, from, to, .. } => {
+                    let e = EdgeView { kind, from, to };
+                    if !out.contains(&e) {
+                        out.push(e);
+                    }
                 }
+                GraphLine::Resolves { host, ip, .. } => {
+                    let e = EdgeView {
+                        kind: "resolves".to_string(),
+                        from: node_id(NodeKind::Host, &norm_host(&host)),
+                        to: node_id(NodeKind::Ip, &norm_host(&ip)),
+                    };
+                    if !out.contains(&e) {
+                        out.push(e);
+                    }
+                }
+                _ => {}
             }
         }
         Ok(out)
@@ -657,6 +971,11 @@ impl TargetStore {
                         );
                     }
                 }
+                GraphLine::Resolves { .. }
+                | GraphLine::SecurityFinding { .. }
+                | GraphLine::Disposition { .. }
+                | GraphLine::DeadEnd { .. }
+                | GraphLine::Passive { .. } => {}
             }
         }
         let mut out: Vec<(u64, NodeView)> = acc
@@ -708,11 +1027,289 @@ impl TargetStore {
         }
         Ok(nodes)
     }
+
+    /// All persisted structured security findings for `target` (deduplicated by `(mission, id)`,
+    /// latest timestamp first).
+    pub fn security_findings(&self, target: &str) -> Result<Vec<TargetFinding>, String> {
+        let (lines, _) = read_graph(&self.graph_path(target)?)?;
+        Ok(extract_security_findings(&lines))
+    }
+
+    /// All persisted host → IP resolution edges for `target` (deduplicated by `(host, ip)`,
+    /// latest timestamp first).
+    pub fn resolves(&self, target: &str) -> Result<Vec<TargetResolves>, String> {
+        let (lines, _) = read_graph(&self.graph_path(target)?)?;
+        Ok(extract_resolves(&lines))
+    }
+
+    /// All persisted risk-area dispositions (`ruled_out` / `needs_follow_up`) for `target`,
+    /// deduplicated by `(surface, risk_area)` (latest wins).
+    pub fn dispositions(&self, target: &str) -> Result<Vec<TargetDisposition>, String> {
+        let (lines, _) = read_graph(&self.graph_path(target)?)?;
+        Ok(extract_dispositions(&lines))
+    }
+
+    /// All persisted dead ends for `target`, latest timestamp first.
+    pub fn dead_ends(&self, target: &str) -> Result<Vec<TargetDeadEnd>, String> {
+        let (lines, _) = read_graph(&self.graph_path(target)?)?;
+        Ok(extract_dead_ends(&lines))
+    }
+
+    /// All persisted passive security signals for `target`, deduplicated by `(host, path, kind, summary)`.
+    pub fn passive_signals(&self, target: &str) -> Result<Vec<TargetPassive>, String> {
+        let (lines, _) = read_graph(&self.graph_path(target)?)?;
+        Ok(extract_passive(&lines))
+    }
+
+    /// Case-insensitive normalized 3-axis `(vuln_class, surface, param_or_sink)` duplicate matching
+    /// across findings persisted in `target`'s graph.
+    pub fn find_duplicate_findings(
+        &self,
+        target: &str,
+        vuln_class: &str,
+        surface: &str,
+        param_or_sink: &str,
+    ) -> Result<Vec<TargetFinding>, String> {
+        let want_class = normalize_vuln_class(vuln_class);
+        let want_surface = normalize_surface(surface);
+        if want_class.is_empty() || want_surface.is_empty() {
+            return Ok(Vec::new());
+        }
+        let want_param = normalize_param_or_sink(param_or_sink);
+        let findings = self.security_findings(target)?;
+        Ok(findings
+            .into_iter()
+            .filter(|f| {
+                normalize_vuln_class(&f.vuln_class) == want_class
+                    && normalize_surface(&f.surface) == want_surface
+                    && normalize_param_or_sink(&f.param_or_sink) == want_param
+            })
+            .collect())
+    }
+
+    /// Validates `add_scope` and `add_exclude` with [`parse_entry`], deduplicates case-insensitively
+    /// against existing entries in `target.toml`, persists the updated file, and returns
+    /// `(updated_cfg, added_scope_count, added_exclude_count)`.
+    pub fn merge_scope(
+        &self,
+        target: &str,
+        add_scope: &[String],
+        add_exclude: &[String],
+    ) -> Result<(TargetCfg, usize, usize), String> {
+        let mut cfg = self.get(target)?;
+        let parsed_scope: Vec<(String, String)> = add_scope
+            .iter()
+            .map(|raw| {
+                let entry = parse_entry(raw)?;
+                Ok((entry.canonical_key(), raw.trim().to_string()))
+            })
+            .collect::<Result<_, String>>()?;
+        let parsed_exclude: Vec<(String, String)> = add_exclude
+            .iter()
+            .map(|raw| {
+                let entry = parse_entry(raw)?;
+                Ok((entry.canonical_key(), raw.trim().to_string()))
+            })
+            .collect::<Result<_, String>>()?;
+
+        let mut seen_scope: std::collections::HashSet<String> = cfg
+            .scope
+            .iter()
+            .map(|e| parse_entry(e).map(|p| p.canonical_key()).unwrap_or_else(|_| norm_host(e)))
+            .collect();
+        let mut seen_exclude: std::collections::HashSet<String> = cfg
+            .exclude
+            .iter()
+            .map(|e| parse_entry(e).map(|p| p.canonical_key()).unwrap_or_else(|_| norm_host(e)))
+            .collect();
+
+        let mut added_scope = 0usize;
+        for (key, display) in parsed_scope {
+            if seen_scope.insert(key) {
+                cfg.scope.push(display);
+                added_scope += 1;
+            }
+        }
+        let mut added_exclude = 0usize;
+        for (key, display) in parsed_exclude {
+            if seen_exclude.insert(key) {
+                cfg.exclude.push(display);
+                added_exclude += 1;
+            }
+        }
+        if added_scope > 0 || added_exclude > 0 {
+            self.put(target, &cfg)?;
+        }
+        Ok((cfg, added_scope, added_exclude))
+    }
+
+    /// Full target summary for a lead's system prompt, capped at [`SUMMARY_MAX_BYTES`] (8 KiB).
+    /// Includes concise, bounded highlights of recorded findings, `ruled_out` / `needs_follow_up`
+    /// dispositions, dead ends, `resolves` edges, and `high` / `medium` passive signals.
+    pub fn summary(&self, target: &str) -> Result<String, String> {
+        let cfg = self.get(target)?;
+        let nodes = self.nodes(target)?;
+        let (lines, _) = read_graph(&self.graph_path(target)?)?;
+        Ok(summary_with_lines(target, &cfg, &nodes, &lines))
+    }
+}
+
+fn extract_security_findings(lines: &[GraphLine]) -> Vec<TargetFinding> {
+    use std::collections::BTreeMap;
+    let mut by_key: BTreeMap<(String, String), TargetFinding> = BTreeMap::new();
+    for g in lines {
+        if let GraphLine::SecurityFinding {
+            id,
+            mission,
+            title,
+            vuln_class,
+            surface,
+            param_or_sink,
+            severity,
+            confidence,
+            at_ms,
+            ..
+        } = g
+        {
+            by_key.insert(
+                (mission.clone(), id.clone()),
+                TargetFinding {
+                    id: id.clone(),
+                    mission: mission.clone(),
+                    title: title.clone(),
+                    vuln_class: vuln_class.clone(),
+                    surface: surface.clone(),
+                    param_or_sink: param_or_sink.clone(),
+                    severity: severity.clone(),
+                    confidence: confidence.clone(),
+                    at_ms: *at_ms,
+                },
+            );
+        }
+    }
+    let mut out: Vec<TargetFinding> = by_key.into_values().collect();
+    out.sort_by(|a, b| b.at_ms.cmp(&a.at_ms).then_with(|| a.mission.cmp(&b.mission)).then_with(|| a.id.cmp(&b.id)));
+    out
+}
+
+fn extract_resolves(lines: &[GraphLine]) -> Vec<TargetResolves> {
+    use std::collections::BTreeMap;
+    let mut by_pair: BTreeMap<(String, String), TargetResolves> = BTreeMap::new();
+    for g in lines {
+        if let GraphLine::Resolves { host, ip, mission, at_ms, .. } = g {
+            let h = norm_host(host);
+            let i = norm_host(ip);
+            by_pair.insert(
+                (h.clone(), i.clone()),
+                TargetResolves { host: h, ip: i, mission: mission.clone(), at_ms: *at_ms },
+            );
+        }
+    }
+    let mut out: Vec<TargetResolves> = by_pair.into_values().collect();
+    out.sort_by(|a, b| b.at_ms.cmp(&a.at_ms).then_with(|| a.host.cmp(&b.host)).then_with(|| a.ip.cmp(&b.ip)));
+    out
+}
+
+fn extract_dispositions(lines: &[GraphLine]) -> Vec<TargetDisposition> {
+    use std::collections::BTreeMap;
+    let mut by_key: BTreeMap<(String, String), TargetDisposition> = BTreeMap::new();
+    for g in lines {
+        if let GraphLine::Disposition { mission, surface, risk_area, disposition, note, at_ms, .. } = g {
+            by_key.insert(
+                (normalize_surface(surface), risk_area.trim().to_ascii_lowercase()),
+                TargetDisposition {
+                    mission: mission.clone(),
+                    surface: surface.clone(),
+                    risk_area: risk_area.clone(),
+                    disposition: disposition.clone(),
+                    note: note.clone(),
+                    at_ms: *at_ms,
+                },
+            );
+        }
+    }
+    let mut out: Vec<TargetDisposition> = by_key.into_values().collect();
+    out.sort_by(|a, b| {
+        b.at_ms.cmp(&a.at_ms).then_with(|| a.surface.cmp(&b.surface)).then_with(|| a.risk_area.cmp(&b.risk_area))
+    });
+    out
+}
+
+fn extract_dead_ends(lines: &[GraphLine]) -> Vec<TargetDeadEnd> {
+    use std::collections::BTreeMap;
+    let mut by_key: BTreeMap<(String, String), TargetDeadEnd> = BTreeMap::new();
+    for g in lines {
+        if let GraphLine::DeadEnd { mission, surface, summary, at_ms, .. } = g {
+            by_key.insert(
+                (normalize_surface(surface), summary.trim().to_ascii_lowercase()),
+                TargetDeadEnd {
+                    mission: mission.clone(),
+                    surface: surface.clone(),
+                    summary: summary.clone(),
+                    at_ms: *at_ms,
+                },
+            );
+        }
+    }
+    let mut out: Vec<TargetDeadEnd> = by_key.into_values().collect();
+    out.sort_by(|a, b| b.at_ms.cmp(&a.at_ms).then_with(|| a.surface.cmp(&b.surface)));
+    out
+}
+
+fn extract_passive(lines: &[GraphLine]) -> Vec<TargetPassive> {
+    use std::collections::BTreeMap;
+    let mut by_key: BTreeMap<(String, String, String, String), TargetPassive> = BTreeMap::new();
+    for g in lines {
+        if let GraphLine::Passive { mission, exchange_id, host, path, signal, at_ms, .. } = g {
+            let h = norm_host(host);
+            by_key.insert(
+                (h.clone(), path.clone(), signal.kind.to_ascii_lowercase(), signal.summary.to_ascii_lowercase()),
+                TargetPassive {
+                    mission: mission.clone(),
+                    exchange_id: exchange_id.clone(),
+                    host: h,
+                    path: path.clone(),
+                    signal: signal.clone(),
+                    at_ms: *at_ms,
+                },
+            );
+        }
+    }
+    let mut out: Vec<TargetPassive> = by_key.into_values().collect();
+    let rank = |sev: &str| match sev.to_ascii_lowercase().as_str() {
+        "high" => 0u8,
+        "medium" => 1,
+        "low" => 2,
+        _ => 3,
+    };
+    out.sort_by(|a, b| {
+        rank(&a.signal.severity)
+            .cmp(&rank(&b.signal.severity))
+            .then_with(|| b.at_ms.cmp(&a.at_ms))
+            .then_with(|| a.host.cmp(&b.host))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    out
 }
 
 pub const SUMMARY_MAX_BYTES: usize = 8 * 1024;
 const SUMMARY_UNTESTED: usize = 40;
 const SUMMARY_FINDINGS: usize = 20;
+const SUMMARY_SECURITY_FINDINGS: usize = 12;
+const SUMMARY_DISPOSITIONS: usize = 12;
+const SUMMARY_DEAD_ENDS: usize = 8;
+const SUMMARY_RESOLVES: usize = 15;
+const SUMMARY_PASSIVE: usize = 10;
+
+fn one_line(text: &str, max_chars: usize) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max_chars {
+        flat
+    } else {
+        let cut: String = flat.chars().take(max_chars.saturating_sub(1)).collect();
+        format!("{cut}…")
+    }
+}
 
 fn kind_word(k: NodeKind) -> &'static str {
     match k {
@@ -726,7 +1323,11 @@ fn kind_word(k: NodeKind) -> &'static str {
 
 /// The text that goes under "# Target {name}" in a lead's system prompt (T5), at most 8 KiB.
 /// Deterministic for a graph: `nodes` is taken in the order [`TargetStore::nodes`] returns.
-pub fn summary(_name: &str, cfg: &TargetCfg, nodes: &[NodeView]) -> String {
+pub fn summary(name: &str, cfg: &TargetCfg, nodes: &[NodeView]) -> String {
+    summary_with_lines(name, cfg, nodes, &[])
+}
+
+fn summary_with_lines(_name: &str, cfg: &TargetCfg, nodes: &[NodeView], lines: &[GraphLine]) -> String {
     let mut s = String::new();
     let scope = if cfg.scope.is_empty() { "(none)".to_string() } else { cfg.scope.join(", ") };
     s.push_str(&format!("Scope: {scope}\n"));
@@ -776,6 +1377,100 @@ pub fn summary(_name: &str, cfg: &TargetCfg, nodes: &[NodeView]) -> String {
         s.push_str(&format!("Findings ({} of {}):\n", findings.len().min(SUMMARY_FINDINGS), findings.len()));
         for f in findings.iter().take(SUMMARY_FINDINGS) {
             s.push_str(f);
+        }
+    }
+    let sec_findings = extract_security_findings(lines);
+    if !sec_findings.is_empty() {
+        s.push_str(&format!(
+            "Recorded security findings ({} of {}):\n",
+            sec_findings.len().min(SUMMARY_SECURITY_FINDINGS),
+            sec_findings.len()
+        ));
+        for f in sec_findings.iter().take(SUMMARY_SECURITY_FINDINGS) {
+            let param = if f.param_or_sink.trim().is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", one_line(&f.param_or_sink, 48))
+            };
+            s.push_str(&format!(
+                "- [{}] {} · {} · {}{} · mission {}\n",
+                one_line(&f.severity, 16),
+                one_line(&f.title, 100),
+                one_line(&f.vuln_class, 32),
+                one_line(&f.surface, 80),
+                param,
+                f.mission
+            ));
+        }
+    }
+    let dispositions: Vec<TargetDisposition> = extract_dispositions(lines)
+        .into_iter()
+        .filter(|d| matches!(d.disposition.to_ascii_lowercase().as_str(), "ruled_out" | "needs_follow_up"))
+        .collect();
+    if !dispositions.is_empty() {
+        s.push_str(&format!(
+            "Dispositions ({} of {}):\n",
+            dispositions.len().min(SUMMARY_DISPOSITIONS),
+            dispositions.len()
+        ));
+        for d in dispositions.iter().take(SUMMARY_DISPOSITIONS) {
+            let note = if d.note.trim().is_empty() { String::new() } else { format!(": {}", one_line(&d.note, 90)) };
+            s.push_str(&format!(
+                "- [{}] {} · {}{} (mission {})\n",
+                one_line(&d.disposition, 20),
+                one_line(&d.surface, 70),
+                one_line(&d.risk_area, 40),
+                note,
+                d.mission
+            ));
+        }
+    }
+    let dead_ends = extract_dead_ends(lines);
+    if !dead_ends.is_empty() {
+        s.push_str(&format!(
+            "Dead ends ({} of {}):\n",
+            dead_ends.len().min(SUMMARY_DEAD_ENDS),
+            dead_ends.len()
+        ));
+        for d in dead_ends.iter().take(SUMMARY_DEAD_ENDS) {
+            s.push_str(&format!(
+                "- {}: {} (mission {})\n",
+                one_line(&d.surface, 70),
+                one_line(&d.summary, 100),
+                d.mission
+            ));
+        }
+    }
+    let resolves = extract_resolves(lines);
+    if !resolves.is_empty() {
+        s.push_str(&format!(
+            "Resolutions ({} of {}):\n",
+            resolves.len().min(SUMMARY_RESOLVES),
+            resolves.len()
+        ));
+        for r in resolves.iter().take(SUMMARY_RESOLVES) {
+            s.push_str(&format!("- {} -> {}\n", r.host, r.ip));
+        }
+    }
+    let passive: Vec<TargetPassive> = extract_passive(lines)
+        .into_iter()
+        .filter(|p| matches!(p.signal.severity.to_ascii_lowercase().as_str(), "high" | "medium"))
+        .collect();
+    if !passive.is_empty() {
+        s.push_str(&format!(
+            "Passive signals ({} of {} high/medium):\n",
+            passive.len().min(SUMMARY_PASSIVE),
+            passive.len()
+        ));
+        for p in passive.iter().take(SUMMARY_PASSIVE) {
+            s.push_str(&format!(
+                "- [{}] {} · {}{}: {}\n",
+                one_line(&p.signal.severity, 12),
+                one_line(&p.signal.kind, 32),
+                p.host,
+                one_line(&p.path, 60),
+                one_line(&p.signal.summary, 90)
+            ));
         }
     }
     let pointer = "Read the rest with security_query, view \"target\" (filters: kind, status, under, max).\n";
@@ -1015,5 +1710,213 @@ mod tests {
     fn exchange_paths_become_templates() {
         assert_eq!(path_template("/users/42/files/3f2b8c1e-aaaa-bbbb-cccc-1234567890ab?x=1"), "/users/{id}/files/{id}");
         assert_eq!(path_template("/api/login"), "/api/login");
+        // JS sourcemaps (.map) are NOT filtered or mangled.
+        assert_eq!(path_template("/static/assets/app.bundle.js.map?v=2"), "/static/assets/app.bundle.js.map");
+    }
+
+    #[test]
+    fn graph_persists_resolves_findings_dispositions_dead_ends_passive_and_map_endpoints() {
+        let d = tempfile::tempdir().unwrap();
+        let s = store(&d);
+        let map_ep = "GET https://www.acme.test:443/static/app.js.map";
+        s.append(
+            "acme",
+            vec![
+                seen(NodeKind::Host, "api.acme.test", "m-1", 10),
+                seen(NodeKind::Endpoint, map_ep, "m-1", 11),
+                GraphLine::Resolves {
+                    host: "api.acme.test".into(),
+                    ip: "203.0.113.10".into(),
+                    mission: "m-1".into(),
+                    at_ms: 100,
+                    prev: String::new(),
+                },
+                // Out-of-scope and excluded resolutions must be dropped.
+                GraphLine::Resolves {
+                    host: "evil.example".into(),
+                    ip: "198.51.100.7".into(),
+                    mission: "m-1".into(),
+                    at_ms: 101,
+                    prev: String::new(),
+                },
+                GraphLine::Resolves {
+                    host: "vpn.acme.test".into(),
+                    ip: "10.20.0.1".into(),
+                    mission: "m-1".into(),
+                    at_ms: 102,
+                    prev: String::new(),
+                },
+                GraphLine::SecurityFinding {
+                    id: "fn-001".into(),
+                    mission: "m-1".into(),
+                    title: "BOLA on user order fetch".into(),
+                    vuln_class: "CWE-639".into(),
+                    surface: "GET https://api.acme.test/v1/orders/42".into(),
+                    param_or_sink: "order_id".into(),
+                    severity: "high".into(),
+                    confidence: "high".into(),
+                    at_ms: 200,
+                    prev: String::new(),
+                },
+                // Out-of-scope URL finding is dropped.
+                GraphLine::SecurityFinding {
+                    id: "fn-bad".into(),
+                    mission: "m-1".into(),
+                    title: "Out of scope".into(),
+                    vuln_class: "CWE-79".into(),
+                    surface: "https://evil.example/search".into(),
+                    param_or_sink: "q".into(),
+                    severity: "medium".into(),
+                    confidence: "high".into(),
+                    at_ms: 201,
+                    prev: String::new(),
+                },
+                GraphLine::Disposition {
+                    mission: "m-1".into(),
+                    surface: "https://api.acme.test/v1/auth/login".into(),
+                    risk_area: "sqli".into(),
+                    disposition: "ruled_out".into(),
+                    note: "Parameterized query verified".into(),
+                    at_ms: 300,
+                    prev: String::new(),
+                },
+                GraphLine::Disposition {
+                    mission: "m-1".into(),
+                    surface: "https://api.acme.test/v1/export".into(),
+                    risk_area: "ssrf".into(),
+                    disposition: "needs_follow_up".into(),
+                    note: "Need OAST callback test".into(),
+                    at_ms: 301,
+                    prev: String::new(),
+                },
+                GraphLine::DeadEnd {
+                    mission: "m-1".into(),
+                    surface: "https://api.acme.test/v1/legacy".into(),
+                    summary: "Returns 410 Gone across all methods".into(),
+                    at_ms: 400,
+                    prev: String::new(),
+                },
+                GraphLine::Passive {
+                    mission: "m-1".into(),
+                    exchange_id: "ex-111111111111".into(),
+                    host: "api.acme.test".into(),
+                    path: "/v1/orders".into(),
+                    signal: crate::event::PassiveSignal {
+                        kind: "cors_misconfig".into(),
+                        severity: "high".into(),
+                        summary: "Reflected Origin with ACAC: true".into(),
+                        detail: String::new(),
+                    },
+                    at_ms: 500,
+                    prev: String::new(),
+                },
+                GraphLine::Passive {
+                    mission: "m-1".into(),
+                    exchange_id: "ex-222222222222".into(),
+                    host: "api.acme.test".into(),
+                    path: "/".into(),
+                    signal: crate::event::PassiveSignal {
+                        kind: "missing_security_headers".into(),
+                        severity: "info".into(),
+                        summary: "Missing CSP and XFO".into(),
+                        detail: String::new(),
+                    },
+                    at_ms: 501,
+                    prev: String::new(),
+                },
+                // Out-of-scope passive signal is dropped.
+                GraphLine::Passive {
+                    mission: "m-1".into(),
+                    exchange_id: "ex-333333333333".into(),
+                    host: "evil.example".into(),
+                    path: "/".into(),
+                    signal: crate::event::PassiveSignal {
+                        kind: "secret_leak".into(),
+                        severity: "high".into(),
+                        summary: "Leaked key".into(),
+                        detail: String::new(),
+                    },
+                    at_ms: 502,
+                    prev: String::new(),
+                },
+            ],
+        )
+        .unwrap();
+
+        assert!(s.verify("acme").unwrap());
+        assert!(s.nodes("acme").unwrap().iter().any(|n| n.locator == map_ep));
+        assert_eq!(s.resolves("acme").unwrap().len(), 1);
+        assert!(s.edges("acme").unwrap().iter().any(|e| e.kind == "resolves"));
+        assert_eq!(s.security_findings("acme").unwrap().len(), 1);
+        assert_eq!(s.dispositions("acme").unwrap().len(), 2);
+        assert_eq!(s.dead_ends("acme").unwrap().len(), 1);
+        assert_eq!(s.passive_signals("acme").unwrap().len(), 2);
+
+        // Cross-mission 3-axis duplicate matching (case-insensitive, normalized CWE + path template + param).
+        let dups = s
+            .find_duplicate_findings("acme", "cwe_0639", "https://API.ACME.TEST:443/v1/orders/999/?debug=1", " ORDER_ID ")
+            .unwrap();
+        assert_eq!(dups.len(), 1);
+        assert_eq!(dups[0].id, "fn-001");
+        assert_eq!(dups[0].mission, "m-1");
+
+        // Different param, vuln_class, or surface do not match.
+        assert!(s
+            .find_duplicate_findings("acme", "CWE-639", "https://api.acme.test/v1/orders/42", "user_id")
+            .unwrap()
+            .is_empty());
+        assert!(s
+            .find_duplicate_findings("acme", "CWE-89", "https://api.acme.test/v1/orders/42", "order_id")
+            .unwrap()
+            .is_empty());
+        assert!(s
+            .find_duplicate_findings("acme", "CWE-639", "https://api.acme.test/v1/invoices/42", "order_id")
+            .unwrap()
+            .is_empty());
+
+        // TargetStore::summary includes bounded highlights and omits low/info passive signals.
+        let sum = s.summary("acme").unwrap();
+        assert!(sum.len() <= SUMMARY_MAX_BYTES);
+        assert!(sum.contains("BOLA on user order fetch"), "{sum}");
+        assert!(sum.contains("[ruled_out]"), "{sum}");
+        assert!(sum.contains("[needs_follow_up]"), "{sum}");
+        assert!(sum.contains("Returns 410 Gone"), "{sum}");
+        assert!(sum.contains("api.acme.test -> 203.0.113.10"), "{sum}");
+        assert!(sum.contains("cors_misconfig"), "{sum}");
+        assert!(!sum.contains("missing_security_headers"), "info passive should not bloat summary: {sum}");
+        assert!(!sum.contains("evil.example"), "{sum}");
+    }
+
+    #[test]
+    fn merge_scope_validates_deduplicates_and_persists() {
+        let d = tempfile::tempdir().unwrap();
+        let s = store(&d);
+        let (cfg, added_s, added_e) = s
+            .merge_scope(
+                "acme",
+                &[
+                    "ACME.TEST.".into(),       // duplicate of existing acme.test
+                    "*.acme.test".into(),      // duplicate of existing *.acme.test
+                    "beta.acme.org".into(),    // new
+                    "BETA.ACME.ORG".into(),    // duplicate within same batch
+                    "198.51.100.0/24".into(),  // new CIDR
+                ],
+                &[
+                    "VPN.ACME.TEST".into(),    // duplicate of existing vpn.acme.test
+                    "billing.acme.org".into(), // new
+                ],
+            )
+            .unwrap();
+        assert_eq!((added_s, added_e), (2, 1));
+        assert!(cfg.scope.contains(&"beta.acme.org".to_string()));
+        assert!(cfg.scope.contains(&"198.51.100.0/24".to_string()));
+        assert!(cfg.exclude.contains(&"billing.acme.org".to_string()));
+        // Persisted to disk.
+        assert_eq!(s.get("acme").unwrap(), cfg);
+
+        // Invalid entry fails cleanly without mutating target.toml.
+        let err = s.merge_scope("acme", &["https://bad.example.com".into()], &[]).unwrap_err();
+        assert!(err.contains("scope entry") || err.contains("CIDR"), "{err}");
+        assert_eq!(s.get("acme").unwrap(), cfg);
     }
 }
