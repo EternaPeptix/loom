@@ -7235,7 +7235,7 @@ function tabKeys(event, tabs, activate) {
   event.preventDefault(); activate(tabs[next]); tabs[next].focus();
 }
 
-let inspectorPreferred = 360;
+let inspectorPreferred = null;
 function resizeInspector(width, { persist = true } = {}) {
   const { value, min, max } = C.clampInspectorWidth(width, innerWidth, EMBEDDED_DESK);
   $("app").style.setProperty("--inspector-width", value + "px");
@@ -9407,7 +9407,8 @@ async function bootApp() {
   setSection("chat", false);
   setDrawer("left", false);
   setDrawer("right", false);
-  inspectorPreferred = Number(recalled("inspector-width", 360)) || 360;
+  const savedInspector = Number(recalled("inspector-width", 0));
+  inspectorPreferred = Number.isFinite(savedInspector) && savedInspector > 0 ? savedInspector : null;
   resizeInspector(inspectorPreferred, { persist: false });
   renderDot();
   connect();

@@ -6213,7 +6213,7 @@ export function layoutQueries(embeddedDesk = false) {
     return {
       narrow: "(max-width: 860px)",
       phone: "(max-width: 560px)",
-      compact: "(max-width: 560px), (max-height: 460px)",
+      compact: "(max-width: 560px), (max-height: 560px)",
     };
   }
   return {
@@ -6223,15 +6223,18 @@ export function layoutQueries(embeddedDesk = false) {
   };
 }
 
-/** Clamp the docked inspector width against the current CSS viewport so zooming in never pushes chat off-screen. */
+/** Clamp the docked inspector width against the current CSS viewport so zoom-in stays readable and zoom-out scales proportionally. */
 export function clampInspectorWidth(requested, viewportWidth, embeddedDesk = false) {
   const vw = Number.isFinite(viewportWidth) && viewportWidth > 0 ? viewportWidth : 1280;
   const compactDocked = !!embeddedDesk && vw <= 1099 && vw > 860;
-  const min = compactDocked ? 210 : 240;
+  const min = compactDocked ? 260 : 240;
   const ratio = compactDocked ? 0.38 : 0.42;
-  const max = Math.max(min, Math.min(560, Math.floor(vw * ratio)));
-  const fallback = compactDocked ? 300 : 360;
-  const raw = Number.isFinite(requested) ? requested : fallback;
+  const maxCap = compactDocked ? 380 : 600;
+  const max = Math.max(min, Math.min(maxCap, Math.floor(vw * ratio)));
+  const fallback = compactDocked
+    ? Math.round(Math.max(min, Math.min(350, vw * 0.34)))
+    : Math.round(Math.max(360, Math.min(520, vw * 0.27)));
+  const raw = Number.isFinite(requested) && requested > 0 ? requested : fallback;
   const value = Math.max(min, Math.min(max, Math.round(raw)));
   return { value, min, max };
 }

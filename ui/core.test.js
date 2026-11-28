@@ -5085,32 +5085,41 @@ test("GUI zoom scaling: layoutQueries, clampInspectorWidth, and zoom-resilient C
   assert.deepEqual(C.layoutQueries(true), {
     narrow: "(max-width: 860px)",
     phone: "(max-width: 560px)",
-    compact: "(max-width: 560px), (max-height: 460px)",
+    compact: "(max-width: 560px), (max-height: 560px)",
   });
 
-  // Inspector width clamping scales cleanly across zoom-in and zoom-out without squeezing chat off-screen.
-  assert.deepEqual(C.clampInspectorWidth(480, 1440, true), { value: 480, min: 240, max: 560 });
-  assert.deepEqual(C.clampInspectorWidth(700, 2400, true), { value: 560, min: 240, max: 560 });
-  // At 150% zoom on a 1440px window (960px CSS width), embedded inspector stays docked with 38% cap and 210px min.
-  assert.deepEqual(C.clampInspectorWidth(480, 960, true), { value: 364, min: 210, max: 364 });
-  assert.deepEqual(C.clampInspectorWidth(120, 960, true), { value: 210, min: 210, max: 364 });
-  assert.deepEqual(C.clampInspectorWidth(NaN, 960, true), { value: 300, min: 210, max: 364 });
+  // Inspector width clamping scales proportionally on zoom-out when un-dragged and clamps explicit widths on zoom-in.
+  assert.deepEqual(C.clampInspectorWidth(null, 2133, true), { value: 520, min: 240, max: 600 });
+  assert.deepEqual(C.clampInspectorWidth(null, 1707, true), { value: 461, min: 240, max: 600 });
+  assert.deepEqual(C.clampInspectorWidth(null, 1280, true), { value: 360, min: 240, max: 537 });
+  assert.deepEqual(C.clampInspectorWidth(480, 1440, true), { value: 480, min: 240, max: 600 });
+  assert.deepEqual(C.clampInspectorWidth(700, 2400, true), { value: 600, min: 240, max: 600 });
+  // At 130%-150% zoom on a laptop window (861..1099px CSS width), embedded inspector stays docked with 38% cap and 260px min.
+  assert.deepEqual(C.clampInspectorWidth(480, 960, true), { value: 364, min: 260, max: 364 });
+  assert.deepEqual(C.clampInspectorWidth(120, 960, true), { value: 260, min: 260, max: 364 });
+  assert.deepEqual(C.clampInspectorWidth(NaN, 960, true), { value: 326, min: 260, max: 364 });
   // Standard browser at 1200px uses 240px min and 42% cap (504px).
   assert.deepEqual(C.clampInspectorWidth(600, 1200, false), { value: 504, min: 240, max: 504 });
   assert.deepEqual(C.clampInspectorWidth(100, 1200, false), { value: 240, min: 240, max: 504 });
   assert.deepEqual(C.clampInspectorWidth(undefined, 0, false), { value: 360, min: 240, max: 537 });
 
-  // Style contract: fluid sidebar/chat/composer/gutters and embedded-desk zoom thresholds.
+  // Style contract: fluid sidebar/chat/composer/gutters, symmetric prose, zoom-in compression, and zero @container rules (WebKit pageZoom quirk).
   const css = readFileSync(join(here, "style.css"), "utf8");
-  assert.match(css, /--sidebar-width:\s*clamp\(192px,\s*21vw,\s*288px\)/);
-  assert.match(css, /--gutter-x:\s*clamp\(12px,\s*2\.2vw,\s*28px\)/);
-  assert.match(css, /\.show-right\s+\.layout\s*\{\s*grid-template-columns:\s*var\(--sidebar-width\)\s+minmax\(0,\s*1fr\)\s+clamp\(240px,\s*var\(--inspector-width,\s*360px\),\s*42vw\)/);
-  assert.match(css, /\.scroller\s*>\s*\*\s*\{\s*width:\s*min\(100%,\s*clamp\(520px,\s*82%,\s*1240px\)\)/);
-  assert.match(css, /\.composer\s*>\s*\*\s*\{\s*width:\s*min\(100%,\s*clamp\(520px,\s*82%,\s*1240px\)\)/);
+  assert.match(css, /--sidebar-width:\s*clamp\(188px,\s*19\.5vw,\s*380px\)/);
+  assert.match(css, /--gutter-x:\s*clamp\(12px,\s*2vw,\s*28px\)/);
+  assert.match(css, /\.show-right\s+\.layout\s*\{\s*grid-template-columns:\s*var\(--sidebar-width\)\s+minmax\(0,\s*1fr\)\s+clamp\(240px,\s*var\(--inspector-width,\s*clamp\(360px,\s*27vw,\s*520px\)\),\s*42vw\)/);
+  assert.match(css, /\.scroller\s*>\s*\*\s*\{\s*width:\s*min\(100%,\s*clamp\(520px,\s*84%,\s*1040px\)\)/);
+  assert.match(css, /\.composer\s*>\s*\*\s*\{\s*width:\s*min\(100%,\s*clamp\(520px,\s*84%,\s*1040px\)\)/);
+  assert.match(css, /\.scroller\s+\.prose\s*\{\s*max-width:\s*none;\s*\}/);
+  assert.match(css, /\.embedded-desk\s+\.lhead\s*\{\s*display:\s*grid;/);
+  assert.match(css, /\.lnew\s+\.btn\s*\{[^}]*overflow:\s*hidden;[^}]*text-overflow:\s*ellipsis;/);
+  assert.match(css, /@media\s*\(max-height:\s*680px\),\s*\(max-width:\s*1020px\)/);
   assert.match(css, /@media\s*\(max-width:\s*1099px\)\s*and\s*\(min-width:\s*861px\)[\s\S]*?body\.embedded-desk\.show-right\s+\.layout/);
   assert.match(css, /@media\s*\(max-width:\s*860px\)[\s\S]*?body\.embedded-desk\s+\.right/);
   assert.match(css, /@media\s*\(max-width:\s*560px\)[\s\S]*?body\.embedded-desk\s+\.bar/);
-  assert.match(css, /@media\s*\(max-width:\s*560px\),\s*\(max-height:\s*460px\)[\s\S]*?body\.embedded-desk\s+\.view\.session/);
+  assert.match(css, /@media\s*\(max-width:\s*560px\),\s*\(max-height:\s*560px\)[\s\S]*?body\.embedded-desk\s+\.view\.session/);
+  const cssNoComments = css.replace(/\/\*[\s\S]*?\*\//g, "");
+  assert.doesNotMatch(cssNoComments, /@container\b/, "avoid @container in style.css due to WebKit pageZoom physical-pixel evaluation");
 
   // Every brace in style.css must stay balanced.
   let depth = 0;
