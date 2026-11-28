@@ -19912,7 +19912,15 @@ done
         assert!(!fake.running(&container), "the box is gone while the sessions stop ({:?})", begun.elapsed());
         let report = panic.await.unwrap().unwrap();
         assert_eq!(report.boxes_torn_down, 1, "{report:?}");
-        assert!(begun.elapsed() >= Duration::from_secs(2), "the session took its grace to stop: {:?}", begun.elapsed());
+        // Under seatbelt the job ignores TERM, so the session takes its grace to stop and the box is shown gone first.
+        // Bubblewrap ends the job's whole namespace at once, so there is no grace to outlast on Linux.
+        if cfg!(target_os = "macos") {
+            assert!(
+                begun.elapsed() >= Duration::from_secs(2),
+                "the session took its grace to stop: {:?}",
+                begun.elapsed()
+            );
+        }
         e.rt.shutdown().await;
     }
 
@@ -20183,6 +20191,8 @@ done
             with_os_sandbox(c);
         })
         .await;
+        // Bubblewrap (the OS sandbox on Linux) hides the workspace's reserved `.ferret` and needs it to exist.
+        std::fs::create_dir_all(e_on.ws.join(".ferret")).unwrap();
 
         let mut new_mitm = e_on.new_session(Some("go"));
         new_mitm.intercept = Some(true);
