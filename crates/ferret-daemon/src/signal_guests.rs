@@ -12,7 +12,7 @@
 //!   and per-guest single-flight RAII guards prevent flooding and unbounded LLM concurrency.
 
 use crate::wire::SignalHealth;
-use ferret_agent::runtime::GuestChatTurn;
+use ferret_agent::runtime::{GuestChatTurn, NoteTriage};
 use ferret_core::config::{valid_e164, valid_signal_uuid, SignalCfg, SignalGuestsCfg};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -35,6 +35,8 @@ pub const GUEST_CHAT_WINDOW_MS: u64 = 60 * 60 * 1_000;
 pub const GUEST_PREVIEW_MAX_CHARS: usize = 240;
 /// Maximum characters kept for a guest's display label / nickname.
 pub const GUEST_LABEL_MAX_CHARS: usize = 80;
+/// Maximum pending triaged guest notes persisted in `signal_guests.json`.
+pub const MAX_NOTE_ACTIONS: usize = 100;
 
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -111,12 +113,42 @@ impl GuestRecord {
     }
 }
 
+/// Persisted record of a delivered guest note (`n-1`, `n-2`, ...) and its optional zero-tool triage
+/// proposal so owner quote-replies (`"do"`, `"do + reply"`, `"reply"`) survive daemon restarts and
+/// execute at most once.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingNoteAction {
+    pub note_id: String,
+    pub guest_id: String,
+    pub guest_address: String,
+    pub guest_name: String,
+    pub verbatim_note: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub triage: Option<NoteTriage>,
+    pub created_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executed_session: Option<String>,
+}
+
+/// Atomic claim result for [`GuestStore::claim_note_execution`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClaimNoteOutcome {
+    Claimed(Box<PendingNoteAction>),
+    AlreadyExecuted { session_id: String },
+    InProgress,
+    NotFound,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PersistedGuests {
     #[serde(default = "default_next_id")]
     next_id: u64,
     #[serde(default)]
     guests: Vec<GuestRecord>,
+    #[serde(default = "default_next_id")]
+    next_note_id: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    note_actions: Vec<PendingNoteAction>,
 }
 
 fn default_next_id() -> u64 {
@@ -125,7 +157,7 @@ fn default_next_id() -> u64 {
 
 impl Default for PersistedGuests {
     fn default() -> Self {
-        Self { next_id: 1, guests: Vec::new() }
+        Self { next_id: 1, guests: Vec::new(), next_note_id: 1, note_actions: Vec::new() }
     }
 }
 
@@ -144,6 +176,8 @@ struct GuestInner {
     note_timestamps: HashMap<String, VecDeque<u64>>,
     /// Per-guest single-flight set preventing concurrent LLM turns for the same guest.
     in_flight: HashSet<String>,
+    /// In-flight note execution claims (`n-1`, lowercase) preventing concurrent `"do"` duplicates.
+    claiming_notes: HashSet<String>,
     /// Monotonic generation bumped on `/reset`, `/guest clear`, revoke, or block so an in-flight
     /// LLM completion cannot write stale turns back into wiped history.
     history_generation: HashMap<String, u64>,
@@ -285,6 +319,18 @@ impl GuestStore {
                         .max()
                         .unwrap_or(0);
                     loaded.next_id = loaded.next_id.max(max_existing.saturating_add(1)).max(1);
+                    // Ensure next_note_id is strictly greater than any existing `n-<n>` ID.
+                    let max_note = loaded
+                        .note_actions
+                        .iter()
+                        .filter_map(|a| a.note_id.strip_prefix("n-").and_then(|n| n.parse::<u64>().ok()))
+                        .max()
+                        .unwrap_or(0);
+                    loaded.next_note_id = loaded.next_note_id.max(max_note.saturating_add(1)).max(1);
+                    if loaded.note_actions.len() > MAX_NOTE_ACTIONS {
+                        let drop_n = loaded.note_actions.len() - MAX_NOTE_ACTIONS;
+                        loaded.note_actions.drain(..drop_n);
+                    }
                     data = loaded;
                 }
                 Err(e) => {
@@ -615,6 +661,107 @@ impl GuestStore {
     pub fn get_by_id(&self, guest_id: &str) -> Option<GuestRecord> {
         let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         g.data.guests.iter().find(|r| r.id.eq_ignore_ascii_case(guest_id)).cloned()
+    }
+
+    /// Persist a delivered guest note (with optional zero-tool triage) in the bounded
+    /// [`MAX_NOTE_ACTIONS`] ring under a monotonic `n-<N>` identifier.
+    pub fn record_note_action(
+        &self,
+        guest_id: &str,
+        guest_address: &str,
+        guest_name: &str,
+        verbatim_note: &str,
+        triage: Option<NoteTriage>,
+        created_ms: u64,
+    ) -> PendingNoteAction {
+        let clean_name = sanitize_inline(guest_name, GUEST_LABEL_MAX_CHARS);
+        let display = if clean_name.is_empty() { guest_id.to_string() } else { clean_name };
+        let clean_note = sanitize_note(verbatim_note, GUEST_NOTE_MAX_CHARS);
+
+        let action = {
+            let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            let note_id = alloc_note_id(&mut g.data);
+            let record = PendingNoteAction {
+                note_id,
+                guest_id: guest_id.to_string(),
+                guest_address: canonical_address(guest_address),
+                guest_name: display,
+                verbatim_note: clean_note,
+                triage,
+                created_ms,
+                executed_session: None,
+            };
+            g.data.note_actions.push(record.clone());
+            while g.data.note_actions.len() > MAX_NOTE_ACTIONS {
+                let evicted = g.data.note_actions.remove(0);
+                g.claiming_notes.remove(&evicted.note_id.to_ascii_lowercase());
+            }
+            record
+        };
+        self.persist();
+        action
+    }
+
+    /// Look up a persisted guest note action by its `n-<N>` identifier.
+    pub fn get_note_action(&self, note_id: &str) -> Option<PendingNoteAction> {
+        let needle = note_id.trim();
+        if needle.is_empty() {
+            return None;
+        }
+        let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        g.data.note_actions.iter().find(|a| a.note_id.eq_ignore_ascii_case(needle)).cloned()
+    }
+
+    /// Atomically claim exclusive right to spawn a mission for `note_id` so concurrent or repeated
+    /// `"do"` replies never spawn duplicate missions. Call [`Self::mark_note_executed`] on success
+    /// or [`Self::unclaim_note_execution`] on failure.
+    pub fn claim_note_execution(&self, note_id: &str) -> ClaimNoteOutcome {
+        let needle = note_id.trim();
+        if needle.is_empty() {
+            return ClaimNoteOutcome::NotFound;
+        }
+        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(action) = g.data.note_actions.iter().find(|a| a.note_id.eq_ignore_ascii_case(needle)).cloned() else {
+            return ClaimNoteOutcome::NotFound;
+        };
+        if let Some(session_id) = action.executed_session {
+            return ClaimNoteOutcome::AlreadyExecuted { session_id };
+        }
+        let key = action.note_id.to_ascii_lowercase();
+        if !g.claiming_notes.insert(key) {
+            return ClaimNoteOutcome::InProgress;
+        }
+        ClaimNoteOutcome::Claimed(Box::new(action))
+    }
+
+    /// Record the spawned mission session ID for `note_id`, release the in-flight claim, and
+    /// persist to `signal_guests.json`.
+    pub fn mark_note_executed(&self, note_id: &str, session_id: &str) -> bool {
+        let needle = note_id.trim();
+        let found = {
+            let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            g.claiming_notes.remove(&needle.to_ascii_lowercase());
+            if let Some(action) = g.data.note_actions.iter_mut().find(|a| a.note_id.eq_ignore_ascii_case(needle)) {
+                action.executed_session = Some(session_id.to_string());
+                true
+            } else {
+                false
+            }
+        };
+        if found {
+            self.persist();
+        }
+        found
+    }
+
+    /// Release an in-flight execution claim for `note_id` after a spawn error so the owner may retry.
+    pub fn unclaim_note_execution(&self, note_id: &str) {
+        let key = note_id.trim().to_ascii_lowercase();
+        if key.is_empty() {
+            return;
+        }
+        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        g.claiming_notes.remove(&key);
     }
 
     /// Build the `/guests` view (approved, pending, blocked) and refresh `#1..#N` shortcuts.
@@ -1130,6 +1277,12 @@ fn alloc_id(data: &mut PersistedGuests) -> String {
     format!("g-{n}")
 }
 
+fn alloc_note_id(data: &mut PersistedGuests) -> String {
+    let n = data.next_note_id.max(1);
+    data.next_note_id = n.saturating_add(1);
+    format!("n-{n}")
+}
+
 fn bump_generation(map: &mut HashMap<String, u64>, guest_id: &str) {
     let entry = map.entry(guest_id.to_string()).or_insert(0);
     *entry = entry.saturating_add(1);
@@ -1440,18 +1593,54 @@ pub fn format_new_contact_alert(
     truncate_chars_clean(&body, max_chars)
 }
 
-/// Format the owner `[Ferret · GUEST NOTE · <id> from <name>]` quote-replyable alert.
-/// Places `<id>` in the trusted header prefix BEFORE the guest name and note body.
-pub fn format_guest_note_alert(guest_id: &str, display_name: &str, note: &str, max_chars: usize) -> String {
+/// Format the owner `[Ferret · GUEST NOTE · <guest_id> · <note_id> from <name>]` quote-replyable
+/// alert with strict line-1 header anchoring BEFORE any untrusted guest name or note body.
+pub fn format_triaged_guest_note_alert(
+    guest_id: &str,
+    note_id: &str,
+    display_name: &str,
+    note: &str,
+    triage: Option<&NoteTriage>,
+    max_chars: usize,
+) -> String {
     let clean_name = sanitize_inline(display_name, GUEST_LABEL_MAX_CHARS);
     let label = if clean_name.is_empty() { guest_id } else { clean_name.as_str() };
     let clean_note = sanitize_note(note, GUEST_NOTE_MAX_CHARS);
-    let body = format!(
-        "[Ferret · GUEST NOTE · {guest_id} from {label}]\n\
-         {clean_note}\n\n\
-         Quote-reply to message {label} directly."
-    );
-    truncate_chars_clean(&body, max_chars)
+
+    let mut out = format!("[Ferret · GUEST NOTE · {guest_id} · {note_id} from {label}]\n{clean_note}");
+
+    if let Some(t) = triage {
+        let suggested_reply = t.suggested_reply.as_deref().map(|r| sanitize_inline(r, 240)).filter(|s| !s.is_empty());
+        let is_actionable = t.actionable && !t.proposed_task.trim().is_empty();
+
+        if is_actionable {
+            let kind = sanitize_inline(&t.kind, 32);
+            let kind_str = if kind.is_empty() { "task" } else { kind.as_str() };
+            let summary_raw = if t.summary.trim().is_empty() { &t.proposed_task } else { &t.summary };
+            let summary = sanitize_inline(summary_raw, 160);
+            out.push_str(&format!("\n\nSuggested action ({kind_str}): {summary}"));
+            if let Some(reply) = suggested_reply.as_deref() {
+                out.push_str(&format!("\nSuggested reply: \"{reply}\""));
+                out.push_str(&format!(
+                    "\n\nQuote-reply \"do\" (or \"do <extra>\") to run it, \"do + reply\" to run & reply, \"reply\" to send the reply, or type any custom reply to {label}."
+                ));
+            } else {
+                out.push_str(&format!(
+                    "\n\nQuote-reply \"do\" (or \"do <extra>\") to run it, or type any custom reply to {label}."
+                ));
+            }
+        } else if let Some(reply) = suggested_reply.as_deref() {
+            out.push_str(&format!(
+                "\n\nSuggested reply: \"{reply}\"\n\nQuote-reply \"reply\" to send it, or type any custom reply to {label}."
+            ));
+        } else {
+            out.push_str(&format!("\n\nQuote-reply to message {label} directly."));
+        }
+    } else {
+        out.push_str(&format!("\n\nQuote-reply to message {label} directly."));
+    }
+
+    truncate_chars_clean(&out, max_chars)
 }
 
 /// Format the owner's `/guests` overview message.
@@ -1812,5 +2001,119 @@ mod tests {
         assert!(store.try_consume_note_quota(&app.id, 102_000));
         assert!(!store.try_consume_note_quota(&app.id, 103_000));
         assert!(store.try_consume_note_quota(&app.id, 100_000 + GUEST_NOTE_WINDOW_MS + 1));
+    }
+
+    #[test]
+    fn pending_note_actions_persist_0600_ring_bounds_backward_compat_and_atomic_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("signal_guests.json");
+
+        // Backward-compatibility: legacy signal_guests.json without `next_note_id` or `note_actions` loads cleanly.
+        std::fs::write(&path, r#"{"next_id": 2, "guests": []}"#).unwrap();
+        let store = GuestStore::open(path.clone());
+
+        let triage = NoteTriage {
+            actionable: true,
+            kind: "calendar".into(),
+            summary: "Add dinner with Alex on Thu 2026-11-27 at 5:00 PM".into(),
+            proposed_task: "Create a calendar event for dinner with Alex on 2026-11-27 at 17:00.".into(),
+            suggested_reply: Some("Sounds great, see you Thursday at 5!".into()),
+        };
+
+        let a1 = store.record_note_action(
+            "g-1",
+            "+15550155",
+            "Alex\u{202e}",
+            "Dinner Thu at 5?",
+            Some(triage.clone()),
+            1_000,
+        );
+        assert_eq!(a1.note_id, "n-1");
+        assert_eq!(a1.guest_name, "Alex");
+        assert_eq!(a1.executed_session, None);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "signal_guests.json must remain mode 0600");
+        }
+
+        // Atomic claim prevents concurrent double execution, unclaim restores retryability, mark_executed seals it.
+        assert!(matches!(store.claim_note_execution("n-1"), ClaimNoteOutcome::Claimed(ref a) if a.note_id == "n-1"));
+        assert_eq!(store.claim_note_execution("n-1"), ClaimNoteOutcome::InProgress);
+        store.unclaim_note_execution("n-1");
+        assert!(matches!(store.claim_note_execution("N-1"), ClaimNoteOutcome::Claimed(_)));
+        assert!(store.mark_note_executed("n-1", "s-abc123"));
+        assert_eq!(
+            store.claim_note_execution("n-1"),
+            ClaimNoteOutcome::AlreadyExecuted { session_id: "s-abc123".into() }
+        );
+        assert_eq!(store.claim_note_execution("n-999"), ClaimNoteOutcome::NotFound);
+
+        // Reload from disk preserves executed_session and monotonic next_note_id.
+        let reloaded = GuestStore::open(path.clone());
+        assert_eq!(reloaded.get_note_action("n-1").unwrap().executed_session.as_deref(), Some("s-abc123"));
+        let a2 = reloaded.record_note_action("g-1", "+15550155", "Alex", "Second note", None, 2_000);
+        assert_eq!(a2.note_id, "n-2");
+
+        // Bounded ring keeps at most MAX_NOTE_ACTIONS newest entries with monotonic IDs.
+        for i in 0..(MAX_NOTE_ACTIONS + 10) {
+            let rec =
+                reloaded.record_note_action("g-1", "+15550155", "Alex", &format!("note {i}"), None, 3_000 + i as u64);
+            assert!(rec.note_id.starts_with("n-"));
+        }
+        assert!(reloaded.get_note_action("n-1").is_none(), "oldest note must be evicted past MAX_NOTE_ACTIONS");
+        assert!(
+            reloaded.get_note_action(&format!("n-{}", MAX_NOTE_ACTIONS + 12)).is_some(),
+            "newest note must remain in ring"
+        );
+    }
+
+    #[test]
+    fn format_triaged_guest_note_alert_anchors_header_and_renders_all_modes() {
+        // 1. Actionable with suggested reply.
+        let full = NoteTriage {
+            actionable: true,
+            kind: "calendar".into(),
+            summary: "Schedule dinner with Alex Thu 5pm".into(),
+            proposed_task: "Add dinner event Thu 17:00".into(),
+            suggested_reply: Some("See you Thursday at 5!".into()),
+        };
+        let msg = format_triaged_guest_note_alert("g-1", "n-7", "Alex\nEvil", "Dinner Thu at 5?", Some(&full), 3500);
+        let first_line = msg.lines().next().unwrap();
+        assert_eq!(first_line, "[Ferret · GUEST NOTE · g-1 · n-7 from Alex Evil]");
+        assert!(msg.contains("Dinner Thu at 5?"), "{msg}");
+        assert!(msg.contains("Suggested action (calendar): Schedule dinner with Alex Thu 5pm"), "{msg}");
+        assert!(msg.contains("Suggested reply: \"See you Thursday at 5!\""), "{msg}");
+        assert!(msg.contains("\"do\"") && msg.contains("\"do + reply\"") && msg.contains("\"reply\""), "{msg}");
+
+        // 2. Actionable without suggested reply.
+        let no_reply = NoteTriage { suggested_reply: None, ..full.clone() };
+        let msg2 =
+            format_triaged_guest_note_alert("g-1", "n-8", "Alex", "Remind me to buy milk", Some(&no_reply), 3500);
+        assert!(msg2.starts_with("[Ferret · GUEST NOTE · g-1 · n-8 from Alex]\n"));
+        assert!(msg2.contains("\"do\""), "{msg2}");
+        assert!(!msg2.contains("\"do + reply\""), "{msg2}");
+
+        // 3. Non-actionable with suggested reply only.
+        let reply_only = NoteTriage {
+            actionable: false,
+            kind: "reply".into(),
+            summary: "Thank you note".into(),
+            proposed_task: String::new(),
+            suggested_reply: Some("You're welcome!".into()),
+        };
+        let msg3 = format_triaged_guest_note_alert("g-1", "n-9", "Alex", "Thanks for lunch!", Some(&reply_only), 3500);
+        assert!(msg3.contains("Suggested reply: \"You're welcome!\""), "{msg3}");
+        assert!(msg3.contains("Quote-reply \"reply\" to send it"), "{msg3}");
+        assert!(!msg3.contains("Suggested action"), "{msg3}");
+        assert!(!msg3.contains("\"do\""), "{msg3}");
+
+        // 4. Plain note (triage = None).
+        let plain = format_triaged_guest_note_alert("g-1", "n-10", "Alex", "Just saying hi", None, 3500);
+        assert!(plain.starts_with("[Ferret · GUEST NOTE · g-1 · n-10 from Alex]\nJust saying hi"));
+        assert!(plain.contains("Quote-reply to message Alex directly."), "{plain}");
+        assert!(!plain.contains("\"do\""), "{plain}");
     }
 }

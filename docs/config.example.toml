@@ -268,6 +268,10 @@ rate_limit_per_hour = 30                        # max LLM turns per guest per ro
 max_reply_chars = 1500                          # max characters per guest reply (200..=7500)
 unknown_cooldown_hours = 24                     # hours before an unapproved unknown sender receives another auto-reply (1..=720)
 persona = ""                                    # optional custom persona appended after the immutable safety boundary (<=2000 chars)
+triage_notes = true                             # run zero-tool triage LLM on incoming guest notes (falls back to plain note on error)
+# triage_model = "local"                        # optional [models.*] profile for guest note triage; omitted = signal.guests.model -> default_model
+# action_workspace = "~/ferret-assistant"       # dedicated workspace outside ~/.ferret for owner-confirmed "do" note actions; omitted = "do" disabled
+action_pack = "core"                            # pack used when spawning an owner-confirmed guest note action mission
 
 [notify]
 # command = ["/usr/local/bin/my-notify"]   # program run per notification, given FERRET_KIND, FERRET_SESSION, FERRET_TITLE and FERRET_TEXT in its environment; default: the platform's notifier (macOS only; elsewhere nobody is notified)
