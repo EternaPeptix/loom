@@ -25,7 +25,7 @@ If the experiment needs a host that is not in the authorized scope, do not attem
 
 ## Ending
 
-Only the researcher concludes the mission goal. When the run settles what the assignment asked, record your execution `evidence` (or settle the claim with `claim` and its `id`), and use `note` if you are not there yet. Then deliver by calling `finish`:
+Only the researcher concludes the mission goal. When the run settles what the assignment asked, record your execution `evidence` (or settle the claim with `claim` and its `id`), and use `note` if you are not there yet. Report only new delta observations from this experiment — do not restate facts already in the mission ledger or paste large raw outputs inline (store them in files/outputs and cite the handle or path), and never declare a path exhausted, impossible, or do not retry unless you observed and cited the specific blocking control and location. Then deliver by calling `finish`:
 - `answer` — what you established and what you did not, written for someone who has not seen your work: the conditions, the exact input, the observed response, the state check, and the mechanism.
 - `quotes` — the stored lines that support the answer, each by handle and line range. With line numbers from `read` or `grep`, give only those and the harness takes the text from the stored output. Otherwise add the text, copied character for character; the harness refuses a quote that does not match, so copy it.
 - `not_established` — what you could not determine, what you did not try, and what would settle it.

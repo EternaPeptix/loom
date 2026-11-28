@@ -1,8 +1,9 @@
-# Example ~/.loom/config.toml.
+# Example ~/.ferret/config.toml.
 #
 # Every key has a default, so an empty file is a valid config and you only need the parts you want to
 # change. Unknown keys are an error. The daemon reads this file only when it starts: restart it
-# (`loom down`, then `loom up`) after editing, and check the file first with `loom config check`.
+# (`ferret down`, then `ferret up`) after editing (except `[models]` and `default_model`, which
+# `ferret models reload` applies live), and check the file first with `ferret config check`.
 # Values shown uncommented are the defaults unless a comment says "example".
 
 # The profile a session uses when it names none. Example: the default is empty, which means the only
@@ -17,7 +18,7 @@ proxy_port = 0            # egress proxy on 127.0.0.1; 0 = pick a free port
 [models.local]
 base_url = "http://127.0.0.1:8000/v1"   # example: replace with your server
 model = "default"                       # example: the id the server serves (a single served model is found automatically)
-# api_key_file = "local"                # API key, if the server wants one: a file of that name in ~/.loom/keys/models (yours, mode 0600)
+# api_key_file = "local"                # API key, if the server wants one: a file of that name in ~/.ferret/keys/models (yours, mode 0600)
 # api_key_env = "MY_SERVER_KEY"         # or: an environment variable of the daemon holding it (commands can read it there; prefer api_key_file)
 # context_window = 1000000              # discovered from the server's model list when omitted; set it if the server does not report one
 # max_output_tokens = 32768             # max_tokens sent with each request; omitted = the server's default
@@ -27,7 +28,7 @@ max_concurrent = 4                      # concurrent requests to this server acr
 stall_timeout_s = 240                   # abort and retry a stream that delivers nothing this long
 retry_window_s = 300                    # keep retrying an unreachable or failing server this long; 0 = until it returns
 retry_max_delay_s = 30                  # longest pause between retries
-# text_tool_calls = "any"              # calls a model writes into its text, taken only at the
+text_tool_calls = "any"                 # calls a model writes into its text, taken only at the
                                         # reply's end: any | tool_call | dsml | invoke | fenced_json | off
 
 # Request fields sent verbatim on every call. Fixed for a session's life: some chat templates render
@@ -39,10 +40,10 @@ retry_max_delay_s = 30                  # longest pause between retries
 [context]
 # The window is compacted when a request reaches this many tokens: the model writes a note, the harness adds a
 # table of keys for every output, and everything before the last few steps leaves the window (nothing is
-# deleted). 0 = 40% of the model's context window, never above 400000.
+# deleted). 0 = 40% of the model's context window, capped at 400000 (100000 when the window is unknown).
+# (Deprecated re-weave keys target_tokens, floor_tokens, keep_recent_steps, stub_tail_lines still load with a
+# startup warning; use compact_at_tokens instead.)
 compact_at_tokens = 0
-# The re-weave keys (target_tokens, floor_tokens, keep_recent_steps, stub_tail_lines) still load, are ignored,
-# and are warned about at start; target_tokens is read as compact_at_tokens when that is 0.
 
 [admit]
 # How much of a tool output the model sees inline. The whole output is always stored and can be paged.
@@ -70,12 +71,14 @@ job_wake_max = 20          # reports per watched job; after the last one it is f
 # the same call. false = run calls only after the whole reply has arrived.
 speculate = true
 # Argument names the file and shell tools are shown with: "trained" (Claude Code's, which most models are
-# tuned on) or "loom". Calls in either shape, and in Codex/Gemini/OpenHands/Cline shapes, run either way.
+# tuned on) or "ferret". Calls in either shape, and in Codex/Gemini/OpenHands/Cline shapes, run either way.
 # See docs/TOOL-SHAPES.md.
 dialect = "trained"
 
 [sandbox]
-mode = "seatbelt"          # "seatbelt" (macOS), "bubblewrap" (Linux, no shell network), or explicitly unconfined "none".
+# Default when omitted: "seatbelt" on macOS, "bubblewrap" on Linux (deny-all command networking only).
+# Set "none" only to run commands explicitly unconfined (refused when [box] enabled = true).
+# mode = "seatbelt"
 protect_credentials = true # ~/.ssh, ~/.aws, ~/.gnupg, keychains, browser profiles ... are unreadable and unwritable to commands and file tools; false turns this off
 # unreadable_paths = ["~/private"]       # more paths commands and file tools cannot read or write ("~" is expanded)
 # extra_writable = ["/path/to/scratch"]  # more directories commands may write to (absolute)
@@ -101,26 +104,40 @@ mode = "deny_all"
 # allow_private = ["10.1.2.3"]   # private, loopback or link-local destinations that are permitted (host pattern, IP or CIDR)
 
 # Captured traffic and HTTPS interception (docs/DESIGN.md, section 11).
-# capture_max_bytes = 1048576     # bytes of each request or response body kept in a captured exchange
-# capture_max_exchanges = 100000  # exchanges recorded per session; past it traffic is relayed but not recorded
-# intercept = "pack"              # "pack": missions of packs with intercept = true decrypt HTTPS; "always"; "never"
+capture_max_bytes = 1048576       # bytes of each request or response body kept in a captured exchange
+capture_max_exchanges = 100000    # exchanges recorded per session; past it traffic is relayed but not recorded
+intercept = "pack"                # "pack": missions of packs with intercept = true decrypt HTTPS; "always"; "never"
 # intercept_passthrough = ["*.bank.example.test"]  # hosts tunneled untouched even when intercepting
-# upstream_roots = ["/etc/ssl/corp-root.pem"]       # extra PEM roots trusted for upstream TLS when intercepting
+# upstream_roots = ["/etc/ssl/corp-root.pem"]      # extra PEM roots trusted for upstream TLS when intercepting
+
+# Egress noise governor and assessment User-Agent (docs/SECURITY_STATE.md).
+#   "off"        (the default) passthrough
+#   "quiet"      2 rps, burst 4, concurrency 1/host, 8 global, jitter 0.5
+#   "balanced"   5 rps, burst 10, concurrency 2/host, 16 global, jitter 0.2
+#   "aggressive" 20 rps, burst 40, concurrency 4/host, 32 global, jitter 0.1
+noise_profile = "off"
+# target_user_agent = "Mozilla/5.0 ..."            # default User-Agent attached when noise_profile != "off" and request sets none
+
+# Optional origin-scoped assessment User-Agent (`Ferret-Assessment/1.0 (engagement=<reference>)`) for SOC/WAF log
+# correlation. Sent ONLY on exact listed origins when a request has no explicit User-Agent; never leaks across redirects.
+# [network.assessment_ua]
+# origins = ["https://app.example.test", "http://staging.example.test:8080"]  # exact scheme://host[:port], no wildcards or paths
+# reference = "bb-42"                              # optional; 1-64 ASCII [A-Za-z0-9._-]
 
 [box]
 # A remote container the agent's commands can run in with `box_exec` (raw TCP to granted hosts, tooling
 # that the local sandbox cannot run). Off by default. See docs/RUN.md, "A box".
 enabled = false
 # Reach Docker one of two ways, not both:
-#   over ssh: loom starts `ssh -N -L <loom home>/keys/box.sock:<remote_socket> <ssh_host>` itself
-# ssh_host = "loom-box"                  # an alias from your ssh config (it may use ProxyJump); batch mode, no prompts
+#   over ssh: ferret starts `ssh -N -L <ferret home>/keys/box.sock:<remote_socket> <ssh_host>` itself
+# ssh_host = "ferret-box"                  # an alias from your ssh config (it may use ProxyJump); batch mode, no prompts
 # remote_socket = "/var/run/docker.sock" # the Docker socket inside that machine
 #   or a socket on this machine:
 # docker_socket = "/var/run/docker.sock"
 # docker_cli = "docker"                  # the docker command line client: a full path, or a name that is looked for on the daemon's PATH once, at start
 # Both images must be pinned by digest; a tag is refused. helper_image needs `sh`, `iptables`, `iptables-restore` and `ip6tables`.
 # image needs `/bin/sh`, `/bin/bash`, `setsid` and `/usr/bin/tar` (GNU tar, or one with `--format=pax`); files go in and out through `tar` run by `docker exec`.
-# The box needs a sandbox: `[sandbox] mode = "none"` is refused with it, and `sandbox.unix_sockets` may not name the box's socket or anything under <loom home>/keys.
+# The box needs a sandbox: `[sandbox] mode = "none"` is refused with it, and `sandbox.unix_sockets` may not name the box's socket or anything under <ferret home>/keys.
 # image = "registry.example.test/box@sha256:0000000000000000000000000000000000000000000000000000000000000000"
 # helper_image = "registry.example.test/netadmin@sha256:0000000000000000000000000000000000000000000000000000000000000000"
 cpus = 4
@@ -128,7 +145,7 @@ memory_mb = 8192
 pids = 512
 work_mb = 4096             # size of the tmpfs on /work
 tmp_mb = 1024              # size of the tmpfs on /tmp
-cap_add = []               # capabilities to add back (all are dropped); loom refuses the dangerous ones (SYS_ADMIN, NET_ADMIN, ...)
+cap_add = []               # capabilities to add back (all are dropped); ferret refuses the dangerous ones (SYS_ADMIN, NET_ADMIN, ...)
 #                            Commands run as uid 1000 with no-new-privileges, so cap_add does NOT give them capabilities: it
 #                            affects only root processes inside the container (and a command cannot become root there).
 sync_max_mb = 64           # most data copied from the workspace into /work by one call
@@ -143,11 +160,15 @@ max_nudges = 3             # stop-gate nudges or malformed replies in a row befo
 # stall_steps = 30         # accepted and ignored: the stall note was removed
 verify_finish = true       # a role with verify_finish has its finish attacked by its verifier first; false skips that for every role (the finish is marked "not verified")
 fresh_start = true         # when the verifier does not accept a finish, the lead starts afresh: the goal is open again (a new conclude needs a new run) and its window is folded with the attempt taken out of view (nothing is deleted); false keeps the rejection in view and the goal concluded
+lead_fold_every_settlements = 0  # fold a lead session's window after this many child settlements arrive since the last compaction (0 = off); re-anchors the coordinator on the sealed mission ledger and key table between waves without reopening the goal
 invalid_calls_before_forcing = 3   # reserved: accepted, but nothing reads it and it has no effect
 unviewed_min_lines = 20    # outputs with at least this many lines never shown are listed in the HUD
 unavailable_notice_s = 300 # a model request still retrying after this long opens a non-blocking inbox item and notifies you (it closes by itself); 0 = never
 copy_max_files = 300000    # a workspace with more files is not copied for an agent that asks for its own copy (workspace = "copy", attempts)
 copy_max_mb = 20480        # nor one with more MiB of file content, where a copy duplicates them; 0 = no limit. Not applied on APFS, where copies are clones that take no space until files change
+compact_tools = false      # true: use compact tool descriptions and schemas to reduce prompt token overhead
+implicit_finish = false    # true: allow explicit-termination sessions to treat a plain reply with no open ledger items as an implicit finish
+# idle_ledger_nudge = true # accepted and ignored: the idle-goal paragraph was removed
 project_instructions = true  # put the workspace root's AGENTS.md and CLAUDE.md into each new session's system prompt (32 KiB at most); false = never read them
 
 [mcp]
@@ -170,6 +191,49 @@ project_instructions = true  # put the workspace root's AGENTS.md and CLAUDE.md 
 # headers = { Authorization = "env:DOCS_MCP_AUTH" }
 # hosts = ["mcp.example.com"]
 
+[mail]
+# Optional operator-scoped, strictly read-only email inbox (`inbox_read` tool) for bug-bounty account
+# activation links and OTP codes. Off by default. Verify with `ferret mail check`. See docs/SECURITY_STATE.md.
+enabled = false
+backend = "imaps"                               # "imaps" (read-only EXAMINE + BODY.PEEK) or "maildir" (local labs)
+# host = "imap.example.test"                    # required when backend = "imaps"; example
+port = 993                                      # IMAPS TLS port (1..=65535)
+# username = "researcher@example.test"          # required when backend = "imaps"; example
+# password_file = "~/.ferret/keys/mail.pass"      # required when backend = "imaps"; regular file, mode 0600, never inline
+auth = "login"                                  # "login" (app password) or "xoauth2" (OAuth2 bearer token in password_file)
+folder = "INBOX"                                # IMAP mailbox name opened read-only
+# maildir_path = "/path/to/maildir"             # required when backend = "maildir"; example
+# allow_senders = ["*@hackerone.com", "*@bugcrowd.com", "*@*.target.example"]  # REQUIRED when enabled; "*" and "*@*" refused
+# allow_recipients = ["researcher+bb-*@example.test"]  # optional plus-address filter; empty = any recipient in the mailbox
+require_auth_pass = false                       # true: require Authentication-Results showing dkim=pass or spf=pass
+max_age_minutes = 120                           # only return messages newer than this many minutes; 0 = unbounded
+max_messages = 20                               # most messages returned per read (1..=50)
+# roles = ["lead", "worker"]                    # optional roles allowed to call inbox_read; empty = every non-read-only role
+
+[signal]
+# Optional two-way Signal bridge talking to a local `signal-cli daemon --http` instance for phone alerts and
+# replies. Off by default. Verify with `ferret signal check` and `ferret signal test`. See docs/RUN.md, "Signal".
+enabled = false
+http_url = "http://127.0.0.1:1337"              # base URL of `signal-cli daemon --http`
+# account = "+15550100"                         # registered signal-cli account in E.164 format; example
+# Outbound destination: an E.164 number ("+15550199"), a Signal ACI/PNI UUID ("00000000-0000-4000-8000-000000000001",
+# optionally prefixed with "u:" or "PNI:"), or a group ("group:<groupId>").
+# For single-number Note-to-Self mode, set `recipient` equal to `account`.
+# If Signal Phone Number Privacy hides your phone number, use your Signal ACI UUID here
+# (find it with `signal-cli -a +15550100 listContacts --all-recipients`).
+# recipient = "+15550199"                       # example
+# Authorized inbound senders (REQUIRED non-empty when enabled; "*" is refused). Accepts explicit E.164 numbers
+# and/or Signal ACI/PNI UUIDs. Under Phone Number Privacy, include your ACI UUID so replies are never dropped.
+# allow_from = ["+15550199"]                    # example
+# Optional allowed Signal group IDs for inbound replies. Accepts raw "<groupId>" or "group:<groupId>"
+# (normalized on load). If `recipient` is "group:<groupId>", that group is allowed automatically.
+allow_groups = []
+# Event kinds forwarded to Signal (must be non-empty when enabled).
+# Valid kinds: "blocker", "question", "approval", "parked", "finished", "error", "disk".
+# ("disk" forwards low-disk warnings; unanswered blocking reminders follow `[notify] repeat_minutes`.)
+events = ["blocker", "question", "approval", "parked", "finished", "error"]
+max_chars = 3500                                # max characters per outbound Signal message (200..=7500)
+
 [notify]
-# command = ["/usr/local/bin/my-notify"]   # program run per notification, given LOOM_KIND, LOOM_SESSION, LOOM_TITLE and LOOM_TEXT in its environment; default: the platform's notifier (macOS only; elsewhere nobody is notified)
-repeat_minutes = 0         # re-notify an unanswered blocking item this often; 0 = never (example: 30)
+# command = ["/usr/local/bin/my-notify"]   # program run per notification, given FERRET_KIND, FERRET_SESSION, FERRET_TITLE and FERRET_TEXT in its environment; default: the platform's notifier (macOS only; elsewhere nobody is notified)
+repeat_minutes = 0         # re-notify an unanswered blocking item this often (also forwarded to [signal] when enabled); 0 = never (example: 30)

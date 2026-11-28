@@ -10,13 +10,17 @@ OUT="$HERE/../Resources/AppIcon.icns"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-python3 "$HERE/make_icon.py" "$WORK/icon-1024.png"
+SRC="$HERE/icon-1024.png"
+if [ ! -f "$SRC" ]; then
+    python3 "$HERE/make_icon.py" "$WORK/icon-1024.png"
+    SRC="$WORK/icon-1024.png"
+fi
 SET="$WORK/AppIcon.iconset"
 mkdir -p "$SET"
 for s in 16 32 128 256 512; do
-    sips -z "$s" "$s" "$WORK/icon-1024.png" --out "$SET/icon_${s}x${s}.png" >/dev/null
+    sips -z "$s" "$s" "$SRC" --out "$SET/icon_${s}x${s}.png" >/dev/null
     d=$((s * 2))
-    sips -z "$d" "$d" "$WORK/icon-1024.png" --out "$SET/icon_${s}x${s}@2x.png" >/dev/null
+    sips -z "$d" "$d" "$SRC" --out "$SET/icon_${s}x${s}@2x.png" >/dev/null
 done
 mkdir -p "$(dirname "$OUT")"
 iconutil -c icns "$SET" -o "$OUT"

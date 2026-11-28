@@ -2,11 +2,11 @@ import Foundation
 import Darwin
 import Security
 
-/// A saved way to reach one loom daemon. See gui/DESIGN.md "Connection model".
+/// A saved way to reach one ferret daemon. See gui/DESIGN.md "Connection model".
 /// Secrets (the bearer token) are NOT stored here — they live in the Keychain, keyed by `id`.
 struct Connection: Codable, Identifiable, Equatable, Sendable {
     enum Mode: String, Codable, Sendable { case sshTunnel, direct }
-    enum TokenSource: String, Codable, Sendable { case fetchOverSsh, manual }
+    enum TokenSource: String, Codable, Sendable { case fetchOverSsh, manual, localFile }
 
     var id: UUID = UUID()
     var name: String = ""
@@ -18,25 +18,39 @@ struct Connection: Codable, Identifiable, Equatable, Sendable {
     var tokenSource: TokenSource = .fetchOverSsh
     // .direct
     var baseURL: String = "http://127.0.0.1:7878"
+
+    /// Human-readable label that never falls back to a blank `sshHost` on Direct connections.
+    var displayName: String {
+        let n = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !n.isEmpty { return n }
+        switch mode {
+        case .sshTunnel:
+            let h = sshHost.trimmingCharacters(in: .whitespacesAndNewlines)
+            return h.isEmpty ? "(unnamed)" : h
+        case .direct:
+            let u = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+            return u.isEmpty ? "(unnamed)" : u
+        }
+    }
 }
 
 /// Load/save the connection list and the per-connection token.
 ///
 /// CONTRACT for the implementer:
-/// - `load()` reads `~/Library/Application Support/loom-desk/connections.json` (empty list when
+/// - `load()` reads `~/Library/Application Support/ferret-desk/connections.json` (empty list when
 ///   missing or unreadable — never throws to the UI). `save(_:)` writes it with file mode 0600,
 ///   creating the directory (0700).
 /// - `token(for:)` / `setToken(_:for:)` / `clearToken(for:)` use the login Keychain
-///   (`kSecClassGenericPassword`, service `com.loom.desk`, account = connection id string). A token is
+///   (`kSecClassGenericPassword`, service `com.ferret.desk`, account = connection id string). A token is
 ///   64 lowercase hex characters; reject anything else in `setToken`.
 enum ConnectionStore {
-    static let keychainService = "com.loom.desk"
+    static let keychainService = "com.ferret.desk"
 
-    /// `~/Library/Application Support/loom-desk`
+    /// `~/Library/Application Support/ferret-desk`
     static var directory: URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSHomeDirectory() + "/Library/Application Support")
-        return base.appendingPathComponent("loom-desk", isDirectory: true)
+        return base.appendingPathComponent("ferret-desk", isDirectory: true)
     }
     static var fileURL: URL { directory.appendingPathComponent("connections.json") }
 
@@ -198,6 +212,57 @@ enum ConnectionStore {
         return t
     }
 
+    // MARK: local daemon discovery (~/.ferret)
+
+    struct LocalDaemonInfo: Equatable, Sendable {
+        var baseURL: String
+        var hasToken: Bool
+        var pid: Int?
+    }
+
+    /// The daemon's local home (`$FERRET_HOME` if set and non-empty, else `~/.ferret`).
+    static var ferretHome: URL {
+        if let env = ProcessInfo.processInfo.environment["FERRET_HOME"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !env.isEmpty {
+            let expanded = (env as NSString).expandingTildeInPath
+            return URL(fileURLWithPath: expanded, isDirectory: true)
+        }
+        return URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true).appendingPathComponent(".ferret", isDirectory: true)
+    }
+
+    /// Convert a daemon `bind` address (`127.0.0.1:7878`, `[::1]:7878`, `localhost:7878`, or full URL)
+    /// into a validated loopback `http://...` base URL.
+    static func parseBindAddress(_ bind: String) -> String? {
+        let trimmed = bind.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let candidate = trimmed.contains("://") ? trimmed : "http://" + trimmed
+        return normalizedBaseURL(candidate)
+    }
+
+    /// Reads and validates `<home>/token` (never logs or exposes invalid content).
+    static func readLocalToken(in home: URL = ferretHome) -> String? {
+        let url = home.appendingPathComponent("token")
+        guard let raw = try? String(contentsOf: url, encoding: .utf8) else { return nil }
+        let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return isValidToken(t) ? t : nil
+    }
+
+    /// Inspects `<home>/daemon.json` and `<home>/token` (without reading the secret into UI state) to
+    /// describe a local daemon for one-click onboarding.
+    static func localDaemonFromHome(_ home: URL = ferretHome) -> LocalDaemonInfo? {
+        struct DaemonFileLite: Decodable { var pid: Int?; var bind: String? }
+        let tokenPath = home.appendingPathComponent("token").path
+        let hasToken = FileManager.default.isReadableFile(atPath: tokenPath)
+        let daemonURL = home.appendingPathComponent("daemon.json")
+        if let data = try? Data(contentsOf: daemonURL),
+           let info = try? JSONDecoder().decode(DaemonFileLite.self, from: data),
+           let bind = info.bind,
+           let base = parseBindAddress(bind) {
+            return LocalDaemonInfo(baseURL: base, hasToken: hasToken, pid: info.pid)
+        }
+        return nil
+    }
+
     #if DEBUG
     static func selfCheck() -> [String] {
         var f: [String] = []
@@ -210,6 +275,13 @@ enum ConnectionStore {
         chk(!isValidToken(good + "\n"), "trailing newline accepted")
         chk(!isValidSSHHost("-oProxyCommand=x"), "option-like host accepted")
         chk(isValidSSHHost("user@studio"), "plain host rejected")
+        chk(Connection(name: "", mode: .direct, baseURL: "http://127.0.0.1:7878").displayName == "http://127.0.0.1:7878",
+            "direct displayName fell back to blank")
+        chk(Connection(name: "", mode: .sshTunnel, sshHost: "studio").displayName == "studio", "ssh displayName")
+        chk(Connection(name: "lab", mode: .direct, baseURL: "http://127.0.0.1:7878").displayName == "lab", "named displayName")
+        chk(parseBindAddress("127.0.0.1:7878") == "http://127.0.0.1:7878", "parseBindAddress ipv4")
+        chk(parseBindAddress("[::1]:7878") == "http://[::1]:7878", "parseBindAddress ipv6")
+        chk(parseBindAddress("10.0.0.5:7878") == nil, "parseBindAddress accepted non-loopback http")
         chk(normalizedBaseURL("http://127.0.0.1:7878/") == "http://127.0.0.1:7878", "base url normalize")
         chk(normalizedBaseURL("file:///etc") == nil, "file url accepted")
         for ok in ["http://127.0.0.1:7878", "http://localhost:7878", "http://[::1]:7878", "https://studio.example.com:7878",
@@ -224,9 +296,16 @@ enum ConnectionStore {
         }
         chk(baseURLProblem("http://10.0.0.5:7878")?.contains("https") == true, "message does not name https")
 
-        // Atomic 0600 persistence & corrupt-JSON backup preservation.
-        let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("loom-conn-check-\(UUID().uuidString)", isDirectory: true)
+        // Atomic 0600 persistence, local home detection & corrupt-JSON backup preservation.
+        let tmpDir = FileManager.default.temporaryDirectory.appendingPathComponent("ferret-conn-check-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: tmpDir) }
+        try? FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
+        try? Data("{\"pid\":42,\"bind\":\"127.0.0.1:7979\",\"started_ms\":1}".utf8)
+            .write(to: tmpDir.appendingPathComponent("daemon.json"))
+        try? Data((good + "\n").utf8).write(to: tmpDir.appendingPathComponent("token"))
+        let detected = localDaemonFromHome(tmpDir)
+        chk(detected == LocalDaemonInfo(baseURL: "http://127.0.0.1:7979", hasToken: true, pid: 42), "localDaemonFromHome failed")
+        chk(readLocalToken(in: tmpDir) == good, "readLocalToken failed")
         let jsonURL = tmpDir.appendingPathComponent("connections.json")
         let sample = Connection(name: "studio", mode: .sshTunnel, sshHost: "studio", remotePort: 7878)
         chk(save([sample], to: jsonURL), "save to temp dir failed")

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Draw the loom-desk app icon (a small weave on a dark rounded square) as a 1024x1024 PNG.
+"""Draw the ferret-desk app icon (a small weave on a dark rounded square) as a 1024x1024 PNG.
 
     python3 make_icon.py out.png
 

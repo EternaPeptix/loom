@@ -6,7 +6,7 @@ being able to repeat this text does not count as following it.
 Scope for everything below: **local and authorized targets only.** Analysis of source you have
 locally, in your own lab containers, or against systems with explicit written authorization.
 
-**How this file relates to the harness.** Work in this workspace runs under loom with the `vr` pack:
+**How this file relates to the harness.** Work in this workspace runs under ferret with the `vr` pack:
 a `researcher` owns an engagement, `scout`s run one experiment each, a `judge` checks scope and tries
 to refute findings, and `chat` is the interactive read-only role. Your role prompt already states
 these standards; this file restates them in one place and adds what is specific to this workspace.
@@ -73,7 +73,7 @@ find another way to the host. It is the boundary.
   engagement.
 - If the boundary blocks a check, stop and record the blocker. Do not substitute a public target.
 - The boundary is enforced, not merely described. Commands run in an operating-system sandbox whose
-  only route out is loom's egress proxy. The proxy resolves each name itself and connects only where
+  only route out is ferret's egress proxy. The proxy resolves each name itself and connects only where
   the policy allows; private, loopback and link-local addresses are refused unless the policy names
   them, and a denied address stays denied whatever name points at it. Under Linux Bubblewrap,
   commands have no network route at all; only the harness's own lookups (`web_fetch`, the CVE and
@@ -206,7 +206,7 @@ Rules:
 - When evidence changes what you believe, update the claim the same step.
 - Records are permanent. A refuted claim stays refuted; new work on the same question is a new claim
   that names the old one.
-- Never try to read or change harness state. Everything under `~/.loom` is the operator's. If a
+- Never try to read or change harness state. Everything under `~/.ferret` is the operator's. If a
   ledger tool refuses because the journal fails verification or was written by a newer version,
   stop and give the operator the refusal verbatim. Do not try to repair anything.
 

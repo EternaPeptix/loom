@@ -23,7 +23,7 @@ max_exec_calls = 0
 require_traffic = true
 prompt = "roles/recon_operator.md"
 termination = "explicit"
-tools = ["bash", "read", "write", "out_read", "web_fetch", "http_send", "security_ingest", "security_query", "security_record", "claim", "evidence", "finish", "report_blocker", "request_scope", "job_wait", "job_kill", "codec_calc"]
+tools = ["bash", "read", "write", "out_read", "web_fetch", "http_send", "security_ingest", "security_query", "security_record", "claim", "evidence", "finish", "report_blocker", "request_scope", "job_wait", "job_kill", "codec_calc", "box_exec", "box_get", "box_reset"]
 hidden_tools = ["out_read"]
 max_steps = 25
 
@@ -31,7 +31,7 @@ max_steps = 25
 require_traffic = true
 prompt = "roles/tactical_operator.md"
 termination = "explicit"
-tools = ["bash", "read", "write", "out_read", "pty_open", "pty_exec", "pty_close", "http_send", "http_repeat", "security_record", "security_query", "claim", "evidence", "finish", "report_blocker", "request_scope", "job_wait", "job_kill"]
+tools = ["bash", "read", "write", "out_read", "pty_open", "pty_exec", "pty_close", "http_send", "http_repeat", "security_record", "security_query", "claim", "evidence", "finish", "report_blocker", "request_scope", "job_wait", "job_kill", "box_exec", "box_get", "box_reset"]
 hidden_tools = ["out_read"]
 max_steps = 30
 
@@ -39,7 +39,7 @@ max_steps = 30
 require_traffic = true
 prompt = "roles/lateral_operator.md"
 termination = "explicit"
-tools = ["bash", "read", "write", "out_read", "pty_open", "pty_exec", "pty_close", "http_send", "http_repeat", "security_record", "security_query", "claim", "evidence", "finish", "report_blocker", "request_scope", "job_wait", "job_kill"]
+tools = ["bash", "read", "write", "out_read", "pty_open", "pty_exec", "pty_close", "http_send", "http_repeat", "security_record", "security_query", "claim", "evidence", "finish", "report_blocker", "request_scope", "job_wait", "job_kill", "box_exec", "box_get", "box_reset"]
 hidden_tools = ["out_read"]
 requires_credential = true
 max_steps = 30

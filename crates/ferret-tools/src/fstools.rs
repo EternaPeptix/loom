@@ -1,0 +1,3542 @@
+//! `read`, `write`, `edit`.
+//!
+//! CONTRACT.
+//!
+//! Paths: `ctx.sandbox.resolve(path)`, then `check_read` / `check_write`; a refusal is a `denied`
+//! result carrying the sandbox's sentence. Every result has meta `META_PATH` = the resolved path.
+//!
+//! A command may swap a directory along the path for a link once it has been checked, so the rules are
+//! applied again to the object actually used, never to a path checked earlier, and that refusal is a
+//! `denied` result too:
+//! - every read (of `read`, of the freshness check and of the diff of `write` and `edit`) opens the
+//!   file and then judges the real path of the open descriptor with `check_read`
+//!   (`files::open_readable`); the names a missing file's hint lists are read from the opened
+//!   directory, and only when `check_read` accepts its real path;
+//! - a write opens the directory without following a link in its last component, making missing
+//!   directories one at a time below the nearest one that exists (each made only after `check_write`
+//!   accepts the real path of the open directory joined with its name, and opened without following
+//!   a link, so a link put in its place is refused with a sentence); `check_write` then judges the real
+//!   path of the open directory joined with the file name, and the temporary file is created
+//!   (`O_EXCL`, no link followed), written, synced, given the old file's permissions and renamed into
+//!   place relative to that descriptor. A file name that is itself a link is read and the procedure
+//!   runs again for the file it names (relative to the link's directory), at most `MAX_LINKS` (8)
+//!   times, so the target's directory is the one judged; more links → error sentence.
+//!
+//! `write_file_checked` is the same write for callers outside these tools (`box_get`). The descriptor
+//! steps themselves — opening (and making) a directory without following a link with a judge of the real
+//! path given as a function, and the `*at` calls — are `pub(crate)` for `workcopy::adopt`, which must not
+//! have a weaker way to write the workspace either; the sentence for a link in the way names the caller's
+//! action, not `write` and `edit`, when another caller uses it.
+//!
+//! All three tools work only on regular files. A device, FIFO or socket → error sentence naming what
+//! the path is and what to use instead; it is never opened (`files::open_readable`). At most `READ_CAP`
+//! (64 MiB) of a file is loaded into memory.
+//!
+//! The file work runs on a blocking thread. A cancelled call returns `interrupted` at once, even
+//! while that thread is stuck in a read. The work left behind checks the same token between reads
+//! and immediately before it writes, and what the session has seen of the file is recorded only when
+//! the call returns the work's own result: an interrupted call never counts as a read, and writes
+//! nothing once it has seen the cancellation.
+//!
+//! ## `read`
+//! A directory → error sentence suggesting `glob`. A missing file → error sentence; when files with
+//! a similar name exist in the same directory (edit distance ≤ 2, or same name ignoring case), name
+//! up to 3 of them. Otherwise: read the bytes, record them as seen, `view::store_text`, then exactly
+//! as `out_read` (window with `cfg.read_max_lines`, numbered lines, `max_line_chars` 20_000,
+//! `max_chars` = `ctx.view_chars`) and return `Body::View` of the stored text. Facts: the path as
+//! given, `view::range_fact(first, numbered.last, total)`, `view::ended_fact(numbered.last)` when the
+//! size bound ended the window early, the handle of the stored text (`out:…`, whose line numbers are
+//! the ones shown; `evidence` quotes it), the normalisation notes when there are any. Binary content: the body is the one-line description from
+//! `normalize`. An empty file: body `(empty file)`.
+//!
+//! A file above `READ_CAP`: without `start`/`end` → error sentence stating its size, saying to pass a
+//! range or to search it with `bash` (`grep` skips files of that size). With a range the file is
+//! streamed and only the lines of the window are kept: at most 80_000 bytes of each line, and at most
+//! the smaller of `WINDOW_BYTES` (4 MiB) and `ctx.view_chars` bytes in all, each line counted with the
+//! `{n}\t` it will be shown with — a window that reaches that size ends before the line that would pass
+//! it (the first line is always kept; the last line of a file without a final newline is checked like
+//! any other) and the range fact says so and where to continue. Each line is shown at most `min(20_000, ctx.view_chars)` characters,
+//! so the numbered text exceeds `ctx.view_chars` by no more than its line numbers, which `finalize`
+//! bounds (a window this tool shapes itself should not reach that backstop in practice). The window has no handle (its stored lines are
+//! numbered from 1, the text shows the file's own numbers): a fact says to quote it from `bash`. The kept lines are normalised and stored like a
+//! whole read and returned as `Body::View` of that stored window: the text numbers the lines as in
+//! the file, `shown` counts them in the stored window. The file is then recorded as seen by size and
+//! modification time. The lines of such a file are counted only when the scan reaches its end. A
+//! window with binary content → error sentence.
+//!
+//! ## `write`
+//! `ctx.files.freshness`: `Unread` → error: the file exists and has not been read in this session —
+//! read it first, or use `edit`; `Changed` → error: it changed on disk since it was read ({was} →
+//! {now} bytes) — read it again. `Missing`/`Current` → write atomically (temp file in the same
+//! directory, `sync_data`, rename; parent directories are created; the existing file's permissions
+//! are kept), then record the new content as seen. Result: outcome `created` or `replaced`; facts:
+//! path, `{lines} lines`, `{bytes} bytes`; for `replaced` the body is the unified diff (3 lines of
+//! context, `similar` crate) of old → new as `Body::Raw`, so a long diff is stored and admitted like
+//! any output; for `created` the body is `Body::Message("(new file)")`. Content is written
+//! byte-for-byte as given. A replaced file above `READ_CAP` is not read back: the body says that there
+//! is no diff and why.
+//!
+//! ## `edit`
+//! Freshness as for `write`, and `Missing` is an error. `old` empty, or `old == new` → error.
+//! A file above `READ_CAP` → error sentence (use `bash`).
+//! `edits` (a non-empty list of `{old, new, all?}`; unknown keys in an entry are refused; not combined
+//! with `old`/`new` or `patch`) applies the entries in order, each to the text the one before it left
+//! (so a later entry may match text an earlier one wrote), by the rules below for each; one write, one
+//! diff, outcome `edited`, fact `{n} replacements` counting every entry. If any entry fails nothing is
+//! written and the error names it (`Edit 2 of 3: ...`).
+//! Count occurrences of `old` in the file text:
+//! - exactly one, or `all` → replace, write atomically, record. Outcome `edited`; facts: path,
+//!   `{n} replacement(s)`; body: the unified diff (3 lines of context) as `Body::Raw`.
+//! - more than one without `all` → error: how many, the line number of each (first 10), and that
+//!   `old` must be extended with surrounding lines or `all` set.
+//! - none → error that helps the next attempt: if `old` matches after ignoring leading/trailing
+//!   whitespace on each line, say so and show those file lines, numbered, exactly as they are in the
+//!   file; else if the first line of `old` (trimmed) occurs in the file, show the numbered lines
+//!   around its first occurrence (as many lines as `old` has, plus 2 either side); else say that
+//!   nothing similar was found and that the file has N lines. Never guess and apply.
+//!
+//! A file that is not valid UTF-8 → error (binary files are not edited).
+//!
+//! Tests required: read whole / range / past the end / missing with suggestion / directory / binary;
+//! read then write then read round trip preserves bytes exactly (CRLF, no trailing newline,
+//! unicode); write refusals (unread, changed) and acceptance after a read; atomicity leaves no temp
+//! file; permissions kept; diff shown; edit unique / all / ambiguous / each no-match hint;
+//! sandbox denial for read and write; `shown` ranges of read are exact; a device, a FIFO and a socket
+//! refused by each tool without hanging; a file above the cap refused whole and read by range
+//! (normalised, stored, cut by size); cancellation of a stuck read, and of a write and an edit before
+//! they write; an interrupted read is not recorded; a path through a link into what the policy refuses
+//! is refused by each tool after the check (and no similar names are listed from there); on macOS, a
+//! refused path named through `/System/Volumes/Data` refused by each tool; a directory swapped for a
+//! link and back in a tight loop during reads and writes, until enough calls met both states: no
+//! protected content returned, nothing created outside, no temporary file left; missing directories
+//! made, a link in their place not followed; a file name that is a link written through to a file the
+//! policy allows, refused towards one it does not, and a cycle of links refused.
+
+use crate::files::{describe_type, open_readable, real_path, Freshness, NotOpened, Readable, Seen};
+use crate::outview::{string, uint};
+use crate::sandbox::Sandbox;
+use crate::{params, schema, view, Body, Tool, ToolCtx, ToolOutput};
+use async_trait::async_trait;
+use ferret_core::admit::normalize;
+use ferret_core::event::{ToolClass, ToolSpec, ToolStatus, META_PATH};
+use serde_json::{json, Map, Value};
+use similar::TextDiff;
+use std::ffi::{CStr, CString, OsStr, OsString};
+use std::fs::{File, FileType, Metadata};
+use std::io::{BufRead, BufReader, Read as IoRead, Write as IoWrite};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio_util::sync::CancellationToken;
+
+/// Longest line shown, in characters.
+const MAX_LINE_CHARS: usize = 20_000;
+/// Longest line shown inside an error hint, in characters.
+const HINT_LINE_CHARS: usize = 500;
+/// Most bytes `read`, `write` and `edit` load into memory from one file (64 MiB). A larger file can
+/// still be read by line range, which streams it.
+const READ_CAP: u64 = 64 * 1024 * 1024;
+/// Size of one read from disk; cancellation is checked between reads.
+const CHUNK: usize = 1 << 20;
+/// A file above the cap is judged binary or text on this many leading bytes before it is streamed.
+const BINARY_PROBE: usize = 8192;
+/// Most bytes kept of one line of a streamed read: room for `MAX_LINE_CHARS` characters.
+const KEEP_LINE_BYTES: usize = MAX_LINE_CHARS * 4;
+/// Most bytes kept of all the lines of one streamed read (4 MiB), and never more than `ctx.view_chars`.
+/// The window ends before the line that would pass it (the first line is always kept), so at most this
+/// much is held, normalised and stored, apart from a first line longer than it.
+const WINDOW_BYTES: usize = 4 * 1024 * 1024;
+
+/// The size limits of a `read`. Tests lower them.
+#[derive(Clone, Copy)]
+struct ReadLimits {
+    /// Most bytes loaded whole (`READ_CAP`).
+    whole: u64,
+    /// Most bytes kept of a streamed window (`WINDOW_BYTES`).
+    window: usize,
+}
+
+const READ_LIMITS: ReadLimits = ReadLimits { whole: READ_CAP, window: WINDOW_BYTES };
+
+/// Most symbolic links `write_atomic` follows from the path it was given to the file it replaces.
+const MAX_LINKS: usize = 8;
+
+/// Why a bounded read of a file did not produce its bytes.
+enum Fail {
+    Io(std::io::Error),
+    NotRegular(FileType),
+    /// The sandbox refused the real path of the file that was opened: its sentence.
+    Denied(String),
+    TooLarge(u64),
+    /// The file was within the cap when opened but grew past it (the cap) while being read.
+    Grew(u64),
+    Cancelled,
+}
+
+impl From<NotOpened> for Fail {
+    fn from(e: NotOpened) -> Fail {
+        match e {
+            NotOpened::Io(e) => Fail::Io(e),
+            NotOpened::NotRegular(kind) => Fail::NotRegular(kind),
+            NotOpened::Denied(why) => Fail::Denied(why),
+        }
+    }
+}
+
+/// Why `write_atomic` wrote nothing.
+#[derive(Debug)]
+pub(crate) enum WriteFail {
+    /// The sandbox refused the real path the file would have been written at: its sentence.
+    Denied(String),
+    /// A link where none is followed, or too many links: a sentence that says what to do.
+    Refused(String),
+    Io(std::io::Error),
+}
+
+impl From<std::io::Error> for WriteFail {
+    fn from(e: std::io::Error) -> WriteFail {
+        WriteFail::Io(e)
+    }
+}
+
+/// The sandbox's read rule, as the judge of the real path of a file the tools opened.
+fn readable_in(ctx: &ToolCtx) -> impl Fn(&Path) -> Result<(), String> + '_ {
+    move |real: &Path| ctx.sandbox.check_read(real).map(|_| ())
+}
+
+/// What the blocking part of a call did: its result and, when the file was read or written, what the
+/// session has now seen of it. That is recorded only if this result is the one the call returns.
+struct Worked {
+    out: ToolOutput,
+    seen: Option<Seen>,
+}
+
+impl From<ToolOutput> for Worked {
+    /// A result that leaves what the session has seen of the file as it was.
+    fn from(out: ToolOutput) -> Worked {
+        Worked { out, seen: None }
+    }
+}
+
+fn interrupted(message: String) -> ToolOutput {
+    let mut out = ToolOutput::error(message);
+    out.status = ToolStatus::Interrupted;
+    out.outcome = "interrupted".into();
+    out
+}
+
+/// Run blocking file work on `path` off the async workers and stop waiting when the call is
+/// cancelled. A read stuck inside the kernel cannot be torn out, but the call returns at once as
+/// interrupted, and the work left behind observes the same token between reads and before it writes.
+/// What the work saw of the file is recorded here, and only when its own result is returned, so a
+/// call reported as interrupted never counts as a read.
+async fn off_thread<F>(ctx: &ToolCtx, tool: &str, path: &Path, work: F) -> ToolOutput
+where
+    F: FnOnce(ToolCtx) -> Worked + Send + 'static,
+{
+    let owned = ctx.clone();
+    let mut job = tokio::task::spawn_blocking(move || work(owned));
+    tokio::select! {
+        biased;
+        done = &mut job => match done {
+            Ok(Worked { out, seen }) => {
+                if let Some(seen) = seen {
+                    ctx.files.record(path, seen);
+                }
+                out
+            }
+            Err(e) => ToolOutput::error(format!(
+                "The `{tool}` tool failed internally ({e}). Check the state of the file before repeating the call."
+            )),
+        },
+        _ = ctx.cancel.cancelled() => interrupted(if tool == "read" {
+            "The `read` call was interrupted before the file was read. Nothing was changed. Call `read` again if you still need it.".to_string()
+        } else {
+            format!("The `{tool}` call was interrupted, and the file may or may not have been changed. Read it again with `read` to see its current content before deciding what to do.")
+        }),
+    }
+}
+
+/// Read the rest of an open regular file, at most `cap` bytes, checking `cancel` between chunks.
+fn read_open(mut file: File, len: u64, cap: u64, cancel: &CancellationToken) -> Result<Vec<u8>, Fail> {
+    let mut bytes = Vec::with_capacity(usize::try_from(len.min(cap)).unwrap_or(0));
+    let mut buf = vec![0u8; CHUNK];
+    loop {
+        if cancel.is_cancelled() {
+            return Err(Fail::Cancelled);
+        }
+        let n = match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(Fail::Io(e)),
+        };
+        bytes.extend_from_slice(buf.get(..n).unwrap_or_default());
+        if bytes.len() as u64 > cap {
+            return Err(Fail::Grew(cap));
+        }
+    }
+    Ok(bytes)
+}
+
+/// Open `path`, require a regular file of at most `cap` bytes that `readable` accepts, and read it.
+fn read_bounded(path: &Path, cap: u64, cancel: &CancellationToken, readable: Readable<'_>) -> Result<Vec<u8>, Fail> {
+    let (file, meta) = open_readable(path, readable)?;
+    if meta.len() > cap {
+        return Err(Fail::TooLarge(meta.len()));
+    }
+    read_open(file, meta.len(), cap, cancel)
+}
+
+/// The refusal of a path that is not a regular file: what it is, and what to use instead.
+fn not_regular(given: &str, tool: &str, kind: &FileType) -> ToolOutput {
+    use std::os::unix::fs::FileTypeExt;
+    let instead = if tool != "read" {
+        "to send data to it on purpose, use `bash`".to_string()
+    } else if kind.is_socket() {
+        format!(
+            "a socket has no content to read: to talk to it, connect to it from `bash` (for example `nc -U {given}`)"
+        )
+    } else {
+        format!("to look at it on purpose, use `bash` with a bounded command (for example `head -c 1000 {given}`)")
+    };
+    ToolOutput::error(format!(
+        "{given} is {}, not a regular file, and `{tool}` works only on regular files. Name a regular file instead; {instead}.",
+        describe_type(kind)
+    ))
+}
+
+/// What `read` says to do about a file above the cap. The `grep` tool is not offered: it skips files
+/// of this size.
+fn too_large_advice(given: &str) -> String {
+    format!(
+        "Pass `start` and `end` to read a range of its lines (the file is streamed), or search it with `bash`, for example `grep -n PATTERN {given} | head -50`."
+    )
+}
+
+/// The result of work that found the call cancelled before it had any effect.
+fn cancelled(tool: &str) -> ToolOutput {
+    interrupted(format!(
+        "The `{tool}` call was interrupted before it changed anything. Call `{tool}` again if you still need it."
+    ))
+}
+
+/// The error for a failed bounded read; `advice` says what to do about a file that is too large.
+fn fail_output(fail: Fail, given: &str, tool: &str, advice: &str) -> ToolOutput {
+    match fail {
+        Fail::Io(e) => ToolOutput::error(format!("{given} cannot be read ({e}). Check the path and its permissions.")),
+        Fail::NotRegular(kind) => not_regular(given, tool, &kind),
+        Fail::Denied(why) => ToolOutput::denied(why),
+        Fail::TooLarge(n) => ToolOutput::error(format!(
+            "{given} is {n} bytes, above the {READ_CAP} byte limit `{tool}` loads into memory. {advice}"
+        )),
+        Fail::Grew(cap) => ToolOutput::error(format!(
+            "{given} grew while it was being read and is now above the {cap} byte limit `{tool}` loads into memory. {advice}"
+        )),
+        Fail::Cancelled => cancelled(tool),
+    }
+}
+
+/// The error for a freshness check that could not be made.
+fn check_failed(given: &str, tool: &str, doing: &str, e: NotOpened) -> ToolOutput {
+    match e {
+        NotOpened::NotRegular(kind) => not_regular(given, tool, &kind),
+        NotOpened::Denied(why) => ToolOutput::denied(why),
+        NotOpened::Io(e) => ToolOutput::error(format!(
+            "{given} cannot be checked before {doing} ({e}). Check the path and its permissions."
+        )),
+    }
+}
+
+/// The error for a write that did not happen; `advice` ends the sentence for an I/O failure.
+fn write_failed(given: &str, fail: WriteFail, advice: &str) -> ToolOutput {
+    match fail {
+        WriteFail::Denied(why) => ToolOutput::denied(why),
+        WriteFail::Refused(why) => {
+            ToolOutput::error(format!("{given} was not written, and nothing was changed: {why}"))
+        }
+        WriteFail::Io(e) => {
+            ToolOutput::error(format!("{given} could not be written ({e}). Nothing was changed; {advice}"))
+        }
+    }
+}
+
+/// Writes `bytes` to the file `path` by the path the `write` tool takes: the sandbox's `check_write` on
+/// the path as given, then `write_atomic` (descriptor-relative, no link followed in the directory,
+/// the real path judged again, temporary file renamed into place, missing directories made one at a
+/// time). `Err` is a sentence saying why nothing was written. For `box_get`, which must not have a
+/// weaker way to write the workspace than the model's own tool.
+pub fn write_file_checked(sandbox: &Sandbox, path: &Path, bytes: &[u8]) -> Result<(), String> {
+    sandbox.check_write(path)?;
+    write_atomic(sandbox, path, bytes).map_err(|fail| match fail {
+        WriteFail::Denied(why) | WriteFail::Refused(why) => why,
+        WriteFail::Io(e) => format!("{} could not be written ({e})", path.display()),
+    })
+}
+
+pub struct Read;
+pub struct Write;
+pub struct Edit;
+
+/// Resolve and sandbox-check a path. A refusal is a `denied` result that already carries the path.
+fn checked(ctx: &ToolCtx, given: &str, for_write: bool) -> Result<PathBuf, Box<ToolOutput>> {
+    let resolved = ctx.sandbox.resolve(given);
+    let verdict = if for_write { ctx.sandbox.check_write(&resolved) } else { ctx.sandbox.check_read(&resolved) };
+    verdict.map_err(|msg| Box::new(ToolOutput::denied(msg).with_meta(META_PATH, json!(resolved.display().to_string()))))
+}
+
+fn with_path(out: ToolOutput, path: &Path) -> ToolOutput {
+    out.with_meta(META_PATH, json!(path.display().to_string()))
+}
+
+/// Number of lines the way the blob store counts them: a final line without a newline counts.
+fn count_lines(text: &str) -> u64 {
+    let newlines = text.matches('\n').count() as u64;
+    if text.is_empty() || text.ends_with('\n') {
+        newlines
+    } else {
+        newlines + 1
+    }
+}
+
+fn clip(line: &str) -> String {
+    match line.char_indices().nth(HINT_LINE_CHARS) {
+        Some((cut, _)) => format!("{}…[+{} chars]", &line[..cut], line[cut..].chars().count()),
+        None => line.to_string(),
+    }
+}
+
+/// The unified diff of `old` → `new` with 3 lines of context.
+fn unified_diff(given: &str, old: &str, new: &str) -> String {
+    let diff = TextDiff::from_lines(old, new).unified_diff().context_radius(3).header(given, given).to_string();
+    if diff.is_empty() {
+        "(no differences: the file already had exactly this content)".to_string()
+    } else {
+        diff
+    }
+}
+
+/// Write `bytes` to the file at the absolute `path` through a temporary file in the same directory, so
+/// that readers see the old content or the new content and a failure leaves no partial file.
+///
+/// After the path was checked, a command may have swapped a directory along it for a link, so every
+/// step works on descriptors. The directory is opened without following a link in its last component
+/// (missing ones are made one at a time, see `open_dir_creating`); the sandbox judges the real path of
+/// that open directory joined with the file name; the temporary file is then created, written, synced
+/// and renamed into place relative to the same descriptor, and nothing is done by path. A file name
+/// that is a link is read and the whole procedure starts again for the file it names, at most
+/// `MAX_LINKS` times, so the directory judged is always the one written in.
+fn write_atomic(sandbox: &Sandbox, path: &Path, bytes: &[u8]) -> Result<(), WriteFail> {
+    let mut target = path.to_path_buf();
+    for _ in 0..=MAX_LINKS {
+        let (Some(name), Some(parent)) = (target.file_name(), target.parent()) else {
+            return Err(WriteFail::Refused(format!(
+                "{} does not end in a file name. Give the path of the file to write and try again.",
+                target.display()
+            )));
+        };
+        let name = name.to_os_string();
+        let dir = open_dir_creating(&|real| sandbox.check_write(real).map(|_| ()), &write_edit_link, parent)?;
+        match entry_at(&dir, &name)? {
+            // A relative target is taken from the directory that holds the link.
+            Entry::Link => target = real_path(dir.as_fd())?.join(read_link_at(&dir, &name)?),
+            Entry::Missing => return replace_in(sandbox, &dir, &name, None, bytes),
+            Entry::Present(mode) => return replace_in(sandbox, &dir, &name, Some(mode), bytes),
+        }
+    }
+    Err(WriteFail::Refused(format!(
+        "{} leads through more than {MAX_LINKS} symbolic links. Name the real file and try again.",
+        path.display()
+    )))
+}
+
+/// Replace the entry `name` of the open directory `dir` with a new file holding `bytes`, once the
+/// sandbox allows writing at the real path of `dir` joined with `name`. `mode` is the permission bits
+/// of the entry replaced, when there is one; the new file gets them. The temporary file is removed on
+/// every failure after it was made.
+fn replace_in(sandbox: &Sandbox, dir: &File, name: &OsStr, mode: Option<u32>, bytes: &[u8]) -> Result<(), WriteFail> {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let real = real_path(dir.as_fd())?;
+    sandbox.check_write(&real.join(name)).map_err(WriteFail::Denied)?;
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = OsString::from(format!(".{}.ferret-{}-{n}.tmp", name.to_string_lossy(), std::process::id()));
+    let mut file = create_new_at(dir, &tmp, 0o666)?;
+    let written = (|| {
+        file.write_all(bytes)?;
+        file.sync_data()?;
+        if let Some(mode) = mode {
+            file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        }
+        rename_at(dir, &tmp, name)
+    })();
+    if written.is_err() {
+        let _ = remove_at(dir, &tmp);
+    }
+    written.map_err(WriteFail::Io)
+}
+
+/// Open the directory `dir` without following a link in its last component. When it is missing, the
+/// nearest directory above it that exists is opened and the missing ones are made below it one at a
+/// time: each only after `judge` has accepted the real path of the open directory it is made in
+/// joined with its name (its refusal is `WriteFail::Denied`), and each opened relative to that descriptor
+/// without following a link, so a link put in the place of one is never followed. `in_the_way` words the
+/// sentence for a link where a directory is expected, from the path of that link.
+pub(crate) fn open_dir_creating(
+    judge: &dyn Fn(&Path) -> Result<(), String>,
+    in_the_way: &dyn Fn(&Path) -> String,
+    dir: &Path,
+) -> Result<File, WriteFail> {
+    let mut missing: Vec<&OsStr> = Vec::new();
+    let mut at = dir;
+    let mut open = loop {
+        match open_dir(at) {
+            Ok(open) => break open,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => match (at.file_name(), at.parent()) {
+                (Some(name), Some(up)) => {
+                    missing.push(name);
+                    at = up;
+                }
+                _ => return Err(WriteFail::Io(e)),
+            },
+            // Whether a link is in the way only chooses the sentence; the open has already refused it.
+            Err(e) => {
+                return Err(not_followed(
+                    at,
+                    e,
+                    || std::fs::symlink_metadata(at).is_ok_and(|m| m.file_type().is_symlink()),
+                    in_the_way,
+                ))
+            }
+        }
+    };
+    for name in missing.into_iter().rev() {
+        let made = real_path(open.as_fd())?.join(name);
+        judge(&made).map_err(WriteFail::Denied)?;
+        match make_dir_at(&open, name) {
+            Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(WriteFail::Io(e)),
+            _ => {}
+        }
+        open = descend_with(&open, name, &made, in_the_way)?;
+    }
+    Ok(open)
+}
+
+/// Open the directory `name` of the open directory `dir`, whose path with that name is `path`,
+/// without following a link: a link there is refused with a sentence.
+fn descend_with(
+    dir: &File,
+    name: &OsStr,
+    path: &Path,
+    in_the_way: &dyn Fn(&Path) -> String,
+) -> Result<File, WriteFail> {
+    open_dir_at(dir, name)
+        .map_err(|e| not_followed(path, e, || matches!(entry_at(dir, name), Ok(Entry::Link)), in_the_way))
+}
+
+/// `descend_with` as `write` and `edit` word a link in the way.
+#[cfg(test)]
+fn descend(dir: &File, name: &OsStr, path: &Path) -> Result<File, WriteFail> {
+    descend_with(dir, name, path, &write_edit_link)
+}
+
+/// Open the directory `dir`, which must exist, without following a link in its last component, and make
+/// nothing. A link there is refused with the sentence `in_the_way` gives.
+pub(crate) fn open_dir_existing(dir: &Path, in_the_way: &dyn Fn(&Path) -> String) -> Result<File, WriteFail> {
+    open_dir(dir).map_err(|e| {
+        not_followed(dir, e, || std::fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink()), in_the_way)
+    })
+}
+
+/// A failure to open the directory `dir` without following a link: a sentence when `is_link` says a
+/// link was in the way (reported as `ELOOP`, or by macOS as `ENOTDIR` when a directory was asked for);
+/// `in_the_way` gives the sentence then, from the path of the link.
+fn not_followed(
+    dir: &Path,
+    e: std::io::Error,
+    is_link: impl FnOnce() -> bool,
+    in_the_way: &dyn Fn(&Path) -> String,
+) -> WriteFail {
+    if !matches!(e.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) || !is_link() {
+        return WriteFail::Io(e);
+    }
+    WriteFail::Refused(in_the_way(dir))
+}
+
+/// The sentence of `write` and `edit` for a link where a directory is expected.
+fn write_edit_link(dir: &Path) -> String {
+    format!(
+        "{} is a symbolic link where `write` and `edit` expect a directory, and they follow no link there. Name \
+         the file by its real path and try again.",
+        dir.display()
+    )
+}
+
+/// What a directory holds under a name, not following a link.
+pub(crate) enum Entry {
+    Missing,
+    Link,
+    /// Anything else, with its permission bits.
+    Present(u32),
+}
+
+/// A file name for the `*at` calls.
+fn c_name(name: &OsStr) -> std::io::Result<CString> {
+    CString::new(name.as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "a file name contains a NUL byte"))
+}
+
+/// The result of a call that returns a new descriptor or -1, as an owned file. It must be called
+/// right after that call, while `errno` is still its.
+fn owned(fd: libc::c_int) -> std::io::Result<File> {
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: the call that returned `fd` made a new descriptor, which nothing else owns.
+    Ok(File::from(unsafe { OwnedFd::from_raw_fd(fd) }))
+}
+
+/// The result of a call that returns 0 or -1. It must be called right after that call.
+fn done(rc: libc::c_int) -> std::io::Result<()> {
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Open the directory `path` for reading without following a link in its last component.
+pub(crate) fn open_dir(path: &Path) -> std::io::Result<File> {
+    std::fs::OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW).open(path)
+}
+
+/// Open the directory `name` of the open directory `dir` without following a link.
+pub(crate) fn open_dir_at(dir: &File, name: &OsStr) -> std::io::Result<File> {
+    let c = c_name(name)?;
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // SAFETY: `c` is a NUL-terminated name that outlives the call, and `dir` is an open descriptor.
+    owned(unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags) })
+}
+
+/// Make the directory `name` in the open directory `dir`, with permissions 0777 less the umask.
+pub(crate) fn make_dir_at(dir: &File, name: &OsStr) -> std::io::Result<()> {
+    let c = c_name(name)?;
+    let mode: libc::mode_t = 0o777;
+    // SAFETY: `c` is a NUL-terminated name that outlives the call, and `dir` is an open descriptor.
+    done(unsafe { libc::mkdirat(dir.as_raw_fd(), c.as_ptr(), mode) })
+}
+
+/// Create the file `name` in the open directory `dir` for writing, with permissions `mode` less the
+/// umask. Nothing may exist under that name; a link there is not followed.
+pub(crate) fn create_new_at(dir: &File, name: &OsStr, mode: libc::c_uint) -> std::io::Result<File> {
+    let c = c_name(name)?;
+    let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // SAFETY: `c` is a NUL-terminated name that outlives the call, and `dir` is an open descriptor.
+    // With O_CREAT, openat reads one more argument, the mode, which a C caller passes as an unsigned int.
+    owned(unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags, mode) })
+}
+
+/// What the open directory `dir` holds under `name`.
+pub(crate) fn entry_at(dir: &File, name: &OsStr) -> std::io::Result<Entry> {
+    let c = c_name(name)?;
+    let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `c` is a NUL-terminated name that outlives the call, `dir` is an open descriptor, and `st`
+    // is writable memory the size of the `stat` that fstatat fills.
+    let rc = unsafe { libc::fstatat(dir.as_raw_fd(), c.as_ptr(), st.as_mut_ptr(), libc::AT_SYMLINK_NOFOLLOW) };
+    if rc != 0 {
+        let e = std::io::Error::last_os_error();
+        return if e.kind() == std::io::ErrorKind::NotFound { Ok(Entry::Missing) } else { Err(e) };
+    }
+    // SAFETY: fstatat returned 0, so it filled `st`.
+    let st = unsafe { st.assume_init() };
+    if st.st_mode & libc::S_IFMT == libc::S_IFLNK {
+        return Ok(Entry::Link);
+    }
+    // `mode_t` is 16 bits wide on macOS and 32 on Linux.
+    #[allow(clippy::useless_conversion)]
+    let bits = u32::from(st.st_mode & 0o7777);
+    Ok(Entry::Present(bits))
+}
+
+/// The target of the link `name` in the open directory `dir`, as written in the link.
+pub(crate) fn read_link_at(dir: &File, name: &OsStr) -> std::io::Result<PathBuf> {
+    let c = c_name(name)?;
+    let mut buf = vec![0u8; 4096];
+    // SAFETY: `c` is a NUL-terminated name that outlives the call, `dir` is an open descriptor, and
+    // readlinkat writes at most `buf.len()` bytes into `buf`.
+    let n = unsafe { libc::readlinkat(dir.as_raw_fd(), c.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+    let n = usize::try_from(n).map_err(|_| std::io::Error::last_os_error())?;
+    if n >= buf.len() {
+        let why = "the target of a link is longer than a path can be";
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, why));
+    }
+    buf.truncate(n);
+    Ok(PathBuf::from(OsString::from_vec(buf)))
+}
+
+/// Rename `from` to `to`, both in the open directory `dir`, replacing what `to` was.
+pub(crate) fn rename_at(dir: &File, from: &OsStr, to: &OsStr) -> std::io::Result<()> {
+    let (f, t) = (c_name(from)?, c_name(to)?);
+    // SAFETY: `f` and `t` are NUL-terminated names that outlive the call, and `dir` is an open descriptor.
+    done(unsafe { libc::renameat(dir.as_raw_fd(), f.as_ptr(), dir.as_raw_fd(), t.as_ptr()) })
+}
+
+/// Remove the file `name` from the open directory `dir`.
+pub(crate) fn remove_at(dir: &File, name: &OsStr) -> std::io::Result<()> {
+    let c = c_name(name)?;
+    // SAFETY: `c` is a NUL-terminated name that outlives the call, and `dir` is an open descriptor.
+    done(unsafe { libc::unlinkat(dir.as_raw_fd(), c.as_ptr(), 0) })
+}
+
+/// Remove the empty directory `name` from the open directory `dir`; a link there is not followed (it is
+/// refused, as it is no directory).
+pub(crate) fn remove_dir_at(dir: &File, name: &OsStr) -> std::io::Result<()> {
+    let c = c_name(name)?;
+    // SAFETY: `c` is a NUL-terminated name that outlives the call, and `dir` is an open descriptor.
+    done(unsafe { libc::unlinkat(dir.as_raw_fd(), c.as_ptr(), libc::AT_REMOVEDIR) })
+}
+
+/// Make the link `name` in the open directory `dir`, pointing at `target` (as written). Nothing may exist
+/// under that name.
+pub(crate) fn symlink_at(dir: &File, target: &OsStr, name: &OsStr) -> std::io::Result<()> {
+    let (t, c) = (c_name(target)?, c_name(name)?);
+    // SAFETY: `t` and `c` are NUL-terminated strings that outlive the call, and `dir` is an open descriptor.
+    done(unsafe { libc::symlinkat(t.as_ptr(), dir.as_raw_fd(), c.as_ptr()) })
+}
+
+/// Open the existing entry `name` of the open directory `dir` for reading, without following a link. It is
+/// opened without waiting (a FIFO put there would otherwise block) and the caller checks that it is a file.
+/// Only adoption's clone uses it, and only macOS clones.
+#[cfg(target_os = "macos")]
+pub(crate) fn open_file_at(dir: &File, name: &OsStr) -> std::io::Result<File> {
+    let c = c_name(name)?;
+    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
+    // SAFETY: `c` is a NUL-terminated name that outlives the call, and `dir` is an open descriptor.
+    owned(unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags) })
+}
+
+/// Make the entry `name` in the open directory `dir` a clone of the open file `src` (copy-on-write, with
+/// its permission bits and no data copied). Fails when anything exists under that name, and when the file
+/// system cannot clone.
+#[cfg(target_os = "macos")]
+pub(crate) fn clone_at(src: &File, dir: &File, name: &OsStr) -> std::io::Result<()> {
+    let c = c_name(name)?;
+    // SAFETY: `src` and `dir` are open descriptors, `c` is a NUL-terminated name that outlives the call, and
+    // fclonefileat(2) has no other memory effects.
+    done(unsafe { libc::fclonefileat(src.as_raw_fd(), dir.as_raw_fd(), c.as_ptr(), 0) })
+}
+
+/// The names in the open directory `dir`, without `.` and `..`. An entry that cannot be read ends the
+/// list early.
+fn list_dir(dir: File) -> std::io::Result<Vec<OsString>> {
+    let fd = dir.into_raw_fd();
+    // SAFETY: `fd` is an open directory descriptor owned here; fdopendir takes it over when it succeeds.
+    let stream = unsafe { libc::fdopendir(fd) };
+    if stream.is_null() {
+        let e = std::io::Error::last_os_error();
+        // SAFETY: fdopendir failed, so `fd` is still owned here; it is closed once, when this drops.
+        drop(unsafe { OwnedFd::from_raw_fd(fd) });
+        return Err(e);
+    }
+    let mut names = Vec::new();
+    loop {
+        // SAFETY: `stream` is the open stream fdopendir returned; it is closed only after this loop.
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            break;
+        }
+        // SAFETY: readdir returned an entry whose `d_name` is a NUL-terminated name, valid until the
+        // next readdir or closedir on this stream; it is copied before either.
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if name != b"." && name != b".." {
+            names.push(OsStr::from_bytes(name).to_os_string());
+        }
+    }
+    // SAFETY: `stream` came from fdopendir and is closed once; that also closes `fd`.
+    unsafe { libc::closedir(stream) };
+    Ok(names)
+}
+
+/// Names in the directory of `path` that are close to its file name. The directory is opened, and
+/// its names are read from that open directory only when `readable` accepts its real path.
+fn similar_names(path: &Path, readable: Readable<'_>) -> Vec<String> {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name().map(|n| n.to_string_lossy().into_owned())) else {
+        return Vec::new();
+    };
+    let flags = libc::O_DIRECTORY | libc::O_NONBLOCK;
+    let Ok(open) = std::fs::OpenOptions::new().read(true).custom_flags(flags).open(dir) else { return Vec::new() };
+    if !real_path(open.as_fd()).is_ok_and(|real| readable(&real).is_ok()) {
+        return Vec::new();
+    }
+    let Ok(entries) = list_dir(open) else { return Vec::new() };
+    let mut near: Vec<(usize, String)> = entries
+        .iter()
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|n| *n != name)
+        .map(|n| (schema::distance(&name, &n), n))
+        .filter(|(d, _)| *d <= 2)
+        .collect();
+    near.sort();
+    near.into_iter().take(3).map(|(_, n)| dir.join(n).display().to_string()).collect()
+}
+
+#[async_trait]
+impl Tool for Read {
+    fn spec(&self) -> ToolSpec {
+        params::spec(
+            "read",
+            "Read a text file. Lines are returned numbered as `N<TAB>text`. Without `start`/`end` you get the file from line 1, up to the number of lines one call returns; the result header says which lines you were shown and how many the file has, so you know whether there is more to read.",
+            ToolClass::Read,
+            &[
+                params::req("path", "string", "Path of the file (absolute, or relative to the workspace)."),
+                params::opt("start", "integer", "First line to show (default 1).").min(1),
+                params::opt("end", "integer", "Last line to show."),
+            ],
+        )
+    }
+
+    fn speculative(&self) -> bool {
+        true
+    }
+
+    async fn run(&self, ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
+        let given = string(args, "path");
+        if given.starts_with("out:") {
+            return crate::outview::read_handle(ctx, given, args).await;
+        }
+        let path = match checked(ctx, given, false) {
+            Ok(p) => p,
+            Err(denied) => return *denied,
+        };
+        let (given, start, end) = (given.to_string(), uint(args, "start"), uint(args, "end"));
+        let target = path.clone();
+        let out =
+            off_thread(ctx, "read", &path, move |c| read_file(&c, &given, &target, start, end, READ_LIMITS)).await;
+        with_path(out, &path)
+    }
+}
+
+/// Open the file `read` was asked for, once `readable` accepts the file opened, or say why it cannot
+/// be read.
+fn open_to_read(given: &str, path: &Path, readable: Readable<'_>) -> Result<(File, Metadata), Box<ToolOutput>> {
+    let refusal = match open_readable(path, readable) {
+        Ok(x) => return Ok(x),
+        Err(NotOpened::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            let mut msg = format!("{given} does not exist.");
+            let near = similar_names(path, readable);
+            if !near.is_empty() {
+                msg.push_str(&format!(" Files with a similar name in that directory: {}.", near.join(", ")));
+            }
+            msg.push_str(" Check the path, or find the file with `glob`.");
+            ToolOutput::error(msg)
+        }
+        Err(NotOpened::NotRegular(kind)) if kind.is_dir() => ToolOutput::error(format!(
+            "{given} is a directory, not a file. List its files with `glob` (for example pattern `{}/*`) and read one of them.",
+            given.trim_end_matches('/')
+        )),
+        Err(e) => fail_output(e.into(), given, "read", ""),
+    };
+    Err(Box::new(refusal))
+}
+
+/// The blocking part of `read`: [`read_content`], and the fact that the file changed since this session
+/// last saw it, with the step of that sight.
+fn read_file(
+    ctx: &ToolCtx,
+    given: &str,
+    path: &Path,
+    start: Option<u64>,
+    end: Option<u64>,
+    limits: ReadLimits,
+) -> Worked {
+    let mut worked = read_content(ctx, given, path, start, end, limits);
+    let changed = worked.seen.as_ref().and_then(|now| ctx.files.changed_since(path, now));
+    if let Some(step) = changed {
+        worked.out = worked.out.with_more(format!("changed since your last read (step {step})"));
+    }
+    worked
+}
+
+/// The blocking part of `read`. A file above `limits.whole` is read only by line range, streamed.
+fn read_content(
+    ctx: &ToolCtx,
+    given: &str,
+    path: &Path,
+    start: Option<u64>,
+    end: Option<u64>,
+    limits: ReadLimits,
+) -> Worked {
+    let (file, meta) = match open_to_read(given, path, &readable_in(ctx)) {
+        Ok(x) => x,
+        Err(refusal) => return (*refusal).into(),
+    };
+    if let Some(image) = read_image(ctx, given, &file, &meta) {
+        return image;
+    }
+    if meta.len() > limits.whole {
+        if start.is_none() && end.is_none() {
+            return ToolOutput::error(format!(
+                "{given} is {} bytes, above the {} byte limit `read` loads into memory. {}",
+                meta.len(),
+                limits.whole,
+                too_large_advice(given)
+            ))
+            .into();
+        }
+        return read_large_range(ctx, given, file, &meta, start, end, limits.window.min(ctx.view_chars));
+    }
+    let bytes = match read_open(file, meta.len(), limits.whole, &ctx.cancel) {
+        Ok(b) => b,
+        Err(f) => return fail_output(f, given, "read", &too_large_advice(given)).into(),
+    };
+    Worked { out: show_whole(ctx, given, &bytes, start, end), seen: Some(Seen::of_bytes(&bytes)) }
+}
+
+/// An image file is attached, not shown as text: its bytes go to the blob store and the result's images.
+/// `None` when the file is not an image (the head does not carry a known magic or header).
+fn read_image(ctx: &ToolCtx, given: &str, file: &File, meta: &Metadata) -> Option<Worked> {
+    use std::io::{Seek, SeekFrom};
+    const HEAD: usize = 64 * 1024;
+    let mut head = Vec::with_capacity(512);
+    let mut f = file;
+    std::io::Read::take(&mut f, HEAD as u64).read_to_end(&mut head).ok()?;
+    // The handle's offset is shared with the caller's reads: put it back whatever the answer is.
+    if !ferret_core::image::has_magic(&head) {
+        f.seek(SeekFrom::Start(0)).ok()?;
+        return None;
+    }
+    let max = ctx.cfg.max_image_bytes;
+    let size = meta.len();
+    let (info, bytes) = if size <= max {
+        // The whole file: the header may lie beyond the head (a JPEG with a long EXIF block).
+        f.seek(SeekFrom::Start(0)).ok()?;
+        let all = read_open(file.try_clone().ok()?, size, max, &ctx.cancel).ok()?;
+        (ferret_core::image::detect(&all)?, Some(all))
+    } else {
+        (ferret_core::image::detect(&head)?, None)
+    };
+    let Some(bytes) = bytes else {
+        let text = ferret_core::image::too_large(given, &info, size, max);
+        return Some(ToolOutput::ok("ok", Body::Message(text)).into());
+    };
+    let stored = match ctx.blobs.put_bytes(&bytes) {
+        Ok(b) => b,
+        Err(e) => {
+            return Some(ToolOutput::error(format!("{given} could not be stored for display ({e}). Try again.")).into())
+        }
+    };
+    let image = ferret_core::ImageRef {
+        blob: stored.id.as_str().to_string(),
+        mime: info.mime.to_string(),
+        bytes: bytes.len() as u64,
+        width: info.width,
+        height: info.height,
+        name: Some(given.to_string()),
+    };
+    let text = ferret_core::image::read_header(given, &info, bytes.len() as u64);
+    Some(ToolOutput::ok("ok", Body::Message(text)).with_images(&[image]).into())
+}
+
+/// What `read` returns for the content of a file that was loaded whole.
+fn show_whole(ctx: &ToolCtx, given: &str, bytes: &[u8], start: Option<u64>, end: Option<u64>) -> ToolOutput {
+    if bytes.is_empty() {
+        return ToolOutput::ok("ok", Body::Message("(empty file)".into())).with_more(given.to_string());
+    }
+    let (stored, norm) = match view::store_text(&ctx.blobs, bytes) {
+        Ok(r) => r,
+        Err(e) => {
+            return ToolOutput::error(format!("{given} was read but could not be stored for display ({e}). Try again."))
+        }
+    };
+    if norm.binary {
+        let notes = norm.notes();
+        let mut out = ToolOutput::ok("ok", Body::View { of: stored.id, text: norm.text, shown: vec![(1, 1)] })
+            .with_more(given.to_string());
+        if let Some(notes) = notes {
+            out = out.with_more(notes);
+        }
+        return out;
+    }
+    let total = stored.lines;
+    let (first, last) = match view::window(start, end, total, ctx.cfg.read_max_lines) {
+        Ok(Some(w)) => w,
+        Ok(None) => return ToolOutput::ok("ok", Body::Message("(empty file)".into())).with_more(given.to_string()),
+        Err(e) => return ToolOutput::error(e),
+    };
+    let numbered = match view::numbered(&ctx.blobs, &stored.id, first, last, MAX_LINE_CHARS, ctx.view_chars) {
+        Ok(r) => r,
+        Err(e) => return ToolOutput::error(format!("{given} could not be shown ({e}). Try again.")),
+    };
+    let shown_last = numbered.last;
+    // The handle of the stored text: `evidence` quotes it, and its lines are the numbers shown here.
+    let handle = stored.handle();
+    let mut out =
+        ToolOutput::ok("ok", Body::View { of: stored.id, text: numbered.text, shown: vec![(first, shown_last)] })
+            .with_more(given.to_string())
+            .with_more(view::range_fact(first, shown_last, total));
+    if shown_last < last {
+        out = out.with_more(view::ended_fact(shown_last));
+    }
+    out = out.with_more(handle);
+    if numbered.shortened > 0 {
+        out = out.with_more(format!("{} long lines shortened", numbered.shortened));
+    }
+    if let Some(notes) = norm.notes() {
+        out = out.with_more(notes);
+    }
+    if bytes.windows(2).any(|w| w == b"\r\n") {
+        out = out.with_more("CRLF line endings (the CRs are not shown)");
+    }
+    out
+}
+
+/// The lines `first..=last` of a file, streamed, and what was learned about the rest of it.
+struct Window {
+    /// The kept lines as they are in the file, each followed by `\n`. A line longer than
+    /// `KEEP_LINE_BYTES` is cut there, on a character boundary.
+    raw: Vec<u8>,
+    /// How many lines `raw` holds.
+    count: u64,
+    /// The lines that were cut: position in `raw` (0-based, ascending) and full length in bytes.
+    cut: Vec<(u64, u64)>,
+    /// The number of lines in the file, known only when the scan reached its end.
+    total: Option<u64>,
+    /// The window ended before line `last` because it reached its size limit; the file goes on.
+    full: bool,
+    binary: bool,
+}
+
+/// The length of `bytes` without the start of a UTF-8 character that is cut off at their end.
+fn whole_chars(bytes: &[u8]) -> usize {
+    // A character is at most 4 bytes, so one that is cut off starts within the last 3.
+    for back in 1..=bytes.len().min(3) {
+        let at = bytes.len() - back;
+        let lead = bytes.get(at).copied().unwrap_or(0);
+        if lead & 0xC0 != 0x80 {
+            let needs = match lead {
+                0xF0..=0xFF => 4,
+                0xE0..=0xEF => 3,
+                0xC0..=0xDF => 2,
+                _ => 1,
+            };
+            return if needs > back { at } else { bytes.len() };
+        }
+    }
+    bytes.len()
+}
+
+/// Close the line of `full_bytes` bytes whose kept part starts at `line_start` in `w.raw`.
+fn end_line(w: &mut Window, line_start: usize, full_bytes: u64) {
+    let kept = w.raw.get(line_start..).unwrap_or_default();
+    if full_bytes > kept.len() as u64 {
+        // A character split by the cut is dropped, so that it is not taken for an invalid byte.
+        let whole = whole_chars(kept);
+        w.raw.truncate(line_start.saturating_add(whole));
+        w.cut.push((w.count, full_bytes));
+    }
+    w.raw.push(b'\n');
+    w.count += 1;
+}
+
+/// Close the line `lineno` (see `end_line`) and count it with its `{n}\t` prefix in `counted`. When it
+/// would take `counted` past `max_bytes` and is not the first line kept, it is dropped again, the window
+/// is marked full, and this returns true: the window ends before it.
+fn close_line(
+    w: &mut Window,
+    line_start: usize,
+    full_bytes: u64,
+    lineno: u64,
+    counted: &mut usize,
+    max_bytes: usize,
+) -> bool {
+    end_line(w, line_start, full_bytes);
+    let prefix = lineno.to_string().len().saturating_add(1);
+    let size = w.raw.len().saturating_sub(line_start).saturating_add(prefix);
+    if w.count > 1 && counted.saturating_add(size) > max_bytes {
+        w.raw.truncate(line_start);
+        w.count = w.count.saturating_sub(1);
+        if w.cut.last().is_some_and(|(at, _)| *at == w.count) {
+            w.cut.pop();
+        }
+        w.full = true;
+        return true;
+    }
+    *counted = counted.saturating_add(size);
+    false
+}
+
+/// Stream `file`, keeping only lines `first..=last`: at most `KEEP_LINE_BYTES` bytes of each, and no
+/// line that would take the kept bytes, each line counted with its `{n}\t` prefix, past `max_bytes` (the
+/// first line is always kept).
+fn stream_window(
+    file: File,
+    cancel: &CancellationToken,
+    first: u64,
+    last: u64,
+    max_bytes: usize,
+) -> Result<Window, Fail> {
+    let mut reader = BufReader::with_capacity(1 << 16, file);
+    let mut w = Window { raw: Vec::new(), count: 0, cut: Vec::new(), total: None, full: false, binary: false };
+    let mut lineno = 1u64;
+    // Where the kept part of the current line starts in `w.raw`, and the line's length so far.
+    let mut line_start = 0usize;
+    let mut line_bytes = 0u64;
+    let mut probed = false;
+    // The bytes of the kept lines as they will be shown: each with its `{n}\t` prefix.
+    let mut counted = 0usize;
+    loop {
+        if cancel.is_cancelled() {
+            return Err(Fail::Cancelled);
+        }
+        let buf = match reader.fill_buf() {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(Fail::Io(e)),
+        };
+        if buf.is_empty() {
+            break;
+        }
+        if !probed {
+            probed = true;
+            // The rule a whole read applies to the file (mostly NULs or not text), on its head.
+            if normalize(buf.get(..buf.len().min(BINARY_PROBE)).unwrap_or(buf)).binary {
+                w.binary = true;
+                return Ok(w);
+            }
+        }
+        let (take, ended) = match buf.iter().position(|b| *b == b'\n') {
+            Some(i) => (i, true),
+            None => (buf.len(), false),
+        };
+        let in_range = lineno >= first && lineno <= last;
+        if in_range {
+            let room = KEEP_LINE_BYTES.saturating_sub(w.raw.len().saturating_sub(line_start)).min(take);
+            w.raw.extend_from_slice(buf.get(..room).unwrap_or_default());
+        }
+        line_bytes = line_bytes.saturating_add(take as u64);
+        reader.consume(take + usize::from(ended));
+        if ended {
+            if in_range {
+                if close_line(&mut w, line_start, line_bytes, lineno, &mut counted, max_bytes) {
+                    return Ok(w);
+                }
+                line_start = w.raw.len();
+            }
+            line_bytes = 0;
+            let full = in_range && counted >= max_bytes;
+            if lineno >= last || full {
+                if reader.fill_buf().map_err(Fail::Io)?.is_empty() {
+                    w.total = Some(lineno);
+                } else {
+                    w.full = lineno < last;
+                }
+                return Ok(w);
+            }
+            lineno = lineno.saturating_add(1);
+        }
+    }
+    if line_bytes > 0 {
+        // The file ends without a final newline: what was collected is its last line.
+        if lineno >= first
+            && lineno <= last
+            && close_line(&mut w, line_start, line_bytes, lineno, &mut counted, max_bytes)
+        {
+            return Ok(w);
+        }
+        w.total = Some(lineno);
+    } else {
+        w.total = Some(lineno.saturating_sub(1));
+    }
+    Ok(w)
+}
+
+/// The lines of a normalised window as `{n}\t{line}`, numbered from `first` and shortened the way
+/// `view::numbered` shortens them, each at most `max_line_chars` characters; `cut` is `Window::cut`.
+/// Returns the text and how many lines were shortened.
+fn number_window(text: &str, first: u64, cut: &[(u64, u64)], max_line_chars: usize) -> (String, u64) {
+    let body = text.strip_suffix('\n').unwrap_or(text);
+    let mut out = String::with_capacity(body.len() + 8);
+    let mut shortened = 0u64;
+    for (i, line) in body.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(&first.saturating_add(i as u64).to_string());
+        out.push('\t');
+        let full_bytes =
+            cut.binary_search_by_key(&(i as u64), |(at, _)| *at).ok().and_then(|j| cut.get(j)).map(|(_, bytes)| *bytes);
+        let (head, rest) = match line.char_indices().nth(max_line_chars) {
+            Some((at, _)) => line.split_at(at),
+            None => (line, ""),
+        };
+        out.push_str(head);
+        if let Some(bytes) = full_bytes {
+            out.push_str(&format!("…[line is {bytes} bytes; the rest is not shown]"));
+            shortened += 1;
+        } else if !rest.is_empty() {
+            out.push_str(&format!("…[+{} chars]", rest.chars().count()));
+            shortened += 1;
+        }
+    }
+    (out, shortened)
+}
+
+/// A file above the whole-read cap, read by line range without loading it. The window goes through
+/// the same normalisation and store as a whole read, so what is shown is a view of stored text: the
+/// text numbers the lines as in the file, and `shown` counts them in the stored window, which is
+/// what coverage of that stored text is kept in.
+fn read_large_range(
+    ctx: &ToolCtx,
+    given: &str,
+    file: File,
+    meta: &Metadata,
+    start: Option<u64>,
+    end: Option<u64>,
+    max_bytes: usize,
+) -> Worked {
+    let (first, last) = match view::window(start, end, u64::MAX, ctx.cfg.read_max_lines) {
+        Ok(Some(w)) => w,
+        Ok(None) => {
+            return ToolOutput::error("There is nothing to show for this range. Give a `start` of 1 or more.").into()
+        }
+        Err(e) => return ToolOutput::error(e).into(),
+    };
+    let w = match stream_window(file, &ctx.cancel, first, last, max_bytes) {
+        Ok(w) => w,
+        Err(f) => return fail_output(f, given, "read", "").into(),
+    };
+    if w.binary {
+        return ToolOutput::error(format!(
+            "{given} is binary data of {} bytes, above the size limit for whole reads, so it cannot be shown as lines. Use `bash` with a bounded command such as `xxd -l 256 {given}`.",
+            meta.len()
+        ))
+        .into();
+    }
+    if w.count == 0 {
+        return match view::window(start, end, w.total.unwrap_or(0), ctx.cfg.read_max_lines) {
+            Err(e) => ToolOutput::error(e),
+            _ => ToolOutput::ok("ok", Body::Message("(empty file)".into())).with_more(given.to_string()),
+        }
+        .into();
+    }
+    let shown_last = first.saturating_add(w.count - 1);
+    let (stored, norm) = match view::store_text(&ctx.blobs, &w.raw) {
+        Ok(r) => r,
+        Err(e) => {
+            return ToolOutput::error(format!("{given} was read but could not be stored for display ({e}). Try again."))
+                .into()
+        }
+    };
+    if norm.binary {
+        return ToolOutput::error(format!(
+            "Lines {first}-{shown_last} of {given} are binary data (they are mostly NUL bytes or other bytes that are not text), so they are not shown as lines. Use `bash` with a bounded command that makes them printable, such as `sed -n '{first},{shown_last}p' {given} | cat -v | head -100`."
+        ))
+        .into();
+    }
+    let (text, shortened) = number_window(&norm.text, first, &w.cut, MAX_LINE_CHARS.min(ctx.view_chars));
+    let range = match w.total {
+        Some(total) => view::range_fact(first, shown_last, total),
+        None if w.full => format!(
+            "lines {first}-{shown_last} — more below: the window ended before line {last} because it reached its size limit of {max_bytes} bytes; continue with `start` {}",
+            shown_last.saturating_add(1)
+        ),
+        None => format!(
+            "lines {first}-{shown_last} — more below (the file is {} bytes, above the whole-read limit, so its lines are not counted)",
+            meta.len()
+        ),
+    };
+    let mut out = ToolOutput::ok("ok", Body::View { of: stored.id, text, shown: vec![(1, w.count)] })
+        .with_more(given.to_string())
+        .with_more(range)
+        .with_more("this window of a large file has no handle: to cite lines of it as evidence, quote them from a bounded `bash` command instead");
+    if shortened > 0 {
+        out = out.with_more(format!("{shortened} long lines shortened"));
+    }
+    if let Some(notes) = norm.notes() {
+        out = out.with_more(notes);
+    }
+    if w.raw.windows(2).any(|pair| pair == b"\r\n") {
+        out = out.with_more("CRLF line endings (the CRs are not shown)");
+    }
+    Worked { out, seen: Some(Seen::of_stat(meta)) }
+}
+
+/// Why a write or edit must not proceed on a file in this state, if it must not.
+fn freshness_refusal(fresh: &Freshness, given: &str, tool: &str) -> Option<ToolOutput> {
+    match fresh {
+        Freshness::Unread => Some(ToolOutput::error(format!(
+            "{given} exists and has not been read in this session, so `{tool}` could replace content you have not seen. Read it with `read` first, then call `{tool}` again."
+        ))),
+        Freshness::Changed { was_bytes, now_bytes } => Some(ToolOutput::error(format!(
+            "{given} changed on disk since you read it ({was_bytes} → {now_bytes} bytes), so `{tool}` could overwrite someone else's change. Read it again with `read`, then call `{tool}` again."
+        ))),
+        Freshness::Missing | Freshness::Current => None,
+    }
+}
+
+#[async_trait]
+impl Tool for Write {
+    fn spec(&self) -> ToolSpec {
+        params::spec(
+            "write",
+            "Create a file, or replace the whole content of an existing one. To replace an existing file you must have read it in this session, and it must not have changed since. The result shows what changed. To change part of a file, use `edit` instead.",
+            ToolClass::Write,
+            &[
+                params::req("path", "string", "Path of the file (absolute, or relative to the workspace)."),
+                params::req("content", "string", "The complete new content of the file."),
+            ],
+        )
+    }
+
+    async fn run(&self, ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
+        let given = string(args, "path");
+        let path = match checked(ctx, given, true) {
+            Ok(p) => p,
+            Err(denied) => return *denied,
+        };
+        let (given, content) = (given.to_string(), string(args, "content").to_string());
+        let target = path.clone();
+        let out = off_thread(ctx, "write", &path, move |c| write_file(&c, &given, &target, &content)).await;
+        with_path(out, &path)
+    }
+}
+
+/// The blocking part of `write`.
+fn write_file(ctx: &ToolCtx, given: &str, path: &Path, content: &str) -> Worked {
+    if path.is_dir() {
+        return ToolOutput::error(format!("{given} is a directory. Give the path of a file to write.")).into();
+    }
+    let readable = readable_in(ctx);
+    let fresh = match ctx.files.freshness(path, &readable) {
+        Ok(f) => f,
+        Err(e) => return check_failed(given, "write", "writing", e).into(),
+    };
+    if let Some(refusal) = freshness_refusal(&fresh, given, "write") {
+        return refusal.into();
+    }
+    // The previous content is needed only for the diff; a file above the cap is replaced without one.
+    let mut diff_omitted = false;
+    let old = if fresh == Freshness::Current {
+        match read_bounded(path, READ_CAP, &ctx.cancel, &readable) {
+            Ok(b) => Some(b),
+            Err(Fail::TooLarge(_) | Fail::Grew(_)) => {
+                diff_omitted = true;
+                None
+            }
+            Err(f) => return fail_output(f, given, "write", "").into(),
+        }
+    } else {
+        None
+    };
+    // A call that was cancelled has already been reported as interrupted: it must not write after that.
+    if ctx.cancel.is_cancelled() {
+        return cancelled("write").into();
+    }
+    if let Err(fail) = write_atomic(&ctx.sandbox, path, content.as_bytes()) {
+        return write_failed(given, fail, "check that the directory is writable and try again.").into();
+    }
+    let facts = [format!("{} lines", count_lines(content)), format!("{} bytes", content.len())];
+    let mut out = match old {
+        Some(old) => {
+            let diff = unified_diff(given, &String::from_utf8_lossy(&old), content);
+            ToolOutput::ok("replaced", Body::Raw(diff.into_bytes()))
+        }
+        None if diff_omitted => ToolOutput::ok(
+            "replaced",
+            Body::Message(format!("(no diff: the previous file was larger than {READ_CAP} bytes, so it was replaced without reading it back)")),
+        ),
+        None => ToolOutput::ok("created", Body::Message("(new file)".into())),
+    };
+    out = out.with_more(given.to_string());
+    for f in facts {
+        out = out.with_more(f);
+    }
+    Worked { out, seen: Some(Seen::of_bytes(content.as_bytes())) }
+}
+
+#[async_trait]
+impl Tool for Edit {
+    fn spec(&self) -> ToolSpec {
+        params::spec(
+            "edit",
+            "Replace text in a file. Give `old` and `new`, or a `patch` hunk(s). `old` should be copied from the file (without the line-number prefix that `read` shows) and occur once unless `all` is true. You must have read the file in this session. The result shows the change as a diff; if `old` is not found, the result shows the closest text in the file.",
+            ToolClass::Write,
+            &[
+                params::req("path", "string", "Path of the file (absolute, or relative to the workspace)."),
+                params::opt("old", "string", "The exact text to replace (required unless `patch` is given)."),
+                params::opt("new", "string", "The text to put in its place (required unless `patch` is given)."),
+                params::opt("all", "boolean", "Replace every occurrence of `old` (default false)."),
+                params::opt("patch", "string", "Unified diff (or *** Update File) patch hunk(s) to apply instead of old/new."),
+                params::opt("edits", "array", "Several replacements to the same file, applied in order, each to the text the one before it left; all or none are applied. Each is {old, new, all?} with the meaning above. Use instead of `old`/`new` and `patch`.").with(
+                    "items",
+                    json!({
+                        "type": "object",
+                        "properties": {
+                            "old": {"type": "string", "description": "The exact text to replace."},
+                            "new": {"type": "string", "description": "The text to put in its place."},
+                            "all": {"type": "boolean", "description": "Replace every occurrence of `old` (default false)."}
+                        },
+                        "required": ["old", "new"],
+                        "additionalProperties": false
+                    }),
+                ),
+            ],
+        )
+    }
+
+    async fn run(&self, ctx: &ToolCtx, args: &Map<String, Value>) -> ToolOutput {
+        let given = string(args, "path");
+        let path = match checked(ctx, given, true) {
+            Ok(p) => p,
+            Err(denied) => return *denied,
+        };
+        let has_old = args.get("old").and_then(Value::as_str).map(str::to_string);
+        let has_new = args.get("new").and_then(Value::as_str).map(str::to_string);
+        let has_patch = args.get("patch").and_then(Value::as_str).map(str::to_string);
+        let has_edits = args.get("edits");
+        if has_edits.is_some() && (has_patch.is_some() || has_old.is_some() || has_new.is_some()) {
+            return ToolOutput::error("Give `edits`, or `old` and `new`, or `patch`; not a mix.");
+        }
+        if has_patch.is_some() && (has_old.is_some() || has_new.is_some()) {
+            return ToolOutput::error("Give either `old` and `new`, or `patch`, not both.");
+        }
+        let given = given.to_string();
+        let target = path.clone();
+        if let Some(list) = has_edits {
+            let edits = match parse_edits(list) {
+                Ok(e) => e,
+                Err(sentence) => return ToolOutput::error(sentence),
+            };
+            let out = off_thread(ctx, "edit", &path, move |c| edit_many(&c, &given, &target, &edits, true)).await;
+            return with_path(out, &path);
+        }
+        if let Some(patch) = has_patch {
+            let out = off_thread(ctx, "edit", &path, move |c| patch_file(&c, &given, &target, &patch)).await;
+            return with_path(out, &path);
+        }
+        let (old, new) = match (has_old, has_new) {
+            (Some(old), Some(new)) => (old, new),
+            (Some(_), None) => {
+                return ToolOutput::error("`old` was given without `new`. Give both `old` and `new`, or give `patch`.");
+            }
+            (None, Some(_)) => {
+                return ToolOutput::error("`new` was given without `old`. Give both `old` and `new`, or give `patch`.");
+            }
+            (None, None) => {
+                return ToolOutput::error("Give either `old` and `new`, or `patch`.");
+            }
+        };
+        let all = args.get("all").and_then(Value::as_bool).unwrap_or(false);
+        let out = off_thread(ctx, "edit", &path, move |c| edit_file(&c, &given, &target, &old, &new, all)).await;
+        with_path(out, &path)
+    }
+}
+
+/// The `edits` argument: a non-empty list of {old, new, all?}.
+fn parse_edits(value: &Value) -> Result<Vec<Replacement>, String> {
+    let Some(list) = value.as_array().filter(|l| !l.is_empty()) else {
+        return Err("`edits` must be a list of {`old`, `new`} objects with at least one entry.".to_string());
+    };
+    list.iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let n = i + 1;
+            let Some(map) = item.as_object() else {
+                return Err(format!("Entry {n} of `edits` is not an object with `old` and `new`."));
+            };
+            if let Some(extra) = map.keys().find(|k| !matches!(k.as_str(), "old" | "new" | "all")) {
+                return Err(format!(
+                    "Entry {n} of `edits` has an unknown key `{extra}`; an entry takes `old`, `new` and `all`."
+                ));
+            }
+            let (Some(old), Some(new)) =
+                (map.get("old").and_then(Value::as_str), map.get("new").and_then(Value::as_str))
+            else {
+                return Err(format!("Entry {n} of `edits` needs `old` and `new`, both strings."));
+            };
+            Ok(Replacement {
+                old: old.to_string(),
+                new: new.to_string(),
+                all: map.get("all").and_then(Value::as_bool).unwrap_or(false),
+            })
+        })
+        .collect()
+}
+
+fn line_list(text: &str, positions: &[usize]) -> String {
+    positions
+        .iter()
+        .take(10)
+        .map(|&i| text.get(..i).map_or(0, |head| head.matches('\n').count() + 1).to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn more_count(count: usize) -> String {
+    if count > 10 {
+        format!(" (the first 10 of {count})")
+    } else {
+        String::new()
+    }
+}
+
+struct PhysLine {
+    start: usize,
+    content_end: usize,
+    full_end: usize,
+    trimmed: String,
+    collapsed: String,
+}
+
+struct FuzzyMatch {
+    start: usize,
+    end: usize,
+    line: usize,
+}
+
+fn collapse_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn split_phys_lines(text: &str) -> Vec<PhysLine> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let bytes = text.as_bytes();
+    while start < bytes.len() {
+        let rel_nl = bytes.get(start..).and_then(|s| s.iter().position(|&b| b == b'\n'));
+        let (content_end, full_end) = match rel_nl {
+            Some(pos) => {
+                let nl = start + pos;
+                let ce = if nl > start && bytes.get(nl - 1) == Some(&b'\r') { nl - 1 } else { nl };
+                (ce, nl + 1)
+            }
+            None => (bytes.len(), bytes.len()),
+        };
+        let slice = text.get(start..content_end).unwrap_or("");
+        out.push(PhysLine {
+            start,
+            content_end,
+            full_end,
+            trimmed: slice.trim().to_string(),
+            collapsed: collapse_ws(slice),
+        });
+        start = full_end;
+    }
+    out
+}
+
+fn find_norm_matches<F, G>(phys: &[PhysLine], old: &str, norm_fn: F, key_fn: G) -> Vec<FuzzyMatch>
+where
+    F: Fn(&str) -> String,
+    G: Fn(&PhysLine) -> &str,
+{
+    let old_trailing_nl = old.ends_with('\n');
+    let old_body = old.strip_suffix("\r\n").or_else(|| old.strip_suffix('\n')).unwrap_or(old);
+    let old_norms: Vec<String> = old_body.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)).map(norm_fn).collect();
+    let k = old_norms.len();
+    if k == 0 || k > phys.len() {
+        return Vec::new();
+    }
+    let mut matches = Vec::new();
+    for i in 0..=phys.len() - k {
+        let ok = (0..k).all(|j| {
+            let line_key = phys.get(i + j).map(&key_fn);
+            let old_key = old_norms.get(j).map(String::as_str);
+            line_key.is_some() && line_key == old_key
+        });
+        if ok {
+            if let (Some(first), Some(last)) = (phys.get(i), phys.get(i + k - 1)) {
+                matches.push(FuzzyMatch {
+                    start: first.start,
+                    end: if old_trailing_nl { last.full_end } else { last.content_end },
+                    line: i + 1,
+                });
+            }
+        }
+    }
+    matches
+}
+
+fn fuzzy_find(text: &str, old: &str) -> Option<Vec<FuzzyMatch>> {
+    if old.trim().is_empty() {
+        return None;
+    }
+    let phys = split_phys_lines(text);
+    let trimmed = find_norm_matches(&phys, old, |s| s.trim().to_string(), |p| p.trimmed.as_str());
+    if !trimmed.is_empty() {
+        return Some(trimmed);
+    }
+    let collapsed = find_norm_matches(&phys, old, collapse_ws, |p| p.collapsed.as_str());
+    if !collapsed.is_empty() {
+        Some(collapsed)
+    } else {
+        None
+    }
+}
+
+/// The blocking part of `edit`.
+/// One `old` -> `new` replacement.
+struct Replacement {
+    old: String,
+    new: String,
+    all: bool,
+}
+
+fn edit_file(ctx: &ToolCtx, given: &str, path: &Path, old: &str, new: &str, all: bool) -> Worked {
+    let one = Replacement { old: old.to_string(), new: new.to_string(), all };
+    edit_many(ctx, given, path, std::slice::from_ref(&one), false)
+}
+
+/// Replacements applied in order, each to the text the one before it left; none is written unless all
+/// apply (`several` makes the sentences name the entry that failed).
+fn edit_many(ctx: &ToolCtx, given: &str, path: &Path, edits: &[Replacement], several: bool) -> Worked {
+    let at = |i: usize| if several { format!("Edit {} of {}: ", i + 1, edits.len()) } else { String::new() };
+    for (i, r) in edits.iter().enumerate() {
+        if r.old.is_empty() {
+            return ToolOutput::error(format!("{}`old` is empty, so there is nothing to find. Give the exact text to replace; to add text to an empty or new file use `write`.", at(i))).into();
+        }
+        if r.old == r.new {
+            return ToolOutput::error(format!(
+                "{}`old` and `new` are identical, so the edit would change nothing. Give a `new` that differs from `old`.",
+                at(i)
+            ))
+            .into();
+        }
+    }
+    if path.is_dir() {
+        return ToolOutput::error(format!("{given} is a directory. Give the path of a file to edit.")).into();
+    }
+    let readable = readable_in(ctx);
+    let fresh = match ctx.files.freshness(path, &readable) {
+        Ok(f) => f,
+        Err(e) => return check_failed(given, "edit", "editing", e).into(),
+    };
+    if fresh == Freshness::Missing {
+        return ToolOutput::error(format!("{given} does not exist, so there is nothing to edit. Create it with `write`, or check the path (`glob` finds files).")).into();
+    }
+    if let Some(refusal) = freshness_refusal(&fresh, given, "edit") {
+        return refusal.into();
+    }
+    let bytes = match read_bounded(path, READ_CAP, &ctx.cancel, &readable) {
+        Ok(b) => b,
+        Err(f) => return fail_output(f, given, "edit", "Use `bash` for a change to a file this large.").into(),
+    };
+    let original = match String::from_utf8(bytes) {
+        Ok(t) => t,
+        Err(_) => {
+            return ToolOutput::error(format!(
+                "{given} is not valid UTF-8 text, and binary files are not edited. Use `bash` for a binary change."
+            ))
+            .into()
+        }
+    };
+
+    let mut text = original.clone();
+    let (mut n, mut used_fuzzy) = (0usize, false);
+    for (i, r) in edits.iter().enumerate() {
+        match replace_one(&text, given, r) {
+            Ok((updated, count, fuzzy)) => {
+                text = updated;
+                n += count;
+                used_fuzzy |= fuzzy;
+            }
+            Err(sentence) => {
+                let applied = if several && i > 0 { " None of the edits was applied." } else { "" };
+                return ToolOutput::error(format!("{}{sentence}{applied}", at(i))).into();
+            }
+        }
+    }
+    let updated = text;
+    let text = original;
+    // As for `write`: nothing is written by a call that has been reported as interrupted.
+    if ctx.cancel.is_cancelled() {
+        return cancelled("edit").into();
+    }
+    if let Err(fail) = write_atomic(&ctx.sandbox, path, updated.as_bytes()) {
+        return write_failed(given, fail, "check that the file is writable and try again.").into();
+    }
+    let count = if n == 1 { "1 replacement".to_string() } else { format!("{n} replacements") };
+    let mut out = ToolOutput::ok("edited", Body::Raw(unified_diff(given, &text, &updated).into_bytes()))
+        .with_more(given.to_string())
+        .with_more(count);
+    if used_fuzzy {
+        out = out.with_more("matched old with whitespace normalization");
+    }
+    Worked { out, seen: Some(Seen::of_bytes(updated.as_bytes())) }
+}
+
+/// Apply one replacement to `text`: the new text, how many replacements, and whether the match needed
+/// whitespace normalization. `Err` is the sentence for the model.
+fn replace_one(text: &str, given: &str, r: &Replacement) -> Result<(String, usize, bool), String> {
+    // A file that uses CRLF throughout shows the model lines without the CRs; the text it gives is
+    // matched, and what it puts in, with the file's own line endings.
+    let crlf = text.contains("\r\n")
+        && text.matches('\n').count() == text.matches("\r\n").count()
+        && !r.old.contains('\r')
+        && !r.new.contains('\r');
+    let (old, new) =
+        if crlf { (r.old.replace('\n', "\r\n"), r.new.replace('\n', "\r\n")) } else { (r.old.clone(), r.new.clone()) };
+
+    let positions: Vec<usize> = text.match_indices(old.as_str()).map(|(i, _)| i).collect();
+    if !positions.is_empty() {
+        if positions.len() > 1 && !r.all {
+            let lines = line_list(text, &positions);
+            let more = more_count(positions.len());
+            return Err(format!(
+                "`old` occurs {} times in {given}, at lines {lines}{more}. Nothing was changed. Extend `old` with the surrounding lines so it matches exactly once, or set `all` to true to replace every occurrence.",
+                positions.len(),
+            ));
+        }
+        return Ok((text.replace(old.as_str(), &new), positions.len(), false));
+    }
+    let Some(fuzzy) = fuzzy_find(text, &old) else {
+        return Err(no_match_message(given, text, &old));
+    };
+    if fuzzy.len() > 1 {
+        let line_nums: Vec<String> = fuzzy.iter().take(10).map(|m| m.line.to_string()).collect();
+        let more = more_count(fuzzy.len());
+        return Err(format!(
+            "`old` (with whitespace normalization) occurs {} times in {given}, at lines {}{more}. Nothing was changed. Extend `old` with the surrounding lines so it matches exactly once.",
+            fuzzy.len(),
+            line_nums.join(", "),
+        ));
+    }
+    let Some(m) = fuzzy.first() else {
+        return Err(no_match_message(given, text, &old));
+    };
+    let mut out = String::with_capacity(text.len() + new.len());
+    out.push_str(text.get(..m.start).unwrap_or(""));
+    out.push_str(&new);
+    out.push_str(text.get(m.end..).unwrap_or(""));
+    Ok((out, 1, true))
+}
+
+enum HunkOp {
+    Context(String),
+    Remove(String),
+    Add(String),
+}
+
+struct PatchHunk {
+    old_start: Option<usize>,
+    hint: Option<String>,
+    ops: Vec<HunkOp>,
+    eof_anchor: bool,
+    old_no_eof_nl: bool,
+    new_no_eof_nl: bool,
+}
+
+impl PatchHunk {
+    fn old_lines(&self) -> Vec<&str> {
+        self.ops
+            .iter()
+            .filter_map(|op| match op {
+                HunkOp::Context(s) | HunkOp::Remove(s) => Some(s.as_str()),
+                HunkOp::Add(_) => None,
+            })
+            .collect()
+    }
+}
+
+fn parse_hunk_header(line: &str) -> Option<(Option<usize>, Option<String>)> {
+    if !line.starts_with("@@") {
+        return None;
+    }
+    if line == "@@" {
+        return Some((None, None));
+    }
+    if let Some(after_prefix) = line.strip_prefix("@@ ") {
+        if let Some((range_part, rest)) = after_prefix.split_once(" @@") {
+            let mut parts = range_part.split_whitespace();
+            if let (Some(old_tok), Some(new_tok), None) = (parts.next(), parts.next(), parts.next()) {
+                if let (Some(old_rest), Some(new_rest)) = (old_tok.strip_prefix('-'), new_tok.strip_prefix('+')) {
+                    let old_ok = old_rest.split_once(',').map_or_else(
+                        || old_rest.parse::<usize>().ok(),
+                        |(s, c)| c.parse::<usize>().ok().and(s.parse::<usize>().ok()),
+                    );
+                    let new_ok = new_rest.split_once(',').map_or_else(
+                        || new_rest.parse::<usize>().ok(),
+                        |(s, c)| c.parse::<usize>().ok().and(s.parse::<usize>().ok()),
+                    );
+                    if let (Some(old_start), Some(_)) = (old_ok, new_ok) {
+                        let hint = rest.trim();
+                        return Some((Some(old_start), (!hint.is_empty()).then(|| hint.to_string())));
+                    }
+                }
+            }
+        }
+        let hint = after_prefix.trim();
+        return Some((None, (!hint.is_empty()).then(|| hint.to_string())));
+    }
+    None
+}
+
+fn is_diff_preamble(line: &str) -> bool {
+    line.is_empty()
+        || line.starts_with("diff --git ")
+        || line.starts_with("index ")
+        || line.starts_with("--- ")
+        || line.starts_with("+++ ")
+        || line.starts_with("old mode ")
+        || line.starts_with("new mode ")
+        || line.starts_with("similarity index ")
+        || line.starts_with("rename from ")
+        || line.starts_with("rename to ")
+        || line == "*** Begin Patch"
+}
+
+fn parse_patch_hunks(patch: &str) -> Result<Vec<PatchHunk>, String> {
+    let raw_lines: Vec<&str> = patch.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)).collect();
+    let mut hunks = Vec::new();
+    let mut cur: Option<PatchHunk> = None;
+    let mut saw_file_directive = false;
+    let mut last_was_add = false;
+
+    for (idx, &line) in raw_lines.iter().enumerate() {
+        if line == "*** End Patch" {
+            break;
+        }
+        if line.starts_with("*** Add File:") || line.starts_with("*** Delete File:") {
+            return Err("Use `write` or `bash` to add or delete files; `edit` only modifies existing files.".into());
+        }
+        if line.starts_with("*** Move to:") {
+            return Err("Use `bash` to rename or move files; `edit` modifies a file in place.".into());
+        }
+        if line.starts_with("*** Update File:") {
+            if saw_file_directive {
+                return Err("`patch` references multiple files; `edit` modifies one file at a time.".into());
+            }
+            if let Some(h) = cur.take() {
+                hunks.push(h);
+            }
+            saw_file_directive = true;
+            last_was_add = false;
+            continue;
+        }
+        if line == "*** End of File" {
+            if let Some(ref mut h) = cur {
+                h.eof_anchor = true;
+            }
+            continue;
+        }
+        if let Some((old_start, hint)) = parse_hunk_header(line) {
+            if let Some(h) = cur.take() {
+                hunks.push(h);
+            }
+            cur = Some(PatchHunk {
+                old_start,
+                hint,
+                ops: Vec::new(),
+                eof_anchor: false,
+                old_no_eof_nl: false,
+                new_no_eof_nl: false,
+            });
+            last_was_add = false;
+            continue;
+        }
+
+        let Some(ref mut hunk) = cur else {
+            if line.starts_with("diff --git ") && !hunks.is_empty() {
+                return Err("`patch` references multiple files; `edit` modifies one file at a time.".into());
+            }
+            if is_diff_preamble(line) {
+                continue;
+            }
+            return Err(format!("Invalid patch header line before first `@@`: {line}"));
+        };
+
+        if let Some(rest) = line.strip_prefix(' ') {
+            hunk.ops.push(HunkOp::Context(rest.to_string()));
+            last_was_add = false;
+        } else if let Some(rest) = line.strip_prefix('-') {
+            hunk.ops.push(HunkOp::Remove(rest.to_string()));
+            last_was_add = false;
+        } else if let Some(rest) = line.strip_prefix('+') {
+            hunk.ops.push(HunkOp::Add(rest.to_string()));
+            last_was_add = true;
+        } else if line.starts_with('\\') {
+            if last_was_add {
+                hunk.new_no_eof_nl = true;
+            } else {
+                hunk.old_no_eof_nl = true;
+            }
+        } else if line.is_empty() {
+            // An empty line between hunk operations means a blank context line whose leading space
+            // was stripped; before another header or at trailing EOF it is just separator noise.
+            let continues_hunk = raw_lines.get(idx + 1).is_some_and(|next| {
+                !next.is_empty()
+                    && !next.starts_with("@@")
+                    && !next.starts_with("*** ")
+                    && !next.starts_with("diff --git ")
+            });
+            if continues_hunk {
+                hunk.ops.push(HunkOp::Context(String::new()));
+                last_was_add = false;
+            }
+        } else if line.starts_with("diff --git ") {
+            return Err("`patch` references multiple files; `edit` modifies one file at a time.".into());
+        } else {
+            return Err(format!("Invalid patch line inside hunk (expected `' '`, `'-'`, `'+'`, or `@@`): {line}"));
+        }
+    }
+    if let Some(h) = cur.take() {
+        hunks.push(h);
+    }
+    if hunks.is_empty() {
+        return Err("`patch` contains no `@@` hunks.".into());
+    }
+    Ok(hunks)
+}
+
+fn find_slice_matches<F>(file_lines: &[String], old: &[&str], from: usize, to: usize, norm: F) -> Vec<usize>
+where
+    F: Fn(&str) -> String,
+{
+    if old.is_empty() || old.len() > file_lines.len() {
+        return Vec::new();
+    }
+    let max_start = (file_lines.len() - old.len()).min(to);
+    if from > max_start {
+        return Vec::new();
+    }
+    let normed_old: Vec<String> = old.iter().map(|s| norm(s)).collect();
+    let mut hits = Vec::new();
+    for pos in from..=max_start {
+        let matched = (0..old.len()).all(|j| file_lines.get(pos + j).map(|s| norm(s)) == normed_old.get(j).cloned());
+        if matched {
+            hits.push(pos);
+        }
+    }
+    hits
+}
+
+fn slice_matches_at<F>(file_lines: &[String], old: &[&str], pos: usize, norm: F) -> bool
+where
+    F: Fn(&str) -> String,
+{
+    if old.is_empty() || pos + old.len() > file_lines.len() {
+        return false;
+    }
+    old.iter().enumerate().all(|(j, line)| file_lines.get(pos + j).is_some_and(|fl| norm(fl) == norm(line)))
+}
+
+fn narrow_by_hint(file_lines: &[String], hits: &[usize], hint: Option<&str>, from: usize) -> Option<usize> {
+    let hint = hint?;
+    let mut hint_lines = (from..file_lines.len()).filter(|&i| file_lines.get(i).is_some_and(|l| l.contains(hint)));
+    let anchor = hint_lines.next()?;
+    let after: Vec<usize> = hits.iter().copied().filter(|&pos| pos >= anchor).collect();
+    if after.len() == 1 {
+        after.first().copied()
+    } else {
+        None
+    }
+}
+
+fn locate_hunk(
+    file_lines: &[String],
+    hunk: &PatchHunk,
+    hunk_num: usize,
+    search_from: usize,
+    line_delta: isize,
+) -> Result<(usize, bool), String> {
+    let old = hunk.old_lines();
+    if old.is_empty() {
+        if file_lines.is_empty() {
+            return Ok((0, false));
+        }
+        if let Some(start) = hunk.old_start {
+            let idx = if start == 0 { 0 } else { ((start as isize) + line_delta).max(0) as usize };
+            return Ok((idx.min(file_lines.len()), false));
+        }
+        if hunk.eof_anchor {
+            return Ok((file_lines.len(), false));
+        }
+        return Err(format!("Patch hunk {hunk_num} has no context or removed lines and no line number."));
+    }
+    let end_bound = file_lines.len();
+    let expected = hunk.old_start.map(|s| ((s.saturating_sub(1)) as isize + line_delta).max(0) as usize);
+
+    if hunk.eof_anchor {
+        if let Some(eof_pos) = file_lines.len().checked_sub(old.len()) {
+            if slice_matches_at(file_lines, &old, eof_pos, |s| s.to_string()) {
+                return Ok((eof_pos, false));
+            }
+            if slice_matches_at(file_lines, &old, eof_pos, |s| s.trim().to_string()) {
+                return Ok((eof_pos, true));
+            }
+            if slice_matches_at(file_lines, &old, eof_pos, collapse_ws) {
+                return Ok((eof_pos, true));
+            }
+        }
+    }
+
+    if let Some(pos) = expected {
+        if slice_matches_at(file_lines, &old, pos, |s| s.to_string()) {
+            return Ok((pos, false));
+        }
+    }
+
+    let exact_after = find_slice_matches(file_lines, &old, search_from, end_bound, |s| s.to_string());
+    if exact_after.len() == 1 {
+        if let Some(&pos) = exact_after.first() {
+            return Ok((pos, false));
+        }
+    }
+    if exact_after.len() > 1 {
+        if let Some(pos) = narrow_by_hint(file_lines, &exact_after, hunk.hint.as_deref(), search_from) {
+            return Ok((pos, false));
+        }
+        return Err(format!(
+            "Patch hunk {hunk_num} matches {} locations; include more surrounding context lines.",
+            exact_after.len()
+        ));
+    }
+
+    if search_from > 0 {
+        let exact_all = find_slice_matches(file_lines, &old, 0, end_bound, |s| s.to_string());
+        if exact_all.len() == 1 {
+            if let Some(&pos) = exact_all.first() {
+                return Ok((pos, false));
+            }
+        }
+        if exact_all.len() > 1 {
+            return Err(format!(
+                "Patch hunk {hunk_num} matches {} locations; include more surrounding context lines.",
+                exact_all.len()
+            ));
+        }
+    }
+
+    if old.iter().any(|l| !l.trim().is_empty()) {
+        for norm in [|s: &str| s.trim().to_string(), collapse_ws] {
+            if let Some(pos) = expected {
+                if slice_matches_at(file_lines, &old, pos, norm) {
+                    return Ok((pos, true));
+                }
+            }
+            let fuzzy_after = find_slice_matches(file_lines, &old, search_from, end_bound, norm);
+            if fuzzy_after.len() == 1 {
+                if let Some(&pos) = fuzzy_after.first() {
+                    return Ok((pos, true));
+                }
+            }
+            if fuzzy_after.len() > 1 {
+                return Err(format!(
+                    "Patch hunk {hunk_num} (with whitespace normalization) matches {} locations; include more surrounding context lines.",
+                    fuzzy_after.len()
+                ));
+            }
+            if search_from > 0 {
+                let fuzzy_all = find_slice_matches(file_lines, &old, 0, end_bound, norm);
+                if fuzzy_all.len() == 1 {
+                    if let Some(&pos) = fuzzy_all.first() {
+                        return Ok((pos, true));
+                    }
+                }
+                if fuzzy_all.len() > 1 {
+                    return Err(format!(
+                        "Patch hunk {hunk_num} (with whitespace normalization) matches {} locations; include more surrounding context lines.",
+                        fuzzy_all.len()
+                    ));
+                }
+            }
+        }
+    }
+
+    let preview = old.first().copied().unwrap_or("");
+    Err(format!("Patch hunk {hunk_num} could not be matched in the file (starts near `{preview}`)."))
+}
+
+/// Apply unified diff or `*** Begin Patch` hunks to an existing read file.
+fn patch_file(ctx: &ToolCtx, given: &str, path: &Path, patch: &str) -> Worked {
+    if patch.trim().is_empty() {
+        return ToolOutput::error("`patch` is empty, so there is nothing to apply.").into();
+    }
+    let hunks = match parse_patch_hunks(patch) {
+        Ok(h) => h,
+        Err(msg) => return ToolOutput::error(msg).into(),
+    };
+    if path.is_dir() {
+        return ToolOutput::error(format!("{given} is a directory. Give the path of a file to edit.")).into();
+    }
+    let readable = readable_in(ctx);
+    let fresh = match ctx.files.freshness(path, &readable) {
+        Ok(f) => f,
+        Err(e) => return check_failed(given, "edit", "editing", e).into(),
+    };
+    if fresh == Freshness::Missing {
+        return ToolOutput::error(format!(
+            "{given} does not exist, so there is nothing to edit. Create it with `write`, or check the path (`glob` finds files)."
+        ))
+        .into();
+    }
+    if let Some(refusal) = freshness_refusal(&fresh, given, "edit") {
+        return refusal.into();
+    }
+    let bytes = match read_bounded(path, READ_CAP, &ctx.cancel, &readable) {
+        Ok(b) => b,
+        Err(f) => return fail_output(f, given, "edit", "Use `bash` for a change to a file this large.").into(),
+    };
+    let text = match String::from_utf8(bytes) {
+        Ok(t) => t,
+        Err(_) => {
+            return ToolOutput::error(format!(
+                "{given} is not valid UTF-8 text, and binary files are not edited. Use `bash` for a binary change."
+            ))
+            .into()
+        }
+    };
+
+    let crlf = text.contains("\r\n") && text.matches('\n').count() == text.matches("\r\n").count();
+    let orig_had_trailing_nl = text.ends_with('\n');
+    let text_lf = if crlf { text.replace("\r\n", "\n") } else { text.clone() };
+    let mut file_lines: Vec<String> = if text_lf.is_empty() {
+        Vec::new()
+    } else {
+        let body = text_lf.strip_suffix('\n').unwrap_or(&text_lf);
+        body.split('\n').map(str::to_string).collect()
+    };
+
+    let mut search_from = 0usize;
+    let mut line_delta = 0isize;
+    let mut used_fuzzy = false;
+    let mut trailing_nl = orig_had_trailing_nl;
+    let n_hunks = hunks.len();
+
+    for (idx, hunk) in hunks.iter().enumerate() {
+        let (pos, fuzzy) = match locate_hunk(&file_lines, hunk, idx + 1, search_from, line_delta) {
+            Ok(found) => found,
+            Err(msg) => return ToolOutput::error(msg).into(),
+        };
+        if fuzzy {
+            used_fuzzy = true;
+        }
+        let old_len = hunk.old_lines().len();
+        let matched: Vec<String> = file_lines.get(pos..pos + old_len).unwrap_or(&[]).to_vec();
+        let at_eof = pos + old_len == file_lines.len();
+        let mut replacement = Vec::new();
+        let mut m_idx = 0usize;
+        for op in &hunk.ops {
+            match op {
+                HunkOp::Context(_) => {
+                    if let Some(orig) = matched.get(m_idx) {
+                        replacement.push(orig.clone());
+                    }
+                    m_idx += 1;
+                }
+                HunkOp::Remove(_) => {
+                    m_idx += 1;
+                }
+                HunkOp::Add(line) => {
+                    replacement.push(line.clone());
+                }
+            }
+        }
+        let new_len = replacement.len();
+        file_lines.splice(pos..pos + old_len, replacement);
+        line_delta += new_len as isize - old_len as isize;
+        search_from = pos + new_len;
+        if idx + 1 == n_hunks && (at_eof || hunk.old_no_eof_nl || hunk.new_no_eof_nl) {
+            if hunk.new_no_eof_nl {
+                trailing_nl = false;
+            } else if (hunk.old_no_eof_nl || (at_eof && !orig_had_trailing_nl)) && !file_lines.is_empty() {
+                trailing_nl = true;
+            }
+        }
+    }
+
+    let line_sep = if crlf { "\r\n" } else { "\n" };
+    let mut updated = file_lines.join(line_sep);
+    if trailing_nl && !file_lines.is_empty() {
+        updated.push_str(line_sep);
+    }
+    if updated == text {
+        return ToolOutput::error("`patch` made no changes to the file.").into();
+    }
+    if ctx.cancel.is_cancelled() {
+        return cancelled("edit").into();
+    }
+    if let Err(fail) = write_atomic(&ctx.sandbox, path, updated.as_bytes()) {
+        return write_failed(given, fail, "check that the file is writable and try again.").into();
+    }
+    let hunk_note = if n_hunks == 1 { "1 hunk".to_string() } else { format!("{n_hunks} hunks") };
+    let mut out = ToolOutput::ok("edited", Body::Raw(unified_diff(given, &text, &updated).into_bytes()))
+        .with_more(given.to_string())
+        .with_more(hunk_note);
+    if used_fuzzy {
+        out = out.with_more("matched old with whitespace normalization");
+    }
+    Worked { out, seen: Some(Seen::of_bytes(updated.as_bytes())) }
+}
+
+/// What to tell the model when `old` is not in the file: the nearest real text, never a guess applied.
+fn no_match_message(given: &str, text: &str, old: &str) -> String {
+    let file_lines: Vec<&str> = text.split('\n').map(|l| l.strip_suffix('\r').unwrap_or(l)).collect();
+    let mut old_lines: Vec<&str> = old.split('\n').collect();
+    if old_lines.len() > 1 && old_lines.last().is_some_and(|l| l.is_empty()) {
+        old_lines.pop();
+    }
+    let numbered = |from: usize, to: usize| -> String {
+        file_lines
+            .iter()
+            .enumerate()
+            .take(to.saturating_add(1))
+            .skip(from)
+            .map(|(i, l)| format!("{}\t{}", i + 1, clip(l)))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let wanted: Vec<&str> = old_lines.iter().map(|l| l.trim()).collect();
+    let n = wanted.len();
+    if n <= file_lines.len() {
+        for start in 0..=(file_lines.len() - n) {
+            let same = file_lines.iter().skip(start).take(n).map(|l| l.trim()).eq(wanted.iter().copied());
+            if same {
+                return format!(
+                    "`old` was not found as written, but lines {}-{} of {given} match it when leading and trailing whitespace is ignored. Those lines, exactly as they are in the file:\n{}\nCopy `old` from them, keeping their exact whitespace, and call `edit` again. Nothing was changed.",
+                    start + 1,
+                    start + n,
+                    numbered(start, start + n - 1)
+                );
+            }
+        }
+    }
+
+    let first = wanted.first().copied().unwrap_or("");
+    if !first.is_empty() {
+        if let Some(at) = file_lines.iter().position(|l| l.contains(first)) {
+            let from = at.saturating_sub(2);
+            let to = (at + n + 1).min(file_lines.len().saturating_sub(1));
+            return format!(
+                "`old` was not found in {given}. Its first line does occur, at line {}; the file has this there (lines {}-{}):\n{}\nCompare it with your `old` and call `edit` again with text copied exactly from these lines. Nothing was changed.",
+                at + 1,
+                from + 1,
+                to + 1,
+                numbered(from, to)
+            );
+        }
+    }
+    format!(
+        "`old` was not found in {given}, and nothing similar was found. The file has {} lines. Use `read` (or `grep`) to look at the part you mean to change, then call `edit` again with text copied exactly from it. Nothing was changed.",
+        count_lines(text)
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::{env, env_with, TestEnv};
+    use ferret_core::config::{SandboxCfg, SandboxMode, ToolsCfg};
+    use ferret_core::event::{ToolResult, ToolStatus, META_SHOWN};
+
+    fn ws(e: &TestEnv, name: &str) -> PathBuf {
+        e.ctx.workspace.join(name)
+    }
+
+    fn put(e: &TestEnv, name: &str, bytes: &[u8]) -> PathBuf {
+        let p = ws(e, name);
+        std::fs::write(&p, bytes).expect("write fixture");
+        p
+    }
+
+    fn shown(r: &ToolResult) -> Value {
+        r.meta.get(META_SHOWN).cloned().unwrap_or(Value::Null)
+    }
+
+    fn is_err(r: &ToolResult) -> bool {
+        r.status == ToolStatus::Error
+    }
+
+    fn numbered_file(n: usize) -> String {
+        (1..=n).map(|i| format!("row {i}\n")).collect()
+    }
+
+    #[test]
+    fn a_file_that_grows_during_the_read_names_the_limit_in_force() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("grow.txt");
+        std::fs::write(&p, vec![b'x'; 100]).unwrap();
+        // The size seen at open time (1) was within the cap (10); the read finds more.
+        let fail = read_open(File::open(&p).unwrap(), 1, 10, &CancellationToken::new()).unwrap_err();
+        let Body::Message(text) = fail_output(fail, "grow.txt", "read", "Use a range.").body else {
+            panic!("not a message")
+        };
+        assert!(text.contains("grew while it was being read") && text.contains("above the 10 byte limit"), "{text}");
+        assert!(!text.contains("is 11 bytes") && !text.contains(&READ_CAP.to_string()), "{text}");
+    }
+
+    #[tokio::test]
+    async fn read_whole_range_and_past_end() {
+        let e = env_with(
+            ToolsCfg { read_max_lines: 10, ..ToolsCfg::default() },
+            SandboxCfg { mode: SandboxMode::None, ..SandboxCfg::default() },
+        );
+        put(&e, "f.txt", numbered_file(25).as_bytes());
+        let r = e.call("read", json!({"path": "f.txt"})).await;
+        assert_eq!(shown(&r), json!([[1, 10]]));
+        assert!(r.text.contains("lines 1-10 of 25 — 15 more below") && r.text.contains("1\trow 1\n"), "{}", r.text);
+        assert_eq!(r.meta.get(META_PATH).and_then(Value::as_str), Some(ws(&e, "f.txt").to_str().unwrap()));
+        let r = e.call("read", json!({"path": "f.txt", "start": 12, "end": 14})).await;
+        assert_eq!(shown(&r), json!([[12, 14]]));
+        assert!(r.text.contains("12\trow 12\n13\trow 13\n14\trow 14") && !r.text.contains("15\trow"), "{}", r.text);
+        let r = e.call("read", json!({"path": "f.txt", "start": 20, "end": 99})).await;
+        assert_eq!(shown(&r), json!([[20, 25]]));
+        let r = e.call("read", json!({"path": "f.txt", "start": 26})).await;
+        assert!(is_err(&r) && r.text.contains("25 lines"), "{}", r.text);
+    }
+
+    #[tokio::test]
+    async fn a_read_says_when_the_file_changed_since_the_last_read() {
+        let e = env_with(ToolsCfg::default(), SandboxCfg { mode: SandboxMode::None, ..SandboxCfg::default() });
+        put(&e, "f.txt", b"one\n");
+        e.ctx.files.set_step(3);
+        let r = e.call("read", json!({"path": "f.txt"})).await;
+        assert!(!r.text.contains("changed since your last read"), "{}", r.text);
+        e.ctx.files.set_step(7);
+        let r = e.call("read", json!({"path": "f.txt"})).await;
+        assert!(!r.text.contains("changed since your last read"), "{}", r.text);
+        put(&e, "f.txt", b"two\n");
+        e.ctx.files.set_step(9);
+        let r = e.call("read", json!({"path": "f.txt"})).await;
+        assert!(
+            r.text.lines().next().unwrap_or_default().contains("changed since your last read (step 7)"),
+            "{}",
+            r.text
+        );
+        let r = e.call("read", json!({"path": "f.txt"})).await;
+        assert!(!r.text.contains("changed since your last read"), "{}", r.text);
+    }
+
+    #[tokio::test]
+    async fn read_empty_directory_missing_and_binary() {
+        let e = env();
+        put(&e, "empty.txt", b"");
+        let r = e.call("read", json!({"path": "empty.txt"})).await;
+        assert!(r.text.contains("(empty file)") && !is_err(&r), "{}", r.text);
+
+        std::fs::create_dir(ws(&e, "sub")).unwrap();
+        let r = e.call("read", json!({"path": "sub"})).await;
+        assert!(is_err(&r) && r.text.contains("directory") && r.text.contains("glob"), "{}", r.text);
+
+        put(&e, "Readme.md", b"x");
+        put(&e, "main.rs", b"x");
+        put(&e, "zzzzzzzz", b"x");
+        let r = e.call("read", json!({"path": "Readm.md"})).await;
+        assert!(is_err(&r) && r.text.contains("does not exist") && r.text.contains("Readme.md"), "{}", r.text);
+        let r = e.call("read", json!({"path": "man.rs"})).await;
+        assert!(r.text.contains("main.rs") && !r.text.contains("zzzzzzzz"), "{}", r.text);
+        let r = e.call("read", json!({"path": "nothing-like-it.txt"})).await;
+        assert!(is_err(&r) && !r.text.contains("similar name"), "{}", r.text);
+
+        put(&e, "bin.dat", &[0u8, 1, 2, 0xff, 0, 0, 7]);
+        let r = e.call("read", json!({"path": "bin.dat"})).await;
+        assert!(r.text.contains("binary data, 7 bytes") && r.text.contains("binary"), "{}", r.text);
+        assert_eq!(shown(&r), json!([[1, 1]]));
+    }
+
+    #[tokio::test]
+    async fn read_of_an_image_attaches_it_and_a_large_one_is_only_described() {
+        let e = env();
+        let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        png.extend_from_slice(&[0, 0, 0, 4, 0, 0, 0, 3, 8, 6, 0, 0, 0]);
+        put(&e, "a.png", &png);
+        let r = e.call("read", json!({"path": "a.png"})).await;
+        assert_eq!(r.status, ToolStatus::Ok, "{}", r.text);
+        assert!(r.text.contains("[read \u{b7} image \u{b7} "), "{}", r.text);
+        assert!(r.text.contains("4x3 PNG"), "{}", r.text);
+        assert_eq!(r.images.len(), 1);
+        assert_eq!((r.images[0].mime.as_str(), r.images[0].width, r.images[0].height), ("image/png", 4, 3));
+        assert_eq!(e.ctx.blobs.read_all(&ferret_core::BlobId::from(r.images[0].blob.clone())).unwrap(), png);
+
+        let mut big = png.clone();
+        big.resize(6 * 1024 * 1024, 0);
+        put(&e, "big.png", &big);
+        let r = e.call("read", json!({"path": "big.png"})).await;
+        assert!(
+            r.images.is_empty() && r.text.contains("Not attached") && r.text.contains("max_image_bytes"),
+            "{}",
+            r.text
+        );
+    }
+
+    fn message(o: &ToolOutput) -> String {
+        match &o.body {
+            Body::Message(m) => m.clone(),
+            other => format!("{other:?}"),
+        }
+    }
+
+    /// Of a result that is a view of stored text: its text, its `shown` ranges, and that stored text.
+    fn view_of(e: &TestEnv, o: &ToolOutput) -> (String, Vec<(u64, u64)>, String) {
+        match &o.body {
+            Body::View { of, text, shown } => {
+                let stored = String::from_utf8(e.ctx.blobs.read_all(of).expect("read blob")).expect("utf-8");
+                (text.clone(), shown.clone(), stored)
+            }
+            other => panic!("not a view of stored text: {other:?}"),
+        }
+    }
+
+    /// The limits of `read` with whole reads lowered to `whole` bytes.
+    fn cap(whole: u64) -> ReadLimits {
+        ReadLimits { whole, ..READ_LIMITS }
+    }
+
+    /// `read` with lowered limits, recorded the way the tool records a call that returns.
+    fn read_limited(e: &TestEnv, name: &str, start: Option<u64>, end: Option<u64>, limits: ReadLimits) -> ToolOutput {
+        let path = ws(e, name);
+        let done = read_file(&e.ctx, name, &path, start, end, limits);
+        if let Some(seen) = done.seen {
+            e.ctx.files.record(&path, seen);
+        }
+        done.out
+    }
+
+    /// Run `scenario` on a thread of its own, with its own runtime, and return the channel its outcome
+    /// arrives on. A call that blocks its thread then fails the test on `recv_timeout` instead of
+    /// hanging it: nothing waits for that thread, or for the runtime it holds.
+    fn on_own_thread<T, F, Fut>(scenario: F) -> std::sync::mpsc::Receiver<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = T>,
+    {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+            let _ = tx.send(rt.block_on(scenario()));
+        });
+        rx
+    }
+
+    #[test]
+    fn devices_fifos_and_sockets_are_refused_without_hanging() {
+        use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        // In a directory of this thread's own, so that it can release a call stuck on the FIFO.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (fifo, sock) = (root.join("pipe"), root.join("sock"));
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        // The device last: a read of it that is not refused never ends, and nothing can release it.
+        let targets = [
+            (fifo.display().to_string(), "FIFO"),
+            (sock.display().to_string(), "a socket"),
+            ("/dev/zero".to_string(), "character device"),
+        ];
+
+        let given_up = Arc::new(AtomicBool::new(false));
+        let (paths, stop) = (targets.clone().map(|(path, _)| path), given_up.clone());
+        let done = on_own_thread(move || async move {
+            let e = env();
+            let mut results = Vec::new();
+            for path in &paths {
+                for (tool, mut args) in
+                    [("read", json!({})), ("write", json!({"content": "x"})), ("edit", json!({"old": "a", "new": "b"}))]
+                {
+                    if stop.load(Ordering::SeqCst) {
+                        return results;
+                    }
+                    args["path"] = json!(path);
+                    results.push(e.call(tool, args).await);
+                }
+            }
+            results
+        });
+        let results = match done.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(results) => results,
+            Err(_) => {
+                // A call is stuck. Opening the write end of the FIFO and closing it again gives a reader
+                // blocked on it end-of-file, so the thread left behind ends instead of holding the pipe.
+                given_up.store(true, Ordering::SeqCst);
+                for _ in 0..50 {
+                    if std::fs::OpenOptions::new().write(true).custom_flags(libc::O_NONBLOCK).open(&fifo).is_ok() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                panic!("a file tool blocked on a FIFO, a socket or a device instead of refusing it");
+            }
+        };
+
+        assert_eq!(results.len(), 9);
+        for (calls, (path, kind)) in results.chunks(3).zip(&targets) {
+            for r in calls {
+                assert!(is_err(r), "{}", r.text);
+                assert!(r.text.contains(&format!("{path} is ")) && r.text.contains(kind), "{}", r.text);
+                assert!(
+                    r.text.contains(&format!("not a regular file, and `{}` works only on regular files", r.name)),
+                    "{}",
+                    r.text
+                );
+                assert!(r.text.contains("`bash`") && !r.text.contains("permissions"), "{}", r.text);
+            }
+        }
+        assert!(results[3].text.contains("nc -U"), "{}", results[3].text);
+        // Nothing was put in their place.
+        assert!(std::fs::symlink_metadata(&fifo).unwrap().file_type().is_fifo());
+        assert!(std::fs::symlink_metadata(&sock).unwrap().file_type().is_socket());
+    }
+
+    #[test]
+    fn a_failed_freshness_check_blames_the_kind_of_file_only_when_that_is_the_fault() {
+        // The standard library reports a NUL in a path as `InvalidInput`, which says nothing about
+        // what the path is.
+        let nul = std::io::Error::new(std::io::ErrorKind::InvalidInput, "file name contained an unexpected NUL byte");
+        let m = message(&check_failed("a.txt", "write", "writing", NotOpened::Io(nul)));
+        assert!(
+            m.contains("a.txt cannot be checked before writing")
+                && m.contains("NUL byte")
+                && !m.contains("regular file"),
+            "{m}"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_above_the_cap_is_refused_whole_and_read_by_range() {
+        let e = env();
+        let path = put(&e, "huge.txt", numbered_file(200).as_bytes());
+        let size = std::fs::metadata(&path).unwrap().len();
+        let whole = read_limited(&e, "huge.txt", None, None, cap(100));
+        assert_eq!(whole.status, ToolStatus::Error);
+        let m = message(&whole);
+        assert!(m.contains(&format!("huge.txt is {size} bytes, above the 100 byte limit")), "{m}");
+        // The advice is a range or `bash`; not the `grep` tool, which skips a file of this size.
+        assert!(m.contains("`start` and `end`") && m.contains("`bash`"), "{m}");
+        assert!(!m.contains("use `grep`") && !m.contains("`grep`"), "{m}");
+        // A refused read is not a read.
+        assert_eq!(e.ctx.files.check(&path).unwrap(), Freshness::Unread);
+
+        let part = read_limited(&e, "huge.txt", Some(5), Some(7), cap(100));
+        assert_eq!(part.status, ToolStatus::Ok);
+        let (text, shown, stored) = view_of(&e, &part);
+        assert_eq!(text, "5\trow 5\n6\trow 6\n7\trow 7");
+        // What is stored is the window: `shown` counts its lines, the text numbers them as in the file.
+        assert_eq!((shown, stored.as_str()), (vec![(1, 3)], "row 5\nrow 6\nrow 7\n"));
+        assert!(part.more.iter().any(|f| f.starts_with("lines 5-7 — more below")), "{:?}", part.more);
+        assert_eq!(e.ctx.files.check(&path).unwrap(), Freshness::Current);
+
+        let tail = read_limited(&e, "huge.txt", Some(199), Some(900), cap(100));
+        assert_eq!(view_of(&e, &tail).0, "199\trow 199\n200\trow 200");
+        assert!(tail.more.iter().any(|f| f.contains("lines 199-200 of 200")), "{:?}", tail.more);
+        let past = read_limited(&e, "huge.txt", Some(300), None, cap(100));
+        assert!(past.status == ToolStatus::Error && message(&past).contains("200 lines"), "{}", message(&past));
+
+        std::fs::write(&path, [b'a', 0, b'b'].repeat(100)).unwrap();
+        let bin = read_limited(&e, "huge.txt", Some(1), Some(2), cap(100));
+        assert!(bin.status == ToolStatus::Error && message(&bin).contains("binary"), "{}", message(&bin));
+    }
+
+    #[tokio::test]
+    async fn a_range_of_a_file_above_the_cap_is_normalised_and_stored() {
+        let e = env();
+        // Clean beyond the first 8 KiB, which decide text or binary before the file is streamed; then
+        // one line for each thing normalisation deals with, then a NUL.
+        let mut bytes = "plain line\n".repeat(1000).into_bytes();
+        bytes.extend_from_slice(b"\x1b[1mbold\x1b[0m\n");
+        bytes.extend_from_slice(b"bell\x07 here\n");
+        bytes.extend_from_slice(b"progress 1\rprogress 2\n");
+        bytes.extend_from_slice(b"caf\xff\n");
+        bytes.extend_from_slice(b"x\0y\n");
+        bytes.extend_from_slice(b"after\n");
+        let path = put(&e, "log.txt", &bytes);
+
+        let out = read_limited(&e, "log.txt", Some(1000), Some(1004), cap(100));
+        assert_eq!(out.status, ToolStatus::Ok, "{out:?}");
+        let (text, shown, stored) = view_of(&e, &out);
+        assert_eq!(text, "1000\tplain line\n1001\tbold\n1002\tbell\\x07 here\n1003\tprogress 2\n1004\tcaf\u{fffd}");
+        assert_eq!(shown, vec![(1, 5)]);
+        assert_eq!(stored, "plain line\nbold\nbell\\x07 here\nprogress 2\ncaf\u{fffd}\n");
+        let facts = out.more.join(" · ");
+        assert!(
+            facts.contains("2 terminal escape sequences removed") && facts.contains("1 overwritten lines collapsed"),
+            "{facts}"
+        );
+        assert!(
+            facts.contains("1 invalid bytes replaced") && facts.contains("1 control characters escaped"),
+            "{facts}"
+        );
+
+        // A NUL in the window: the lines are refused as binary, not shown raw, and it is not a read.
+        e.ctx.files.forget(&path);
+        let out = read_limited(&e, "log.txt", Some(1004), Some(1006), cap(100));
+        assert_eq!(out.status, ToolStatus::Error);
+        let m = message(&out);
+        assert!(
+            m.contains("Lines 1004-1006 of log.txt are binary data") && m.contains("`bash`") && !m.contains('\0'),
+            "{m}"
+        );
+        assert_eq!(e.ctx.files.check(&path).unwrap(), Freshness::Unread);
+    }
+
+    #[tokio::test]
+    async fn a_streamed_window_is_bounded_in_bytes_and_says_where_to_continue() {
+        let e = env();
+        put(&e, "rows.txt", numbered_file(200).as_bytes());
+        // `10\trow 10` and the newline are 10 bytes: the third such line would take the window past 20 bytes.
+        let limits = ReadLimits { whole: 100, window: 20 };
+        let out = read_limited(&e, "rows.txt", Some(10), Some(50), limits);
+        let (text, shown, _) = view_of(&e, &out);
+        assert_eq!((text.as_str(), shown), ("10\trow 10\n11\trow 11", vec![(1, 2)]));
+        let facts = out.more.join(" · ");
+        assert!(facts.contains("lines 10-11 — more below") && facts.contains("before line 50"), "{facts}");
+        assert!(facts.contains("size limit of 20 bytes") && facts.contains("continue with `start` 12"), "{facts}");
+        // The stored window is numbered from 1 while the text shows the file's numbers: no handle, and it says so.
+        assert!(
+            facts.contains("has no handle") && facts.contains("bounded `bash` command") && !facts.contains("out:"),
+            "{facts}"
+        );
+        // A window that ends at the line asked for, or with the file, was not cut by its size.
+        let out = read_limited(&e, "rows.txt", Some(10), Some(11), limits);
+        assert!(
+            view_of(&e, &out).0.ends_with("11\trow 11") && !out.more.join(" · ").contains("size limit"),
+            "{:?}",
+            out.more
+        );
+        let out = read_limited(&e, "rows.txt", Some(199), Some(900), ReadLimits { whole: 100, window: 40 });
+        assert!(out.more.iter().any(|f| f.starts_with("lines 199-200 of 200")), "{:?}", out.more);
+
+        // Of one line, 80,000 bytes are kept, cut on a character boundary, and 20,000 characters shown.
+        put(&e, "long.txt", format!("short\na{}\nend\n", "é".repeat(60_000)).as_bytes());
+        let out = read_limited(&e, "long.txt", Some(1), Some(3), cap(100));
+        let (text, shown, stored) = view_of(&e, &out);
+        assert_eq!(shown, vec![(1, 3)]);
+        let lines: Vec<&str> = text.split('\n').collect();
+        assert_eq!((lines[0], lines[2], lines.len()), ("1\tshort", "3\tend", 3));
+        assert!(
+            lines[1].starts_with("2\taéé") && lines[1].ends_with("é…[line is 120001 bytes; the rest is not shown]"),
+            "{} bytes",
+            lines[1].len()
+        );
+        assert_eq!(lines[1].chars().filter(|c| *c == 'é').count(), 19_999);
+        assert_eq!(stored.len(), "short\n".len() + 79_999 + "\nend\n".len());
+        assert_eq!(
+            out.more.iter().filter(|f| f.contains("shortened") || f.contains("invalid")).collect::<Vec<_>>(),
+            vec!["1 long lines shortened"]
+        );
+    }
+
+    #[test]
+    fn a_whole_read_ends_at_a_whole_line_within_the_view_size() {
+        let mut e = env();
+        e.ctx.view_chars = 100;
+        put(&e, "rows.txt", numbered_file(500).as_bytes());
+        let mut start = 1u64;
+        let mut seen = Vec::new();
+        while start <= 500 {
+            let out = read_limited(&e, "rows.txt", Some(start), None, READ_LIMITS);
+            let (text, shown, _) = view_of(&e, &out);
+            assert!(text.chars().count() <= 100, "{}", text.chars().count());
+            let last = shown[0].1;
+            assert!(text.ends_with(&format!("{last}\trow {last}")), "{text}");
+            let facts = out.more.join(" · ");
+            if last < 500 && last - start + 1 < 200 {
+                assert!(facts.contains(&format!("lines {start}-{last} of 500")), "{facts}");
+                assert!(facts.contains(&format!("continue with start {}", last + 1)), "{facts}");
+            }
+            seen.extend(start..=last);
+            start = last + 1;
+        }
+        assert_eq!(seen, (1..=500).collect::<Vec<u64>>());
+    }
+
+    #[test]
+    fn a_whole_read_of_long_lines_shows_the_first_line_shortened_to_fit() {
+        let mut e = env();
+        e.ctx.view_chars = 200;
+        put(&e, "big.jsonl", format!("{}\n{}\n", "a".repeat(2000), "b".repeat(2000)).as_bytes());
+        let out = read_limited(&e, "big.jsonl", None, None, READ_LIMITS);
+        let (text, shown, _) = view_of(&e, &out);
+        assert!(text.chars().count() <= 200 && text.starts_with("1\taaa"), "{text}");
+        assert_eq!(shown, vec![(1, 1)]);
+        let facts = out.more.join(" · ");
+        assert!(facts.contains("line 1 of 2") && facts.contains("continue with start 2"), "{facts}");
+    }
+
+    #[test]
+    fn large_window_cut_by_finalize_says_to_continue_past_lines_it_did_not_show() {
+        let mut e = env();
+        let policy = ferret_core::admit::AdmitPolicy { max_inline_tokens: 91, ..Default::default() };
+        let estimator = ferret_core::estimate::TokenEstimator::default();
+        e.ctx.view_chars = policy.view_chars(&estimator);
+        let body: String = "x\n".repeat(10_000);
+        put(&e, "short.txt", body.as_bytes());
+        let out = read_limited(&e, "short.txt", Some(5000), Some(7000), cap(10));
+        let spec = e.registry.get("read").unwrap().spec();
+        let r = crate::finalize(
+            &e.ctx,
+            &spec,
+            out,
+            &crate::Admission { policy: &policy, estimator: &estimator },
+            std::time::Instant::now(),
+        );
+        let last_seen = r.text.lines().filter_map(|l| l.split('\t').next()?.parse::<u64>().ok()).max().unwrap();
+        let cont = r
+            .text
+            .split("continue with `start` ")
+            .nth(1)
+            .and_then(|t| t.split(|c: char| !c.is_ascii_digit()).next())
+            .and_then(|n| n.parse::<u64>().ok())
+            .unwrap();
+        assert_eq!(cont, last_seen + 1, "{}", r.text);
+    }
+
+    #[test]
+    fn a_last_line_without_a_newline_that_would_pass_the_window_size_is_not_kept() {
+        let mut e = env();
+        e.ctx.view_chars = 20;
+        put(&e, "tail.txt", format!("{}\n{}", "a".repeat(8), "b".repeat(12)).as_bytes());
+        let out = read_limited(&e, "tail.txt", Some(1), Some(5), cap(10));
+        let (text, shown, _) = view_of(&e, &out);
+        assert_eq!(shown, vec![(1, 1)]);
+        assert!(text.starts_with("1\taaaaaaaa") && !text.contains('b'), "{text}");
+        let facts = out.more.join(" · ");
+        assert!(facts.contains("continue with `start` 2"), "{facts}");
+        // As the first line it is kept however long it is.
+        put(&e, "lone.txt", "c".repeat(300).as_bytes());
+        let out = read_limited(&e, "lone.txt", Some(1), Some(5), cap(10));
+        let (_, shown, _) = view_of(&e, &out);
+        assert_eq!(shown, vec![(1, 1)]);
+    }
+
+    #[test]
+    fn a_large_file_window_ends_before_the_line_that_would_pass_the_view_size() {
+        let mut e = env();
+        e.ctx.view_chars = 40;
+        put(&e, "rows.txt", numbered_file(200).as_bytes());
+        // Ten bytes a line with its number: four lines are 40 bytes, a fifth would pass 40.
+        let out = read_limited(&e, "rows.txt", Some(10), Some(50), cap(100));
+        let (text, shown, _) = view_of(&e, &out);
+        assert_eq!(text, "10\trow 10\n11\trow 11\n12\trow 12\n13\trow 13");
+        assert_eq!(shown, vec![(1, 4)]);
+        let facts = out.more.join(" · ");
+        assert!(facts.contains("lines 10-13 — more below") && facts.contains("continue with `start` 14"), "{facts}");
+        // The first line is kept and shown at most `view_chars` characters even when it alone passes it.
+        put(&e, "long.txt", format!("{}\nnext\n", "z".repeat(500)).as_bytes());
+        let out = read_limited(&e, "long.txt", Some(1), Some(2), cap(100));
+        let (text, shown, _) = view_of(&e, &out);
+        assert_eq!(shown, vec![(1, 1)]);
+        assert!(text.starts_with("1\tzzz") && text.chars().count() < 80, "{text}");
+        assert!(out.more.iter().any(|f| f.contains("continue with `start` 2")), "{:?}", out.more);
+    }
+
+    #[tokio::test]
+    async fn write_and_edit_refuse_a_changed_file_that_was_read_by_range() {
+        let e = env();
+        let path = put(&e, "big.txt", numbered_file(50).as_bytes());
+        let seen = read_limited(&e, "big.txt", Some(1), Some(2), cap(10));
+        assert_eq!(seen.status, ToolStatus::Ok);
+        // Unchanged since the ranged read: the freshness check passes without hashing the file.
+        let r = e.call("edit", json!({"path": "big.txt", "old": "row 3\n", "new": "three\n"})).await;
+        assert!(!is_err(&r), "{}", r.text);
+        // A second ranged read, then someone else changes the file.
+        read_limited(&e, "big.txt", Some(1), Some(2), cap(10));
+        put(&e, "big.txt", b"changed elsewhere\n");
+        let r = e.call("write", json!({"path": "big.txt", "content": "x"})).await;
+        assert!(is_err(&r) && r.text.contains("changed on disk"), "{}", r.text);
+        let r = e.call("edit", json!({"path": "big.txt", "old": "changed", "new": "x"})).await;
+        assert!(is_err(&r) && r.text.contains("changed on disk"), "{}", r.text);
+        assert_eq!(std::fs::read(&path).unwrap(), b"changed elsewhere\n");
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_read_returns_at_once_and_is_not_recorded() {
+        let e = env();
+        let path = put(&e, "f.txt", numbered_file(20).as_bytes());
+        // Work that reads the file and is then stuck, the way a read inside the kernel can be, until
+        // the test lets it go. The call is cancelled once the file has been read.
+        let (reached, at_work) = std::sync::mpsc::channel::<bool>();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let cancel = e.ctx.cancel.clone();
+        let canceller = std::thread::spawn(move || {
+            let was_read = at_work.recv().unwrap_or(false);
+            cancel.cancel();
+            was_read
+        });
+        let (given, target) = ("f.txt".to_string(), path.clone());
+        let out = off_thread(&e.ctx, "read", &path, move |c| {
+            let done = read_file(&c, &given, &target, None, None, READ_LIMITS);
+            let _ = reached.send(done.seen.is_some());
+            let _ = held.recv();
+            done
+        })
+        .await;
+        assert_eq!(out.status, ToolStatus::Interrupted, "{out:?}");
+        assert!(message(&out).contains("interrupted before the file was read"), "{out:?}");
+        assert!(canceller.join().unwrap(), "the work had read the file when the call was cancelled");
+        drop(release);
+
+        // The model was not shown the file, so a write over it is refused as unread.
+        assert_eq!(e.ctx.files.check(&path).unwrap(), Freshness::Unread);
+        let mut later = e.ctx.clone();
+        later.cancel = CancellationToken::new();
+        let refused = write_file(&later, "f.txt", &path, "x").out;
+        assert!(refused.status == ToolStatus::Error && message(&refused).contains("has not been read"), "{refused:?}");
+        assert_eq!(std::fs::read(&path).unwrap(), numbered_file(20).as_bytes());
+
+        // A call that is already cancelled when it starts also ends as interrupted, whole or ranged.
+        let r = e.call("read", json!({"path": "f.txt"})).await;
+        assert_eq!(r.status, ToolStatus::Interrupted, "{}", r.text);
+        for limits in [READ_LIMITS, cap(10)] {
+            let done = read_file(&e.ctx, "f.txt", &path, Some(1), Some(2), limits);
+            assert!(done.out.status == ToolStatus::Interrupted && done.seen.is_none(), "{:?}", done.out);
+        }
+        assert_eq!(e.ctx.files.check(&path).unwrap(), Freshness::Unread);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_write_or_edit_changes_nothing() {
+        let e = env();
+        let old = put(&e, "old.txt", b"one\ntwo\n");
+        e.call("read", json!({"path": "old.txt"})).await;
+        let new = ws(&e, "new.txt");
+        e.ctx.cancel.cancel();
+
+        // The work itself stops before it writes, whether or not it had a file to read first ...
+        let attempts = [
+            write_file(&e.ctx, "new.txt", &new, "x"),
+            write_file(&e.ctx, "old.txt", &old, "x"),
+            edit_file(&e.ctx, "old.txt", &old, "one", "1", false),
+        ];
+        for done in attempts {
+            assert!(done.out.status == ToolStatus::Interrupted && done.seen.is_none(), "{:?}", done.out);
+            assert!(message(&done.out).contains("interrupted before it changed anything"), "{:?}", done.out);
+        }
+        // ... and so does the work that a call leaves behind on its thread when it returns.
+        let calls = [
+            ("write", json!({"path": "new.txt", "content": "x"})),
+            ("write", json!({"path": "old.txt", "content": "x"})),
+            ("edit", json!({"path": "old.txt", "old": "one", "new": "1"})),
+        ];
+        for (tool, args) in calls {
+            let r = e.call(tool, args).await;
+            assert_eq!(r.status, ToolStatus::Interrupted, "{}", r.text);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!new.exists());
+        assert_eq!(std::fs::read(&old).unwrap(), b"one\ntwo\n");
+        // What the session has seen is as the read left it.
+        assert_eq!(e.ctx.files.check(&old).unwrap(), Freshness::Current);
+        assert_eq!(e.ctx.files.check(&new).unwrap(), Freshness::Missing);
+    }
+
+    #[tokio::test]
+    async fn round_trip_preserves_bytes() {
+        let e = env();
+        let cases: [(&str, &str); 4] = [
+            ("crlf.txt", "one\r\ntwo\r\nthree\r\n"),
+            ("nonl.txt", "no final newline"),
+            ("uni.txt", "héllo wörld ✓ 日本語\n🦀\n"),
+            ("mixed.txt", "a\r\nb\nc\r\n\n\n"),
+        ];
+        for (name, content) in cases {
+            put(&e, name, b"old content\n");
+            let r = e.call("read", json!({"path": name})).await;
+            assert!(!is_err(&r));
+            let r = e.call("write", json!({"path": name, "content": content})).await;
+            assert!(!is_err(&r), "{}", r.text);
+            assert_eq!(std::fs::read(ws(&e, name)).unwrap(), content.as_bytes(), "{name}");
+            // The written file is current, so reading and writing it back again is allowed and exact.
+            let r = e.call("read", json!({"path": name})).await;
+            assert!(!is_err(&r) && !r.text.contains('\r'), "{}", r.text);
+            let r = e.call("write", json!({"path": name, "content": content})).await;
+            assert!(!is_err(&r), "{}", r.text);
+            assert_eq!(std::fs::read(ws(&e, name)).unwrap(), content.as_bytes(), "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn read_reports_crlf_and_missing_final_newline_shown() {
+        let e = env();
+        put(&e, "c.txt", b"a\r\nb");
+        let r = e.call("read", json!({"path": "c.txt"})).await;
+        assert!(r.text.contains("1\ta\n2\tb") && r.text.contains("CRLF"), "{}", r.text);
+        assert_eq!(shown(&r), json!([[1, 2]]));
+    }
+
+    #[tokio::test]
+    async fn write_creates_and_refuses_unread_and_changed() {
+        let e = env();
+        let r = e.call("write", json!({"path": "new/dir/a.txt", "content": "hi\nthere\n"})).await;
+        assert!(
+            r.text.contains("created")
+                && r.text.contains("2 lines")
+                && r.text.contains("9 bytes")
+                && r.text.contains("(new file)"),
+            "{}",
+            r.text
+        );
+        assert_eq!(std::fs::read(ws(&e, "new/dir/a.txt")).unwrap(), b"hi\nthere\n");
+
+        put(&e, "b.txt", b"existing\n");
+        let r = e.call("write", json!({"path": "b.txt", "content": "x"})).await;
+        assert!(is_err(&r) && r.text.contains("has not been read") && r.text.contains("`read`"), "{}", r.text);
+        assert_eq!(std::fs::read(ws(&e, "b.txt")).unwrap(), b"existing\n");
+
+        e.call("read", json!({"path": "b.txt"})).await;
+        put(&e, "b.txt", b"changed elsewhere\n");
+        let r = e.call("write", json!({"path": "b.txt", "content": "x"})).await;
+        assert!(is_err(&r) && r.text.contains("9 → 18 bytes") && r.text.contains("Read it again"), "{}", r.text);
+        assert_eq!(std::fs::read(ws(&e, "b.txt")).unwrap(), b"changed elsewhere\n");
+
+        e.call("read", json!({"path": "b.txt"})).await;
+        let r = e.call("write", json!({"path": "b.txt", "content": "changed elsewhere\nplus\n"})).await;
+        assert!(r.text.contains("replaced"), "{}", r.text);
+        assert!(r.text.contains("+plus") && r.text.contains(" changed elsewhere"), "{}", r.text);
+    }
+
+    #[tokio::test]
+    async fn write_leaves_no_temp_file_and_keeps_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let e = env();
+        let p = put(&e, "run.sh", b"#!/bin/sh\n");
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        e.call("read", json!({"path": "run.sh"})).await;
+        let r = e.call("write", json!({"path": "run.sh", "content": "#!/bin/sh\necho hi\n"})).await;
+        assert!(!is_err(&r), "{}", r.text);
+        assert_eq!(std::fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o755);
+        let names: Vec<String> = std::fs::read_dir(&e.ctx.workspace)
+            .unwrap()
+            .flatten()
+            .map(|d| d.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["run.sh".to_string()]);
+    }
+
+    /// An environment whose policy protects `<dir>/outside`, a directory beside the workspace where no
+    /// write is allowed, and that directory.
+    fn env_with_outside(dir: &tempfile::TempDir) -> (TestEnv, PathBuf) {
+        let outside = dir.path().canonicalize().unwrap().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let protected_paths = vec![outside.display().to_string()];
+        (
+            env_with(
+                ToolsCfg::default(),
+                SandboxCfg { mode: SandboxMode::None, protected_paths, ..SandboxCfg::default() },
+            ),
+            outside,
+        )
+    }
+
+    /// An environment whose policy makes `<dir>/secret`, beside the workspace, unreadable, and that
+    /// directory, holding the file `name` with the content `PRIVATE`.
+    fn env_with_secret(dir: &tempfile::TempDir, name: &str) -> (TestEnv, PathBuf) {
+        let secret = dir.path().canonicalize().unwrap().join("secret");
+        std::fs::create_dir(&secret).unwrap();
+        std::fs::write(secret.join(name), "PRIVATE").unwrap();
+        let unreadable_paths = vec![secret.display().to_string()];
+        (
+            env_with(
+                ToolsCfg::default(),
+                SandboxCfg { mode: SandboxMode::None, unreadable_paths, ..SandboxCfg::default() },
+            ),
+            secret,
+        )
+    }
+
+    /// The names in the workspace, at any depth, that are temporary files of `write_atomic`.
+    fn temp_files(e: &TestEnv) -> Vec<PathBuf> {
+        let (mut found, mut dirs) = (Vec::new(), vec![e.ctx.workspace.clone()]);
+        while let Some(d) = dirs.pop() {
+            for entry in std::fs::read_dir(&d).unwrap().flatten() {
+                if entry.file_type().unwrap().is_dir() {
+                    dirs.push(entry.path());
+                } else if entry.file_name().to_string_lossy().contains(".ferret-") {
+                    found.push(entry.path());
+                }
+            }
+        }
+        found
+    }
+
+    #[tokio::test]
+    async fn a_file_name_that_is_a_link_is_written_through_only_where_writes_are_allowed() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let (e, outside) = env_with_outside(&dir);
+        put(&e, "real.txt", b"old\n");
+        symlink("real.txt", ws(&e, "link.txt")).unwrap();
+        symlink(outside.join("x.txt"), ws(&e, "out.txt")).unwrap();
+
+        // Through the tools: the check resolves the link, and the file it names is the one written.
+        e.call("read", json!({"path": "link.txt"})).await;
+        let r = e.call("write", json!({"path": "link.txt", "content": "new\n"})).await;
+        assert!(r.text.contains("replaced"), "{}", r.text);
+        assert_eq!(std::fs::read(ws(&e, "real.txt")).unwrap(), b"new\n");
+        assert!(std::fs::symlink_metadata(ws(&e, "link.txt")).unwrap().file_type().is_symlink());
+        let r = e.call("write", json!({"path": "out.txt", "content": "x"})).await;
+        assert_eq!(r.status, ToolStatus::Denied, "{}", r.text);
+
+        // A link the writer meets after the check (a relative one is taken from its own directory) is
+        // followed by the writer itself, and the directory of its target is the one judged.
+        write_atomic(&e.ctx.sandbox, &ws(&e, "link.txt"), b"again\n").unwrap();
+        assert_eq!(std::fs::read(ws(&e, "real.txt")).unwrap(), b"again\n");
+        assert!(std::fs::symlink_metadata(ws(&e, "link.txt")).unwrap().file_type().is_symlink());
+        let fail = write_atomic(&e.ctx.sandbox, &ws(&e, "out.txt"), b"x").unwrap_err();
+        let protected = format!("{} is protected", outside.join("x.txt").display());
+        assert!(matches!(&fail, WriteFail::Denied(why) if why.starts_with(&protected)), "{fail:?}");
+        symlink("b", ws(&e, "a")).unwrap();
+        symlink("a", ws(&e, "b")).unwrap();
+        let fail = write_atomic(&e.ctx.sandbox, &ws(&e, "a"), b"x").unwrap_err();
+        assert!(matches!(&fail, WriteFail::Refused(why) if why.contains("more than 8 symbolic links")), "{fail:?}");
+
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+        assert_eq!(temp_files(&e), Vec::<PathBuf>::new());
+    }
+
+    #[tokio::test]
+    async fn missing_directories_are_made_and_a_link_in_their_place_is_not_followed() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let (e, outside) = env_with_outside(&dir);
+        write_atomic(&e.ctx.sandbox, &ws(&e, "x/y/z/f.txt"), b"deep").unwrap();
+        assert_eq!(std::fs::read(ws(&e, "x/y/z/f.txt")).unwrap(), b"deep");
+
+        // A link where a directory of the path is missing or expected, whether it leads where writes
+        // are refused or to a directory that does not exist yet, is refused and makes nothing.
+        symlink(&outside, ws(&e, "l")).unwrap();
+        symlink(ws(&e, "notyet"), ws(&e, "m")).unwrap();
+        for (path, link) in [("l/new/f.txt", "l"), ("l/f.txt", "l"), ("m/f.txt", "m"), ("m/sub/f.txt", "m")] {
+            let fail = write_atomic(&e.ctx.sandbox, &ws(&e, path), b"x").unwrap_err();
+            let sentence =
+                format!("{} is a symbolic link where `write` and `edit` expect a directory", ws(&e, link).display());
+            assert!(matches!(&fail, WriteFail::Refused(why) if why.starts_with(&sentence)), "{path}: {fail:?}");
+        }
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+        assert!(!ws(&e, "notyet").exists());
+
+        // A directory made below an open one is opened from it without following a link, so a link put
+        // in its place after it was found missing is refused the same way.
+        let open = open_dir(&e.ctx.workspace).unwrap();
+        let fail = descend(&open, OsStr::new("l"), &ws(&e, "l")).unwrap_err();
+        let sentence =
+            format!("{} is a symbolic link where `write` and `edit` expect a directory", ws(&e, "l").display());
+        assert!(matches!(&fail, WriteFail::Refused(why) if why.starts_with(&sentence)), "{fail:?}");
+        put(&e, "plain", b"x");
+        assert!(matches!(descend(&open, OsStr::new("plain"), &ws(&e, "plain")), Err(WriteFail::Io(_))));
+        assert_eq!(temp_files(&e), Vec::<PathBuf>::new());
+    }
+
+    #[tokio::test]
+    async fn a_new_file_in_the_workspace_gets_the_default_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let e = env();
+        // What the process umask gives an ordinary file; the write tool must not change it.
+        let reference = put(&e, "reference.txt", b"x");
+        let want = std::fs::metadata(&reference).unwrap().permissions().mode() & 0o777;
+        if want & 0o044 == 0 {
+            // A precondition of the environment, not of the code: under a umask that already hides new files from
+            // group and others a private mode and the default cannot be told apart, so there is nothing to check.
+            eprintln!("skipped: the umask of this test process hides new files from group and others");
+            return;
+        }
+        let r = e.call("write", json!({"path": "fresh.txt", "content": "hello\n"})).await;
+        assert!(!is_err(&r), "{}", r.text);
+        assert_eq!(std::fs::metadata(ws(&e, "fresh.txt")).unwrap().permissions().mode() & 0o777, want);
+    }
+
+    #[tokio::test]
+    async fn write_to_a_directory_is_refused() {
+        let e = env();
+        std::fs::create_dir(ws(&e, "d")).unwrap();
+        let r = e.call("write", json!({"path": "d", "content": "x"})).await;
+        assert!(is_err(&r) && r.text.contains("directory"), "{}", r.text);
+    }
+
+    #[tokio::test]
+    async fn long_diff_is_stored_whole() {
+        let e = env();
+        put(&e, "big.txt", numbered_file(3000).as_bytes());
+        e.call("read", json!({"path": "big.txt", "start": 1, "end": 2})).await;
+        let new: String = (1..=3000).map(|i| format!("changed {i}\n")).collect();
+        let r = e.call("write", json!({"path": "big.txt", "content": new})).await;
+        assert!(r.output.is_some());
+        let stored = e.stored(&r);
+        assert!(stored.contains("-row 3000") && stored.contains("+changed 3000"));
+    }
+
+    #[tokio::test]
+    async fn edit_unique_all_and_ambiguous() {
+        let e = env();
+        put(&e, "c.txt", b"alpha\nbeta\nalpha\ngamma\n");
+        let r = e.call("edit", json!({"path": "c.txt", "old": "beta", "new": "BETA"})).await;
+        assert!(is_err(&r) && r.text.contains("not been read"), "{}", r.text);
+        e.call("read", json!({"path": "c.txt"})).await;
+
+        let r = e.call("edit", json!({"path": "c.txt", "old": "alpha", "new": "A"})).await;
+        assert!(
+            is_err(&r) && r.text.contains("2 times") && r.text.contains("lines 1, 3") && r.text.contains("`all`"),
+            "{}",
+            r.text
+        );
+        assert_eq!(std::fs::read(ws(&e, "c.txt")).unwrap(), b"alpha\nbeta\nalpha\ngamma\n");
+
+        let r = e.call("edit", json!({"path": "c.txt", "old": "beta", "new": "BETA"})).await;
+        assert!(
+            r.text.contains("edited")
+                && r.text.contains("1 replacement")
+                && r.text.contains("-beta")
+                && r.text.contains("+BETA"),
+            "{}",
+            r.text
+        );
+        assert_eq!(std::fs::read(ws(&e, "c.txt")).unwrap(), b"alpha\nBETA\nalpha\ngamma\n");
+
+        // The edit refreshed what the session has seen, so the next one needs no new read.
+        let r = e.call("edit", json!({"path": "c.txt", "old": "alpha", "new": "A", "all": true})).await;
+        assert!(r.text.contains("2 replacements"), "{}", r.text);
+        assert_eq!(std::fs::read(ws(&e, "c.txt")).unwrap(), b"A\nBETA\nA\ngamma\n");
+    }
+
+    #[tokio::test]
+    async fn edit_ambiguous_lists_ten_lines() {
+        let e = env();
+        put(&e, "m.txt", "x\n".repeat(12).as_bytes());
+        e.call("read", json!({"path": "m.txt"})).await;
+        let r = e.call("edit", json!({"path": "m.txt", "old": "x", "new": "y"})).await;
+        assert!(
+            r.text.contains("12 times") && r.text.contains("1, 2, 3, 4, 5, 6, 7, 8, 9, 10 (the first 10 of 12)"),
+            "{}",
+            r.text
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_argument_and_state_errors() {
+        let e = env();
+        let r = e.call("edit", json!({"path": "none.txt", "old": "a", "new": "b"})).await;
+        assert!(is_err(&r) && r.text.contains("does not exist"), "{}", r.text);
+        put(&e, "f.txt", b"abc\n");
+        e.call("read", json!({"path": "f.txt"})).await;
+        let r = e.call("edit", json!({"path": "f.txt", "old": "", "new": "b"})).await;
+        assert!(is_err(&r) && r.text.contains("empty"), "{}", r.text);
+        let r = e.call("edit", json!({"path": "f.txt", "old": "abc", "new": "abc"})).await;
+        assert!(is_err(&r) && r.text.contains("identical"), "{}", r.text);
+        put(&e, "f.txt", b"abcd\n");
+        let r = e.call("edit", json!({"path": "f.txt", "old": "abc", "new": "x"})).await;
+        assert!(is_err(&r) && r.text.contains("4 → 5 bytes"), "{}", r.text);
+        put(&e, "bad.bin", &[0xff, 0xfe, b'a', b'b']);
+        e.call("read", json!({"path": "bad.bin"})).await;
+        let r = e.call("edit", json!({"path": "bad.bin", "old": "ab", "new": "x"})).await;
+        assert!(is_err(&r) && r.text.contains("UTF-8"), "{}", r.text);
+    }
+
+    #[tokio::test]
+    async fn edit_no_match_whitespace_hint() {
+        let e = env();
+        put(&e, "w.py", b"def f():\n    if x:\n        return 1\n    return 2\n");
+        e.call("read", json!({"path": "w.py"})).await;
+        let r = e.call("edit", json!({"path": "w.py", "old": "if x:\n    return 1", "new": "    pass"})).await;
+        assert_eq!(r.status, ToolStatus::Ok, "{}", r.text);
+        assert!(r.text.contains("matched old with whitespace normalization"), "{}", r.text);
+        assert_eq!(std::fs::read(ws(&e, "w.py")).unwrap(), b"def f():\n    pass\n    return 2\n");
+    }
+
+    #[tokio::test]
+    async fn edit_no_match_first_line_hint_and_nothing_similar() {
+        let e = env();
+        put(&e, "g.txt", b"1\n2\n3\nfn main() {\n    run();\n}\n7\n8\n9\n");
+        e.call("read", json!({"path": "g.txt"})).await;
+        let r = e.call("edit", json!({"path": "g.txt", "old": "fn main() {\n    start();\n}", "new": "x"})).await;
+        assert!(is_err(&r) && r.text.contains("first line does occur, at line 4"), "{}", r.text);
+        assert!(r.text.contains("2\t2\n3\t3\n4\tfn main() {\n5\t    run();\n6\t}\n7\t7\n8\t8"), "{}", r.text);
+        assert!(!r.text.contains("9\t9"), "{}", r.text);
+        let r = e.call("edit", json!({"path": "g.txt", "old": "zebra", "new": "x"})).await;
+        assert!(is_err(&r) && r.text.contains("nothing similar") && r.text.contains("9 lines"), "{}", r.text);
+    }
+
+    #[tokio::test]
+    async fn edit_in_crlf_file_keeps_line_endings() {
+        let e = env();
+        put(&e, "w.txt", b"one\r\ntwo\r\nthree\r\n");
+        e.call("read", json!({"path": "w.txt"})).await;
+        let r = e.call("edit", json!({"path": "w.txt", "old": "one\ntwo", "new": "1\n2\n2b"})).await;
+        assert!(!is_err(&r), "{}", r.text);
+        assert_eq!(std::fs::read(ws(&e, "w.txt")).unwrap(), b"1\r\n2\r\n2b\r\nthree\r\n");
+    }
+
+    #[tokio::test]
+    async fn edit_without_trailing_newline_is_exact() {
+        let e = env();
+        put(&e, "n.txt", b"keep\nlast");
+        e.call("read", json!({"path": "n.txt"})).await;
+        let r = e.call("edit", json!({"path": "n.txt", "old": "last", "new": "end"})).await;
+        assert!(!is_err(&r), "{}", r.text);
+        assert_eq!(std::fs::read(ws(&e, "n.txt")).unwrap(), b"keep\nend");
+        assert!(r.text.contains("No newline at end of file"), "{}", r.text);
+    }
+
+    /// What a swap after the check leads to, made to happen every time: the work is handed a path in the
+    /// workspace (as the check returns it) that now leads through a link into a directory the policy
+    /// makes unreadable. Each tool refuses what it opened, or the directory it would write in, and
+    /// nothing there is returned, listed or changed.
+    #[tokio::test]
+    async fn a_path_that_leads_through_a_link_after_the_check_is_judged_where_it_leads() {
+        let dir = tempfile::tempdir().unwrap();
+        let (e, secret) = env_with_secret(&dir, "k.txt");
+        std::os::unix::fs::symlink(&secret, ws(&e, "d")).unwrap();
+        let key = ws(&e, "d/k.txt");
+        let refused = [
+            read_file(&e.ctx, "d/k.txt", &key, None, None, READ_LIMITS),
+            write_file(&e.ctx, "d/k.txt", &key, "x"),
+            edit_file(&e.ctx, "d/k.txt", &key, "PRIVATE", "x", false),
+        ];
+        for done in &refused {
+            assert!(done.out.status == ToolStatus::Denied && done.seen.is_none(), "{:?}", done.out);
+            let m = message(&done.out);
+            let refusal = format!("{} is not readable", secret.join("k.txt").display());
+            assert!(m.contains(&refusal) && !m.contains("PRIVATE"), "{m}");
+        }
+        // A new file is not made there: the directory is a link where the write expects a directory.
+        let made = write_file(&e.ctx, "d/new.txt", &ws(&e, "d/new.txt"), "x").out;
+        assert_eq!(made.status, ToolStatus::Error, "{made:?}");
+        let m = message(&made);
+        assert!(
+            m.starts_with("d/new.txt was not written, and nothing was changed: ") && m.contains("is a symbolic link"),
+            "{m}"
+        );
+        // A missing file's hint lists no names from there.
+        let missing = read_file(&e.ctx, "d/k.txx", &ws(&e, "d/k.txx"), None, None, READ_LIMITS).out;
+        let m = message(&missing);
+        assert!(m.contains("does not exist") && !m.contains("similar name"), "{m}");
+        assert_eq!(std::fs::read(secret.join("k.txt")).unwrap(), b"PRIVATE");
+        assert_eq!(std::fs::read_dir(&secret).unwrap().count(), 1);
+    }
+
+    /// macOS also names the folders of the data volume under `/System/Volumes/Data`. Resolving links
+    /// keeps that form, which the rules are not written in, but the system names an open file or
+    /// directory in the usual form, so each tool still refuses what the rules refuse.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_refused_path_named_through_the_data_volume_is_refused() {
+        let data = |p: &Path| format!("/System/Volumes/Data{}", p.display());
+        let dir = tempfile::tempdir().unwrap();
+        let (e, secret) = env_with_secret(&dir, "k.txt");
+        let key = data(&secret.join("k.txt"));
+        if !Path::new(&key).exists() {
+            return; // the temp directory is not on the data volume
+        }
+        // The alias is turned back into the usual path before the rules are applied, so each tool refuses by
+        // the rule that names the file, which is the usual path.
+        let plain = secret.join("k.txt").display().to_string();
+        for (tool, args) in [
+            ("read", json!({"path": key})),
+            ("write", json!({"path": key, "content": "x"})),
+            ("edit", json!({"path": key, "old": "PRIVATE", "new": "x"})),
+        ] {
+            let r = e.call(tool, args).await;
+            assert!(
+                r.status == ToolStatus::Denied
+                    && (r.text.contains(&format!("{plain} is not readable"))
+                        || r.text.contains(&format!("{plain} is not writable")))
+                    && !r.text.contains("PRIVATE"),
+                "{tool}: {}",
+                r.text
+            );
+        }
+        assert_eq!(std::fs::read(secret.join("k.txt")).unwrap(), b"PRIVATE");
+
+        let other = tempfile::tempdir().unwrap();
+        let (e, outside) = env_with_outside(&other);
+        let r = e.call("write", json!({"path": data(&outside.join("new.txt")), "content": "x"})).await;
+        let refusal = format!("{} is protected", outside.join("new.txt").display());
+        assert!(r.status == ToolStatus::Denied && r.text.contains(&refusal), "{}", r.text);
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+    }
+
+    /// A thread that turns the directory `dir` into the link `link` and back, over and over: each turn
+    /// renames the directory to `<dir>.real`, the link to `dir`, and both back, so `dir` names the
+    /// directory, nothing, the link, nothing and the directory again. Plain renames, because they are
+    /// fast: an atomic `RENAME_SWAP` of a directory and a link is slow on APFS, down to a few a second
+    /// while other tests sync files, too few for the calls to meet the race often. A directory that a
+    /// write makes at `dir` while it names nothing is moved aside to a new name first.
+    struct Flipper {
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        turns: std::sync::Arc<AtomicU64>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Flipper {
+        fn start(dir: PathBuf, link: PathBuf) -> Flipper {
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let turns = std::sync::Arc::new(AtomicU64::new(0));
+            let (stopped, turned) = (stop.clone(), turns.clone());
+            let thread = std::thread::spawn(move || {
+                let real = dir.with_extension("real");
+                let mut strays = 0u64;
+                let mut rename = |from: &Path, to: &Path| {
+                    let mut tries = 0;
+                    while let Err(e) = std::fs::rename(from, to) {
+                        tries += 1;
+                        assert!(tries < 1000, "{} cannot be renamed to {}: {e}", from.display(), to.display());
+                        strays += 1;
+                        let _ = std::fs::rename(to, to.with_extension(format!("stray{strays}")));
+                    }
+                };
+                while !stopped.load(Ordering::SeqCst) {
+                    rename(&dir, &real);
+                    rename(&link, &dir);
+                    rename(&dir, &link);
+                    rename(&real, &dir);
+                    turned.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+            Flipper { stop, turns, thread: Some(thread) }
+        }
+
+        /// How many times `dir` has been the link.
+        fn turns(&self) -> u64 {
+            self.turns.load(Ordering::SeqCst)
+        }
+
+        /// Stop at the end of the turn, so that `dir` is the directory again, and pass on a failure.
+        fn finish(mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(thread) = self.thread.take() {
+                thread.join().unwrap();
+            }
+        }
+    }
+
+    impl Drop for Flipper {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    /// How one call of a race went.
+    enum Raced {
+        Done,
+        Refused,
+        /// Neither, as when the path named nothing at that moment.
+        Other,
+    }
+
+    /// Flip `dir` and `link` (see `Flipper`) while `call` is made with 0, 1, 2, … and panics on what
+    /// the race must never give. It ends on counts, not on time, because renames and syncs slow down a
+    /// great deal while other tests run: once at least 200 calls have been made while `dir` became the
+    /// link at least 200 times, and at least one call succeeded and one was refused, so the calls met
+    /// both states. Not getting there within 30 seconds fails the test.
+    async fn race<F, Fut>(dir: PathBuf, link: PathBuf, mut call: F)
+    where
+        F: FnMut(u64) -> Fut,
+        Fut: std::future::Future<Output = Raced>,
+    {
+        let flipper = Flipper::start(dir, link);
+        let started = std::time::Instant::now();
+        let (mut calls, mut done, mut refused) = (0u64, 0u64, 0u64);
+        while calls < 200 || flipper.turns() < 200 || done == 0 || refused == 0 {
+            if started.elapsed() > std::time::Duration::from_secs(30) {
+                let turns = flipper.turns();
+                panic!("the race did not run within 30 s: {turns} turns, {calls} calls, {done} succeeded, {refused} refused");
+            }
+            match call(calls).await {
+                Raced::Done => done += 1,
+                Raced::Refused => refused += 1,
+                Raced::Other => {}
+            }
+            calls += 1;
+        }
+        flipper.finish();
+    }
+
+    /// A command of the session turns a directory of the workspace into a link to a directory the
+    /// policy makes unreadable and back, again and again, while the model reads a file under it. The
+    /// check of the path and the open of the file are separate steps; only the file actually opened is
+    /// judged, so no call ever returns the protected content. (Against the code that checked the path
+    /// and then opened it again by name, this loop returned the protected file in each of six runs, by
+    /// the 54th call at the latest, well before `race` lets it end.)
+    #[tokio::test]
+    async fn a_directory_swapped_for_a_link_during_a_read_reveals_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (e, secret) = env_with_secret(&dir, "id");
+        std::fs::create_dir(ws(&e, "d")).unwrap();
+        put(&e, "d/id", b"public");
+        std::os::unix::fs::symlink(&secret, ws(&e, "d.link")).unwrap();
+        let e = &e;
+        race(ws(e, "d"), ws(e, "d.link"), move |n| async move {
+            let r = e.call("read", json!({"path": "d/id"})).await;
+            assert!(!r.text.contains("PRIVATE"), "call {n} returned the content of the unreadable file: {}", r.text);
+            if r.text.contains("1\tpublic") {
+                Raced::Done
+            } else if r.status == ToolStatus::Denied {
+                Raced::Refused
+            } else {
+                Raced::Other
+            }
+        })
+        .await;
+    }
+
+    /// As above for `write`: the directory is turned into a link to a directory where the policy allows
+    /// no writes (a protected path: on macOS every temp directory lies under a writable root), while the
+    /// model writes files under it, some in directories that do not exist yet. Nothing ever appears in
+    /// that directory, and no temporary file is left behind. (Against the code that checked the path and
+    /// then wrote by name, an entry appeared there in each of six runs, by the 19th call at the latest.)
+    #[tokio::test]
+    async fn a_directory_swapped_for_a_link_during_a_write_gets_no_file_outside() {
+        let dir = tempfile::tempdir().unwrap();
+        let (e, outside) = env_with_outside(&dir);
+        std::fs::create_dir(ws(&e, "d")).unwrap();
+        std::os::unix::fs::symlink(&outside, ws(&e, "d.link")).unwrap();
+        let (e, out) = (&e, &outside);
+        race(ws(e, "d"), ws(e, "d.link"), move |n| async move {
+            let path = if n % 2 == 0 { "d/evil.plist".to_string() } else { format!("d/n{n}/evil.plist") };
+            let r = e.call("write", json!({"path": path, "content": format!("call {n}\n")})).await;
+            let made = std::fs::read_dir(out).unwrap().next().is_some();
+            assert!(!made, "call {n} made an entry in the protected directory: {}", r.text);
+            if r.status == ToolStatus::Ok {
+                Raced::Done
+            } else if r.status == ToolStatus::Denied || r.text.contains("is a symbolic link") {
+                Raced::Refused
+            } else {
+                Raced::Other
+            }
+        })
+        .await;
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+        assert_eq!(temp_files(e), Vec::<PathBuf>::new());
+    }
+
+    #[tokio::test]
+    async fn sandbox_denial_for_read_and_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().canonicalize().unwrap().join("secret");
+        std::fs::create_dir(&secret).unwrap();
+        std::fs::write(secret.join("k.txt"), "key").unwrap();
+        let cfg = SandboxCfg {
+            mode: SandboxMode::None,
+            unreadable_paths: vec![secret.display().to_string()],
+            protected_paths: vec![secret.display().to_string()],
+            ..SandboxCfg::default()
+        };
+        let e = env_with(ToolsCfg::default(), cfg);
+        let target = secret.join("k.txt").display().to_string();
+        let r = e.call("read", json!({"path": target})).await;
+        assert_eq!(r.status, ToolStatus::Denied);
+        assert_eq!(r.meta.get(META_PATH).and_then(Value::as_str), Some(target.as_str()));
+        let r = e.call("write", json!({"path": target, "content": "x"})).await;
+        assert_eq!(r.status, ToolStatus::Denied);
+        let r = e.call("edit", json!({"path": target, "old": "key", "new": "x"})).await;
+        assert_eq!(r.status, ToolStatus::Denied);
+        assert_eq!(std::fs::read(secret.join("k.txt")).unwrap(), b"key");
+    }
+
+    #[tokio::test]
+    async fn read_delegates_out_handle() {
+        let e = env();
+        let stored = e.ctx.blobs.put_bytes(b"alpha\nbeta\ngamma\ndelta\n").unwrap();
+        let h = stored.handle();
+        let r = e.call("read", json!({"path": h, "start": 2, "end": 3})).await;
+        assert_eq!(r.status, ToolStatus::Ok, "{}", r.text);
+        assert!(r.text.contains("2\tbeta"), "{}", r.text);
+        assert!(r.text.contains("3\tgamma"), "{}", r.text);
+        assert!(!r.text.contains("1\talpha"), "{}", r.text);
+        assert!(!r.text.contains("4\tdelta"), "{}", r.text);
+    }
+
+    #[tokio::test]
+    async fn edit_fuzzy_whitespace_collapsed_crlf_and_refusals() {
+        let e = env();
+        put(&e, "c.txt", b"fn main() {\r\n    let   x  =  1;\r\n}\r\n");
+        e.call("read", json!({"path": "c.txt"})).await;
+        let r = e.call("edit", json!({"path": "c.txt", "old": "let x = 1;", "new": "    let x = 2;"})).await;
+        assert_eq!(r.status, ToolStatus::Ok, "{}", r.text);
+        assert!(r.text.contains("matched old with whitespace normalization"), "{}", r.text);
+        assert_eq!(std::fs::read(ws(&e, "c.txt")).unwrap(), b"fn main() {\r\n    let x = 2;\r\n}\r\n");
+
+        // Ambiguous fuzzy match (>1) refuses even with all=true.
+        put(&e, "dup.py", b"def a():\n    x  =  1\ndef b():\n        x   =   1\n");
+        e.call("read", json!({"path": "dup.py"})).await;
+        let r = e.call("edit", json!({"path": "dup.py", "old": "x = 1", "new": "y = 2", "all": true})).await;
+        assert!(is_err(&r), "{}", r.text);
+        assert!(r.text.contains("occurs 2 times"), "{}", r.text);
+        assert_eq!(std::fs::read(ws(&e, "dup.py")).unwrap(), b"def a():\n    x  =  1\ndef b():\n        x   =   1\n");
+
+        // Zero fuzzy match still emits no-match error cleanly.
+        let r = e.call("edit", json!({"path": "dup.py", "old": "missing_fn():\n    z = 9", "new": "pass"})).await;
+        assert!(is_err(&r), "{}", r.text);
+        assert!(r.text.contains("`old` was not found in dup.py"), "{}", r.text);
+    }
+
+    #[tokio::test]
+    async fn edit_patch_unified_diff_and_shifted_hunks() {
+        let e = env();
+        put(&e, "u.rs", b"header\r\nalpha\r\nbeta\r\ngamma\r\ndelta\r\nepsilon\r\n");
+        e.call("read", json!({"path": "u.rs"})).await;
+        // Shifted @@ offset (line 10 instead of 2) plus second hunk adjusting later lines.
+        let patch = "\
+--- a/u.rs
++++ b/u.rs
+@@ -10,3 +10,4 @@
+ alpha
+-beta
++BETA
++beta_extra
+ gamma
+@@ -5,2 +6,2 @@
+ delta
+-epsilon
++EPSILON";
+        let r = e.call("edit", json!({"path": "u.rs", "patch": patch})).await;
+        assert_eq!(r.status, ToolStatus::Ok, "{}", r.text);
+        assert!(r.text.contains("2 hunks"), "{}", r.text);
+        assert_eq!(
+            std::fs::read(ws(&e, "u.rs")).unwrap(),
+            b"header\r\nalpha\r\nBETA\r\nbeta_extra\r\ngamma\r\ndelta\r\nEPSILON\r\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_patch_begin_patch_and_eof_anchor() {
+        let e = env();
+        put(&e, "b.txt", b"first\nmiddle\nlast\n");
+        e.call("read", json!({"path": "b.txt"})).await;
+        let patch = "\
+*** Begin Patch
+*** Update File: b.txt
+@@
+ first
+-middle
++CENTER
+@@
+ last
++tail
+*** End of File
+*** End Patch";
+        let r = e.call("edit", json!({"path": "b.txt", "patch": patch})).await;
+        assert_eq!(r.status, ToolStatus::Ok, "{}", r.text);
+        assert_eq!(std::fs::read(ws(&e, "b.txt")).unwrap(), b"first\nCENTER\nlast\ntail\n");
+    }
+
+    #[tokio::test]
+    async fn edit_patch_validation_and_error_preservation() {
+        let e = env();
+        put(&e, "v.txt", b"hello\nworld\n");
+        e.call("read", json!({"path": "v.txt"})).await;
+
+        let empty_old = e.call("edit", json!({"path": "v.txt", "old": "", "new": "x"})).await;
+        assert!(is_err(&empty_old) && empty_old.text.contains("`old` is empty"), "{}", empty_old.text);
+
+        let same = e.call("edit", json!({"path": "v.txt", "old": "hello", "new": "hello"})).await;
+        assert!(is_err(&same) && same.text.contains("`old` and `new` are identical"), "{}", same.text);
+
+        let both =
+            e.call("edit", json!({"path": "v.txt", "old": "hello", "new": "hi", "patch": "@@\n-hello\n+hi"})).await;
+        assert!(is_err(&both) && both.text.contains("not both"), "{}", both.text);
+
+        let neither = e.call("edit", json!({"path": "v.txt"})).await;
+        assert!(is_err(&neither) && neither.text.contains("`old` and `new`, or `patch`"), "{}", neither.text);
+
+        let no_match = e.call("edit", json!({"path": "v.txt", "patch": "@@\n-missing\n+found"})).await;
+        assert!(is_err(&no_match) && no_match.text.contains("could not be matched"), "{}", no_match.text);
+    }
+}

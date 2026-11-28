@@ -17,6 +17,7 @@ verify_finish = true
 verifier = "judge"
 tools = [
   "bash", "job_wait", "job_kill", "job_list", "read", "glob", "grep", "out_read", "out_grep", "web_fetch",
+  "box_exec", "box_get", "box_reset",
   "plan", "step", "note", "claim", "claim_update", "evidence", "ledger", "pin", "log_search", "reflect",
   "cve_lookup", "cve_search", "advisory_lookup", "dep_scan",
   "agent_spawn", "agent_fanout", "attempt", "agent_adopt", "agent_message", "agent_stop", "decide", "verify",
@@ -33,6 +34,7 @@ prompt = "roles/scout.md"
 termination = "explicit"
 tools = [
   "bash", "job_wait", "job_kill", "job_list", "read", "write", "edit", "glob", "grep", "out_read", "out_grep", "web_fetch",
+  "box_exec", "box_get", "box_reset",
   "note", "claim", "claim_update", "evidence", "ledger", "pin", "log_search", "reflect",
   "cve_lookup", "advisory_lookup", "dep_scan",
   "finish", "report_blocker", "wait", "hand_off",

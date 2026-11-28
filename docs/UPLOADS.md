@@ -1,29 +1,29 @@
 # File uploads
 
-Normative. The operator can attach files to a message (composer, new-mission form, `loom send --file`,
-`loom run --file`). The model sees them the way chat products present uploads: as files saved at a path it
+Normative. The operator can attach files to a message (composer, new-mission form, `ferret send --file`,
+`ferret run --file`). The model sees them the way chat products present uploads: as files saved at a path it
 can read, listed under the message, with small text files shown inline.
 
 ## Storage
 
 - `POST /api/uploads?workspace=<abs path>&name=<file name>`, raw body (any `Content-Type`), at most
   `UPLOAD_MAX_BYTES` (32 MiB, the Files viewer cap). The workspace must be an existing directory that is
-  not and is not inside the loom home (the session-creation rules and sentences). 201 with
+  not and is not inside the ferret home (the session-creation rules and sentences). 201 with
   `{ "path": <abs>, "name": <stored name>, "bytes": n, "mime": <sniffed or given> }`; 400 bad name or
   query, 404 workspace missing, 409 refused workspace, 413 too large.
-- Stored at `<workspace>/.loom/uploads/<name>`; the name is the given base name with `/`, `\`, NUL and
+- Stored at `<workspace>/.ferret/uploads/<name>`; the name is the given base name with `/`, `\`, NUL and
   control characters replaced by `_`, leading dots stripped, cut to 120 bytes; if it exists,
   `<stem>-2.<ext>`, `-3`, … The directory is made by the daemon (mode 0700 dirs, 0600 files).
-- `<workspace>/.loom` is never writable inside the sandbox and is readable except `oracle-secrets`, so
+- `<workspace>/.ferret` is never writable inside the sandbox and is readable except `oracle-secrets`, so
   every session in the workspace can read an upload and none can change it. Under Bubblewrap, where the
-  workspace `.loom` is hidden, `.loom/uploads` is bound read-only (test both sandboxes' rules).
-- The Files routes (`/api/sessions/{id}/files`, `/files/lines`) serve `.loom/uploads` and nothing else
-  under `.loom`.
+  workspace `.ferret` is hidden, `.ferret/uploads` is bound read-only (test both sandboxes' rules).
+- The Files routes (`/api/sessions/{id}/files`, `/files/lines`) serve `.ferret/uploads` and nothing else
+  under `.ferret`.
 
 ## The message
 
 `MessageBody` and `NewSession` gain `attachments: [<abs path>]` (serde default empty; text may then be
-empty). Each path must be a regular file directly in `<workspace>/.loom/uploads/` of the session's
+empty). Each path must be a regular file directly in `<workspace>/.ferret/uploads/` of the session's
 workspace (400 otherwise: "Attach files with POST /api/uploads first; {path} is not an upload of this
 workspace."). The runtime appends the attachment block to the text before recording the user message (the
 record holds exactly what the model reads):
@@ -32,8 +32,8 @@ record holds exactly what the model reads):
 <text>
 
 Attached files (saved read-only; read them with `read`):
-- /ws/.loom/uploads/report.csv (12.1 KiB, text/csv)
-- /ws/.loom/uploads/screen.png (226 KiB, image/png)
+- /ws/.ferret/uploads/report.csv (12.1 KiB, text/csv)
+- /ws/.ferret/uploads/screen.png (226 KiB, image/png)
 ```
 
 A UTF-8 text file of at most 16 KiB is also shown inline, after the list, as
@@ -55,4 +55,4 @@ attachments and no text. Draft attachments are kept with the draft (tab storage)
 
 ## CLI
 
-`loom send <id> [TEXT] --file PATH...` and `loom run ... --file PATH...` upload each file, then send.
+`ferret send <id> [TEXT] --file PATH...` and `ferret run ... --file PATH...` upload each file, then send.

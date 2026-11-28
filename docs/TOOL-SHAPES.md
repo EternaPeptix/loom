@@ -1,6 +1,6 @@
 # Tool shapes: what the model is shown and what it may send
 
-Normative. Models are not fine-tuned for loom. Where a loom tool does what a widely trained tool does, the
+Normative. Models are not fine-tuned for ferret. Where a ferret tool does what a widely trained tool does, the
 model is shown the trained shape, and a call in any well-known harness's shape is run, not refused. Only
 tools with no trained counterpart (the ledger, agents, inbox, stored outputs) keep shapes of their own.
 
@@ -8,7 +8,7 @@ tools with no trained counterpart (the ledger, agents, inbox, stored outputs) ke
 
 `dialect = "trained"` (default) presents the six file and shell tools with the argument names, units and
 defaults of Claude Code, which DeepSeek, Kimi, Qwen, GLM and MiniMax models are tuned against.
-`dialect = "loom"` presents loom's own names, as before, for comparison runs. Tool **names** stay loom's
+`dialect = "ferret"` presents ferret's own names, as before, for comparison runs. Tool **names** stay ferret's
 lowercase names in both (`read`, `bash`, …). The dialect is fixed for the life of a session (its tool list
 is part of the cached prefix).
 
@@ -36,7 +36,7 @@ is part of the cached prefix).
 
 ## 2. Accepted shapes (every dialect)
 
-Before the schema check, a call is brought into loom's internal shape (`crates/loom-tools/src/dialect.rs`). Keys that are presented, and loom's
+Before the schema check, a call is brought into ferret's internal shape (`crates/ferret-tools/src/dialect.rs`). Keys that are presented, and ferret's
 internal keys, are taken silently. Anything else that maps unambiguously is repaired, and the repair is
 said in the result header **in the presented names** (`argument \`old_str\` read as \`old_string\``), so the
 model learns the shape it was shown. Anything ambiguous is refused, as before; unknown arguments are
@@ -65,7 +65,7 @@ never silently dropped.
 | `attempt_completion`, `complete_task`, `task_complete` | `finish` | `result`, `message` → `answer` (also for `finish` itself) |
 | `think` | (none) | answered `ok` with "Noted." and no effect; it is a scratchpad in OpenHands and Claude tool use |
 
-A name that maps to a tool the role does not have is refused as today, naming the loom tool
+A name that maps to a tool the role does not have is refused as today, naming the ferret tool
 ("`Task` runs `agent_spawn`, which this role does not have").
 
 **`plan` with statuses.** Items may carry `status` in either vocabulary: `pending`/`todo`,
@@ -75,20 +75,20 @@ statuses; this is the TodoWrite pattern of resending the whole list. A call that
 new plan, with the given statuses.
 
 **`timeout` units.** `bash` `timeout` is milliseconds when it is 1000 or more. Below 1000 it is read as
-seconds (OpenHands and older loom traces send seconds), and the result says so. A timeout above the
+seconds (OpenHands and older ferret traces send seconds), and the result says so. A timeout above the
 maximum is clamped and said.
 
 ## 3. Records and the UI
 
 The `tool_call` record keeps the arguments exactly as sent; the `tool_result` header carries the repairs.
 The UI reads paths from `path`, `file_path`, `absolute_path` and `target_file`, shows `description` as the
-row label (the command stays visible beside it), and shows a mapped call under the loom tool it ran (the
+row label (the command stays visible beside it), and shows a mapped call under the ferret tool it ran (the
 `tool_result` record names it), with the name it was sent under in the row's tooltip ("Called as `Read`; ran
 `read`"). Search rows show their pattern and where, `web_fetch` its URL, job tools their job.
 
 ## 4. One tool per job (merges and hidden tools)
 
-A model is shown one tool for each thing it can do. Where two loom tools did the same job, one absorbs the
+A model is shown one tool for each thing it can do. Where two ferret tools did the same job, one absorbs the
 other; the absorbed tool is **hidden** (left out of the wire tool list through the role's `hidden_tools`)
 but still runs when called, so old transcripts, resumed sessions and models that remember the name keep
 working. Nothing is deleted. Usage over 21,272 recorded calls decided which name survives: the more trained or

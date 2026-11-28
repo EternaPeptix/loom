@@ -1,12 +1,12 @@
-# Contributing to loom
+# Contributing to ferret
 
-`docs/DESIGN.md` is the specification of what loom does and why. This file is about how to change the
+`docs/DESIGN.md` is the specification of what ferret does and why. This file is about how to change the
 code.
 
 ## Where things are
 
-Six crates under `crates/` (`loom-core`, `loom-model`, `loom-tools`, `loom-net`, `loom-agent`,
-`loom-daemon`), the web UI under `ui/` (plain JavaScript, no build step), the macOS menu-bar app under
+Six crates under `crates/` (`ferret-core`, `ferret-model`, `ferret-tools`, `ferret-net`, `ferret-agent`,
+`ferret-daemon`), the web UI under `ui/` (plain JavaScript, no build step), the macOS menu-bar app under
 `gui/`, role packs under `packs/`, and documents under `docs/`. `README.md` has the crate table.
 
 ## The module contract
@@ -34,7 +34,7 @@ the details. They must stay true of the code:
 - No `unwrap`, `expect`, `panic!`, `unreachable!`, indexing that can go out of bounds, or arithmetic
   that can overflow or underflow, outside tests. Text is cut on character boundaries only.
 - Errors that can reach the model are sentences that say what to do next. Text the model sees comes from
-  `crates/loom-agent/src/texts.rs` (or the module that owns the tool), not from ad-hoc strings.
+  `crates/ferret-agent/src/texts.rs` (or the module that owns the tool), not from ad-hoc strings.
 - Comments say what the code does or why; they do not narrate how it came to be.
 - Dependencies come from `[workspace.dependencies]` in the root `Cargo.toml`. A new one is added there
   and in the crate's manifest.
@@ -46,41 +46,41 @@ the details. They must stay true of the code:
 You need Rust 1.88 or newer. From the repository root:
 
 ```
-cargo build --release -p loom-daemon                  # the `loom` binary
+cargo build --release -p ferret-daemon                  # the `ferret` binary
 cargo test --workspace                                # everything
-cargo test -p loom-tools sandbox::                    # one crate, one module
+cargo test -p ferret-tools sandbox::                    # one crate, one module
 cargo clippy --workspace --all-targets -- -D warnings # must be clean
 node --test ui/core.test.js                           # the web UI's logic (Node.js 22.12 or newer)
-cargo run -p loom-agent --example eval                # scripted models against the mock server, scored
+cargo run -p ferret-agent --example eval                # scripted models against the mock server, scored
 ```
 
 When a change touches what the model reads (a prompt, a tool description, a refusal) or what the harness
-refuses, run the last one before and after: it prints what each scripted run took (`loom-agent::evalkit`).
+refuses, run the last one before and after: it prints what each scripted run took (`ferret-agent::evalkit`).
 Its tests pin those counts, so a change that moves one must say why.
 
-Tests live next to the code in `#[cfg(test)] mod tests` blocks; `crates/loom-model/examples/live.rs` is a
+Tests live next to the code in `#[cfg(test)] mod tests` blocks; `crates/ferret-model/examples/live.rs` is a
 manual check against a real server. Rules for tests:
 
 - A contract's "Tests required" list is the minimum.
-- Use `tempfile` for anything on disk. Tests never touch the network or the real `~/.loom`.
-- Model traffic goes to the scripted `MockServer` in `loom-model`, never a real server.
+- Use `tempfile` for anything on disk. Tests never touch the network or the real `~/.ferret`.
+- Model traffic goes to the scripted `MockServer` in `ferret-model`, never a real server.
 - Tests that execute `sandbox-exec` skip themselves when `/usr/bin/sandbox-exec` is missing.
 - A new behaviour gets a test that fails without it.
 
 `./x` is an optional wrapper that copies the tree to another machine and runs cargo there, for when you
 would rather not build on your own. It runs `cargo` with the arguments you give it, on the host named
-by `LOOM_BUILD_HOST` (set it to `local` to run cargo in place). Always set `LOOM_BUILD_HOST`: when it is
+by `FERRET_BUILD_HOST` (set it to `local` to run cargo in place). Always set `FERRET_BUILD_HOST`: when it is
 unset, `./x` does not stop but falls back to a host name written into the script, which is not a
-machine you have. `LOOM_LANE=<name>` gives your builds a separate source copy and target directory on
+machine you have. `FERRET_LANE=<name>` gives your builds a separate source copy and target directory on
 that host so parallel work does not wait on a lock:
 
 ```
-LOOM_BUILD_HOST=<host> LOOM_LANE=<lane> ./x test -p <crate> <module>::
-LOOM_BUILD_HOST=<host> LOOM_LANE=<lane> ./x clippy --workspace --all-targets -- -D warnings
+FERRET_BUILD_HOST=<host> FERRET_LANE=<lane> ./x test -p <crate> <module>::
+FERRET_BUILD_HOST=<host> FERRET_LANE=<lane> ./x clippy --workspace --all-targets -- -D warnings
 ```
 
 The lane name may contain letters, digits, `-` and `_` only. `gui/build.sh` builds the desktop app the
-same way; it requires `LOOM_BUILD_HOST` and stops with a message when it is unset.
+same way; it requires `FERRET_BUILD_HOST` and stops with a message when it is unset.
 
 ## Committing
 

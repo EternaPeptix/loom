@@ -1,14 +1,14 @@
 #!/bin/bash
 # x — run cargo for this repo on a build host, so the operator's machine stays idle.
 #
-#   LOOM_BUILD_HOST=<ssh host> ./x test -p loom-core   run cargo on that host, output here
-#   LOOM_BUILD_HOST=local ./x test -p loom-core        run cargo right here (plain `cargo` works too)
-#   LOOM_LANE=tools LOOM_BUILD_HOST=<host> ./x test -p loom-tools
+#   FERRET_BUILD_HOST=<ssh host> ./x test -p ferret-core   run cargo on that host, output here
+#   FERRET_BUILD_HOST=local ./x test -p ferret-core        run cargo right here (plain `cargo` works too)
+#   FERRET_LANE=tools FERRET_BUILD_HOST=<host> ./x test -p ferret-tools
 #                                                      private source copy + target dir (parallel work,
 #                                                      no lock waits)
-#   LOOM_BUILD_HOST=<host or local> ./x --pull-bin     build release and copy the `loom` binary to ./bin/loom
+#   FERRET_BUILD_HOST=<host or local> ./x --pull-bin     build release and copy the `ferret` binary to ./bin/ferret
 #
-# LOOM_BUILD_HOST has no default: set it to an ssh host name (key-based login, no prompts) or to "local".
+# FERRET_BUILD_HOST has no default: set it to an ssh host name (key-based login, no prompts) or to "local".
 # In local mode --pull-bin takes the binary from $CARGO_TARGET_DIR (default ./target).
 #
 # The tree this script sits in is pushed with rsync before every run, to a directory that belongs to
@@ -21,34 +21,34 @@
 # be installed in ./bin. Any other code is cargo's.
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
-HOST="${LOOM_BUILD_HOST:-}"
-LANE="${LOOM_LANE:-main}"
-REMOTE="loom-build"
+HOST="${FERRET_BUILD_HOST:-}"
+LANE="${FERRET_LANE:-main}"
+REMOTE="ferret-build"
 
 if [ -z "$HOST" ]; then
-    echo "x: LOOM_BUILD_HOST is not set. Set it to the ssh host that should build, or to \"local\" to run cargo on this machine (plain cargo also works)." >&2
+    echo "x: FERRET_BUILD_HOST is not set. Set it to the ssh host that should build, or to \"local\" to run cargo on this machine (plain cargo also works)." >&2
     exit 2
 fi
-case "$LANE" in *[!A-Za-z0-9_-]*|"") echo "x: LOOM_LANE must be [A-Za-z0-9_-]+" >&2; exit 2 ;; esac
+case "$LANE" in *[!A-Za-z0-9_-]*|"") echo "x: FERRET_LANE must be [A-Za-z0-9_-]+" >&2; exit 2 ;; esac
 
 # A binary copied across machines must be re-signed ad-hoc or Gatekeeper SIGKILLs it on launch.
 resign() {
     if command -v codesign >/dev/null; then codesign --force --sign - "$1" 2>/dev/null || true; fi
 }
 
-# Install a built binary as ./bin/loom. The arguments are a copy command; the destination it is given is
-# a file named `loom` in a fresh temporary directory inside ./bin. That copy is made executable and
-# re-signed there and then renamed over ./bin/loom, so a daemon running from the old file is never
+# Install a built binary as ./bin/ferret. The arguments are a copy command; the destination it is given is
+# a file named `ferret` in a fresh temporary directory inside ./bin. That copy is made executable and
+# re-signed there and then renamed over ./bin/ferret, so a daemon running from the old file is never
 # rewritten in place.
 install_bin() {
     local dir
     mkdir -p "$ROOT/bin" && dir="$(mktemp -d "$ROOT/bin/.install.XXXXXX")" || return 91
-    if "$@" "$dir/loom" && chmod 755 "$dir/loom" && resign "$dir/loom" && mv -f "$dir/loom" "$ROOT/bin/loom"; then
+    if "$@" "$dir/ferret" && chmod 755 "$dir/ferret" && resign "$dir/ferret" && mv -f "$dir/ferret" "$ROOT/bin/ferret"; then
         rmdir "$dir" 2>/dev/null
-        ls -la "$ROOT/bin/loom"
+        ls -la "$ROOT/bin/ferret"
         return 0
     fi
-    rm -f "$dir/loom"
+    rm -f "$dir/ferret"
     rmdir "$dir" 2>/dev/null
     return 91
 }
@@ -56,10 +56,10 @@ install_bin() {
 if [ "$HOST" = "local" ]; then
     cd "$ROOT" || exit 2
     if [ "${1:-}" = "--pull-bin" ]; then
-        cargo build --release -p loom-daemon || exit $?
-        built="${CARGO_TARGET_DIR:-$ROOT/target}/release/loom"
+        cargo build --release -p ferret-daemon || exit $?
+        built="${CARGO_TARGET_DIR:-$ROOT/target}/release/ferret"
         if ! install_bin cp "$built"; then
-            echo "x: could not copy $built to $ROOT/bin/loom. If cargo's target directory is configured elsewhere, set CARGO_TARGET_DIR to it and run again." >&2
+            echo "x: could not copy $built to $ROOT/bin/ferret. If cargo's target directory is configured elsewhere, set CARGO_TARGET_DIR to it and run again." >&2
             exit 91
         fi
         exit 0
@@ -97,7 +97,7 @@ pull_lock() {
 push
 rc=$?
 if [ "$rc" -eq 89 ]; then
-    echo "x: cannot reach $HOST over ssh (key-based login without prompts is required). Check the host name, the network and your ssh key, or set LOOM_BUILD_HOST=local." >&2
+    echo "x: cannot reach $HOST over ssh (key-based login without prompts is required). Check the host name, the network and your ssh key, or set FERRET_BUILD_HOST=local." >&2
     exit 89
 elif [ "$rc" -eq 88 ]; then
     echo "x: reached $HOST over ssh, but could not create ~/$REMOTE/src-$LANE there (remote exit $ssh_rc). Check the permissions of the home directory and the free disk space on $HOST." >&2
@@ -108,9 +108,9 @@ elif [ "$rc" -ne 0 ]; then
 fi
 
 if [ "${1:-}" = "--pull-bin" ]; then
-    remote "cargo build --release -p loom-daemon" || exit $?
-    if ! install_bin rsync -a "$HOST:$REMOTE/target-$LANE/release/loom"; then
-        echo "x: could not copy the release binary from $HOST to $ROOT/bin/loom. Check the free disk space here and run again." >&2
+    remote "cargo build --release -p ferret-daemon" || exit $?
+    if ! install_bin rsync -a "$HOST:$REMOTE/target-$LANE/release/ferret"; then
+        echo "x: could not copy the release binary from $HOST to $ROOT/bin/ferret. Check the free disk space here and run again." >&2
         exit 91
     fi
     pull_lock

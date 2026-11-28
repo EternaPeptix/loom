@@ -24,9 +24,9 @@ what a result did not cover, and drop advice the model does not need.
 
 ## Part K: compaction (replaces re-weave)
 
-Owns: `crates/loom-core/src/{event.rs, weave.rs, config.rs}`, `crates/loom-agent/src/{session.rs
+Owns: `crates/ferret-core/src/{event.rs, weave.rs, config.rs}`, `crates/ferret-agent/src/{session.rs
 (context management, step loop), runtime.rs (route), texts.rs (compaction texts)}`,
-`crates/loom-daemon/src/{api.rs, cli.rs, client.rs}` (compact route, records `before`), docs.
+`crates/ferret-daemon/src/{api.rs, cli.rs, client.rs}` (compact route, records `before`), docs.
 
 K1. Record. New `Event::Compaction(Compaction)`, additive (old logs load unchanged):
 
@@ -54,8 +54,8 @@ K2. When. Before each model request of a step:
   `Fold::Overflow` cases). Tail is empty (K3) and the note request uses the headers-only window (K4).
 - `stall`: the same step request has hit `stall_timeout_s` 3 times and its prompt is at least
   `compact_at / 2`: the size is the likely cause, so compact instead of retrying it again.
-- `operator`: `POST /api/sessions/{id}/compact` (`/reweave` stays as an alias), `loom compact <id>`
-  (`loom reweave` alias). Runs before the next request; on an idle session it compacts without
+- `operator`: `POST /api/sessions/{id}/compact` (`/reweave` stays as an alias), `ferret compact <id>`
+  (`ferret reweave` alias). Runs before the next request; on an idle session it compacts without
   starting a turn.
 - `fresh_start`: where a fresh start happens today (a `finish` its verifier did not accept, with
   `agents.fresh_start` on). Tail is empty; `objections` carries the verifier's objections.
@@ -91,10 +91,10 @@ compaction's table. Deterministic (same log, same table). Sections, each omitted
 ```
 Outputs — read one with read(path: "out:<key>"); search everything with log_search
 out:e134a0f0b4bf46c1 · bash · python3 public_sequence.py · exit 0 · 7 lines · step 412, 11-19 14:02
-out:cc8752638528652e · edit · crates/loom-agent/src/runtime.rs · edited · +3 −2 · step 418
+out:cc8752638528652e · edit · crates/ferret-agent/src/runtime.rs · edited · +3 −2 · step 418
 … 1,204 earlier outputs (steps 1–380) are not listed: search them with log_search.
 Files changed by edit/write (shell commands are not tracked)
-crates/loom-agent/src/runtime.rs · +3 −2 · 2 edits · last out:cc8752638528652e
+crates/ferret-agent/src/runtime.rs · +3 −2 · 2 edits · last out:cc8752638528652e
 Agents
 s-fl-web · Solver: web build hooks · web_solver · finished · report out:5a1c…
 Jobs still running
@@ -183,9 +183,9 @@ one step, and its first request after each compaction is below 40% of `compact_a
 
 ## Part H: hypotheses and the rule engine come out of the harness
 
-Owns: `crates/loom-core/src/security_state.rs`, `crates/loom-core/src/security_state/causal.rs`,
-`crates/loom-agent/src/rtools/security.rs`, `crates/loom-agent/src/rtools/security/shapes.rs`,
-`crates/loom-agent/src/{prior.rs, frontier.rs, hud.rs}` (their hypothesis and projection parts),
+Owns: `crates/ferret-core/src/security_state.rs`, `crates/ferret-core/src/security_state/causal.rs`,
+`crates/ferret-agent/src/rtools/security.rs`, `crates/ferret-agent/src/rtools/security/shapes.rs`,
+`crates/ferret-agent/src/{prior.rs, frontier.rs, hud.rs}` (their hypothesis and projection parts),
 packs' texts that mention them.
 
 H1. `security_record` no longer offers `hypothesis_open`, `hypothesis_priority`,
@@ -206,8 +206,8 @@ Each repair is said in the result, as other argument repairs are.
 
 ## Part N: say what a result did not cover
 
-Owns: `crates/loom-tools/src/{bash.rs (facts only), search.rs, fstools.rs (read facts), lib.rs
-(meta)}`, `crates/loom-agent/src/rtools/agents.rs` (report header), the verifier's request text.
+Owns: `crates/ferret-tools/src/{bash.rs (facts only), search.rs, fstools.rs (read facts), lib.rs
+(meta)}`, `crates/ferret-agent/src/rtools/agents.rs` (report header), the verifier's request text.
 
 N1. `bash`/`box_exec`: the proxy decisions in the session's `net.jsonl` stamped between the call's
 start and its result are counted; when any was denied, the fact `network: {k} connections denied
@@ -227,7 +227,7 @@ it.
 
 ## Part T: less steering, fewer tool mistakes
 
-Owns: `crates/loom-agent/src/{gate.rs, rtools/terminal.rs, rtools/agents.rs, texts.rs (nudge and
+Owns: `crates/ferret-agent/src/{gate.rs, rtools/terminal.rs, rtools/agents.rs, texts.rs (nudge and
 refusal texts), session.rs (nudge decisions only)}`, `packs/*/pack.toml`, `pack.rs` tests.
 
 T1. A harness message names only tools the role is shown: every `has(..)` that decides wording uses

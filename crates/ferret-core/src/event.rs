@@ -1,0 +1,1551 @@
+//! Schema 2 adds non-rendered active-budget interval and Exec-admission records; schema 1 logs remain readable.
+//! The normative event schema. A session log is a sequence of [`Record`]s, one JSON object per line.
+//!
+//! Field and variant names here are the wire format: the daemon serves records exactly as stored and
+//! the UI reads them directly. Add fields with `#[serde(default)]`; never rename or repurpose one.
+
+use crate::blob::BlobRef;
+use crate::ids::{CallId, MissionId, SessionId};
+use crate::image::ImageRef;
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+
+/// Position of a record in its session log, starting at 0.
+pub type Seq = u64;
+
+/// `ToolResult::meta` key: line ranges of a stored output that `text` put in front of the model, as
+/// `[[first, last], …]` (1-based, inclusive). Refers to `META_OF_BLOB` when present, else to `output`.
+pub const META_SHOWN: &str = "shown";
+/// `ToolResult::meta` key: full id of the stored output this result is a view of (`out_read`,
+/// `out_grep`). Absent when the result shows its own `output`.
+pub const META_OF_BLOB: &str = "of_blob";
+/// `ToolResult::meta` key: process exit code (integer).
+pub const META_EXIT_CODE: &str = "exit_code";
+/// `ToolResult::meta` key: signal number that ended the process.
+pub const META_SIGNAL: &str = "signal";
+/// `ToolResult::meta` key: absolute path of the file a `read`/`write`/`edit` touched.
+pub const META_PATH: &str = "path";
+/// `ToolResult::meta` key: full id of the raw bytes, when the stored text differs from them.
+pub const META_RAW_BLOB: &str = "raw_blob";
+/// `ToolResult::meta` key: full ids (an array of strings) of further outputs the call stored and names in
+/// its header, beside `output` and `META_RAW_BLOB` (dep-scan's further reports). They are outputs of the
+/// session's mission like the others (`ferret_tools::outputs`).
+pub const META_ALSO_STORED: &str = "also_stored";
+/// `ToolResult::meta` key: absolute directory a `bash` call left the session's shell in (see `ferret_tools::bash`).
+pub const META_CWD: &str = "cwd";
+/// `ToolResult::meta` key: id of the background job a call turned into or started.
+pub const META_JOB: &str = "job";
+/// Output was admitted for a stored action; coverage awaits an actual actor callback.
+pub const META_DEFERRED_OBSERVATION: &str = "deferred_observation";
+/// `ToolResult::meta` key: which check of the harness refused the call, for the refusals a
+/// scorecard counts by kind: [`REFUSAL_QUOTE`], [`REFUSAL_VERIFIER`], or [`REFUSAL_CEREMONY`].
+/// Absent on any other result.
+pub const META_REFUSAL: &str = "refusal";
+/// [`META_REFUSAL`]: a quote of a `finish` or an `evidence` did not check, so nothing was delivered or
+/// attached.
+pub const REFUSAL_QUOTE: &str = "quote";
+/// [`META_REFUSAL`]: the verifier of a lead's `finish` did not accept the result.
+pub const REFUSAL_VERIFIER: &str = "verifier";
+/// [`META_REFUSAL`]: a harness ceremony or shape check refused the call without running it.
+pub const REFUSAL_CEREMONY: &str = "ceremony";
+/// `ToolResult::meta` key: `true` when the harness repaired or normalized the call's arguments.
+pub const META_REPAIRED: &str = "repaired";
+/// `ToolResult::meta` key on a delivered `finish` (status `Ok`): `true` when an independent verifier
+/// accepted the result, `false` when it was delivered without one. Absent in logs written before the
+/// key existed.
+pub const META_VERIFIED: &str = "verified";
+/// `ToolResult::meta` key: how the result counts as evidence, set by the tool that produced it: the
+/// snake_case name of an [`EvidenceGrade`] (`run`, `analysis`, `read`, `reference`). Absent on most
+/// results; [`EvidenceGrade::of`] then grades by class. A tool sets it only to lower a grade.
+pub const META_EVIDENCE_GRADE: &str = "evidence_grade";
+
+/// What a quote from a tool's output can show, graded by the harness, never by the model. Only `Run` is
+/// execution evidence: every rule that asks for a run (concluding the goal, settling a verifier's
+/// objection, progress after a rejected finish) is met by a `Run` and by nothing else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceGrade {
+    /// Something was run and its behaviour observed: a command, a request, a debugger, an oracle.
+    Run,
+    /// A tool's analysis of something it did not run: a dependency scanner's verdicts, a decompilation,
+    /// cross-references. It describes the target; it does not show what the target does.
+    Analysis,
+    /// Something was read: a file, a page, a listing, a search.
+    Read,
+    /// Reference data about the world rather than the target: a CVE or advisory record, a page fetched
+    /// from a reference host.
+    Reference,
+}
+
+impl EvidenceGrade {
+    /// The wire name: `run`, `analysis`, `read` or `reference`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EvidenceGrade::Run => "run",
+            EvidenceGrade::Analysis => "analysis",
+            EvidenceGrade::Read => "read",
+            EvidenceGrade::Reference => "reference",
+        }
+    }
+
+    /// The grade named `word` exactly (one of the wire names); `None` otherwise.
+    pub fn parse(word: &str) -> Option<EvidenceGrade> {
+        match word {
+            "run" => Some(EvidenceGrade::Run),
+            "analysis" => Some(EvidenceGrade::Analysis),
+            "read" => Some(EvidenceGrade::Read),
+            "reference" => Some(EvidenceGrade::Reference),
+            _ => None,
+        }
+    }
+
+    /// The grade of a tool result of class `class` whose meta is `meta`.
+    /// - No [`META_EVIDENCE_GRADE`]: `Run` for class `Exec`, `Read` for every other class (what the
+    ///   harness did before the key existed, so a log written then grades as it did).
+    /// - A grade's name: that grade, except that `run` counts only on an `Exec` result; on any other class
+    ///   it is `Read`. The key can lower a grade and never raise one.
+    /// - Anything else (not a string, or not a grade's name): `Analysis` for an `Exec` result and `Read`
+    ///   otherwise, so an unreadable grade never makes a run.
+    pub fn of(class: ToolClass, meta: &Map<String, Value>) -> EvidenceGrade {
+        let exec = class == ToolClass::Exec;
+        let Some(value) = meta.get(META_EVIDENCE_GRADE) else {
+            return if exec { EvidenceGrade::Run } else { EvidenceGrade::Read };
+        };
+        match value.as_str().and_then(EvidenceGrade::parse) {
+            Some(EvidenceGrade::Run) if !exec => EvidenceGrade::Read,
+            Some(grade) => grade,
+            None if exec => EvidenceGrade::Analysis,
+            None => EvidenceGrade::Read,
+        }
+    }
+
+    /// The grade of a recorded result of the tool `name`: [`EvidenceGrade::of`], except that a result of one
+    /// of the tools that state their grade ([`GRADED_ANALYSIS_TOOLS`], [`GRADED_REFERENCE_TOOLS`]) which
+    /// carries no [`META_EVIDENCE_GRADE`] (a log written before they stated it) gets the grade they state
+    /// now, never `Run`. So an output stored before an upgrade cannot become a run by being cited after it.
+    pub fn of_tool_result(name: &str, class: ToolClass, meta: &Map<String, Value>) -> EvidenceGrade {
+        if !meta.contains_key(META_EVIDENCE_GRADE) {
+            if GRADED_ANALYSIS_TOOLS.contains(&name) {
+                return EvidenceGrade::Analysis;
+            }
+            if GRADED_REFERENCE_TOOLS.contains(&name) {
+                return EvidenceGrade::Reference;
+            }
+        }
+        EvidenceGrade::of(class, meta)
+    }
+}
+
+/// Tools whose every result states the grade `analysis` (see [`EvidenceGrade::of_tool_result`]).
+pub const GRADED_ANALYSIS_TOOLS: &[&str] = &["dep_scan", "bin_decompile", "bin_xrefs"];
+/// Tools whose every result states the grade `reference` (`web_fetch` states it only for some, so it is not
+/// here: an old `web_fetch` result grades by class, as `read`).
+pub const GRADED_REFERENCE_TOOLS: &[&str] = &["cve_lookup", "cve_search", "advisory_lookup"];
+
+/// Who produced an item. Never changed by projection, eviction or summarisation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Author {
+    /// The human operator.
+    User,
+    /// The model driving this session.
+    Model,
+    /// A tool, reporting what it observed.
+    Tool,
+    /// ferret itself.
+    Harness,
+    /// Another session (a child reporting to its parent, or a parent briefing a child).
+    Agent(SessionId),
+}
+
+/// One line of a session log.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Record {
+    pub seq: Seq,
+    pub ts_ms: u64,
+    pub author: Author,
+    /// SHA-256 (hex) of the previous line's bytes, without its newline; 64 zeros for `seq` 0.
+    pub prev: String,
+    #[serde(flatten)]
+    pub event: Event,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Event {
+    /// Always `seq` 0. Fixes everything that sits at the head of the prompt.
+    SessionStart(SessionStart),
+    /// First record after a copied parent prefix in a forked child. Overrides identity and contract.
+    Forked(Forked),
+    UserMessage {
+        text: String,
+        /// Images the operator attached, stored in the blob store. Skipped when empty.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ImageRef>,
+    },
+    /// Text from the harness that the model must see and that stays in the window.
+    HarnessNote {
+        note: NoteKind,
+        text: String,
+    },
+    TurnStart {
+        trigger: Trigger,
+    },
+    /// Active-budget interval transition. Paused during limiter queues, retries and idle turns.
+    /// Not rendered; old logs without these records retain their original wall-clock accounting.
+    BudgetClock {
+        running: bool,
+    },
+    /// Durable admission of an Exec attempt, before dispatch. Not rendered or inherited as own work.
+    ExecStarted {
+        call_id: CallId,
+    },
+    /// Bookkeeping for one model request. Not rendered.
+    ModelRequest(ModelRequest),
+    ModelResponse(ModelResponse),
+    /// A model-authored literal plan admitted by the opt-in guarded-plan prototype.
+    ContinuationPlanned {
+        plan_id: String,
+        source_call: CallId,
+        plan: Value,
+    },
+    /// A stored action substitutes for a model callback. This is not a model response.
+    StoredAction(StoredAction),
+    ContinuationStopped {
+        plan_id: String,
+        reason: String,
+    },
+    /// Deferred outputs included verbatim in a successfully completed actor request.
+    OutputsObserved {
+        req_id: String,
+        calls: Vec<CallId>,
+    },
+    /// Intent to run a tool. Appended and synced before the tool starts.
+    ToolCall(ToolCall),
+    ToolResult(ToolResult),
+    /// Superseded by [`Event::Compaction`]; no new one is written, old ones still render.
+    Reweave(Reweave),
+    /// The window was compacted: a note with a key table replaces what came before. See [`Compaction`].
+    Compaction(Compaction),
+    /// One captured HTTP request and its response (CONTRACTS-TRAFFIC-TARGETS C1).
+    Exchange(Exchange),
+    /// Keep this call's output verbatim through evictions until unpinned.
+    Pin {
+        call_id: CallId,
+        reason: String,
+    },
+    Unpin {
+        call_id: CallId,
+    },
+    ChildSpawned(ChildSpawned),
+    ChildSettled(ChildSettled),
+    /// A child's complete result, synced in its own log before it is marked ended or delivered.
+    /// Recovery treats this as a terminal outbox record; the parent acknowledges it with ChildSettled.
+    ChildCompleted(ChildCompleted),
+    JobRegistered {
+        job_id: String,
+        call_id: CallId,
+        command: String,
+    },
+    JobSettled {
+        job_id: String,
+        exit_code: Option<i32>,
+        output: Option<BlobRef>,
+        detail: String,
+    },
+    /// Lines of a background job's output matched the pattern its call asked to be told of
+    /// (`bash` with `wake_on`). The harness note that follows shows the lines. Not rendered.
+    JobMatched {
+        job_id: String,
+        /// The pattern as the call gave it.
+        pattern: String,
+        /// The part of the job's output this is about, stored. `None` only when storing failed.
+        output: Option<BlobRef>,
+        /// Byte offset of that part in the job's whole output.
+        from: u64,
+        /// Line numbers, in `output`, of the matching lines the note shows.
+        shown: Vec<u64>,
+        /// Lines of the part that match, in all.
+        matches: u64,
+    },
+    InboxOpened(InboxItem),
+    InboxResolved {
+        item_id: String,
+        answer: String,
+    },
+    /// A ledger op written by this session (the op itself lives in the mission journal).
+    Ledger {
+        n: u64,
+        summary: String,
+    },
+    Net(NetDecision),
+    /// The stable prefix changed without a re-weave. Always a defect worth looking at.
+    CacheBreak {
+        req_id: String,
+        first_diff_message: u32,
+        detail: String,
+    },
+    /// The session was cut off (daemon restart, damaged log, user stop mid-step).
+    Interrupted {
+        reason: String,
+    },
+    TurnEnd {
+        reason: TurnEndReason,
+    },
+    SessionEnd {
+        outcome: SessionOutcome,
+        detail: String,
+    },
+    /// The session's model changed while the daemon ran: the operator switched it, or its profile was
+    /// reloaded with new settings. Requests from here on go to `to`, and the weave replays reasoning as
+    /// `reasoning_replay` says. Never shown to the model: a different model is a cold cache by nature,
+    /// not something to reason about.
+    ModelSwitched(ModelSwitched),
+    /// A kind this build does not know. Preserved on disk, ignored by the weave.
+    #[serde(other)]
+    Unknown,
+}
+
+/// See [`Event::ModelSwitched`].
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ModelSwitched {
+    pub from: ModelRef,
+    pub to: ModelRef,
+    /// The reasoning replay of `to`'s profile, which the weave applies from here on.
+    #[serde(default)]
+    pub reasoning_replay: ReasoningReplay,
+    /// Why: `operator`, `profile reloaded`, or `changed while the session was idle`.
+    #[serde(default)]
+    pub reason: String,
+}
+
+/// What one MCP server offered when a mission started (docs/CONTRACTS-MCP.md M6). Recorded in the lead's
+/// `session_start` so every session of the mission, and a session opened from its log, presents the same
+/// tools for its whole life.
+/// One captured HTTP request and its response (CONTRACTS-TRAFFIC-TARGETS C1). The messages are whole HTTP/1.1
+/// messages (head and body) in the blob store, readable as outputs by their keys.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Exchange {
+    /// `ex-` and 12 base32 characters.
+    pub id: String,
+    /// The call it was made in: the tool's own call, or for proxy traffic the call running when it started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<CallId>,
+    /// `tool` (an in-process client: http_send, web_fetch, MCP over HTTP) or `proxy` (a command's traffic).
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    /// `http` or `https`.
+    pub scheme: String,
+    /// `plain`, `intercepted` or `tool`.
+    pub tls: String,
+    pub method: String,
+    pub host: String,
+    pub port: u16,
+    /// Path and query as sent.
+    pub target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub request: BlobRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response: Option<BlobRef>,
+    pub request_bytes: u64,
+    pub response_bytes: u64,
+    /// A body passed `capture_max_bytes` and was cut there (the byte counts are the true sizes).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
+    /// Intercepted HTTPS to a host listed in the target's `upstream_insecure`: its certificate was not checked.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub upstream_unverified: bool,
+    pub duration_ms: u64,
+}
+
+/// The named target a mission works on, as recorded at its start (CONTRACTS-TRAFFIC-TARGETS T2, T5).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TargetRef {
+    pub name: String,
+    pub scope: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub upstream_insecure: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub intercept_passthrough: Vec<String>,
+    /// The graph summary that went into the lead's system prompt (T5).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub summary: String,
+}
+
+/// The credential profile a mission attaches, as recorded at its start (CONTRACTS-TRAFFIC-TARGETS S3). Never a
+/// value: the profile name and the redaction-safe summary line (S10).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CredsRef {
+    pub profile: String,
+    pub summary: String,
+    /// Items left out because their host was outside the target scope at the start (S6).
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub dropped: usize,
+}
+
+fn is_zero_usize(n: &usize) -> bool {
+    *n == 0
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpListing {
+    /// The server's name in `[mcp.servers]`.
+    pub server: String,
+    /// `stdio` or `http`.
+    pub transport: String,
+    /// The protocol version the server answered (empty when it did not start).
+    #[serde(default)]
+    pub protocol: String,
+    #[serde(default)]
+    pub server_name: String,
+    #[serde(default)]
+    pub server_version: String,
+    #[serde(default)]
+    pub tools: Vec<McpToolDef>,
+    /// Why the server could not be started or listed; it then has no tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// One tool as an MCP server listed it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpToolDef {
+    /// The server's own name for it (not the `mcp__…` name the model sees).
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    /// The server's `inputSchema`, as listed.
+    #[serde(default)]
+    pub input_schema: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_only_hint: Option<bool>,
+}
+
+/// One project instruction file as it went into a session's system prompt.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectInstruction {
+    /// The file name, `AGENTS.md` or `CLAUDE.md`.
+    pub name: String,
+    /// Its text as the prompt has it (cut at the size limit, with the cut marker).
+    pub text: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SessionStart {
+    pub session: SessionId,
+    pub mission: MissionId,
+    #[serde(default)]
+    pub parent: Option<SessionId>,
+    /// Absolute path of the workspace directory.
+    pub workspace: String,
+    pub pack: String,
+    pub role: String,
+    pub termination: Termination,
+    pub model: ModelRef,
+    #[serde(default)]
+    pub reasoning_replay: ReasoningReplay,
+    /// The complete system message, fixed for the life of the session.
+    pub system_prompt: String,
+    /// The complete tool set, fixed for the life of the session.
+    pub tools: Vec<ToolSpec>,
+    #[serde(default)]
+    pub budget: Budget,
+    /// Resume after a daemon restart without waiting for the operator.
+    #[serde(default)]
+    pub unattended: bool,
+    #[serde(default)]
+    pub title: String,
+    /// The project instruction files (`AGENTS.md`, `CLAUDE.md`) read from the workspace root when the
+    /// session was created, as they went into `system_prompt` (cut, if long). Kept so the prompt is
+    /// never rebuilt from a file that has changed since, and so the UI can list the names.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub project_instructions: Vec<ProjectInstruction>,
+    /// The MCP servers' listings (CONTRACTS-MCP M6): set on a mission lead's start; empty for a child
+    /// (it takes its lead's) and when no server is configured.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp: Vec<McpListing>,
+    /// HTTPS through the proxy is decrypted and captured for this mission (CONTRACTS-TRAFFIC-TARGETS I1).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub intercept: bool,
+    /// The named target the mission works on, as it was at the start (T2, T5); a child takes its lead's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<TargetRef>,
+    /// The credential profile attached to the mission's in-scope requests (S3); a child takes its lead's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creds: Option<CredsRef>,
+    /// Log format version; absent in logs written before the field existed (version 1). A log with
+    /// a higher number is read-only for this build.
+    #[serde(default = "schema_v1")]
+    pub schema: u32,
+}
+
+/// The log schema version this build writes and supports.
+pub const SCHEMA: u32 = 2;
+
+fn schema_v1() -> u32 {
+    1
+}
+
+/// A fork: the child's log begins with a byte-for-byte copy of the parent's log up to and including
+/// `upto_seq`, then this record. The child therefore shares the parent's request prefix exactly.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Forked {
+    pub session: SessionId,
+    pub parent: SessionId,
+    pub upto_seq: Seq,
+    pub role: String,
+    pub termination: Termination,
+    #[serde(default)]
+    pub budget: Budget,
+    pub brief: Brief,
+    /// The child role's contract text, rendered with the brief as the child's assignment.
+    #[serde(default)]
+    pub contract: String,
+    /// Tool names the child role may call. The tool list sent to the model stays the parent's (the
+    /// request head must not change); calls outside this list are refused at call time.
+    #[serde(default)]
+    pub allowed_tools: Option<Vec<String>>,
+    #[serde(default)]
+    pub title: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ModelRef {
+    /// Name of the profile in the config.
+    pub profile: String,
+    pub model: String,
+    pub context_window: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningReplay {
+    /// Reasoning is sent back with the response it belongs to and stays in place (append-only), until
+    /// a re-weave drops it. The default: the target chat template keeps replayed reasoning where it
+    /// was and renders an empty reasoning block when it is missing.
+    #[default]
+    All,
+    /// Reasoning is never sent back.
+    None,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Termination {
+    /// A reply without tool calls ends the turn (interactive chat).
+    Free,
+    /// The session ends work only through a terminating tool; anything else goes through the stop gate.
+    Explicit,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Budget {
+    #[serde(default)]
+    pub max_steps: Option<u32>,
+    #[serde(default)]
+    pub max_minutes: Option<u32>,
+}
+
+/// What a tool does, used for scheduling, eviction order and evidence rules.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolClass {
+    /// Finding things: listings, searches. First to be evicted.
+    Nav,
+    /// Reading content: files, pages, stored output.
+    Read,
+    /// Running something and observing it.
+    Exec,
+    /// Changing files.
+    Write,
+    /// Ledger and agent management.
+    State,
+    /// Ends or parks the session's work.
+    Terminal,
+}
+
+impl ToolClass {
+    /// Safe to run concurrently with other calls of the same response.
+    pub fn is_read_only(self) -> bool {
+        matches!(self, ToolClass::Nav | ToolClass::Read)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ToolSpec {
+    pub name: String,
+    pub description: String,
+    /// JSON Schema for the arguments object.
+    pub parameters: Value,
+    pub class: ToolClass,
+}
+
+impl ToolSpec {
+    /// The OpenAI `tools[]` entry.
+    pub fn to_openai(&self) -> Value {
+        serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": self.parameters,
+            }
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoteKind {
+    /// The stop gate listing what is still open.
+    Nudge,
+    /// The model's output hit the output limit.
+    OutputCut,
+    /// Something was interrupted and its outcome is unknown.
+    Interrupted,
+    /// A user approval, verbatim, with its scope. Never evicted.
+    Approval,
+    /// A standing user constraint, verbatim. Never evicted.
+    Constraint,
+    /// A budget was reached or is about to be.
+    Budget,
+    /// Result of the finish gate or a verifier.
+    Verdict,
+    /// A background job or inbox answer arrived.
+    Arrival,
+    /// A task handed to this session by its parent (role contract and brief). Never evicted.
+    Assignment,
+    /// The session has gone a while without recorded progress.
+    Stall,
+    Info,
+}
+
+impl NoteKind {
+    /// Notes that survive every re-weave.
+    pub fn is_protected(self) -> bool {
+        matches!(self, NoteKind::Approval | NoteKind::Constraint | NoteKind::Assignment)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NoteKind::Nudge => "nudge",
+            NoteKind::OutputCut => "output_cut",
+            NoteKind::Interrupted => "interrupted",
+            NoteKind::Approval => "approval",
+            NoteKind::Constraint => "constraint",
+            NoteKind::Budget => "budget",
+            NoteKind::Verdict => "verdict",
+            NoteKind::Arrival => "arrival",
+            NoteKind::Assignment => "assignment",
+            NoteKind::Stall => "stall",
+            NoteKind::Info => "info",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Trigger {
+    Start,
+    User,
+    ChildSettled,
+    JobSettled,
+    /// A watched background job wrote a line matching its pattern (`job_matched`).
+    JobOutput,
+    InboxAnswer,
+    Resume,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Purpose {
+    /// An ordinary agent step.
+    Step,
+    /// A digest request made on the existing prefix before a re-weave.
+    Digest,
+    /// The note request of a compaction.
+    Compact,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ModelRequest {
+    pub req_id: String,
+    /// 1-based step number within the session.
+    pub step: u32,
+    pub epoch: u32,
+    pub purpose: Purpose,
+    /// Number of stable messages sent (the HUD is not counted).
+    pub n_messages: u32,
+    /// SHA-256 over the stable messages' canonical JSON, in order.
+    pub stable_hash: String,
+    /// The ephemeral HUD text sent with this request, stored for inspection.
+    #[serde(default)]
+    pub hud: Option<BlobRef>,
+    pub est_tokens: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ModelResponse {
+    pub req_id: String,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub reasoning: String,
+    #[serde(default)]
+    pub tool_calls: Vec<ToolCallRequest>,
+    pub finish: FinishReason,
+    #[serde(default)]
+    pub usage: Usage,
+    #[serde(default)]
+    pub timing: Timing,
+    /// How many attempts the request took (1 = no retry).
+    #[serde(default)]
+    pub attempts: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StoredAction {
+    pub plan_id: String,
+    pub source_call: CallId,
+    pub node: u32,
+    pub omitted_callback: String,
+    pub call: ToolCallRequest,
+    pub arguments_hash: String,
+    pub predecessor: Option<CallId>,
+    /// Resolved input paths and their observed hashes; no file contents are disclosed here.
+    pub file_guards: Value,
+    pub guard_ms: u64,
+}
+
+/// A tool call as the model wrote it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCallRequest {
+    pub call_id: CallId,
+    pub name: String,
+    /// The arguments exactly as produced (may be invalid JSON).
+    pub arguments: String,
+    /// False when the output limit cut the call short. Incomplete calls are never run or rendered.
+    #[serde(default = "yes")]
+    pub complete: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FinishReason {
+    Stop,
+    ToolCalls,
+    /// The output limit was reached.
+    Length,
+    /// The request was cancelled.
+    Aborted,
+    /// The request failed after retries; `text` holds the error.
+    Error,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Usage {
+    #[serde(default)]
+    pub prompt_tokens: u64,
+    #[serde(default)]
+    pub cached_tokens: u64,
+    #[serde(default)]
+    pub completion_tokens: u64,
+    #[serde(default)]
+    pub reasoning_tokens: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Timing {
+    /// Waiting for a scheduler slot.
+    #[serde(default)]
+    pub queue_ms: u64,
+    /// Request sent to first streamed token.
+    #[serde(default)]
+    pub ttft_ms: u64,
+    /// Request sent to end of stream.
+    #[serde(default)]
+    pub total_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ToolCall {
+    pub call_id: CallId,
+    pub req_id: String,
+    pub name: String,
+    /// Parsed arguments (`null` when the model's JSON was invalid).
+    pub args: Value,
+    pub class: ToolClass,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolStatus {
+    Ok,
+    /// The tool ran and reported failure (non-zero exit, file not found, …).
+    Error,
+    /// Arguments failed validation or the tool does not exist; nothing ran.
+    Invalid,
+    /// Refused by policy (sandbox, scope, approval).
+    Denied,
+    Timeout,
+    /// Cut off; effects unknown.
+    Interrupted,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ToolResult {
+    pub call_id: CallId,
+    pub name: String,
+    pub status: ToolStatus,
+    /// Exactly what the model sees for this result.
+    pub text: String,
+    /// The complete output, when it was stored (always, for anything a tool produced).
+    #[serde(default)]
+    pub output: Option<BlobRef>,
+    /// True when `text` is a cut of `output`.
+    #[serde(default)]
+    pub cut: bool,
+    pub class: ToolClass,
+    /// Tool-specific facts. Well-known keys are the `META_*` constants in this module.
+    #[serde(default)]
+    pub meta: Map<String, Value>,
+    #[serde(default)]
+    pub duration_ms: u64,
+    /// Images the result carries (`read` of an image file). Skipped when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImageRef>,
+    /// The exchanges the tool made itself (`http_send`, `web_fetch`, MCP over HTTP): the session records one
+    /// `exchange` right after this result. Never serialized here: each is its own record.
+    #[serde(skip)]
+    pub exchanges: Vec<Exchange>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Reweave {
+    /// The epoch this re-weave starts (first re-weave is 1).
+    pub epoch: u32,
+    /// Evictions apply to records at or before this seq; the brief is rendered right after it.
+    pub upto_seq: Seq,
+    /// New evictions made by this re-weave. Earlier re-weaves' evictions still apply.
+    pub evictions: Vec<Eviction>,
+    /// Harness note rendered after the evicted span: ledger snapshot and how to resume.
+    pub brief: String,
+    /// Model-written leads about evicted narration, rendered inside the brief, marked as unverified.
+    #[serde(default)]
+    pub digest: Option<String>,
+    pub reason: String,
+    pub before_tokens: u64,
+    pub after_tokens_est: u64,
+}
+
+/// A compaction of the window (CONTRACTS-COMPACTION Part K). Records at or before `upto_seq` leave the
+/// window; nothing is deleted from the log. The weave renders the compaction item, then the records after
+/// `upto_seq`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Compaction {
+    /// Previous epoch + 1 (re-weaves count as epochs).
+    pub epoch: u32,
+    /// Records at or before this seq leave the window.
+    pub upto_seq: Seq,
+    /// `size`, `refused`, `stall`, `operator`, `fresh_start` or `settlement_fold`.
+    pub reason: String,
+    /// The request size that triggered it (measured, else estimated).
+    pub before_tokens: u64,
+    /// Estimate of the first request after it.
+    pub after_tokens_est: u64,
+    /// The model's note; `None` when the note request failed.
+    #[serde(default)]
+    pub note: Option<String>,
+    #[serde(default)]
+    pub note_req: Option<String>,
+    /// The key table, rendered by the harness.
+    pub table: String,
+    /// Every key listed in `table`, in order.
+    #[serde(default)]
+    pub keys: Vec<String>,
+    /// Keys the note cited that do not exist; removed from it.
+    #[serde(default)]
+    pub dropped_keys: Vec<String>,
+    /// `fresh_start`: what the verifier objected to.
+    #[serde(default)]
+    pub objections: Option<String>,
+    /// The ledger brief (and frontier) at the time, as the session rendered it. Not in the contract's field
+    /// list: the weave is a pure function of the log and cannot reach the ledger.
+    #[serde(default)]
+    pub brief: String,
+    /// The size the session compacts at, which bounds the operator messages and pins the item carries.
+    /// `0` (an old or hand-written record) reads as 400 000.
+    #[serde(default)]
+    pub compact_at: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Eviction {
+    pub seq: Seq,
+    pub action: EvictAction,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvictAction {
+    /// Replace the rendered content with this text (tool results, agent reports).
+    Stub { text: String },
+    /// Remove the content. For a model response this removes text and reasoning but keeps tool calls.
+    Drop,
+    /// For a model response: stop replaying its reasoning; text and tool calls stay.
+    DropReasoning,
+    /// For a tool result: take the call and its result out of the window together, so the response that
+    /// made the call no longer lists it. Unlike `Drop`, nothing of the call's arguments stays in view.
+    Remove,
+}
+
+/// A typed task hand-off. Rendered for the child by the harness, never by the parent's prose.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Brief {
+    /// One sentence: what must be answered.
+    pub question: String,
+    #[serde(default)]
+    pub hypothesis: Option<String>,
+    /// Files, symbols, systems the child may touch, and why they matter.
+    #[serde(default)]
+    pub scope: Option<String>,
+    /// Neighbouring work that belongs to someone else.
+    #[serde(default)]
+    pub do_not: Option<String>,
+    /// What the result must contain.
+    #[serde(default, rename = "return")]
+    pub returns: Option<String>,
+    #[serde(default)]
+    pub stop_when: Option<String>,
+    /// Anything else the child needs that is not in its starting context.
+    #[serde(default)]
+    pub context: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpawnMode {
+    /// Starts from the role prompt and the brief.
+    Fresh,
+    /// Starts from the parent's exact prefix plus the brief.
+    Fork,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ChildSpawned {
+    pub child: SessionId,
+    pub role: String,
+    pub mode: SpawnMode,
+    pub brief: Brief,
+    #[serde(default)]
+    pub budget: Budget,
+    /// The tool call that asked for it, when the model did.
+    #[serde(default)]
+    pub call_id: Option<CallId>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildOutcome {
+    /// Returned a result that met its contract.
+    Returned,
+    /// Returned an objective blocker.
+    Blocked,
+    BudgetExhausted,
+    Stopped,
+    Failed,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ChildSettled {
+    pub child: SessionId,
+    pub outcome: ChildOutcome,
+    /// The framed, capped report as the parent sees it.
+    pub report: String,
+    /// The complete report.
+    #[serde(default)]
+    pub full: Option<BlobRef>,
+    #[serde(default)]
+    pub usage: Usage,
+    #[serde(default)]
+    pub steps: u32,
+    /// The report was returned as the result of the tool call that was waiting for the child. The
+    /// record is kept for the session's history; the weave does not render it (the report is
+    /// already in view as that call's result).
+    #[serde(default)]
+    pub inline: bool,
+}
+
+/// Durable child outbox payload. Kept separate from the parent-facing receipt so recovery retains
+/// machine-readable verdicts, evidence and accounting even if delivery never happened.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ChildCompleted {
+    pub child: SessionId,
+    pub role: String,
+    pub outcome: ChildOutcome,
+    pub report: String,
+    pub full: Option<BlobRef>,
+    pub payload: Value,
+    pub steps: u32,
+    pub usage: Usage,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InboxKind {
+    Approval,
+    Question,
+    Blocker,
+    /// The stop gate gave up nudging.
+    Parked,
+    /// The mission finished and passed its gate.
+    Finished,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct InboxItem {
+    pub item_id: String,
+    /// On the wire this is `item_kind`: a record is flat and `kind` is the record's own tag.
+    #[serde(rename = "item_kind")]
+    pub kind: InboxKind,
+    pub text: String,
+    #[serde(default)]
+    pub options: Vec<String>,
+    /// The session cannot continue until this is answered.
+    #[serde(default)]
+    pub blocking: bool,
+    #[serde(default)]
+    pub call_id: Option<CallId>,
+    /// The ledger question (`q3`) this item belongs to; answering the item answers the question.
+    #[serde(default)]
+    pub reference: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetDecision {
+    pub host: String,
+    pub port: u16,
+    /// `CONNECT` or the HTTP method of a plain request.
+    pub method: String,
+    pub allowed: bool,
+    /// The rule that decided it, e.g. `allow *.example.test`, `deny private-address`, `default deny`.
+    pub rule: String,
+    #[serde(default)]
+    pub resolved: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnEndReason {
+    /// Replied without tool calls in a `free` session.
+    Yielded,
+    Finished,
+    Asked,
+    Blocked,
+    /// Waiting for jobs or children.
+    Waiting,
+    Stopped,
+    /// The stop gate parked it for the operator.
+    Parked,
+    BudgetExhausted,
+    Error,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionOutcome {
+    Done,
+    Stopped,
+    Failed,
+    BudgetExhausted,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ids::BlobId;
+    use serde_json::json;
+
+    fn record(event: Event) -> Record {
+        Record { seq: 3, ts_ms: 1, author: Author::Harness, prev: "0".repeat(64), event }
+    }
+
+    fn image() -> ImageRef {
+        ImageRef {
+            blob: "cd".repeat(32),
+            mime: "image/png".into(),
+            bytes: 9,
+            width: 4,
+            height: 3,
+            name: Some("a.png".into()),
+        }
+    }
+
+    #[test]
+    fn images_ride_a_user_message_and_a_tool_result_and_empty_ones_leave_no_trace() {
+        let plain = serde_json::to_string(&record(Event::UserMessage { text: "hi".into(), images: vec![] })).unwrap();
+        assert!(!plain.contains("images"), "{plain}");
+        // A line written before images existed reads, with none.
+        let back: Record = serde_json::from_str(&plain).unwrap();
+        assert_eq!(back.event, Event::UserMessage { text: "hi".into(), images: vec![] });
+        assert_eq!(serde_json::to_string(&back).unwrap(), plain, "old lines re-serialise byte for byte");
+
+        let r = record(Event::UserMessage { text: "hi".into(), images: vec![image()] });
+        let v: Value = serde_json::to_value(&r).unwrap();
+        assert_eq!(
+            v["images"],
+            json!([{"blob":"cd".repeat(32),"mime":"image/png","bytes":9,"width":4,"height":3,"name":"a.png"}])
+        );
+        assert_eq!(serde_json::from_value::<Record>(v).unwrap(), r);
+
+        let t = ToolResult {
+            exchanges: Vec::new(),
+            call_id: CallId::from("c1"),
+            name: "read".into(),
+            status: ToolStatus::Ok,
+            text: "x".into(),
+            output: None,
+            cut: false,
+            class: ToolClass::Read,
+            meta: Default::default(),
+            duration_ms: 1,
+            images: vec![image()],
+        };
+        let r = record(Event::ToolResult(t.clone()));
+        let s = serde_json::to_string(&r).unwrap();
+        assert_eq!(serde_json::from_str::<Record>(&s).unwrap(), r);
+        let none = serde_json::to_string(&record(Event::ToolResult(ToolResult { images: vec![], ..t }))).unwrap();
+        assert!(!none.contains("images"), "{none}");
+    }
+
+    #[test]
+    fn record_is_flat_and_tagged() {
+        let r = record(Event::UserMessage { text: "hi".into(), images: vec![] });
+        let v: Value = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["kind"], "user_message");
+        assert_eq!(v["text"], "hi");
+        assert_eq!(v["seq"], 3);
+        assert_eq!(v["author"], "harness");
+        let back: Record = serde_json::from_value(v).unwrap();
+        assert_eq!(back, r);
+    }
+
+    #[test]
+    fn agent_author_round_trips() {
+        let mut r = record(Event::TurnStart { trigger: Trigger::User });
+        r.author = Author::Agent(SessionId::from("s-abc"));
+        let s = serde_json::to_string(&r).unwrap();
+        assert!(s.contains("\"author\":{\"agent\":\"s-abc\"}"));
+        assert_eq!(serde_json::from_str::<Record>(&s).unwrap(), r);
+    }
+
+    #[test]
+    fn unknown_kind_is_tolerated() {
+        let line = format!(
+            "{{\"seq\":9,\"ts_ms\":1,\"author\":\"harness\",\"prev\":\"{}\",\"kind\":\"from_the_future\",\"x\":1}}",
+            "0".repeat(64)
+        );
+        let r: Record = serde_json::from_str(&line).unwrap();
+        assert_eq!(r.event, Event::Unknown);
+        assert_eq!(r.seq, 9);
+    }
+
+    /// One record of every kind. A record is flat, so a field of an event that shares a name with a
+    /// field of the record (or with the `kind` tag) would silently produce a line that cannot be read
+    /// back; this is the guard against that.
+    fn one_of_each() -> Vec<(&'static str, Event)> {
+        let s = || SessionId::from("s-a");
+        let c = || CallId::from("c1");
+        let blob = || BlobRef { id: BlobId::from("ab".repeat(32)), bytes: 10, lines: 2 };
+        let brief = || Brief { question: "q".into(), returns: Some("r".into()), ..Default::default() };
+        let budget = || Budget { max_steps: Some(5), max_minutes: Some(9) };
+        vec![
+            (
+                "session_start",
+                Event::SessionStart(SessionStart {
+                    session: s(),
+                    mission: MissionId::from("m-a"),
+                    parent: Some(SessionId::from("s-p")),
+                    workspace: "/w".into(),
+                    pack: "core".into(),
+                    role: "lead".into(),
+                    termination: Termination::Explicit,
+                    model: ModelRef { profile: "local".into(), model: "m".into(), context_window: 1000 },
+                    reasoning_replay: ReasoningReplay::All,
+                    system_prompt: "sys".into(),
+                    tools: vec![ToolSpec {
+                        name: "bash".into(),
+                        description: "d".into(),
+                        parameters: serde_json::json!({"type": "object"}),
+                        class: ToolClass::Exec,
+                    }],
+                    budget: budget(),
+                    unattended: true,
+                    schema: SCHEMA,
+                    intercept: false,
+                    target: None,
+                    creds: None,
+                    title: "t".into(),
+                    project_instructions: Vec::new(),
+                    mcp: Vec::new(),
+                }),
+            ),
+            (
+                "forked",
+                Event::Forked(Forked {
+                    session: s(),
+                    parent: SessionId::from("s-p"),
+                    upto_seq: 4,
+                    role: "worker".into(),
+                    termination: Termination::Explicit,
+                    budget: budget(),
+                    brief: brief(),
+                    contract: "c".into(),
+                    allowed_tools: Some(vec!["read".into()]),
+                    title: "t".into(),
+                }),
+            ),
+            ("user_message", Event::UserMessage { text: "hi".into(), images: vec![] }),
+            ("harness_note", Event::HarnessNote { note: NoteKind::Nudge, text: "n".into() }),
+            ("turn_start", Event::TurnStart { trigger: Trigger::User }),
+            (
+                "model_request",
+                Event::ModelRequest(ModelRequest {
+                    req_id: "r-1".into(),
+                    step: 1,
+                    epoch: 0,
+                    purpose: Purpose::Step,
+                    n_messages: 3,
+                    stable_hash: "h".into(),
+                    hud: Some(blob()),
+                    est_tokens: 9,
+                }),
+            ),
+            (
+                "model_response",
+                Event::ModelResponse(ModelResponse {
+                    req_id: "r-1".into(),
+                    text: "t".into(),
+                    reasoning: "r".into(),
+                    tool_calls: vec![ToolCallRequest {
+                        call_id: c(),
+                        name: "bash".into(),
+                        arguments: "{}".into(),
+                        complete: true,
+                    }],
+                    finish: FinishReason::ToolCalls,
+                    usage: Usage { prompt_tokens: 5, cached_tokens: 4, completion_tokens: 3, reasoning_tokens: 2 },
+                    timing: Timing { queue_ms: 1, ttft_ms: 2, total_ms: 3 },
+                    attempts: 1,
+                }),
+            ),
+            (
+                "continuation_planned",
+                Event::ContinuationPlanned {
+                    plan_id: "gp-1".into(),
+                    source_call: c(),
+                    plan: serde_json::json!({"nodes":[]}),
+                },
+            ),
+            (
+                "stored_action",
+                Event::StoredAction(StoredAction {
+                    plan_id: "gp-1".into(),
+                    source_call: c(),
+                    node: 1,
+                    omitted_callback: "omitted-1".into(),
+                    call: ToolCallRequest {
+                        call_id: "stored-1".into(),
+                        name: "bash".into(),
+                        arguments: "{}".into(),
+                        complete: true,
+                    },
+                    arguments_hash: "hash".into(),
+                    predecessor: None,
+                    file_guards: serde_json::json!([]),
+                    guard_ms: 1,
+                }),
+            ),
+            ("continuation_stopped", Event::ContinuationStopped { plan_id: "gp-1".into(), reason: "exhausted".into() }),
+            ("outputs_observed", Event::OutputsObserved { req_id: "r-2".into(), calls: vec!["stored-1".into()] }),
+            (
+                "tool_call",
+                Event::ToolCall(ToolCall {
+                    call_id: c(),
+                    req_id: "r-1".into(),
+                    name: "bash".into(),
+                    args: serde_json::json!({"command": "ls"}),
+                    class: ToolClass::Exec,
+                }),
+            ),
+            (
+                "tool_result",
+                Event::ToolResult(ToolResult {
+                    exchanges: Vec::new(),
+                    call_id: c(),
+                    name: "bash".into(),
+                    status: ToolStatus::Ok,
+                    text: "ok".into(),
+                    output: Some(blob()),
+                    cut: true,
+                    class: ToolClass::Exec,
+                    meta: Map::new(),
+                    duration_ms: 5,
+                    images: Vec::new(),
+                }),
+            ),
+            (
+                "reweave",
+                Event::Reweave(Reweave {
+                    epoch: 1,
+                    upto_seq: 7,
+                    evictions: vec![
+                        Eviction { seq: 3, action: EvictAction::Stub { text: "s".into() } },
+                        Eviction { seq: 4, action: EvictAction::Drop },
+                        Eviction { seq: 5, action: EvictAction::DropReasoning },
+                        Eviction { seq: 6, action: EvictAction::Remove },
+                    ],
+                    brief: "b".into(),
+                    digest: Some("d".into()),
+                    reason: "target".into(),
+                    before_tokens: 9,
+                    after_tokens_est: 4,
+                }),
+            ),
+            (
+                "compaction",
+                Event::Compaction(Compaction {
+                    epoch: 2,
+                    upto_seq: 7,
+                    reason: "size".into(),
+                    before_tokens: 9,
+                    after_tokens_est: 4,
+                    note: Some("n".into()),
+                    note_req: Some("r-9".into()),
+                    table: "t".into(),
+                    keys: vec!["out:0123456789abcdef".into()],
+                    dropped_keys: vec!["out:ffffffffffffffff".into()],
+                    objections: None,
+                    brief: "b".into(),
+                    compact_at: 50_000,
+                }),
+            ),
+            ("pin", Event::Pin { call_id: c(), reason: "r".into() }),
+            ("unpin", Event::Unpin { call_id: c() }),
+            (
+                "child_spawned",
+                Event::ChildSpawned(ChildSpawned {
+                    child: s(),
+                    role: "worker".into(),
+                    mode: SpawnMode::Fork,
+                    brief: brief(),
+                    budget: budget(),
+                    call_id: Some(c()),
+                }),
+            ),
+            (
+                "child_settled",
+                Event::ChildSettled(ChildSettled {
+                    child: s(),
+                    outcome: ChildOutcome::Returned,
+                    report: "r".into(),
+                    full: Some(blob()),
+                    usage: Usage::default(),
+                    steps: 2,
+                    inline: true,
+                }),
+            ),
+            (
+                "child_completed",
+                Event::ChildCompleted(ChildCompleted {
+                    child: s(),
+                    role: "worker".into(),
+                    outcome: ChildOutcome::Returned,
+                    report: "answer and checked quotes".into(),
+                    full: Some(blob()),
+                    payload: serde_json::json!({"quotes": ["checked"]}),
+                    steps: 2,
+                    usage: Usage::default(),
+                }),
+            ),
+            ("job_registered", Event::JobRegistered { job_id: "j1".into(), call_id: c(), command: "make".into() }),
+            (
+                "job_settled",
+                Event::JobSettled { job_id: "j1".into(), exit_code: Some(0), output: Some(blob()), detail: "d".into() },
+            ),
+            (
+                "job_matched",
+                Event::JobMatched {
+                    job_id: "j1".into(),
+                    pattern: "CRASH".into(),
+                    output: Some(blob()),
+                    from: 40,
+                    shown: vec![3, 7],
+                    matches: 2,
+                },
+            ),
+            (
+                "inbox_opened",
+                Event::InboxOpened(InboxItem {
+                    item_id: "i-1".into(),
+                    kind: InboxKind::Question,
+                    text: "t".into(),
+                    options: vec!["a".into()],
+                    blocking: true,
+                    call_id: Some(c()),
+                    reference: Some("q1".into()),
+                }),
+            ),
+            ("inbox_resolved", Event::InboxResolved { item_id: "i-1".into(), answer: "a".into() }),
+            ("ledger", Event::Ledger { n: 3, summary: "s".into() }),
+            (
+                "net",
+                Event::Net(NetDecision {
+                    host: "h".into(),
+                    port: 443,
+                    method: "CONNECT".into(),
+                    allowed: false,
+                    rule: "deny".into(),
+                    resolved: Some("1.2.3.4".into()),
+                }),
+            ),
+            ("cache_break", Event::CacheBreak { req_id: "r-1".into(), first_diff_message: 2, detail: "d".into() }),
+            ("interrupted", Event::Interrupted { reason: "r".into() }),
+            ("turn_end", Event::TurnEnd { reason: TurnEndReason::Finished }),
+            ("session_end", Event::SessionEnd { outcome: SessionOutcome::Done, detail: "d".into() }),
+            (
+                "model_switched",
+                Event::ModelSwitched(ModelSwitched {
+                    from: ModelRef { profile: "a".into(), model: "m1".into(), context_window: 1000 },
+                    to: ModelRef { profile: "b".into(), model: "m2".into(), context_window: 2000 },
+                    reasoning_replay: ReasoningReplay::None,
+                    reason: "operator".into(),
+                }),
+            ),
+        ]
+    }
+
+    #[test]
+    fn every_kind_is_tagged_with_its_own_name_and_reads_back() {
+        for (name, event) in one_of_each() {
+            let r = record(event);
+            let line = serde_json::to_string(&r).unwrap();
+            let v: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(v["kind"], name, "tag of {name}: {line}");
+            assert_eq!(v["seq"], 3, "seq of {name}");
+            assert_eq!(v["author"], "harness", "author of {name}");
+            let back: Record =
+                serde_json::from_str(&line).unwrap_or_else(|e| panic!("{name} does not read back: {e}\n{line}"));
+            assert_eq!(back, r, "{name}");
+            assert_ne!(back.event, Event::Unknown, "{name}");
+        }
+    }
+
+    #[test]
+    fn struct_variants_round_trip() {
+        let r = record(Event::ToolResult(ToolResult {
+            exchanges: Vec::new(),
+            call_id: CallId::from("c1"),
+            name: "bash".into(),
+            status: ToolStatus::Ok,
+            text: "ok".into(),
+            output: None,
+            cut: false,
+            class: ToolClass::Exec,
+            meta: Map::new(),
+            duration_ms: 5,
+            images: Vec::new(),
+        }));
+        let s = serde_json::to_string(&r).unwrap();
+        assert_eq!(serde_json::from_str::<Record>(&s).unwrap(), r);
+        let brief = Brief { question: "q".into(), returns: Some("r".into()), ..Default::default() };
+        let v = serde_json::to_value(&brief).unwrap();
+        assert_eq!(v["return"], "r");
+    }
+
+    fn graded(value: Value) -> Map<String, Value> {
+        let mut meta = Map::new();
+        meta.insert(META_EVIDENCE_GRADE.into(), value);
+        meta
+    }
+
+    #[test]
+    fn without_a_grade_an_exec_result_is_a_run_and_anything_else_a_read() {
+        let none = Map::new();
+        assert_eq!(EvidenceGrade::of(ToolClass::Exec, &none), EvidenceGrade::Run);
+        for class in [ToolClass::Nav, ToolClass::Read, ToolClass::Write, ToolClass::State, ToolClass::Terminal] {
+            assert_eq!(EvidenceGrade::of(class, &none), EvidenceGrade::Read, "{class:?}");
+        }
+    }
+
+    #[test]
+    fn a_grade_in_the_meta_can_lower_a_result_but_never_raise_it() {
+        for grade in [EvidenceGrade::Analysis, EvidenceGrade::Read, EvidenceGrade::Reference] {
+            let meta = graded(json!(grade.as_str()));
+            assert_eq!(EvidenceGrade::of(ToolClass::Exec, &meta), grade);
+            assert_eq!(EvidenceGrade::of(ToolClass::Read, &meta), grade);
+        }
+        let run = graded(json!("run"));
+        assert_eq!(EvidenceGrade::of(ToolClass::Exec, &run), EvidenceGrade::Run);
+        // `run` on anything but an Exec result is not a run.
+        for class in [ToolClass::Nav, ToolClass::Read, ToolClass::Write, ToolClass::State, ToolClass::Terminal] {
+            assert_eq!(EvidenceGrade::of(class, &run), EvidenceGrade::Read, "{class:?}");
+        }
+    }
+
+    #[test]
+    fn an_unreadable_grade_fails_closed() {
+        for bad in [json!("RUN"), json!("execution"), json!(""), json!(true), json!(1), json!(null), json!(["run"])] {
+            let meta = graded(bad.clone());
+            assert_eq!(EvidenceGrade::of(ToolClass::Exec, &meta), EvidenceGrade::Analysis, "{bad}");
+            assert_eq!(EvidenceGrade::of(ToolClass::Read, &meta), EvidenceGrade::Read, "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_self_grading_tools_result_without_a_grade_is_never_a_run() {
+        let none = Map::new();
+        for name in GRADED_ANALYSIS_TOOLS {
+            assert_eq!(EvidenceGrade::of_tool_result(name, ToolClass::Exec, &none), EvidenceGrade::Analysis);
+        }
+        for name in GRADED_REFERENCE_TOOLS {
+            for class in [ToolClass::Read, ToolClass::Nav] {
+                assert_eq!(EvidenceGrade::of_tool_result(name, class, &none), EvidenceGrade::Reference);
+            }
+        }
+        // Any other tool, and any result that states a grade, is graded by `of`.
+        assert_eq!(EvidenceGrade::of_tool_result("bash", ToolClass::Exec, &none), EvidenceGrade::Run);
+        assert_eq!(EvidenceGrade::of_tool_result("web_fetch", ToolClass::Read, &none), EvidenceGrade::Read);
+        assert_eq!(EvidenceGrade::of_tool_result("gdb_probe", ToolClass::Exec, &none), EvidenceGrade::Run);
+        let stated = graded(json!("analysis"));
+        assert_eq!(EvidenceGrade::of_tool_result("bash", ToolClass::Exec, &stated), EvidenceGrade::Analysis);
+        let reference = graded(json!("reference"));
+        assert_eq!(EvidenceGrade::of_tool_result("dep_scan", ToolClass::Exec, &reference), EvidenceGrade::Reference);
+    }
+
+    #[test]
+    fn grades_have_their_wire_names() {
+        for (grade, word) in [
+            (EvidenceGrade::Run, "run"),
+            (EvidenceGrade::Analysis, "analysis"),
+            (EvidenceGrade::Read, "read"),
+            (EvidenceGrade::Reference, "reference"),
+        ] {
+            assert_eq!(grade.as_str(), word);
+            assert_eq!(EvidenceGrade::parse(word), Some(grade));
+            assert_eq!(serde_json::to_value(grade).unwrap(), json!(word));
+            assert_eq!(serde_json::from_value::<EvidenceGrade>(json!(word)).unwrap(), grade);
+        }
+        assert_eq!(EvidenceGrade::parse("Run"), None);
+    }
+}

@@ -11,17 +11,17 @@
 // cites keys of its log and one that does not exist, and a fresh start with objections and an empty tail).
 // Records: GET .../records?after=&limit= pages forward (next_after); ?before=&limit= pages backward (prev_before); both is a 400.
 // POST /api/sessions/{id}/compact (and /reweave) appends a `compaction` record and emits it.
-// Workspace folders add (shapes and status codes mirror crates/loom-daemon: refusals are 409, a missing path 404, a bad query 400):
-// GET /api/fs/dirs?path= (fake home /fixture/user; /fixture/home is the loom home and is refused;
+// Workspace folders add (shapes and status codes mirror crates/ferret-daemon: refusals are 409, a missing path 404, a bad query 400):
+// GET /api/fs/dirs?path= (fake home /fixture/user; /fixture/home is the ferret home and is refused;
 // /fixture/user/many has 2,300 folders; /fixture/user/shared is a link), POST /api/sessions (a missing workspace is refused
 // with the daemon's sentence; with create_workspace it is made and the answer carries created: true), and the Files routes
-// GET /api/sessions/{id}/files?path= and .../files/lines?path=&start=&count= over the workspaces /fixture/loom (nested
+// GET /api/sessions/{id}/files?path= and .../files/lines?path=&start=&count= over the workspaces /fixture/ferret (nested
 // folders, big.log with 20,000 lines, target.bin binary, huge.sql over the 32 MiB cap, outside a link, locked unreadable,
-// pipe not a file, generated with 2,050 entries, .loom closed) and /fixture/indexer.
+// pipe not a file, generated with 2,050 entries, .ferret closed) and /fixture/indexer.
 // MCP adds: s-mcp (two MCP calls, one ok and one isError) and GET /api/sessions/{id}/mcp (two servers for s-mcp, [] for the rest).
-// Uploads add: POST /api/uploads?workspace=&name= (201 {path, name, bytes, mime} under <workspace>/.loom/uploads/, 413 over 32 MiB),
+// Uploads add: POST /api/uploads?workspace=&name= (201 {path, name, bytes, mime} under <workspace>/.ferret/uploads/, 413 over 32 MiB),
 // `attachments` in message and session bodies (the attachment block is appended as the daemon does), and the Files routes serve
-// .loom/uploads and nothing else under .loom. s-tools carries a user message with a CSV and a PNG attached.
+// .ferret/uploads and nothing else under .ferret. s-tools carries a user message with a CSV and a PNG attached.
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
@@ -61,11 +61,11 @@ const emitQueued = id => emit({ type: "queued", session: id });
 const profiles = [
   { profile: "dsv41", base_url: "https://api.fixture.invalid/dsv41/v1", model: "dsv41", reachable: true, detail: "", context_window: 1000000, max_concurrent: 4, vision: true },
   { profile: "qwen", base_url: "https://api.fixture.invalid/qwen/v1", model: "qwen4-max-preview", reachable: true, detail: "", context_window: 262144, max_concurrent: 2, vision: false },
-  { profile: "necromicon", base_url: "http://10.0.0.9:8000/v1", model: "necromicon", reachable: false, detail: "connection refused: http://10.0.0.9:8000/v1 did not answer; start the server or run `loom models reload` after fixing the profile's base_url.", context_window: 128000, max_concurrent: 1 },
+  { profile: "necromicon", base_url: "http://10.0.0.9:8000/v1", model: "necromicon", reachable: false, detail: "connection refused: http://10.0.0.9:8000/v1 did not answer; start the server or run `ferret models reload` after fixing the profile's base_url.", context_window: 128000, max_concurrent: 1 },
 ];
 const modelRef = p => ({ profile: p.profile, model: p.model, context_window: p.context_window });
 
-// The Models tab's view of a mission (crates/loom-agent MissionModels): the lead's model, the choice per role, live profiles.
+// The Models tab's view of a mission (crates/ferret-agent MissionModels): the lead's model, the choice per role, live profiles.
 const roleChoices = new Map(); // mission -> {any: string|null, roles: Map<role, string|null>}
 function missionModels(id) {
   const info = sessions.find(s => s.id === id);
@@ -84,7 +84,7 @@ function missionModels(id) {
     any_role: ch.any, roles, profiles: profiles.map(p => p.profile), default_model: "dsv41" };
 }
 const profileOf = name => profiles.find(p => p.profile === name);
-function session(id, title, { parent = null, phase = "running", last_end = null, outcome = null, workspace = "/fixture/loom", profile = "dsv41", prompt = 86000, cached = 84000, mission = null, role = null, pack = "core", age = 3600000, step = 48, completion = 18000 } = {}) {
+function session(id, title, { parent = null, phase = "running", last_end = null, outcome = null, workspace = "/fixture/ferret", profile = "dsv41", prompt = 86000, cached = 84000, mission = null, role = null, pack = "core", age = 3600000, step = 48, completion = 18000 } = {}) {
   const p = profileOf(profile);
   return { id, title, mission: mission || (parent || id === "s-audit" ? "m-audit" : "m-" + id), parent, workspace, pack, role: role || (parent ? "worker" : "lead"), profile: p.profile, model: p.model, context_window: p.context_window, created_ms: now - age, unattended: true, archived: false, active: phase === "running", status: { phase, step, last_end, outcome, epoch: 1, prompt_tokens: prompt, cached_tokens: cached, completion_tokens_total: completion, open_inbox: 0 } };
 }
@@ -119,14 +119,14 @@ for (const [id, title, parent, role, phase, last_end, outcome, profile, step, co
   custom.add(id);
 }
 sessions.push(
-  session("s-parked", "Fix the flaky recovery test", { phase: "idle", last_end: "parked", profile: "necromicon", workspace: "/fixture/loom", step: 63, completion: 71000, prompt: 90000, cached: 0, age: 5 * 3600000 }),
+  session("s-parked", "Fix the flaky recovery test", { phase: "idle", last_end: "parked", profile: "necromicon", workspace: "/fixture/ferret", step: 63, completion: 71000, prompt: 90000, cached: 0, age: 5 * 3600000 }),
   session("s-quiet", "Rebuild the search index", { phase: "running", profile: "dsv41", workspace: "/fixture/indexer", step: 27, completion: 33000, prompt: 410000, cached: 380000, age: 2 * 3600000 }),
   session("s-notify", "Nightly dependency sweep", { phase: "running", profile: "qwen", workspace: "/fixture/docs", step: 12, completion: 9000, age: 40 * MIN }),
-  session("s-tools", "Tool result shapes", { phase: "idle", last_end: "waiting", profile: "dsv41", workspace: "/fixture/loom", step: 9, completion: 6000, age: 90 * MIN }),
-  session("s-compacted", "Long-running mission (two compactions)", { phase: "idle", last_end: "waiting", profile: "dsv41", workspace: "/fixture/loom", step: 17, completion: 120000, prompt: 61000, cached: 52000, age: 30 * 3600000 }),
-  session("s-loop", "Stuck build (60 identical calls)", { phase: "idle", last_end: "waiting", profile: "dsv41", workspace: "/fixture/loom", step: 64, completion: 40000, prompt: 90000, cached: 85000, age: 3 * 3600000 }),
-  session("s-mcp", "Triage issues through MCP servers", { phase: "idle", last_end: "waiting", profile: "dsv41", workspace: "/fixture/loom", step: 4, completion: 3000, age: 50 * MIN }),
-  session("s-big", "Long investigation (5,000 records)", { phase: "idle", last_end: "waiting", profile: "dsv41", workspace: "/fixture/loom", step: 1250, completion: 900000, prompt: 300000, cached: 280000, age: 6 * 3600000 }),
+  session("s-tools", "Tool result shapes", { phase: "idle", last_end: "waiting", profile: "dsv41", workspace: "/fixture/ferret", step: 9, completion: 6000, age: 90 * MIN }),
+  session("s-compacted", "Long-running mission (two compactions)", { phase: "idle", last_end: "waiting", profile: "dsv41", workspace: "/fixture/ferret", step: 17, completion: 120000, prompt: 61000, cached: 52000, age: 30 * 3600000 }),
+  session("s-loop", "Stuck build (60 identical calls)", { phase: "idle", last_end: "waiting", profile: "dsv41", workspace: "/fixture/ferret", step: 64, completion: 40000, prompt: 90000, cached: 85000, age: 3 * 3600000 }),
+  session("s-mcp", "Triage issues through MCP servers", { phase: "idle", last_end: "waiting", profile: "dsv41", workspace: "/fixture/ferret", step: 4, completion: 3000, age: 50 * MIN }),
+  session("s-big", "Long investigation (5,000 records)", { phase: "idle", last_end: "waiting", profile: "dsv41", workspace: "/fixture/ferret", step: 1250, completion: 900000, prompt: 300000, cached: 280000, age: 6 * 3600000 }),
 );
 for (const id of ["s-parked", "s-quiet", "s-notify", "s-tools", "s-loop", "s-big", "s-mcp", "s-compacted", "s-result"]) custom.add(id);
 let inbox = [
@@ -208,7 +208,7 @@ let exN = 0;
 const exBlob = (text) => { const id = (EXBLOBS.size + 1).toString(16).padStart(4, "0").repeat(16); EXBLOBS.set(id, text); return { id, bytes: Buffer.byteLength(text), lines: text.split("\n").length }; };
 function exchange(session, ts_ms, f) {
   const n = exN++;
-  const reqText = `${f.method} ${f.target} HTTP/1.1\nHost: ${f.host}\nUser-Agent: loom/0.9\nAuthorization: Bearer fx-secret-token-9b2e\nCookie: session=fx-cookie-77c1; theme=dark\nAccept: application/json\n\n`;
+  const reqText = `${f.method} ${f.target} HTTP/1.1\nHost: ${f.host}\nUser-Agent: ferret/0.9\nAuthorization: Bearer fx-secret-token-9b2e\nCookie: session=fx-cookie-77c1; theme=dark\nAccept: application/json\n\n`;
   const resText = f.status == null ? null : `HTTP/1.1 ${f.status} ${f.reason || "OK"}\nContent-Type: application/json\nSet-Cookie: session=fx-set-cookie-31d0; HttpOnly\nX-Request-Id: fx-req-${n}\n${f.location ? "Location: " + f.location + "\n" : ""}\n${f.body ?? ""}`;
   const rec = { id: "ex-" + EX_IDS[n % EX_IDS.length], call_id: f.call_id ?? null, source: f.source || "tool", tool: f.tool ?? null, scheme: f.scheme || "https", tls: f.tls || "tool", method: f.method, host: f.host, port: f.port ?? 443, target: f.target, status: f.status ?? null, error: f.error ?? null, request: exBlob(reqText), response: resText === null ? null : exBlob(resText), request_bytes: reqText.length, response_bytes: resText ? resText.length : 0, truncated: !!f.truncated, upstream_unverified: !!f.unverified, duration_ms: f.ms ?? 120 };
   append(session, "exchange", { ts_ms, ...rec }, "harness");
@@ -241,7 +241,7 @@ for (const r of logs.get("s-fl-lead")) if (r.kind === "session_start") r.target 
 for (const [id] of fleet) { const log = logs.get(id); log.sort((a, b) => a.ts_ms - b.ts_ms || a.seq - b.seq); log.forEach((r, i) => { r.seq = i; }); }
 
 // A blocking question, a scope request and a parked card for the inbox. The parked text is the daemon's texts::turn_failed(why).
-const err = "connection refused: http://10.0.0.9:8000/v1 did not answer; start the server or run `loom models reload` after fixing the profile's base_url.";
+const err = "connection refused: http://10.0.0.9:8000/v1 did not answer; start the server or run `ferret models reload` after fixing the profile's base_url.";
 inbox.push(
   { session: "s-fl-crypto", mission: "m-fleet", title: "Solver: artifact signing", opened_ms: now - 22 * MIN, item: { item_id: "i-fl-key", item_kind: "question", text: "The signing key is not in the workspace. Is it in the vault, or should the signature check be skipped?", options: ["Use the vault key", "Skip the signature check"], blocking: true, call_id: "question", reference: "q2" } },
   { session: "s-fl-net", mission: "m-fleet", title: "Net: registry mirrors", opened_ms: now - 9 * MIN, item: { item_id: "i-fl-scope", item_kind: "approval", text: "Needs to read the package index to compare mirror hashes.", options: ["registry.fixture.invalid", "mirror.fixture.invalid"], blocking: false, call_id: "request_scope" } },
@@ -267,7 +267,7 @@ append("s-fl-net", "inbox_opened", { ts_ms: now - 9 * MIN, ...inbox.find(e => e.
 {
   const t0 = now - 25 * MIN;
   startOf(sessionOf("s-result"), t0, "Review the dependency tree and list anything unmaintained or vulnerable.");
-  const t = step("s-result", t0 + 2 * MIN, { text: "Reading the lockfile.", command: "cargo tree --depth 1", out: "loom v0.1.0\n├── axum v0.8.4\n├── serde v1.0.228\n└── tokio v1.48.0", exit: 0, ms: 2100 });
+  const t = step("s-result", t0 + 2 * MIN, { text: "Reading the lockfile.", command: "cargo tree --depth 1", out: "ferret v0.1.0\n├── axum v0.8.4\n├── serde v1.0.228\n└── tokio v1.48.0", exit: 0, ms: 2100 });
   append("s-result", "model_request", { ts_ms: t, req_id: "fx-result-final", step: 48, epoch: 1, purpose: "step", est_tokens: 40000 }, "harness");
   append("s-result", "model_response", { ts_ms: now - 11 * MIN, req_id: "fx-result-final", text: "## Dependency review\n\nNo direct dependency is unmaintained. Two need attention:\n\n1. **rand 0.10.3** has a patch release (0.10.4) with a fix for `fill_bytes` on short buffers.\n2. **shlex 1.3.0** is a major version behind; 2.0 changes quoting of empty strings.\n\nNo advisory matches the lockfile.", reasoning: "", tool_calls: [], finish: "stop", usage: { prompt_tokens: 40000, cached_tokens: 0, completion_tokens: 160 }, timing: { total_ms: 5200 }, attempts: 1 }, "model");
   append("s-result", "inbox_opened", { ts_ms: now - 10 * MIN, ...inbox.find(e => e.item.item_id === "i-result").item }, "harness");
@@ -294,25 +294,25 @@ append("s-fl-net", "inbox_opened", { ts_ms: now - 9 * MIN, ...inbox.find(e => e.
   startOf(sessionOf("s-tools"), t0, "Try the build, write the config, and read the log.");
   t = step("s-tools", t, { text: "Running the tests.", command: "make test", status: "error", out: "make: *** [test] Error 2", exit: 2 });
   t = step("s-tools", t, { command: "make lint", out: "lint: clean", exit: 0 });
-  t = step("s-tools", t, { command: "cargo test -p loom-agent recovery -- --nocapture 2>&1 | tail -n 40", args: { command: "cargo test -p loom-agent recovery -- --nocapture 2>&1 | tail -n 40", description: "Run the recovery tests" }, out: "test result: ok. 12 passed", exit: 0 });
-  t = step("s-tools", t, { name: "read", cls: "read", args: { absolute_path: "/fixture/loom/README.md" }, out: "# loom", ms: 4 });
+  t = step("s-tools", t, { command: "cargo test -p ferret-agent recovery -- --nocapture 2>&1 | tail -n 40", args: { command: "cargo test -p ferret-agent recovery -- --nocapture 2>&1 | tail -n 40", description: "Run the recovery tests" }, out: "test result: ok. 12 passed", exit: 0 });
+  t = step("s-tools", t, { name: "read", cls: "read", args: { absolute_path: "/fixture/ferret/README.md" }, out: "# ferret", ms: 4 });
   t = step("s-tools", t, { name: "read", cls: "read", args: { target_file: "notes/empty.txt" }, out: "", ms: 4 });
   // An operator message with two uploads and one inline copy, as the daemon records it.
   {
     // Written out here: the seed runs before the workspace trees exist, so attachmentBlock cannot read them yet.
     const csv = "corpus,ms,notes\nsmall,412,warm\nlarge,9120,cold cache\nlarge,8740,warm";
-    const a = { block: "\n\nAttached files (saved read-only; read them with `read`):\n- /fixture/loom/.loom/uploads/report.csv (69 B, text/csv)\n- /fixture/loom/.loom/uploads/screen.png (226 KiB, image/png)\n\n`/fixture/loom/.loom/uploads/report.csv`:\n```csv\n" + csv + "\n```" };
+    const a = { block: "\n\nAttached files (saved read-only; read them with `read`):\n- /fixture/ferret/.ferret/uploads/report.csv (69 B, text/csv)\n- /fixture/ferret/.ferret/uploads/screen.png (226 KiB, image/png)\n\n`/fixture/ferret/.ferret/uploads/report.csv`:\n```csv\n" + csv + "\n```" };
     append("s-tools", "user_message", { ts_ms: t, text: "These are the numbers and the screenshot from the failing run; compare them with the last build." + a.block, images: [SCREEN_REF] }, "user");
     t += 1000;
   }
-  // Paths for the Files tab's "Open file": inside /fixture/loom (absolute and relative), the binary one, and one that is not there.
-  t = step("s-tools", t, { name: "read", cls: "read", args: { path: "/fixture/loom/.loom/uploads/screen.png" }, out: "[read · image · /fixture/loom/.loom/uploads/screen.png · 480x300 · " + SCREEN_REF.bytes + " B] The image is attached to this result.", images: [{ ...SCREEN_REF, name: "screen.png" }, ICON_REF], ms: 9 });
-  t = step("s-tools", t, { name: "read", cls: "read", args: { path: "/fixture/loom/crates/loom-agent/src/runtime.rs", start: 1, end: 5 }, out: "//! runtime.rs: fixture source\n    // line 2 of runtime.rs", ms: 12 });
-  // As the daemon records an edit: its facts line, the unified diff it applied, its end line (crates/loom-core admit.rs).
-  t = step("s-tools", t, { name: "edit", cls: "write", args: { path: "crates/loom-agent/src/runtime.rs", old: "timeout_ms: 30_000", new: "timeout_ms: 60_000" }, meta: { path: "/fixture/loom/crates/loom-agent/src/runtime.rs" }, ms: 9,
-    out: "[edit · edited · /fixture/loom/crates/loom-agent/src/runtime.rs · 2 replacements · 17 lines · out:cc8752638528652e]\n--- /fixture/loom/crates/loom-agent/src/runtime.rs\n+++ /fixture/loom/crates/loom-agent/src/runtime.rs\n@@ -1592,7 +1592,8 @@\n     let report = RecoveryReport {\n         outcome,\n-        report: text,\n+        report: text.clone(),\n+        summary: summarize(&text),\n         full: None,\n         steps,\n         usage: Usage::default(),\n@@ -2210,3 +2211,3 @@\n fn retry_policy() -> Policy {\n-    Policy { timeout_ms: 30_000, attempts: 3 }\n+    Policy { timeout_ms: 60_000, attempts: 3 }\n }\n[end of edit output · edited]" });
-  t = step("s-tools", t, { name: "write", cls: "write", args: { path: "notes/no-newline.txt", content: "one line without a final newline" }, meta: { path: "/fixture/loom/notes/no-newline.txt" }, ms: 6,
-    out: "[write · created · /fixture/loom/notes/no-newline.txt · 1 line]\n(new file)\n[end of write output · created]" });
+  // Paths for the Files tab's "Open file": inside /fixture/ferret (absolute and relative), the binary one, and one that is not there.
+  t = step("s-tools", t, { name: "read", cls: "read", args: { path: "/fixture/ferret/.ferret/uploads/screen.png" }, out: "[read · image · /fixture/ferret/.ferret/uploads/screen.png · 480x300 · " + SCREEN_REF.bytes + " B] The image is attached to this result.", images: [{ ...SCREEN_REF, name: "screen.png" }, ICON_REF], ms: 9 });
+  t = step("s-tools", t, { name: "read", cls: "read", args: { path: "/fixture/ferret/crates/ferret-agent/src/runtime.rs", start: 1, end: 5 }, out: "//! runtime.rs: fixture source\n    // line 2 of runtime.rs", ms: 12 });
+  // As the daemon records an edit: its facts line, the unified diff it applied, its end line (crates/ferret-core admit.rs).
+  t = step("s-tools", t, { name: "edit", cls: "write", args: { path: "crates/ferret-agent/src/runtime.rs", old: "timeout_ms: 30_000", new: "timeout_ms: 60_000" }, meta: { path: "/fixture/ferret/crates/ferret-agent/src/runtime.rs" }, ms: 9,
+    out: "[edit · edited · /fixture/ferret/crates/ferret-agent/src/runtime.rs · 2 replacements · 17 lines · out:cc8752638528652e]\n--- /fixture/ferret/crates/ferret-agent/src/runtime.rs\n+++ /fixture/ferret/crates/ferret-agent/src/runtime.rs\n@@ -1592,7 +1592,8 @@\n     let report = RecoveryReport {\n         outcome,\n-        report: text,\n+        report: text.clone(),\n+        summary: summarize(&text),\n         full: None,\n         steps,\n         usage: Usage::default(),\n@@ -2210,3 +2211,3 @@\n fn retry_policy() -> Policy {\n-    Policy { timeout_ms: 30_000, attempts: 3 }\n+    Policy { timeout_ms: 60_000, attempts: 3 }\n }\n[end of edit output · edited]" });
+  t = step("s-tools", t, { name: "write", cls: "write", args: { path: "notes/no-newline.txt", content: "one line without a final newline" }, meta: { path: "/fixture/ferret/notes/no-newline.txt" }, ms: 6,
+    out: "[write · created · /fixture/ferret/notes/no-newline.txt · 1 line]\n(new file)\n[end of write output · created]" });
   t = step("s-tools", t, { name: "read", cls: "read", args: { path: "target.bin" }, out: "(binary file)", ms: 4 });
   t = step("s-tools", t, { name: "read", cls: "read", args: { path: "src/removed.rs" }, status: "error", out: "no such file: src/removed.rs", ms: 4 });
   t = step("s-tools", t, { name: "write", cls: "write", args: { path: "/etc/hosts", text: "127.0.0.1 fixture" }, status: "denied", out: "denied: /etc/hosts is outside the sandbox's writable paths (the workspace and /tmp). Nothing was written." });
@@ -333,7 +333,7 @@ append("s-fl-net", "inbox_opened", { ts_ms: now - 9 * MIN, ...inbox.find(e => e.
   const tool = name => ({ name, description: name, parameters: { type: "object", properties: {} } });
   logs.get(id)[0].tools = ["bash", "read", "edit", "write", "grep", "mcp__github__search_issues", "mcp__github__get_issue", "mcp__github__list_pulls", "mcp__docs__fetch_page"].map(tool);
   const issues = ["#412 retry budget is not reset after a parked turn", "#397 backoff overflows after 31 attempts", "#388 retry on 429 ignores Retry-After", "#371 idempotent POSTs are retried without a key", "#365 retry count missing from the status line", "#350 jitter makes the recovery test flaky", "#344 retries hide the first error", "#339 no cap on total retry time", "#331 retry docs describe the old defaults", "#318 retry log lines lack the request id"];
-  t = step(id, t, { text: "Searching the tracker for retry issues.", name: "mcp__github__search_issues", cls: "exec", args: { query: "retry is:open", repo: "fixture/loom" }, ms: 840,
+  t = step(id, t, { text: "Searching the tracker for retry issues.", name: "mcp__github__search_issues", cls: "exec", args: { query: "retry is:open", repo: "fixture/ferret" }, ms: 840,
     out: "[mcp__github__search_issues · ok · github · 12 lines · out:5c1e0a7d93b24f68]\n10 results for \"retry is:open\"\n" + issues.join("\n") });
   t = step(id, t, { text: "Reading the retry docs.", name: "mcp__docs__fetch_page", cls: "exec", args: { path: "/missing" }, status: "error", ms: 310,
     out: "[mcp__docs__fetch_page · error · docs · 1 line · out:9b04d2e6c7a15f30]\nPage not found: /missing" });
@@ -352,7 +352,7 @@ const MCP_SERVERS = {
   startOf(sessionOf(id), t0, "Make the workspace build.");
   t = step(id, t, { text: "Checking the tree first.", command: "ls", out: "Cargo.toml\ncrates", exit: 0 });
   t = step(id, t, { command: "cat Cargo.toml", out: "[workspace]\nmembers = [\"crates/*\"]", exit: 0 });
-  const fail = "error[E0432]: unresolved import `loom_core::Missing`\n --> crates/loom-agent/src/lib.rs:3:5\nerror: could not compile `loom-agent` (lib) due to 1 previous error";
+  const fail = "error[E0432]: unresolved import `ferret_core::Missing`\n --> crates/ferret-agent/src/lib.rs:3:5\nerror: could not compile `ferret-agent` (lib) due to 1 previous error";
   for (let i = 0; i < 60; i++) t = step(id, t, { command: "cargo build", status: "error", out: fail, exit: 101, ms: 900 });
   for (let i = 0; i < 3; i++) t = step(id, t, { command: "cargo check", out: "Finished dev profile", exit: 0 });
   for (let i = 0; i < 2; i++) t = step(id, t, { command: "cargo fmt --check", out: "", exit: 0 });
@@ -391,11 +391,11 @@ const ckBlob = (k) => k + "0".repeat(48);
 const COMPACTION_TABLE_1 = [
   "Outputs — read one with read(path: \"out:<key>\"); search everything with log_search",
   `out:${CK.test} · bash · python3 public_sequence.py · exit 0 · 7 lines · step 3, 11-22 09:14`,
-  `out:${CK.edit} · edit · crates/loom-agent/src/runtime.rs · edited · +3 −2 · step 5`,
+  `out:${CK.edit} · edit · crates/ferret-agent/src/runtime.rs · edited · +3 −2 · step 5`,
   `out:${CK.grep} · grep · retry_after · 12 matches · step 6`,
   "… 1,204 earlier outputs (steps 1–2) are not listed: search them with log_search.",
   "Files changed by edit/write (shell commands are not tracked)",
-  `crates/loom-agent/src/runtime.rs · +3 −2 · 2 edits · last out:${CK.edit}`,
+  `crates/ferret-agent/src/runtime.rs · +3 −2 · 2 edits · last out:${CK.edit}`,
   "Agents",
   "s-fl-web · Solver: web build hooks · web_solver · finished · report out:5a1c3e7d90b2f648",
   "Jobs still running",
@@ -412,10 +412,10 @@ const COMPACTION_NOTE_1 = [
 const COMPACTION_TABLE_2 = [
   "Outputs — read one with read(path: \"out:<key>\"); search everything with log_search",
   `out:${CK.log} · bash · tail -n 200 retry.log · exit 0 · 200 lines · step 14, 11-23 08:41`,
-  `out:${CK.edit} · edit · crates/loom-agent/src/runtime.rs · edited · +3 −2 · step 5`,
+  `out:${CK.edit} · edit · crates/ferret-agent/src/runtime.rs · edited · +3 −2 · step 5`,
   `out:${CK.test} · bash · python3 public_sequence.py · exit 0 · 7 lines · step 3`,
   "Files changed by edit/write (shell commands are not tracked)",
-  `crates/loom-agent/src/runtime.rs · +3 −2 · 2 edits · last out:${CK.edit}`,
+  `crates/ferret-agent/src/runtime.rs · +3 −2 · 2 edits · last out:${CK.edit}`,
 ].join("\n");
 {
   const id = "s-compacted"; const t0 = now - 30 * 3600000; const H = 3600000;
@@ -423,22 +423,22 @@ const COMPACTION_TABLE_2 = [
   append(id, "turn_start", { ts_ms: t0 + 2000, trigger: "user" }, "harness");
   let t = t0 + 10000;
   const keyed = (k, lines, bytes) => ({ id: ckBlob(k), bytes, lines });
-  t = step(id, t, { command: "git status --short", out: "M crates/loom-agent/src/runtime.rs", exit: 0 });
-  t = step(id, t, { command: "cargo check -p loom-agent", out: "Finished dev profile", exit: 0 });
+  t = step(id, t, { command: "git status --short", out: "M crates/ferret-agent/src/runtime.rs", exit: 0 });
+  t = step(id, t, { command: "cargo check -p ferret-agent", out: "Finished dev profile", exit: 0 });
   t = step(id, t, { command: "python3 public_sequence.py", out: "1\n2\n3\n4\n5\n6\n7\n[output cut: 7 lines stored]", cut: true, output: keyed(CK.test, 7, 420), exit: 0, meta: { shown: [[1, 7]] } });
-  t = step(id, t, { name: "read", cls: "read", args: { path: "crates/loom-agent/src/runtime.rs", start: 1594, end: 1599 }, out: lines.slice(1593, 1599).join("\n") });
-  t = step(id, t, { name: "edit", cls: "write", args: { path: "crates/loom-agent/src/runtime.rs" }, out: "edited crates/loom-agent/src/runtime.rs +3 −2", cut: true, output: keyed(CK.edit, 12, 900) });
+  t = step(id, t, { name: "read", cls: "read", args: { path: "crates/ferret-agent/src/runtime.rs", start: 1594, end: 1599 }, out: lines.slice(1593, 1599).join("\n") });
+  t = step(id, t, { name: "edit", cls: "write", args: { path: "crates/ferret-agent/src/runtime.rs" }, out: "edited crates/ferret-agent/src/runtime.rs +3 −2", cut: true, output: keyed(CK.edit, 12, 900) });
   t = step(id, t, { name: "grep", cls: "read", args: { pattern: "retry_after" }, out: "runtime.rs:1601: retry_after\n[output cut: 12 matches stored]", cut: true, output: keyed(CK.grep, 12, 1100) });
   t = step(id, t, { command: "cargo test --workspace", out: "test result: ok", exit: 0 });
   const upto1 = (logs.get(id) || []).length - 1 - 4; // the last step stays in view
   append(id, "compaction", { ts_ms: t, epoch: 2, upto_seq: upto1, reason: "size", before_tokens: 312000, after_tokens_est: 38000, note: COMPACTION_NOTE_1, note_req: "fx-note-1", table: COMPACTION_TABLE_1, keys: [CK.test, CK.edit, CK.grep], dropped_keys: ["out:0123456789abcdef"], objections: null }, "harness");
   t += 20000;
   t = step(id, t + H, { command: "tail -n 200 retry.log", out: "retry 3 failed: connection reset\n[output cut: 200 lines stored]", cut: true, output: keyed(CK.log, 200, 15000), exit: 0, meta: { shown: [[1, 2]] } });
-  t = step(id, t, { command: "cargo test -p loom-agent retry", out: "test retry::reports_last_error ... FAILED", status: "error", exit: 101 });
-  t = step(id, t, { command: "cargo test -p loom-agent retry", out: "test result: ok", exit: 0 });
+  t = step(id, t, { command: "cargo test -p ferret-agent retry", out: "test retry::reports_last_error ... FAILED", status: "error", exit: 101 });
+  t = step(id, t, { command: "cargo test -p ferret-agent retry", out: "test result: ok", exit: 0 });
   append(id, "model_response", { ts_ms: t, req_id: "fx-final", text: "The retry path reports its last error now.", reasoning: "", tool_calls: [], finish: "stop", usage: { prompt_tokens: 61000, cached_tokens: 52000, completion_tokens: 20 }, timing: { total_ms: 900 }, attempts: 1 }, "model");
   append(id, "compaction", { ts_ms: t + 4000, epoch: 3, upto_seq: (logs.get(id) || []).length - 1, reason: "fresh_start", before_tokens: 118000, after_tokens_est: 22000, note: `## Goal\n- Report the last retry error.\n\n## Tried, not settled\n- The finish claimed the fix; the verifier rejected it (out:${CK.log}).\n\n## Next\n- Reproduce the failure with the test before claiming it again.`, note_req: "fx-note-2", table: COMPACTION_TABLE_2, keys: [CK.log, CK.edit, CK.test], dropped_keys: [], objections: "The finish cites no run of the failing test; the log tail in out:" + CK.log + " shows the error still occurs." }, "harness");
-  t = step(id, t + H, { command: "cargo test -p loom-agent retry -- --nocapture", out: "test result: ok. 1 passed", exit: 0 });
+  t = step(id, t + H, { command: "cargo test -p ferret-agent retry -- --nocapture", out: "test result: ok. 1 passed", exit: 0 });
   append(id, "turn_end", { ts_ms: t + 1000, reason: "waiting" }, "harness");
 }
 
@@ -478,7 +478,7 @@ const targetCounts = () => { const c = { finding: 0, tested: 0, deferred: 0, unt
 const ledgers = new Map([["m-audit", ledger], ["m-fleet", fleetLedger]]);
 
 // GET /api/missions/{id}/score: the daemon's ScoreView, { mission, sessions: [{ session, role, parent, card }], total }.
-// Cards are folded from each log the way loom-core's scorecard::score does (steps, calls, malformed, finish refusals,
+// Cards are folded from each log the way ferret-core's scorecard::score does (steps, calls, malformed, finish refusals,
 // quote refusals, finished), except where `cardOverride` gives a hand-set one so the fleet shows varied counts.
 const card0 = () => ({ steps: 0, finished: false, steps_to_finish: null, calls: 0, malformed_calls: 0, finish_calls: 0, finish_refusals: 0, quote_refusals: 0, verifier_accepts: 0, verifier_rejections: 0, fresh_starts: 0, hand_offs: 0, asks: 0, unrecorded: false });
 const cardOverride = {
@@ -558,22 +558,22 @@ const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 // ---- Workspace folders: the picker (GET /api/fs/dirs), creating a missing workspace (POST /api/sessions with
 // create_workspace) and the Files tab (GET /api/sessions/{id}/files, .../files/lines). All in memory; nothing is read or written on disk.
 const USER_HOME = "/fixture/user";
-const LOOM_HOME = "/fixture/home"; // /api/status.home: workspaces inside it are refused, as the daemon refuses them
+const FERRET_HOME = "/fixture/home"; // /api/status.home: workspaces inside it are refused, as the daemon refuses them
 const FILE_CAP = 32 * 1024 * 1024;
 const dirNode = (children = {}, extra = {}) => ({ kind: "dir", mtime: now - 3600000, children, ...extra });
 const fileNode = (text, mtime = now - 7200000) => ({ kind: "file", mtime, text });
 const rustText = (name) => Array.from({ length: 140 }, (_, i) => i === 0 ? `//! ${name}: fixture source` : i % 9 === 0 ? `fn step_${i}() -> usize { ${i} }` : `    // line ${i + 1} of ${name}`).join("\n") + "\n";
 const bigLog = Array.from({ length: 20000 }, (_, i) => `2026-11-16T10:${String(Math.floor(i / 600) % 60).padStart(2, "0")}:${String(i % 60).padStart(2, "0")}Z INFO tick ${i + 1}${i === 12344 ? " needle: only in the loaded range" : ""}`).join("\n") + "\n";
 const SEED_CSV = "corpus,ms,notes\nsmall,412,warm\nlarge,9120,cold cache\nlarge,8740,warm\n";
-function loomTree() {
+function ferretTree() {
   return dirNode({
     "Cargo.toml": fileNode("[workspace]\nmembers = [\"crates/*\"]\n"),
-    "README.md": fileNode("# loom\n\nA fixture workspace.\n\nA <b>line</b> with markup stays inert text.\n", now - 60000),
+    "README.md": fileNode("# ferret\n\nA fixture workspace.\n\nA <b>line</b> with markup stays inert text.\n", now - 60000),
     ".gitignore": fileNode("target/\n"), ".env": fileNode("FIXTURE=1\n"),
-    ".loom": dirNode({ "oracle.key": fileNode("never listed\n"), uploads: dirNode({ "report.csv": fileNode(SEED_CSV), "screen.png": { kind: "file", mtime: now - 3600000, binary: 231 * 1000 } }) }, { harness: true }),
+    ".ferret": dirNode({ "oracle.key": fileNode("never listed\n"), uploads: dirNode({ "report.csv": fileNode(SEED_CSV), "screen.png": { kind: "file", mtime: now - 3600000, binary: 231 * 1000 } }) }, { harness: true }),
     crates: dirNode({
-      "loom-agent": dirNode({ src: dirNode({ "runtime.rs": fileNode(rustText("runtime.rs")), "session.rs": fileNode(rustText("session.rs")), "pack.rs": fileNode(rustText("pack.rs")) }) }),
-      "loom-core": dirNode({ src: dirNode({ "ledger.rs": fileNode(rustText("ledger.rs")), "event.rs": fileNode(rustText("event.rs")) }) }),
+      "ferret-agent": dirNode({ src: dirNode({ "runtime.rs": fileNode(rustText("runtime.rs")), "session.rs": fileNode(rustText("session.rs")), "pack.rs": fileNode(rustText("pack.rs")) }) }),
+      "ferret-core": dirNode({ src: dirNode({ "ledger.rs": fileNode(rustText("ledger.rs")), "event.rs": fileNode(rustText("event.rs")) }) }),
     }),
     docs: dirNode({ "DESIGN.md": fileNode("# Design\n\nFixture text.\n"), "UI.md": fileNode("# UI\n") }),
     notes: dirNode({ "empty.txt": fileNode(""), "no-newline.txt": fileNode("one line without a final newline") }),
@@ -588,16 +588,16 @@ function loomTree() {
 }
 function indexerTree() {
   return dirNode({
-    "bench.toml": fileNode("[corpus]\nsmall = 10\nlarge = 1000\n"), ".loom": dirNode({}, { harness: true }),
+    "bench.toml": fileNode("[corpus]\nsmall = 10\nlarge = 1000\n"), ".ferret": dirNode({}, { harness: true }),
     src: dirNode({ "index.rs": fileNode(rustText("index.rs")) }),
     results: dirNode({ "baseline.csv": fileNode("corpus,ms\nsmall,412\nlarge,9120\n", now - 600000) }),
   });
 }
-const wsRoots = new Map([["/fixture/loom", loomTree()], ["/fixture/indexer", indexerTree()], ["/fixture/docs", dirNode({ "plan.md": fileNode("# Plan\n") })], ["/fixture/pipeline", dirNode({ "build.sh": fileNode("#!/bin/sh\n") })]]);
+const wsRoots = new Map([["/fixture/ferret", ferretTree()], ["/fixture/indexer", indexerTree()], ["/fixture/docs", dirNode({ "plan.md": fileNode("# Plan\n") })], ["/fixture/pipeline", dirNode({ "build.sh": fileNode("#!/bin/sh\n") })]]);
 const fsStatic = new Map([
   ["/", ["fixture"]],
-  ["/fixture", ["user", "loom", "indexer", "docs", "pipeline", "tmp"]],
-  ["/fixture/home", [".loom"]], ["/fixture/tmp", ["scratch"]],
+  ["/fixture", ["user", "ferret", "indexer", "docs", "pipeline", "tmp"]],
+  ["/fixture/home", [".ferret"]], ["/fixture/tmp", ["scratch"]],
   ["/fixture/user", ["code", "Documents", ".config", ".cache", "shared", "many"]],
   ["/fixture/user/code", ["alpha", "beta", "gamma"]],
   ["/fixture/user/Documents", ["Invoices", "Notes"]],
@@ -644,7 +644,7 @@ function fsMkdirp(path) {
 function fsListing(rawPath) {
   const path = cleanPath(expandHome(String(rawPath || USER_HOME)));
   if (!path.startsWith("/")) return { status: 409, error: `${path} is not an absolute path. Give a path that starts with / or ~/.` };
-  if (inside(path, LOOM_HOME)) return { status: 409, error: `The loom home (${LOOM_HOME}) is not listed: it holds the daemon's keys and sessions. Choose another folder.` };
+  if (inside(path, FERRET_HOME)) return { status: 409, error: `The ferret home (${FERRET_HOME}) is not listed: it holds the daemon's keys and sessions. Choose another folder.` };
   if (fsFiles.has(path)) return { status: 409, error: `${path} is not a folder.` };
   const dirs = fsDirs(path);
   if (dirs === null) return { status: 404, error: `There is no folder ${path}.` };
@@ -670,7 +670,7 @@ function wsResolve(id, rel) {
   const pieces = raw.split("/").filter((p) => p && p !== ".");
   if (pieces.includes("..")) return { status: 409, error: `The path ${raw} uses \`..\`. Paths are relative to the workspace and stay inside it.` };
   const text = pieces.join("/");
-  if (pieces[0] && pieces[0].toLowerCase() === ".loom" && !(pieces[0] === ".loom" && pieces[1] === "uploads")) return { status: 409, error: `${text} is not shown: harness files are not shown.` };
+  if (pieces[0] && pieces[0].toLowerCase() === ".ferret" && !(pieces[0] === ".ferret" && pieces[1] === "uploads")) return { status: 409, error: `${text} is not shown: harness files are not shown.` };
   let node = root;
   for (const part of pieces) {
     node = node.kind === "dir" ? (node.children || {})[part] : null;
@@ -689,7 +689,7 @@ function filesListing(id, rel) {
   let names = Object.entries(r.node.children || {});
   if (r.node.many) names = names.concat(Array.from({ length: r.node.many }, (_, i) => [`item-${String(i + 1).padStart(4, "0")}.txt`, fileNode("x\n")]));
   const entries = names.map(([name, c]) => {
-    const closed = r.parts.length === 0 && name.toLowerCase() === ".loom";
+    const closed = r.parts.length === 0 && name.toLowerCase() === ".ferret";
     return {
       name, kind: closed ? "dir" : c.kind, size: closed ? 0 : nodeSize(c), mtime_ms: closed ? 0 : c.mtime, hidden: name.startsWith("."),
       ...(closed ? { note: "harness files are not shown" } : {}),
@@ -716,7 +716,7 @@ function filesLines(id, rel, start, count) {
   return { value: { path: r.text, text, first, last, total, total_lines: total, bytes: size, mtime_ms, binary: false } };
 }
 
-// File uploads (docs/UPLOADS.md): stored in memory at <workspace>/.loom/uploads/<name>; the attachment block is the daemon's text.
+// File uploads (docs/UPLOADS.md): stored in memory at <workspace>/.ferret/uploads/<name>; the attachment block is the daemon's text.
 const UPLOAD_MAX = 32 * 1024 * 1024;
 const MIME = { csv: "text/csv", txt: "text/plain", md: "text/markdown", json: "application/json", png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif", pdf: "application/pdf", rs: "text/x-rust", log: "text/plain" };
 const unitSize = (n) => { // the daemon's texts::file_size, which matches the UI's byteSize
@@ -728,10 +728,10 @@ const unitSize = (n) => { // the daemon's texts::file_size, which matches the UI
 function uploadsDir(ws, make) {
   let root = wsRoots.get(ws);
   if (!root) { if (!make) return null; root = dirNode(); wsRoots.set(ws, root); }
-  root.children[".loom"] = root.children[".loom"] || dirNode({}, { harness: true });
-  const loom = root.children[".loom"];
-  if (!loom.children.uploads) { if (!make) return null; loom.children.uploads = dirNode(); }
-  return loom.children.uploads;
+  root.children[".ferret"] = root.children[".ferret"] || dirNode({}, { harness: true });
+  const ferret = root.children[".ferret"];
+  if (!ferret.children.uploads) { if (!make) return null; ferret.children.uploads = dirNode(); }
+  return ferret.children.uploads;
 }
 function storeUpload(ws, rawName, buf, given) {
   let name = String(rawName).split(/[\\/]/).pop().replace(/[\u0000-\u001f\u007f]/g, "_").replace(/^\.+/, "");
@@ -746,7 +746,7 @@ function storeUpload(ws, rawName, buf, given) {
   try { text = new TextDecoder("utf-8", { fatal: true }).decode(buf); if (text.includes("\u0000")) text = null; } catch { text = null; }
   dir.children[stored] = text !== null ? fileNode(text, Date.now()) : { kind: "file", mtime: Date.now(), binary: buf.length };
   const mime = given && given !== "application/octet-stream" ? given : MIME[ext.slice(1).toLowerCase()] || (text !== null ? "text/plain" : "application/octet-stream");
-  return { status: 201, value: { path: `${ws}/.loom/uploads/${stored}`, name: stored, bytes: buf.length, mime } };
+  return { status: 201, value: { path: `${ws}/.ferret/uploads/${stored}`, name: stored, bytes: buf.length, mime } };
 }
 /** The attachment block the daemon appends to the text, or {error}. */
 function attachmentBlock(ws, paths) {
@@ -755,7 +755,7 @@ function attachmentBlock(ws, paths) {
   const dir = uploadsDir(ws, false);
   const list = [], inline = [];
   for (const p of paths) {
-    const prefix = `${ws}/.loom/uploads/`;
+    const prefix = `${ws}/.ferret/uploads/`;
     const name = typeof p === "string" && p.startsWith(prefix) ? p.slice(prefix.length) : "";
     const node = name && !name.includes("/") && dir ? dir.children[name] : null;
     if (!node || node.kind !== "file") return { error: `Attach files with POST /api/uploads first; ${p} is not an upload of this workspace.` };
@@ -776,7 +776,7 @@ async function createSession(data) {
   const attached = attachmentBlock(path, data.attachments);
   if (attached.error) return { status: 400, error: attached.error };
   if (!path.startsWith("/")) return { status: 409, error: `The workspace ${raw} is a relative path that does not exist. Give an absolute path, or one that starts with ~/.` };
-  if (inside(path, LOOM_HOME)) return { status: 409, error: `The workspace ${path} is inside the loom home (${LOOM_HOME}) or its copies folder, which sessions cannot use. Choose a folder elsewhere.` };
+  if (inside(path, FERRET_HOME)) return { status: 409, error: `The workspace ${path} is inside the ferret home (${FERRET_HOME}) or its copies folder, which sessions cannot use. Choose a folder elsewhere.` };
   // As the daemon does, the earlier missions to recall are checked before any folder is made.
   if (data.prior !== undefined) {
     if (!Array.isArray(data.prior)) return { status: 400, error: "prior must be a list of mission ids." };
@@ -787,7 +787,7 @@ async function createSession(data) {
   }
   let created = false;
   if (fsDirs(path) === null) {
-    if (!data.create_workspace) return { status: 409, error: `The workspace ${path} does not exist. Create it from the new-mission form (Create), or run \`loom run --create-workspace\`.` };
+    if (!data.create_workspace) return { status: 409, error: `The workspace ${path} does not exist. Create it from the new-mission form (Create), or run \`ferret run --create-workspace\`.` };
     fsMkdirp(path); created = true;
   }
   const id = "s-new-" + (++createdSessions);
@@ -837,7 +837,7 @@ function windowFor(info) {
     epoch: 3, est_tokens: estTotal, target_tokens: 400000, floor_tokens: 180000, context_window: win,
     prompt_tokens: lastPrompt, cached_tokens: id === "s-parked" ? 0 : counted ? Math.round(lastPrompt * 0.88) : 0,
     items: [
-      { seq: 1, kind: "session_start", role: "system", chars: PART_CHARS.system, state: "live", pinned: false, call_id: null, class: null, preview: "You are the lead of this mission. The workspace is /fixture/loom." },
+      { seq: 1, kind: "session_start", role: "system", chars: PART_CHARS.system, state: "live", pinned: false, call_id: null, class: null, preview: "You are the lead of this mission. The workspace is /fixture/ferret." },
       { seq: 2, kind: "user_message", role: "user", chars: 420, state: "live", pinned: false, call_id: null, class: null, preview: "Audit the reliability of the retry path and report what you find." },
       { seq: 3, kind: "harness_note", role: "user", chars: 320, state: "live", pinned: false, call_id: null, class: null, preview: "<harness kind=\"constraint\">Do not push to main.", note: "constraint" },
       { seq: 5, kind: "model_response", role: "assistant", chars: 880, state: "live", pinned: false, call_id: null, class: null, preview: "Reading the retry module first." },
@@ -952,7 +952,7 @@ const server = createServer(async (req, res) => {
     }
     if (req.method === "POST" && path === "/api/web-sessions") {
       const data = await body(req); requests.push({ path, body: data });
-      if (data.code !== LOGIN_CODE) return json(res, { error: "Missing or wrong access token. Run `loom open`, or send the token in ~/.loom/token as a Bearer token." }, 401);
+      if (data.code !== LOGIN_CODE) return json(res, { error: "Missing or wrong access token. Run `ferret open`, or send the token in ~/.ferret/token as a Bearer token." }, 401);
       return json(res, { secret: "fixture-secret" });
     }
     if (req.method === "POST" && path === "/api/uploads") {
@@ -962,7 +962,7 @@ const server = createServer(async (req, res) => {
       requests.push({ path, workspace: ws, name, bytes: size });
       if (size > UPLOAD_MAX) return json(res, { error: `That file is ${Math.ceil(size / 1048576)} MiB, more than the 32 MiB an upload may be.` }, 413);
       if (!ws || !ws.startsWith("/") || !name) return json(res, { error: "Give ?workspace=<absolute path>&name=<file name>." }, 400);
-      if (inside(cleanPath(ws), LOOM_HOME)) return json(res, { error: `The workspace ${ws} is inside the loom home (${LOOM_HOME}), which sessions cannot use. Choose a folder elsewhere.` }, 409);
+      if (inside(cleanPath(ws), FERRET_HOME)) return json(res, { error: `The workspace ${ws} is inside the ferret home (${FERRET_HOME}), which sessions cannot use. Choose a folder elsewhere.` }, 409);
       if (fsDirs(cleanPath(ws)) === null) return json(res, { error: `There is no folder ${ws}.` }, 404);
       await wait(400);
       const r = storeUpload(cleanPath(ws), name, Buffer.concat(chunks), req.headers["content-type"] || "");

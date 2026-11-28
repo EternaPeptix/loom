@@ -1,7 +1,7 @@
 # Operator acceptance contracts
 
 `oracle_check` checks a candidate against the operator's protected
-`<workspace>/.loom/security-oracle.json`. The actor supplies the candidate, not its expected value,
+`<workspace>/.ferret/security-oracle.json`. The actor supplies the candidate, not its expected value,
 endpoint, replay command, baseline or success rule. Unsandboxed mode is refused. The contract is
 hashed and pinned at first use in a session; changing it requires a new verifier. A symlink to an
 actor-writable contract is refused.
@@ -43,7 +43,7 @@ actor can copy. Passive `flag_regex` matches are prompts to verify, never comple
 ```
 
 The operator pins every required target/harness file. Each run gets an independent fresh copy of
-those exact bytes. Staging is under protected `<loom_home>/oracle-runs`, outside all session scratch trees. The replay
+those exact bytes. Staging is under protected `<ferret_home>/oracle-runs`, outside all session scratch trees. The replay
 sandbox hides original actor-writable roots and all sibling/current session paths, makes the
 snapshot read-only and grants writes only to its separate private temp directory. Input and output
 stay separate from target files. Pre/post hashes additionally detect changes. Timeout, known OOM and
@@ -61,7 +61,7 @@ rebuild patched targets, or grant a networked guest permission beyond the sessio
 ## Signed trusted supervisor / platform submission
 
 ```json
-{"kind":"signed_supervisor","endpoint":"https://trusted-lab.example/verify","key_file":".loom/oracle-secrets/key","require_root":true}
+{"kind":"signed_supervisor","endpoint":"https://trusted-lab.example/verify","key_file":".ferret/oracle-secrets/key","require_root":true}
 ```
 
 The endpoint receives a fresh `nonce`, `candidate_sha256`, and `candidate_base64`. It returns exactly
@@ -74,7 +74,7 @@ these fields:
 The HMAC message is five newline-separated UTF-8 values: nonce, candidate hash, lowercase accepted
 boolean, UID decimal or empty, lowercase admin_enabled boolean or empty (no final newline). The key
 is raw bytes (at least 32), must be agent-unreadable even through its actual descriptor path, and is
-never put in the process environment or receipt. `.loom/oracle-secrets` is unreadable by default.
+never put in the process environment or receipt. `.ferret/oracle-secrets` is unreadable by default.
 The endpoint itself still requires an operator scope grant.
 
 `require_root` requires authentic acceptance plus UID zero or an enabled administrator claim. The

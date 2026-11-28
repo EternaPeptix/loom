@@ -7,7 +7,7 @@ import * as C from "./core.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 
-// ---- fixtures: one record of every kind, shaped like `one_of_each` in loom-core/src/event.rs ----
+// ---- fixtures: one record of every kind, shaped like `one_of_each` in ferret-core/src/event.rs ----
 
 const BLOB = { id: "ab".repeat(32), bytes: 10, lines: 2 };
 const BRIEF = { question: "q", return: "r" };
@@ -496,7 +496,7 @@ test("diskWarning: a sentence below 5 GiB or 5 percent free, null otherwise or w
   assert.equal(C.diskWarning(undefined), null);
   assert.equal(C.diskWarning({ free_bytes: 400 * GiB, total_bytes: 1000 * GiB }), null);
   assert.equal(C.diskWarning({ free_bytes: 5 * GiB, total_bytes: 40 * GiB }), null);
-  assert.match(C.diskWarning({ free_bytes: 3 * GiB, total_bytes: 1000 * GiB }), /^Low disk space: 3\.0 GiB free of 1000\.0 GiB\..*loom gc/);
+  assert.match(C.diskWarning({ free_bytes: 3 * GiB, total_bytes: 1000 * GiB }), /^Low disk space: 3\.0 GiB free of 1000\.0 GiB\..*ferret gc/);
   assert.match(C.diskWarning({ free_bytes: 40 * GiB, total_bytes: 1000 * GiB }), /Low disk space/);
   assert.equal(C.diskWarning({ free_bytes: 0, total_bytes: 0 }), null);
 });
@@ -526,10 +526,10 @@ test("inbox from the api list and the page title", () => {
   const inbox = C.createInbox();
   C.applyInboxList(inbox, [{ session: "s-1", mission: "m", title: "t", opened_ms: 1, item: { item_id: "i-9", item_kind: "blocker", text: "x", options: [], blocking: true } }]);
   assert.deepEqual(C.inboxCounts(inbox), { open: 1, blocking: 1 });
-  assert.equal(C.pageTitle({ open: 0, blocking: 0 }), "loom");
-  assert.equal(C.pageTitle({ open: 2, blocking: 0 }), "(2) loom");
-  assert.equal(C.pageTitle({ open: 2, blocking: 1 }), "(1) needs you · loom");
-  assert.equal(C.pageTitle({ open: 5, blocking: 3 }), "(3) needs you · loom");
+  assert.equal(C.pageTitle({ open: 0, blocking: 0 }), "ferret");
+  assert.equal(C.pageTitle({ open: 2, blocking: 0 }), "(2) ferret");
+  assert.equal(C.pageTitle({ open: 2, blocking: 1 }), "(1) needs you · ferret");
+  assert.equal(C.pageTitle({ open: 5, blocking: 3 }), "(3) needs you · ferret");
 });
 
 test("inbox list does not resurrect an item the operator already answered", () => {
@@ -979,7 +979,7 @@ test("the ledger model carries a notice for what the read could not show", () =>
     state: { entries: 0 }, skipped: 2, skipped_detail: "entry 4: op `x`", torn_tail: true, ahead_of_head: 1,
   });
   assert.equal(m.notices.length, 3);
-  assert.match(m.notices[0], /^2 ledger entries written by a newer loom are not shown \(first: entry 4: op `x`\)/);
+  assert.match(m.notices[0], /^2 ledger entries written by a newer ferret are not shown \(first: entry 4: op `x`\)/);
   assert.match(m.notices[1], /interrupted write/);
   assert.match(m.notices[2], /^1 ledger entry is not vouched for/);
 });
@@ -1288,12 +1288,12 @@ async function loadSignedOutPage(t, hash) {
   return page;
 }
 
-test("app.js: with no code and no stored secret the page says to run loom open, and a login address arriving in that tab loads it again", async (t) => {
+test("app.js: with no code and no stored secret the page says to run ferret open, and a login address arriving in that tab loads it again", async (t) => {
   const page = await loadSignedOutPage(t, "");
   assert.deepEqual(page.requests, []);
   assert.equal(page.shown.length, 1);
   assert.match(page.shown[0], /not signed in/);
-  assert.match(page.shown[0], /loom open/);
+  assert.match(page.shown[0], /ferret open/);
   // Pasting an address into the tab changes only the fragment; the page is not loaded by the browser.
   const arrive = (hash) => {
     globalThis.location.hash = hash;
@@ -1306,7 +1306,7 @@ test("app.js: with no code and no stored secret the page says to run loom open, 
   assert.equal(page.reloads, 1);
 });
 
-test("app.js: a code the daemon refuses is sent once without credentials, leaves the address, and the page says to run loom open", async (t) => {
+test("app.js: a code the daemon refuses is sent once without credentials, leaves the address, and the page says to run ferret open", async (t) => {
   const code = "0123456789abcdef0123456789abcdef";
   const page = await loadSignedOutPage(t, "#code=" + code);
   assert.deepEqual(page.requests, [
@@ -1315,7 +1315,7 @@ test("app.js: a code the daemon refuses is sent once without credentials, leaves
   assert.deepEqual(page.replaced, ["/"]);
   assert.equal(page.shown.length, 1);
   assert.match(page.shown[0], /not signed in/);
-  assert.match(page.shown[0], /loom open/);
+  assert.match(page.shown[0], /ferret open/);
 });
 
 // ---- safety: nothing in the shipped DOM code can turn record content into markup ----
@@ -1796,8 +1796,8 @@ function inboxWith(entries) {
 }
 
 test("workspaceName is the last path component", () => {
-  assert.equal(C.workspaceName("/Users/me/code/loom"), "loom");
-  assert.equal(C.workspaceName("/Users/me/code/loom/"), "loom");
+  assert.equal(C.workspaceName("/Users/me/code/ferret"), "ferret");
+  assert.equal(C.workspaceName("/Users/me/code/ferret/"), "ferret");
   assert.equal(C.workspaceName("/"), "no workspace");
   assert.equal(C.workspaceName(""), "no workspace");
   assert.equal(C.workspaceName(null), "no workspace");
@@ -3183,8 +3183,8 @@ test("creating a missing workspace: the flag, the detection and the question", (
   assert.equal("create_workspace" in C.buildNewSession(base).body, false);
   assert.equal(C.buildNewSession({ ...base, createWorkspace: true }).body.create_workspace, true);
   assert.equal(C.buildNewSession({ ...base, createWorkspace: true }).body.workspace, "/w/new");
-  assert.ok(C.missingWorkspaceError("The workspace /w/new does not exist. Create it from the UI or run `loom run --create-workspace`."));
-  assert.ok(!C.missingWorkspaceError("The workspace is inside the loom home."));
+  assert.ok(C.missingWorkspaceError("The workspace /w/new does not exist. Create it from the UI or run `ferret run --create-workspace`."));
+  assert.ok(!C.missingWorkspaceError("The workspace is inside the ferret home."));
   assert.ok(!C.missingWorkspaceError("The workspace rel/x is a relative path that does not exist. Give an absolute path, or one that starts with ~/."));
   assert.equal(C.createWorkspaceQuestion("/w/new"), "/w/new does not exist. Create it and start the mission?");
 });
@@ -3234,12 +3234,12 @@ test("openFileTarget follows path arguments of file tools", () => {
 
 test("Files rows: hidden, filter, harness entry, words", () => {
   const entries = [
-    { name: "src", kind: "dir", size: 0, mtime_ms: 1 }, { name: ".loom", kind: "dir", size: 0, mtime_ms: 0, hidden: true, note: "harness files are not shown" },
+    { name: "src", kind: "dir", size: 0, mtime_ms: 1 }, { name: ".ferret", kind: "dir", size: 0, mtime_ms: 0, hidden: true, note: "harness files are not shown" },
     { name: ".env", kind: "file", size: 5, mtime_ms: 1 }, { name: "Readme.md", kind: "file", size: 5, mtime_ms: 1 },
     { name: "out", kind: "link", size: 0, mtime_ms: 1 }, { name: "locked", kind: "dir", error: "permission denied" },
   ];
   assert.deepEqual(C.fileRows(entries).map((e) => e.name), ["src", "Readme.md", "out", "locked"]);
-  assert.deepEqual(C.fileRows(entries, { showHidden: true }).map((e) => e.name), ["src", ".loom", ".env", "Readme.md", "out", "locked"]);
+  assert.deepEqual(C.fileRows(entries, { showHidden: true }).map((e) => e.name), ["src", ".ferret", ".env", "Readme.md", "out", "locked"]);
   assert.deepEqual(C.fileRows(entries, { query: " READ" }).map((e) => e.name), ["Readme.md"]);
   assert.deepEqual(C.fileRows(null), []);
   assert.equal(C.isHarnessEntry(entries[1]), true);
@@ -3419,7 +3419,7 @@ test("app.js copies only from a user gesture and only through copyText", () => {
   assert.equal([...app.matchAll(/navigator\.clipboard/g)].length, 1, "one clipboard call, inside copyText");
   assert.equal([...app.matchAll(/execCommand\("copy"\)/g)].length, 1, "one command fallback, inside copyText");
   assert.ok(!/execCommand\("(cut|paste)"\)/.test(app));
-  assert.ok(app.includes('"loom_copy_on_select"'));
+  assert.ok(app.includes('"ferret_copy_on_select"'));
 });
 
 test("viewerSelectionEdges: edge rows with none of their text selected are left out", () => {
@@ -3643,16 +3643,16 @@ test("mineStep walks the operator's own messages; [ and ] are the keys, never wh
 
 test("splitAttachments takes the runtime's attachment block apart", () => {
   const head = "Attached files (saved read-only; read them with `read`):";
-  const text = `Compare these.\n\n${head}\n- /ws/.loom/uploads/report.csv (12.1 KiB, text/csv)\n- /ws/.loom/uploads/my (1).png (226 KiB, image/png)\n\n\`/ws/.loom/uploads/report.csv\`:\n\`\`\`csv\na,b\n\`\`\``;
+  const text = `Compare these.\n\n${head}\n- /ws/.ferret/uploads/report.csv (12.1 KiB, text/csv)\n- /ws/.ferret/uploads/my (1).png (226 KiB, image/png)\n\n\`/ws/.ferret/uploads/report.csv\`:\n\`\`\`csv\na,b\n\`\`\``;
   const r = C.splitAttachments(text);
   assert.equal(r.text, "Compare these.");
   assert.deepEqual(r.files, [
-    { path: "/ws/.loom/uploads/report.csv", name: "report.csv", size: "12.1 KiB", mime: "text/csv" },
-    { path: "/ws/.loom/uploads/my (1).png", name: "my (1).png", size: "226 KiB", mime: "image/png" },
+    { path: "/ws/.ferret/uploads/report.csv", name: "report.csv", size: "12.1 KiB", mime: "text/csv" },
+    { path: "/ws/.ferret/uploads/my (1).png", name: "my (1).png", size: "226 KiB", mime: "image/png" },
   ]);
-  assert.equal(r.inline, "`/ws/.loom/uploads/report.csv`:\n```csv\na,b\n```");
+  assert.equal(r.inline, "`/ws/.ferret/uploads/report.csv`:\n```csv\na,b\n```");
   // Attachments without text, and a list with no inline copies.
-  const bare = C.splitAttachments(`${head}\n- /ws/.loom/uploads/a.bin (3 B, application/octet-stream)`);
+  const bare = C.splitAttachments(`${head}\n- /ws/.ferret/uploads/a.bin (3 B, application/octet-stream)`);
   assert.equal(bare.text, "");
   assert.equal(bare.files.length, 1);
   assert.equal(bare.inline, "");
@@ -3667,7 +3667,7 @@ test("splitAttachments takes the runtime's attachment block apart", () => {
 });
 
 test("Copy message copies only the text above the attachment block", () => {
-  const text = "Look at this.\n\nAttached files (saved read-only; read them with `read`):\n- /ws/.loom/uploads/a.txt (1 B, text/plain)";
+  const text = "Look at this.\n\nAttached files (saved read-only; read them with `read`):\n- /ws/.ferret/uploads/a.txt (1 B, text/plain)";
   assert.equal(C.messageCopyText({ kind: "user", text }), "Look at this.");
   assert.equal(C.messageCopyText({ kind: "user", text: text.replace("Look at this.\n\n", "") }), null);
 });
@@ -3684,7 +3684,7 @@ test("tool shapes: absolute_path and target_file are paths; description is the r
   assert.equal(C.toolRow({ kind: "tool", name: "bash", state: "done", argsLine: "ls", args: { command: "ls", description: 7 }, result: null }).label, "");
 });
 
-test("a call sent under another harness's name shows the loom tool that ran, and its path or pattern", () => {
+test("a call sent under another harness's name shows the ferret tool that ran, and its path or pattern", () => {
   const store = C.createRecordStore("s-1");
   C.applyRecord(store, { seq: 0, ts_ms: 1, author: "model", kind: "tool_call", call_id: "c1", name: "Read", args: { file_path: "/ws/a.rs", offset: 1, limit: 5 }, class: "read" });
   C.applyRecord(store, { seq: 1, ts_ms: 2, author: "tool", kind: "tool_result", call_id: "c1", name: "read", status: "ok", text: "[read · ok]", class: "read", meta: {}, duration_ms: 3 });
@@ -3763,10 +3763,10 @@ test("image words: alt, facts, path, count", () => {
   assert.equal(C.imageAlt({ ...img, name: "" }), "attached image");
   assert.equal(C.imageFacts(img), "640×400 · 226 KiB · image/png");
   assert.equal(C.imageFacts({ blob: "x", mime: "", bytes: 0, width: 0, height: 0, name: "" }), "");
-  const files = [{ path: "/w/.loom/uploads/screen.png", name: "screen.png" }, { path: "/w/.loom/uploads/b.png", name: "b.png" }];
-  assert.equal(C.imagePath(img, { files }), "/w/.loom/uploads/screen.png");
+  const files = [{ path: "/w/.ferret/uploads/screen.png", name: "screen.png" }, { path: "/w/.ferret/uploads/b.png", name: "b.png" }];
+  assert.equal(C.imagePath(img, { files }), "/w/.ferret/uploads/screen.png");
   assert.equal(C.imagePath({ ...img, name: "" }, { files, args: { path: "/w/x.png" } }), "/w/x.png");
-  assert.equal(C.imagePath({ ...img, name: "" }, { files: [files[1]] }), "/w/.loom/uploads/b.png");
+  assert.equal(C.imagePath({ ...img, name: "" }, { files: [files[1]] }), "/w/.ferret/uploads/b.png");
   assert.equal(C.imagePath({ ...img, name: "zzz.png" }, { files, args: { file_path: "/w/y.png" } }), "/w/y.png");
   assert.equal(C.imagePath(img, {}), null);
   assert.equal(C.imageCountLabel(1), "1 image");
@@ -4353,8 +4353,8 @@ test("credShow lists kind name and host, credCommands names the target, credsRef
   assert.deepEqual(r.lines, ["cookie sid · a.test", "header Authorization · a.test"]);
   assert.equal(r.summary, "default · 1 cookie · a.test");
   assert.deepEqual(C.credShow(null), { summary: "", lines: [] });
-  assert.equal(C.credCommands("acme")[0], "loom creds record --target acme");
-  assert.match(C.credCommands("acme")[1], /^loom creds set --target acme --host .* --cookie '.*'$/);
+  assert.equal(C.credCommands("acme")[0], "ferret creds record --target acme");
+  assert.match(C.credCommands("acme")[1], /^ferret creds set --target acme --host .* --cookie '.*'$/);
   assert.deepEqual(C.credsRefOf({ creds: { profile: "default", summary: "s", dropped: 2 } }), { profile: "default", summary: "s", dropped: 2 });
   assert.equal(C.credsRefOf({}), null);
   assert.equal(C.credsRefOf(null), null);
@@ -4366,4 +4366,285 @@ test("buildNewSession sends creds only with a target and not for none", () => {
   assert.equal("creds" in C.buildNewSession({ ...base, target: "acme", creds: "" }).body, false);
   assert.equal("creds" in C.buildNewSession({ ...base, target: "acme", creds: "none" }).body, false);
   assert.equal("creds" in C.buildNewSession({ ...base, target: "", creds: "default" }).body, false);
+});
+
+// ---- Slice B usability fixes ----
+
+test("isPendingReceipt unlocks Send after a message is held in the queue", () => {
+  assert.equal(C.isPendingReceipt(null), false);
+  assert.equal(C.isPendingReceipt({ accepted: false }), false);
+  assert.equal(C.isPendingReceipt({ accepted: true, state: "queued" }), true);
+  assert.equal(C.isPendingReceipt({ accepted: true, state: "held" }), false, "held after-turn message must not lock Send");
+  assert.equal(C.isPendingReceipt({ accepted: true, state: "failed" }), false);
+  assert.equal(C.isPendingReceipt({ accepted: true, state: "delivered", recordedSeq: 42 }), false);
+});
+
+test("canQueueSession allows any running operable root session regardless of pack role name", () => {
+  const running = st({ phase: "running" });
+  const idle = st({ phase: "idle" });
+  const ended = st({ phase: "ended", outcome: "done" });
+  assert.equal(C.canQueueSession(info("a", { role: "lead", status: running })), true);
+  assert.equal(C.canQueueSession(info("b", { role: "researcher", status: running })), true);
+  assert.equal(C.canQueueSession(info("c", { role: "commander", status: running })), true);
+  assert.equal(C.canQueueSession(info("d", { role: "chat", status: running })), true);
+  assert.equal(C.canQueueSession(info("e", { role: "worker", parent: "a", status: running })), false, "child agents cannot queue");
+  assert.equal(C.canQueueSession(info("f", { role: "lead", status: idle })), false);
+  assert.equal(C.canQueueSession(info("g", { role: "lead", status: ended })), false);
+  assert.equal(C.canQueueSession(info("h", { role: "lead", archived: true, status: running })), false);
+  assert.equal(C.canQueueSession(null), false);
+});
+
+test("cardResolution ignores empty approved arrays so parked answers do not read as approved host grants", () => {
+  const item = { item_id: "i", item_kind: "parked", blocking: true, options: [], text: "budget exhausted" };
+  const done = { seq: 5, ts: 1, answer: "Keep working on the goal." };
+  assert.equal(C.cardResolution(item, done, { answer: done.answer, approved: [] }, null).approved, undefined);
+  assert.deepEqual(C.cardResolution(item, done, { answer: "", approved: ["a.test"] }, null).approved, ["a.test"]);
+});
+
+test("defaultModelProfile picks daemon default over alphabetical order, else first reachable", () => {
+  const models = [
+    { profile: "alpha", reachable: false },
+    { profile: "beta", reachable: true },
+    { profile: "zeta", reachable: true },
+  ];
+  assert.equal(C.defaultModelProfile(models, "zeta"), "zeta");
+  assert.equal(C.defaultModelProfile(models, "missing"), "beta", "falls back to first reachable");
+  assert.equal(C.defaultModelProfile(models, ""), "beta");
+  assert.equal(C.defaultModelProfile([{ profile: "only", reachable: false }], ""), "only");
+  assert.equal(C.defaultModelProfile([], "zeta"), "");
+});
+
+test("proseTree renders tables, blockquotes, hr, heading levels, italics and safe http(s) links without unsafe schemes", () => {
+  const md = [
+    "# H1",
+    "## H2",
+    "### H3",
+    "",
+    "| Host | Status |",
+    "| --- | --- |",
+    "| `a.test` | **ok** |",
+    "| b\\|c.test | *warn* |",
+    "",
+    "> Quoted *line* with [docs](https://example.com/a) and [bad](javascript:alert(1))",
+    "> second quote line",
+    "",
+    "---",
+    "",
+    "Keep snake_case_name and 2*3*4 literal, but *italic* works.",
+  ].join("\n");
+  const blocks = C.proseTree(md);
+  assert.deepEqual(blocks.map((b) => b.type), ["h", "h", "h", "table", "blockquote", "hr", "p"]);
+  assert.deepEqual([blocks[0].level, blocks[1].level, blocks[2].level], [2, 3, 4]);
+  assert.equal(blocks[3].headers.length, 2);
+  assert.equal(blocks[3].rows.length, 2);
+  assert.deepEqual(blocks[3].rows[0][0], [{ type: "code", text: "a.test" }]);
+  assert.deepEqual(blocks[3].rows[0][1], [{ type: "strong", text: "ok" }]);
+  assert.deepEqual(blocks[3].rows[1][0], [{ type: "text", text: "b|c.test" }]);
+  assert.deepEqual(blocks[3].rows[1][1], [{ type: "em", text: "warn" }]);
+  assert.ok(blocks[4].inline.some((p) => p.type === "a" && p.href === "https://example.com/a" && p.text === "docs"));
+  assert.ok(!blocks[4].inline.some((p) => p.type === "a" && /javascript:/i.test(p.href)), "javascript: links stay inert text");
+  assert.ok(blocks[4].inline.some((p) => p.type === "text" && p.text.includes("[bad](javascript:alert(1))")));
+  const pInline = blocks[6].inline;
+  assert.ok(pInline.some((p) => p.type === "text" && p.text.includes("snake_case_name") && p.text.includes("2*3*4")));
+  assert.ok(pInline.some((p) => p.type === "em" && p.text === "italic"));
+});
+
+test("findFields and briefDetails expose all fields of child_spawned briefs", () => {
+  const block = {
+    kind: "child_spawned",
+    seq: 12,
+    role: "auditor",
+    child: "s-child1",
+    brief: {
+      question: "Check auth middleware",
+      hypothesis: "Missing CSRF token check",
+      scope: "crates/web",
+      do_not: "Do not modify prod config",
+      return: "Finding summary",
+      stop_when: "Verified or refuted",
+      context: "Follow-up from PR #42",
+    },
+  };
+  const fields = C.findFields(block, "all");
+  const joined = fields.map((f) => f[1]).join(" | ");
+  for (const needle of ["auditor", "s-child1", "Check auth middleware", "CSRF token", "crates/web", "prod config", "Finding summary", "refuted", "PR #42"]) {
+    assert.ok(joined.includes(needle), `expected findFields to contain ${needle}`);
+  }
+  const details = C.briefDetails(block.brief);
+  assert.deepEqual(details.map((d) => d.key), ["hypothesis", "scope", "do_not", "return", "stop_when", "context"]);
+  assert.deepEqual(C.briefDetails({ question: "Only question" }), []);
+});
+
+test("packRoleSummary surfaces role description, intercept/restricted flags, and open-network warning", () => {
+  const pack = {
+    name: "vr",
+    description: "Vulnerability research.",
+    intercept: true,
+    requires_restricted_network: true,
+    roles: [{ name: "researcher", description: "Leads vulnerability analysis." }],
+  };
+  const open = C.packRoleSummary(pack, "researcher", "open");
+  assert.equal(open.desc, "Vulnerability research.");
+  assert.equal(open.roleDesc, "Leads vulnerability analysis.");
+  assert.deepEqual(open.flags, ["MITM proxy intercept", "Requires restricted network"]);
+  assert.match(open.warning, /restricted network/i);
+  const restricted = C.packRoleSummary(pack, "researcher", "allowlist");
+  assert.equal(restricted.warning, null);
+});
+
+test("resolvePriorInput maps known session ids to mission ids and flags unknown session ids", () => {
+  const byId = new Map([
+    ["s-111", { id: "s-111", mission: "m-aaa" }],
+    ["s-222", { id: "s-222", mission: "m-bbb" }],
+  ]);
+  const r = C.resolvePriorInput("s-111 m-ccc s-111 s-unknown", byId);
+  assert.equal(r.text, "m-aaa m-ccc s-unknown");
+  assert.deepEqual(r.mapped, [{ from: "s-111", to: "m-aaa" }, { from: "s-111", to: "m-aaa" }]);
+  assert.deepEqual(r.unknownSessions, ["s-unknown"]);
+});
+
+test("targetCreateBody and extended targetPut validate all target settings", () => {
+  assert.match(C.targetCreateBody({ name: "", scope: "a.test" }).error, /name is required/i);
+  assert.match(C.targetCreateBody({ name: "../bad", scope: "a.test" }).error, /must start/i);
+  const created = C.targetCreateBody({
+    name: "acme",
+    scope: "*.acme.test\n10.0.0.0/24",
+    exclude: "pay.acme.test",
+    upstream_insecure: "lab.acme.test",
+    intercept_passthrough: "pin.acme.test",
+    notes: "Q4 pentest",
+  });
+  assert.deepEqual(created.body, {
+    name: "acme",
+    scope: ["*.acme.test", "10.0.0.0/24"],
+    exclude: ["pay.acme.test"],
+    upstream_insecure: ["lab.acme.test"],
+    intercept_passthrough: ["pin.acme.test"],
+    notes: "Q4 pentest",
+  });
+  const updated = C.targetPut(created.body, "*.acme.test", "", { upstream_insecure: "127.0.0.1", notes: "updated" });
+  assert.deepEqual(updated.body.upstream_insecure, ["127.0.0.1"]);
+  assert.deepEqual(updated.body.intercept_passthrough, ["pin.acme.test"]);
+  assert.equal(updated.body.notes, "updated");
+  assert.match(C.targetPut(created.body, "*.acme.test", "", { upstream_insecure: "https://bad" }).error, /upstream insecure/i);
+});
+
+test("export URLs and daemon report formatters (SARIF, HAR, reload, GC, MCP check, Signal)", () => {
+  assert.equal(C.sarifUrl("m-1"), "/api/missions/m-1/sarif");
+  assert.equal(C.harUrl("m-1"), "/api/missions/m-1/har");
+  assert.equal(C.harUrl("m-1", { host: "a.test", limit: 50 }), "/api/missions/m-1/har?host=a.test&limit=50");
+  assert.equal(C.harUrl("m-1", { host: "all" }), "/api/missions/m-1/har");
+  assert.equal(C.formatHarImport({ imported: 12, skipped: 2, failed: 1, truncated: true }), "HAR import: 12 imported · 2 skipped · 1 failed · truncated.");
+  assert.match(C.formatReloadReport({ added: ["fast"], changed: ["main"], removed: [], rebound: ["s-1"], default_model: "main", notes: [] }), /added: fast.*changed: main.*1 session rebound.*default: main/);
+  assert.equal(C.formatReloadReport({}), "Profiles reloaded; no changes.");
+  assert.match(C.formatGcReport({ examined: 10, kept: 7, collected: 3, collected_bytes: 2048, applied: false }), /GC preview: 3 blobs reclaimable/);
+  assert.match(C.formatGcReport({ examined: 10, kept: 7, collected: 3, collected_bytes: 2048, applied: true }), /GC removed 3 blobs/);
+  const mcpOk = C.formatMcpCheck({ server: "gh", protocol: "2025-03-26", server_name: "github", server_version: "1.0", tools: [{ name: "t1" }], error: null, stderr_tail: [] });
+  assert.equal(mcpOk.ok, true);
+  assert.match(mcpOk.summary, /OK · github 1\.0 · protocol 2025-03-26 · 1 tool/);
+  const mcpErr = C.formatMcpCheck({ server: "gh", error: "connection refused", tools: [], stderr_tail: ["err line"] });
+  assert.equal(mcpErr.ok, false);
+  assert.match(mcpErr.summary, /Check failed: connection refused/);
+  const sigOff = C.formatSignalStatus(null);
+  assert.equal(sigOff.available, false);
+  const sigOn = C.formatSignalStatus({ enabled: true, connected: true, account: "+1555", recipient: "+1666", last_event_ms: 99000, pending_sends: 1, dropped_events: 0 }, 100000);
+  assert.equal(sigOn.state, "Connected");
+  assert.equal(sigOn.tone, "ok");
+  assert.ok(sigOn.rows.some(([k, v]) => k === "Account" && v === "+1555"));
+});
+
+test("rewriteRuleSummary and buildRewriteRule validate and format proxy rewrite rules", () => {
+  assert.match(C.buildRewriteRule({ name: "" }).error, /name is required/i);
+  assert.match(C.buildRewriteRule({ name: "r1", actionType: "set_header", headerName: "" }).error, /Header name/i);
+  // set_status requires response phase and 200..=599 excluding 204 and 304 (matches crates/ferret-net/src/rewrite.rs).
+  assert.match(C.buildRewriteRule({ name: "r1", phase: "request", actionType: "set_status", value: "200" }).error, /response phase/i);
+  assert.match(C.buildRewriteRule({ name: "r1", phase: "response", actionType: "set_status", value: "100" }).error, /200 and 599/);
+  assert.match(C.buildRewriteRule({ name: "r1", phase: "response", actionType: "set_status", value: "204" }).error, /204 and 304/);
+  assert.match(C.buildRewriteRule({ name: "r1", phase: "response", actionType: "set_status", value: "304" }).error, /204 and 304/);
+  assert.match(C.buildRewriteRule({ name: "r1", phase: "response", actionType: "set_status", value: "999" }).error, /200 and 599/);
+  assert.equal(C.buildRewriteRule({ name: "r1", phase: "response", actionType: "set_status", value: "418" }).rule.actions[0].value, 418);
+  const built = C.buildRewriteRule({
+    name: "auth-hdr",
+    phase: "request",
+    priority: 10,
+    host: "*.acme.test",
+    methods: "get, post",
+    url_regex: "/api/.*",
+    actionType: "set_header",
+    headerName: "X-Api-Key",
+    value: "secret-val",
+    sensitive: true,
+    note: "staging key",
+  });
+  assert.equal(built.rule.enabled, false);
+  assert.deepEqual(built.rule.matchers, { host: "*.acme.test", methods: ["GET", "POST"], url_regex: "/api/.*" });
+  assert.deepEqual(built.rule.actions, [{ type: "set_header", name: "X-Api-Key", value: "secret-val", sensitive: true }]);
+  assert.equal(C.rewriteRuleSummary(built.rule), "request · host=*.acme.test GET/POST url=//api/.*/ · set header X-Api-Key (secret)");
+
+  // Editing an existing sensitive rule with blank value sends value: null so the daemon retains the stored secret,
+  // and preserves extra matchers (headers, body_regex, resp_headers, resp_body_regex).
+  const edited = C.buildRewriteRule({
+    id: 7,
+    name: "auth-hdr",
+    enabled: true,
+    phase: "request",
+    host: "*.acme.test",
+    extraMatchers: { headers: [{ name: "X-Env", value_regex: "stage" }], body_regex: "token=" },
+    actionType: "set_header",
+    headerName: "X-Api-Key",
+    value: "",
+    sensitive: true,
+    hadSensitiveValue: true,
+  });
+  assert.equal(edited.rule.actions[0].value, null, "blank sensitive value on edit must send null to preserve secret");
+  assert.deepEqual(edited.rule.matchers.headers, [{ name: "X-Env", value_regex: "stage" }]);
+  assert.equal(edited.rule.matchers.body_regex, "token=");
+  // Providing a new value overwrites it explicitly.
+  const rotated = C.buildRewriteRule({
+    id: 7, name: "auth-hdr", phase: "request", host: "*.acme.test",
+    actionType: "set_header", headerName: "X-Api-Key", value: "new-secret", sensitive: true, hadSensitiveValue: true,
+  });
+  assert.equal(rotated.rule.actions[0].value, "new-secret");
+  // Multi-action rules are rejected instead of silently truncated.
+  assert.match(C.buildRewriteRule({ id: 9, name: "multi", extraActions: [{ type: "delete_header", name: "X-A" }], actionType: "set_header", headerName: "X-B", value: "1" }).error, /Multi-action/);
+});
+
+test("classifyAuthInput distinguishes ferret open URLs, hex codes/tokens, and bearer tokens", () => {
+  assert.match(C.classifyAuthInput("  ").error, /Paste a login URL/);
+  const code = "0123456789abcdef0123456789abcdef";
+  assert.deepEqual(C.classifyAuthInput("http://127.0.0.1:7878/#code=" + code), { kind: "code", value: code });
+  assert.deepEqual(C.classifyAuthInput("#code=" + code), { kind: "code", value: code });
+  assert.deepEqual(C.classifyAuthInput(code), { kind: "code_or_token", value: code });
+  assert.deepEqual(C.classifyAuthInput("bearer-tok-xyz"), { kind: "token", value: "bearer-tok-xyz" });
+});
+
+test("app.js: when #auth-overlay exists, lost() preserves the DOM non-destructively and sets document.title for ferret-desk KVO", async (t) => {
+  let replacedBody = false;
+  const makeNode = (id) => ({ id, hidden: true, textContent: "", value: "", dataset: {}, addEventListener() {}, focus() {}, setAttribute() {}, append() {} });
+  const nodes = new Map(["auth-overlay", "auth-overlay-reason", "auth-overlay-error", "auth-overlay-form", "auth-overlay-input", "auth-overlay-submit", "auth-overlay-retry"].map((id) => [id, makeNode(id)]));
+  const fake = {
+    document: {
+      title: "ferret",
+      getElementById: (id) => nodes.get(id) || null,
+      createElement: (tag) => ({ tag, kids: [], append(...k) { this.kids.push(...k); }, setAttribute() {} }),
+      createTextNode: (text) => ({ textContent: text }),
+      body: { replaceChildren: () => { replacedBody = true; } },
+    },
+    window: { addEventListener() {} },
+    location: { hash: "", pathname: "/", search: "", reload() {} },
+    history: { replaceState() {} },
+    matchMedia: () => ({ matches: false, addEventListener() {} }),
+    sessionStorage: { getItem: () => null, setItem() {}, removeItem() {} },
+    fetch: async () => ({ ok: false, status: 401 }),
+  };
+  for (const [name, value] of Object.entries(fake)) {
+    const before = Object.getOwnPropertyDescriptor(globalThis, name);
+    Object.defineProperty(globalThis, name, { value, configurable: true, writable: true });
+    t.after(() => (before ? Object.defineProperty(globalThis, name, before) : delete globalThis[name]));
+  }
+  await import("./app.js?page=overlay-check");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(replacedBody, false, "non-destructive overlay must not wipe document.body");
+  assert.equal(nodes.get("auth-overlay").hidden, false, "#auth-overlay must be shown");
+  assert.equal(globalThis.document.title, "ferret · not signed in", "must preserve ferret-desk KVO title contract");
 });

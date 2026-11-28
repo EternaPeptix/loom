@@ -9,7 +9,7 @@ is assumed.
 Copy this directory into the configured packs directory, configure scoped target access, and install
 the operator acceptance contract described in [SECURITY-ORACLES](../../docs/SECURITY-ORACLES.md).
 Start a **new** mission with pack `ctf`, role `dispatcher`. On Linux use the supported Bubblewrap
-configuration and create the reserved workspace `.loom` directory first. Subprocess networking is
+configuration and create the reserved workspace `.ferret` directory first. Subprocess networking is
 deny-all there; trusted structured HTTP still uses explicit mission grants. Interactive TCP pivots
 need a separately qualified proxy/guest bridge and are not supplied by this pack, unless the operator configures a remote box (`[box]`, see [RUN](../../docs/RUN.md)): the solver roles can then run tooling with `box_exec` in a container that reaches the granted targets directly, including raw TCP.
 
@@ -24,7 +24,8 @@ Those profile names must exist in the operator's model configuration. Read-only/
 authenticated ledger review capabilities; filesystem read-only does not mean the journal is frozen.
 
 External tools such as rizin/pdg, GDB/Python, pwntools or z3 are optional operator prerequisites for
-the relevant challenge; Loom does not install them. See [tool limits](../../docs/SECURITY-TOOLS.md)
-and the [evaluation protocol](../../docs/SECURITY-EVAL.md) before making performance claims.
+the relevant challenge; Ferret does not install them. See [tool limits](../../docs/SECURITY-TOOLS.md)
+and the [evaluation protocol](../../docs/SECURITY-EVAL.md) before making performance claims. For A/B
+comparison against a unified generalist solver without domain silos, see [ctf-generalist](../ctf-generalist/README.md).
 
 The pack is marked `solvable`, which tells roles the challenge was built to be solved and refuses `conclude` unreachable; remove the key for targets that are not solvable by construction.
