@@ -2956,12 +2956,14 @@ impl Inner {
         }
     }
 
-    /// Stop one session: cancel its turn and tell it.
+    /// Stop one session: cancel its turn and tell it with a monotonic stop epoch so that once
+    /// the cancelled turn unwinds, the companion channel stop cannot double-interrupt a newly
+    /// resumed turn.
     fn stop_one(&self, id: &SessionId) {
         let st = self.st();
         if let Some(a) = st.known.get(id).and_then(|k| k.active.as_ref()) {
-            a.control.stop_turn();
-            let _ = a.inputs.send(Input::Stop);
+            let epoch = a.control.request_stop();
+            let _ = a.inputs.send(Input::StopAt(epoch));
         }
     }
 
@@ -17460,5 +17462,113 @@ done
         assert!(self_dups.is_empty());
 
         e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn stop_followed_immediately_by_message_does_not_double_interrupt() {
+        // 1) Operator clicks Stop while Turn 1 is stalled in a model request and immediately sends
+        //    a follow-up message with zero delay: Turn 1 ends Stopped, Turn 2 runs to completion
+        //    with a fresh uncancelled token and zero spurious second Interrupted event.
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_c = calls.clone();
+        let e = env(Script::new(move |body, _| {
+            if mentions(body, "CONTINUEMARK1") {
+                Action::Reply(Reply::text("resumed cleanly"))
+            } else {
+                calls_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Action::Stall { ms: 600_000 }
+            }
+        }))
+        .await;
+        let mut req = e.new_session(Some("start stalled turn"));
+        req.role = Some("chat".into());
+        let id = e.rt.create_session(req).await.unwrap().meta.id;
+        until("stalled request started", || calls.load(std::sync::atomic::Ordering::SeqCst) >= 1).await;
+
+        e.rt.stop(&id).await.unwrap();
+        e.rt.send_message(&id, "CONTINUEMARK1").await.unwrap();
+
+        until("second turn yielded", || {
+            let ends: Vec<TurnEndReason> = e
+                .records(&id)
+                .into_iter()
+                .filter_map(|r| match r.event {
+                    Event::TurnEnd { reason } => Some(reason),
+                    _ => None,
+                })
+                .collect();
+            ends.len() >= 2
+        })
+        .await;
+        let rs = e.records(&id);
+        let ends: Vec<TurnEndReason> = rs
+            .iter()
+            .filter_map(|r| match r.event {
+                Event::TurnEnd { reason } => Some(reason),
+                _ => None,
+            })
+            .collect();
+        let interrupted = rs.iter().filter(|r| matches!(r.event, Event::Interrupted { .. })).count();
+        assert_eq!(ends, vec![TurnEndReason::Stopped, TurnEndReason::Yielded], "{:?}", e.kinds(&id));
+        assert_eq!(interrupted, 1, "must record exactly one Interrupted event, not double-interrupt");
+        assert!(
+            rs.iter().any(|r| matches!(&r.event, Event::ModelResponse(m) if m.text.contains("resumed cleanly"))),
+            "resumed turn must complete cleanly"
+        );
+
+        // 2) Exact channel-ordering race: Input::User arrives in the active input channel ahead of
+        //    stop_one()'s companion Input::StopAt(epoch) while Turn 1 is stalled, plus a duplicate
+        //    stop() while unwinding. Turn 1's cancellation marks the epoch handled so Turn 2
+        //    ignores the stale StopAt and runs cleanly without double-interrupting.
+        let calls2 = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls2_c = calls2.clone();
+        let e2 = env(Script::new(move |body, _| {
+            if mentions(body, "CONTINUEMARK2") {
+                Action::Reply(Reply::text("second turn ran"))
+            } else {
+                calls2_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Action::Stall { ms: 600_000 }
+            }
+        }))
+        .await;
+        let mut req2 = e2.new_session(Some("initial work"));
+        req2.role = Some("chat".into());
+        let id2 = e2.rt.create_session(req2).await.unwrap().meta.id;
+        until("stalled request started", || calls2.load(std::sync::atomic::Ordering::SeqCst) >= 1).await;
+
+        e2.rt.send_message(&id2, "CONTINUEMARK2").await.unwrap();
+        e2.rt.stop(&id2).await.unwrap();
+        e2.rt.stop(&id2).await.unwrap();
+
+        until("second turn completes without double-interrupt", || {
+            let ends: Vec<TurnEndReason> = e2
+                .records(&id2)
+                .into_iter()
+                .filter_map(|r| match r.event {
+                    Event::TurnEnd { reason } => Some(reason),
+                    _ => None,
+                })
+                .collect();
+            ends.len() >= 2
+        })
+        .await;
+        let rs2 = e2.records(&id2);
+        let ends2: Vec<TurnEndReason> = rs2
+            .iter()
+            .filter_map(|r| match r.event {
+                Event::TurnEnd { reason } => Some(reason),
+                _ => None,
+            })
+            .collect();
+        let interrupted2 = rs2.iter().filter(|r| matches!(r.event, Event::Interrupted { .. })).count();
+        assert_eq!(ends2, vec![TurnEndReason::Stopped, TurnEndReason::Yielded], "{:?}", e2.kinds(&id2));
+        assert_eq!(interrupted2, 1, "stale StopAt from Turn 1 must never double-interrupt Turn 2");
+        assert!(
+            rs2.iter().any(|r| matches!(&r.event, Event::ModelResponse(m) if m.text.contains("second turn ran"))),
+            "Turn 2 must run cleanly after Turn 1 stopped"
+        );
+
+        e.rt.shutdown().await;
+        e2.rt.shutdown().await;
     }
 }

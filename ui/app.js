@@ -7,10 +7,12 @@ import * as C from "./core.js";
 const $ = (id) => (typeof document.getElementById === "function" ? document.getElementById(id) : null);
 
 // Layout follows the width; input behaviour follows the pointer, so a narrow window with a mouse keeps Enter-to-send.
-const PHONE = matchMedia("(max-width: 699px)");
-const COMPACT = matchMedia("(max-width: 699px), (max-height: 700px)"); // the whole session scrolls as one
-const COARSE = matchMedia("(pointer: coarse)");
 const EMBEDDED_DESK = typeof navigator === "object" && C.isEmbeddedDesk(navigator.userAgent);
+const LAYOUT_Q = C.layoutQueries(EMBEDDED_DESK);
+const NARROW = matchMedia(LAYOUT_Q.narrow);
+const PHONE = matchMedia(LAYOUT_Q.phone);
+const COMPACT = matchMedia(LAYOUT_Q.compact); // the whole session scrolls as one
+const COARSE = matchMedia("(pointer: coarse)");
 /** The one element that scrolls the chat: the session view where it scrolls as a whole, else the record's own scroller. */
 // Phones scroll the whole session as one, but only the Chat tab follows the stream: other tabs write to the hidden chat scroller.
 const chatScroller = () => (COMPACT.matches && S.section === "chat" ? $("view-session") : $("scroller"));
@@ -1109,7 +1111,7 @@ function setView(v) {
   S.view = v;
   if (was === "session" && v !== "session") {
     saveSeen();
-    if (!matchMedia("(max-width: 1099px)").matches) S.inspectorPref = document.body.classList.contains("show-right");
+    if (!NARROW.matches) S.inspectorPref = document.body.classList.contains("show-right");
     if (document.body.classList.contains("show-right")) setDrawer("right", false);
   }
   if (v !== "session") { renderStats(); stopRunTimer(); hideBarIdentity(); $("child-blocker").hidden = true; want("right"); }
@@ -1121,7 +1123,7 @@ function setView(v) {
   $("view-target").hidden = v !== "target";
   if (v === "session") {
     markRead();
-    if (was !== "session" && !matchMedia("(max-width: 1099px)").matches && S.inspectorPref && !document.body.classList.contains("show-right")) {
+    if (was !== "session" && !NARROW.matches && S.inspectorPref && !document.body.classList.contains("show-right")) {
       setDrawer("right", true);
     }
   }
@@ -1263,7 +1265,7 @@ async function loadRecords(store, tries) {
     }
     $("loading").hidden = true;
     // Where the session scrolls as a whole (a phone, a short window) it opens at its latest message and composer.
-    if (!store.landed && matchMedia("(max-width: 699px), (max-height: 700px)").matches) {
+    if (!store.landed && COMPACT.matches) {
       store.landed = true;
       requestAnimationFrame(() => requestAnimationFrame(() => {
         if (S.rec === store && S.section === "chat" && S.follow) $("view-session").scrollTop = $("view-session").scrollHeight;
@@ -7198,8 +7200,8 @@ let drawerOpener = null;
 let nextOpener = null; // the button that asked for a drawer (a click does not focus it in every browser)
 function setDrawer(side, open) {
   const panel = $(side);
-  const narrow = matchMedia("(max-width: 1099px)").matches;
-  const mobile = matchMedia("(max-width: 699px)").matches;
+  const narrow = NARROW.matches;
+  const mobile = PHONE.matches;
   const wasOpen = document.body.classList.contains("show-" + side);
   const asked = nextOpener;
   nextOpener = null;
@@ -7233,13 +7235,20 @@ function tabKeys(event, tabs, activate) {
   event.preventDefault(); activate(tabs[next]); tabs[next].focus();
 }
 
-function resizeInspector(width) {
-  const max = Math.max(280, Math.min(560, Math.floor(innerWidth * 0.45)));
-  const value = Math.max(280, Math.min(max, width));
+let inspectorPreferred = 360;
+function resizeInspector(width, { persist = true } = {}) {
+  const { value, min, max } = C.clampInspectorWidth(width, innerWidth, EMBEDDED_DESK);
   $("app").style.setProperty("--inspector-width", value + "px");
-  $("inspector-resize").setAttribute("aria-valuenow", String(value));
-  $("inspector-resize").setAttribute("aria-valuemax", String(max));
-  remember("inspector-width", value);
+  const handle = $("inspector-resize");
+  if (handle) {
+    handle.setAttribute("aria-valuemin", String(min));
+    handle.setAttribute("aria-valuenow", String(value));
+    handle.setAttribute("aria-valuemax", String(max));
+  }
+  if (persist) {
+    inspectorPreferred = value;
+    remember("inspector-width", value);
+  }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -8129,7 +8138,7 @@ function wire() {
     else location.hash = "#/inbox";
   });
   $("empty-missions").addEventListener("click", (e) => {
-    if (matchMedia("(max-width: 699px)").matches) {
+    if (PHONE.matches) {
       setDrawer("right", false);
       nextOpener = e.currentTarget;
       setDrawer("left", true);
@@ -8206,7 +8215,13 @@ function wire() {
       if (y !== null) lastTouchY = y;
     }, { passive: true });
   }
-  const layoutChanged = () => { if (S.view === "session") want("blocks", "header"); };
+  const layoutChanged = () => {
+    resizeInspector(inspectorPreferred, { persist: false });
+    setDrawer("left", document.body.classList.contains("show-left"));
+    setDrawer("right", document.body.classList.contains("show-right"));
+    if (S.view === "session") want("blocks", "header");
+  };
+  NARROW.addEventListener("change", layoutChanged);
   COMPACT.addEventListener("change", layoutChanged);
   COARSE.addEventListener("change", layoutChanged);
   PHONE.addEventListener("change", layoutChanged);
@@ -8496,6 +8511,7 @@ $("picker").addEventListener("keydown", pickerEmptyKeys);
   window.addEventListener("hashchange", route);
   window.addEventListener("pagehide", saveSeen);
   window.addEventListener("resize", () => {
+    resizeInspector(inspectorPreferred, { persist: false });
     if (S.view === "session") want("header");
     renderDot();
     setDrawer("left", document.body.classList.contains("show-left"));
@@ -8505,7 +8521,7 @@ $("picker").addEventListener("keydown", pickerEmptyKeys);
   resize.addEventListener("keydown", e => {
     const current = Number(resize.getAttribute("aria-valuenow"));
     if (e.key === "ArrowLeft" || e.key === "ArrowRight") { e.preventDefault(); resizeInspector(current + (e.key === "ArrowLeft" ? 16 : -16)); }
-    if (e.key === "Home" || e.key === "End") { e.preventDefault(); resizeInspector(e.key === "Home" ? 280 : 560); }
+    if (e.key === "Home" || e.key === "End") { e.preventDefault(); resizeInspector(e.key === "Home" ? 0 : 560); }
   });
   resize.addEventListener("pointerdown", e => {
     if (e.button !== 0) return;
@@ -8520,8 +8536,8 @@ $("picker").addEventListener("keydown", pickerEmptyKeys);
     const authEl = $("auth-overlay");
     if (authEl && !authEl.hidden) return;
     if (document.querySelector("dialog[open]")) return;
-    const side = matchMedia("(max-width: 1099px)").matches && document.body.classList.contains("show-right") ? "right"
-      : matchMedia("(max-width: 699px)").matches && document.body.classList.contains("show-left") ? "left" : null;
+    const side = NARROW.matches && document.body.classList.contains("show-right") ? "right"
+      : PHONE.matches && document.body.classList.contains("show-left") ? "left" : null;
     if (e.key === "Escape" && !e.defaultPrevented) {
       if (side === "left") { e.preventDefault(); setDrawer("left", false); return; }
       const dismissRightInline = () => {
@@ -9391,7 +9407,8 @@ async function bootApp() {
   setSection("chat", false);
   setDrawer("left", false);
   setDrawer("right", false);
-  resizeInspector(Number(recalled("inspector-width", 396)) || 396);
+  inspectorPreferred = Number(recalled("inspector-width", 360)) || 360;
+  resizeInspector(inspectorPreferred, { persist: false });
   renderDot();
   connect();
   await Promise.all([loadSessions(), loadInbox(), loadStatus(), loadTargets()]);

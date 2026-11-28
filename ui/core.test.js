@@ -5074,3 +5074,50 @@ test("Wave B helpers: multi-principal credsProfilesOf, buildNewSession creds_pro
   assert.deepEqual(summary.flags, ["MITM proxy intercept", "Requires restricted network"]);
   assert.match(summary.warning, /restricted network/i);
 });
+
+test("GUI zoom scaling: layoutQueries, clampInspectorWidth, and zoom-resilient CSS breakpoints", () => {
+  // Embedded desktop keeps desktop shell across zoom levels; browser keeps mobile breakpoints.
+  assert.deepEqual(C.layoutQueries(false), {
+    narrow: "(max-width: 1099px)",
+    phone: "(max-width: 699px)",
+    compact: "(max-width: 699px), (max-height: 700px)",
+  });
+  assert.deepEqual(C.layoutQueries(true), {
+    narrow: "(max-width: 860px)",
+    phone: "(max-width: 560px)",
+    compact: "(max-width: 560px), (max-height: 460px)",
+  });
+
+  // Inspector width clamping scales cleanly across zoom-in and zoom-out without squeezing chat off-screen.
+  assert.deepEqual(C.clampInspectorWidth(480, 1440, true), { value: 480, min: 240, max: 560 });
+  assert.deepEqual(C.clampInspectorWidth(700, 2400, true), { value: 560, min: 240, max: 560 });
+  // At 150% zoom on a 1440px window (960px CSS width), embedded inspector stays docked with 38% cap and 210px min.
+  assert.deepEqual(C.clampInspectorWidth(480, 960, true), { value: 364, min: 210, max: 364 });
+  assert.deepEqual(C.clampInspectorWidth(120, 960, true), { value: 210, min: 210, max: 364 });
+  assert.deepEqual(C.clampInspectorWidth(NaN, 960, true), { value: 300, min: 210, max: 364 });
+  // Standard browser at 1200px uses 240px min and 42% cap (504px).
+  assert.deepEqual(C.clampInspectorWidth(600, 1200, false), { value: 504, min: 240, max: 504 });
+  assert.deepEqual(C.clampInspectorWidth(100, 1200, false), { value: 240, min: 240, max: 504 });
+  assert.deepEqual(C.clampInspectorWidth(undefined, 0, false), { value: 360, min: 240, max: 537 });
+
+  // Style contract: fluid sidebar/chat/composer/gutters and embedded-desk zoom thresholds.
+  const css = readFileSync(join(here, "style.css"), "utf8");
+  assert.match(css, /--sidebar-width:\s*clamp\(192px,\s*21vw,\s*288px\)/);
+  assert.match(css, /--gutter-x:\s*clamp\(12px,\s*2\.2vw,\s*28px\)/);
+  assert.match(css, /\.show-right\s+\.layout\s*\{\s*grid-template-columns:\s*var\(--sidebar-width\)\s+minmax\(0,\s*1fr\)\s+clamp\(240px,\s*var\(--inspector-width,\s*360px\),\s*42vw\)/);
+  assert.match(css, /\.scroller\s*>\s*\*\s*\{\s*width:\s*min\(100%,\s*clamp\(520px,\s*82%,\s*1240px\)\)/);
+  assert.match(css, /\.composer\s*>\s*\*\s*\{\s*width:\s*min\(100%,\s*clamp\(520px,\s*82%,\s*1240px\)\)/);
+  assert.match(css, /@media\s*\(max-width:\s*1099px\)\s*and\s*\(min-width:\s*861px\)[\s\S]*?body\.embedded-desk\.show-right\s+\.layout/);
+  assert.match(css, /@media\s*\(max-width:\s*860px\)[\s\S]*?body\.embedded-desk\s+\.right/);
+  assert.match(css, /@media\s*\(max-width:\s*560px\)[\s\S]*?body\.embedded-desk\s+\.bar/);
+  assert.match(css, /@media\s*\(max-width:\s*560px\),\s*\(max-height:\s*460px\)[\s\S]*?body\.embedded-desk\s+\.view\.session/);
+
+  // Every brace in style.css must stay balanced.
+  let depth = 0;
+  for (const ch of css) {
+    if (ch === "{") depth++;
+    else if (ch === "}") depth--;
+    assert.ok(depth >= 0, "unexpected closing brace in style.css");
+  }
+  assert.equal(depth, 0, "unclosed brace in style.css");
+});

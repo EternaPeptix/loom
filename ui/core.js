@@ -6207,6 +6207,35 @@ export function isEmbeddedDesk(userAgent) {
   return /\bFerretDesk\//.test(String(userAgent ?? ""));
 }
 
+/** Responsive viewport media queries matching `style.css`. Embedded ferret-desk keeps desktop layouts across zoom levels. */
+export function layoutQueries(embeddedDesk = false) {
+  if (embeddedDesk) {
+    return {
+      narrow: "(max-width: 860px)",
+      phone: "(max-width: 560px)",
+      compact: "(max-width: 560px), (max-height: 460px)",
+    };
+  }
+  return {
+    narrow: "(max-width: 1099px)",
+    phone: "(max-width: 699px)",
+    compact: "(max-width: 699px), (max-height: 700px)",
+  };
+}
+
+/** Clamp the docked inspector width against the current CSS viewport so zooming in never pushes chat off-screen. */
+export function clampInspectorWidth(requested, viewportWidth, embeddedDesk = false) {
+  const vw = Number.isFinite(viewportWidth) && viewportWidth > 0 ? viewportWidth : 1280;
+  const compactDocked = !!embeddedDesk && vw <= 1099 && vw > 860;
+  const min = compactDocked ? 210 : 240;
+  const ratio = compactDocked ? 0.38 : 0.42;
+  const max = Math.max(min, Math.min(560, Math.floor(vw * ratio)));
+  const fallback = compactDocked ? 300 : 360;
+  const raw = Number.isFinite(requested) ? requested : fallback;
+  const value = Math.max(min, Math.min(max, Math.round(raw)));
+  return { value, min, max };
+}
+
 const MIME_EXT = {
   "image/png": "png",
   "image/jpeg": "jpg",

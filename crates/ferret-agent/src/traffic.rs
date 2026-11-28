@@ -242,6 +242,161 @@ fn locator_host(locator: &str) -> String {
     norm(host)
 }
 
+/// True when the trailing words of `prefix` (within the current clause) explicitly negate the
+/// immediately following host mention — e.g. `not auth.idp.test`, `instead of auth.idp.test`,
+/// `does not use auth.idp.test`, `doesn't use auth.idp.test`, `not hitting auth.idp.test`,
+/// `not calling auth.idp.test`, `not on auth.idp.test`, `no longer auth.idp.test`, `never auth.idp.test`.
+///
+/// Narrow by design so security claims like `"CSRF is not enforced on api.acme.test"` or
+/// `"api.acme.test does not check auth"` still require traffic to `api.acme.test`.
+fn is_preceded_by_negation(prefix: &str) -> bool {
+    let trimmed = prefix.trim_end_matches(|c: char| {
+        c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '(' | '[' | '<' | ':')
+    });
+    if trimmed.is_empty() {
+        return false;
+    }
+    let clause = trimmed
+        .rsplit_once(['\n', '\r', '.', '!', '?', ';', ',', '(', ')', '[', ']'])
+        .map_or(trimmed, |(_, rest)| rest);
+    let words: Vec<String> = clause
+        .split_whitespace()
+        .map(|w| {
+            w.replace('\u{2019}', "'")
+                .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '\'')
+                .to_ascii_lowercase()
+        })
+        .filter(|w| !w.is_empty())
+        .collect();
+    if words.is_empty() {
+        return false;
+    }
+    const PREPS: &[&str] = &["on", "at", "to", "from", "via", "by", "for", "in", "through", "over"];
+    const VERBS: &[&str] = &[
+        "use", "uses", "used", "using",
+        "hit", "hits", "hitting",
+        "call", "calls", "calling",
+        "reach", "reaches", "reached", "reaching",
+        "contact", "contacts", "contacted", "contacting",
+        "query", "queries", "queried", "querying",
+        "request", "requests", "requested", "requesting",
+        "target", "targets", "targeted", "targeting",
+        "connect", "connects", "connected", "connecting",
+        "talk", "talks", "talked", "talking",
+        "send", "sends", "sent", "sending",
+        "route", "routes", "routed", "routing",
+        "point", "points", "pointed", "pointing",
+        "hosted", "served", "proxied", "forwarded",
+        "redirect", "redirects", "redirected", "redirecting",
+        "going",
+    ];
+    let mut end = words.len();
+    let has_prep = end > 0 && PREPS.contains(&words[end - 1].as_str());
+    if has_prep {
+        end -= 1;
+    }
+    let has_verb = end > 0 && VERBS.contains(&words[end - 1].as_str());
+    if has_verb {
+        end -= 1;
+    }
+    if end == 0 {
+        return false;
+    }
+    let tail = &words[..end];
+    let last = tail[tail.len() - 1].as_str();
+    let prev = tail.len().checked_sub(2).map(|i| tail[i].as_str());
+    let prev2 = tail.len().checked_sub(3).map(|i| tail[i].as_str());
+
+    if matches!(last, "not" | "never" | "neither" | "nor") {
+        return true;
+    }
+    if matches!((prev, last), (Some("instead"), "of") | (Some("rather"), "than") | (Some("no"), "longer")) {
+        return true;
+    }
+    if matches!((prev2, prev, last), (Some("as"), Some("opposed"), "to")) {
+        return true;
+    }
+    if has_verb && matches!(last, "doesn't" | "don't" | "didn't" | "cannot" | "can't" | "won't" | "without") {
+        return true;
+    }
+    if (has_verb || has_prep) && matches!(last, "isn't" | "aren't" | "wasn't" | "weren't") {
+        return true;
+    }
+    false
+}
+
+/// True when `token` looks like an HTTP(S) URL, IP address, or bare dotted hostname (optionally with
+/// `:port` or `/path`).
+fn looks_like_host_token(token: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        return true;
+    }
+    let head = token.split(['/', '?', '#']).next().unwrap_or(token).trim_end_matches(['.', ':', ',']);
+    let host = head
+        .split_once(':')
+        .filter(|(h, p)| !h.contains(':') && !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+        .map_or(head, |(h, _)| h)
+        .trim_matches(['[', ']']);
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+    if !host.contains('.') || host.len() > 253 {
+        return false;
+    }
+    let mut labels = host.split('.');
+    let mut count = 0usize;
+    let mut last_label = "";
+    for label in &mut labels {
+        if label.is_empty()
+            || label.len() > 63
+            || label.starts_with('-')
+            || !label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return false;
+        }
+        count += 1;
+        last_label = label;
+    }
+    count >= 2 && last_label.len() >= 2 && last_label.bytes().any(|b| b.is_ascii_alphabetic())
+}
+
+/// Return a copy of `text` with explicitly negated host mentions (e.g. `"NOT auth.idp.test"`,
+/// `"instead of https://auth.idp.test"`, `"does not use auth.idp.test"`) blanked out so
+/// [`ferret_core::target::claim_hosts`] does not require mission traffic to hosts the claim
+/// explicitly states were NOT used. Any non-negated mention of the same host elsewhere in `text`
+/// stays intact.
+fn strip_negated_hosts(text: &str) -> String {
+    let is_delim = |c: char| {
+        c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '(' | ')' | '<' | '>' | ',' | ';' | '[' | ']')
+    };
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    let mut iter = text.char_indices().peekable();
+    while let Some((i, c)) = iter.next() {
+        if is_delim(c) {
+            continue;
+        }
+        let start = i;
+        let mut end = start + c.len_utf8();
+        while let Some(&(j, nc)) = iter.peek() {
+            if is_delim(nc) {
+                break;
+            }
+            end = j + nc.len_utf8();
+            iter.next();
+        }
+        let token = &text[start..end];
+        if looks_like_host_token(token) && is_preceded_by_negation(&text[..start]) {
+            out.push_str(&text[cursor..start]);
+            out.push(' ');
+            cursor = end;
+        }
+    }
+    out.push_str(&text[cursor..]);
+    out
+}
+
 /// One host a claim names, and the exchanges that show it was reached (empty: not reached).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostReach {
@@ -269,7 +424,8 @@ pub fn claim_reach(
         .filter(|a| matches!(a.kind, AssetKind::Host | AssetKind::Service | AssetKind::Endpoint))
         .map(|a| locator_host(&a.locator))
         .collect();
-    let hosts = ferret_core::target::claim_hosts(&claim.text, &asset_hosts, scope);
+    let filtered = strip_negated_hosts(&claim.text);
+    let hosts = ferret_core::target::claim_hosts(&filtered, &asset_hosts, scope);
     let all = mission.all();
     let support: Vec<_> =
         state.evidence.iter().filter(|e| e.input.claim == claim.id && e.input.attested && e.input.supports).collect();
@@ -330,7 +486,8 @@ pub fn finding_reach(
             combined.push_str(piece);
         }
     }
-    let hosts = ferret_core::target::claim_hosts(&combined, &asset_hosts, scope);
+    let filtered = strip_negated_hosts(&combined);
+    let hosts = ferret_core::target::claim_hosts(&filtered, &asset_hosts, scope);
     let all = mission.all();
     let support: Vec<_> = state
         .evidence
@@ -439,8 +596,24 @@ pub fn check_traffic(
         if missed.is_empty() {
             continue;
         }
+        let has_claim_update = role.tools.iter().any(|x| x == "claim_update");
+        let has_claim = role.tools.iter().any(|x| x == "claim");
+        let target_noun = if missed.len() == 1 { "that host" } else { "those hosts" };
+        let amend = if has_claim_update {
+            format!(
+                " You can withdraw or amend {} with `claim_update` (for example status `withdrawn`), or cite evidence from a call that reached {target_noun}.",
+                claim.id
+            )
+        } else if has_claim {
+            format!(
+                " You can withdraw or amend {} with `claim` (passing `id` and status `withdrawn`), or cite evidence from a call that reached {target_noun}.",
+                claim.id
+            )
+        } else {
+            String::new()
+        };
         return Err(format!(
-            "{tool} cannot be accepted yet: {} names {}, but none of its supporting evidence reached {}. {cite}, or take the host out of the claim.",
+            "{tool} cannot be accepted yet: {} names {}, but none of its supporting evidence reached {}. {cite}, or take the host out of the claim.{amend}",
             claim.id,
             missed.join(", "),
             if missed.len() == 1 { "it" } else { "them" }
@@ -818,5 +991,84 @@ mod tests {
             mac: String::new(),
         });
         check_traffic(&make_role(true), "finish", &state2, &[], &traffic).unwrap();
+    }
+
+    #[test]
+    fn check_traffic_ignores_explicitly_negated_host_mentions_and_hints_claim_update() {
+        use ferret_core::ids::SessionId;
+        use ferret_core::ledger::{ClaimStatus, Entry, EvidenceInput, EvidenceKind, LedgerOp, LedgerState};
+
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = BlobStore::open(dir.path()).unwrap();
+        let traffic = Traffic::none();
+        let scope = ferret_core::target::Scope::parse(&["*.acme.test".into(), "*.idp.test".into()], &[]).unwrap();
+        let _ = traffic.target_scope.set(scope);
+        traffic.mission.add(&make_exchange(
+            &blobs,
+            "ex-222222222222",
+            "wallet.acme.test",
+            Some("call-1"),
+            Some(200),
+        ));
+
+        let build_state = |text: &str| {
+            let mut state = LedgerState::default();
+            let mut n = 0u64;
+            let mut apply = |op: LedgerOp| {
+                n += 1;
+                state.apply(&Entry {
+                    n,
+                    ts_ms: n,
+                    session: SessionId::from("s-1"),
+                    from_user: false,
+                    op,
+                    mac: String::new(),
+                });
+            };
+            apply(LedgerOp::ClaimAdd { text: text.into(), assets: vec![] });
+            apply(LedgerOp::EvidenceAdd(EvidenceInput {
+                claim: "c1".into(),
+                kind: EvidenceKind::Execution,
+                supports: true,
+                session: SessionId::from("s-1"),
+                call_id: CallId::from("call-1"),
+                blob: None,
+                lines: None,
+                quote: None,
+                note: "ran check".into(),
+                attested: true,
+                tool: Some("http_send".into()),
+                grade: Some(ferret_core::event::EvidenceGrade::Run),
+            }));
+            apply(LedgerOp::ClaimUpdate { id: "c1".into(), status: ClaimStatus::Supported, note: "done".into() });
+            state
+        };
+
+        let role = make_role(true);
+        for comparative in [
+            "App uses wallet.acme.test, NOT auth.idp.test",
+            "Routes to wallet.acme.test, not https://auth.idp.test/api/v1",
+            "Uses wallet.acme.test instead of auth.idp.test",
+            "Uses wallet.acme.test rather than `auth.idp.test`",
+            "wallet.acme.test does not use auth.idp.test",
+            "wallet.acme.test doesn't use auth.idp.test",
+            "wallet.acme.test never auth.idp.test and no longer login.idp.test",
+            "wallet.acme.test is not hitting auth.idp.test, not calling login.idp.test, and not on cdn.idp.test",
+        ] {
+            let state = build_state(comparative);
+            check_traffic(&role, "finish", &state, &["e1".into()], &traffic)
+                .unwrap_or_else(|e| panic!("negated host should not block `{comparative}`: {e}"));
+        }
+
+        // Security claims where "not" describes missing protection on a host must still require traffic!
+        let missing_protection = build_state("CSRF is not enforced on auth.idp.test");
+        let err = check_traffic(&role, "finish", &missing_protection, &["e1".into()], &traffic).unwrap_err();
+        assert!(err.contains("auth.idp.test"), "{err}");
+        assert!(err.contains("claim_update"), "error must suggest claim_update: {err}");
+
+        // A host negated once AND asserted affirmatively elsewhere still requires traffic!
+        let mixed = build_state("Uses wallet.acme.test, NOT auth.idp.test. Later auth.idp.test returned 200.");
+        let err = check_traffic(&role, "finish", &mixed, &["e1".into()], &traffic).unwrap_err();
+        assert!(err.contains("auth.idp.test"), "{err}");
     }
 }
