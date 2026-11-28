@@ -421,6 +421,40 @@ outbound alerts) will fail with `UNTRUSTED_IDENTITY`. To trust the updated ident
 - **Slash commands:** `/inbox`, `/status`, `/tail [id|#n] [count]`, `/scope <id|#n> [host...]`,
   `/dismiss [id|#n]`, `/stop [id|#n]`, `/resume [id|#n]`, `/approve <id|#n> <text>`,
   `/rule <id|#n> <text>`, `/release <id|#n> <reason>`, `/mute [15m|2h|off]`, `/unmute`, and `/help` (`/start`).
+  When `[signal.guests]` is enabled, operators also have `/guests` and `/guest approve|revoke|block|unblock|clear|say`.
+
+### Guest chat and unknown-sender gatekeeper
+
+`[signal.guests]` (off by default) lets non-operator direct messages be handled safely without ever
+exposing operator missions, files, tools, or commands:
+
+```toml
+[signal.guests]
+enabled = true
+owner_name = "Jordan"
+# allow = ["+15550101", "00000000-0000-4000-8000-000000000001"]  # optional static pre-approved guests
+# model = "local"                                                # optional [models.*] profile for guests
+# persona = "Keep answers brief and friendly."
+```
+
+- **Fail-closed & DM-only:** When disabled, non-operator messages are silently dropped. Even when enabled,
+  non-operator group messages are always silently dropped.
+- **Unknown DM gatekeeper (zero LLM calls):** Blocked senders are silently ignored. First-time unknown DM
+  senders receive the fixed `unknown_reply` (rate-limited per sender by `unknown_cooldown_hours`, default
+  `24`) and, when `notify_owner_on_unknown = true`, trigger a quote-replyable `[Ferret · NEW CONTACT]`
+  alert to `signal.recipient`. Quote-reply `"approve"` (or `"approve <nickname>"`) to allow them and send a
+  welcome DM, or `"block"` / `"deny"` to silence future messages.
+- **Strict isolation for approved guests:** Approved guests (from static `allow` or owner approval) talk to
+  an isolated LLM completion path with an immutable safety preamble, zero host/file/mission/mail/operator
+  tools, per-guest rolling history in `~/.ferret/signal_guests.json` (mode `0600`), hourly message limits
+  (`rate_limit_per_hour`), and a per-guest single-flight guard so guest replies never block operator commands.
+- **Guest commands & notes:** Guests may only use `/help`, `/reset` (`/clear`), and `/note <message>` (when
+  `allow_notes = true`, capped at 500 characters and 3 notes per 15 minutes; the model may also call
+  `leave_note_for_owner` under the same cap). Delivered `[Ferret · GUEST NOTE from <name>]` alerts can be
+  quote-replied by the owner to message the guest directly without an LLM in the middle.
+- **Owner guest commands:** `/guests` (lists approved, pending, and blocked contacts with `#1..#N` aliases),
+  `/guest approve <id|#n|e164|uuid> [name]`, `/guest revoke <id|#n|name>`, `/guest block <id|#n|name>`,
+  `/guest unblock <id|#n>`, `/guest clear <id|#n|name>`, and `/guest say <id|#n|name> <message>`.
 
 ## Start
 
@@ -676,7 +710,7 @@ the finish is then delivered at once, marked `not verified`.
 
 Under the ferret home: `config.toml`, `token`, `daemon.json`, `daemon.lock`, `keys/`, `ca/`, `logs/ferretd.log`,
 `packs/`, `targets/`, `blobs/` (stored outputs), `rewrite_rules.json` (0600, operator proxy rewrites),
-`signal_sent.json` (0600, Signal quote-reply map), `sessions/<id>/` (`log.jsonl`, `meta.json`, `status.json`, `jobs/`,
+`signal_sent.json` (0600, Signal quote-reply map), `signal_guests.json` (0600, Signal guest approvals, blocks, and isolated chat histories), `sessions/<id>/` (`log.jsonl`, `meta.json`, `status.json`, `jobs/`,
 `tmp/`, `queued/`, `net.jsonl`, and for a child `settlement.json` and, when it works in its own copy
 of the workspace, `copy.json`), `missions/<id>/` (`journal.jsonl`, `journal.head`). Session ids made
 of anything other than letters, digits, `-`, `_` and `.` never map to a path outside the home.

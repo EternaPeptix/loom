@@ -4551,6 +4551,9 @@ test("export URLs and daemon report formatters (SARIF, HAR, reload, GC, MCP chec
   assert.equal(sigOn.state, "Connected");
   assert.equal(sigOn.tone, "ok");
   assert.ok(sigOn.rows.some(([k, v]) => k === "Account" && v === "+1555"));
+  assert.ok(!sigOn.rows.some(([k]) => k === "Guests"));
+  const sigGuests = C.formatSignalStatus({ enabled: true, connected: true, account: "+15550100", recipient: "+15550199", guests_enabled: true, guests_approved: 2, guests_pending: 1 }, 100000);
+  assert.ok(sigGuests.rows.some(([k, v]) => k === "Guests" && v === "2 approved, 1 pending"));
 });
 
 test("rewriteRuleSummary and buildRewriteRule validate and format proxy rewrite rules", () => {

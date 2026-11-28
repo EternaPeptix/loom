@@ -5875,6 +5875,9 @@ export function formatSignalStatus(signal, now = Date.now()) {
   const rows = [];
   if (signal.account) rows.push(["Account", String(signal.account)]);
   if (signal.recipient) rows.push(["Recipient", String(signal.recipient)]);
+  if (signal.guests_enabled) {
+    rows.push(["Guests", `${num(signal.guests_approved || 0)} approved, ${num(signal.guests_pending || 0)} pending`]);
+  }
   if (signal.last_event_ms) rows.push(["Last event", age(now, signal.last_event_ms) === "now" ? "just now" : age(now, signal.last_event_ms) + " ago"]);
   if (signal.last_send_ms) rows.push(["Last send", age(now, signal.last_send_ms) === "now" ? "just now" : age(now, signal.last_send_ms) + " ago"]);
   if (muted) rows.push(["Muted until", new Date(signal.muted_until_ms).toLocaleTimeString()]);

@@ -1045,6 +1045,9 @@ fn format_signal_status(sig: &SignalStatusView, style: &Style, width: usize, out
     if sig.muted_until_ms.is_some() {
         parts.push("muted".to_string());
     }
+    if sig.guests_enabled {
+        parts.push(format!("guests: {} approved, {} pending", sig.guests_approved, sig.guests_pending));
+    }
     let line = parts.join(" · ");
     out.push(format!("{mark} {}", cut(&line, width.saturating_sub(2))));
     if let Some(err) = sig.last_error.as_deref().filter(|s| !s.trim().is_empty()) {
@@ -2893,13 +2896,31 @@ mod tests {
             dropped_events: 2,
             pending_sends: 1,
             muted_until_ms: Some(999999),
+            ..SignalStatusView::default()
         });
         let with_sig = status(&view, &MONO);
         assert!(
             with_sig.contains("✗ signal: disconnected · +15550100 -> +15550199 · pending 1 · dropped 2 · muted\n"),
             "{with_sig}"
         );
+        assert!(!with_sig.contains("guests:"), "{with_sig}");
         assert!(with_sig.contains("  error: UNTRUSTED_IDENTITY: trust safety number\n"), "{with_sig}");
+        // Guest counts appear when signal.guests_enabled is true.
+        if let Some(sig) = view.signal.as_mut() {
+            sig.connected = true;
+            sig.last_error = None;
+            sig.muted_until_ms = None;
+            sig.pending_sends = 0;
+            sig.dropped_events = 0;
+            sig.guests_enabled = true;
+            sig.guests_approved = 3;
+            sig.guests_pending = 1;
+        }
+        let with_guests = status(&view, &MONO);
+        assert!(
+            with_guests.contains("✓ signal: connected · +15550100 -> +15550199 · guests: 3 approved, 1 pending\n"),
+            "{with_guests}"
+        );
         view.signal = None;
         // An unsafe posture (unconfined, or open network) is warned in bold yellow.
         view.sandbox = "none".into();

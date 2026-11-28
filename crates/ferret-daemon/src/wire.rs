@@ -64,6 +64,12 @@ pub struct SignalStatusView {
     pub pending_sends: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub muted_until_ms: Option<u64>,
+    #[serde(default)]
+    pub guests_enabled: bool,
+    #[serde(default)]
+    pub guests_approved: usize,
+    #[serde(default)]
+    pub guests_pending: usize,
 }
 
 /// Thread-safe live health state shared between the Signal bridge and `GET /api/status`.
@@ -87,6 +93,9 @@ impl SignalHealth {
                 dropped_events: 0,
                 pending_sends: 0,
                 muted_until_ms: None,
+                guests_enabled: cfg.guests.enabled,
+                guests_approved: 0,
+                guests_pending: 0,
             }),
         }
     }
@@ -157,6 +166,12 @@ impl SignalHealth {
 
     pub fn set_muted_until(&self, until_ms: Option<u64>) {
         self.write().muted_until_ms = until_ms;
+    }
+
+    pub fn set_guest_counts(&self, approved: usize, pending: usize) {
+        let mut w = self.write();
+        w.guests_approved = approved;
+        w.guests_pending = pending;
     }
 }
 
@@ -501,4 +516,39 @@ pub struct DaemonFile {
     pub pid: u32,
     pub bind: String,
     pub started_ms: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signal_health_tracks_guest_telemetry_and_deserializes_legacy_views() {
+        let cfg = ferret_core::config::SignalCfg {
+            enabled: true,
+            account: "+15550100".into(),
+            recipient: "+15550199".into(),
+            guests: ferret_core::config::SignalGuestsCfg {
+                enabled: true,
+                ..ferret_core::config::SignalGuestsCfg::default()
+            },
+            ..ferret_core::config::SignalCfg::default()
+        };
+
+        let health = SignalHealth::from_config(&cfg);
+        let snap = health.snapshot();
+        assert!(snap.enabled);
+        assert!(snap.guests_enabled);
+        assert_eq!((snap.guests_approved, snap.guests_pending), (0, 0));
+
+        health.set_guest_counts(4, 2);
+        let updated = health.snapshot();
+        assert_eq!((updated.guests_approved, updated.guests_pending), (4, 2));
+
+        // Older daemon JSON without guest fields deserializes cleanly via #[serde(default)].
+        let legacy = r#"{"enabled":true,"connected":true,"account":"+15550100","recipient":"+15550199"}"#;
+        let parsed: SignalStatusView = serde_json::from_str(legacy).unwrap();
+        assert!(!parsed.guests_enabled);
+        assert_eq!((parsed.guests_approved, parsed.guests_pending), (0, 0));
+    }
 }

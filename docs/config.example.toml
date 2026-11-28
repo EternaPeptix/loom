@@ -234,6 +234,23 @@ allow_groups = []
 events = ["blocker", "question", "approval", "parked", "finished", "error"]
 max_chars = 3500                                # max characters per outbound Signal message (200..=7500)
 
+[signal.guests]
+# Optional isolated guest-chat and unknown-sender gatekeeper for direct messages. Off by default
+# (fail-closed: non-operator senders are silently dropped). Guests have ZERO access to workspaces,
+# missions, sessions, files, emails, tools, or operator commands. See docs/RUN.md, "Guest chat".
+enabled = false
+# allow = ["+15550101", "00000000-0000-4000-8000-000000000001"]  # static pre-approved guest E.164 or Signal UUIDs; "*" refused; example
+# model = "local"                               # optional [models.*] profile for guest chats; omitted = default_model
+owner_name = "the owner"                        # owner name shown in the guest safety preamble (1..=100 chars)
+unknown_reply = "Hi! I'm an AI assistant. I've let my owner know you reached out — once they approve your contact, I'll be able to chat with you here."
+notify_owner_on_unknown = true                  # alert signal.recipient on new unknown DMs (quote-reply "approve" or "block")
+allow_notes = true                              # allow approved guests to pass notes to the owner via /note or leave_note_for_owner
+max_history_turns = 20                          # rolling conversation turn pairs kept per guest (1..=100)
+rate_limit_per_hour = 30                        # max LLM turns per guest per rolling hour (1..=500)
+max_reply_chars = 1500                          # max characters per guest reply (200..=7500)
+unknown_cooldown_hours = 24                     # hours before an unapproved unknown sender receives another auto-reply (1..=720)
+persona = ""                                    # optional custom persona appended after the immutable safety boundary (<=2000 chars)
+
 [notify]
 # command = ["/usr/local/bin/my-notify"]   # program run per notification, given FERRET_KIND, FERRET_SESSION, FERRET_TITLE and FERRET_TEXT in its environment; default: the platform's notifier (macOS only; elsewhere nobody is notified)
 repeat_minutes = 0         # re-notify an unanswered blocking item this often (also forwarded to [signal] when enabled); 0 = never (example: 30)

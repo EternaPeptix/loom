@@ -673,7 +673,7 @@ use ferret_core::config::{ensure_private_dir, Config, NetworkMode, Paths, Sandbo
 use ferret_core::estimate::TokenEstimator;
 use ferret_core::event::{
     Author, Brief, Budget, ChildOutcome, ChildSettled, ChildSpawned, Event, EvidenceGrade, Forked, InboxItem, ModelRef,
-    NetDecision, Record, Seq, SessionOutcome, SessionStart, SpawnMode, Termination, ToolClass, ToolStatus,
+    NetDecision, Record, Seq, SessionOutcome, SessionStart, SpawnMode, Termination, ToolClass, ToolSpec, ToolStatus,
     TurnEndReason, Usage, META_ALSO_STORED, META_EXIT_CODE, META_OF_BLOB, META_RAW_BLOB, META_SIGNAL,
 };
 use ferret_core::journal::{self, Journal};
@@ -711,6 +711,24 @@ pub const BUS_CAPACITY: usize = 8_192;
 /// Operator notifications kept on the dedicated notice channel (`Runtime::subscribe_notices`),
 /// isolated from high-volume streaming `BusEvent::Delta` traffic.
 pub const NOTICES_CAPACITY: usize = 256;
+
+/// Name of the sole optional tool exposed during [`Runtime::isolated_guest_chat`].
+pub const GUEST_NOTE_TOOL_NAME: &str = "leave_note_for_owner";
+
+/// One conversational turn passed into [`Runtime::isolated_guest_chat`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuestChatTurn {
+    pub role: String, // "user" or "assistant"
+    pub text: String,
+}
+
+/// Reply produced by [`Runtime::isolated_guest_chat`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GuestChatReply {
+    pub text: String,
+    pub notes: Vec<String>,
+    pub model_used: String,
+}
 
 /// Whether a new mission decrypts HTTPS (CONTRACTS-TRAFFIC-TARGETS I1): `[network] intercept` decides
 /// (`always` / `never`), else the mission's own choice, else its pack's flag.
@@ -7188,6 +7206,196 @@ impl Runtime {
         out
     }
 
+    /// Run a physically tool-isolated guest chat turn against a live model profile.
+    ///
+    /// Security invariants:
+    /// - Uses the live hot-reloadable model table (`self.inner.models`) and acquires a
+    ///   [`Priority::Background`] slot so guest chats never starve active missions.
+    /// - Sets `text_calls = false` and passes no blob/image resolver.
+    /// - Exposes either zero tools (`!allow_note_tool`) or strictly the single
+    ///   [`GUEST_NOTE_TOOL_NAME`] tool (`allow_note_tool`); no host, file, shell, web, ledger,
+    ///   mail, or mission tools are ever provided.
+    /// - Performs at most ONE follow-up completion (with zero tools) when `leave_note_for_owner`
+    ///   is invoked, capped at 1 trimmed note (<= 500 chars) per turn. Any unknown or disallowed
+    ///   tool call is rejected immediately without execution or looping.
+    pub async fn isolated_guest_chat(
+        &self,
+        profile: Option<&str>,
+        system_prompt: &str,
+        history: &[GuestChatTurn],
+        allow_note_tool: bool,
+        max_tokens: u32,
+        cancel: &CancellationToken,
+    ) -> Result<GuestChatReply, String> {
+        const GUEST_CHAT_TIMEOUT: Duration = Duration::from_secs(60);
+        const GUEST_NOTE_MAX_CHARS: usize = 500;
+        const GUEST_NOTE_TOOL_RESULT: &str =
+            "Note recorded for delivery to the owner. Now write a brief, friendly reply to the guest.";
+
+        self.inner.check_open()?;
+        let models = self.inner.models();
+        let requested = profile.map(str::trim).filter(|s| !s.is_empty());
+        let profile_name = models.resolve(requested)?;
+        let rt = models
+            .get(&profile_name)
+            .cloned()
+            .ok_or_else(|| format!("model profile \"{profile_name}\" is not configured ({}).", models.names()))?;
+        let model_used = lock(&rt.discovered)
+            .as_ref()
+            .map(|d| d.served_model.clone())
+            .unwrap_or_else(|| rt.client.profile().model.clone());
+
+        let mut messages: Vec<ferret_core::Message> = Vec::with_capacity(history.len() + 1);
+        if !system_prompt.trim().is_empty() {
+            messages.push(ferret_core::Message::system(system_prompt));
+        }
+        let mut turn_count = 0usize;
+        for turn in history {
+            if turn.text.trim().is_empty() {
+                continue;
+            }
+            match turn.role.as_str() {
+                "user" => {
+                    messages.push(ferret_core::Message::user(turn.text.clone()));
+                    turn_count += 1;
+                }
+                "assistant" => {
+                    messages.push(ferret_core::Message::assistant(turn.text.clone()));
+                    turn_count += 1;
+                }
+                other => {
+                    return Err(format!(
+                        "invalid guest chat turn role \"{other}\"; expected \"user\" or \"assistant\"."
+                    ));
+                }
+            }
+        }
+        if turn_count == 0 {
+            return Err("guest chat requires at least one non-empty message.".to_string());
+        }
+
+        let tools = if allow_note_tool {
+            vec![ToolSpec {
+                name: GUEST_NOTE_TOOL_NAME.to_string(),
+                description: "Leave a concise note or message for the owner to read later.".to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "note": {
+                            "type": "string",
+                            "description": "Concise message to pass along to the owner (max 500 characters)."
+                        }
+                    },
+                    "required": ["note"],
+                    "additionalProperties": false
+                }),
+                class: ToolClass::Nav,
+            }]
+        } else {
+            Vec::new()
+        };
+
+        let clamped_max_tokens = u64::from(max_tokens.clamp(128, 2048));
+        let req_cancel = cancel.child_token();
+        let work = async {
+            let request = ChatRequest {
+                messages: messages.clone(),
+                tools,
+                tool_choice: ToolChoice::Auto,
+                max_tokens: Some(clamped_max_tokens),
+                seed: None,
+                extra: serde_json::Map::new(),
+                images: ferret_model::ImageResolver::default(),
+                text_calls: false,
+            };
+            let permit = rt
+                .limiter
+                .acquire(Priority::Background, &req_cancel)
+                .await
+                .ok_or_else(|| "Guest chat request was cancelled.".to_string())?;
+            let first = rt.client.complete(&request, None, &req_cancel).await;
+            drop(permit);
+            let first = first.map_err(|e| texts::sentence(&e.to_string()))?;
+
+            if first.tool_calls.is_empty() {
+                return Ok(GuestChatReply { text: first.text.trim().to_string(), notes: Vec::new(), model_used });
+            }
+
+            for tc in &first.tool_calls {
+                if !allow_note_tool || tc.name != GUEST_NOTE_TOOL_NAME {
+                    return Err(format!("guest chat model attempted disallowed tool call `{}`.", tc.name));
+                }
+            }
+
+            let mut notes: Vec<String> = Vec::new();
+            let mut asst = ferret_core::Message::assistant(first.text.clone());
+            asst.tool_calls = first
+                .tool_calls
+                .iter()
+                .map(|tc| ferret_core::message::ToolCallMsg {
+                    id: tc.call_id.as_str().to_string(),
+                    name: tc.name.clone(),
+                    arguments: tc.arguments.clone(),
+                })
+                .collect();
+            messages.push(asst);
+
+            for tc in &first.tool_calls {
+                let tool_reply = if !notes.is_empty() {
+                    "Only one note may be recorded per turn; this extra note was ignored."
+                } else if let Some(note) = extract_guest_note(&tc.arguments, GUEST_NOTE_MAX_CHARS) {
+                    notes.push(note);
+                    GUEST_NOTE_TOOL_RESULT
+                } else {
+                    "Could not record note: provide a non-empty `note` string."
+                };
+                messages.push(ferret_core::Message::tool(tc.call_id.as_str(), tool_reply));
+            }
+
+            let follow_req = ChatRequest {
+                messages,
+                tools: Vec::new(),
+                tool_choice: ToolChoice::Auto,
+                max_tokens: Some(clamped_max_tokens),
+                seed: None,
+                extra: serde_json::Map::new(),
+                images: ferret_model::ImageResolver::default(),
+                text_calls: false,
+            };
+            let permit = rt
+                .limiter
+                .acquire(Priority::Background, &req_cancel)
+                .await
+                .ok_or_else(|| "Guest chat request was cancelled.".to_string())?;
+            let follow = rt.client.complete(&follow_req, None, &req_cancel).await;
+            drop(permit);
+            let follow = follow.map_err(|e| texts::sentence(&e.to_string()))?;
+
+            if !follow.tool_calls.is_empty() {
+                return Err(format!(
+                    "guest chat model attempted disallowed tool call `{}` on follow-up.",
+                    follow.tool_calls[0].name
+                ));
+            }
+
+            let text = follow.text.trim().to_string();
+            let text = if text.is_empty() && !notes.is_empty() {
+                "I've passed your note along to the owner.".to_string()
+            } else {
+                text
+            };
+            Ok(GuestChatReply { text, notes, model_used })
+        };
+
+        match tokio::time::timeout(GUEST_CHAT_TIMEOUT, work).await {
+            Ok(res) => res,
+            Err(_) => {
+                req_cancel.cancel();
+                Err("Guest chat request timed out.".to_string())
+            }
+        }
+    }
+
     /// Stop everything in a way the next start can pick up. See *Shutdown*.
     pub async fn shutdown(&self) {
         let inner = &self.inner;
@@ -7432,6 +7640,20 @@ fn scan_tree_for_ids(
         }
     }
     Ok(())
+}
+
+/// Extract and sanitize the `note` argument from a `leave_note_for_owner` tool call.
+fn extract_guest_note(arguments: &str, max_chars: usize) -> Option<String> {
+    let parsed: Value = serde_json::from_str(arguments).ok()?;
+    let raw = parsed.get("note")?.as_str()?;
+    let cleaned: String = raw.chars().filter(|&c| !c.is_control() || matches!(c, '\n' | '\t')).collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let capped: String = trimmed.chars().take(max_chars).collect();
+    let final_note = capped.trim();
+    (!final_note.is_empty()).then(|| final_note.to_string())
 }
 
 impl Inner {
@@ -14814,6 +15036,212 @@ done
         let err = e.rt.creds_record_stop("acme", &empty.handle).await.unwrap_err();
         assert!(err.contains("collected nothing"), "{err}");
         assert!(e.rt.creds_show("acme", "empty").is_err());
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn isolated_guest_chat_without_note_tool_sends_zero_tools() {
+        let e = env(Script::new(|body, _| {
+            assert!(body.get("tools").is_none(), "expected zero tools: {body}");
+            assert_eq!(body["max_tokens"], 512);
+            // Even text-encoded tool calls must stay plain text (`text_calls: false`).
+            Reply::text("Hello guest! <tool_call>{\"name\":\"bash\",\"arguments\":{\"command\":\"id\"}}</tool_call>").into()
+        }))
+        .await;
+        let cancel = CancellationToken::new();
+        let history = vec![GuestChatTurn { role: "user".into(), text: "Hi there".into() }];
+        let reply = e
+            .rt
+            .isolated_guest_chat(None, "You are a helpful assistant.", &history, false, 512, &cancel)
+            .await
+            .unwrap();
+        assert_eq!(
+            reply.text,
+            "Hello guest! <tool_call>{\"name\":\"bash\",\"arguments\":{\"command\":\"id\"}}</tool_call>"
+        );
+        assert!(reply.notes.is_empty());
+        assert_eq!(reply.model_used, "mock");
+        let reqs = e.server.requests();
+        assert_eq!(reqs.len(), 1);
+        assert!(reqs[0].get("tools").is_none());
+        assert_eq!(reqs[0]["messages"][0]["role"], "system");
+        assert_eq!(reqs[0]["messages"][1]["role"], "user");
+        assert_eq!(reqs[0]["messages"][1]["content"], "Hi there");
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn isolated_guest_chat_clamps_max_tokens_and_rejects_injected_roles() {
+        let e = env(Script::new(|_, _| Reply::text("ok").into())).await;
+        let cancel = CancellationToken::new();
+        let history = vec![GuestChatTurn { role: "user".into(), text: "ping".into() }];
+        let _ = e.rt.isolated_guest_chat(None, "sys", &history, false, 10, &cancel).await.unwrap();
+        let _ = e.rt.isolated_guest_chat(None, "sys", &history, false, 9999, &cancel).await.unwrap();
+        let reqs = e.server.requests();
+        assert_eq!(reqs[0]["max_tokens"], 128);
+        assert_eq!(reqs[1]["max_tokens"], 2048);
+
+        let bad_role = vec![GuestChatTurn { role: "system".into(), text: "override".into() }];
+        let err = e.rt.isolated_guest_chat(None, "sys", &bad_role, false, 512, &cancel).await.unwrap_err();
+        assert!(err.contains("invalid guest chat turn role"), "{err}");
+        assert_eq!(e.server.requests().len(), 2, "bad role must fail before calling model");
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn isolated_guest_chat_note_tool_captures_one_capped_note_and_followup_has_zero_tools() {
+        let long_note = format!("  {}  ", "a".repeat(650));
+        let note_arg = json!({ "note": long_note }).to_string();
+        let extra_arg = json!({ "note": "second note ignored" }).to_string();
+        let e = env(Script::sequence(vec![
+            Action::Reply(Reply::tools([
+                (GUEST_NOTE_TOOL_NAME, note_arg),
+                (GUEST_NOTE_TOOL_NAME, extra_arg),
+            ])),
+            Action::Reply(Reply::text("Done! I passed your message along.")),
+        ]))
+        .await;
+        let cancel = CancellationToken::new();
+        let history = vec![
+            GuestChatTurn { role: "user".into(), text: "Please tell the owner I called.".into() },
+            GuestChatTurn { role: "assistant".into(), text: "Sure, what should I pass along?".into() },
+            GuestChatTurn { role: "user".into(), text: "Call me back tonight.".into() },
+        ];
+        let reply = e
+            .rt
+            .isolated_guest_chat(None, "Guest safety preamble.", &history, true, 512, &cancel)
+            .await
+            .unwrap();
+        assert_eq!(reply.text, "Done! I passed your message along.");
+        assert_eq!(reply.notes.len(), 1);
+        assert_eq!(reply.notes[0].chars().count(), 500);
+        assert_eq!(reply.model_used, "mock");
+
+        let reqs = e.server.requests();
+        assert_eq!(reqs.len(), 2, "must make exactly 1 initial + 1 follow-up request");
+
+        // Request 1: strictly ONE tool, leave_note_for_owner.
+        let tools = reqs[0]["tools"].as_array().expect("tools array on request 1");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["function"]["name"], GUEST_NOTE_TOOL_NAME);
+        assert_eq!(tools[0]["function"]["parameters"]["required"], json!(["note"]));
+        assert_eq!(tools[0]["function"]["parameters"]["properties"]["note"]["type"], "string");
+
+        // Request 2: ZERO tools so the model cannot loop, plus tool result message.
+        assert!(reqs[1].get("tools").is_none(), "follow-up must send zero tools: {}", reqs[1]);
+        let msgs = reqs[1]["messages"].as_array().unwrap();
+        let tool_contents: Vec<&str> = msgs
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .filter_map(|m| m["content"].as_str())
+            .collect();
+        assert_eq!(tool_contents.len(), 2);
+        assert_eq!(
+            tool_contents[0],
+            "Note recorded for delivery to the owner. Now write a brief, friendly reply to the guest."
+        );
+        assert!(tool_contents[1].contains("Only one note"), "{}", tool_contents[1]);
+        e.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn isolated_guest_chat_rejects_unknown_and_disallowed_tool_calls_without_looping() {
+        // Case 1: allow_note_tool = true, model tries to call `bash`.
+        let e = env(Script::sequence(vec![
+            Action::Reply(Reply::tool("bash", r#"{"command":"id"}"#)),
+            Action::Reply(Reply::text("should never be reached")),
+        ]))
+        .await;
+        let cancel = CancellationToken::new();
+        let history = vec![GuestChatTurn { role: "user".into(), text: "run id".into() }];
+        let err = e.rt.isolated_guest_chat(None, "sys", &history, true, 512, &cancel).await.unwrap_err();
+        assert!(err.contains("disallowed tool call `bash`"), "{err}");
+        assert_eq!(e.server.requests().len(), 1, "must not send follow-up or loop on unknown tool");
+        e.rt.shutdown().await;
+
+        // Case 2: allow_note_tool = false, model tries to emit `leave_note_for_owner` anyway.
+        let e2 = env(Script::sequence(vec![
+            Action::Reply(Reply::tool(GUEST_NOTE_TOOL_NAME, r#"{"note":"sneaky"}"#)),
+            Action::Reply(Reply::text("should never be reached")),
+        ]))
+        .await;
+        let err2 = e2.rt.isolated_guest_chat(None, "sys", &history, false, 512, &cancel).await.unwrap_err();
+        assert!(err2.contains("disallowed tool call"), "{err2}");
+        assert_eq!(e2.server.requests().len(), 1);
+        e2.rt.shutdown().await;
+
+        // Case 3: follow-up tries to call a tool again despite zero tools -> rejected, max 2 requests.
+        let e3 = env(Script::sequence(vec![
+            Action::Reply(Reply::tool(GUEST_NOTE_TOOL_NAME, r#"{"note":"first"}"#)),
+            Action::Reply(Reply::tool(GUEST_NOTE_TOOL_NAME, r#"{"note":"loop"}"#)),
+            Action::Reply(Reply::text("should never be reached")),
+        ]))
+        .await;
+        let err3 = e3.rt.isolated_guest_chat(None, "sys", &history, true, 512, &cancel).await.unwrap_err();
+        assert!(err3.contains("on follow-up"), "{err3}");
+        assert_eq!(e3.server.requests().len(), 2, "must never loop past 1 follow-up");
+        e3.rt.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn isolated_guest_chat_selects_named_profile_and_uses_background_priority() {
+        let (e, other) = env_two_models(
+            Script::new(|_, _| Reply::text("from primary").into()),
+            Script::new(|_, _| Reply::text("from guest profile").into()),
+        )
+        .await;
+        let cancel = CancellationToken::new();
+        let history = vec![GuestChatTurn { role: "user".into(), text: "hello".into() }];
+        let reply = e
+            .rt
+            .isolated_guest_chat(Some("other"), "sys", &history, false, 512, &cancel)
+            .await
+            .unwrap();
+        assert_eq!(reply.text, "from guest profile");
+        assert_eq!(reply.model_used, "mock");
+        assert_eq!(e.server.requests().len(), 0);
+        assert_eq!(other.requests().len(), 1);
+
+        // Verify guest chat uses lowest priority (Priority::Background): when capacity=1 is held
+        // and guest chat enqueues BEFORE a Child waiter, the Child waiter still gets the slot first.
+        let limiter = e.rt.inner.models().get("other").unwrap().limiter.clone();
+        limiter.set_capacity(1);
+        let held = limiter.acquire(Priority::Lead, &cancel).await.unwrap();
+        let rt_clone = e.rt.clone();
+        let hist_clone = history.clone();
+        let c_clone = cancel.clone();
+        let guest_task = tokio::spawn(async move {
+            rt_clone.isolated_guest_chat(Some("other"), "sys", &hist_clone, false, 512, &c_clone).await
+        });
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(limiter.waiting(), 1);
+        let lim_child = limiter.clone();
+        let c_child = cancel.clone();
+        let child_task = tokio::spawn(async move { lim_child.acquire(Priority::Child, &c_child).await.unwrap() });
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(limiter.waiting(), 2);
+        drop(held);
+        let child_permit = child_task.await.unwrap();
+        assert_eq!(other.requests().len(), 1, "guest chat must still be waiting behind Child permit");
+        drop(child_permit);
+        let guest_res = guest_task.await.unwrap().unwrap();
+        assert_eq!(guest_res.text, "from guest profile");
+        assert_eq!(other.requests().len(), 2);
+
+        // Pre-cancelled token returns promptly without hitting the model server.
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let err = e
+            .rt
+            .isolated_guest_chat(Some("other"), "sys", &history, false, 512, &cancelled)
+            .await
+            .unwrap_err();
+        assert!(err.contains("cancelled"), "{err}");
+        assert_eq!(other.requests().len(), 2);
         e.rt.shutdown().await;
     }
 }

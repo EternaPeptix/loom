@@ -296,5 +296,18 @@ and post-restart open-blocker reminders) and can answer or steer missions direct
   work from Signal. Verify setup with `ferret signal check` and `ferret signal test`, and monitor live bridge
   health in `ferret status` / `GET /api/status`. See `docs/RUN.md` ("Signal") for step-by-step setup and
   troubleshooting.
+- **Isolated guest chat & unknown-sender gatekeeper (`[signal.guests]`):** Disabled by default (fail-closed:
+  non-operator senders stay silently dropped). When enabled, guest routing is strictly DM-only (non-operator
+  group messages are always silently dropped). Unknown DM senders never invoke an LLM: blocked contacts are
+  silently dropped (matched across E.164, Signal UUID, and learned PNP mappings), while new senders receive
+  a fixed `unknown_reply` gated by `unknown_cooldown_hours` and trigger a quote-replyable
+  `[Ferret · NEW CONTACT]` owner alert. Approved guests (static `allow` with `*` refused, or owner-approved
+  in `<ferret home>/signal_guests.json` mode `0600`) can never reach operator slash commands, sessions,
+  workspaces, files, mail, or inbox items; their turns run asynchronously through `Runtime::isolated_guest_chat`
+  (`Priority::Background`, `text_calls: false`, immutable safety boundary preamble ahead of optional
+  `persona`, zero tools or strictly `leave_note_for_owner` capped at 3 notes / 15 min and 500 chars),
+  bounded by a 2000-character inbound limit, `rate_limit_per_hour`, and a per-guest single-flight guard.
+  Owners manage guests via quote-replies or `/guests` and `/guest approve|revoke|block|unblock|clear|say`.
+
 
 
