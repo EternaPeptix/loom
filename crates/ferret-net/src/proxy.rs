@@ -271,6 +271,9 @@
 //! check and a tunnel's server name, is seen by the observer. Veto: a check asks it for the resolved address. Server
 //! names: a placeholder encrypted hello naming the destination passes and one naming another host does not, an alert
 //! or a record of version `0.0` in front of a hello naming a denied name is refused with nothing sent upstream.
+//! Pacing: a tunnel and a forwarded request queued behind another one to the same host are cut while they wait and
+//! open nothing (`502`, one refusal with the cut's reason, the destination accepts nothing), are judged by a policy
+//! set while they wait, and once let through carry `paced_ms`; a queued tunnel whose client closes opens nothing.
 //! `clienthello` has its own list.
 //!
 //! ## Audit
@@ -305,6 +308,19 @@
 //! - A forwarded request whose client ends its side (closes, or only shuts down its writing half) is
 //!   not read any more but still gets the response while the destination keeps sending: it ends when
 //!   the destination is silent for 30 s, or at once when a write to the client fails.
+//!
+//! ## Pacing
+//! With a noise profile other than `off` (`set_governor`, `crate::pace`), a command's tunnel (not an intercepted
+//! one, whose requests are paced one by one inside it) and a command's forwarded request wait for the governor
+//! (`Governor::acquire`, at most `pace::PACE_WAIT_MAX`) once they are registered and before anything is resolved or
+//! opened; reference and tool credentials are never paced. The wait ends early, with nothing resolved, opened or
+//! sent: when the connection is cut (`cut_hosts`, `cut`), the client gets `502` saying so and the record is a refusal
+//! with the cut's reason followed by ` (cut while it waited for pacing)`; when the proxy shuts down, or when the
+//! client goes away (a tunnel's client that closes its end; a forwarded request's whose connection fails: one that
+//! only shut down its writing half still waits and is served, as above), nothing is recorded. When the wait ends the
+//! policy is read again from the session's current entry, so a hold or a revoke set meanwhile decides the
+//! connection. Every decision recorded for a connection that waited carries `paced_ms`, how long it waited: the
+//! client connected that long before the time of the record (the monitor's TW-21 judges the decision at that time).
 //!
 //! ## Forwarded requests
 //! The request body is forwarded up to its end as its head frames it: `Content-Length` bytes, or a
@@ -1607,6 +1623,7 @@ fn local_decision(head: Option<&Head>, rule: &str) -> NetDecision {
         rule: cut(rule, 300),
         resolved: None,
         sni: None,
+        paced_ms: None,
     }
 }
 
@@ -1730,6 +1747,7 @@ fn parse_authority(s: &str, default_port: Option<u16>) -> Result<(String, u16), 
 }
 
 /// Everything needed to attribute and report one request's decision.
+#[derive(Clone, Copy)]
 struct Ctx<'a> {
     shared: &'a Shared,
     session: &'a SessionId,
@@ -1738,6 +1756,11 @@ struct Ctx<'a> {
     method: &'a str,
     host: &'a str,
     port: u16,
+    /// The credentials are the session's reference ones (its entry on the shared listener).
+    reference: bool,
+    /// How long the connection waited for the noise governor before it was judged (0: it did not wait); every
+    /// decision recorded for it says so (`NetDecision::paced_ms`).
+    paced_ms: u64,
 }
 
 impl Ctx<'_> {
@@ -1762,6 +1785,7 @@ impl Ctx<'_> {
             rule,
             resolved: resolved.map(|a| a.to_string()),
             sni,
+            paced_ms: (self.paced_ms > 0).then_some(self.paced_ms),
         };
         audit_decision(self.shared, Some(self.session), d, true).await
     }
@@ -2199,15 +2223,14 @@ async fn handle(
             Ok((host, port)) => {
                 let (shared, session, lookups) = (&*shared, &session, &lookups);
                 let method = if connect { "CONNECT" } else { CHECK_METHOD };
-                let cx = Ctx { shared, session, lookups, method, host: &host, port };
+                let cx = Ctx { shared, session, lookups, method, host: &host, port, reference, paced_ms: 0 };
                 if connect {
                     let live = LiveGuard::register(shared, session, &host, port, seen);
-                    let policy = current_policy(shared, session, reference, policy);
                     tunnel(
                         client,
                         extra,
                         &cx,
-                        &policy,
+                        policy,
                         capture.as_deref(),
                         inject.as_deref(),
                         !reference && !tool,
@@ -2236,13 +2259,12 @@ async fn handle(
     match plain_target(&head.target) {
         Ok((host, port, authority, path)) => {
             let (shared, session, lookups) = (&*shared, &session, &lookups);
-            let cx = Ctx { shared, session, lookups, method: &head.method, host: &host, port };
+            let cx = Ctx { shared, session, lookups, method: &head.method, host: &host, port, reference, paced_ms: 0 };
             let live = LiveGuard::register(shared, session, &host, port, seen);
             let cut = live.cut.clone();
-            let policy = current_policy(shared, session, reference, policy);
             let capture = capture.as_deref();
             let fx = Forward { authority: &authority, path: &path, reference, tool, inject: inject.as_deref() };
-            forward(client, extra, &head, &cx, &policy, capture, &fx, slot, cancel, cut).await;
+            forward(client, extra, &head, &cx, policy, capture, &fx, slot, cancel, cut).await;
         }
         Err(m) => reject(&mut client, &shared, slot, &session, &head, &m).await,
     }
@@ -2355,6 +2377,74 @@ fn judge_sni(first: Vec<u8>, sni: Option<String>, ech: bool, cx: &Ctx<'_>, polic
     Bound::Pass(first, Some(name))
 }
 
+/// What a connection's wait for the noise governor came to (see *Pacing*).
+enum Paced {
+    /// Go on, holding the governor's permit (`None` when nothing paces it or the wait reached its bound), after
+    /// waiting that many milliseconds.
+    Go(Option<crate::pace::PaceGuard>, u64),
+    /// The connection was cut while it waited: nothing was resolved or opened.
+    Cut,
+    /// The client went away while it waited (see `client_gone`), or the proxy shut down: nothing was resolved,
+    /// opened or recorded.
+    Gone,
+}
+
+/// Waits for the noise governor when `paced` and it is on, watching the cut, the shutdown and the client, so that a
+/// connection queued behind others is neither opened after a cut nor for a client that gave up. `eof_is_gone`: a
+/// client that closed its end is gone (a tunnel's); else only one whose connection failed is (a forwarded request's
+/// client may shut down its writing half and still read the response).
+async fn pace(
+    cx: &Ctx<'_>,
+    client: &TcpStream,
+    paced: bool,
+    eof_is_gone: bool,
+    cancel: &CancellationToken,
+    cut: &Cut,
+) -> Paced {
+    let gov = cx.shared.governor();
+    if !paced || gov.is_off() {
+        return Paced::Go(None, 0);
+    }
+    if cut.is_cancelled() {
+        return Paced::Cut;
+    }
+    let started = std::time::Instant::now();
+    let guard = tokio::select! {
+        biased;
+        _ = cut.cancelled() => return Paced::Cut,
+        _ = cancel.cancelled() => return Paced::Gone,
+        g = gov.acquire(cx.host, cancel) => g,
+        _ = client_gone(client, eof_is_gone) => return Paced::Gone,
+    };
+    if cut.is_cancelled() {
+        return Paced::Cut;
+    }
+    Paced::Go(guard, u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX))
+}
+
+/// Returns when the client's connection failed, or, with `eof_is_gone`, when it closed its end; never while it is
+/// there: bytes it already sent (a request body, an early flight) mean it is.
+async fn client_gone(client: &TcpStream, eof_is_gone: bool) {
+    let mut byte = [0u8; 1];
+    match client.peek(&mut byte).await {
+        Err(_) => {}
+        Ok(0) if eof_is_gone => {}
+        Ok(_) => std::future::pending::<()>().await,
+    }
+}
+
+/// Answers a connection that was cut while it waited for pacing: `502`, and a refusal on record (nothing was opened,
+/// so there is no allow to follow).
+async fn cut_while_paced(client: &mut TcpStream, cx: &Ctx<'_>, slot: OwnedSemaphorePermit, cut: &Cut) {
+    let why = cut.why();
+    cx.record_best_effort(false, format!("{why} (cut while it waited for pacing)"), None).await;
+    let body = format!(
+        "ferret proxy: the connection to {} was closed before it was opened: {why}. Nothing was sent.\n",
+        cx.dest()
+    );
+    answer(client, cx.shared, slot, "502 Bad Gateway", "", &body).await;
+}
+
 /// How a tunnel's relay phase ended.
 enum Phase {
     Relayed(RelayEnd),
@@ -2370,7 +2460,7 @@ async fn tunnel(
     mut client: TcpStream,
     extra: Vec<u8>,
     cx: &Ctx<'_>,
-    policy: &Policy,
+    policy: Arc<Policy>,
     capture: Option<&CaptureCfg>,
     inject: Option<&crate::inject::Inject>,
     paced: bool,
@@ -2381,7 +2471,15 @@ async fn tunnel(
     let idle = cx.shared.limits.idle_timeout;
     let will_intercept = capture.is_some_and(|c| extra.is_empty() && c.intercepts(cx.host, cx.port));
     // Intercepted tunnels pace each HTTP request individually in `intercept::serve`; opaque tunnels pace once here.
-    let _pace = if paced && !will_intercept { cx.shared.governor().acquire(cx.host, &cancel).await } else { None };
+    let (_pace, paced_ms) = match pace(cx, &client, paced && !will_intercept, true, &cancel, &cut).await {
+        Paced::Go(guard, ms) => (guard, ms),
+        Paced::Cut => return cut_while_paced(&mut client, cx, slot, &cut).await,
+        Paced::Gone => return,
+    };
+    let cx = &Ctx { paced_ms, ..*cx };
+    // Judged by the session's policy as it is now: a hold or a revoke set while the connection waited counts.
+    let policy = current_policy(cx.shared, cx.session, cx.reference, policy);
+    let policy = &*policy;
     let (mut up, allowed) = match open_upstream(cx, policy).await {
         Ok(s) => s,
         Err((status, body)) => return answer(&mut client, cx.shared, slot, status, "", &body).await,
@@ -3149,7 +3247,7 @@ async fn forward(
     extra: Vec<u8>,
     head: &Head,
     cx: &Ctx<'_>,
-    policy: &Policy,
+    policy: Arc<Policy>,
     capture: Option<&CaptureCfg>,
     fx: &Forward<'_>,
     slot: OwnedSemaphorePermit,
@@ -3164,7 +3262,15 @@ async fn forward(
     };
     let gov = cx.shared.governor();
     let command_traffic = !reference && !tool;
-    let _pace = if command_traffic { gov.acquire(cx.host, &cancel).await } else { None };
+    let (_pace, paced_ms) = match pace(cx, &client, command_traffic, false, &cancel, &cut).await {
+        Paced::Go(guard, ms) => (guard, ms),
+        Paced::Cut => return cut_while_paced(&mut client, cx, slot, &cut).await,
+        Paced::Gone => return,
+    };
+    let cx = &Ctx { paced_ms, ..*cx };
+    // Judged by the session's policy as it is now: a hold or a revoke set while the request waited counts.
+    let policy = current_policy(cx.shared, cx.session, cx.reference, policy);
+    let policy = &*policy;
     let (mut up, allowed) = match open_upstream(cx, policy).await {
         Ok(s) => s,
         Err((status, text)) => return answer(&mut client, cx.shared, slot, status, "", &text).await,
@@ -6020,6 +6126,114 @@ mod tests {
         assert_eq!(hosts[0].host, "127.0.0.1");
         assert_eq!(hosts[0].sent, 2);
         assert_eq!(hosts[0].backoffs, 1);
+    }
+
+    /// An echo server that counts the connections it accepted.
+    async fn counting_echo_server() -> (u16, Arc<AtomicU64>) {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicU64::new(0));
+        let n = accepted.clone();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                n.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let (mut r, mut w) = s.split();
+                    let _ = tokio::io::copy(&mut r, &mut w).await;
+                });
+            }
+        });
+        (port, accepted)
+    }
+
+    /// The `quiet` profile without jitter: one connection per host at a time, so a second one waits.
+    fn quiet_governor() -> crate::pace::Governor {
+        let mut prof = crate::pace::NoiseProfile::from_name(ferret_core::config::NoiseProfileName::Quiet, None);
+        prof.jitter = 0.0;
+        crate::pace::Governor::new(prof)
+    }
+
+    /// The decisions of `session` that arrive within `wait`.
+    async fn decisions_of(rx: &mut Rx, session: &SessionId, wait: Duration) -> Vec<NetDecision> {
+        let mut out = Vec::new();
+        while let Ok(Some((sid, d))) = timeout(wait, rx.recv()).await {
+            if &sid == session {
+                out.push(d);
+            }
+        }
+        out
+    }
+
+    /// A tunnel and a forwarded request queued behind another tunnel to the same host (main's noise governor) are cut
+    /// while they wait: nothing is resolved or opened, the client gets `502`, and the record is a refusal, not an allow
+    /// of the destination after the cut.
+    #[tokio::test]
+    async fn a_connection_cut_while_it_waits_for_pacing_opens_nothing() {
+        let (echo, accepted) = counting_echo_server().await;
+        let (p, mut rx) = start().await;
+        p.set_governor(quiet_governor());
+        let s = SessionId::from("s-pace-cut");
+        let g = p.grant(&s, lab()).unwrap();
+        let mut holder = tunnel_to(&g, &format!("127.0.0.1:{echo}")).await;
+        assert!(echoes(&mut holder).await);
+        let send = |req: String| {
+            let port = g.port;
+            tokio::spawn(async move { raw(port, req.as_bytes()).await })
+        };
+        let queued = send(connect_req(&g, &format!("127.0.0.1:{echo}")));
+        let forwarded = send(format!("GET http://127.0.0.1:{echo}/ HTTP/1.1\r\n{}\r\n", auth(&g)));
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(!queued.is_finished() && !forwarded.is_finished(), "both wait for the host's one slot");
+        // The operator revokes the host: every connection of the session to it is cut, the waiting ones too.
+        assert!(p.set_policy(&s, policy(NetworkMode::DenyAll, &[], &[], &[])));
+        assert_eq!(p.cut_hosts(&s, "127.0.0.1"), 3);
+        for client in [queued, forwarded] {
+            let resp = timeout(T, client).await.unwrap().unwrap();
+            assert_eq!(status(&resp), 502, "{resp}");
+            assert!(resp.contains("was closed before it was opened") && resp.contains(CUT), "{resp}");
+        }
+        assert_eq!(accepted.load(Ordering::SeqCst), 1, "only the first tunnel reached the destination");
+        let ds = decisions_of(&mut rx, &s, Duration::from_millis(500)).await;
+        let allows = ds.iter().filter(|d| d.allowed && !d.rule.contains("failed after the allow")).count();
+        assert_eq!(allows, 1, "the waiting connections are never on record as allowed: {ds:?}");
+        let cut = ds.iter().filter(|d| !d.allowed && d.rule.ends_with("(cut while it waited for pacing)")).count();
+        assert_eq!(cut, 2, "{ds:?}");
+    }
+
+    /// The policy a queued connection is judged by is the session's when its wait ends (a hold or a revoke set
+    /// meanwhile), its decision says how long it waited, and a queued tunnel whose client gave up opens nothing.
+    #[tokio::test]
+    async fn a_connection_that_waited_for_pacing_is_judged_by_the_policy_of_its_end_and_says_how_long() {
+        let (echo, accepted) = counting_echo_server().await;
+        let (p, mut rx) = start().await;
+        p.set_governor(quiet_governor());
+        let s = SessionId::from("s-pace-policy");
+        let g = p.grant(&s, lab()).unwrap();
+        let holder = tunnel_to(&g, &format!("127.0.0.1:{echo}")).await;
+        // A client that gives up while it waits.
+        let mut quitter = TcpStream::connect(("127.0.0.1", g.port)).await.unwrap();
+        quitter.write_all(connect_req(&g, &format!("127.0.0.1:{echo}")).as_bytes()).await.unwrap();
+        let queued = {
+            let (port, req) = (g.port, connect_req(&g, &format!("127.0.0.1:{echo}")));
+            tokio::spawn(async move { raw(port, req.as_bytes()).await })
+        };
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        drop(quitter);
+        assert!(p.set_policy(&s, policy(NetworkMode::DenyAll, &[], &[], &[])));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // The first tunnel ends; the host's slot is free.
+        drop(holder);
+        let resp = timeout(T, queued).await.unwrap().unwrap();
+        assert_eq!(status(&resp), 403, "the hold set while it waited decides it: {resp}");
+        let ds = decisions_of(&mut rx, &s, Duration::from_millis(500)).await;
+        let refused: Vec<&NetDecision> = ds.iter().filter(|d| !d.allowed).collect();
+        assert_eq!(refused.len(), 1, "one refusal, nothing for the client that gave up: {ds:?}");
+        assert!(refused[0].paced_ms.is_some_and(|ms| ms >= 300), "{:?}", refused[0]);
+        assert!(
+            ds.iter().filter(|d| d.allowed).all(|d| d.paced_ms.unwrap_or(0) < 300),
+            "the first did not wait: {ds:?}"
+        );
+        assert_eq!(accepted.load(Ordering::SeqCst), 1, "neither queued connection reached the destination");
     }
 
     /// E1 with the operator's rewrite rules: a rule acts on a request after its destination was decided, so a rule that

@@ -541,6 +541,7 @@ mod tests {
                 rule: "default deny".into(),
                 resolved: None,
                 sni: None,
+                paced_ms: None,
             },
         };
         w.append(&p, &e("a.example")).expect("a");

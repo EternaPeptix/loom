@@ -21,7 +21,9 @@
 //!     `/dismiss [id|#n]`, `/tail [id|#n]`, `/mute [dur]`, `/unmute`, `/release`, `/approve`,
 //!     `/rule`, `/help`.
 //!   - Quote-reply (`dataMessage.quote.id` matching a sent alert, with `quote.text` fallback):
-//!     grants/denies `request_scope` approvals via `Runtime::grant_scope`, answers open inbox items
+//!     grants/denies `request_scope` approvals via `Runtime::grant_scope` (only hosts the request's alert shows in
+//!     full: an `approve`, `/scope <item>` or `/approve <item>` of a request whose alert cuts a host short or leaves
+//!     hosts out, or the number of such a host, grants nothing and says how to approve it), answers open inbox items
 //!     with strict `1..=N` option expansion and confirmation echo, or sends a follow-up to the
 //!     mission's lead session when resolved or an error alert. Unmatched quotes NEVER fall through
 //!     to unquoted routing.
@@ -1556,7 +1558,7 @@ async fn dispatch_inbound(
     // 2. Quote-reply to a specific Ferret outbound alert (NEVER fall through to Step 4 on miss).
     if let Some(qts) = quote_ts {
         if let Some(target) = store.lookup(qts).or_else(|| fallback_ref_from_quote_text(quote_text, runtime)) {
-            return Some(handle_quoted_reply(runtime, &target, text).await);
+            return Some(handle_quoted_reply(runtime, &target, text, cfg.max_chars).await);
         }
         return Some(
             "✗ That quoted message is no longer tracked (expired or not a Ferret alert). Send /inbox or reply `@<id> <text>`."
@@ -1574,7 +1576,7 @@ async fn dispatch_inbound(
                 "Usage: `@<item_or_session_id> <message>` (or `@#1 <message>` after /inbox or /status).".to_string(),
             );
         }
-        return Some(handle_addressed_reply(runtime, store, id_token, body).await);
+        return Some(handle_addressed_reply(runtime, store, id_token, body, cfg.max_chars).await);
     }
 
     // 4. Plain unquoted reply: ignored in groups so casual chatter never hijacks blockers; in DMs
@@ -1672,12 +1674,12 @@ fn extract_footer_token<'a>(text: &'a str, label: &str) -> Option<&'a str> {
     }
 }
 
-async fn handle_quoted_reply(runtime: &Runtime, target: &OutboundRef, text: &str) -> String {
+async fn handle_quoted_reply(runtime: &Runtime, target: &OutboundRef, text: &str, max_chars: usize) -> String {
     if let Some(item_id) = &target.item_id {
         let inbox = runtime.inbox();
         if let Some(entry) = inbox.iter().find(|e| e.item.item_id == *item_id) {
             if is_scope_request(&entry.item) {
-                return handle_scope_reply(runtime, entry, text).await;
+                return handle_scope_reply(runtime, entry, text, max_chars).await;
             }
             return answer_with_options(runtime, entry, text).await;
         }
@@ -1689,7 +1691,38 @@ async fn handle_quoted_reply(runtime: &Runtime, target: &OutboundRef, text: &str
     }
 }
 
-async fn handle_scope_reply(runtime: &Runtime, entry: &InboxEntry, raw_reply: &str) -> String {
+/// Which of a scope request's hosts its Signal alert shows in full (in the alert as `format_inbox_alert` writes it for
+/// a reminder, whose longer header cuts the most): a host that is cut short (`…`) or left out (`… +N more`) is not.
+fn hosts_shown_in_full(runtime: &Runtime, entry: &InboxEntry, max_chars: usize) -> Vec<bool> {
+    let (title, is_child, _) = session_meta_summary(runtime, &entry.session);
+    let title = if is_child { format!("unverified: {title}") } else { title };
+    let alert = format_inbox_alert("approval", &entry.session, &title, &entry.item, max_chars, true);
+    let lines: Vec<&str> = alert.lines().collect();
+    (1..=entry.item.options.len())
+        .zip(&entry.item.options)
+        .map(|(i, host)| {
+            let line = format!("  {i}. {}", host.trim());
+            // A line followed by another: the last line of a cut alert may itself be cut.
+            lines.iter().position(|l| *l == line).is_some_and(|at| at + 1 < lines.len())
+        })
+        .collect()
+}
+
+/// The refusal of a Signal approval that names a host its alert did not show in full: an approval grants what the
+/// operator saw, and the monitor counts every grant as the operator's (`docs/MONITOR.md` §2.4).
+fn hidden_hosts_refusal(entry: &InboxEntry, hidden: &[&String]) -> String {
+    format!(
+        "✗ Nothing granted on {}: the alert could not show {} of the {} requested hosts in full ({}), and an approval from \
+         Signal grants only hosts it showed. Reply with the numbers of hosts shown in full, send `/scope <session> \
+         <host>...` with the names written out, or approve it in the web UI or with `ferret scope`.",
+        entry.title,
+        hidden.len(),
+        entry.item.options.len(),
+        hidden.iter().map(|h| truncate_chars(h, 48)).collect::<Vec<_>>().join(", ")
+    )
+}
+
+async fn handle_scope_reply(runtime: &Runtime, entry: &InboxEntry, raw_reply: &str, max_chars: usize) -> String {
     let reply = raw_reply.trim();
     let lower = reply.to_ascii_lowercase();
     let hosts = &entry.item.options;
@@ -1703,6 +1736,10 @@ async fn handle_scope_reply(runtime: &Runtime, entry: &InboxEntry, raw_reply: &s
         };
     }
 
+    let shown = hosts_shown_in_full(runtime, entry, max_chars);
+    let hidden_of = |list: &[String]| -> Vec<&String> {
+        hosts.iter().zip(&shown).filter(|(h, full)| !**full && list.contains(h)).map(|(h, _)| h).collect()
+    };
     let selected: Vec<String> = if matches!(lower.as_str(), "approve" | "yes" | "y" | "allow" | "grant" | "all") {
         hosts.clone()
     } else if let Some(chosen) = parse_host_indices(reply, hosts) {
@@ -1718,6 +1755,10 @@ async fn handle_scope_reply(runtime: &Runtime, entry: &InboxEntry, raw_reply: &s
         );
     };
 
+    let hidden = hidden_of(&selected);
+    if !hidden.is_empty() {
+        return hidden_hosts_refusal(entry, &hidden);
+    }
     match runtime.grant_scope(&entry.session, &selected, Some("approved via Signal")).await {
         Ok(receipt) => {
             let _ = runtime.answer(&entry.item.item_id, "").await;
@@ -1762,7 +1803,13 @@ fn parse_host_indices(reply: &str, hosts: &[String]) -> Option<Result<Vec<String
     Some(Ok(selected))
 }
 
-async fn handle_addressed_reply(runtime: &Runtime, store: &SentStore, token: &str, body: &str) -> String {
+async fn handle_addressed_reply(
+    runtime: &Runtime,
+    store: &SentStore,
+    token: &str,
+    body: &str,
+    max_chars: usize,
+) -> String {
     let inbox = runtime.inbox();
 
     // 1. `#N` or numeric alias from `/inbox` or multi-blocker prompt.
@@ -1770,7 +1817,7 @@ async fn handle_addressed_reply(runtime: &Runtime, store: &SentStore, token: &st
         if let Some(item_id) = store.inbox_alias(n) {
             if let Some(entry) = inbox.iter().find(|e| e.item.item_id == item_id) {
                 return if is_scope_request(&entry.item) {
-                    handle_scope_reply(runtime, entry, body).await
+                    handle_scope_reply(runtime, entry, body, max_chars).await
                 } else {
                     answer_with_options(runtime, entry, body).await
                 };
@@ -1790,7 +1837,7 @@ async fn handle_addressed_reply(runtime: &Runtime, store: &SentStore, token: &st
     if item_matches.len() == 1 {
         let entry = item_matches[0];
         return if is_scope_request(&entry.item) {
-            handle_scope_reply(runtime, entry, body).await
+            handle_scope_reply(runtime, entry, body, max_chars).await
         } else {
             answer_with_options(runtime, entry, body).await
         };
@@ -1876,7 +1923,7 @@ async fn handle_slash_command(
         "/stop" => cmd_stop(runtime, store, arg).await,
         "/resume" => cmd_resume(runtime, store, arg).await,
         "/dismiss" => cmd_dismiss(runtime, store, arg).await,
-        "/scope" => cmd_scope(runtime, store, arg).await,
+        "/scope" => cmd_scope(runtime, store, arg, cfg.max_chars).await,
         "/tail" => cmd_tail(runtime, store, arg, cfg.max_chars),
         "/mute" => cmd_mute(store, health, arg),
         "/unmute" => {
@@ -1884,7 +1931,7 @@ async fn handle_slash_command(
             "✓ Signal alerts unmuted.".to_string()
         }
         "/release" => cmd_release(runtime, store, arg).await,
-        "/approve" => cmd_approve(runtime, store, arg).await,
+        "/approve" => cmd_approve(runtime, store, arg, cfg.max_chars).await,
         "/rule" => cmd_rule(runtime, store, arg).await,
         _ => format!("Unknown command `{cmd}`. Send /help for options."),
     }
@@ -2098,7 +2145,7 @@ async fn cmd_dismiss(runtime: &Runtime, store: &SentStore, arg: &str) -> String 
     }
 }
 
-async fn cmd_scope(runtime: &Runtime, store: &SentStore, arg: &str) -> String {
+async fn cmd_scope(runtime: &Runtime, store: &SentStore, arg: &str, max_chars: usize) -> String {
     let tokens: Vec<&str> = arg.split_whitespace().collect();
     if tokens.is_empty() {
         // Convenience: if exactly 1 scope request is open, show how to approve it.
@@ -2119,7 +2166,7 @@ async fn cmd_scope(runtime: &Runtime, store: &SentStore, arg: &str) -> String {
         let inbox = runtime.inbox();
         if let Ok(entry) = resolve_inbox_token(&inbox, store, tokens[0]) {
             if is_scope_request(&entry.item) {
-                return handle_scope_reply(runtime, entry, "approve").await;
+                return handle_scope_reply(runtime, entry, "approve", max_chars).await;
             }
             return format!(
                 "✗ Item [{}] is not a network scope request. Use `/scope <session|#n> <host>...`.",
@@ -2322,7 +2369,7 @@ async fn cmd_release(runtime: &Runtime, store: &SentStore, arg: &str) -> String 
     }
 }
 
-async fn cmd_approve(runtime: &Runtime, store: &SentStore, arg: &str) -> String {
+async fn cmd_approve(runtime: &Runtime, store: &SentStore, arg: &str, max_chars: usize) -> String {
     let mut split = arg.splitn(2, char::is_whitespace);
     let token = split.next().unwrap_or("").trim();
     let text = split.next().unwrap_or("").trim();
@@ -2334,7 +2381,7 @@ async fn cmd_approve(runtime: &Runtime, store: &SentStore, arg: &str) -> String 
         let inbox = runtime.inbox();
         if let Ok(entry) = resolve_inbox_token(&inbox, store, token) {
             if is_scope_request(&entry.item) {
-                return handle_scope_reply(runtime, entry, "approve").await;
+                return handle_scope_reply(runtime, entry, "approve", max_chars).await;
             }
         }
         return "Usage: `/approve <session|#n> <what is approved>`.".to_string();
@@ -3274,6 +3321,58 @@ mod tests {
         let recovered = SentStore::open(corrupt_path);
         assert!(recovered.lookup(1).is_none());
 
+        env.rt.shutdown().await;
+    }
+
+    /// A Signal approval grants only the hosts its alert showed in full: the monitor counts every grant as the
+    /// operator's, so `approve` (all) of a request whose alert cut a host short or left hosts out grants nothing, and
+    /// neither does the number of a host shown cut; the number of a host shown in full still grants it.
+    #[tokio::test]
+    async fn a_signal_approval_grants_only_hosts_its_alert_showed_in_full() {
+        const LONG: &str = "api.target.example.com.cdn-edge-cache-node-0042.prod-global.attacker.test";
+        let script = Script::new(|_, step| match step {
+            0 => {
+                let mut hosts = vec![LONG.to_string()];
+                hosts.extend((2..=12).map(|i| format!("h{i:02}.example.test")));
+                let args = json!({"hosts": hosts, "why": "Fetch docs"}).to_string();
+                Reply::tool("request_scope", &args).into()
+            }
+            _ => Reply::text("done").into(),
+        });
+        let env = start_test_runtime(script).await;
+        let dir = tempfile::tempdir().unwrap();
+        let store = SentStore::open(dir.path().join("signal_sent.json"));
+        let cfg = SignalCfg { max_chars: 400, ..sample_cfg("http://127.0.0.1:1337") };
+        let health = SignalHealth::from_config(&cfg);
+        let info = env.rt.create_session(new_session(&env.ws, "lead", "Gamma Mission", "go")).await.unwrap();
+        wait_for(|| env.rt.inbox().iter().any(|e| is_scope_request(&e.item))).await;
+        let entry = env.rt.inbox().into_iter().find(|e| is_scope_request(&e.item)).unwrap();
+        let alert = format_inbox_alert("approval", &info.meta.id, &info.meta.title, &entry.item, 400, false);
+        assert!(!alert.contains(LONG) && alert.contains("more"), "{alert}");
+        store.record_outbound(OutboundRef {
+            timestamp: 3003,
+            kind: "approval".into(),
+            item_id: Some(entry.item.item_id.clone()),
+            session: info.meta.id.as_str().into(),
+            title: info.meta.title.clone(),
+            options: entry.item.options.clone(),
+            is_scope_request: true,
+            lead_session: None,
+        });
+        let reply = |text: &str| text_inbound(text, Some(3003), None, None);
+        for text in ["approve", "1", "2 12"] {
+            let out = dispatch_inbound(&env.rt, &store, &health, &cfg, &reply(text)).await.unwrap();
+            assert!(out.contains("✗ Nothing granted") && !out.contains("✓"), "{text}: {out}");
+            assert!(env.rt.inbox().iter().any(|e| e.item.item_id == entry.item.item_id), "the request stays open");
+        }
+        for text in ["/approve #1", "/scope #1"] {
+            let out = dispatch_inbound(&env.rt, &store, &health, &cfg, &text_inbound("/inbox", None, None, None)).await;
+            assert!(out.is_some());
+            let out = dispatch_inbound(&env.rt, &store, &health, &cfg, &text_inbound(text, None, None, None)).await;
+            assert!(out.as_deref().is_some_and(|o| o.contains("✗ Nothing granted")), "{text}: {out:?}");
+        }
+        let out = dispatch_inbound(&env.rt, &store, &health, &cfg, &reply("2")).await.unwrap();
+        assert!(out.contains("✓ Granted scope on Gamma Mission: h02.example.test"), "{out}");
         env.rt.shutdown().await;
     }
 

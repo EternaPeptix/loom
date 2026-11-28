@@ -129,14 +129,19 @@
 //!     The policy then has the infrastructure deny (E1): `with_infrastructure(infra_spec(&config))`: the
 //!     daemon's port (`sandbox.daemon_port`), the `host:port` of every model profile's `base_url` (those of the
 //!     start-up configuration, of the live set, and of every profile a reload made live since the start, kept after
-//!     a later reload removes or changes it: `Inner::infra_config`), the box's
-//!     `ssh_host` when the box is enabled, and `network.infrastructure`; `Runtime::start` parses them once
+//!     a later reload removes or changes it: `Inner::infra_config`), the services the daemon talks to for the
+//!     operator (`service_endpoints`: the Signal bridge's signal-cli, `signal.http_url`, with `[signal]` enabled, and the
+//!     mail inbox's IMAP server, `mail.host` on `mail.port`, with `[mail]` enabled and `imaps`; each on its port), the
+//!     box's `ssh_host` when the box is enabled, and `network.infrastructure`; `Runtime::start` parses them once
 //!     and refuses to start on an entry it cannot read (`The network configuration cannot be used: …`). The
 //!     spec also carries what `crate::infra` resolved (the box's Docker host from `ssh -G`, the addresses of
 //!     every named entry, this machine's own addresses), at start and every `RESOLVE_EVERY`; a `box.ssh_host`
 //!     of the form `user@host` or `ssh://user@host:2222` is reduced to its host, and one whose host the policy
 //!     cannot read is left out with a warning. `Runtime::start` sets `config.sandbox.infra_ports` (the loopback
-//!     ports of model endpoints and `network.infrastructure`, `crate::infra::loopback_ports`); `sandbox_cfg_for`
+//!     ports of model endpoints, of signal-cli and of `network.infrastructure`, `crate::infra::loopback_ports`) and adds
+//!     the services' files to `config.sandbox.unreadable_paths` (`service_secret_paths`: `mail.password_file` and
+//!     `mail.maildir_path` with `[mail]` enabled, signal-cli's store under `$XDG_DATA_HOME` with `[signal]` enabled; the
+//!     default `~/.local/share/signal-cli` is one of the sandbox's credential stores); `sandbox_cfg_for`
 //!     adds those of the endpoints of the profiles `Inner::infra_config` holds, when the sandbox is made: a running
 //!     session's sandbox keeps the ports it was made with.
 //!     Hosts the operator revoked in this run (`revoke_scope`) are left out of `granted_hosts`.
@@ -1487,6 +1492,42 @@ pub(crate) fn service_endpoints(config: &Config) -> Vec<(String, String)> {
     out
 }
 
+/// The files of the services the daemon talks to for the operator that a command could use in their place, when the
+/// service is enabled: `[mail]`'s `password_file` (the IMAP password or token) and `maildir_path` (the mail that
+/// `allow_senders` scopes), and signal-cli's account store under `$XDG_DATA_HOME` when the daemon has one (the default
+/// `~/.local/share/signal-cli` is one of the sandbox's credential stores). A `~` path is kept as written (the sandbox
+/// expands it), a relative one is taken from the daemon's directory, as the mail reader takes it. `Runtime::start`
+/// adds them to `sandbox.unreadable_paths`: the endpoint deny (`service_endpoints`) closes the network route to the
+/// service, this closes the route through its files.
+pub(crate) fn service_secret_paths(config: &Config) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |p: &str| {
+        let p = p.trim();
+        if p.is_empty() {
+            return;
+        }
+        let written = if p == "~" || p.starts_with("~/") || Path::new(p).is_absolute() {
+            p.to_string()
+        } else {
+            std::path::absolute(p).map_or_else(|_| p.to_string(), |a| a.display().to_string())
+        };
+        if !out.contains(&written) {
+            out.push(written);
+        }
+    };
+    if config.mail.enabled {
+        for p in [config.mail.password_file.as_deref(), config.mail.maildir_path.as_deref()].into_iter().flatten() {
+            push(p);
+        }
+    }
+    if config.signal.enabled {
+        if let Some(data) = std::env::var_os("XDG_DATA_HOME").filter(|d| Path::new(d).is_absolute()) {
+            push(&Path::new(&data).join("signal-cli").display().to_string());
+        }
+    }
+    out
+}
+
 /// `infra_spec` with what the daemon resolved (see `crate::infra`): the Docker host's other names, the
 /// addresses of every named entry and this machine's own addresses.
 fn infra_spec_resolved(config: &Config, res: &crate::infra::Resolution) -> InfraSpec {
@@ -1507,8 +1548,9 @@ pub(crate) fn infra_policy(config: &Config, res: &crate::infra::Resolution) -> R
         .and_then(|p| p.with_infrastructure(&infra_spec_resolved(config, res)))
 }
 
-/// Whether the infrastructure deny can be built from `config` (`network.infrastructure`, the model endpoints, the box's
-/// host), as [`Runtime::start`] builds it before anything else: `ferret config check` refuses what the start would, with
+/// Whether the infrastructure deny can be built from `config` (`network.infrastructure`, the model endpoints, the services
+/// the daemon talks to for the operator (`signal.http_url`, `mail.host` on `mail.port`, when enabled), the box's host), as
+/// [`Runtime::start`] builds it before anything else: `ferret config check` refuses what the start would, with
 /// the same sentence. Names are not resolved here, so the answer does not depend on this machine's resolver.
 pub fn check_infrastructure(config: &Config) -> Result<(), String> {
     infra_policy(config, &crate::infra::Resolution::default())
@@ -5882,6 +5924,12 @@ impl Runtime {
     pub async fn start(mut config: Config, paths: Paths) -> Result<Runtime, String> {
         // The loopback ports of infrastructure that no command may reach, whatever loopback it is allowed.
         config.sandbox.infra_ports = crate::infra::loopback_ports(&config);
+        // And the files of the services the daemon talks to for the operator (the mail password, the maildir).
+        for p in service_secret_paths(&config) {
+            if !config.sandbox.unreadable_paths.contains(&p) {
+                config.sandbox.unreadable_paths.push(p);
+            }
+        }
         config.check().map_err(|e| e.to_string())?;
         // The infrastructure every command policy refuses is checked now, not at the first session.
         // The names are resolved here, once, and again every `RESOLVE_EVERY` (see `crate::infra`).
@@ -9474,6 +9522,52 @@ mod tests {
         e.rt.shutdown().await;
     }
 
+    /// E1 for the services' files: with `[mail]` enabled, the IMAP password file and the maildir are unreadable to a
+    /// session's commands and file tools wherever they lie (the endpoint deny only closes the network route), and so is
+    /// a signal-cli store under `$XDG_DATA_HOME` (the default one is a credential store of the sandbox).
+    #[tokio::test]
+    async fn the_mail_password_file_and_the_maildir_are_unreadable_to_commands() {
+        let secrets = tempfile::tempdir().unwrap();
+        let pass = secrets.path().join("mail.pass");
+        std::fs::write(&pass, "app-password\n").unwrap();
+        let maildir = secrets.path().join("Maildir");
+        std::fs::create_dir_all(maildir.join("new")).unwrap();
+        std::fs::write(maildir.join("new/1.eml"), "From: a@platform.example.test\n\nhi\n").unwrap();
+        std::fs::write(secrets.path().join("notes.txt"), "other").unwrap();
+        let (p, m) = (pass.display().to_string(), maildir.display().to_string());
+        let e = env_with_packs(
+            Script::new(|_, _| finish("ok")),
+            |c| {
+                c.mail.enabled = true;
+                c.mail.host = "imap.example.test".into();
+                c.mail.username = "researcher@example.test".into();
+                c.mail.password_file = Some(p);
+                c.mail.maildir_path = Some(m);
+                c.mail.allow_senders = vec!["*@platform.example.test".into()];
+            },
+            |_| {},
+        )
+        .await;
+        let role = e.rt.inner.packs.role(None, None).unwrap().clone();
+        let cfg = sandbox_cfg_for(&e.rt.inner.config.sandbox, &role, &e.ws, &e.rt.inner.models().configs());
+        let tmp = e.dir.path().join("tmp-mail");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let sb = Sandbox::new(&cfg, &e.ws, &tmp, &e.rt.paths().home, None).unwrap();
+        assert!(sb.check_read(&pass).is_err(), "the IMAP password");
+        assert!(sb.check_read(&maildir.join("new/1.eml")).is_err(), "the maildir, past allow_senders");
+        assert!(sb.check_read(&secrets.path().join("notes.txt")).is_ok(), "only those");
+        e.rt.shutdown().await;
+
+        let mut signal = Config::default();
+        signal.signal.enabled = true;
+        let with_xdg = std::env::var_os("XDG_DATA_HOME").filter(|d| Path::new(d).is_absolute());
+        let want: Vec<String> =
+            with_xdg.iter().map(|d| Path::new(d).join("signal-cli").display().to_string()).collect();
+        assert_eq!(service_secret_paths(&signal), want);
+        signal.signal.enabled = false;
+        assert!(service_secret_paths(&signal).is_empty());
+    }
+
     /// A profile a reload adds is infrastructure at once: a host the mission was granted becomes unreachable when it
     /// turns out to be a model endpoint, and a loopback endpoint's port is refused to the sandboxes made from then on.
     #[tokio::test]
@@ -10091,6 +10185,7 @@ mod tests {
             rule: "mode open".into(),
             resolved: None,
             sni: None,
+            paced_ms: None,
         };
         let path = e.rt.paths().session_dir(&id).join("net.jsonl");
         // Lines written before the chain existed still load; new lines chain after them.

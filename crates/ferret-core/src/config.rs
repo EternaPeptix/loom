@@ -665,9 +665,9 @@ pub struct SandboxCfg {
     /// fork until the user has `limit - nproc_headroom` processes, so a fork bomb stops while the daemon can
     /// still start the processes that stop it. 0 sets no limit. Never below the processes that exist plus 64.
     pub nproc_headroom: u32,
-    /// Loopback ports of infrastructure (a model endpoint or a `network.infrastructure` entry on this
-    /// machine) that no command may connect to, whatever else allows loopback. Set by the runtime; not a
-    /// config key.
+    /// Loopback ports of infrastructure (a model endpoint, the Signal bridge's signal-cli or a
+    /// `network.infrastructure` entry on this machine) that no command may connect to, whatever else allows
+    /// loopback. Set by the runtime; not a config key.
     #[serde(skip)]
     pub infra_ports: Vec<u16>,
 }

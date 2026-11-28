@@ -14,6 +14,8 @@
 //! - `hosts_in(text)` returns the host names and addresses a text sends something to: the authority of every URL
 //!   (`scheme://user@host:port/…`, userinfo and port removed), and the host argument of `curl`, `wget`, `nc`, `ncat`,
 //!   `telnet`, `ssh`, `scp`, `nmap`, `hydra`, `ffuf` and `sqlmap`. It does not take file names (`main.py`) for hosts.
+//!   `destinations_in(text)` is the same with the port the text gives each one, when it gives one (a URL's or a
+//!   `host:port` operand's, `nc host port`, `telnet host port`, `openssl s_client -connect host:port`).
 //!   `urls_in(text)` returns the URLs themselves. `paths_in(text)` returns the path-like tokens (absolute, `~`, `$HOME`,
 //!   `./`, `../`), without a URL's path.
 //! - `without_urls(text)` is the text with every URL cut out: the `.git/config` of a URL aimed at a target is not a
@@ -82,6 +84,16 @@ impl Re {
             .unwrap_or_default()
     }
 
+    /// The first capture group of every match, with the second when it took part.
+    pub fn group1_and_2<'a>(&self, text: &'a str) -> Vec<(&'a str, Option<&'a str>)> {
+        self.re
+            .as_ref()
+            .map(|r| {
+                r.captures_iter(text).filter_map(|c| Some((c.get(1)?.as_str(), c.get(2).map(|m| m.as_str())))).collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// The pieces of `text` between matches.
     pub fn split<'a>(&self, text: &'a str) -> Vec<&'a str> {
         self.re.as_ref().map(|r| r.split(text).collect()).unwrap_or_else(|| vec![text])
@@ -114,7 +126,11 @@ patterns! {
     SEGMENT_SEP => r"\|\||&&|[;|\n]";
     SEARCH_TOOL => r"(?i)^\s*(?:sudo\s+)?(?:git\s+)?(?:grep|egrep|fgrep|zgrep|rg|ag|ack|ripgrep)\b";
     URL_AUTHORITY => r#"(?i)\b[a-z][a-z0-9+.-]*://([^\s/'"<>`?#)\]}]+)"#;
-    NET_COMMAND_HOST => r#"(?i)(?:^|[\s;&|(])(?:curl|wget|nc|ncat|netcat|telnet|ssh|scp|sftp|nmap|hydra|ffuf|sqlmap|gobuster|nikto|wfuzz)\s+(?:-[^\s]+\s+(?:[0-9]+\s+)?)*(?:[A-Za-z0-9._-]+@)?((?:[a-z0-9-]+\.)+[a-z]{2,}|\d{1,3}(?:\.\d{1,3}){3}|\[[0-9a-f:]+\])(?::\d{1,5})?(?:[\s/]|$)"#;
+    NET_COMMAND_HOST => r#"(?i)(?:^|[\s;&|(])(?:curl|wget|nc|ncat|netcat|telnet|ssh|scp|sftp|nmap|hydra|ffuf|sqlmap|gobuster|nikto|wfuzz)\s+(?:-[^\s]+\s+(?:[0-9]+\s+)?)*(?:[A-Za-z0-9._-]+@)?((?:[a-z0-9-]+\.)+[a-z]{2,}|\d{1,3}(?:\.\d{1,3}){3}|\[[0-9a-f:]+\])(?::(\d{1,5}))?(?:[\s/]|$)"#;
+    /// `nc host port`, `telnet host port`: the port is an operand of its own.
+    NET_HOST_PORT => r#"(?i)(?:^|[\s;&|(])(?:nc|ncat|netcat|telnet)\s+(?:-[^\s]+\s+(?:[0-9]+\s+)?)*((?:[a-z0-9-]+\.)+[a-z]{2,}|\d{1,3}(?:\.\d{1,3}){3}|localhost)\s+(\d{1,5})(?:\s|$)"#;
+    /// `openssl s_client -connect host:port` and the like.
+    CONNECT_HOST_PORT => r#"(?i)-connect\s+((?:[a-z0-9-]+\.)+[a-z]{2,}|\d{1,3}(?:\.\d{1,3}){3}|localhost|\[[0-9a-f:]+\]):(\d{1,5})"#;
     PATH_TOKEN => r#"(?:^|[\s='"(<>:,;|&])((?:~|\$HOME|\$\{HOME\}|\$TMPDIR|\$\{TMPDIR\}|\$PWD|\$\{PWD\}|\.{1,2}|/)[A-Za-z0-9_@%+=:,./~$-]{1,300})"#;
     BASE64_RUN => r"[A-Za-z0-9+/_-]{8,}={0,2}";
     HEX_RUN => r"\b(?:[0-9a-fA-F]{2}){4,}\b";
@@ -356,6 +372,29 @@ pub fn hosts_in(text: &str) -> Vec<String> {
     out
 }
 
+/// The destinations `text` sends something to, as `hosts_in` finds them (and `openssl`'s `-connect host:port`), each
+/// with the port the text gives it when it gives one: a URL's `:port`, a network command's `host:port` operand, the
+/// port operand of `nc host port` and `telnet host port`.
+pub fn destinations_in(text: &str) -> Vec<(String, Option<u16>)> {
+    let text = cut(text, MAX_SCAN_BYTES);
+    let mut out: Vec<(String, Option<u16>)> = Vec::new();
+    let mut push = |h: String, p: Option<u16>| {
+        if !h.is_empty() && !out.contains(&(h.clone(), p)) {
+            out.push((h, p));
+        }
+    };
+    for a in URL_AUTHORITY.group1(text) {
+        push(host_of_authority(a), port_of_authority(a));
+    }
+    for (h, p) in NET_COMMAND_HOST.group1_and_2(text) {
+        push(host_of_authority(h.trim_matches(['[', ']'])), p.and_then(|p| p.parse().ok()));
+    }
+    for (h, p) in NET_HOST_PORT.captures2(text).into_iter().chain(CONNECT_HOST_PORT.captures2(text)) {
+        push(host_of_authority(h.trim_matches(['[', ']'])), p.parse().ok());
+    }
+    out
+}
+
 /// The path-like tokens of `text`, URLs left out.
 pub fn paths_in(text: &str) -> Vec<String> {
     let bare = without_urls(text);
@@ -462,6 +501,16 @@ mod tests {
         assert_eq!(port_of_authority("[::1]:81"), Some(81));
         assert_eq!(port_of_authority("a.test"), None);
         assert_eq!(hosts_in("ssh -p 2222 root@jump.example.test uptime"), vec!["jump.example.test"]);
+        // With their ports, where the text gives one.
+        let d = destinations_in(t);
+        assert!(
+            d.contains(&("api.example.test".into(), Some(8443))) && d.contains(&("10.0.0.5".into(), Some(4444))),
+            "{d:?}"
+        );
+        let d = destinations_in("openssl s_client -connect imap.mail.example:993 </dev/null; nc -w 3 localhost 1337");
+        assert!(d.contains(&("imap.mail.example".into(), Some(993))), "{d:?}");
+        assert!(d.contains(&("localhost".into(), Some(1337))), "{d:?}");
+        assert_eq!(destinations_in("curl https://a.example/x"), vec![("a.example".to_string(), None)]);
     }
 
     #[test]

@@ -34,6 +34,7 @@ fn env_of(paths: &Paths) -> Arc<Env> {
         packs: Default::default(),
         relaxed_profiles: Default::default(),
         mcp_hosts: Default::default(),
+        box_shell: Default::default(),
     })
 }
 
@@ -230,6 +231,7 @@ fn the_grant_in_force_at_the_time_is_the_one_that_counts() {
                 rule: "default deny".into(),
                 resolved: None,
                 sni: None,
+                paced_ms: None,
             },
         };
         w.append(&h.paths.sessions_dir().join("s-1").join("net.jsonl"), &e).expect("net");

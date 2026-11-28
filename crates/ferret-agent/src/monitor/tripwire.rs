@@ -357,6 +357,7 @@ mod tests {
             goal: String::new(),
             operator_messages: vec![],
             rules: vec![],
+            approvals: vec![],
             grants: vec![],
             allow: vec![],
             deny: vec![],

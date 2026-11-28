@@ -432,6 +432,7 @@ mod tests {
             packs: Default::default(),
             relaxed_profiles: Default::default(),
             mcp_hosts: Default::default(),
+            box_shell: Default::default(),
         }
     }
 

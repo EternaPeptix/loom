@@ -35,7 +35,9 @@
 //! loopback rule (a listener on `0.0.0.0` or `[::]` answers on its LAN, tailnet and global addresses).
 //! A name that resolved to nothing, or addresses that changed since, are covered only as the daemon last
 //! resolved them. `Policy::infrastructure_refusal(entry)` names the rule that refuses a grant entry
-//! (its IP literal, with its port, or every port when it has none), for the early sentence. Cloud
+//! (its IP literal, with its port, or every port when it has none), for the early sentence;
+//! `Policy::infrastructure_on_some_port(host)` names a rule that refuses a host (no port) on any port at all, such as
+//! a service on its own port (what a grant of the host without a port leaves refused). Cloud
 //! metadata names are `metadata`, `instance-data`, `metadata.goog` and `metadata.*` / `instance-data.*`
 //! under `.internal` (not `metadata.target.example`, an ordinary host). The ferret proxy's own listeners (every other
 //! session's port) are refused by the proxy itself (`deny the egress proxy's own port`), not here. An
@@ -772,6 +774,30 @@ impl Policy {
         let h = normalize_host(h);
         let literal = h.parse::<IpAddr>().ok();
         self.infra_hit(&h, port.unwrap_or(0), literal)
+    }
+
+    /// The infrastructure rule that refuses `host` (a name or an IP literal, no port) on some port, if any: what a
+    /// grant of the host without a port leaves refused, such as the IMAP server of `[mail]` on its port. Names are
+    /// judged by name only, as in `infrastructure_refusal`. The monitor asks it of a scope request without a port.
+    pub fn infrastructure_on_some_port(&self, host: &str) -> Option<String> {
+        let h = normalize_host(host.trim().trim_start_matches('[').trim_end_matches(']'));
+        let literal = h.parse::<IpAddr>().ok();
+        self.infra
+            .iter()
+            .find(|r| match &r.kind {
+                InfraKind::Name(p) => Pattern { port: None, ..p.clone() }.matches(&h, 0),
+                InfraKind::Net { net, .. } => literal.is_some_and(|a| net.contains(a)),
+                InfraKind::Loopback { .. } => {
+                    InfraRule { label: String::new(), kind: InfraKind::Loopback { ports: None } }.hits(
+                        &h,
+                        0,
+                        literal,
+                        &self.local_addrs,
+                    )
+                }
+                InfraKind::MetadataNames => is_metadata_name(&h),
+            })
+            .map(|r| format!("deny infrastructure: {}", r.label))
     }
 
     /// The `deny infrastructure ...` rule that matches the name or the address, if any.
@@ -1807,6 +1833,16 @@ mod tests {
         }
         assert!(infra_rule(&p.check_addr("x.test", 1337, ip("127.0.0.1"), "r")));
         assert!(p.infrastructure_refusal("127.0.0.1:1337").is_some());
+        // A host without a port is infrastructure on some port: what the monitor asks of a scope request without one.
+        assert_eq!(
+            p.infrastructure_on_some_port("imap.example.test").as_deref(),
+            Some("deny infrastructure: mail.host imap.example.test:993")
+        );
+        assert!(
+            p.infrastructure_on_some_port("localhost").is_some() && p.infrastructure_on_some_port("[::1]").is_some()
+        );
+        assert!(p.infrastructure_on_some_port("metadata.google.internal").is_some());
+        assert!(p.infrastructure_on_some_port("other.example.test").is_none());
         // Port-exact, as a model endpoint.
         assert!(p.check_name("imap.example.test", 443).allowed);
         assert!(p.check_name("127.0.0.1", 1338).allowed);

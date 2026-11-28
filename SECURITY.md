@@ -83,7 +83,7 @@ On macOS, with `[sandbox] mode = "seatbelt"` (the default), commands run under `
   stores and password-manager data, cloud, registry, model-hub, AI-tool and database client credentials
   (`~/.cache/huggingface`, `~/.claude.json`, `~/.pgpass`, `~/.vault-token`, `~/.m2/settings.xml`,
   `~/.config/rclone`, and more), wallets, the macOS Keychains and Cookies folders, Mail, Messages,
-  Telegram, Group Containers and the Chrome, Chromium, Brave, Edge, Arc, Vivaldi, Opera, Firefox and
+  Telegram, Signal (Signal Desktop and signal-cli's `~/.local/share/signal-cli`), Group Containers and the Chrome, Chromium, Brave, Edge, Arc, Vivaldi, Opera, Firefox and
   Safari profiles. So are
   the whole ferret home but the session's temp directory and the harness's staging of analysis inputs (the
   token and keys included), whose names are hidden as well as their content, and your `unreadable_paths`. A listed directory that is or contains the
@@ -100,7 +100,9 @@ On macOS, with `[sandbox] mode = "seatbelt"` (the default), commands run under `
   port, the model endpoints of the configuration, the Signal bridge's `signal-cli` and the mail inbox's IMAP server
   (when enabled), the box's Docker host and `network.infrastructure` (`deny infrastructure: …` in the audit file),
   by name and by the addresses the daemon resolves for the named
-  entries and for this machine, and the sandbox refuses those loopback ports directly (also under `loopback_all`);
+  entries and for this machine, and the sandbox refuses those loopback ports directly (also under `loopback_all`) and
+  hides those services' files from commands and file tools (`mail.password_file`, `mail.maildir_path` and signal-cli's
+  account store, wherever they lie);
   `ferret scope revoke` takes a grant back for good (it is refused whatever else allows it, and kept across a restart)
   and cuts its open connections. Commands that listen on loopback can be reached by other
   local processes. Commands cannot connect to the daemon's own port, whatever you allow on loopback, so a

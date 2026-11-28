@@ -1055,6 +1055,11 @@ pub struct NetDecision {
     /// older records and from every record whose tunnel named its own destination.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sni: Option<String>,
+    /// How long, in milliseconds, the connection waited for the egress noise governor before it was judged: the
+    /// client connected that long before the time this decision was recorded. Absent when it did not wait (the
+    /// governor is off, it was not paced, it was let through at once) and from older records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paced_ms: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1431,6 +1436,7 @@ mod tests {
                     rule: "deny".into(),
                     resolved: Some("1.2.3.4".into()),
                     sni: None,
+                    paced_ms: None,
                 }),
             ),
             ("cache_break", Event::CacheBreak { req_id: "r-1".into(), first_diff_message: 2, detail: "d".into() }),

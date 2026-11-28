@@ -41,7 +41,9 @@
 //! requires entry `n` to exist with exactly that mac, so removing the last entries, deleting the
 //! journal, or substituting another mission's journal (and head) is `Tampered`. The journal may be
 //! ahead of the head by entries that verify (crash between the two writes); the next append repairs
-//! it. A head whose seal fails is `Tampered`. A journal without a head (written before heads existed)
+//! it. A head whose seal fails is `Tampered`. A head sealed with the label of the time before ferret was renamed
+//! (`loom-journal-head-v1`) verifies as well, so a mission directory of that time keeps its ledger; the next append
+//! seals the head with the current label. A journal without a head (written before heads existed)
 //! is accepted and gets one at its next append. A head write that fails does not fail the append (the
 //! entry is durable, and an error would make the caller record it twice); it shows only as
 //! [`JournalRead::ahead_of_head`] until a later append writes the head.
@@ -62,7 +64,8 @@
 //! Tests required: append/read round trip; ids consecutive; tamper detection for an edited body, a
 //! removed line, a reordered pair, a truncated tail; wrong key; rule refusal writes nothing; `check`
 //! refusal writes nothing; two threads appending 50 entries each yield 100 distinct consecutive `n`;
-//! key file created with mode 0600 and reused.
+//! key file created with mode 0600 and reused; a head sealed with the label from before the rename verifies (and still
+//! catches a truncation), the next append seals it with the current label, and any other label does not verify.
 
 use crate::ids::SessionId;
 use crate::ledger::{Entry, LedgerOp, LedgerState};
@@ -150,6 +153,9 @@ struct Loaded {
 }
 
 const HEAD_LABEL: &[u8] = b"ferret-journal-head-v1\0";
+/// The label of the heads written before ferret was renamed (it was loom): such a head verifies too, so a mission
+/// directory of that time keeps its ledger, and the next append seals the head with `HEAD_LABEL`.
+const LEGACY_HEAD_LABEL: &[u8] = b"loom-journal-head-v1\0";
 
 #[cfg(test)]
 thread_local! {
@@ -289,7 +295,7 @@ impl Journal {
         Ok(loaded)
     }
 
-    fn head_mac(&self, n: u64, mac: &str) -> std::io::Result<HmacSha256> {
+    fn head_mac(&self, label: &[u8], n: u64, mac: &str) -> std::io::Result<HmacSha256> {
         let dir = self
             .path
             .parent()
@@ -297,7 +303,7 @@ impl Journal {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
         let mut m = new_mac(&self.key)?;
-        m.update(HEAD_LABEL);
+        m.update(label);
         m.update(dir.as_bytes());
         m.update(b"\0");
         m.update(n.to_string().as_bytes());
@@ -328,8 +334,11 @@ impl Journal {
         ) else {
             return Err(bad("is missing `n`, `mac` or `seal`"));
         };
-        let m = self.head_mac(n, mac).map_err(|e| tampered(0, format!("unusable key: {e}")))?;
-        if m.verify_slice(&seal).is_err() {
+        let verifies = |label: &[u8]| -> Result<bool, JournalError> {
+            let m = self.head_mac(label, n, mac).map_err(|e| tampered(0, format!("unusable key: {e}")))?;
+            Ok(m.verify_slice(&seal).is_ok())
+        };
+        if !verifies(HEAD_LABEL)? && !verifies(LEGACY_HEAD_LABEL)? {
             return Err(bad(
                 "does not verify (it was altered, copied from another mission, or sealed with a different key)",
             ));
@@ -350,7 +359,7 @@ impl Journal {
 
     /// Atomically record `{n, mac, seal}` of the last entry beside the journal.
     fn write_head(&self, n: u64, mac: &str) -> std::io::Result<()> {
-        let seal = hex::encode(self.head_mac(n, mac)?.finalize().into_bytes());
+        let seal = hex::encode(self.head_mac(HEAD_LABEL, n, mac)?.finalize().into_bytes());
         let body = serde_json::to_vec(&serde_json::json!({ "n": n, "mac": mac, "seal": seal }))?;
         let head = self.head_path();
         let tmp = head.with_extension("head.tmp");
@@ -1105,6 +1114,45 @@ mod tests {
         assert!(head_file(&j).exists());
         assert_eq!(j.read_report().map(|r| (r.entries.len(), r.ahead_of_head)).ok(), Some((3, 0)));
         assert!(std::fs::read_to_string(j.path()).unwrap_or_default().starts_with(GOLDEN));
+    }
+
+    /// Seals the journal's current head again with `label`, as a build that used that label wrote it.
+    fn reseal_head(j: &Journal, label: &[u8]) {
+        let head: Value = serde_json::from_slice(&std::fs::read(head_file(j)).unwrap_or_default()).unwrap_or_default();
+        let (n, mac) = (head["n"].as_u64().unwrap_or(0), head["mac"].as_str().unwrap_or("").to_string());
+        let seal = hex::encode(j.head_mac(label, n, &mac).map(|m| m.finalize().into_bytes()).unwrap_or_default());
+        let body = serde_json::json!({ "n": n, "mac": mac, "seal": seal });
+        std::fs::write(head_file(j), serde_json::to_vec(&body).unwrap_or_default()).unwrap_or_default();
+    }
+
+    fn head_seal(j: &Journal) -> String {
+        let head: Value = serde_json::from_slice(&std::fs::read(head_file(j)).unwrap_or_default()).unwrap_or_default();
+        head["seal"].as_str().unwrap_or("").to_string()
+    }
+
+    #[test]
+    fn a_head_sealed_before_the_rename_verifies_and_is_resealed_at_the_next_append() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let j = journal(&dir);
+        fill(&j, 2);
+        reseal_head(&j, LEGACY_HEAD_LABEL);
+        let legacy = head_seal(&j);
+        // A mission directory written before the rename keeps its ledger, and its head still vouches for its length.
+        assert_eq!(j.read_report().map(|r| (r.entries.len(), r.ahead_of_head)).ok(), Some((2, 0)));
+        let v = lines(&j);
+        write_lines(&j, &v[..1]);
+        assert!(matches!(j.read(), Err(JournalError::Tampered { .. })), "truncation under a legacy head is caught");
+        write_lines(&j, &v);
+        // The next append seals the head with the current label.
+        assert_eq!(plus_op(&j).map(|(e, _)| e.n).ok(), Some(3));
+        let current = head_seal(&j);
+        assert_ne!(current, legacy);
+        reseal_head(&j, HEAD_LABEL);
+        assert_eq!(head_seal(&j), current, "the new head is sealed with HEAD_LABEL");
+        assert_eq!(j.read_report().map(|r| (r.entries.len(), r.ahead_of_head)).ok(), Some((3, 0)));
+        // Any other label is still a head that does not verify.
+        reseal_head(&j, b"other-journal-head-v1\0");
+        assert!(matches!(j.read(), Err(JournalError::Tampered { .. })));
     }
 
     #[test]

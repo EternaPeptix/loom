@@ -1280,9 +1280,9 @@ The Seatbelt policy:
   `~/.config/hub`, `~/.config/glab-cli`, `~/.oci`, `~/.config/doctl`, `~/.fly/config.yml`, `~/.config/heroku`,
   `~/.heroku`, `~/.config/netlify`, `~/.config/sops`, `~/.age`, `~/.config/age`, `~/.bitcoin`,
   `~/.ethereum`, `~/.config/solana`, `~/.wrangler`, `~/.config/.wrangler`, `~/.pulumi/credentials.json`,
-  `~/Library/Keychains`, `~/Library/Cookies`, the Chrome (also Beta and Canary), Chromium, Brave, Edge,
+  `~/.local/share/signal-cli`, `~/Library/Keychains`, `~/Library/Cookies`, the Chrome (also Beta and Canary), Chromium, Brave, Edge,
   Arc, Vivaldi, Opera, Firefox and Safari profiles; under `~/Library/Application Support`: `Bitwarden`,
-  `Bitwarden CLI`, `1Password`, `Telegram Desktop`, `Claude/claude_desktop_config.json`, `doctl` and
+  `Bitwarden CLI`, `1Password`, `Telegram Desktop`, `Signal`, `Claude/claude_desktop_config.json`, `doctl` and
   `sops`; `~/Library/Containers/com.bitwarden.desktop`, `~/Library/Preferences/netlify`,
   `~/Library/Preferences/.wrangler`, `~/Library/Group Containers`, `~/Library/Mail`, `~/Library/Messages`).
   Other stores go in `sandbox.unreadable_paths`. A store that is or
@@ -1409,14 +1409,20 @@ head within 10 s gets `400`.
   `fd00:ec2::254`, `100.100.100.200`, `192.0.0.192`, the names `metadata`, `instance-data`, `metadata.goog` and
   `metadata.*` / `instance-data.*` under `.internal`) and, on this machine, DevTools and inspector ports 9222 and 9229 and the Docker API ports
   2375 and 2376. From the configuration: the daemon's port, the `host:port` of every model profile's
-  `base_url`, the box's `ssh_host` and `network.infrastructure`. The proxy's own listeners (every other
+  `base_url`, the services the daemon talks to for the operator (`runtime::service_endpoints`: the Signal bridge's
+  signal-cli, `signal.http_url`, with `[signal]` enabled; the mail inbox's IMAP server, `mail.host` on `mail.port`,
+  with `[mail]` enabled and `imaps`; each on its own port only, rule `deny infrastructure: signal.http_url …` /
+  `mail.host …`), the box's `ssh_host` and `network.infrastructure`. The proxy's own listeners (every other
   session's port) are refused by the proxy itself. A named endpoint is refused by name and by the addresses the
   daemon resolves for it (at start and every five minutes: model endpoints, `network.infrastructure` names, the
   box's `ssh_host` and the `HostName` of `ssh -G`), and this machine's own interface addresses count as this machine
   for the loopback rules, so an IP alias or a short name of the same host is refused too; a grant that names
   infrastructure is refused when it is made. The sandbox refuses the loopback ports of these (and 9222, 9229, 2375,
-  2376) directly, also under `loopback_all`. `Runtime::start` refuses a `network.infrastructure` entry it cannot
-  read; a `ssh_host` of the form `user@host` or `ssh://user@host:2222` is reduced to its host.
+  2376) directly, also under `loopback_all`, and the services' files are not readable to commands and file tools
+  (`runtime::service_secret_paths` in `sandbox.unreadable_paths`: `mail.password_file`, `mail.maildir_path`, and
+  signal-cli's store under `$XDG_DATA_HOME`; the default `~/.local/share/signal-cli` is a credential store).
+  `Runtime::start` refuses a `network.infrastructure` entry or a service endpoint it cannot read; a `ssh_host` of the
+  form `user@host` or `ssh://user@host:2222` is reduced to its host.
 - **Per-session scope grants.** The operator can authorize more hosts for a running mission without a
   restart (`Runtime::grant_scope`, `POST /api/sessions/{id}/scope`, `ferret scope`). The egress policy of
   every running session of the mission becomes the configured network plus the granted hosts: under

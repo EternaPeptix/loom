@@ -4,7 +4,8 @@
 //! CONTRACT.
 //!
 //! - `Authorization` holds operator-authored strings only: the goal verbatim, the operator's chat messages and the
-//!   *answer part* of their inbox answers, the rules in force, the operator's grants with the operator's own notes and
+//!   *answer part* of their inbox answers, the rules in force, the approvals not yet used (`[scope] text`, from the
+//!   ledger: `ferret approve`, the web UI, Signal's `/approve`), the operator's grants with the operator's own notes and
 //!   their `[lab]` / `[prod]` marks, the configured allow and deny lists and network mode, the box targets, the pack's
 //!   `solvable` and `requires_restricted_network` flags and the role, the `scope` and `exclude` of the mission's named
 //!   target as its lead's start recorded them (`SessionMeta::target`, CONTRACTS-TRAFFIC-TARGETS T2), and the hosts the
@@ -35,7 +36,8 @@
 //! - `Authorization::build(mission, entries, upto_ms, facts)` (M2) folds the mission's journal entries up to a time
 //!   (`upto_ms`, so a record is judged by the authorization in force when it was made, and a replay is not judged by a
 //!   grant that came later) and takes the rest from `AuthFacts`: the goal (`LedgerState::goal`, verbatim), the
-//!   constraints that are not retired (rules), the operator's grants (`LedgerState::granted_hosts`, each with the note
+//!   constraints that are not retired (rules), the approvals not used (`LedgerState::approvals` without `used_for`), the
+//!   operator's grants (`LedgerState::granted_hosts`, each with the note
 //!   of its grant, `Mark::None`: `ferret scope --lab` is M4), the operator's chat messages and the answer part of their
 //!   inbox answers (`AuthFacts::operator_messages`, from the records authored by the user, cut to `MAX_MESSAGES` of
 //!   `MAX_MESSAGE_CHARS`), and the configuration's allow and deny lists, network mode, `solvable`,
@@ -48,7 +50,8 @@
 //! after `upto_ms` do not count; a revoked grant is gone. In P0:
 //! `a_grant_gives_its_mark_and_nothing_else_does`, `wildcard_and_port_grants_give_their_mark`,
 //! `the_strictest_mark_wins_and_lapsed_grants_give_nothing`, `real_targets_are_derived_from_mode_allow_list_and_grants`;
-//! after the merge of targets and MCP: `the_target_scope_and_mcp_hosts_authorize_and_exclusions_do_not`.
+//! after the merge of targets and MCP: `the_target_scope_and_mcp_hosts_authorize_and_exclusions_do_not`; after the merge
+//! of main (da5d310): `the_operators_approvals_not_yet_used_are_in_the_block`.
 
 use ferret_core::ledger::{Entry, LedgerState};
 use ferret_core::MissionId;
@@ -112,6 +115,10 @@ pub struct Authorization {
     pub goal: String,
     pub operator_messages: Vec<String>,
     pub rules: Vec<String>,
+    /// The operator's approvals not yet used (`[scope] text`, verbatim): what `ferret approve`, the web UI and Signal's
+    /// `/approve` record in the ledger.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub approvals: Vec<String>,
     pub grants: Vec<Grant>,
     pub allow: Vec<String>,
     pub deny: Vec<String>,
@@ -204,6 +211,12 @@ impl Authorization {
             goal: state.goal.clone().unwrap_or_default(),
             operator_messages: messages.into_iter().skip(skip).collect(),
             rules: state.constraints.iter().filter(|c| c.retired.is_none()).map(|c| c.text.clone()).collect(),
+            approvals: state
+                .approvals
+                .iter()
+                .filter(|a| a.used_for.is_none())
+                .map(|a| format!("[{}] {}", a.scope.trim(), a.text.trim()))
+                .collect(),
             grants: state
                 .granted_hosts()
                 .into_iter()
@@ -243,6 +256,7 @@ mod tests {
             goal: "test the lab".into(),
             operator_messages: vec![],
             rules: vec![],
+            approvals: vec![],
             grants: vec![Grant {
                 host: "Lab.Example".into(),
                 note: String::new(),
@@ -411,6 +425,25 @@ mod tests {
         let a = Authorization::build(&MissionId::from("m-1"), &entries, u64::MAX, &facts());
         let json = serde_json::to_string(&a).unwrap_or_default();
         assert!(!json.contains("AGENT-"), "{json}");
+    }
+
+    /// An approval (`ferret approve`, the web UI, Signal's `/approve`) is the operator's words: it is in the block until
+    /// it is used. An agent cannot write one (the ledger refuses `ApprovalGrant` not from the user).
+    #[test]
+    fn the_operators_approvals_not_yet_used_are_in_the_block() {
+        use ferret_core::ledger::LedgerOp;
+        let grant = |n, ts, text: &str, scope: &str| Entry {
+            from_user: true,
+            ..entry(n, ts, "s-1", LedgerOp::ApprovalGrant { text: text.into(), scope: scope.into() })
+        };
+        let entries = vec![
+            grant(1, 10, "You may test staging.acme.example", "network"),
+            grant(2, 11, "ok to push the fix branch", "git push"),
+            entry(3, 12, "s-1", LedgerOp::ApprovalUse { id: "a2".into(), used_for: "pushed".into() }),
+        ];
+        let a = Authorization::build(&MissionId::from("m-1"), &entries, u64::MAX, &facts());
+        assert_eq!(a.approvals, vec!["[network] You may test staging.acme.example".to_string()]);
+        assert!(Authorization::build(&MissionId::from("m-1"), &entries, 5, &facts()).approvals.is_empty());
     }
 
     #[test]

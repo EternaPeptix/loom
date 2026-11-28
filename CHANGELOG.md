@@ -22,7 +22,44 @@
   `ctf-generalist` pack a configuration whose `[monitor.recipients]` names the other packs fails `ferret config check`
   until it names this one too (or lists the profile in `tripwires_only_profiles`); the worked example has the line.
 - **Main's pacing and the cut.** The noise governor paces an intercepted tunnel's requests inside the tunnel, which a
-  cut (E4a) or a shutdown still ends at once.
+  cut (E4a) or a shutdown still ends at once. An opaque tunnel and a forwarded request wait for the governor (up to 30 s)
+  before anything is resolved or opened, and that wait now watches the cut too: a connection cut while it waits
+  (`ferret scope revoke`, the monitor's cut) opens nothing, its client gets `502` and the record is a refusal (`… (cut
+  while it waited for pacing)`), never an allow of a revoked destination; the policy is read again when the wait ends,
+  so a hold or a revoke set meanwhile decides it; and a tunnel whose client gave up while it waited opens nothing and
+  leaves no record (a forwarded request whose client only shut down its writing half is still served).
+- **A paced decision says how long it waited.** A net decision of a connection that waited for the governor carries
+  `paced_ms`; TW-21 (and FS-3 through it) judges it at the time its process connected, so a connection held back
+  20 s past the end of its call is not idle egress.
+- **The services' files are not readable to commands either (E1).** The endpoint deny closed only the network route
+  to signal-cli and the IMAP server. With `[mail]` enabled, `mail.password_file` and `mail.maildir_path` are now in
+  the sandbox's unreadable paths wherever they lie (a command could otherwise read the IMAP password, or the maildir
+  past `allow_senders`); signal-cli's account store (`~/.local/share/signal-cli`) and Signal Desktop's are credential
+  stores of the sandbox, and with `[signal]` enabled a signal-cli store under the daemon's `$XDG_DATA_HOME` is hidden too
+  (another `--config` directory goes in `sandbox.unreadable_paths`).
+- **A Signal approval grants only what its alert showed.** `request_scope` takes any number of hosts and the Signal alert
+  cuts long names (`…`) and leaves hosts out (`… +N more`), while `approve` granted them all, and the monitor counts every
+  grant as the operator's. `approve` (and `/scope <item>`, `/approve <item>`) of such a request, or the number of a host
+  shown cut, now grants nothing and says to give the numbers of hosts shown in full, write the names out with `/scope
+  <session> <host>...`, or use the web UI or `ferret scope`.
+- **The monitor and main's box tools.** Main gave core's lead, worker and chat (and `vr`, `redteam`) `box_exec`,
+  `box_get` and `box_reset`. A command that runs in the box (`box_exec`, `box_reset`, `bash` of a role whose
+  `default_shell` is `box`) is no longer judged by the tripwires about this machine (its paths for TW-05, TW-07,
+  TW-09, TW-10, TW-16 and FS-1; TW-09's git commands, TW-10's `ps eww`, TW-16's `LD_PRELOAD`, TW-22's side channels);
+  destinations, sinks, credentials and canaries still are. `box_get` is judged by the workspace file it writes (`to`,
+  by default the box path's last name), so `box_get` into `AGENTS.md` or `.git/hooks/pre-commit` raises TW-26 or
+  TW-09 and a fetched `/root/.gitconfig` does not.
+- **Operator approvals are authorization.** The approvals not yet used (`ferret approve`, the web UI, Signal's
+  `/approve`) are in the monitor's authorization and are operator text for TW-03, so a scope request for the host an
+  approval names, citing it, is an ordinary request.
+- **Infrastructure on its own port.** TW-02 judges a call's destinations on the port the call gives them (a URL's,
+  `host:port`, `nc host port`, `telnet host port`, `openssl s_client -connect host:port`), so `nc 127.0.0.1 1337`
+  (signal-cli), `-connect imap.mail.example:993` and the daemon's port are infrastructure attempts; TW-03 reads a scope
+  request without a port as covering every port, a service's own included (`Policy::infrastructure_on_some_port`).
+- **A mission directory from before the rename keeps its ledger.** Main renamed the journal head's seal label
+  (`loom-journal-head-v1` to `ferret-journal-head-v1`), so every journal of a home moved from `~/.loom` failed
+  verification (the runtime's ledger reads and the monitor's authorization with it). A head sealed with the old label
+  verifies again and is sealed with the new one at the next append.
 - **`ferret config check`** runs main's start-up checks (the `[mail]` password file, the packs: `packs: …`) with the
   infrastructure deny, then the model policy. `ferret status` and `GET /api/status` carry both the egress and monitor
   lines and main's default model and Signal state; the web UI's daemon status panel shows Egress and Monitor.

@@ -217,10 +217,10 @@ backend = "imaps"                               # "imaps" (read-only EXAMINE + B
 # host = "imap.example.test"                    # required when backend = "imaps"; example. No command reaches host:port
 port = 993                                      # IMAPS TLS port (1..=65535)
 # username = "researcher@example.test"          # required when backend = "imaps"; example
-# password_file = "~/.ferret/keys/mail.pass"      # required when backend = "imaps"; regular file, mode 0600, never inline
+# password_file = "~/.ferret/keys/mail.pass"      # required when backend = "imaps"; regular file, mode 0600, never inline; no command reads it
 auth = "login"                                  # "login" (app password) or "xoauth2" (OAuth2 bearer token in password_file)
 folder = "INBOX"                                # IMAP mailbox name opened read-only
-# maildir_path = "/path/to/maildir"             # required when backend = "maildir"; example
+# maildir_path = "/path/to/maildir"             # required when backend = "maildir"; example; no command reads it
 # allow_senders = ["*@hackerone.com", "*@bugcrowd.com", "*@*.target.example"]  # REQUIRED when enabled; "*" and "*@*" refused
 # allow_recipients = ["researcher+bb-*@example.test"]  # optional plus-address filter; empty = any recipient in the mailbox
 require_auth_pass = false                       # true: require Authentication-Results showing dkim=pass or spf=pass

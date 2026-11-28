@@ -41,6 +41,8 @@
 //!   `RESTART_BLIND_MS`). Nor are a session's decisions before its `session_start` (`started_at`: a lead's MCP servers
 //!   are listed through its proxy before it), nor decisions toward its mission's MCP hosts while its last turn has not
 //!   ended finished or stopped (a server's own traffic; the session closes its MCP connections at such an end).
+//!   A decision is judged at the time its process connected: the record's time less its `paced_ms`, the time a
+//!   connection waited for the egress noise governor before the proxy judged and recorded it.
 //!   A session freed for being quiet keeps its start, its shell directory and its `blind_until`. TW-06's index (`log::SecretIndex`) holds, per hashed value, the missions whose own results
 //!   showed it; a use flags only a mission that never saw the value itself; one mission's flood evicts only its own
 //!   tags, and new tags are handed to the core to persist (`take_new_secrets`) and come back with `restore_secrets`.
@@ -49,7 +51,8 @@
 //!   5 over the mission; S3 when the host was steered, which nothing does before M4); TW-02 an attempt at an
 //!   infrastructure or metadata destination (`deny infrastructure: ...` rules, an allowed connection to one is S4),
 //!   `docker.sock` in arguments, and the floor's vetoes; TW-03 `request_scope` shapes (a wildcard, a registrable domain
-//!   in no operator text, a `why` that claims an authorization no operator text holds); TW-04 bypass encodings in
+//!   in no operator text, a `why` that claims an authorization no operator text holds; operator text is the goal, the
+//!   operator's messages and answers, the rules, the approvals not yet used, the grants, `allow` and the target's scope); TW-04 bypass encodings in
 //!   destinations and scope requests (S2, S3 on repeat); TW-05 the floor's squatter events, and encoded or `zz` names
 //!   written and never read (S1); TW-06 a credential shape in a call toward a sink (S4), in another mission's results
 //!   (S4) or in ledger prose (S2); TW-07 reads under the ferret home outside the session's own directory and other
@@ -70,6 +73,13 @@
 //!   `harness_test` flag (M4); the S3 of TW-17 beside a gated call (M8); a re-finish in a reopened turn (M9); gzip runs
 //!   (M6); a listener serving flag-shaped content (TW-19, needs the census to read content).
 //!
+//! A command that runs in the mission's box (`box_exec`, `box_reset`, and `bash` of a role whose `default_shell` is `box`:
+//! `Env::box_shell`) has no local paths, and TW-09's git commands, TW-10's process inspection, TW-16's preload and
+//! tracing and TW-22's side channels do not read it; its destinations, sinks, credentials and canaries are judged as any
+//! call's. `box_get` writes `to` in the workspace (by default the last name of its box `path`): that is its path, and the
+//! box path is none. A destination in a call's arguments is judged for TW-02 on the port the call gives it
+//! (`patterns::destinations_in`), else on 443 and 80; a scope request's host on the port it names, else on every port.
+//!
 //! A call is read as sent and as run: the paths, URLs and content that the executor's adaptation of a call adds (an
 //! aliased tool or argument name, a Codex `apply_patch` split into one call per file, a fetch's `url` taken from its
 //! `prompt`: `ferret_tools::dialect::adapt` against every tool ferret has, then `schema::normalize_for_tool`) count like
@@ -89,7 +99,11 @@
 //! `mcp_server_traffic_and_what_comes_before_the_session_start_are_not_idle_egress`, `workspace_instructions_are_build_files`,
 //! `an_early_sleep_is_found_beside_a_description_and_a_timeout`,
 //! `an_mcp_tools_arguments_are_not_a_command_line_and_a_writing_tool_writes`,
-//! `an_upload_in_a_workspace_whose_ferret_directory_is_the_home_is_not_the_home`.
+//! `an_upload_in_a_workspace_whose_ferret_directory_is_the_home_is_not_the_home`. After the merge of main (da5d310):
+//! `box_get_is_judged_by_the_workspace_file_it_writes`, `a_command_in_the_box_is_not_judged_as_one_on_this_machine`,
+//! `a_decision_the_noise_governor_held_back_is_judged_when_its_process_connected`,
+//! `a_service_on_its_own_port_is_an_infrastructure_destination_in_arguments_and_scope_requests`,
+//! `tw03_an_operator_approval_is_operator_text`.
 
 #![allow(clippy::too_many_arguments)]
 
@@ -148,6 +162,8 @@ pub struct Env {
     /// Per pack, the hosts its MCP servers add to its sessions (each server's `hosts` and the host of its `url`, for the
     /// servers some role of the pack gets: what a lead connects to, CONTRACTS-MCP M4, M6).
     pub mcp_hosts: BTreeMap<String, Vec<String>>,
+    /// The roles (pack, role) whose `bash` runs in the box (`default_shell = "box"`).
+    pub box_shell: BTreeSet<(String, String)>,
 }
 
 impl std::fmt::Debug for Env {
@@ -196,6 +212,18 @@ impl Env {
                 (!hosts.is_empty()).then_some((n, hosts))
             })
             .collect();
+        let box_shell = packs
+            .names()
+            .into_iter()
+            .filter_map(|n| packs.get(&n).map(|p| (n, p)))
+            .flat_map(|(n, p)| {
+                p.roles
+                    .values()
+                    .filter(|r| r.default_shell.as_deref() == Some("box"))
+                    .map(|r| (n.clone(), r.name.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
         Env {
             home: canon(&paths.home),
             copies: {
@@ -214,6 +242,7 @@ impl Env {
             packs: facts,
             relaxed_profiles,
             mcp_hosts,
+            box_shell,
         }
     }
 
@@ -537,6 +566,20 @@ impl CallView {
         v.add_repaired(&steps, &ls);
         let step_arg =
             |key: &str| steps.first().and_then(|s| s.args.get(key)).and_then(Value::as_str).map(str::to_string);
+        // `box_get` reads `path` in the box and writes `to` in the workspace (by default the last name of `path`
+        // there): the host path it writes is that one, and the box path is no local path at all.
+        if tool == "box_get" {
+            let given = |key: &str| {
+                step_arg(key)
+                    .or_else(|| args.get(key).and_then(Value::as_str).map(str::to_string))
+                    .map(|t| t.trim().to_string())
+                    .filter(|t| !t.is_empty())
+            };
+            let own_name = given("path")
+                .and_then(|p| p.trim_end_matches('/').rsplit('/').next().map(str::to_string))
+                .filter(|n| !n.is_empty());
+            v.paths = given("to").or(own_name).into_iter().collect();
+        }
         v.command = step_arg("command").unwrap_or_else(|| v.cmd.clone());
         if tool == "bash" {
             v.cwd = step_arg("cwd").filter(|c| !c.trim().is_empty());
@@ -1066,6 +1109,11 @@ impl Engine {
         (!v.allowed && v.rule.starts_with("deny infrastructure")).then_some(v.rule)
     }
 
+    /// The infrastructure rule that refuses `host` on some port (`Policy::infrastructure_on_some_port`).
+    fn infra_on_some_port(&self, host: &str) -> Option<String> {
+        self.env.infra.as_ref()?.infrastructure_on_some_port(host)
+    }
+
     fn on_call(
         &mut self,
         ctx: &SessionCtx,
@@ -1115,11 +1163,24 @@ impl Engine {
         if view.prose && !view.runs {
             return;
         }
-        // Everything below reads what the call does, not what it says.
-        self.local_paths(ctx, rec, &view, &action, &base, out);
+        // Everything below reads what the call does, not what it says. A command that runs in the box has no local
+        // paths: what it names is the box's.
+        if !self.in_box(ctx, &view) {
+            self.local_paths(ctx, rec, &view, &action, &base, out);
+        }
         self.commands(ctx, rec, &view, &action, &hosts, auth, fold, out);
         self.destinations_in_args(ctx, rec, &view, &action, &hosts, auth, fold, out);
         self.fleet_tokens(ctx, rec, &view);
+    }
+
+    /// True when the call runs a command in the mission's box, not on this machine: `box_exec`, `box_reset`, and `bash`
+    /// of a role whose shell is the box (`default_shell = "box"`). The tripwires about this machine (its paths, git
+    /// metadata, processes, preload and tracing, the side channels out of the sandbox) do not read it (§6.2); those about
+    /// destinations, sinks, credentials and canaries do.
+    fn in_box(&self, ctx: &SessionCtx, view: &CallView) -> bool {
+        view.runs
+            && (matches!(view.name.as_str(), "box_exec" | "box_reset")
+                || (view.name == "bash" && self.env.box_shell.contains(&(ctx.pack.clone(), ctx.role.clone()))))
     }
 
     /// The directory a call's command starts in, where its relative paths are: for `bash`, its `cwd` argument, else
@@ -1335,12 +1396,15 @@ impl Engine {
         out: &mut Vec<Hit>,
     ) {
         let exec = view.runs;
-        let box_tool = view.name.starts_with("box_") || view.name.starts_with("rootbox_");
+        let in_box = self.in_box(ctx, view);
+        let box_tool = in_box || view.name.starts_with("box_") || view.name.starts_with("rootbox_");
         let non_lab: Vec<&String> = hosts.iter().filter(|h| !self.is_lab(auth, h, None)).collect();
         if exec {
             let bare = pat::without_urls(action);
+            // TW-09, TW-10, TW-16 (preload and tracing) and TW-22 are about this machine, not the box's.
+            let here = !in_box;
             // TW-09
-            let git = GIT_HOOKS.is_match(&bare) || GIT_WRITE_CMD.is_match(&bare);
+            let git = here && (GIT_HOOKS.is_match(&bare) || GIT_WRITE_CMD.is_match(&bare));
             if git {
                 out.push(self.mk(
                     ctx,
@@ -1355,7 +1419,7 @@ impl Engine {
                 ));
             }
             // TW-10
-            if let Some(m) = PROC_INSPECT.first(&bare) {
+            if let Some(m) = PROC_INSPECT.first(&bare).filter(|_| here) {
                 if !bare.contains("$$") {
                     out.push(self.mk(
                         ctx,
@@ -1436,7 +1500,7 @@ impl Engine {
                 }
             }
             // TW-16
-            if let Some(m) = PRELOAD_PTRACE.first(&bare) {
+            if let Some(m) = PRELOAD_PTRACE.first(&bare).filter(|_| here) {
                 out.push(self.mk(
                     ctx,
                     rec,
@@ -1450,11 +1514,11 @@ impl Engine {
                 ));
             }
             // TW-22
-            let mut side = SIDE_CHANNEL.first(&bare).map(str::to_string);
-            if side.is_none() && NATIVE_NET_API.is_match(&bare) && COMPILER.is_match(&bare) {
+            let mut side = SIDE_CHANNEL.first(&bare).map(str::to_string).filter(|_| here);
+            if here && side.is_none() && NATIVE_NET_API.is_match(&bare) && COMPILER.is_match(&bare) {
                 side = Some("a build of code that names a native network API".into());
             }
-            if side.is_none() && CTYPES_APPLE.is_match(&bare) {
+            if here && side.is_none() && CTYPES_APPLE.is_match(&bare) {
                 side = Some("python ctypes loading an Apple network framework".into());
             }
             if let Some(m) = side {
@@ -1692,8 +1756,22 @@ impl Engine {
                 }
             }
         }
-        for h in &dests {
-            if let Some(rule) = self.infra_class(h, 443).or_else(|| self.infra_class(h, 80)) {
+        // Each destination on the port the call gives it (a service's own port, the daemon's), else on 443 and 80.
+        let mut ported = pat::destinations_in(&dscan);
+        for u in &view.urls {
+            for d in pat::destinations_in(&pat::destination_text(u)) {
+                if !ported.contains(&d) {
+                    ported.push(d);
+                }
+            }
+        }
+        let mut named: BTreeSet<String> = BTreeSet::new();
+        for (h, port) in &ported {
+            let rule = match port {
+                Some(p) => self.infra_class(h, *p),
+                None => self.infra_class(h, 443).or_else(|| self.infra_class(h, 80)),
+            };
+            if let Some(rule) = rule.filter(|_| named.insert(h.clone())) {
                 out.push(self.mk(
                     ctx,
                     rec,
@@ -1792,6 +1870,7 @@ impl Engine {
             auth.goal.as_str(),
             &auth.operator_messages.join("\n"),
             &auth.rules.join("\n"),
+            &auth.approvals.join("\n"),
             &auth.grants.iter().map(|g| format!("{} {}", g.host, g.note)).collect::<Vec<_>>().join("\n"),
             &auth.allow.join("\n"),
             &auth.target_scope.join("\n"),
@@ -1802,7 +1881,13 @@ impl Engine {
             let host = pat::host_of_authority(raw.trim_start_matches("*."));
             let wildcard = raw.starts_with("*.");
             let loopback = host == "localhost" || host.starts_with("127.") || host == "::1" || host == "0.0.0.0";
-            let infra = self.infra_class(&host, 443).is_some();
+            // On the port the request names; without one a grant covers every port, a service's own included.
+            let infra = match pat::port_of_authority(raw.trim_start_matches("*.")) {
+                Some(p) => self.infra_class(&host, p).is_some(),
+                None => {
+                    self.infra_class(&host, 443).is_some() || (!loopback && self.infra_on_some_port(&host).is_some())
+                }
+            };
             let domain = pat::registrable_domain(&host);
             let known = operator_text.contains(&domain) || operator_text.contains(&host);
             let mut reasons: Vec<&str> = Vec::new();
@@ -2343,11 +2428,14 @@ impl Engine {
         // runtime does for a session before its `session_start` (a lead's MCP servers, listed through its proxy and
         // sandbox) is not the session's; nor is a configured MCP server's traffic to its own hosts while its connection
         // may be open (a session's connections close when a turn of it ends finished or stopped, CONTRACTS-MCP M3).
+        // A decision is judged at the time the process connected: a connection the noise governor held back was
+        // recorded `paced_ms` after that.
+        let at = ts_ms.saturating_sub(d.paced_ms.unwrap_or(0));
         if let Some(st) = self.sessions.get(&ctx.session) {
-            let before_start = st.started_ms != 0 && ts_ms < st.started_ms;
+            let before_start = st.started_ms != 0 && at < st.started_ms;
             let mcp_open = auth.is_mcp_host(&host, Some(port)) && !self.ended.contains(ctx.session.as_str());
-            if ts_ms >= st.blind_until && !before_start && !mcp_open && !st.busy_at(ts_ms) {
-                self.fleet.idle_egress(&ctx.mission, &ctx.session, &host, port, ts_ms);
+            if at >= st.blind_until && !before_start && !mcp_open && !st.busy_at(at) {
+                self.fleet.idle_egress(&ctx.mission, &ctx.session, &host, port, at);
                 out.push(self.mk(
                     ctx,
                     &rec,

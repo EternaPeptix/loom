@@ -126,8 +126,8 @@
 //! - network: denied, except loopback connections to the egress proxy port (when there is one), to
 //!   `cfg.loopback_ports` — or to every loopback port when `cfg.loopback_all` — and to
 //!   `cfg.unix_sockets`. Listening on loopback is allowed. DevTools and the inspector (9222, 9229), the Docker
-//!   API (2375, 2376) and every `cfg.infra_ports` port (loopback model endpoints and `network.infrastructure`
-//!   entries on this machine; set by the runtime, not a configuration key) are refused the same way, whatever
+//!   API (2375, 2376) and every `cfg.infra_ports` port (loopback model endpoints, the Signal bridge's signal-cli and
+//!   `network.infrastructure` entries on this machine; set by the runtime, not a configuration key) are refused the same way, whatever
 //!   `loopback_all` or `loopback_ports` allows; `loopback_all` is always written for TCP and UDP. The daemon's own port (`cfg.daemon_port`, which
 //!   the daemon sets; not a configuration key) is refused whatever allows it, at every address: Seatbelt
 //!   counts the host's own addresses as loopback, and a command that read a `ferret open` login code from the
@@ -535,6 +535,9 @@ const CREDENTIAL_PATHS: &[&str] = &[
     ".wrangler",
     ".config/.wrangler",
     ".pulumi/credentials.json",
+    // signal-cli's account store (the keys of the Signal bridge's account, which may be the operator's own as a
+    // linked device), at its default place (`$XDG_DATA_HOME/signal-cli`; the runtime adds another `XDG_DATA_HOME`).
+    ".local/share/signal-cli",
     "Library/Keychains",
     "Library/Cookies",
     "Library/Application Support/Google/Chrome",
@@ -552,6 +555,7 @@ const CREDENTIAL_PATHS: &[&str] = &[
     "Library/Containers/com.bitwarden.desktop",
     "Library/Application Support/1Password",
     "Library/Application Support/Telegram Desktop",
+    "Library/Application Support/Signal",
     "Library/Application Support/Claude/claude_desktop_config.json",
     // Where tools that also keep an XDG location above store their logins on macOS.
     "Library/Application Support/doctl",
@@ -2946,6 +2950,9 @@ mod tests {
             "Library/Containers/com.bitwarden.desktop/Data/Library/Application Support/Bitwarden/data.json",
             "Library/Application Support/1Password/x",
             "Library/Application Support/Telegram Desktop/tdata/key_datas",
+            "Library/Application Support/Signal/config.json",
+            ".local/share/signal-cli/data/+15550100",
+            ".local/share/signal-cli/data/accounts.json",
             "Library/Application Support/Claude/claude_desktop_config.json",
             "Library/Group Containers/group.x/vault",
             "Library/Mail/V10/x",

@@ -161,15 +161,20 @@ A pack that sets `requires_restricted_network` (`vr` does) is refused while the 
 
 Some destinations are refused to every command whatever you grant or allow (`deny infrastructure: …` in `ferret net`):
 cloud metadata addresses and names, the DevTools and inspector ports 9222 and 9229 and the Docker API ports 2375 and
-2376 on this machine, the daemon's own port, every model endpoint of the configuration and the box's Docker host.
+2376 on this machine, the daemon's own port, every model endpoint of the configuration, the Signal bridge's `signal-cli`
+(`signal.http_url`, when `[signal]` is enabled) and the mail inbox's IMAP server (`mail.host` on `mail.port`, when
+`[mail]` is enabled with `imaps`), each on its own port, and the box's Docker host.
 These are refused by name and by the addresses the daemon resolves for them (at start and every five minutes), so the
 same host reached by its IP address, a short name or a tailnet alias is refused too, and this machine's own LAN, tailnet
 and global addresses count as this machine. The box's Docker host is the host of `ssh_host` (`user@host` and
 `ssh://user@host:2222` work) and the `HostName` that `ssh -G` resolves it to. A grant that names one is refused when you
 make it. The proxy is not the only door: the sandbox also refuses the DevTools, inspector and Docker API ports and the
-loopback ports of model endpoints and `network.infrastructure` entries directly, also with `loopback_all = true` or a
-`loopback_ports` entry (config refuses listing those ports, and Docker, containerd and Podman sockets in
-`unix_sockets`). A destination with no listing here is not protected: add it to `network.infrastructure`.
+loopback ports of model endpoints, of `signal-cli` and of `network.infrastructure` entries directly, also with
+`loopback_all = true` or a `loopback_ports` entry (config refuses listing those ports, and Docker, containerd and Podman
+sockets in `unix_sockets`), and it hides the services' files from commands and file tools: `mail.password_file` and
+`mail.maildir_path` wherever they lie, and signal-cli's account store (`~/.local/share/signal-cli`, or
+`$XDG_DATA_HOME/signal-cli` when the daemon has that variable; keep another `--config` directory in
+`sandbox.unreadable_paths`). A destination with no listing here is not protected: add it to `network.infrastructure`.
 List more with `network.infrastructure` (same syntax as `deny`: hosts, `host:port`, CIDR blocks), for example a tailnet
 machine or a desktop app's debugging port. `ferret open` hands the desktop's opener a short-lived page file instead of the address,
 so the login code is never on a command line; if your `.html` files open in an editor, it prints a line saying to use
@@ -272,7 +277,8 @@ file tools: `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/gh`, `~/.config/gcloud`, 
 `~/Library/Keychains`, `~/Library/Cookies`, the profile directories of Chrome, Chromium, Brave, Edge,
 Arc, Vivaldi, Opera, Firefox and Safari, and many more: model-hub, AI-tool, database, cloud, registry,
 password-manager, wallet and chat stores (`~/.cache/huggingface`, `~/.claude.json`, `~/.pgpass`,
-`~/.vault-token`, `~/.m2/settings.xml`, `~/.config/rclone`, `~/Library/Mail`, ...; the list is in
+`~/.vault-token`, `~/.m2/settings.xml`, `~/.config/rclone`, `~/Library/Mail`, signal-cli's and Signal Desktop's, ...;
+the list is in
 `docs/DESIGN.md`). Add other stores to `unreadable_paths`. A
 listed directory that is or contains the workspace is skipped. This needs a home directory: with
 `HOME` unset, every session fails to build its sandbox and the message names `HOME` and
@@ -483,8 +489,12 @@ outbound alerts) will fail with `UNTRUSTED_IDENTITY`. To trust the updated ident
 
 - **Quote-reply** to an alert to answer that exact inbox item (option numbers `1..N` expand to the option
   text), grant or deny a `request_scope` approval (`approve`/`yes`/`all`, host numbers such as `1 2`, or
-  `deny`/`no`/`dismiss`), or send a follow-up message to a finished/errored mission. Sent message mappings
-  persist across daemon restarts in `~/.ferret/signal_sent.json` (mode `0600`).
+  `deny`/`no`/`dismiss`), or send a follow-up message to a finished/errored mission. An approval from Signal grants
+  only hosts the alert showed in full: when a long request cut a host short (`…`) or left hosts out (`… +N more`),
+  `approve` (and `/scope <item>`, `/approve <item>`) grants nothing and says so, and so does the number of such a host;
+  give the numbers of hosts shown in full, write the names out with `/scope <session> <host>...`, or approve it in the
+  web UI or with `ferret scope`. Sent message mappings persist across daemon restarts in `~/.ferret/signal_sent.json`
+  (mode `0600`).
 - **Plain reply** (in a direct message, never in a group) answers the sole open blocking item directly.
 - **`@<id> <text>`** answers an open inbox item or messages a mission by ID prefix/suffix (or short `#n`
   index shown by `/inbox` and `/status`).

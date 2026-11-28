@@ -39,6 +39,7 @@ fn env_of(paths: &Paths) -> Arc<Env> {
         packs: [("core".to_string(), PackFacts::default())].into(),
         relaxed_profiles: BTreeSet::new(),
         mcp_hosts: Default::default(),
+        box_shell: Default::default(),
     })
 }
 
@@ -303,6 +304,7 @@ fn net_line(h: &Home, session: &str, ts: u64, host: &str, allowed: bool) {
             rule: "allow".into(),
             resolved: None,
             sni: None,
+            paced_ms: None,
         },
     };
     w.append(&h.paths.sessions_dir().join(session).join("net.jsonl"), &e).expect("net");
@@ -439,6 +441,7 @@ fn floor_events_and_unattributed_infrastructure_decisions_are_read() {
             rule: "deny infrastructure: cloud metadata".into(),
             resolved: None,
             sni: None,
+            paced_ms: None,
         },
     };
     w.append(&logs.join("net-unattributed.jsonl"), &e).expect("unattributed");
@@ -677,6 +680,7 @@ fn decision_line(h: &Home, session: &str, ts: u64, host: &str, rule: &str) {
             rule: rule.into(),
             resolved: None,
             sni: None,
+            paced_ms: None,
         },
     };
     w.append(&h.paths.sessions_dir().join(session).join("net.jsonl"), &e).expect("net");
