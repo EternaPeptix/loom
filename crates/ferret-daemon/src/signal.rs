@@ -7113,7 +7113,10 @@ mod tests {
             let (rpc_url, sent) = start_mock_delay_signal_rpc().await;
             let script = Script::new(|_, step| match step {
                 0 => Reply::tool("ask_user", r#"{"question":"Answer at computer?","blocking":true}"#).into(),
-                _ => Reply::tool("ask_user", r#"{"question":"Second hold","blocking":true}"#).into(),
+                1 => Reply::tool("ask_user", r#"{"question":"Second hold","blocking":true}"#).into(),
+                // Answered, the lead stops asking: a third question would open after the answers below and race
+                // the delay on a slow machine.
+                _ => Reply::text("done").into(),
             });
             let env = start_test_runtime(script).await;
             let dir = tempfile::tempdir().unwrap();
@@ -7217,8 +7220,12 @@ mod tests {
         }
         {
             let (rpc_url, sent) = start_mock_delay_signal_rpc().await;
-            let script =
-                Script::new(|_, _| Reply::tool("ask_user", r#"{"question":"FreshOnBoot","blocking":true}"#).into());
+            // One question: answered, the lead replies instead of asking again, so no new item can open after
+            // the answer and outlast the delay on a slow machine.
+            let script = Script::new(|_, step| match step {
+                0 => Reply::tool("ask_user", r#"{"question":"FreshOnBoot","blocking":true}"#).into(),
+                _ => Reply::text("done").into(),
+            });
             let env = start_test_runtime(script).await;
             let _ = env.rt.create_session(new_session(&env.ws, "lead", "FreshBoot", "go")).await.unwrap();
             wait_for(|| !env.rt.inbox().is_empty()).await;
